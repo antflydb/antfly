@@ -47,7 +47,7 @@ SDK_PREFIXES = (
     "py/packages/embedded/",
     "rs/crates/embedded/",
     "rs/crates/embedded-sys/",
-    "zig/pkg/antfly/capi-conformance/",
+    "zig/pkg/antfly-embedded/capi-conformance/",
 )
 SDK_FILES = {
     "openapi.yaml",

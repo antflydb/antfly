@@ -20,7 +20,7 @@ const std = @import("std");
 const scraping = @import("antfly_scraping");
 const vopr = @import("vopr");
 const remote_content_runtime = @import("../common/remote_content_runtime.zig");
-const secrets = @import("../common/secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 const extensions = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -361,7 +361,7 @@ pub const Scenario = struct {
                 self.proposals += 1;
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 if (self.committed) |*command| command.deinit(self.allocator);
             }
         };

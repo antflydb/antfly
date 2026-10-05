@@ -22,8 +22,8 @@ const std = @import("std");
 const httpx = @import("httpx");
 const vopr = @import("vopr");
 const audio_runtime = @import("../common/audio_runtime.zig");
-const config_mod = @import("../common/config.zig");
-const provider_registry = @import("../common/provider_registry.zig");
+const config_mod = @import("antfly_local_sources").common_config;
+const provider_registry = @import("antfly_local_sources").common_provider_registry;
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
@@ -351,7 +351,7 @@ pub const Scenario = struct {
             return false;
         }
 
-        fn finalize(self: *State) void {
+        pub fn finalize(self: *State) void {
             const mode = self.mode.?;
             switch (mode) {
                 .stt_success => self.result_classified = self.request_error == null and std.mem.eql(u8, self.transcript orelse "", "vopr transcript"),

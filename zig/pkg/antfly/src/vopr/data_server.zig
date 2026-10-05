@@ -20,9 +20,9 @@ const std = @import("std");
 const httpx = @import("httpx");
 const vopr = @import("vopr");
 const data_runtime = @import("../data/runtime.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
-const http_common = @import("../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const request_lifecycle = @import("request_lifecycle.zig");
 const http_disconnect = @import("http_disconnect.zig");
 const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
@@ -60,7 +60,10 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         // The production HTTP stack intentionally uses large fixed parser and
         // formatting buffers. Match a production worker thread's stack rather
         // than the compact default used by protocol-level VOPR scenarios.
-        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        // 8 MiB overflowed under Debug codegen on the equivalent
+        // single-DataServer Raft-merge campaign (data/runtime.zig); use the
+        // same 32 MiB headroom here.
+        .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         .network = .{ .max_sockets = options.max_sockets },
         .instrumentation = .{ .enabled = options.prioritize_time, .map_digest = 0x44535652 },
     });

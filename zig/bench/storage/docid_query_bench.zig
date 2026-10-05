@@ -85,7 +85,7 @@ const FilterPlan = struct {
     native_ids: []const u64,
     ordinal_filter: doc_set.ResolvedDocFilter,
 
-    fn deinit(self: *FilterPlan, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FilterPlan, alloc: std.mem.Allocator) void {
         if (self.doc_ids.len > 0) alloc.free(self.doc_ids);
         if (self.native_ids.len > 0) alloc.free(self.native_ids);
         self.ordinal_filter.deinit(alloc);
@@ -412,8 +412,8 @@ fn addBatchProfile(total: *db_mod.BatchProfile, item: db_mod.BatchProfile) void 
 
 fn lsmWriteStatsDelta(after: anytype, before: @TypeOf(after)) @TypeOf(after) {
     var out = after;
-    inline for (std.meta.fields(@TypeOf(after))) |field| {
-        @field(out, field.name) = @field(after, field.name) -| @field(before, field.name);
+    inline for (comptime std.meta.fieldNames(@TypeOf(after))) |reflected_name| {
+        @field(out, reflected_name) = @field(after, reflected_name) -| @field(before, reflected_name);
     }
     return out;
 }

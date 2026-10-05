@@ -36,8 +36,8 @@ resolve_zig() {
     printf '%s\n' "$ZIG"
   elif command -v zig >/dev/null 2>&1; then
     command -v zig
-  elif [[ -x "../../../.tools/zig-x86_64-linux-0.16.0/zig" ]]; then
-    printf '%s\n' "../../../.tools/zig-x86_64-linux-0.16.0/zig"
+  elif [[ -x "../../../.tools/zig-x86_64-linux-0.17.0/zig" ]]; then
+    printf '%s\n' "../../../.tools/zig-x86_64-linux-0.17.0/zig"
   else
     echo "zig not found; set ZIG=/path/to/zig" >&2
     return 1
@@ -125,7 +125,7 @@ for candidate_model_dir in "${model_dirs[@]}"; do
           ;;
       esac
       echo "model_dir=${candidate_model_dir} graph_mode=${graph_mode} qmatmul_variant=${qmatmul_variant}"
-      env "${graph_env[@]}" ANTFLY_CUDA_QMATMUL_VARIANT="$qmatmul_variant" timeout "$timeout_seconds" "$zig_bin" build --global-cache-dir "$zig_global_cache_dir" -Doptimize=ReleaseFast -Dcuda=true -Dcuda-artifacts="$cuda_artifacts" -Dcuda-libs="$cuda_libraries" bench-reranker-e2e -- \
+      env "${graph_env[@]}" ANTFLY_CUDA_QMATMUL_VARIANT="$qmatmul_variant" timeout "$timeout_seconds" "$zig_bin" build --global-cache-dir "$zig_global_cache_dir" -Doptimize=fast -Dcuda=true -Dcuda-artifacts="$cuda_artifacts" -Dcuda-libs="$cuda_libraries" bench-reranker-e2e -- \
         --model-dir "$candidate_model_dir" \
         --backend cuda \
         --warmup-iters "$warmup_iters" \

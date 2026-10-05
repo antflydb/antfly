@@ -239,7 +239,7 @@ const ProjectorWeights = struct {
         return .{ .cb = cb, .allocator = allocator, .gguf = gguf, .owner = owner };
     }
 
-    fn deinit(self: *ProjectorWeights) void {
+    pub fn deinit(self: *ProjectorWeights) void {
         const metal_compute_mod = @import("../ops/metal_compute.zig");
         var it = self.entries.iterator();
         while (it.next()) |entry| {
@@ -302,8 +302,8 @@ const AudioHostOps = struct {
             const item = std.mem.trim(u8, raw, " ");
             if (item.len == 0) continue;
             const all = std.mem.eql(u8, item, "all");
-            inline for (@typeInfo(AudioHostOps).@"struct".fields) |field| {
-                if (all or std.mem.eql(u8, item, field.name)) @field(ops_mask, field.name) = true;
+            inline for (comptime std.meta.fieldNames(AudioHostOps)) |reflected_name| {
+                if (all or std.mem.eql(u8, item, reflected_name)) @field(ops_mask, reflected_name) = true;
             }
         }
         return ops_mask;
@@ -687,7 +687,7 @@ const AudioFeatures = struct {
     frames: usize,
     mel_bins: usize,
 
-    fn deinit(self: *AudioFeatures) void {
+    pub fn deinit(self: *AudioFeatures) void {
         self.allocator.free(self.data);
         self.allocator.free(self.mask);
     }
@@ -698,7 +698,7 @@ const SubsampledAudio = struct {
     valid_mask: []bool,
     seq_len: usize,
 
-    fn deinit(self: *SubsampledAudio, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SubsampledAudio, allocator: std.mem.Allocator) void {
         allocator.free(self.valid_mask);
     }
 };
@@ -1388,7 +1388,7 @@ const AudioLayerInputs = struct {
         };
     }
 
-    fn deinit(self: *AudioLayerInputs, cb: *const ComputeBackend) void {
+    pub fn deinit(self: *AudioLayerInputs, cb: *const ComputeBackend) void {
         cb.free(self.rel_in);
         cb.free(self.valid_ct);
         cb.free(self.ones);
@@ -1414,7 +1414,7 @@ const AudioProfile = struct {
     const Bucket = enum { features, subsample, ffn, norms, attn_proj, attn_kernel, attn_out, lconv, tail, readback };
     cb: *const ComputeBackend,
     last_ns: u64 = 0,
-    totals: [std.enums.values(Bucket).len]u64 = [_]u64{0} ** std.enums.values(Bucket).len,
+    totals: [std.enums.values(Bucket).len]u64 = @as([std.enums.values(Bucket).len]u64, @splat(0)),
 
     fn start(self: *AudioProfile) void {
         self.last_ns = platform.time.monotonicNs();
@@ -1423,14 +1423,14 @@ const AudioProfile = struct {
     fn mark(self: *AudioProfile, bucket: Bucket) void {
         if (self.cb.decoderRuntimeHasActiveFrame()) self.cb.decoderRuntimeFlushActiveFrame() catch {};
         const now = platform.time.monotonicNs();
-        self.totals[@intFromEnum(bucket)] += now -| self.last_ns;
+        self.totals[@backingInt(bucket)] += now -| self.last_ns;
         self.last_ns = now;
     }
 
     fn finish(self: *const AudioProfile, rows: usize) void {
         std.debug.print("gemma4_audio_metal rows={d}", .{rows});
         inline for (std.enums.values(Bucket)) |bucket| {
-            std.debug.print(" {s}={d}us", .{ @tagName(bucket), self.totals[@intFromEnum(bucket)] / std.time.ns_per_us });
+            std.debug.print(" {s}={d}us", .{ @tagName(bucket), self.totals[@backingInt(bucket)] / std.time.ns_per_us });
         }
         std.debug.print("\n", .{});
     }
@@ -1658,7 +1658,7 @@ const FrameFft = struct {
         return .{ .plan = plan, .padded = padded, .ones = ones, .power = power };
     }
 
-    fn deinit(self: *FrameFft, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *FrameFft, allocator: std.mem.Allocator) void {
         self.plan.deinit(allocator);
         allocator.free(self.padded);
         allocator.free(self.ones);
@@ -2639,7 +2639,7 @@ test "gemma4 12b real mmproj optional projector smoke" {
     var cb = compute.computeBackend();
 
     if (image_path) |path| {
-        const image_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+        const image_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
         defer allocator.free(image_bytes);
         var projected = try encodeProjectedImagesFromStore(&cb, allocator, store, &.{image_bytes});
         defer projected.deinit();
@@ -2650,7 +2650,7 @@ test "gemma4 12b real mmproj optional projector smoke" {
     }
 
     if (audio_path) |path| {
-        const audio_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(128 * 1024 * 1024));
+        const audio_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(128 * 1024 * 1024));
         defer allocator.free(audio_bytes);
         var projected = try encodeProjectedAudioFromStore(&cb, allocator, store, &.{audio_bytes});
         defer projected.deinit();

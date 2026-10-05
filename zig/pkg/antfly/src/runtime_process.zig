@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Process context and symbol visibility shared by the independent runtime roots.
 
@@ -76,10 +76,10 @@ const RuntimeProcess = struct {
         errdefer alloc.free(argument_storage);
         var initialized_arguments: usize = 0;
         errdefer for (argument_storage[0..initialized_arguments]) |argument| alloc.free(argument);
-        argument_storage[0] = try alloc.dupeZ(u8, "antfly-runtime");
+        argument_storage[0] = try alloc.dupeSentinel(u8, "antfly-runtime", 0);
         initialized_arguments = 1;
         for (input_arguments, 1..) |argument, index| {
-            argument_storage[index] = try alloc.dupeZ(u8, argument.slice());
+            argument_storage[index] = try alloc.dupeSentinel(u8, argument.slice(), 0);
             initialized_arguments += 1;
         }
         const argument_ptrs = try alloc.alloc([*:0]const u8, argument_storage.len);
@@ -117,7 +117,7 @@ const RuntimeProcess = struct {
         };
     }
 
-    fn deinit(self: *RuntimeProcess) void {
+    pub fn deinit(self: *RuntimeProcess) void {
         self.io_impl.deinit();
         self.process_environ.block.deinit(self.alloc);
         self.environ_map.deinit();
@@ -156,3 +156,6 @@ pub fn runtimeAllocator() std.mem.Allocator {
     const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else std.heap.page_allocator;
     return platform.allocator.processAllocator(fallback);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

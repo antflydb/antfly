@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Bounded, metadata-owned history of hidden initial-FK replica admission.
 //! A canceled work item is only a candidate for local retirement. Physical
@@ -59,7 +59,7 @@ pub const Replica = struct {
         bytes[4] = if (self.retirement_authority == .canceled_plan) 1 else 2;
         bytes[5] = @intFromBool(self.canceled);
         bytes[6] = @intFromBool(self.acked);
-        bytes[7] = @intFromEnum(self.retirement_authority);
+        bytes[7] = @backingInt(self.retirement_authority);
         @memcpy(bytes[8..24], &self.plan_id);
         @memcpy(bytes[24..56], &self.plan_digest);
         inline for (.{ self.child_table_id, self.group_id, self.range_id, self.node_id, self.store_id, self.store_incarnation, self.replica_id, self.root_generation }, 0..) |value, index| {
@@ -93,7 +93,7 @@ pub const Replica = struct {
             .store_root_incarnation = std.mem.readInt(u128, bytes[120..136], .little),
             .canceled = bytes[5] == 1,
             .acked = bytes[6] == 1,
-            .retirement_authority = @enumFromInt(bytes[7]),
+            .retirement_authority = @fromBackingInt(bytes[7]),
         };
         try result.validate();
         return result;

@@ -1,3 +1,18 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Bounded-batch construction and held-out recall/candidate-work probe.
 //! The read-only float32 fixture is external vector ownership; its bytes are
 //! reported separately from build workspace. This excludes HTTP and WAL costs.
@@ -24,7 +39,7 @@ const Source = struct {
 fn now(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).nanoseconds;
 }
-fn read(comptime T: type, init: std.process.Init, path: []const u8, limit: usize) ![]T {
+pub fn read(comptime T: type, init: std.process.Init, path: []const u8, limit: usize) ![]T {
     const bytes = try std.Io.Dir.cwd().readFileAllocOptions(init.io, path, std.heap.smp_allocator, .limited(limit), .@"8", null);
     if (bytes.len % @sizeOf(T) != 0) return error.InvalidFixture;
     return std.mem.bytesAsSlice(T, bytes);
@@ -51,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     const nq = queries.len / dims;
     if (train.len % dims != 0 or queries.len % dims != 0 or truth.len != nq * 100) return error.InvalidFixture;
     var source: Source = .{ .values = train, .dims = dims };
-    const path = try init.arena.allocator().dupeZ(u8, args[7]);
+    const path = try init.arena.allocator().dupeSentinel(u8, args[7], 0);
     var idx = try hbc.HBCIndex.open(alloc, path, .{
         .dims = @intCast(dims),
         .metric = .cosine,

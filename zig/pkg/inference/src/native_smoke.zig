@@ -27,7 +27,6 @@ const runtime = @import("runtime/root.zig");
 const native_backend_choice = @import("native_backend_choice.zig");
 const graph_mod = @import("graph/root.zig");
 const c_file = @import("util/c_file.zig");
-const io_compat = @import("io/compat.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
         pub const Client = struct {
@@ -74,7 +73,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer if (gguf_report) |*report| report.deinit();
     try printGgufSummary(&manifest, gguf_report);
     if (opts.draft_model) |draft_model| {
-        try printMtpPairValidation(allocator, opts.model_dir, gguf_report, draft_model);
+        try printMtpPairValidation(allocator, io, opts.model_dir, gguf_report, draft_model);
     }
 
     if (opts.inspect_only) return;
@@ -197,7 +196,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     budget_limits = try applyBudgetOverrides(budget_limits, opts);
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
-        .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config },
+        .{ .backend = backend_kind, .kv_dtype = kv_dtype, .config = gpt_config, .workspace_capacity = model.session.generationWorkspaceCapacity() },
     };
     const scheduler_prefill_ceiling = if (native_generate_lease) |lease|
         lease.prefill_chunk_size
@@ -426,6 +425,7 @@ fn mtpPairVerdictName(verdict: MtpPairVerdict) []const u8 {
 
 fn printMtpPairValidation(
     allocator: std.mem.Allocator,
+    io: std.Io,
     target_model_dir: []const u8,
     target_report: ?session_factory.GgufInspectionReport,
     draft_model_dir: []const u8,
@@ -440,9 +440,9 @@ fn printMtpPairValidation(
 
     const target_cfg = if (target_report) |report| report.gpt_config else null;
     const draft_cfg = if (draft_report) |report| report.gpt_config else try loadGptConfigFromManifestConfig(allocator, &draft_manifest);
-    const target_tokenizer = try tokenizerFingerprint(allocator, target_model_dir);
+    const target_tokenizer = try tokenizerFingerprint(allocator, io, target_model_dir);
     defer if (target_tokenizer) |fp| allocator.free(fp);
-    const draft_tokenizer = try tokenizerFingerprint(allocator, draft_model_dir);
+    const draft_tokenizer = try tokenizerFingerprint(allocator, io, draft_model_dir);
     defer if (draft_tokenizer) |fp| allocator.free(fp);
     const tokenizer_match = tokenizersCompatible(target_tokenizer, draft_tokenizer);
     const masked_embeddings = try modelHasTensor(allocator, draft_model_dir, "masked_embedding.centroids.weight") and
@@ -515,7 +515,7 @@ fn tokenizersCompatible(left: ?[]const u8, right: ?[]const u8) bool {
     return std.mem.eql(u8, left.?, right.?);
 }
 
-fn tokenizerFingerprint(allocator: std.mem.Allocator, model_dir: []const u8) !?[]const u8 {
+fn tokenizerFingerprint(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !?[]const u8 {
     const names = [_][]const u8{
         "tokenizer.json",
         "tokenizer.model",
@@ -524,7 +524,7 @@ fn tokenizerFingerprint(allocator: std.mem.Allocator, model_dir: []const u8) !?[
     for (names) |name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, name });
         defer allocator.free(path);
-        const stat = io_compat.cwd().statFile(io_compat.io(), path, .{}) catch |err| switch (err) {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => continue,
             error.NotDir => continue,
             else => return err,

@@ -112,7 +112,7 @@ pub const Count1DecodeProgress = struct {
 };
 
 pub const TableUsage = struct {
-    counts: [34]usize = [_]usize{0} ** 34,
+    counts: [34]usize = @as([34]usize, @splat(0)),
 
     pub fn note(self: *TableUsage, table_index: u8) void {
         if (table_index < self.counts.len) self.counts[table_index] += 1;
@@ -198,7 +198,7 @@ const SymbolLookupEntry = struct {
 };
 
 fn buildSymbolLookup(comptime bits: []const u8, comptime codes: []const u16) [symbol_lookup_size]SymbolLookupEntry {
-    var table = [_]SymbolLookupEntry{.{}} ** symbol_lookup_size;
+    var table = @as([symbol_lookup_size]SymbolLookupEntry, @splat(.{}));
     for (bits, codes, 0..) |entry_bits, entry_code, symbol| {
         if (entry_bits == 0 or entry_bits > symbol_lookup_bits) continue;
         const shift: u5 = @intCast(symbol_lookup_bits - entry_bits);
@@ -215,7 +215,7 @@ fn buildSymbolLookup(comptime bits: []const u8, comptime codes: []const u16) [sy
 }
 
 fn buildQuadLookup(comptime bits: []const u8, comptime codes: []const u8) [quad_lookup_size]SymbolLookupEntry {
-    var table = [_]SymbolLookupEntry{.{}} ** quad_lookup_size;
+    var table = @as([quad_lookup_size]SymbolLookupEntry, @splat(.{}));
     for (bits, codes, 0..) |entry_bits, entry_code, symbol| {
         if (entry_bits == 0 or entry_bits > quad_lookup_bits) continue;
         const shift: u5 = @intCast(quad_lookup_bits - entry_bits);
@@ -1036,7 +1036,7 @@ test "big value partial decode supports table zero" {
         .count1_table_select = false,
     };
     var reader = BitSliceReader.init(&.{ 0xFF, 0x00 }, 0, 16);
-    var pairs = [_]DecodedPair{.{ .x = -1, .y = -1 }} ** 4;
+    var pairs = @as([4]DecodedPair, @splat(.{ .x = -1, .y = -1 }));
     const progress = try decodeBigValuePairsPartial(&reader, plan, &pairs);
     try std.testing.expectEqual(@as(usize, 4), progress.pairs_decoded);
     try std.testing.expect(progress.unsupported_table == null);
@@ -1059,7 +1059,7 @@ test "big value partial decode reports a table outside the codebook space" {
         .count1_table_select = false,
     };
     var reader = BitSliceReader.init(&.{0}, 0, 8);
-    var pairs = [_]DecodedPair{.{ .x = -1, .y = -1 }} ** 5;
+    var pairs = @as([5]DecodedPair, @splat(.{ .x = -1, .y = -1 }));
     const progress = try decodeBigValuePairsPartial(&reader, plan, &pairs);
     try std.testing.expectEqual(@as(usize, 2), progress.pairs_decoded);
     try std.testing.expectEqual(@as(?u8, 32), progress.unsupported_table);
@@ -1067,7 +1067,7 @@ test "big value partial decode reports a table outside the codebook space" {
     var every_table_plan = plan;
     every_table_plan.table_select = .{ 0, 27, 0 };
     var reader_supported = BitSliceReader.init(&.{ 0, 0, 0, 0 }, 0, 32);
-    var supported_pairs = [_]DecodedPair{.{ .x = -1, .y = -1 }} ** 5;
+    var supported_pairs = @as([5]DecodedPair, @splat(.{ .x = -1, .y = -1 }));
     const supported = try decodeBigValuePairsPartial(&reader_supported, every_table_plan, &supported_pairs);
     try std.testing.expectEqual(@as(?u8, null), supported.unsupported_table);
 }
@@ -1157,7 +1157,7 @@ test "table 16 family decodes zero pair" {
 
 test "count1 table A decodes signed quad" {
     var reader = BitSliceReader.init(&.{0b01111000}, 0, 5);
-    var quads = [_]DecodedQuad{.{ .v = 0, .w = 0, .x = 0, .y = 0 }} ** 1;
+    var quads = @as([1]DecodedQuad, @splat(.{ .v = 0, .w = 0, .x = 0, .y = 0 }));
     const progress = try decodeCount1QuadsPartial(&reader, false, &quads, 4);
     try std.testing.expectEqual(@as(usize, 1), progress.quads_decoded);
     try std.testing.expectEqual(@as(usize, 4), progress.samples_decoded);
@@ -1166,7 +1166,7 @@ test "count1 table A decodes signed quad" {
 
 test "count1 table B decodes full quad" {
     var reader = BitSliceReader.init(&.{0b11110000}, 0, 4);
-    var quads = [_]DecodedQuad{.{ .v = 0, .w = 0, .x = 0, .y = 0 }} ** 1;
+    var quads = @as([1]DecodedQuad, @splat(.{ .v = 0, .w = 0, .x = 0, .y = 0 }));
     const progress = try decodeCount1QuadsPartial(&reader, true, &quads, 4);
     try std.testing.expectEqual(@as(usize, 1), progress.quads_decoded);
     try std.testing.expectEqual(@as(usize, 4), progress.samples_decoded);

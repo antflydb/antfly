@@ -45,7 +45,7 @@ const AssetResolver = struct {
         };
     }
 
-    fn deinit(self: *AssetResolver) void {
+    pub fn deinit(self: *AssetResolver) void {
         self.allocator.free(self.canonical_root);
         self.* = undefined;
     }
@@ -118,8 +118,7 @@ pub const LoadedMultiStageReader = struct {
         var metadata = try metadata_mod.loadFromDir(allocator, model_path);
         defer metadata.deinit();
         if (!metadata_mod.isMultiStage(&metadata)) return error.InvalidMetadata;
-        const runtime_io = session_manager.io orelse
-            std.Io.Threaded.global_single_threaded.io();
+        const runtime_io = session_manager.io orelse return error.MissingIoRuntime;
         var asset_resolver = try AssetResolver.init(
             allocator,
             runtime_io,
@@ -473,7 +472,7 @@ const PreflightAssets = struct {
         return dict;
     }
 
-    fn deinit(self: *PreflightAssets) void {
+    pub fn deinit(self: *PreflightAssets) void {
         if (self.char_dict) |dict| ctc_decode.freeCharDict(self.allocator, dict);
         if (self.vision_tokenizer) |*managed| managed.deinit();
         self.char_dict = null;
@@ -850,7 +849,7 @@ test "Paddle stage normalization matches recognition and detection input ranges"
 }
 
 test "Paddle recognition padding is neutral in normalized model input" {
-    var pixels = [_]u8{0} ** 12;
+    var pixels = @as([12]u8, @splat(0));
     const img = image.Image{ .data = &pixels, .width = 2, .height = 2, .channels = 3 };
     var config = multistage_ocr.PreprocessConfig{ .width = 4, .height = 2 };
     applyModelTypeNormalization("paddleocr", .recognition, &config);

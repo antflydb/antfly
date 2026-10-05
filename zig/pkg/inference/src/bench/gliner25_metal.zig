@@ -44,7 +44,7 @@ const startup_timeout_ms = 120000;
 const teardown_timeout_ms = 30000;
 
 comptime {
-    if (builtin.mode != .ReleaseFast) @compileError("GLiNER2.5 benchmark requires ReleaseFast for the complete dependency graph");
+    if (builtin.mode != .fast) @compileError("GLiNER2.5 benchmark requires ReleaseFast for the complete dependency graph");
     if (!build_options.enable_metal or build_options.enable_cuda or build_options.enable_onnx or build_options.enable_pjrt)
         @compileError("GLiNER2.5 Metal benchmark requires -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false");
 }
@@ -103,7 +103,7 @@ const Extraction = struct {
     input_shape: [2]usize,
     runtime_stats: RuntimeStats,
 
-    fn deinit(self: *Extraction, a: Allocator) void {
+    pub fn deinit(self: *Extraction, a: Allocator) void {
         self.result.deinit();
         if (self.input_ids) |ids| a.free(ids);
         if (self.attention_mask) |mask| a.free(mask);
@@ -169,16 +169,16 @@ fn filePin(comptime name: []const u8, pin: Pin) bundle.FilePin {
 }
 
 fn verifyFiles(a: Allocator, directory: []const u8, files: Files, control: Control) !void {
-    inline for (std.meta.fields(Files)) |field| {
-        const pin = @field(files, field.name);
-        if (!validDigest(pin.sha256) or pin.size_bytes == 0 or pin.size_bytes > try bundle.fileLimit(field.name)) return error.InvalidBenchmarkArtifactPin;
+    inline for (comptime std.meta.fieldNames(Files)) |reflected_name| {
+        const pin = @field(files, reflected_name);
+        if (!validDigest(pin.sha256) or pin.size_bytes == 0 or pin.size_bytes > try bundle.fileLimit(reflected_name)) return error.InvalidBenchmarkArtifactPin;
         try control.check();
-        const path = try std.fs.path.join(a, &.{ directory, field.name });
+        const path = try std.fs.path.join(a, &.{ directory, reflected_name });
         defer a.free(path);
         // Read-only mappings avoid creating a second full checkpoint copy.
         var mapping = try inference.util.c_file.MmapRegion.init(a, path);
         defer mapping.deinit();
-        try bundle.verifyBytes(filePin(field.name, pin), mapping.data, control);
+        try bundle.verifyBytes(filePin(reflected_name, pin), mapping.data, control);
     }
 }
 
@@ -195,7 +195,7 @@ fn checkBackend(cb: *const inference.ops.ComputeBackend) !void {
     try cb.checkExecutionControl();
 }
 
-fn extract(a: Allocator, session: Session, controller: *admission_memory.AdmissionController, config: *const model.Config, tokenizer: inference.tokenizer.Tokenizer, case: *const Case, schema_json: []const u8, capture_tokens: bool, options: Options, control: Control) !Extraction {
+pub fn extract(a: Allocator, session: Session, controller: *admission_memory.AdmissionController, config: *const model.Config, tokenizer: inference.tokenizer.Tokenizer, case: *const Case, schema_json: []const u8, capture_tokens: bool, options: Options, control: Control) !Extraction {
     try control.check();
     var phase = PhaseTimings{};
     const schema_start = try diagnosticNow(options.diagnostics);
@@ -352,7 +352,7 @@ fn verifyEnvironment() !void {
     }
     // Some runtime switches are enabled by presence, including empty/"0".
     // A production-default receipt therefore requires them to be absent.
-    inline for (std.meta.fields(NativeEnvironment)) |field| if (std.c.getenv(field.name) != null) return error.NonDefaultBenchmarkMetalEnvironment;
+    inline for (comptime std.meta.fieldNames(NativeEnvironment)) |reflected_name| if (std.c.getenv(reflected_name) != null) return error.NonDefaultBenchmarkMetalEnvironment;
 }
 
 fn closeSession(session: Session, watchdog: *Watchdog) void {

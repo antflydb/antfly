@@ -337,7 +337,7 @@ fn createDirAbsolutePortable(path: []const u8) !void {
     }
 
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -364,7 +364,7 @@ fn createDirAbsolutePortable(path: []const u8) !void {
 
 fn mkdirPathIgnoreExistingPosix(dir_fd: std.posix.fd_t, path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -389,7 +389,7 @@ fn mkdirPathIgnoreExistingPosix(dir_fd: std.posix.fd_t, path: []const u8) !void 
 
 fn openDirAtPathPosix(dir_fd: std.posix.fd_t, path: []const u8) !std.posix.fd_t {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     return try std.posix.openatZ(dir_fd, path_z.ptr, .{
         .ACCMODE = .RDONLY,
@@ -412,7 +412,7 @@ fn dirAlreadyExistsPosix(path: []const u8) bool {
 
 fn mkdirAbsoluteIgnoreExistingPosix(path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -469,6 +469,9 @@ fn createAbsoluteDirPathPosix(path: []const u8) !void {
 }
 
 fn createAbsoluteFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.CreateFileOptions) !std.Io.File {
+    if (comptime builtin.os.tag == .wasi) {
+        return std.Io.Dir.createFileAbsolute(io, path, flags);
+    }
     return createAbsoluteFileViaParentDir(path, flags) catch |err| switch (err) {
         error.BadPathName => createAbsoluteFileViaAbsolutePath(path, flags) catch |fallback_err| switch (fallback_err) {
             error.BadPathName => std.Io.Dir.createFileAbsolute(io, path, flags),

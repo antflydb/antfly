@@ -30,7 +30,7 @@ const Options = struct {
     backend: reranker.BackendChoice = .auto,
     max_examples: usize = 256,
 
-    fn deinit(self: *Options) void {
+    pub fn deinit(self: *Options) void {
         _ = self;
     }
 };

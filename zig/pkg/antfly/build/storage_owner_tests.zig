@@ -1,20 +1,20 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
-const AntflyRootImports = @import("imports.zig").AntflyRootImports;
+const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 const runtime = @import("runtime.zig");
 
 /// These sources require separately linked owner suites, not source shards.
@@ -32,11 +32,11 @@ pub const Result = struct { runs: [3]*std.Build.Step.Run, benchmark: *std.Build.
 pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     imports: AntflyRootImports,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
-    artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
+    artifacts: [@typeInfo(runtime.RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile,
 ) Result {
     const owner_filter = b.option([]const u8, "storage-owner-test-filter", "Compile and run one matching storage owner test subset");
     const source_filter = b.option([]const u8, "storage-owner-source-test-filter", "Compile and run matching provisioned storage owner tests");
@@ -82,15 +82,15 @@ pub fn add(
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
-                .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
             if (index == 2) {
-                tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+                tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {
                 inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-                    tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+                    tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
             }
         } else {
             test_metadata.link(module);
@@ -98,7 +98,7 @@ pub fn add(
         }
         if (index == 3) {
             inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-                module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+                module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
     const physical_module = b.createModule(.{
@@ -110,17 +110,17 @@ pub fn add(
     var physical_imports = imports;
     physical_imports.boundary_profile = .owner;
     physical_imports.configureStorage(b, physical_module, true);
-    @import("storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
+    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
     physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
         .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-        handoff_tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+        handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
     b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
         .dependOn(&handoff_tests.run(b).step);
     return .{ .runs = runs, .benchmark = benchmark };

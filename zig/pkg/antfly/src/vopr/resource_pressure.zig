@@ -21,15 +21,15 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const request_admission = @import("../common/request_admission.zig");
-const resource_manager = @import("../storage/resource_manager.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
+const request_admission = @import("antfly_local_sources").common_request_admission;
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 const vopr_durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const lite_backend = @import("../storage/lite/backend.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const lake = @import("../serverless/query/lake_parquet_rowgroup.zig");
+const lite_backend = @import("antfly_local_sources").storage_lite_backend;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const lake = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
@@ -562,7 +562,7 @@ pub const Scenario = struct {
             resource_manager.Slice.lsm_compaction_work,
             resource_manager.Slice.inference_scratch_working_set,
             resource_manager.Slice.lake_range_cache_queue,
-        }) |slice| options.budgets[@intFromEnum(slice)] = .{ .soft_limit_bytes = 480_000, .hard_limit_bytes = 640_000 };
+        }) |slice| options.budgets[@backingInt(slice)] = .{ .soft_limit_bytes = 480_000, .hard_limit_bytes = 640_000 };
         return options;
     }
 
@@ -577,7 +577,11 @@ pub const Scenario = struct {
         var sim = try vopr.vopr_io.VoprIo.init(.{
             .seed = 0x52e5_50e5,
             .required = .of(&.{ .files, .sockets, .task_scheduling, .synchronization, .clock_read }),
-            .tasks = .{ .stack_size = 8 * 1024 * 1024, .max_tasks = 4 },
+            // Same production-shaped DB-campaign headroom as the other
+            // VoprIo configs that overflowed 8 MiB under Debug codegen
+            // (data/runtime.zig, vopr/db_index_races.zig); only 4 tasks are
+            // ever live here, so the extra headroom is cheap.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024, .max_tasks = 4 },
             .files = .{ .max_open_handles = 8, .capacity_bytes = 1024 * 1024 },
             .network = .{ .max_sockets = 3, .stream_capacity = 128 },
         });

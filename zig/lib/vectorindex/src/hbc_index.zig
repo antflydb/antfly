@@ -122,7 +122,7 @@ fn txnSupportsGetManySorted(comptime Txn: type) bool {
     };
 }
 
-fn getNamespacedManySorted(
+pub fn getNamespacedManySorted(
     self: anytype,
     txn: anytype,
     comptime namespace: store.Namespace,
@@ -246,7 +246,7 @@ fn CachedVectorReadHandle(comptime T: type) type {
             };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             switch (self.*) {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
@@ -269,7 +269,7 @@ fn CachedMetadataReadHandle(comptime T: type) type {
             };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             switch (self.*) {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
@@ -315,7 +315,7 @@ fn borrowSearchCachedNodeHandle(self: anytype, txn: anytype, node_id: u64) !?Cac
     return null;
 }
 
-fn loadSearchNodeFromStorage(self: anytype, txn: anytype, node_id: u64) !types.Node {
+pub fn loadSearchNodeFromStorage(self: anytype, txn: anytype, node_id: u64) !types.Node {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "loadSearchNodeFromStorage")) {
         return try self.loadSearchNodeFromStorage(txn, node_id);
@@ -493,7 +493,7 @@ fn borrowCachedMetadataHandle(self: anytype, txn: anytype, vector_id: u64) ?Cach
     return null;
 }
 
-fn txnUsesImmutableGeneration(self: anytype, txn: anytype) bool {
+pub fn txnUsesImmutableGeneration(self: anytype, txn: anytype) bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "txnUsesImmutableGeneration")) {
         return self.txnUsesImmutableGeneration(txn);
@@ -635,7 +635,7 @@ fn admitAndLoadTreeLeafScan(
     return loadNativeLeafScanForProbe(self, txn, probe);
 }
 
-fn finishCandidateScan(self: anytype, admission: anytype, req: search_types.SearchRequest, profile: *search_types.SearchProfile, now: fn () u64, elapsed: fn (u64) u64) !void {
+pub fn finishCandidateScan(self: anytype, admission: anytype, req: search_types.SearchRequest, profile: *search_types.SearchProfile, now: fn () u64, elapsed: fn (u64) u64) !void {
     if (comptime @hasDecl(childType(@TypeOf(self)), "finishCandidateScan")) {
         const start = now();
         try self.finishCandidateScan(admission, req);
@@ -803,21 +803,21 @@ fn loadQuantizedOwned(
     };
 }
 
-fn recordDeferredQuantizedNode(self: anytype, node_id: u64) !void {
+pub fn recordDeferredQuantizedNode(self: anytype, node_id: u64) !void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "recordDeferredQuantizedNode")) {
         try self.recordDeferredQuantizedNode(node_id);
     }
 }
 
-fn clearDeferredQuantizedNode(self: anytype, node_id: u64) void {
+pub fn clearDeferredQuantizedNode(self: anytype, node_id: u64) void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "clearDeferredQuantizedNode")) {
         self.clearDeferredQuantizedNode(node_id);
     }
 }
 
-fn rebuildDeferredQuantizedNodes(self: anytype, txn: anytype, options: hbc_runtime.BatchInsertOptions) !bool {
+pub fn rebuildDeferredQuantizedNodes(self: anytype, txn: anytype, options: hbc_runtime.BatchInsertOptions) !bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "rebuildDeferredQuantizedNodesWithOptions")) {
         try self.rebuildDeferredQuantizedNodesWithOptions(txn, options);
@@ -1022,7 +1022,7 @@ fn loadAppendedLeafVectorsFromNonQuantizedPayload(
     return true;
 }
 
-fn shouldDeferQuantizedRebuildToBulkFinish(self: anytype, options: hbc_runtime.BatchInsertOptions) bool {
+pub fn shouldDeferQuantizedRebuildToBulkFinish(self: anytype, options: hbc_runtime.BatchInsertOptions) bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldDeferQuantizedRebuildToBulkFinish")) {
         return self.shouldDeferQuantizedRebuildToBulkFinish(options);
@@ -1030,7 +1030,7 @@ fn shouldDeferQuantizedRebuildToBulkFinish(self: anytype, options: hbc_runtime.B
     return false;
 }
 
-fn shouldDeferLeafSplitToBulkFinish(self: anytype, options: anytype) bool {
+pub fn shouldDeferLeafSplitToBulkFinish(self: anytype, options: anytype) bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldDeferLeafSplitToBulkFinish")) {
         return self.shouldDeferLeafSplitToBulkFinish(options);
@@ -1059,14 +1059,14 @@ fn shouldDeferOversizedLeafQuantizedPayload(self: anytype, node: *const types.No
     return false;
 }
 
-fn recordDeferredOversizedLeaf(self: anytype, leaf_id: u64) !void {
+pub fn recordDeferredOversizedLeaf(self: anytype, leaf_id: u64) !void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "recordDeferredOversizedLeaf")) {
         try self.recordDeferredOversizedLeaf(leaf_id);
     }
 }
 
-fn noteMutatedCachedQuantized(self: anytype, node_id: u64) void {
+pub fn noteMutatedCachedQuantized(self: anytype, node_id: u64) void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "noteMutatedCachedQuantized")) {
         self.noteMutatedCachedQuantized(node_id);
@@ -1080,7 +1080,7 @@ fn invalidateCachedQuantizedIfAvailable(self: anytype, node_id: u64) void {
     }
 }
 
-fn addApplyWorkspaceBytes(self: anytype, bytes: u64) void {
+pub fn addApplyWorkspaceBytes(self: anytype, bytes: u64) void {
     const Index = comptime childType(@TypeOf(self));
     if (bytes == 0) return;
     if (comptime @hasDecl(Index, "addApplyWorkspaceBytes")) {
@@ -1088,7 +1088,7 @@ fn addApplyWorkspaceBytes(self: anytype, bytes: u64) void {
     }
 }
 
-fn releaseApplyWorkspaceBytes(self: anytype, bytes: u64) void {
+pub fn releaseApplyWorkspaceBytes(self: anytype, bytes: u64) void {
     const Index = comptime childType(@TypeOf(self));
     if (bytes == 0) return;
     if (comptime @hasDecl(Index, "releaseApplyWorkspaceBytes")) {
@@ -2060,7 +2060,7 @@ test "internal node split range loads child ranges in one sorted batch" {
         second: []const u8,
         calls: usize = 0,
 
-        fn getManySorted(self: *@This(), namespace: anytype, keys: []const []const u8, values: []?[]const u8) !void {
+        pub fn getManySorted(self: *@This(), namespace: anytype, keys: []const []const u8, values: []?[]const u8) !void {
             try std.testing.expectEqual(.nodes, namespace);
             try std.testing.expectEqual(@as(usize, 2), keys.len);
             try std.testing.expect(std.mem.order(u8, keys[0], keys[1]) == .lt);
@@ -2126,7 +2126,7 @@ test "leaf node split range loads member metadata in one sorted batch" {
     const TestTxn = struct {
         calls: usize = 0,
 
-        fn getManySorted(self: *@This(), namespace: anytype, keys: []const []const u8, values: []?[]const u8) !void {
+        pub fn getManySorted(self: *@This(), namespace: anytype, keys: []const []const u8, values: []?[]const u8) !void {
             try std.testing.expectEqual(.vecs, namespace);
             try std.testing.expectEqual(@as(usize, 2), keys.len);
             try std.testing.expect(std.mem.order(u8, keys[0], keys[1]) == .lt);
@@ -2376,7 +2376,7 @@ test "getMetadataManySortedInTxnWithScratch validates scratch capacity" {
     };
 
     const TestTxn = struct {
-        fn getManySorted(_: @This(), _: anytype, _: []const []const u8, _: []?[]const u8) !void {}
+        pub fn getManySorted(_: @This(), _: anytype, _: []const []const u8, _: []?[]const u8) !void {}
     };
 
     var out_metadata: [2]?[]const u8 = .{ null, null };
@@ -2558,7 +2558,7 @@ const CompleteSnapshotAttempt = struct {
     mutation_epoch: u64,
 };
 
-fn publishedMutationEpoch(self: anytype) u64 {
+pub fn publishedMutationEpoch(self: anytype) u64 {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "publishedMutationEpoch")) return self.publishedMutationEpoch();
     return 0;
@@ -2678,8 +2678,8 @@ fn searchProfiledRequestAttempt(
         // A normal early exit without a completed validation is retryable.
         finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
     };
-    errdefer |failure| if (coverage_tracker.claim_held) {
-        failCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, failure);
+    errdefer if (coverage_tracker.claim_held) {
+        failCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, error.CompleteCoverageValidationFailed);
         coverage_tracker.claim_held = false;
     };
     if (!capture_durable_snapshot) {
@@ -3651,7 +3651,7 @@ const CompleteCoverageTracker = struct {
         self.assignment_count = 0;
     }
 
-    fn validate(self: *CompleteCoverageTracker, index: anytype, txn: anytype, scratch: anytype) !void {
+    pub fn validate(self: *CompleteCoverageTracker, index: anytype, txn: anytype, scratch: anytype) !void {
         if (!self.enabled) return;
         if (self.observed_count != self.expected_count) return error.IncompletePublishedSnapshot;
         return self.flushAssignments(index, txn, scratch);
@@ -3993,7 +3993,7 @@ fn CandidateScoreSink(comptime with_projection: bool) type {
 }
 
 pub fn benchmarkFusedNativeCandidates() !void {
-    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    if (builtin.mode != .fast) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const dims = 768;
     const count = 512;
@@ -4002,13 +4002,13 @@ pub fn benchmarkFusedNativeCandidates() !void {
     defer alloc.free(data);
     const projected = try alloc.alloc(f16, dims * count);
     defer alloc.free(projected);
-    var centroid = [_]f32{0.1} ** dims;
+    var centroid = @as([dims]f32, @splat(0.1));
     var query: [dims]f32 = undefined;
     var ids: [count]u64 = undefined;
-    var checksums = [_]u32{0} ** count;
-    var scales = [_]f32{1} ** count;
-    var bounds = [_]f32{0.01} ** count;
-    var norms = [_]f32{0.1} ** count;
+    var checksums = @as([count]u32, @splat(0));
+    var scales = @as([count]f32, @splat(1));
+    var bounds = @as([count]f32, @splat(0.01));
+    var norms = @as([count]f32, @splat(0.1));
     for (&query, 0..) |*value, d| value.* = @as(f32, @floatFromInt(d % 5)) / 9;
     for (0..count) |row| {
         ids[row] = row + 1;
@@ -4062,9 +4062,9 @@ pub fn testFusedNativeCandidateParity() !void {
         var query: [65]f32 = undefined;
         var ids: [count]u64 = undefined;
         var checksums: [count]u32 = undefined;
-        var scales = [_]f32{1} ** count;
-        var bounds = [_]f32{0.01} ** count;
-        var norms = [_]f32{0.1} ** count;
+        var scales = @as([count]f32, @splat(1));
+        var bounds = @as([count]f32, @splat(0.01));
+        var norms = @as([count]f32, @splat(0.1));
         for (0..dims) |d| {
             centroid[d] = @as(f32, @floatFromInt(d % 7)) / 10;
             query[d] = @as(f32, @floatFromInt(d % 5)) / 9;
@@ -4273,7 +4273,7 @@ fn scoreLeafMemberIds(
         var scores: [grouping.max_groups]f64 = undefined;
         try plan.rank(exact_query, &order, &scores);
         var sink: RangeCandidateScoreSink = .{ .base = .{ .results = results, .ids = member_ids } };
-        var selected = [_]bool{false} ** grouping.max_groups;
+        var selected = @as([grouping.max_groups]bool, @splat(false));
         const keep = @max(@as(usize, 1), plan.ends.len * 3 / 4);
         var selected_rows: usize = 0;
         for (order[0..keep]) |group| {
@@ -6026,7 +6026,7 @@ pub fn repairDirtyPostingsTxnWithOptions(
 test "loadVectorIdsSortedWithScratch external fallback keeps per-id vector views disjoint" {
     const TestTxn = struct {};
     const TestIndex = struct {
-        fn hasExternalVectorLoader(_: @This()) bool {
+        pub fn hasExternalVectorLoader(_: @This()) bool {
             return true;
         }
 
@@ -6083,7 +6083,7 @@ test "loadTransformedVectorIdsIntoMatrix uses external transformed matrix loader
             return transformed;
         }
 
-        fn loadExternalVectorsTransformedIntoMatrix(
+        pub fn loadExternalVectorsTransformedIntoMatrix(
             self: @This(),
             _: TestTxn,
             vector_ids: []const u64,
@@ -6137,11 +6137,11 @@ test "loadVectorIdsSortedWithScratch uses external batch scratch loader" {
     const TestIndex = struct {
         calls: *usize,
 
-        fn hasExternalVectorLoader(_: @This()) bool {
+        pub fn hasExternalVectorLoader(_: @This()) bool {
             return true;
         }
 
-        fn getExternalVectorViewsSortedWithScratch(
+        pub fn getExternalVectorViewsSortedWithScratch(
             self: @This(),
             _: TestTxn,
             vector_ids: []const u64,
@@ -6239,7 +6239,7 @@ test "boundary rerank uses explicit rerank boundary below candidate window" {
         .{ .vector_id = 3, .distance = 0.205, .error_bound = 0.02 },
         .{ .vector_id = 4, .distance = 0.50, .error_bound = 0.01 },
     };
-    var flags = [_]bool{false} ** ranked_items.len;
+    var flags = @as([ranked_items.len]bool, @splat(false));
     const selected = selectRerankCandidatesInto(flags[0..], ranked_items[0..], rerankBoundaryK(req), req, .boundary);
     try std.testing.expectEqual(@as(usize, 2), selected.top_k_count);
     try std.testing.expect(!selected.flags[0]);
@@ -6394,7 +6394,7 @@ test "estimate quantized distances rejects stale quantized count" {
 
 test "native quantized read view declines stale payloads" {
     const TestIndex = struct {
-        fn loadNativeQuantizedView(
+        pub fn loadNativeQuantizedView(
             _: *@This(),
             _: void,
             _: u64,
@@ -6485,7 +6485,7 @@ test "kmeans bulk builders pack bounded leaves" {
         max_internal_children: usize = 0,
         nodes: std.AutoHashMapUnmanaged(u64, types.Node) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iterator = self.nodes.valueIterator();
             while (iterator.next()) |node| node.deinit(self.alloc);
             self.nodes.deinit(self.alloc);
@@ -7248,7 +7248,7 @@ fn saveDeletedLeafRows(self: anytype, txn: anytype, leaf: *types.Node, rows: *co
     self.write_profile.delete_preserved_vector_rows += @intCast(leaf.members.len);
 }
 
-fn prepareNativeDeletedRows(self: anytype, txn: anytype, leaf: *const types.Node, deletes: []const u64, options: hbc_runtime.BatchInsertOptions) !bool {
+pub fn prepareNativeDeletedRows(self: anytype, txn: anytype, leaf: *const types.Node, deletes: []const u64, options: hbc_runtime.BatchInsertOptions) !bool {
     if (comptime @hasDecl(childType(@TypeOf(self)), "prepareNativeDeletedRows"))
         return self.prepareNativeDeletedRows(txn, leaf, deletes, options);
     return false;
@@ -8028,7 +8028,7 @@ const RelocationCentroidCache = struct {
     count: usize = 0,
     sum: []f64 = &.{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.sum);
     }
 };
@@ -8374,7 +8374,7 @@ fn tryCoalesceExistingVectorInLeafTxnOptions(
     return true;
 }
 
-fn getPreviousVectorForMutationScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
+pub fn getPreviousVectorForMutationScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "getPreviousVectorForMutationScratch"))
         return self.getPreviousVectorForMutationScratch(txn, vector_id, scratch);

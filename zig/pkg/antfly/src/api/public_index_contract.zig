@@ -569,11 +569,13 @@ fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool
 }
 
 fn graphNodeMappingFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    // Sources identify stored documents; numeric constants are only valid
+    // for targets, which can also identify external entities.
+    if (std.mem.eql(u8, field, "source")) return isString(value);
     if (std.mem.eql(u8, field, "model")) {
         return value == .string and
             (std.mem.eql(u8, value.string, "document") or std.mem.eql(u8, value.string, "external"));
     }
-    if (std.mem.eql(u8, field, "source")) return isString(value);
     return isString(value) or isNumber(value);
 }
 
@@ -706,6 +708,7 @@ pub fn isAllowedGraphNodeMappingField(field: []const u8) bool {
 }
 
 pub fn isAllowedGraphEdgeMappingField(field: []const u8) bool {
+    if (std.mem.eql(u8, field, "edge_id")) return true;
     return std.mem.eql(u8, field, "type") or
         std.mem.eql(u8, field, "weight") or
         std.mem.eql(u8, field, "metadata");

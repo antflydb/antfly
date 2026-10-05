@@ -42,7 +42,7 @@ const Owner = struct {
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         return self;
     }
-    fn deinit(self: *Owner) void {
+    pub fn deinit(self: *Owner) void {
         const backing = self.backing;
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
@@ -183,7 +183,7 @@ test "gliner boundary long relations rebase Unicode before global repeated menti
         .mode = .windowed,
         .max_window_body_words = 4,
         .overlap_words = 1,
-        .inference_fingerprint = [_]u8{9} ** 32,
+        .inference_fingerprint = @as([32]u8, @splat(9)),
     });
     defer document.deinit();
     const windows = try a.alloc(Window, document.windows.len);

@@ -57,7 +57,7 @@ fn pathExists(b: *std.Build, path: []const u8) bool {
 pub const AddTestsOptions = struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     hash_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
 };
@@ -125,20 +125,20 @@ pub fn addBenchmark(b: *std.Build, options: AddBenchmarkOptions) *std.Build.Step
     const lib_image_bench_mod = b.createModule(.{
         .root_source_file = options.root.path(b, "src/image_bench.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     lib_image_bench_mod.addImport("antfly_hash", hash_bench_mod);
     lib_image_bench_mod.addOptions("build_options", lib_image_bench_build_options);
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_bench_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
+        lib_image_bench_mod.addIncludePath(b.graph.cwdRelativePath(spng_paths.include_dir));
     }
     const lib_image_bench = b.addExecutable(.{
         .name = "lib-image-bench",
         .root_module = lib_image_bench_mod,
     });
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_bench.root_module.addLibraryPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_bench.root_module.addRPath(.{ .cwd_relative = spng_paths.lib_dir });
+        lib_image_bench.root_module.addLibraryPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
+        lib_image_bench.root_module.addRPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
         lib_image_bench.root_module.linkSystemLibrary("spng", .{});
         lib_image_bench.root_module.link_libc = true;
     }
@@ -152,7 +152,7 @@ pub const AddConformanceOptions = struct {
     conformance_fetch: bool,
     conformance_fixtures: []const u8,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     hash_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     spng_paths: ?SpngPaths,
@@ -194,15 +194,15 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     lib_image_corpus_mod.addImport("antfly_hash", hash_mod);
     lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_corpus_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
+        lib_image_corpus_mod.addIncludePath(b.graph.cwdRelativePath(spng_paths.include_dir));
     }
     const lib_image_corpus = b.addExecutable(.{
         .name = "lib-image-corpus",
         .root_module = lib_image_corpus_mod,
     });
     if (lib_image_spng_paths) |spng_paths| {
-        lib_image_corpus.root_module.addLibraryPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_corpus.root_module.addRPath(.{ .cwd_relative = spng_paths.lib_dir });
+        lib_image_corpus.root_module.addLibraryPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
+        lib_image_corpus.root_module.addRPath(b.graph.cwdRelativePath(spng_paths.lib_dir));
         lib_image_corpus.root_module.linkSystemLibrary("spng", .{});
         lib_image_corpus.root_module.link_libc = true;
     }
@@ -227,7 +227,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     const image_jpeg_seed_corpora_e2e = b.addExecutable(.{
         .name = "image-jpeg-seed-corpora-e2e",
         .root_module = b.createModule(.{
-            .root_source_file = options.root.path(b, "src/image_jpeg_seed_corpora_e2e.zig"),
+            .root_source_file = options.root.path(b, "src/image_jpeg_seed_corpora_runner.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -269,7 +269,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) AddConforma
     };
 }
 
-pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, hash: *std.Build.Module) *std.Build.Module {
+pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, hash: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = root.path(b, "src/mod.zig"),
         .target = target,

@@ -19,7 +19,7 @@ const Allocator = std.mem.Allocator;
 
 const lane_count = 16;
 const Vec = @Vector(lane_count, u8);
-const Mask = std.meta.Int(.unsigned, lane_count);
+const Mask = @Int(.unsigned, lane_count);
 
 pub const StructuralIndex = struct {
     /// Offsets of structural punctuation outside strings: `{ } [ ] : ,`.

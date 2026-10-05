@@ -1,23 +1,23 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
-const selectTestFilters = @import("test_support.zig").selectTestFilters;
-const compileFiltersWithAnchors = @import("test_support.zig").compileFiltersWithAnchors;
-const addFilteredTestRunArtifactWithRuntimeFilters = @import("test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
-const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
+const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
+const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
+const addFilteredTestRunArtifactWithRuntimeFilters = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters;
+const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 
 pub const AddTestsOptions = struct {
     target: std.Build.ResolvedTarget,
@@ -62,15 +62,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "raft batch round trips merge replay identity with checkpoint",
         "raft batch round trips merge source transition",
         "raft batch round trips merge artifacts",
-        "db replicated merge artifacts",
+        // Ordered merge/split DB regressions run in the server storage gate.
         "db replicated merge checkpoints persist phase range and watermark across reopen",
-        "db replicated merge checkpoints keep rolled back receivers live across delayed controls and reopen",
-        "db terminal merge controls preserve a subsequent split across reopen",
-        "db physical lsm split retains parent merge receipts and clears child receipts across reopen",
         "lsm backend physical split preserves L0 overwrite and tombstone order",
-        "db merge receiver fences stale copies and retains retired transitions across reopen",
-        "db merge copy attempts fence delayed leaders before finalize across reopen",
         "data runtime health metrics include replay debt and provisioned warmup counters",
+        "data runtime kernel resource metrics",
         "data runtime status refresh publishes synthetic missing status for absent local group db",
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
@@ -127,7 +123,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft document apply identity prevents non-idempotent restart replay",
         "data raft replica retirement removes only retired group apply state",
         "data raft apply records transaction conflicts without stopping replica progress",
-        "db raced replicated transaction completion persists receipt and participant acknowledgement",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
         "data runtime startup catch-up clears dirty bit for terminal degraded index load",
@@ -186,8 +181,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
         "local raft admission leaves global metadata refresh to control",
+        "restore publication recovers a cold owner through Raft admission",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
+        "raft batch round trips guarded graph owner replay afterimages",
         "raft batch round trips deterministic transaction begin",
         "raft batch round trips deterministic storage owner descriptor",
         "raft batch round trips binary initial owner range",
@@ -256,7 +253,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = data_runtime_test_mod,
         .filters = selectTestFilters(b, &lib_data_runtime_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
         // The broad macOS ReleaseFast runtime root has measured at 12.12 GiB.
@@ -268,7 +265,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "data-runtime-implementation-tests",
         .root_module = options.data_implementation_module,
         .filters = lib_data_runtime_tests.object.filters,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
         .max_rss = lib_data_runtime_tests.object.step.max_rss,
     });
     const run_lib_data_runtime_tests = @import("linked_tests.zig").runPair(b, lib_data_runtime_tests, implementation_tests);
@@ -278,7 +275,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "data-private-initial-owner-predicate-tests",
         .root_module = options.data_implementation_module,
         .filters = &.{"ordinary unpublished placement does not require a private initial FK owner snapshot"},
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-data-private-initial-owner-predicate-test", "Verify hidden initial-FK owner preflight excludes ordinary unpublished placements")
         .dependOn(&addFilteredTestRunArtifact(b, private_initial_owner_predicate_tests).step);
@@ -414,7 +411,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             lib_data_storage_runtime_filters,
         ),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });

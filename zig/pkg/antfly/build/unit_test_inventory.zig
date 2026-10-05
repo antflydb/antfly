@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 
@@ -20,7 +20,7 @@ const std = @import("std");
 /// compile filters, suite filters and runtime exclusions all affect ownership.
 pub fn add(b: *std.Build, aggregate: *std.Build.Step, baseline: ?*std.Build.Step, other_roots: []const *std.Build.Step) void {
     const audit = b.addSystemCommand(&.{"python3"});
-    audit.addFileArg(b.path("tools/audit_unit_test_ownership.py"));
+    audit.addFileArg2(b.path("tools/audit_unit_test_ownership.py"), .{ .make_absolute = true });
     const ownership_tests = b.addTest(.{
         .name = "unit-test-ownership-rule-tests",
         .root_module = b.createModule(.{
@@ -42,7 +42,7 @@ pub fn add(b: *std.Build, aggregate: *std.Build.Step, baseline: ?*std.Build.Step
         for (other_roots) |root| collect(b, root, audit, &visited, &count, "--baseline-inventory");
     }
     audit.addArg("--report");
-    const report = audit.addOutputFileArg("unit-test-inventory.json");
+    const report = audit.addOutputFileArg2("unit-test-inventory.json", .{ .make_absolute = true });
     const step = b.step("unit-test-inventory", "Audit unique ownership across all four CI unit gates");
     step.dependOn(&b.addInstallFile(report, "unit-test-inventory.json").step);
 }
@@ -56,7 +56,7 @@ pub fn testObject(artifact: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     return null;
 }
 
-fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, visited: *std.AutoHashMap(*std.Build.Step, void), count: *usize, inventory_arg: []const u8) void {
+pub fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, visited: *std.AutoHashMap(*std.Build.Step, void), count: *usize, inventory_arg: []const u8) void {
     if ((visited.getOrPut(step) catch @panic("OOM")).found_existing) return;
     if (step.cast(std.Build.Step.Run)) |run| blk: {
         for (run.argv.items) |arg| {
@@ -79,23 +79,25 @@ fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, vis
             const protocol_runner = object.test_runner == null or object.test_runner.?.mode != .simple;
             if (protocol_runner or inference_runner) {
                 list.addArg("python3");
-                list.addFileArg(b.path("tools/audit_unit_test_ownership.py"));
+                list.addFileArg2(b.path("tools/audit_unit_test_ownership.py"), .{ .make_absolute = true });
                 list.addArg(if (protocol_runner) "--protocol-executable" else "--inference-executable");
-                list.addArtifactArg(arg.artifact.artifact);
+                list.addArtifactArg2(arg.artifact.artifact, .{ .make_absolute = true });
                 if (inference_runner) {
                     list.addArg("--");
                     for (run.argv.items[1..]) |value| {
+                        if (value == .passthru) continue;
                         if (value != .bytes) @panic("unexpected inference test argument");
                         list.addArg(value.bytes);
                     }
                 }
             } else {
-                if (!std.mem.endsWith(u8, runner_path, "antfly/src/test_runner.zig")) @panic("unit inventory needs an adapter for this test runner");
+                if (!std.mem.endsWith(u8, runner_path, "antfly-embedded/src/local/test_runner.zig")) @panic("unit inventory needs an adapter for this test runner");
                 // Preserve actual filters on simple runners and linked executables.
                 for (run.argv.items) |value| switch (value) {
                     .bytes => |bytes| list.addArg(bytes),
                     .artifact => |a| list.addPrefixedArtifactArg(a.prefix, a.artifact),
                     .lazy_path => |p| list.addPrefixedFileArg(p.prefix, p.lazy_path),
+                    .passthru => {},
                     else => @panic("unexpected unit test inventory argument"),
                 };
                 if (run.producer == null) {
@@ -110,7 +112,7 @@ fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, vis
             list.cwd = run.cwd;
             const selection = @import("unit_test_ownership.zig").selection(run, object);
             audit.addArgs(&.{ inventory_arg, b.fmt("{s} [{s}] #{d}", .{ path, selection, count.* }) });
-            audit.addFileArg(list.captureStdErr(.{}));
+            audit.addFileArg2(list.captureStdErr(.{}), .{ .make_absolute = true });
             count.* += 1;
             break;
         }

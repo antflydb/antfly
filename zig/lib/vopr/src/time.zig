@@ -32,7 +32,7 @@ pub const MonotonicDomain = enum {
     lease,
 };
 
-const domain_count = @typeInfo(MonotonicDomain).@"enum".fields.len;
+const domain_count = @typeInfo(MonotonicDomain).@"enum".field_names.len;
 
 const Node = struct {
     id: NodeId,
@@ -177,7 +177,7 @@ pub const Model = struct {
     pub fn advanceDomain(self: *Model, node_id: NodeId, domain: MonotonicDomain, delta_ns: u64) !void {
         if (delta_ns > std.math.maxInt(i64)) return error.MonotonicDomainAdjustmentOverflow;
         const node = try self.nodeMut(node_id);
-        const slot = &node.monotonic_adjustment_ns[@intFromEnum(domain)];
+        const slot = &node.monotonic_adjustment_ns[@backingInt(domain)];
         slot.* = std.math.add(i64, slot.*, @intCast(delta_ns)) catch
             return error.MonotonicDomainAdjustmentOverflow;
     }
@@ -192,7 +192,7 @@ pub const Model = struct {
         const node = try self.nodeById(node_id);
         const effective_global = node.paused_at_global_ns orelse self.global_monotonic_ns;
         const base = effective_global -| node.paused_accumulated_ns;
-        const adjustment = node.monotonic_adjustment_ns[@intFromEnum(domain)];
+        const adjustment = node.monotonic_adjustment_ns[@backingInt(domain)];
         if (adjustment < 0) return error.InvalidMonotonicDomainAdjustment;
         return std.math.add(u64, base, @intCast(adjustment)) catch error.MonotonicTimeOverflow;
     }

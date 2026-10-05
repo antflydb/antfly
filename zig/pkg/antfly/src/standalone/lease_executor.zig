@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const common = @import("../common/http/http_common.zig");
+const common = @import("antfly_local_sources").common_http_http_common;
 
 pub const LeaseExecutor = struct {
     alloc: std.mem.Allocator,

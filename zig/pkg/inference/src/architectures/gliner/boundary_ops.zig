@@ -31,7 +31,7 @@ pub const ContentShape = struct {
     lengths: []const usize,
     control: ?Control = null,
 
-    fn validate(self: ContentShape) !void {
+    pub fn validate(self: ContentShape) !void {
         if (self.batch == 0 or self.dim == 0 or self.lengths.len != self.batch) return error.InvalidInputShape;
         for (self.lengths) |length| if (length > self.words) return error.InvalidInputShape;
         if (self.control) |control| try control.check();
@@ -532,7 +532,7 @@ pub fn bandedAttentionBackward(shape: AttentionShape, q: []const f32, k: []const
 
 test "gliner boundary banded attention uses local context and masks ragged rows" {
     const shape = AttentionShape{ .batch = 2, .positions = 4, .heads = 1, .head_dim = 1, .window = 1, .lengths = &.{ 4, 2 } };
-    const q = [_]f32{0} ** 8;
+    const q = @as([8]f32, @splat(0));
     const values = [_]f32{ 1, 2, 6, 8, 10, 20, std.math.nan(f32), std.math.nan(f32) };
     var out: [8]f32 = undefined;
     try bandedAttention(shape, &q, &q, &values, &out);
@@ -571,7 +571,7 @@ test "gliner boundary banded attention backward matches finite differences" {
 }
 
 fn poolAllocationProbe(allocator: std.mem.Allocator) !void {
-    const zeros = [_]f32{0} ** 8;
+    const zeros = @as([8]f32, @splat(0));
     var pool = try buildSharedPool(allocator, .{
         .batch = 1,
         .boundaries = 4,
@@ -602,7 +602,7 @@ test "gliner boundary shared pool stable ties deduplicate quotas and unwind ever
 }
 
 test "gliner boundary shared pool masks padding and inactive queries per sample" {
-    const zeros = [_]f32{0} ** 12;
+    const zeros = @as([12]f32, @splat(0));
     var pool = try buildSharedPool(std.testing.allocator, .{
         .batch = 2,
         .boundaries = 3,

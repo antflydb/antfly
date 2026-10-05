@@ -16,7 +16,7 @@
 //! Raw, hand-written FFI declarations for `libantfly`, the embedded Antfly
 //! C ABI.
 //!
-//! This mirrors `zig/pkg/antfly/include/antfly.h` field-for-field and
+//! This mirrors `zig/pkg/antfly-embedded/include/antfly.h` field-for-field and
 //! function-for-function. There is no `bindgen`/`libclang` dependency: the
 //! header is small and stable enough that a hand-written mirror is easier to
 //! audit and does not require a C toolchain to build this crate.

@@ -94,7 +94,7 @@ fn routedOracle(comptime resident: bool) !void {
     const name = try graph.internString("__encoder_route_leaf");
     const leaf = graph.nodeMut(built.nodes.encoder);
     leaf.op = .{ .parameter = .{ .name_offset = name.offset, .name_len = name.len } };
-    leaf.inputs = .{ml.null_node} ** 4;
+    leaf.inputs = @splat(ml.null_node);
     leaf.num_inputs = 0;
     leaf.vjp_alternate = ml.null_node;
     try graph.parameters.append(a, built.nodes.encoder);
@@ -133,10 +133,10 @@ fn routedOracle(comptime resident: bool) !void {
     var states: [96]f32 = undefined;
     for (&states, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index + 1)) * 0.01;
     try putF32(a, &cb, &runtime, &graph, built.nodes.encoder, &states);
-    const identity = training.StepIdentity{ .binding = .{0x13} ** 32, .optimizer_step = 1, .microbatch = 2 };
+    const identity = training.StepIdentity{ .binding = @splat(0x13), .optimizer_step = 1, .microbatch = 2 };
     var tape = try session.forward(&cb, runtime.items, identity, null);
     defer tape.deinit();
-    var gradients: [96]f32 = .{0} ** 96;
+    var gradients: [96]f32 = @splat(0);
     var cotangents: [5]ops.CT = undefined;
     var expected_outputs: [5][]const f32 = undefined;
     var allocated: usize = 0;
@@ -177,7 +177,7 @@ fn routedOracle(comptime resident: bool) !void {
         cotangents[family] = try cb.fromFloat32Shape(cotangent, try dims(shape, &buffer));
         allocated += 1;
     }
-    const decisions = [_]u8{0x27} ** 32;
+    const decisions = @as([32]u8, @splat(0x27));
     try tape.sealDecisions(decisions);
     var backward = try tape.backward(identity, decisions, loss, &cotangents, null);
     defer backward.deinit(&cb);

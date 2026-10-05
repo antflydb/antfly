@@ -176,7 +176,7 @@ const Bitmap = struct {
         return result;
     }
 
-    fn deinit(self: *Bitmap, alloc: Allocator) void {
+    pub fn deinit(self: *Bitmap, alloc: Allocator) void {
         alloc.free(self.data);
         self.* = undefined;
     }
@@ -314,7 +314,7 @@ const ArithmeticDecoder = struct {
         return self;
     }
 
-    fn read(self: *ArithmeticDecoder) !u8 {
+    pub fn read(self: *ArithmeticDecoder) !u8 {
         if (self.pos >= self.bytes.len) return error.TruncatedJbig2Stream;
         defer self.pos += 1;
         return self.bytes[self.pos];
@@ -636,7 +636,7 @@ const IntContexts = struct {
         }
         return .{ .dt = all[0], .fs = all[1], .ds = all[2], .it = all[3], .ri = all[4], .rdw = all[5], .rdh = all[6], .rdx = all[7], .rdy = all[8] };
     }
-    fn deinit(self: *IntContexts, alloc: Allocator) void {
+    pub fn deinit(self: *IntContexts, alloc: Allocator) void {
         inline for (.{ self.dt, self.fs, self.ds, self.it, self.ri, self.rdw, self.rdh, self.rdx, self.rdy }) |item| alloc.free(item);
         self.* = undefined;
     }
@@ -755,7 +755,7 @@ fn decodeTextRegion(alloc: Allocator, work: *DecodeWorkBudget, arith: *Arithmeti
 
 const Dictionary = struct {
     symbols: []Bitmap,
-    fn deinit(self: *Dictionary, alloc: Allocator) void {
+    pub fn deinit(self: *Dictionary, alloc: Allocator) void {
         for (self.symbols) |*symbol| symbol.deinit(alloc);
         alloc.free(self.symbols);
         self.* = undefined;
@@ -790,7 +790,7 @@ const Decoder = struct {
     page_allows_op_override: bool = false,
     expected_dimensions: ?ExpectedDimensions = null,
 
-    fn deinit(self: *Decoder) void {
+    pub fn deinit(self: *Decoder) void {
         for (self.segments.items) |*segment| if (segment.dictionary) |*dict| dict.deinit(self.alloc);
         self.segments.deinit(self.alloc);
         if (self.page) |*page| page.deinit(self.alloc);
@@ -1213,7 +1213,7 @@ test "arithmetic decoder matches Annex E context transitions" {
     // MPS and LPS exchange paths without relying on a PDF container.
     const encoded = [_]u8{ 0x84, 0xc7, 0x3b, 0xfc, 0xe1, 0xa1, 0x43, 0x04, 0x02, 0x20, 0x00, 0x00 };
     var decoder = try ArithmeticDecoder.init(&encoded);
-    var contexts = [_]u8{0} ** 2;
+    var contexts = @as([2]u8, @splat(0));
     var bits: u16 = 0;
     for (0..16) |_| bits = (bits << 1) | try decoder.decode(&contexts, 0);
     try std.testing.expectEqual(@as(u16, 2), bits);

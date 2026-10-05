@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const platform = @import("antfly_platform");
-const resource_manager = @import("resource_manager.zig");
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
 
 pub const supported = platform.filesystem.capacity_supported;
 

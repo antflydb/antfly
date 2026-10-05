@@ -13,9 +13,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const inverted = @import("section/inverted.zig");
-pub const scorer = @import("search/scorer.zig");
-pub const analysis = @import("search/analysis.zig");
-pub const roaring = @import("encoding/roaring.zig");
+pub const inverted = @import("antfly_local_sources").section_inverted;
+pub const scorer = @import("antfly_local_sources").search_scorer;
+pub const analysis = @import("antfly_local_sources").search_analysis;
+pub const roaring = @import("antfly_local_sources").encoding_roaring;
 pub const platform_time = @import("antfly_platform").time;
 pub const fst = @import("antfly_fst");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

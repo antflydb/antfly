@@ -69,7 +69,7 @@ const PendingRead = struct {
     read_context: ReadContext,
     acks: []bool,
 
-    fn deinit(self: *PendingRead, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PendingRead, alloc: std.mem.Allocator) void {
         if (self.context.len > 0) alloc.free(self.context);
         if (self.acks.len > 0) alloc.free(self.acks);
         self.* = undefined;

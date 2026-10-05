@@ -33,7 +33,9 @@ from license_headers import apply_header, group_for, read_header
 
 ROOT = Path(__file__).resolve().parent.parent
 POLICY_PATH = ROOT / "specs/graph_identifier_policy.json"
-ZIG_PATH = ROOT / "zig/pkg/antfly/src/graph/identifier_policy_generated.zig"
+ZIG_PATH = (
+    ROOT / "zig/pkg/antfly-embedded/src/local/graph/identifier_policy_generated.zig"
+)
 GO_PATH = ROOT / "go/pkg/sdk/graph_identifier_policy_generated.go"
 PYTHON_PATH = ROOT / "py/packages/sdk/src/antfly/graph_identifier_policy_generated.py"
 TYPESCRIPT_PATH = ROOT / "ts/packages/sdk/src/graph-identifier-policy.generated.ts"

@@ -74,7 +74,7 @@ The duplicate-copy switch exists only as a test-build benchmark control.
 
 ```sh
 cd zig
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'owned batch retention benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'owned batch retention benchmark'
 ```
 
 Local arm64 ReleaseFast metadata-only benchmark, median of seven 100-lookup
@@ -87,7 +87,7 @@ contention are excluded; these are not end-to-end query throughput numbers.
 ```sh
 cd zig
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'current writer directory'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'current writer directory point scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'current writer directory point scaling benchmark'
 ```
 
 ## Bounded memtable retirement
@@ -126,7 +126,7 @@ maintenance, owned scans, and close/abandon with partially reclaimed trees.
 
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'memtable reclamation'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'memtable reclamation last-reference latency benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'memtable reclamation last-reference latency benchmark'
 ```
 
 ## Read-side ownership across storage and runtime boundaries
@@ -177,7 +177,7 @@ counter creation/transitions with pinned reads on both backends.
 
 ```sh
 python3 tools/run_bounded_zig_build.py build runtime-scan-sink-test
-python3 tools/run_bounded_zig_build.py build antfly-storage-test -Doptimize=ReleaseFast -- 'derived coverage snapshot'
+python3 tools/run_bounded_zig_build.py build antfly-storage-test -Doptimize=fast -- 'derived coverage snapshot'
 python3 tools/run_bounded_zig_build.py build sparse-test
 ```
 
@@ -226,7 +226,7 @@ the delete hook checks that the backend mutex is available during physical I/O.
 
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'output cleanup'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'output cleanup off-lock handoff scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'output cleanup off-lock handoff scaling benchmark'
 ```
 
 ### Journal snapshot ownership and bounded reclamation
@@ -277,7 +277,7 @@ and single-charge resource accounting.
 
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'ledger reclamation' --test-filter 'output cleanup'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'ledger reclamation checkpoint churn benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'ledger reclamation checkpoint churn benchmark'
 ```
 
 ### Time-sliced compaction publication
@@ -328,7 +328,7 @@ separately cover rebase, retention, failure cleanup and resource-credit release.
 
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'compaction publication stages' --test-filter 'obsolete ledger' --test-filter 'obsolete run cleanup fault'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction publication atomic fence scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'compaction publication atomic fence scaling benchmark'
 ```
 
 ### Logical-generation scheduling
@@ -423,7 +423,7 @@ accounting after all directory roots have been destroyed.
 
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'compaction parked jobs' --test-filter 'directory accounting token'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'directory accounting pin retention scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'directory accounting pin retention scaling benchmark'
 ```
 
 Tombstone metadata distinguishes known zero, known nonzero and unknown. Mainline
@@ -460,10 +460,10 @@ close, corrupt blocks and publication-headroom retries. Reproduce from `zig/`:
 
 ```sh
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'bulk publication' --test-filter 'unknown tombstone' --test-filter 'tiers committed runs' --test-filter 'snapshot clone has'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication no-op scheduling scaling benchmark'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk publication large generation discovery'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'maintenance score aggregate' --test-filter 'bulk continuation' --test-filter 'unknown tombstone'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'bulk admission' --test-filter 'foreground deferred GC' --test-filter 'async batch reads tree'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'bulk publication no-op scheduling scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'bulk publication large generation discovery'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'maintenance score aggregate' --test-filter 'bulk continuation' --test-filter 'unknown tombstone'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'bulk admission' --test-filter 'foreground deferred GC' --test-filter 'async batch reads tree'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'prepared compaction rejects'
 ```
 
@@ -555,7 +555,7 @@ input size. Cooperative budgets are not hard real-time bounds.
 
 ```sh
 cd zig
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction admitted pinned' --test-filter 'compaction scheduler prepared membership'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'compaction admitted pinned' --test-filter 'compaction scheduler prepared membership'
 python3 tools/run_bounded_zig_build.py build lsm-backend-test -- --test-filter 'compaction admission' --test-filter 'compaction suspended broad'
 ```
 
@@ -695,7 +695,7 @@ and its oversized-component-to-progress handoff.
 Reproduce from `zig/`:
 
 ```sh
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'closure frontier' --test-filter 'GC phase' --test-filter 'persistent directory and lazy cursor scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'closure frontier' --test-filter 'GC phase' --test-filter 'persistent directory and lazy cursor scaling benchmark'
 ```
 
 ### Policy-bound continuation admission
@@ -754,7 +754,7 @@ validation completed in 91.7 ms; that timing is a single sample, not an
 end-to-end ingestion result. Reproduce from `zig/` with:
 
 ```sh
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction phase handoff'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'compaction phase handoff'
 ```
 
 The ReleaseFast admission regression held two 5,001-input discoveries under a
@@ -767,7 +767,7 @@ would request about 49 MiB for two lanes at 100,000 runs. These are metadata-onl
 measurements, not SST I/O or end-to-end throughput results. Reproduce with:
 
 ```sh
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction scratch admission' --test-filter 'compaction discovery receives'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'compaction scratch admission' --test-filter 'compaction discovery receives'
 ```
 
 Before acquiring an execution grant, admission checks the current caller's
@@ -787,7 +787,7 @@ during those requests. This measures metadata admission, not SST I/O or an
 end-to-end ingestion speedup. Reproduce from `zig/` with:
 
 ```sh
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'compaction policy'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'compaction policy'
 ```
 
 ## Manifest journal
@@ -959,12 +959,12 @@ than exposing partial metadata. The buffered codec remains an export/oracle path
 Reproduce from `zig/` with:
 
 ```sh
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'writer owner narrow publication scaling benchmark' --test-filter 'dependency certificate delta scaling benchmark'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'lsm incremental manifest publication benchmark' --test-filter 'lsm persistent directory and lazy cursor scaling benchmark'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'obsolete ledger' --test-filter 'native durability lane contention benchmark'
-python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=ReleaseFast -- --test-filter 'lsm overlap scoring aggregate scaling benchmark' --test-filter 'lsm dependency continuation slice scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'writer owner narrow publication scaling benchmark' --test-filter 'dependency certificate delta scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'lsm incremental manifest publication benchmark' --test-filter 'lsm persistent directory and lazy cursor scaling benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'obsolete ledger' --test-filter 'native durability lane contention benchmark'
+python3 tools/run_bounded_zig_build.py build lsm-backend-test -Doptimize=fast -- --test-filter 'lsm overlap scoring aggregate scaling benchmark' --test-filter 'lsm dependency continuation slice scaling benchmark'
 python3 tools/run_bounded_zig_build.py build unit-storage-test-audit
-python3 tools/run_bounded_zig_build.py build lib-lsm-backend-sim-test -Doptimize=ReleaseSafe
+python3 tools/run_bounded_zig_build.py build lib-lsm-backend-sim-test -Doptimize=safe
 ```
 
 Each filter covers a specific invariant:
@@ -974,4 +974,4 @@ Each filter covers a specific invariant:
 - `obsolete ledger` / `native durability lane contention benchmark`: obsolete-path GC bookkeeping stays cheap relative to a full comparison walk, and moving fsync to the publication lane preserves correct overlapping publication under concurrent writers/readers without native contention regressions.
 - `lsm overlap scoring aggregate scaling benchmark` / `lsm dependency continuation slice scaling benchmark`: aggregate overlap scoring avoids the old repeated rank-lookup cost at scale, and deadline-sliced dependency-continuation maintenance keeps each turn bounded while still completing validation, destruction, and installation.
 - `unit-storage-test-audit`: storage test discovery stays complete (no silently-skipped test files).
-- `lib-lsm-backend-sim-test -Doptimize=ReleaseSafe`: the broad simulation suite (GC, ownership, headroom, manifest, schema, relational, and backup coverage) stays green under ReleaseSafe.
+- `lib-lsm-backend-sim-test -Doptimize=safe`: the broad simulation suite (GC, ownership, headroom, manifest, schema, relational, and backup coverage) stays green under ReleaseSafe.

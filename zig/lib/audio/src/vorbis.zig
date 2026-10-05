@@ -82,11 +82,11 @@ const vorbis_codebook_lookup_size = 1 << vorbis_codebook_lookup_bits;
 pub const Floor = struct {
     kind: u16,
     partition_count: u8 = 0,
-    classes: [32]u8 = [_]u8{0} ** 32,
-    class_dimensions: [16]u8 = [_]u8{0} ** 16,
-    class_subclasses: [16]u8 = [_]u8{0} ** 16,
-    class_masterbooks: [16]?u8 = [_]?u8{null} ** 16,
-    subclass_books: [16][8]?u8 = [_][8]?u8{[_]?u8{null} ** 8} ** 16,
+    classes: [32]u8 = @as([32]u8, @splat(0)),
+    class_dimensions: [16]u8 = @as([16]u8, @splat(0)),
+    class_subclasses: [16]u8 = @as([16]u8, @splat(0)),
+    class_masterbooks: [16]?u8 = @as([16]?u8, @splat(null)),
+    subclass_books: [16][8]?u8 = @as([16][8]?u8, @splat(@as([8]?u8, @splat(null)))),
     multiplier: u8 = 0,
     rangebits: u8 = 0,
     x_list: []u32 = &.{},
@@ -97,7 +97,7 @@ pub const Floor = struct {
     floor0_amp_bits: u8 = 0,
     floor0_amp_db: u8 = 0,
     floor0_book_count: u8 = 0,
-    floor0_books: [16]u8 = [_]u8{0} ** 16,
+    floor0_books: [16]u8 = @as([16]u8, @splat(0)),
 
     pub fn deinit(self: *const Floor, allocator: std.mem.Allocator) void {
         if (self.x_list.len != 0) allocator.free(self.x_list);
@@ -112,8 +112,8 @@ pub const Residue = struct {
     partition_size: u32,
     classifications: u8,
     classbook: u8,
-    cascades: [64]u8 = [_]u8{0} ** 64,
-    books: [64][8]?u8 = [_][8]?u8{[_]?u8{null} ** 8} ** 64,
+    cascades: [64]u8 = @as([64]u8, @splat(0)),
+    books: [64][8]?u8 = @as([64][8]?u8, @splat(@as([8]?u8, @splat(null)))),
 };
 
 pub const Mapping = struct {
@@ -220,7 +220,7 @@ const DecodedFloor = struct {
     allocator: std.mem.Allocator,
     owns_buffers: bool = true,
 
-    fn deinit(self: *DecodedFloor) void {
+    pub fn deinit(self: *DecodedFloor) void {
         if (!self.owns_buffers) return;
         if (self.final_y.len != 0) self.allocator.free(self.final_y);
         if (self.step2_flags.len != 0) self.allocator.free(self.step2_flags);
@@ -253,7 +253,7 @@ const VorbisDecodeScratch = struct {
     floor_lsp_coefficients: []f32 = &.{},
     imdct_work: []fast_imdct.Complex = &.{},
 
-    fn deinit(self: *VorbisDecodeScratch) void {
+    pub fn deinit(self: *VorbisDecodeScratch) void {
         self.allocator.free(self.floor_decodes);
         self.allocator.free(self.no_residue);
         self.allocator.free(self.spectra);
@@ -370,9 +370,9 @@ const SharedVorbisWindow = struct {
 };
 
 var shared_vorbis_plan_lock: std.atomic.Mutex = .unlocked;
-var shared_vorbis_plans: [8]SharedVorbisImdctPlan = [_]SharedVorbisImdctPlan{.{}} ** 8;
+var shared_vorbis_plans: [8]SharedVorbisImdctPlan = @as([8]SharedVorbisImdctPlan, @splat(.{}));
 var shared_vorbis_window_lock: std.atomic.Mutex = .unlocked;
-var shared_vorbis_windows: [16]SharedVorbisWindow = [_]SharedVorbisWindow{.{}} ** 16;
+var shared_vorbis_windows: [16]SharedVorbisWindow = @as([16]SharedVorbisWindow, @splat(.{}));
 
 fn sharedVorbisImdctPlan(blocksize: u16) !*const ImdctPlan {
     while (!shared_vorbis_plan_lock.tryLock()) std.atomic.spinLoopHint();
@@ -2609,7 +2609,7 @@ fn buildCanonicalCodewords(codeword_lengths: []const u8, codewords: []u32) !u8 {
     // already assigned one. This is not the same as the DEFLATE canonical
     // assignment, which sorts by length first. `available[k]` holds the
     // next free codeword of length k, left-aligned in 32 bits; 0 means none.
-    var available = [_]u32{0} ** 33;
+    var available = @as([33]u32, @splat(0));
     var max_len: u8 = 0;
     var first = true;
     for (codeword_lengths, 0..) |length, i| {
@@ -2988,7 +2988,7 @@ test "fused vorbis timeline window overlap matches separate pass" {
         );
     }
 
-    var separate_timeline = [_]f32{0} ** (total_frames * channels);
+    var separate_timeline = @as([(total_frames * channels)]f32, @splat(0));
     const start_frame_signed: isize =
         @as(isize, @intCast(packet_center)) - @as(isize, @intCast(blocksize / 2));
     for (0..channels) |channel| {
@@ -3002,7 +3002,7 @@ test "fused vorbis timeline window overlap matches separate pass" {
         }
     }
 
-    var fused_timeline = [_]f32{0} ** (total_frames * channels);
+    var fused_timeline = @as([(total_frames * channels)]f32, @splat(0));
     try addPacketBlockToTimelineWithWindow(
         &fused_timeline,
         total_frames,

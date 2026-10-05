@@ -28,7 +28,7 @@
 //! based, but must use conditional ref publication and immutable puts.
 
 const std = @import("std");
-const bundle = @import("backup_bundle.zig");
+const bundle = @import("antfly_local_sources").storage_backup_bundle;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;

@@ -19,7 +19,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const maintenance = @import("maintenance.zig");
+const maintenance = @import("antfly_local_sources").storage_maintenance;
 const system_store_client = @import("kernel_system_store_client.zig");
 
 pub const LocalTransitionAction = abi.LocalTransitionAction;
@@ -27,6 +27,8 @@ pub const LocalTransitionPhase = abi.LocalTransitionPhase;
 pub const LocalTransitionResultKind = abi.LocalTransitionResultKind;
 pub const LocalTransitionRequest = abi.LocalTransitionRequest;
 pub const LocalTransitionResult = abi.LocalTransitionResult;
+pub const ContextResourceBudgetStats = abi.ContextResourceBudgetStats;
+pub const ContextMetricsResult = abi.ContextMetricsResult;
 pub const AggregationHit = abi.AggregationHit;
 pub const AggregationRequest = abi.AggregationRequest;
 pub const singleNamespaceStore = system_store_client.singleNamespaceStore;
@@ -103,7 +105,7 @@ pub const Context = struct {
         self: *Context,
         allocator: std.mem.Allocator,
         namespace: []const u8,
-    ) !@import("backend_erased.zig").Store {
+    ) !@import("antfly_local_sources").storage_backend_erased.Store {
         try self.ensure();
         return try system_store_client.open(allocator, self.handle, namespace);
     }
@@ -570,7 +572,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_wait_for_sync(
             self.handle,
             &.{
-                .sync_level = @intFromEnum(sync_level),
+                .sync_level = @backingInt(sync_level),
                 .table_name = .fromSlice(table_name),
                 .cancellation_ctx = @ptrCast(@constCast(&cancellation)),
                 .cancellation_fn = Callback.cancelled,
@@ -610,7 +612,7 @@ pub const Owner = struct {
         backup_id: []const u8,
         format: abi.BackupFormat,
     ) !Response {
-        return self.backupWithControl(.{ .format = @intFromEnum(format), .table_name = .fromSlice(table_name), .backup_root = .fromSlice(backup_root), .backup_id = .fromSlice(backup_id) });
+        return self.backupWithControl(.{ .format = @backingInt(format), .table_name = .fromSlice(table_name), .backup_root = .fromSlice(backup_root), .backup_id = .fromSlice(backup_id) });
     }
 
     pub fn backupWithControl(self: *Owner, request: abi.BackupRequest) !Response {
@@ -711,13 +713,13 @@ pub const Owner = struct {
         return response;
     }
 
-    pub fn scanStream(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink) !void {
+    pub fn scanStream(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink) !void {
         return self.scanStreamWithOptions(table_name, request_json, sink, .{});
     }
 
-    pub fn scanStreamWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink, options: QueryOptions) !void {
+    pub fn scanStreamWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink, options: QueryOptions) !void {
         const Bridge = struct {
-            sink: @import("../runtime_scan_sink.zig").ScanStreamSink,
+            sink: @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink,
             failure: ?anyerror = null,
             fn start(ptr: ?*anyopaque) callconv(.c) u8 {
                 const bridge: *@This() = @ptrCast(@alignCast(ptr.?));
@@ -939,7 +941,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_artifact_operation_json(
             self.handle,
             &.{
-                .operation = @intFromEnum(operation),
+                .operation = @backingInt(operation),
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
                 .cancellation_ctx = cancellation_ctx,
@@ -1018,7 +1020,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
-                .action = @intFromEnum(action),
+                .action = @backingInt(action),
                 .table_name = .fromSlice(table_name),
             },
             &result,
@@ -1030,7 +1032,7 @@ pub const Owner = struct {
     pub fn captureHotStandbySeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
-            .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
+            .action = @backingInt(abi.MaintenanceAction.capture_ha_seed_snapshot),
             .table_name = .fromSlice(table_name),
             .snapshot_token = .fromSlice(token),
             .destination_root = .fromSlice(destination),
@@ -1047,7 +1049,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
-                .action = @intFromEnum(abi.MaintenanceAction.prepare_ha_seed_snapshot),
+                .action = @backingInt(abi.MaintenanceAction.prepare_ha_seed_snapshot),
                 .table_name = .fromSlice(table_name),
                 .deadline_ns = deadline_ns,
             },

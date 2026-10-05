@@ -30,7 +30,7 @@ pub const BuildInfo = struct {
 pub fn create(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     version: []const u8,
 }) BuildInfo {
     const metadata = b.addOptions();

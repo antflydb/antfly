@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const auth = @import("usermgr/user_manager.zig");
+const auth = @import("antfly_local_sources").usermgr_user_manager;
 extern fn usermgr_abi_create() callconv(.c) ?*auth.UserManager;
 extern fn usermgr_abi_fail(c_int) callconv(.c) void;
 extern fn usermgr_abi_destroy(*auth.UserManager) callconv(.c) void;
@@ -39,3 +39,6 @@ test "usermgr archive boundary preserves secure randomness errors and releases m
     var key = try manager.createApiKey("alice", "test", &.{}, &.{}, null);
     defer key.deinit(manager.alloc);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

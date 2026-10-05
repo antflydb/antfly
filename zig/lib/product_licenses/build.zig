@@ -24,6 +24,7 @@ pub fn installApache(b: *std.Build, repo_root: std.Build.LazyPath, name: []const
         "LICENSES/Apache-2.0.txt",
         "THIRD_PARTY_NOTICES.md",
         "scripts/apache_engine_files.txt",
+        "scripts/source_license_roots.json",
         "scripts/embedded_asset_licenses.json",
     }) |file| {
         const copy = b.addInstallFile(repo_root.path(b, file), b.fmt("{s}/{s}", .{ directory, file }));

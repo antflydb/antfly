@@ -168,7 +168,7 @@ const ReductionPlan = struct {
     counts: []usize,
     active: usize,
     total: usize,
-    fn deinit(self: *ReductionPlan) void {
+    pub fn deinit(self: *ReductionPlan) void {
         self.allocator.free(self.counts);
     }
     fn factor(self: ReductionPlan, options: BinaryOptions, row: usize) f64 {
@@ -1060,14 +1060,14 @@ test "boundary training cancellation interrupts selection matching and loss accu
     const a = std.testing.allocator;
     var checks: usize = 0;
     const limits = Limits{ .control = .{ .ptr = &checks, .check_fn = Cancel.check } };
-    const values = [_]f32{0} ** 256;
-    const valid = [_]bool{true} ** 256;
+    const values = @as([256]f32, @splat(0));
+    const valid = @as([256]bool, @splat(true));
     const tensor = Tensor{ .shape = .{ .batch = 1, .queries = 1, .candidates = 256 }, .values = &values };
     try std.testing.expectError(error.Cancelled, balancedBce(a, tensor, &values, &valid, .{ .limits = limits }));
     checks = 0;
     try std.testing.expectError(error.Cancelled, hardNegatives(a, tensor, &values, &valid, .{ .limits = limits }));
     checks = 0;
-    const spans = [_]Span{.{ .start = 0, .end = 1 }} ** 256;
+    const spans = @as([256]Span, @splat(.{ .start = 0, .end = 1 }));
     const gold = Gold{ .batch = 1, .queries = 1, .capacity = 256, .spans = &spans, .valid = &valid };
     try std.testing.expectError(error.Cancelled, candidateLabels(a, .{ .shape = tensor.shape, .spans = &spans, .valid = &valid }, gold, true, limits));
 }
@@ -1153,7 +1153,7 @@ test "CUDA boundary BCE gradients round sigmoid before subtraction like pinned T
     const logits = [_]f32{ -100, -20, -2, 0, 2, 17, 20 };
     const labels = [_]f32{ 0, 0, 1, 0, 0, 1, 1 };
     const expected = [_]f32{ 0, 2.061153470123145e-9, -0.8807970881462097, 0.5, 0.8807970285415649, 0, 0 };
-    const valid = [_]bool{true} ** logits.len;
+    const valid = @as([logits.len]bool, @splat(true));
     const tensor = Tensor{ .shape = .{ .batch = 1, .queries = 1, .candidates = logits.len }, .values = &logits };
     var result = try balancedBce(std.testing.allocator, tensor, &labels, &valid, .{ .reduction = .sum, .gradient_precision = .tensor_f32 });
     defer result.deinit();

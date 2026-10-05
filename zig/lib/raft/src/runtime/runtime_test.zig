@@ -32,10 +32,18 @@ const StorageRecorder = struct {
     compact_failures_remaining: usize = 0,
     compact_failure_group: ?core.types.GroupId = null,
     compact_successes: usize = 0,
-    compacted_groups: [8]core.types.GroupId = [_]core.types.GroupId{0} ** 8,
+    compacted_groups: [8]core.types.GroupId = @as([8]core.types.GroupId, @splat(0)),
     retired_groups: usize = 0,
+    async_begin: bool = false,
+    maintenance_due: bool = false,
+    release_persistence: bool = true,
+    release_compaction: bool = true,
+    retained_ready: ?core.Ready = null,
+    retained_group: core.types.GroupId = 0,
+    retained_compact_index: ?u64 = null,
 
-    fn deinit(self: *StorageRecorder) void {
+    pub fn deinit(self: *StorageRecorder) void {
+        if (self.retained_ready) |*ready| ready.deinit(self.alloc);
         self.stores.deinit(self.alloc);
         self.* = undefined;
     }
@@ -47,12 +55,68 @@ const StorageRecorder = struct {
     fn iface(self: *StorageRecorder) runtime.storage_iface.GroupStorage {
         return .{
             .ptr = self,
-            .vtable = &.{
+            .vtable = if (self.async_begin) &.{
+                .persist_ready = persistReady,
+                .begin_ready = beginReady,
+                .begin_maintenance = beginMaintenance,
+                .begin_compact_snapshot = beginCompactSnapshot,
+                .compact_snapshot = compactSnapshot,
+                .retire_group = retireGroup,
+            } else &.{
                 .persist_ready = persistReady,
                 .compact_snapshot = compactSnapshot,
                 .retire_group = retireGroup,
             },
         };
+    }
+
+    fn beginReady(ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready, _: ?runtime.storage_iface.PersistenceWake) !?runtime.storage_iface.PendingReadyPersistence {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        std.debug.assert(self.retained_ready == null);
+        self.retained_ready = try ready.clone(self.alloc);
+        self.retained_group = group_id;
+        return .{ .ptr = self, .durable_term = self.stores.get(group_id).?.hard_state.current_term, .durable_vote = self.stores.get(group_id).?.hard_state.voted_for, .durable_index = try self.stores.get(group_id).?.storage().lastIndex(), .vtable = &.{ .is_complete = isComplete, .complete = complete, .deinit = finish } };
+    }
+
+    fn beginMaintenance(ptr: *anyopaque, group_id: core.types.GroupId, admission: *runtime.storage_iface.PersistenceAdmission, wake: ?runtime.storage_iface.PersistenceWake) !?runtime.storage_iface.PendingReadyPersistence {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        if (!self.maintenance_due) return null;
+        if (!admission.admits(1024)) return null;
+        self.maintenance_due = false;
+        return beginReady(ptr, group_id, .{}, wake);
+    }
+
+    fn isComplete(ptr: *anyopaque) bool {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        return if (self.retained_compact_index != null) self.release_compaction and self.release_persistence else self.release_persistence;
+    }
+
+    fn beginCompactSnapshot(ptr: *anyopaque, group_id: u64, metadata: core.types.SnapshotMetadata, payload: runtime.storage_iface.SnapshotMaterialization, index: u64, admission: *runtime.storage_iface.PersistenceAdmission, wake: ?runtime.storage_iface.PersistenceWake) !?runtime.storage_iface.PendingReadyPersistence {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        if (!admission.admits(1024)) return null;
+        if (self.compact_failures_remaining > 0) {
+            self.compact_failures_remaining -= 1;
+            return error.InjectedSnapshotPublishFailure;
+        }
+        const operation = try beginReady(ptr, group_id, .{ .snapshot = .{ .metadata = metadata, .data = switch (payload) {
+            .bytes => |bytes| bytes,
+            .artifact => return error.UnexpectedSnapshotArtifact,
+        } } }, wake);
+        self.retained_compact_index = index;
+        return operation;
+    }
+
+    fn complete(ptr: *anyopaque) !void {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        if (self.retained_compact_index) |index| return compactSnapshot(ptr, self.retained_group, self.retained_ready.?.snapshot.?, index);
+        try persistReady(self, self.retained_group, self.retained_ready.?);
+    }
+
+    fn finish(ptr: *anyopaque) void {
+        const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
+        self.retained_ready.?.deinit(self.alloc);
+        self.retained_ready = null;
+        self.retained_compact_index = null;
     }
 
     fn persistReady(ptr: *anyopaque, group_id: core.types.GroupId, ready: core.Ready) !void {
@@ -183,7 +247,7 @@ const DiskBatcherRecorder = struct {
     persist_calls: usize = 0,
     persisted_entries: usize = 0,
 
-    fn deinit(self: *DiskBatcherRecorder) void {
+    pub fn deinit(self: *DiskBatcherRecorder) void {
         self.stores.deinit(self.alloc);
         self.* = undefined;
     }
@@ -263,7 +327,7 @@ const TestSnapshotArtifact = struct {
         return try alloc.dupe(u8, self.bytes);
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *TestSnapshotArtifact = @ptrCast(@alignCast(ptr));
         const alloc = self.alloc;
         alloc.free(self.bytes);
@@ -277,12 +341,12 @@ const ApplyRecorder = struct {
     applied_entries: usize = 0,
     applied_read_states: usize = 0,
     last_applied_index: core.types.Index = 0,
-    last_applied_by_group: [128]core.types.Index = [_]core.types.Index{0} ** 128,
+    last_applied_by_group: [128]core.types.Index = @as([128]core.types.Index, @splat(0)),
     last_read_index: core.types.Index = 0,
     snapshot_materializations: std.atomic.Value(usize) = .init(0),
     snapshot_failures_remaining: std.atomic.Value(usize) = .init(0),
     snapshot_prepare_failures_remaining: usize = 0,
-    materialized_groups: [8]std.atomic.Value(core.types.GroupId) = [_]std.atomic.Value(core.types.GroupId){.init(0)} ** 8,
+    materialized_groups: [8]std.atomic.Value(core.types.GroupId) = @as([8]std.atomic.Value(core.types.GroupId), @splat(.init(0))),
     block_snapshot_materialization: bool = false,
     snapshot_materialization_started: std.Io.Event = .unset,
     release_snapshot_materialization: std.Io.Event = .unset,
@@ -326,7 +390,7 @@ const ApplyRecorder = struct {
             } };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.heap.page_allocator.destroy(self);
         }
@@ -442,7 +506,7 @@ const ApplyQueueRecorder = struct {
 const PartialApplyRecorder = struct {
     attempts: usize = 0,
     failed_once: bool = false,
-    successful_by_group: [256]usize = [_]usize{0} ** 256,
+    successful_by_group: [256]usize = @as([256]usize, @splat(0)),
 
     fn iface(self: *@This()) runtime.storage_iface.StateMachine {
         return .{
@@ -475,6 +539,8 @@ const TransportRecorder = struct {
     sent_messages: usize = 0,
     batched_peer_count: usize = 0,
     batched_group_count: usize = 0,
+    heartbeats: usize = 0,
+    appends: usize = 0,
 
     fn iface(self: *TransportRecorder) runtime.transport_iface.Transport {
         return .{
@@ -491,6 +557,7 @@ const TransportRecorder = struct {
         const self: *TransportRecorder = @ptrCast(@alignCast(ptr));
         self.send_calls += 1;
         self.sent_messages += messages.len;
+        self.recordKinds(messages);
     }
 
     fn sendPeerBatches(ptr: *anyopaque, batches: []const runtime.transport_iface.PeerBatch) !void {
@@ -501,7 +568,15 @@ const TransportRecorder = struct {
             for (peer_batch.groups) |group_batch| {
                 self.batched_group_count += 1;
                 self.sent_messages += group_batch.messages.len;
+                self.recordKinds(group_batch.messages);
             }
+        }
+    }
+
+    fn recordKinds(self: *@This(), messages: []const core.Message) void {
+        for (messages) |msg| {
+            if (msg.msg_type == .heartbeat or msg.msg_type == .heartbeat_response) self.heartbeats += 1;
+            if (msg.msg_type == .append_entries or msg.msg_type == .append_entries_response or msg.msg_type == .request_vote or msg.msg_type == .request_vote_response) self.appends += 1;
         }
     }
 };
@@ -652,6 +727,110 @@ fn drainGroup(host: *runtime.MultiRaft, group_id: core.types.GroupId) !usize {
         if (!processed) break;
     }
     return passes;
+}
+
+test "multi raft slow async persistence keeps heartbeats live without releasing durability acknowledgements" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true };
+    defer storage.deinit();
+    try storage.registerStore(19, &store);
+    var apply = ApplyRecorder{ .alloc = std.testing.allocator };
+    var transport = TransportRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{
+        .group_storage = storage.iface(),
+        .state_machine = apply.iface(),
+        .transport = transport.iface(),
+    });
+    defer host.deinit();
+    try host.addGroup(.{
+        .group_id = 19,
+        .local_node_id = 1,
+        .raft_config = .{ .id = 1, .group_id = 19, .peers = &.{ 1, 2, 3 }, .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true, .async_storage_writes = true },
+        .storage = store.storage(),
+    });
+    try host.campaignGroup(19);
+    _ = try drainGroup(&host, 19);
+    try host.step(19, .{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = 1 });
+    _ = try drainGroup(&host, 19);
+    try std.testing.expectEqual(core.types.StateRole.leader, host.group(19).?.status().soft.role);
+    // Make the leader's initial entry committed before holding the next WAL.
+    try host.step(19, .{ .msg_type = .append_entries_response, .from = 2, .to = 1, .term = 1, .log_index = 1 });
+    _ = try drainGroup(&host, 19);
+    const previous_appends = transport.appends;
+    const previous_heartbeats = transport.heartbeats;
+    const previous_applied = apply.applied_entries;
+    storage.release_persistence = false;
+    try host.propose(19, "must-be-durable-before-replication");
+    _ = try host.processReady(19);
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    // Equivalent to a 12.3-second stalled sync, without wall-clock sleeps.
+    const pending_started = host.oldest_pending_persistence_ns.load(.acquire);
+    const timeout = 5 * std.time.ns_per_s;
+    try std.testing.expect(!host.persistenceIsStalledAt(pending_started + timeout - 1, timeout));
+    try std.testing.expect(host.persistenceIsStalledAt(pending_started + timeout, timeout));
+    for (0..123) |_| {
+        try host.step(19, .{ .msg_type = .heartbeat_response, .from = 2, .to = 1, .term = 1 });
+        _ = try host.runRound(1, 1);
+    }
+    try std.testing.expectEqual(core.types.StateRole.leader, host.group(19).?.status().soft.role);
+    try std.testing.expect(transport.heartbeats > previous_heartbeats);
+    try std.testing.expectEqual(previous_appends, transport.appends);
+    try std.testing.expectEqual(previous_applied, apply.applied_entries);
+    try std.testing.expectEqual(@as(u64, 1), try store.storage().lastIndex());
+    storage.release_persistence = true;
+    _ = try drainGroup(&host, 19);
+    try std.testing.expect(!host.persistenceIsStalledAt(pending_started + 12_300 * std.time.ns_per_ms, timeout));
+    try std.testing.expectEqual(@as(u64, 0), host.metricsSnapshot().pending_persistence_age_ms);
+    try std.testing.expectEqual(@as(u64, 2), try store.storage().lastIndex());
+    try std.testing.expect(transport.appends > previous_appends);
+    // Failure also leaves the barrier closed; repeated rounds cannot retry
+    // partial completion or accidentally release the retained responses.
+    storage.release_persistence = false;
+    try host.propose(19, "failed-sync");
+    _ = try host.processReady(19);
+    const before_failure = transport.appends;
+    storage.persist_failures_remaining = 1;
+    storage.release_persistence = true;
+    try std.testing.expectError(error.InjectedReadyPersistenceFailure, host.processReady(19));
+    try std.testing.expectError(error.InjectedReadyPersistenceFailure, host.processReady(19));
+    try std.testing.expect(host.persistenceIsStalledAt(std.math.maxInt(u64), timeout));
+    try std.testing.expectEqual(before_failure, transport.appends);
+    try std.testing.expect(host.removeGroup(19));
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+    try std.testing.expect(storage.retained_ready == null);
+    try std.testing.expect(!host.persistenceIsStalledAt(std.math.maxInt(u64), timeout));
+}
+
+test "multi raft async persistence ceiling quarantines without consuming Ready and recovery stays fenced" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true, .release_persistence = false };
+    defer storage.deinit();
+    try storage.registerStore(20, &store);
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{ .max_single_persistence_bytes = 1 }, .{ .group_storage = storage.iface() });
+    defer host.deinit();
+    try addSingleNodeGroup(&host, 20, &store, true);
+    try host.campaignGroup(20);
+    try std.testing.expect(!(try host.processReady(20)));
+    const quarantine = host.scheduler.groupQuarantine(20).?;
+    try std.testing.expectEqual(runtime.scheduler.QuarantineReason.persistence_ready_too_large, quarantine.reason);
+    try std.testing.expect(host.group(20).?.hasReady());
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+    try std.testing.expectEqual(@as(usize, 0), storage.persist_calls);
+    try host.resumeQuarantinedGroup(20, .{ .expected_incident_id = quarantine.incident_id, .new_limit_bytes = 64 * 1024 });
+    try std.testing.expect(try host.processReady(20));
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    storage.release_persistence = true;
+    storage.persist_failures_remaining = 1;
+    try std.testing.expectError(error.InjectedReadyPersistenceFailure, host.processReady(20));
+    const old_incarnation = host.group_incarnations.get(20).?;
+    try std.testing.expect(host.removeGroup(20));
+    try addSingleNodeGroup(&host, 20, &store, true);
+    try std.testing.expect(host.group_incarnations.get(20).? != old_incarnation);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+    try std.testing.expect(storage.retained_ready == null);
+    try std.testing.expect(!host.group(20).?.hasReady());
 }
 
 test "multi raft processReady drains a synchronous single-node group" {
@@ -3334,4 +3513,187 @@ test "multi raft retryable async apply acknowledges only completed groups" {
         try std.testing.expectEqual(@as(usize, 1), apply.applied_count);
         try std.testing.expectEqual(@as(usize, 0), host.pending_apply.items.len);
     }
+}
+
+test "multi raft completed append keeps heartbeats live while apply admission is blocked" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    // Term one is already durable; the new entry and its acknowledgement are
+    // retained behind the append barrier and then behind apply admission.
+    store.setHardState(.{ .current_term = 1, .voted_for = 2 });
+    try store.append(&.{.{ .index = 1, .term = 1 }});
+    try store.setConfState(.{ .voters = @constCast(&[_]u64{ 1, 2, 3 }) });
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true, .release_persistence = false };
+    defer storage.deinit();
+    try storage.registerStore(21, &store);
+    var transport = TransportRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{ .max_pending_apply_tasks = 0 }, .{ .group_storage = storage.iface(), .transport = transport.iface() });
+    defer host.deinit();
+    try host.addGroup(.{ .group_id = 21, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 21, .peers = &.{ 1, 2, 3 }, .async_storage_writes = true }, .storage = store.storage() });
+    // Admit the incoming Ready with room for application, then revoke that
+    // queue's capacity while its physical append is outstanding.
+    host.cfg.max_pending_apply_tasks = 1;
+    try host.step(21, .{ .msg_type = .append_entries, .from = 2, .to = 1, .term = 1, .log_index = 1, .log_term = 1, .commit_index = 1, .entries = @constCast(&[_]core.Entry{.{ .index = 2, .term = 1 }}) });
+    try std.testing.expect(try host.processReady(21));
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    host.cfg.max_pending_apply_tasks = 0;
+    storage.release_persistence = true;
+    const previous_appends = transport.appends;
+    for (0..8) |_| {
+        try host.step(21, .{ .msg_type = .heartbeat, .from = 2, .to = 1, .term = 1, .commit_index = 1 });
+        _ = try host.processReady(21);
+    }
+    try std.testing.expect(transport.heartbeats >= 8);
+    try std.testing.expectEqual(previous_appends, transport.appends);
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    host.cfg.max_pending_apply_tasks = 1;
+    _ = try drainGroup(&host, 21);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+    try std.testing.expectEqual(@as(u64, 2), try store.storage().lastIndex());
+}
+
+test "multi raft idle checkpoint admission is bounded and durable-prefix reads complete while I/O is held" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true };
+    defer storage.deinit();
+    try storage.registerStore(22, &store);
+    var apply = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{ .group_storage = storage.iface(), .state_machine = apply.iface() });
+    defer host.deinit();
+    try addSingleNodeGroup(&host, 22, &store, true);
+    try host.campaignGroup(22);
+    _ = try drainGroup(&host, 22);
+    const previous_reads = apply.applied_read_states;
+    storage.maintenance_due = true;
+    storage.release_persistence = false;
+    host.cfg.max_single_persistence_bytes = 1;
+    try std.testing.expect(!(try host.processReady(22)));
+    const incident = host.scheduler.groupQuarantine(22).?;
+    try std.testing.expectEqual(runtime.scheduler.QuarantineReason.persistence_ready_too_large, incident.reason);
+    try std.testing.expect(storage.maintenance_due);
+    try std.testing.expect(storage.retained_ready == null);
+    try host.resumeQuarantinedGroup(22, .{ .expected_incident_id = incident.incident_id, .new_limit_bytes = 1024 });
+    try std.testing.expect(try host.processReady(22));
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    try host.readIndex(22, "read-during-checkpoint");
+    _ = try host.processReady(22);
+    try std.testing.expectEqual(previous_reads + 1, apply.applied_read_states);
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    storage.release_persistence = true;
+    _ = try drainGroup(&host, 22);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+}
+
+test "multi raft election waits for its own durable term and vote without restarting under slow I/O" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true, .release_persistence = false };
+    defer storage.deinit();
+    try storage.registerStore(23, &store);
+    var transport = TransportRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{ .group_storage = storage.iface(), .transport = transport.iface() });
+    defer host.deinit();
+    try host.addGroup(.{ .group_id = 23, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 23, .peers = &.{ 1, 2, 3 }, .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true, .async_storage_writes = true }, .storage = store.storage() });
+    try host.campaignGroup(23);
+    try std.testing.expect(try host.processReady(23));
+    for (0..123) |_| _ = try host.runRound(1, 1);
+    // The first request has not crossed its durability barrier. Starting
+    // another election here would invalidate the request before it was sent.
+    try std.testing.expectEqual(@as(u64, 1), host.group(23).?.status().hard.current_term);
+    try std.testing.expectEqual(core.types.StateRole.candidate, host.group(23).?.status().soft.role);
+    try std.testing.expectEqual(@as(usize, 0), transport.appends);
+    storage.release_persistence = true;
+    _ = try drainGroup(&host, 23);
+    try std.testing.expect(transport.appends > 0);
+    try host.step(23, .{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = 1 });
+    _ = try drainGroup(&host, 23);
+    try std.testing.expectEqual(core.types.StateRole.leader, host.group(23).?.status().soft.role);
+}
+
+test "multi raft asynchronous snapshot publication retries startup, fences compaction and keeps durable reads live" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    // Arm publication failure and hold before a Ready can schedule compaction.
+    // Ordinary log persistence stays live throughout this scenario.
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true, .release_compaction = false, .compact_failures_remaining = 1 };
+    defer storage.deinit();
+    try storage.registerStore(24, &store);
+    var apply = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .applied_log_retained_entries = 1,
+        .applied_log_compaction_min_interval_entries = 1,
+    }, .{ .group_storage = storage.iface(), .state_machine = apply.iface() });
+    defer host.deinit();
+    try addSingleNodeGroup(&host, 24, &store, true);
+    try host.campaignGroup(24);
+    _ = try drainGroup(&host, 24);
+    try host.propose(24, "published-before-compaction");
+    _ = try drainGroup(&host, 24);
+    // Ready persistence is complete; hold only the snapshot's publication.
+    const deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
+    while (storage.retained_compact_index == null and clock.monotonicNs() < deadline) {
+        _ = try host.drainReady(0);
+        sleepOneMillisecond();
+    }
+    try std.testing.expect(storage.retained_compact_index != null);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_compaction_failures);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_compaction_retries);
+    try std.testing.expect(host.snapshot_publish != null);
+    try std.testing.expectEqual(@as(u64, 1), try store.storage().firstIndex());
+    try std.testing.expectEqual(@as(u64, 1), host.group(24).?.raw_node.raft.log.firstIndex());
+    const reads = apply.applied_read_states;
+    try host.readIndex(24, "read-during-snapshot-publication");
+    _ = try host.processReady(24);
+    try std.testing.expectEqual(reads + 1, apply.applied_read_states);
+    try std.testing.expect(host.snapshot_publish != null);
+    storage.release_compaction = true;
+    _ = try drainGroup(&host, 24);
+    try std.testing.expectEqual(@as(u64, 2), try store.storage().firstIndex());
+    try std.testing.expectEqual(@as(u64, 2), host.group(24).?.raw_node.raft.log.firstIndex());
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().snapshot_compaction_completions);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+    try std.testing.expect(host.snapshot_publish == null);
+}
+
+test "multi raft completed incoming snapshot still requires apply admission" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    store.setHardState(.{ .current_term = 1, .voted_for = 2 });
+    try store.setConfState(.{ .voters = @constCast(&[_]u64{ 1, 2, 3 }) });
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true, .release_persistence = false };
+    defer storage.deinit();
+    try storage.registerStore(25, &store);
+    var apply = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{}, .{ .group_storage = storage.iface(), .state_machine = apply.iface() });
+    defer host.deinit();
+    try host.addGroup(.{ .group_id = 25, .local_node_id = 1, .raft_config = .{ .id = 1, .group_id = 25, .peers = &.{ 1, 2, 3 }, .async_storage_writes = true }, .storage = store.storage() });
+    try host.step(25, .{ .msg_type = .snapshot, .from = 2, .to = 1, .term = 1, .snapshot = .{
+        .metadata = .{ .index = 5, .term = 1, .conf_state = .{ .voters = @constCast(&[_]u64{ 1, 2, 3 }) } },
+        .data = @constCast("state-at-five"),
+    } });
+    try std.testing.expect(try host.processReady(25));
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    storage.release_persistence = true;
+    host.cfg.max_pending_apply_tasks = 0;
+    try std.testing.expect(!(try host.processReady(25)));
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    try std.testing.expectEqual(@as(usize, 0), apply.apply_calls);
+    // A nonempty queue also removes the one-Ready liveness exception. The
+    // snapshot's payload must count against its remaining byte capacity.
+    host.cfg.max_pending_apply_tasks = 2;
+    host.cfg.max_pending_apply_bytes = 2;
+    host.cfg.max_apply_tasks_per_round = 0;
+    try host.pending_apply.append(std.testing.allocator, .{ .group_id = 25, .snapshot = null, .entries = &.{}, .read_states = &.{}, .conf_state = null, .approx_bytes = 1 });
+    try std.testing.expect(!(try host.processReady(25)));
+    try std.testing.expectEqual(@as(usize, 1), host.pending_persistence.count());
+    try std.testing.expectEqual(@as(usize, 1), host.pending_apply.items.len);
+    host.pending_apply.clearRetainingCapacity(); // The placeholder owns no allocations.
+    host.cfg.max_pending_apply_bytes = std.math.maxInt(usize);
+    host.cfg.max_apply_tasks_per_round = 32;
+    host.cfg.max_pending_apply_tasks = 1;
+    _ = try drainGroup(&host, 25);
+    try std.testing.expectEqual(@as(usize, 0), host.pending_persistence.count());
+    try std.testing.expectEqual(@as(usize, 1), apply.apply_calls);
+    try std.testing.expectEqual(@as(u64, 5), store.snapshot_state.metadata.index);
 }

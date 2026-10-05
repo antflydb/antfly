@@ -38,12 +38,12 @@ multi-newline behavior, curly quotes, and non-ASCII letters.
 
 ## Reproducible benchmark
 
-Always pass `-Doptimize=ReleaseFast`; the tokenizer is an imported module and
+Always pass `-Doptimize=fast`; the tokenizer is an imported module and
 must be optimized along with the benchmark executable:
 
 ```sh
 cd zig
-zig build -Doptimize=ReleaseFast bench-tokenizer && ./zig-out/bin/tokenizer_benchmark \
+zig build -Doptimize=fast bench-tokenizer && ./zig-out/bin/tokenizer_benchmark \
   /path/to/tokenizer.json /path/to/corpus.txt \
   --warmup 2 --iterations 100 --threads 1
 ```
@@ -112,7 +112,7 @@ counters intentionally add work to the hot path.
 Every run also reports process CPU time, average utilized cores, CPU
 nanoseconds per byte, phase peak-RSS high-water marks, cache admissions,
 evictions, and rejected reservations. `zig build
--Doptimize=ReleaseFast bench-tokenizer-build` installs the standalone binary
+-Doptimize=fast bench-tokenizer-build` installs the standalone binary
 at `zig-out/bin/tokenizer_benchmark` for `perf`, Instruments, or another
 external hardware-counter profiler. The checked-in experiment driver runs the
 stage, cache, task-count, and chunk sweeps:
@@ -858,7 +858,7 @@ zig build test
 cd ../..
 zig build root-test
 zig build resource-budget-test
-zig build -Doptimize=ReleaseFast bench-tokenizer-build
+zig build -Doptimize=fast bench-tokenizer-build
 ```
 
 `test-tokenizer` runs both the Hugging Face and SentencePiece implementations;

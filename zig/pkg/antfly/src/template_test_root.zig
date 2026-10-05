@@ -13,10 +13,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const template = @import("template.zig");
-pub const template_remote = @import("template_remote.zig");
+pub const template = @import("antfly_local_sources").template;
+pub const template_remote = @import("antfly_local_sources").template_remote;
 
 test {
     _ = template;
     _ = template_remote;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

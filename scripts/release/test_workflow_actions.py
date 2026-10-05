@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -144,6 +145,29 @@ class WorkflowActionPolicyTests(unittest.TestCase):
                     "sudo apt-get install -y --no-install-recommends gettext-base",
                     workflow[provision:installer],
                 )
+
+    def test_environment_checks_provision_github_cli_in_each_job(self) -> None:
+        workflow_dir = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+        for path in sorted(workflow_dir.glob("*.yml")):
+            workflow = path.read_text(encoding="utf-8")
+            jobs = re.finditer(
+                r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                workflow.split("\njobs:\n", 1)[1],
+                re.MULTILINE | re.DOTALL,
+            )
+            for job in jobs:
+                block = job[2]
+                if "python scripts/release/github_environment.py check" not in block:
+                    continue
+                with self.subTest(workflow=path.name, job=job[1]):
+                    # Each ARC job starts in a fresh container; a setup in its
+                    # predecessor cannot provide the CLI for this invocation.
+                    setup = block.find("uses: ./.github/actions/setup-github-cli")
+                    check = block.index(
+                        "python scripts/release/github_environment.py check"
+                    )
+                    self.assertGreaterEqual(setup, 0)
+                    self.assertLess(setup, check)
 
 
 if __name__ == "__main__":

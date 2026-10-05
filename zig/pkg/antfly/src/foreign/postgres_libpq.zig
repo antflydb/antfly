@@ -162,11 +162,11 @@ const PoolAvailability = if (supports_waitable_pool)
                     );
                 } else if (uses_relative_condwait) blk: {
                     const relative = durationTimespec(wait_ns);
-                    break :blk @as(std.c.E, @enumFromInt(pthread_ext.pthread_cond_timedwait_relative_np(
+                    break :blk @as(std.c.E, @fromBackingInt(@intCast(pthread_ext.pthread_cond_timedwait_relative_np(
                         &state.cond,
                         &state.mutex,
                         &relative,
-                    )));
+                    ))));
                 } else blk: {
                     // The remaining supported pthread targets do not expose a
                     // portable monotonic condition clock. Use a short relative
@@ -203,7 +203,7 @@ const PoolAvailability = if (supports_waitable_pool)
             if (std.c.pthread_mutex_unlock(&state.mutex) != .SUCCESS) unreachable;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             const state = self.state;
             if (std.c.pthread_cond_destroy(&state.cond) != .SUCCESS) unreachable;
             if (std.c.pthread_mutex_destroy(&state.mutex) != .SUCCESS) unreachable;
@@ -242,7 +242,7 @@ else
             _ = self.epoch.fetchAdd(1, .release);
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.* = undefined;
         }
     };
@@ -1852,7 +1852,7 @@ pub const Executor = struct {
             }
         }
 
-        const dsn_z = try self.alloc.dupeZ(u8, dsn);
+        const dsn_z = try self.alloc.dupeSentinel(u8, dsn, 0);
         defer self.alloc.free(dsn_z);
         const conn = self.pqconnectdb(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         if (self.pqstatus(conn) != CONNECTION_OK) {
@@ -1874,7 +1874,7 @@ pub const Executor = struct {
             self.invalidateConnection(dsn, cached);
         }
 
-        const dsn_z = try self.alloc.dupeZ(u8, dsn);
+        const dsn_z = try self.alloc.dupeSentinel(u8, dsn, 0);
         defer self.alloc.free(dsn_z);
         const conn = self.pqconnectStart(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         errdefer self.pqfinish(conn);
@@ -1915,7 +1915,7 @@ pub const Executor = struct {
         try ensureNotCancelled(cancellation);
         if (execution_deadline_ns) |deadline_ns| try ensureDeadline(deadline_ns);
 
-        const dsn_z = try self.alloc.dupeZ(u8, dsn);
+        const dsn_z = try self.alloc.dupeSentinel(u8, dsn, 0);
         defer self.alloc.free(dsn_z);
         const conn = self.pqconnectStart(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         errdefer self.pqfinish(conn);
@@ -1999,7 +1999,7 @@ pub const Executor = struct {
     }
 
     fn connectFresh(self: *@This(), alloc: Allocator, dsn: []const u8) !?*PGconn {
-        const dsn_z = try alloc.dupeZ(u8, dsn);
+        const dsn_z = try alloc.dupeSentinel(u8, dsn, 0);
         defer alloc.free(dsn_z);
         const conn = self.pqconnectdb(dsn_z.ptr) orelse return error.ForeignConnectionFailed;
         if (self.pqstatus(conn) != CONNECTION_OK) {
@@ -2093,7 +2093,7 @@ pub const Executor = struct {
         if (deadline_ns) |deadline| try ensureDeadline(deadline);
         var owned_args = try OwnedArgs.init(alloc, prepared.args);
         defer owned_args.deinit(alloc);
-        const sql_text_z = try alloc.dupeZ(u8, prepared.sql_text);
+        const sql_text_z = try alloc.dupeSentinel(u8, prepared.sql_text, 0);
         defer alloc.free(sql_text_z);
 
         if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignQueryFailed;
@@ -2139,7 +2139,7 @@ pub const Executor = struct {
         var owned_args = try OwnedArgs.init(alloc, prepared.args);
         defer owned_args.deinit(alloc);
 
-        const sql_text_z = try alloc.dupeZ(u8, prepared.sql_text);
+        const sql_text_z = try alloc.dupeSentinel(u8, prepared.sql_text, 0);
         defer alloc.free(sql_text_z);
 
         const result = self.pqexecParams(
@@ -2178,7 +2178,7 @@ pub const Executor = struct {
         allow_command_ok: bool,
     ) !?*PGresult {
         try ensureDeadline(execution_deadline_ns);
-        const sql_text_z = try alloc.dupeZ(u8, sql_text);
+        const sql_text_z = try alloc.dupeSentinel(u8, sql_text, 0);
         defer alloc.free(sql_text_z);
 
         if (self.pqsetnonblocking(conn, 1) != 0) return error.ForeignQueryFailed;
@@ -2192,7 +2192,7 @@ pub const Executor = struct {
     }
 
     fn execSimpleInternal(self: *@This(), conn: ?*PGconn, alloc: Allocator, sql_text: []const u8, allow_command_ok: bool) !?*PGresult {
-        const sql_text_z = try alloc.dupeZ(u8, sql_text);
+        const sql_text_z = try alloc.dupeSentinel(u8, sql_text, 0);
         defer alloc.free(sql_text_z);
 
         const result = self.pqexec(conn, sql_text_z.ptr) orelse return error.ForeignQueryFailed;
@@ -2638,7 +2638,7 @@ pub const Executor = struct {
         checkpoint: []u8,
         snapshot_name: []u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.checkpoint);
             alloc.free(self.snapshot_name);
             self.* = undefined;
@@ -2977,7 +2977,7 @@ const LazyExecutor = struct {
     executor: ?*Executor = null,
     warned_init_failure: bool = false,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         lock(&self.mutex);
         defer self.mutex.unlock();
         if (self.executor) |executor| {
@@ -3484,7 +3484,7 @@ const OwnedArgs = struct {
                 .bool => |value| {
                     const printed = try std.fmt.allocPrint(alloc, "{}", .{value});
                     defer alloc.free(printed);
-                    const text = try alloc.dupeZ(u8, printed);
+                    const text = try alloc.dupeSentinel(u8, printed, 0);
                     values[idx] = text.ptr;
                     lengths[idx] = @intCast(printed.len);
                     owned_strings[idx] = text;
@@ -3492,7 +3492,7 @@ const OwnedArgs = struct {
                 .integer => |value| {
                     const printed = try std.fmt.allocPrint(alloc, "{d}", .{value});
                     defer alloc.free(printed);
-                    const text = try alloc.dupeZ(u8, printed);
+                    const text = try alloc.dupeSentinel(u8, printed, 0);
                     values[idx] = text.ptr;
                     lengths[idx] = @intCast(printed.len);
                     owned_strings[idx] = text;
@@ -3500,13 +3500,13 @@ const OwnedArgs = struct {
                 .float => |value| {
                     const printed = try std.fmt.allocPrint(alloc, "{d}", .{value});
                     defer alloc.free(printed);
-                    const text = try alloc.dupeZ(u8, printed);
+                    const text = try alloc.dupeSentinel(u8, printed, 0);
                     values[idx] = text.ptr;
                     lengths[idx] = @intCast(printed.len);
                     owned_strings[idx] = text;
                 },
                 .string => |value| {
-                    const text = try alloc.dupeZ(u8, value);
+                    const text = try alloc.dupeSentinel(u8, value, 0);
                     values[idx] = text.ptr;
                     lengths[idx] = @intCast(value.len);
                     owned_strings[idx] = text;
@@ -3523,7 +3523,7 @@ const OwnedArgs = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.owned_strings) |buffer| {
             if (buffer) |owned| alloc.free(owned);
         }
@@ -4213,7 +4213,7 @@ test "postgres libpq registration succeeds without libpq and fails on first use"
     };
 
     const previous = std.c.getenv("ANTFLY_LIBPQ_PATH");
-    const restore = if (previous) |value| try alloc.dupeZ(u8, std.mem.span(value)) else null;
+    const restore = if (previous) |value| try alloc.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer if (restore) |value| {
         _ = c.setenv("ANTFLY_LIBPQ_PATH", value, 1);
         alloc.free(value);

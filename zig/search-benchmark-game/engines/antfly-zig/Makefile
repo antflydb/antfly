@@ -11,7 +11,7 @@ clean:
 	rm -fr $(ANTFLY_ROOT)/zig-out/bin/search_benchmark_query
 
 compile:
-	cd $(ANTFLY_ROOT) && zig build search-bench -Doptimize=ReleaseFast
+	cd $(ANTFLY_ROOT) && zig build search-bench -Doptimize=fast
 
 index: $(INDEX_DIR)
 

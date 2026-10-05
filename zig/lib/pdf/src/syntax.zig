@@ -26,7 +26,7 @@ pub const DictEntry = struct {
     key: []u8,
     value: Object,
 
-    fn deinit(self: *DictEntry, alloc: Allocator) void {
+    pub fn deinit(self: *DictEntry, alloc: Allocator) void {
         alloc.free(self.key);
         self.value.deinit(alloc);
         self.* = undefined;
@@ -184,7 +184,7 @@ const Token = union(enum) {
     name: []u8,
     keyword: []u8,
 
-    fn deinit(self: *Token, alloc: Allocator) void {
+    pub fn deinit(self: *Token, alloc: Allocator) void {
         switch (self.*) {
             .string => |value| alloc.free(value),
             .name => |value| alloc.free(value),
@@ -942,7 +942,7 @@ test "scanner represents oversized finite integer tokens as real numbers" {
 }
 
 test "scanner rejects integer tokens beyond finite real range" {
-    var scanner = Scanner.init(std.testing.allocator, "9" ** 400);
+    var scanner = Scanner.init(std.testing.allocator, z17RepeatString("9", 400));
     defer scanner.deinit();
     try std.testing.expectError(error.Overflow, scanner.readObject());
 }
@@ -1077,4 +1077,15 @@ test "scanner cleans stream dictionaries on malformed stream endings" {
         defer scanner.deinit();
         try std.testing.expectError(case.expected, scanner.readObject());
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

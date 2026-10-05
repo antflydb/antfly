@@ -82,7 +82,7 @@ const Recipe = struct {
     calls: [2]usize = @splat(0),
     reject: bool = false,
     fail_call: ?usize = null,
-    fn validate(raw: ?*const anyopaque, expected: [32]u8) !void {
+    pub fn validate(raw: ?*const anyopaque, expected: [32]u8) !void {
         const self: *const Recipe = @ptrCast(@alignCast(raw.?));
         if (self.reject or !std.mem.eql(u8, &self.fingerprint, &expected)) return error.ReplayRecipeChanged;
     }

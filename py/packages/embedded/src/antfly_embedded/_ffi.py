@@ -16,7 +16,7 @@
 """ctypes bindings for the ``libantfly`` C ABI (see ``zig/CAPI.md``).
 
 This module defines the C structures byte-for-byte as declared in
-``zig/pkg/antfly/include/antfly.h`` and configures the argument/return types
+``zig/pkg/antfly-embedded/include/antfly.h`` and configures the argument/return types
 for every function this binding calls. It intentionally mirrors only the
 subset of the C ABI that ``go/pkg/embedded`` (the reference binding) exposes.
 

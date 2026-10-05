@@ -167,7 +167,7 @@ pub const Heap = struct {
     }
 
     fn largeAlignment(alignment: std.mem.Alignment) std.mem.Alignment {
-        return @enumFromInt(@max(@intFromEnum(alignment), @intFromEnum(std.mem.Alignment.fromByteUnits(std.heap.pageSize()))));
+        return @fromBackingInt(@max(@backingInt(alignment), @backingInt(std.mem.Alignment.fromByteUnits(std.heap.pageSize()))));
     }
 };
 

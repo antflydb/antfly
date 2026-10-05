@@ -25,7 +25,7 @@ pub const Steps = struct {
 pub fn addSteps(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     codegen: *std.Build.Step.Compile,
     compare_tool: *std.Build.Step.Compile,
     /// Stable source label embedded in the generated metadata.
@@ -37,14 +37,14 @@ pub fn addSteps(b: *std.Build, options: struct {
     const grammar = options.root.path(b, "grammar/antfly_sql.y");
     const generated = options.root.path(b, "grammar/generated/root.zig");
     const generate = b.addRunArtifact(yacc_codegen);
-    generate.addFileArg(grammar);
-    const output = generate.addOutputFileArg("sql_grammar_root.zig");
+    generate.addFileArg2(grammar, .{ .make_absolute = true });
+    const output = generate.addOutputFileArg2("sql_grammar_root.zig", .{ .make_absolute = true });
     generate.addArg(options.grammar_label);
     const update = b.addUpdateSourceFiles();
-    update.addCopyFileToSource(output, generated.getPath(b));
+    update.addCopyFileToSource(output, generated.src_path.sub_path);
     const compare = b.addRunArtifact(options.compare_tool);
-    compare.addFileArg(output);
-    compare.addFileArg(generated);
+    compare.addFileArg2(output, .{ .make_absolute = true });
+    compare.addFileArg2(generated, .{ .make_absolute = true });
 
     const generated_compile = b.addTest(.{
         .root_module = b.createModule(.{
@@ -69,7 +69,7 @@ pub fn addSteps(b: *std.Build, options: struct {
         .root_module = b.createModule(.{
             .root_source_file = options.root.path(b, "parser_bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         }),
     });
 

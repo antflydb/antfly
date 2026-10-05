@@ -6502,6 +6502,24 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			return nil
 		}
+		// Retry receipt collection before checking target identity. A completed job
+		// with unreadable output is missing evidence, not a stale activation: do
+		// not reset its attempt and rerun activation while logs can be recovered.
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded &&
+			haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) && action.SeedArtifactReceipt == nil {
+			// Older operators may already have armed TTL before collecting a
+			// receipt. Disarm it before reading or checkpointing recovered logs.
+			if err := r.ensureHAAdminJobTTLAfterCheckpoint(ctx, cluster, ha.Admin, action); err != nil {
+				return err
+			}
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+			if action.SeedArtifactReceipt == nil {
+				continue
+			}
+			// Checkpoint recovered evidence before dependencies execute or TTL
+			// cleanup can remove its only durable source.
+			return errHAPlanNeedsPersistence
+		}
 		if haActionKind(action.Kind) == haActionActivateSeedArtifact && action.AdminJobPhase == haAdminJobPhaseSucceeded {
 			current, err := r.haActivationReceiptMatchesCurrentTarget(ctx, cluster, *action)
 			if err != nil {
@@ -9382,7 +9400,25 @@ func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx conte
 	action.AdminResult = result
 }
 
+// haSeedArtifactReceiptBody accepts observed CLI output with zero
+// or more complete warning: diagnostic lines, then exactly one JSON document.
+// Only leading diagnostics are stripped. The receipt decoder still rejects
+// unknown fields, multiple documents, and any content after the receipt. Never
+// search for braces or choose a matching object from an arbitrary log stream.
+func haSeedArtifactReceiptBody(body string) string {
+	body = strings.TrimSpace(body)
+	for strings.HasPrefix(body, "warning: ") {
+		_, rest, found := strings.Cut(body, "\n")
+		if !found {
+			return ""
+		}
+		body = strings.TrimSpace(rest)
+	}
+	return body
+}
+
 func parseHASeedArtifactReceipt(body string, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactReceiptStatus {
+	body = haSeedArtifactReceiptBody(body)
 	type chunkReceipt struct {
 		Index     uint64 `json:"index"`
 		SizeBytes uint64 `json:"size_bytes"`
@@ -13170,6 +13206,20 @@ func (r *AntflyClusterReconciler) ensureHAAdminJobTTLAfterCheckpoint(ctx context
 			return nil
 		}
 		return fmt.Errorf("get terminal HA admin Job %s before enabling TTL: %w", action.AdminJobName, err)
+	}
+	// A terminal phase alone does not checkpoint machine-readable evidence.
+	// Keep the original pod/logs available for recovery until it is validated.
+	if action.AdminJobPhase == haAdminJobPhaseSucceeded &&
+		haActionRequiresSeedArtifactReceipt(haActionKind(action.Kind)) && !haAdminActionSucceededWithEvidence(*action) {
+		if job.Spec.TTLSecondsAfterFinished == nil {
+			return nil
+		}
+		patch := client.MergeFrom(job.DeepCopy())
+		job.Spec.TTLSecondsAfterFinished = nil
+		if err := r.Patch(ctx, job, patch); err != nil {
+			return fmt.Errorf("disable TTL cleanup for HA admin Job %s missing receipt evidence: %w", action.AdminJobName, err)
+		}
+		return nil
 	}
 	desired := haAdminJobTTLSecondsAfterFinished(admin)
 	if job.Spec.TTLSecondsAfterFinished != nil && *job.Spec.TTLSecondsAfterFinished == desired {

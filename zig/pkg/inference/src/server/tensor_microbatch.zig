@@ -600,7 +600,7 @@ const TestSubmit = struct {
             return;
         };
     }
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.output) |output| destroy(self.output_allocator, output);
         self.output = null;
     }

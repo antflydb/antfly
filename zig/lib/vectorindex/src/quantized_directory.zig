@@ -72,7 +72,7 @@ const ReorderedLeaf = struct {
         return .{ .set = reordered, .members = ids, .projections = values, .plan_bytes = encoded };
     }
 
-    fn deinit(self: *ReorderedLeaf, alloc: Allocator) void {
+    pub fn deinit(self: *ReorderedLeaf, alloc: Allocator) void {
         self.set.deinit(alloc);
         alloc.free(self.members);
         alloc.free(self.projections);
@@ -841,7 +841,7 @@ pub const View = struct {
 
     pub fn asProto(self: View) proto.RaBitQuantizedVectorSet {
         return .{
-            .metric = @enumFromInt(self.metric),
+            .metric = @fromBackingInt(self.metric),
             .centroid = @constCast(self.centroid),
             .codes = .{
                 .count = @intCast(self.count),
@@ -1323,7 +1323,7 @@ const TestingSink = struct {
     alloc: Allocator,
     out: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn deinit(self: *TestingSink) void {
+    pub fn deinit(self: *TestingSink) void {
         self.out.deinit(self.alloc);
     }
 

@@ -14,10 +14,10 @@
 // limitations.
 
 const std = @import("std");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const catalog = @import("catalog.zig");
-const ast = @import("ast.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
 const Backend = struct {
     fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
         return error.UnexpectedBackendCall;
@@ -170,7 +170,7 @@ test "SQL EXISTS validates discarded expressions without evaluating them" {
             try std.testing.expect(result.output.rows[0][0].bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     for ([_]struct { query: []const u8, err: anyerror }{
         .{ .query = "SELECT EXISTS (SELECT missing + 1 FROM (SELECT 1 AS x) i)", .err = error.UndefinedColumn },
@@ -229,7 +229,7 @@ test "SQL membership unwinds allocations admits parameters and fails closed outs
             try std.testing.expect(result.output.rows[0][0].bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT x FROM (SELECT 1 AS x) i)", .{});
     defer compiled.deinit();
@@ -307,7 +307,7 @@ test "SQL membership bounded hash projections share one capture instead of per r
     var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM outer_rows o WHERE o.x+1 IN (SELECT i.x+1 FROM inner_rows i)", .{});
     defer compiled.deinit();
     {
-        var description = try @import("describe.zig").describe(std.testing.allocator, fixture.backend(), &compiled, &.{});
+        var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, fixture.backend(), &compiled, &.{});
         defer description.deinit();
         const join = description.binding.relation.?.root.operation.join;
         try std.testing.expectEqual(@as(usize, 1), join.left_keys.len);
@@ -519,7 +519,7 @@ test "SQL composed correlated aggregates retain empty group defaults and compute
             try std.testing.expectEqualStrings("10", result.output.rows[1][1].string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT i.y + SUM(i.y) FROM (SELECT 1 AS y) i)", .{});
     defer compiled.deinit();
@@ -587,7 +587,7 @@ test "SQL decorrelation unwinds every allocation and enforces shared memory admi
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT EXISTS (SELECT 1)", .{});
     defer compiled.deinit();
@@ -598,7 +598,7 @@ test "SQL correlated scalar parameter constraints propagate through join and res
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT $1 FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2 AS x) o WHERE o.x=1", .{});
     defer compiled.deinit();
-    var description = try @import("describe.zig").describe(std.testing.allocator, backend.backend(), &compiled, &.{});
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
     defer description.deinit();
     try std.testing.expectEqualSlices(?ast.ColumnType, &.{ .integer, .integer }, description.binding.parameter_types);
     var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{ .{ .integer = 7 }, .{ .integer = 1 } }, .{});

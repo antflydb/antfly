@@ -175,13 +175,13 @@ fn consume(parameters: []const run.Parameter, seen: []bool, name: []const u8, di
 }
 
 fn testLayout(a: Allocator, dora: bool) !void {
-    const base0 = [_]f32{1} ** 32;
-    const base2 = [_]f32{1} ** 8;
-    const initial_a0 = [_]f32{0.2} ** 8;
-    const initial_b0 = [_]f32{0} ** 16;
-    const initial_m0 = [_]f32{2} ** 8;
-    const initial_a2 = [_]f32{0.1} ** 16;
-    const initial_b2 = [_]f32{0} ** 2;
+    const base0 = @as([32]f32, @splat(1));
+    const base2 = @as([8]f32, @splat(1));
+    const initial_a0 = @as([8]f32, @splat(0.2));
+    const initial_b0 = @as([16]f32, @splat(0));
+    const initial_m0 = @as([8]f32, @splat(2));
+    const initial_a2 = @as([16]f32, @splat(0.1));
+    const initial_b2 = @as([2]f32, @splat(0));
     const initial_m2 = [_]f32{2.828427};
     const original = [_]run.Parameter{
         .{ .name = "classifier.0.weight", .canonical_name = "classifier.0.weight", .dimensions = &.{ 8, 4 }, .values = &base0, .kind = .original },

@@ -14,9 +14,9 @@
 // limitations.
 
 //! Integration coverage for public handles and private server owners.
-const public = @import("db.zig");
+const public = @import("antfly_local_sources").capi_db;
 const server_api = @import("server_owner.zig");
-const shared = @import("handles.zig");
+const shared = @import("antfly_local_sources").capi_handles;
 const antfly = server_api.antfly;
 const storage_root = server_api.storage_root;
 const replication_ingress = server_api.replication_ingress;
@@ -262,7 +262,7 @@ const metadataApplyPreparedSnapshotCancel = server_api.metadataApplyPreparedSnap
 const metadataApplyPreparedSnapshotDestroy = server_api.metadataApplyPreparedSnapshotDestroy;
 const metadataApplyStoreAddListeners = server_api.metadataApplyStoreAddListeners;
 const metadataApplyStoreRemoveListeners = server_api.metadataApplyStoreRemoveListeners;
-const metadataApplyStoreBindHA = server_api.metadataApplyStoreBindHA;
+const metadataApplyStoreBindHotStandby = server_api.metadataApplyStoreBindHotStandby;
 const metadataApplyStoreProjection = server_api.metadataApplyStoreProjection;
 const metadataReconcileReplicaRoot = server_api.metadataReconcileReplicaRoot;
 const dataApplyStoreOpen = server_api.dataApplyStoreOpen;
@@ -305,11 +305,11 @@ const storageOwnerBulkBegin = server_api.storageOwnerBulkBegin;
 const storageOwnerBulkFinish = server_api.storageOwnerBulkFinish;
 const storageOwnerBulkAbort = server_api.storageOwnerBulkAbort;
 const storageOwnerOperationTableName = server_api.storageOwnerOperationTableName;
-const storageHASeedFailure = server_api.storageHASeedFailure;
-const validateHASeedRequest = server_api.validateHASeedRequest;
-const storageHASeedActivateJson = server_api.storageHASeedActivateJson;
-const storageHASeedValidateJson = server_api.storageHASeedValidateJson;
-const storageHASeedPruneJson = server_api.storageHASeedPruneJson;
+const storageHotStandbySeedFailure = server_api.storageHotStandbySeedFailure;
+const validateHotStandbySeedRequest = server_api.validateHotStandbySeedRequest;
+const storageHotStandbySeedActivateJson = server_api.storageHotStandbySeedActivateJson;
+const storageHotStandbySeedValidateJson = server_api.storageHotStandbySeedValidateJson;
+const storageHotStandbySeedPruneJson = server_api.storageHotStandbySeedPruneJson;
 const StorageOwnerDocumentChildRangeDispatch = server_api.StorageOwnerDocumentChildRangeDispatch;
 const StorageOwnerCommittedBatchEffects = server_api.StorageOwnerCommittedBatchEffects;
 const storageOwnerCallbackStatusToError = server_api.storageOwnerCallbackStatusToError;
@@ -641,7 +641,7 @@ fn tempTestAflitePath(alloc: Allocator, root: []const u8, label: []const u8) ![:
     defer alloc.free(base);
     const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 const lite_restore_options = capi.OpenOptions{ .storage_kind = capi.storage_kind_lite };
@@ -687,7 +687,7 @@ const JsonWritePair = struct {
         };
     }
 
-    fn deinit(self: *JsonWritePair, alloc: Allocator) void {
+    pub fn deinit(self: *JsonWritePair, alloc: Allocator) void {
         alloc.free(self.key_b64);
         alloc.free(self.value_b64);
         self.* = undefined;
@@ -1125,7 +1125,7 @@ test "storage owner open rejects prior ABI before reading expanded request field
 test "storage HA seed boundary preserves status and exact failure identity" {
     var response: kernel_owner_abi.OwnedBytes = .{};
     var failure: kernel_owner_abi.FailureIdentity = .{};
-    const status = storageHASeedActivateJson(&.{
+    const status = storageHotStandbySeedActivateJson(&.{
         .version = 0,
         .operation = .activate,
         .request_json = .fromSlice("{}"),
@@ -1133,7 +1133,7 @@ test "storage HA seed boundary preserves status and exact failure identity" {
     try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, status);
     try std.testing.expectEqual(status, failure.status);
     try std.testing.expectEqual(kernel_owner_abi.FailureBoundary.storage_owner, failure.boundary);
-    try std.testing.expectEqual(@intFromEnum(kernel_owner_abi.HASeedOperation.activate), failure.operation);
+    try std.testing.expectEqual(@backingInt(kernel_owner_abi.HASeedOperation.activate), failure.operation);
     try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
     try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
     try std.testing.expectEqual(@as(u64, 0), response.len);
@@ -1398,7 +1398,7 @@ test "capi transaction lifecycle" {
     const txn_id: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_begin_transaction_with_id(handle_ptr, null, 1_000, null, 0));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_write_transaction(handle_ptr, null, null, 0, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @backingInt(transactions_mod.TxnStatus.committed), 2_000));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, &txn_id, null));
     var reset_status: u8 = 99;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, null, &reset_status));
@@ -1418,11 +1418,11 @@ test "capi transaction lifecycle" {
         },
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(handle_ptr, &txn_id, &writes, writes.len, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(handle_ptr, &txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(handle_ptr, &txn_id, @backingInt(transactions_mod.TxnStatus.committed), 2_000));
 
     var status: u8 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(handle_ptr, &txn_id, &status));
-    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), status);
+    try std.testing.expectEqual(@as(u8, @backingInt(transactions_mod.TxnStatus.committed)), status);
 
     var commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(handle_ptr, &txn_id, &commit_version));
@@ -1557,7 +1557,7 @@ test "capi SQL mutations fence exact primary bytes with unchanged TTL and schema
         defer alloc.free(schema);
         try database.setSchemaJson(alloc, schema);
         try database.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":1,\"expires\":\"2090-01-01T00:00:00Z\"}" }} });
-        var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "items" };
+        var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "items" };
         const backend = adapter.backend();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
@@ -1592,8 +1592,8 @@ test "capi SQL local integrity coordinator enforces unique arbitration and self 
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"parent_fk","child_columns":["parent"],"parent_table":"rows","parent_columns":["id"],"on_delete":"cascade","on_update":"cascade"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
     try database.setSchemaJson(alloc, schema);
-    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
-    const sql = @import("sql.zig");
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("antfly_local_sources").capi_sql;
     for ([_]struct { statement: []const u8, count: u64 }{
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('p',1,NULL),('c',2,1)", .count = 2 },
         .{ .statement = "INSERT INTO rows (_id,id,parent) VALUES ('skipped',1,NULL) ON CONFLICT (id) DO NOTHING RETURNING id", .count = 0 },
@@ -1648,8 +1648,8 @@ test "capi SQL native expression partial unique claims reject collisions and arb
     try database.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"email_key","keys":[{"expression":{"op":"lower_ascii","args":[{"op":"column","column":"email"}]},"result_type":"string"}],"where":[{"column":"active","op":"eq","value":true}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"active":{"type":"boolean"}},"additionalProperties":false}}}}
     );
-    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
-    const sql = @import("sql.zig");
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("antfly_local_sources").capi_sql;
     for ([_]struct { statement: []const u8, count: u64 }{
         .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('a','Alice',TRUE)", .count = 1 },
         .{ .statement = "INSERT INTO rows (_id,email,active) VALUES ('skip','ALICE',TRUE) ON CONFLICT DO NOTHING", .count = 0 },
@@ -1693,8 +1693,8 @@ test "capi SQL local integrity refuses partial ownership instead of inventing co
     try database.setSchemaJson(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     );
-    var adapter = @import("sql.zig").Adapter(antfly){ .db = &database, .table_name = "rows" };
-    const sql = @import("sql.zig");
+    var adapter = @import("antfly_local_sources").capi_sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    const sql = @import("antfly_local_sources").capi_sql;
     var compiled = try sql.compiler.compile(alloc, "INSERT INTO rows (_id,id) VALUES ('k',1)", .{});
     defer compiled.deinit();
     try std.testing.expectError(error.UnsupportedSqlExecution, sql.runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{}));
@@ -1958,12 +1958,12 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_snapshot_file_path);
 
     try std.testing.expectEqual(@as(u32, 2), antfly_abi_version());
-    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
-    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
-    try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.outcome_unknown))));
-    try std.testing.expectEqualStrings("ANTFLY_UNSUPPORTED", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.unsupported))));
+    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.ok))));
+    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.outcome_unknown))));
+    try std.testing.expectEqualStrings("ANTFLY_UNSUPPORTED", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.unsupported))));
     try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@backingInt(capi.ErrorCode.busy))), "retry") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.WriterLocked));
@@ -2111,7 +2111,16 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    const format_version = blk: {
+        // Simulate the allocator's exclusive file lock. Handle status must
+        // remain available without opening a competing external reader.
+        var held = try std.Io.Dir.cwd().openFile(std.testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close(std.testing.io);
+        const guard = public.enterHandle(src_handle, .read) orelse return error.InvalidHandle;
+        defer guard.leave();
+        break :blk guard.handle.owned_lite_backend.?.storageStatus().format_version.?;
+    };
+    const expected_format_version = try std.fmt.allocPrint(alloc, "\"format_version\":{d}", .{format_version});
     defer alloc.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, status_json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
@@ -2327,10 +2336,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .is_delete = false,
     }};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(src_handle, &lite_txn_id, &txn_writes, txn_writes.len, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 4_000));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @backingInt(transactions_mod.TxnStatus.committed), 4_000));
     var lite_txn_status: u8 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(src_handle, &lite_txn_id, &lite_txn_status));
-    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), lite_txn_status);
+    try std.testing.expectEqual(@as(u8, @backingInt(transactions_mod.TxnStatus.committed)), lite_txn_status);
     var lite_txn_commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(src_handle, &lite_txn_id, &lite_txn_commit_version));
     try std.testing.expectEqual(@as(u64, 4_000), lite_txn_commit_version);
@@ -2568,7 +2577,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .format_version = backup_codec.format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
+        .backup_id = @as([16]u8, @splat(0)),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -3187,7 +3196,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .reserved0 = 1,
         .inference_host_budget_mb = 1,
         .busy_timeout_ms = 1,
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
@@ -3220,7 +3229,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .open_mode = capi.open_mode_readonly,
         .profile = capi.profile_native,
         .flags = std.math.maxInt(u32),
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &defaults, &default_handle));
     antfly_db_close(default_handle);
@@ -3514,6 +3523,17 @@ test "capi search json returns stamped identity generation" {
         cleanupTestDir(path);
     }
 
+    // Evaluation must fail before either the Lite fallback or linked storage
+    // path can return an unfiltered public result.
+    const evaluated_query = "{\"full_text_search\":{\"match_all\":{}},\"evaluate\":{\"scope\":\"candidates\",\"candidate_count\":2,\"compute\":{\"x\":{\"literal\":1}},\"where\":{\"eq\":[{\"literal\":1},{\"literal\":0}]}}}";
+    var rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.mapError(error.UnsupportedQueryRequest), antfly_db_search_json(
+        handle_id,
+        .{ .ptr = evaluated_query.ptr, .len = evaluated_query.len },
+        &rejected,
+    ));
+    try std.testing.expect(rejected.ptr == null);
+
     try handle.db.addIndex(.{
         .name = "dv_v1",
         .kind = .dense_vector,
@@ -3660,7 +3680,7 @@ test "capi request paths trigger readable lease hook" {
     cleanupTestDir(path);
 
     const Recorder = struct {
-        contexts: [9][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 9,
+        contexts: [9][32]u8 = @as([9][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         group_ids: [9]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         count: usize = 0,
@@ -3848,8 +3868,8 @@ test "capi relational expression errors preserve public status semantics" {
     // Keep the public C error mapping aligned without importing schema source
     // across the standalone C ABI module's directory boundary.
     const expression_errors = antfly.capi_dependencies.relational_expression_errors;
-    inline for (@typeInfo(expression_errors.Error).error_set.?) |field| {
-        const err = @field(expression_errors.Error, field.name);
+    inline for (@typeInfo(expression_errors.Error).error_set.error_names.?) |field| {
+        const err = @field(expression_errors.Error, field);
         try std.testing.expectEqual(if (expression_errors.isInvalidInput(err)) capi.ErrorCode.invalid_argument else capi.ErrorCode.intent_conflict, capi.mapError(err));
     }
 }
@@ -4254,7 +4274,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
         fn acknowledge(ptr: ?*anyopaque, txn: *const kernel_owner_abi.TxnId, owner: kernel_owner_abi.BorrowedBytes, items: ?[*]const kernel_owner_abi.BorrowedBytes, len: usize) callconv(.c) kernel_owner_abi.Status {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
-            std.testing.expectEqual([_]u8{5} ** 16, txn.bytes) catch return .internal;
+            std.testing.expectEqual(@as([16]u8, @splat(5)), txn.bytes) catch return .internal;
             std.testing.expectEqualStrings("owner", owner.slice()) catch return .internal;
             std.testing.expectEqual(@as(usize, 2), len) catch return .internal;
             std.testing.expectEqualStrings("first", items.?[0].slice()) catch return .internal;
@@ -4268,7 +4288,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     bridge.owner_id = &owner_id;
     bridge.config = .{ .callback_ctx = &capture, .replicated_metadata = 1, .acknowledge_participants_fn = Capture.acknowledge };
     const config = bridge.dbConfig();
-    try std.testing.expect(config.acknowledge_participants_fn != null);
+    try std.testing.expect(config.factory != null);
     try StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" });
     for ([_]anyerror{ error.UnsupportedOperation, error.UnsupportedRaftBatchProtocolVersion, error.RaftBatchWriteOutcomeUnknown }) |err| {
         capture.result = kernel_error_identity.statusFromError(err);
@@ -4277,9 +4297,186 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
     try std.testing.expectError(error.InvalidParticipant, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{}));
     try std.testing.expectEqual(@as(usize, 4), capture.calls);
     bridge.config.acknowledge_participants_fn = null;
-    try std.testing.expect(bridge.dbConfig().acknowledge_participants_fn == null);
+    try std.testing.expectError(error.UnsupportedOperation, StorageOwnerTransactionRecovery.acknowledgeParticipants(&bridge, @splat(5), "owner", &.{ "first", "second" }));
 }
 
 // These callbacks are installed only by the private server owner. Public Lite
 // handles share the registry and destruction ordering without importing server
 // context, recovery, or coordination implementations.
+
+test "capi fact relationships preserve identities and filter before ranking" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-facts");
+    defer directory.cleanup();
+    const path = try tempTestPath(alloc, directory.path(), "facts");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer antfly_db_close(handle_ptr);
+    const handle = asHandle(handle_ptr).?;
+    try handle.db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try handle.db.batch(.{
+        .writes = &.{
+            .{ .key = "a", .value = "{}" },            .{ .key = "b", .value = "{}" },
+            .{ .key = "fact:one", .value = "{}" },     .{ .key = "fact:two", .value = "{}" },
+            .{ .key = "fact:expired", .value = "{}" },
+        },
+        .graph_writes = &.{
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 1, .metadata_json = "{\"value\":1.0000000000000001}" },
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "two", .owner_document = "fact:two", .weight = 2, .metadata_json = "{}" },
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "expired", .owner_document = "fact:expired", .weight = 0.1, .metadata_json = "{\"invalid_at\":\"2020-01-01T00:00:00Z\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    var edge_output: capi.Buffer = .{};
+    defer freeRawBuffer(edge_output.ptr, edge_output.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{ .ptr = "facts", .len = 5 }, .{ .ptr = "a", .len = 1 }, .{ .ptr = "R", .len = 1 }, 0, &edge_output));
+    const edge_bytes = edge_output.ptr.?[0..edge_output.len];
+    try std.testing.expect(std.mem.indexOf(u8, edge_bytes, "\"edge_id_b64\":\"b25l\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_bytes, "\"owner_document_b64\":\"ZmFjdDpvbmU=\"") != null);
+    const requests = [_][]const u8{
+        \\{"index_name":"facts","start_key_b64":"YQ==","max_depth":1,"deduplicate_nodes":false,"include_paths":true,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","weight_mode":"min_weight","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","weight_mode":"min_weight","k":3,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}
+        ,
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"deduplicate":false,"include_paths":true,"max_depth":1,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}],"named_sets":[]}
+        ,
+    };
+    for (requests, 0..) |request, i| {
+        var output: capi.Buffer = .{};
+        defer freeRawBuffer(output.ptr, output.len);
+        const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
+        const status = switch (i) {
+            0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
+            1 => antfly_db_find_shortest_path_json(handle_ptr, slice, &output),
+            2 => antfly_db_find_k_shortest_paths_json(handle_ptr, slice, &output),
+            else => antfly_db_execute_graph_queries_json(handle_ptr, slice, &output),
+        };
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"b25l\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"owner_document_b64\":\"ZmFjdDpvbmU=\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "ZXhwaXJlZA==") == null);
+        if (i != 1) try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"dHdv\"") != null);
+    }
+    const decimal_requests = [_][]const u8{
+        \\{"index_name":"facts","start_key_b64":"YQ==","max_depth":1,"include_paths":true,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","k":2,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"include_paths":true,"max_depth":1,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}],"named_sets":[]}
+        ,
+    };
+    for (decimal_requests, 0..) |request, i| {
+        var output: capi.Buffer = .{};
+        defer freeRawBuffer(output.ptr, output.len);
+        const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
+        const status = switch (i) {
+            0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
+            1 => antfly_db_find_shortest_path_json(handle_ptr, slice, &output),
+            2 => antfly_db_find_k_shortest_paths_json(handle_ptr, slice, &output),
+            else => antfly_db_execute_graph_queries_json(handle_ptr, slice, &output),
+        };
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"b25l\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"dHdv\"") == null);
+    }
+    for ([_][]const u8{
+        "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":true}",
+        "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":[]}",
+        "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":42}",
+    }) |malformed| {
+        var rejected: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_traverse_edges_json(handle_ptr, .{ .ptr = malformed.ptr, .len = malformed.len }, &rejected));
+    }
+    const bad = "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":{\"known_at\":\"bad\"}}";
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_traverse_edges_json(handle_ptr, .{ .ptr = bad.ptr, .len = bad.len }, &output));
+}
+
+test "capi fact path serialization and parsing release partial allocations" {
+    const alloc = std.testing.allocator;
+    const edge = paths_mod.PathEdge{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one\xff", .owner_document = "fact\x00", .weight = 1, .metadata = "{\"tenant\":\"g\"}", .traversal_direction = .out };
+    const Case = struct {
+        fn serialize(a: Allocator, value: paths_mod.PathEdge) !void {
+            var encoded = try JsonPathEdge.init(a, value);
+            defer encoded.deinit(a);
+            const decoded_id = try decodeBase64Alloc(a, encoded.edge_id_b64.?);
+            defer a.free(decoded_id);
+            try std.testing.expectEqualStrings(value.edge_id, decoded_id);
+            try std.testing.expectEqualStrings(value.metadata, encoded.metadata_json);
+        }
+        fn parse(a: Allocator) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"properties\":[{\"field\":\"/metadata/tenant\",\"op\":\"eq\",\"value\":\"g\"}]}", .{});
+            defer parsed.deinit();
+            var query = try parseGraphQueryRequestOwned(a, .{ .name = "walk", .type = "traverse", .index_name = "facts", .start_nodes = .{ .keys = &.{"YQ=="} }, .edge_types = &.{"R"}, .edge_filter = parsed.value });
+            defer deinitOwnedGraphQuery(a, &query);
+            try std.testing.expect(query.params.edge_filter.active());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.serialize, .{edge});
+    try std.testing.checkAllAllocationFailures(alloc, Case.parse, .{});
+}
+
+test "capi fact algebraic paths retain provenance and respect frontier limits" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-fact-algebraic");
+    defer directory.cleanup();
+    const path = try tempTestPath(alloc, directory.path(), "facts");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer antfly_db_close(handle_ptr);
+    const handle = asHandle(handle_ptr).?;
+    try handle.db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}" });
+    try handle.db.batch(.{
+        .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" }, .{ .key = "c", .value = "{}" }, .{ .key = "d", .value = "{}" }, .{ .key = "fact:one", .value = "{}" } },
+        .graph_writes = &.{
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 2, .metadata_json = "{\"fact\":1}" },
+            .{ .index_name = "facts", .source = "a", .target = "c", .edge_type = "R", .edge_id = "two" },
+            .{ .index_name = "facts", .source = "b", .target = "d", .edge_type = "R", .edge_id = "three" },
+        },
+        .sync_level = .full_index,
+    });
+    for ([_]usize{ (paths_mod.PathFindOptions{}).max_intermediate_states, 8 }) |frontier_limit| {
+        for ([_]graph_mod.EdgeDirection{ .out, .in, .both }) |direction| {
+            const source: []const u8 = if (direction == .in) "b" else "a";
+            const target: []const u8 = if (direction == .in) "a" else "b";
+            const result = (try handle.db.findShortestPathWithOptions(alloc, "facts", source, target, .{ .direction = direction, .weight_mode = .min_hops, .max_depth = 2, .max_intermediate_states = frontier_limit })).?;
+            defer paths_mod.freePath(alloc, result);
+            try std.testing.expectEqualStrings("one", result.edges[0].edge_id);
+            try std.testing.expectEqualStrings("fact:one", result.edges[0].owner_document);
+            try std.testing.expectEqualStrings("{\"fact\":1}", result.edges[0].metadata);
+            try std.testing.expectEqual(if (direction == .in) graph_mod.EdgeDirection.in else graph_mod.EdgeDirection.out, result.edges[0].traversal_direction.?);
+        }
+    }
+    const queries = [_][]const u8{
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"include_paths":true,"max_depth":1}],"named_sets":[]}
+        ,
+        \\{"graph_queries":[{"name":"path","type":"shortest_path","index_name":"facts","start_nodes":{"keys":["YQ=="]},"target_nodes":{"keys":["Yg=="]},"weight_mode":"min_hops","max_depth":2}],"named_sets":[]}
+        ,
+    };
+    for (queries) |query| {
+        var output: capi.Buffer = .{};
+        defer freeRawBuffer(output.ptr, output.len);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_execute_graph_queries_json(handle_ptr, .{ .ptr = query.ptr, .len = query.len }, &output));
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "fact:one") != null or std.mem.indexOf(u8, bytes, "ZmFjdDpvbmU=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\\\"fact\\\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"traversal_direction\":0") != null);
+    }
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, handle.db.findKShortestPathsWithOptions(alloc, "facts", "a", "d", 1, .{ .weight_mode = .min_hops, .max_depth = 2, .max_intermediate_states = 1 }));
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, handle.db.findShortestPathWithOptions(alloc, "facts", "a", "d", .{ .weight_mode = .min_hops, .max_depth = 2, .max_intermediate_states = 1 }));
+}
+
+test "capi fact edge cleanup releases the owned array exactly once" {
+    const alloc = std.testing.allocator;
+    const edges = try alloc.alloc(graph_mod.Edge, 1);
+    edges[0] = .{ .source = "", .target = "", .edge_type = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    graphFreeEdges(alloc, edges);
+}

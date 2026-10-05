@@ -24,7 +24,7 @@ data should be represented explicitly instead of being silently aggregated away.
 
 The current code already has the beginning of a status plane:
 
-- `pkg/antfly/src/api/runtime_status.zig`
+- `pkg/antfly-embedded/src/local/api/runtime_status.zig`
   - Defines `LocalTableRuntimeStatus`, `LocalTableRuntimeStatuses`,
     `TableRuntimeSnapshot`, and `TableRuntimeSnapshotCache`.
   - The cache stores in-memory per-table snapshots and supports full replace,

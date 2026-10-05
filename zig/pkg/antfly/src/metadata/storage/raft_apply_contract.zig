@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const metadata = @import("../domain.zig");
-const metadata_incarnation = @import("../incarnation.zig");
+const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
 const metadata_table_manager = @import("../table_manager.zig");
 const topology_protocol = @import("../topology_protocol.zig");
 
@@ -103,14 +103,14 @@ pub const StandaloneCatalogUpdate = struct {
     /// An exact physical-root proof for native schema finalization, or a
     /// binding-only first registration before any FK publication begins.
     native_owner: ?@import("../standalone_native_owner.zig").Binding = null,
-    import_catalog: ?@import("../../system_catalog/domain.zig").State = null,
+    import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
-    setting_command: ?@import("../../system_catalog/settings.zig").Command = null,
-    policy_command: ?@import("../../system_catalog/policies.zig").Command = null,
+    setting_command: ?@import("antfly_local_sources").system_catalog_settings.Command = null,
+    policy_command: ?@import("antfly_local_sources").system_catalog_policies.Command = null,
     logical: ?struct {
         previous_revision: u64,
-        delta: @import("../../system_catalog/domain.zig").Delta,
+        delta: @import("antfly_local_sources").system_catalog_domain.Delta,
     } = null,
 };
 
@@ -205,7 +205,7 @@ pub const CommittedKeyListener = struct {
 /// Process-local token used to detach and drain one registered callback pair.
 pub const LifecycleListenerRegistration = struct { id: u64 };
 
-const system_catalog = @import("../../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 
 pub const TableTopologyMutation = union(enum) {
     create: struct {
@@ -260,12 +260,12 @@ pub const CatalogProjectionRequest = union(enum) {
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
-    sql_setting_snapshot: @import("../../system_catalog/settings.zig").Scope,
+    sql_setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
     sql_policy_snapshot: struct { table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8 },
-    sql_policy_install_snapshot: @import("../../system_catalog/policies.zig").InstallRequest,
+    sql_policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
     sql_policy_publication_status: u64,
     sql_policy_publication_work: u64,
-    sql_policy_begin_command: @import("../../system_catalog/policies.zig").BeginRequest,
+    sql_policy_begin_command: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
     require_policy_index_mutation_allowed: u64,
     require_policy_topology_mutation_allowed: u64,
     fk_generation_publication_status: u64,

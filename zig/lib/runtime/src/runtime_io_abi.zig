@@ -19,7 +19,7 @@
 //! The Receiver must stay at a stable address until its tasks and I/O finish.
 const std = @import("std");
 const native = @import("runtime_native_abi.zig");
-const fields = std.meta.fields(std.Io.VTable);
+const fields = @typeInfo(std.Io.VTable).@"struct".field_names;
 const ErrorName = extern struct { ptr: [*]const u8, len: usize };
 const ErrorNames = *const fn (u16) callconv(.c) ErrorName;
 
@@ -29,9 +29,9 @@ fn errorName(code: u16) callconv(.c) ErrorName {
 }
 
 fn decodeError(comptime E: type, name: ErrorName) E {
-    inline for (@typeInfo(E).error_set.?) |item| {
-        if (std.mem.eql(u8, name.ptr[0..name.len], item.name))
-            return @field(E, item.name);
+    inline for (@typeInfo(E).error_set.error_names.?) |item| {
+        if (std.mem.eql(u8, name.ptr[0..name.len], item))
+            return @field(E, item);
     }
     @panic("incompatible executor error domain");
 }
@@ -41,11 +41,11 @@ fn hasErrors(comptime T: type) bool {
         .error_set, .error_union => true,
         .optional => |info| hasErrors(info.child),
         .@"struct" => |info| blk: {
-            for (info.fields) |field| if (hasErrors(field.type)) break :blk true;
+            for (info.field_types) |field_type| if (hasErrors(field_type)) break :blk true;
             break :blk false;
         },
         .@"union" => |info| blk: {
-            for (info.fields) |field| if (hasErrors(field.type)) break :blk true;
+            for (info.field_types) |field_type| if (hasErrors(field_type)) break :blk true;
             break :blk false;
         },
         else => false,
@@ -60,20 +60,20 @@ fn Wire(comptime T: type) type {
         .error_union => |info| struct { failure: ?ErrorName, value: Wire(info.payload) },
         .optional => |info| ?Wire(info.child),
         .@"struct" => |info| blk: {
-            var names: [info.fields.len][]const u8 = undefined;
-            var types: [info.fields.len]type = undefined;
-            for (info.fields, 0..) |field, i| {
-                names[i] = field.name;
-                types[i] = Wire(field.type);
+            var names: [info.field_names.len][]const u8 = undefined;
+            var types: [info.field_names.len]type = undefined;
+            for (info.field_names, info.field_types, 0..) |reflected_name, field_type, i| {
+                names[i] = reflected_name;
+                types[i] = Wire(field_type);
             }
             break :blk @Struct(.auto, null, &names, &types, &@splat(.{}));
         },
         .@"union" => |info| blk: {
-            var names: [info.fields.len][]const u8 = undefined;
-            var types: [info.fields.len]type = undefined;
-            for (info.fields, 0..) |field, i| {
-                names[i] = field.name;
-                types[i] = Wire(field.type);
+            var names: [info.field_names.len][]const u8 = undefined;
+            var types: [info.field_names.len]type = undefined;
+            for (info.field_names, info.field_types, 0..) |reflected_name, field_type, i| {
+                names[i] = reflected_name;
+                types[i] = Wire(field_type);
             }
             break :blk @Union(.auto, info.tag_type.?, &names, &types, &@splat(.{}));
         },
@@ -92,7 +92,7 @@ fn encode(comptime T: type, value: T) Wire(T) {
         .optional => |info| if (value) |payload| encode(info.child, payload) else null,
         .@"struct" => |info| blk: {
             var result: Wire(T) = undefined;
-            inline for (info.fields) |field| @field(result, field.name) = encode(field.type, @field(value, field.name));
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(result, reflected_name) = encode(field_type, @field(value, reflected_name));
             break :blk result;
         },
         .@"union" => switch (value) {
@@ -110,7 +110,7 @@ fn decode(comptime T: type, value: Wire(T)) T {
         .optional => |info| if (value) |payload| decode(info.child, payload) else null,
         .@"struct" => |info| blk: {
             var result: T = undefined;
-            inline for (info.fields) |field| @field(result, field.name) = decode(field.type, @field(value, field.name));
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(result, reflected_name) = decode(field_type, @field(value, reflected_name));
             break :blk result;
         },
         .@"union" => switch (value) {
@@ -130,7 +130,7 @@ fn remap(comptime T: type, value: T, names: ErrorNames) T {
         .optional => |info| if (value) |payload| remap(info.child, payload, names) else null,
         .@"struct" => |info| blk: {
             var result: T = undefined;
-            inline for (info.fields) |field| @field(result, field.name) = remap(field.type, @field(value, field.name), names);
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(result, reflected_name) = remap(field_type, @field(value, reflected_name), names);
             break :blk result;
         },
         .@"union" => switch (value) {
@@ -165,7 +165,7 @@ const ReaderState = struct {
         return .{ .file = reader.file, .err = reader.err, .mode = reader.mode, .pos = reader.pos, .size = reader.size, .size_err = reader.size_err, .seek_err = reader.seek_err, .buffer = reader.interface.buffer, .seek = reader.interface.seek, .end = reader.interface.end };
     }
 
-    fn restore(self: ReaderState, reader: *std.Io.File.Reader) void {
+    pub fn restore(self: ReaderState, reader: *std.Io.File.Reader) void {
         reader.file = self.file;
         reader.err = self.err;
         reader.mode = self.mode;
@@ -215,17 +215,17 @@ pub const Receiver = struct {
         var args: Args = args_value;
         var reader_transfer: ReaderTransfer = undefined;
         var reader_ptr: ?*std.Io.File.Reader = null;
-        inline for (std.meta.fields(Args)) |field| {
-            if (comptime field.type == *std.Io.File.Reader) {
-                reader_ptr = @field(args, field.name);
+        inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime field_type == *std.Io.File.Reader) {
+                reader_ptr = @field(args, reflected_name);
                 reader_transfer = .{ .executor = Borrow.init(&reader_ptr.?.io), .state = encode(ReaderState, ReaderState.capture(reader_ptr.?)) };
             }
         }
         var output: Wire(Return(name)) = undefined;
         self.borrow.dispatch(&self.borrow, @intCast(std.meta.fieldIndex(std.Io.VTable, name).?), &args, @ptrCast(&output), if (reader_ptr != null) &reader_transfer else null, errorName);
         if (reader_ptr) |reader| decode(ReaderState, reader_transfer.state).restore(reader);
-        inline for (std.meta.fields(Args)) |field| {
-            if (comptime field.type == *std.Io.Batch) remapBatch(@field(args, field.name), self.borrow.error_names);
+        inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime field_type == *std.Io.Batch) remapBatch(@field(args, reflected_name), self.borrow.error_names);
         }
         return decode(Return(name), output);
     }
@@ -245,7 +245,7 @@ fn Return(comptime name: []const u8) type {
     return @typeInfo(Function(name)).@"fn".return_type.?;
 }
 fn parameter(comptime name: []const u8, comptime i: usize) type {
-    return @typeInfo(Function(name)).@"fn".params[i].type.?;
+    return @typeInfo(Function(name)).@"fn".param_types[i].?;
 }
 fn receiver(ptr: ?*anyopaque) *Receiver {
     return @ptrCast(@alignCast(ptr.?));
@@ -277,7 +277,7 @@ fn wrapper(comptime name: []const u8) @FieldType(std.Io.VTable, name) {
             return receiver(p0).call(name, .{ p0, p1, p2, p3, p4, p5, p6, p7 });
         }
     };
-    return switch (@typeInfo(Function(name)).@"fn".params.len) {
+    return switch (@typeInfo(Function(name)).@"fn".param_types.len) {
         1 => &W.f1,
         2 => &W.f2,
         3 => &W.f3,
@@ -309,7 +309,7 @@ fn unlockStderr(ptr: ?*anyopaque) void {
 const vtable: std.Io.VTable = blk: {
     @setEvalBranchQuota(100_000);
     var result: std.Io.VTable = undefined;
-    for (fields) |field| @field(result, field.name) = wrapper(field.name);
+    for (fields) |field_name| @field(result, field_name) = wrapper(field_name);
     result.lockStderr = lockStderr;
     result.tryLockStderr = tryLockStderr;
     result.unlockStderr = unlockStderr;
@@ -318,41 +318,41 @@ const vtable: std.Io.VTable = blk: {
 
 fn dispatchLocal(borrow: *const Borrow, method: u16, raw_args: *const anyopaque, output: *anyopaque, reader_transfer: ?*ReaderTransfer, names: ErrorNames) callconv(.c) void {
     @setEvalBranchQuota(100_000);
-    inline for (fields, 0..) |field, index| {
+    inline for (fields, 0..) |field_name, index| {
         if (method == index) {
-            const Args = std.meta.ArgsTuple(Function(field.name));
+            const Args = std.meta.ArgsTuple(Function(field_name));
             var args = @as(*const Args, @ptrCast(@alignCast(raw_args))).*;
             args[0] = borrow.userdata;
             const owner_vtable: *const std.Io.VTable = @ptrCast(@alignCast(borrow.vtable));
             var reader_io: Receiver = undefined;
             var local_reader: std.Io.File.Reader = undefined;
-            inline for (std.meta.fields(Args)) |arg| {
-                if (comptime arg.type == *std.Io.File.Reader) {
+            inline for (@typeInfo(Args).@"struct".field_names, @typeInfo(Args).@"struct".field_types) |arg_name, arg_type| {
+                if (comptime arg_type == *std.Io.File.Reader) {
                     const transfer = reader_transfer.?;
                     reader_io = transfer.executor.receive() catch @panic("invalid reader executor borrow");
                     const state = decode(ReaderState, transfer.state);
                     local_reader = std.Io.File.Reader.init(state.file, reader_io.io(), state.buffer);
                     state.restore(&local_reader);
-                    @field(args, arg.name) = &local_reader;
+                    @field(args, arg_name) = &local_reader;
                 }
-                if (comptime arg.type == *std.Io.Batch) remapBatch(@field(args, arg.name), names);
+                if (comptime arg_type == *std.Io.Batch) remapBatch(@field(args, arg_name), names);
             }
-            const result = @call(.auto, @field(owner_vtable, field.name), args);
-            if (comptime std.mem.eql(u8, field.name, "lockStderr")) {
+            const result = @call(.auto, @field(owner_vtable, field_name), args);
+            if (comptime std.mem.eql(u8, field_name, "lockStderr")) {
                 if (result) |locked| locked.file_writer.interface.flush() catch {} else |_| {}
-            } else if (comptime std.mem.eql(u8, field.name, "tryLockStderr")) {
+            } else if (comptime std.mem.eql(u8, field_name, "tryLockStderr")) {
                 if (result) |maybe_locked| {
                     if (maybe_locked) |locked| locked.file_writer.interface.flush() catch {};
                 } else |_| {}
             }
             if (reader_transfer) |transfer| {
                 // Only the file-copy methods accept ReaderTransfer.
-                inline for (std.meta.fields(Args)) |arg| {
-                    if (comptime arg.type == *std.Io.File.Reader)
+                inline for (@typeInfo(Args).@"struct".field_types) |arg_type| {
+                    if (comptime arg_type == *std.Io.File.Reader)
                         transfer.state = encode(ReaderState, ReaderState.capture(&local_reader));
                 }
             }
-            @as(*Wire(Return(field.name)), @ptrCast(@alignCast(output))).* = encode(Return(field.name), result);
+            @as(*Wire(Return(field_name)), @ptrCast(@alignCast(output))).* = encode(Return(field_name), result);
             return;
         }
     }

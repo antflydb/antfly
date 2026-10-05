@@ -13,13 +13,16 @@ schemas, transactions, enrichment, maintenance, portable backups, and the SQL
 compiler and execution engine used by the embedded C API. SQL HTTP/pgwire
 adapters and distributed SQL coordination remain server-owned.
 
-Shared engine sources currently remain under `zig/pkg/antfly` to preserve
-imports and avoid duplicating implementations. Their exact license scope is
-recorded in [`scripts/apache_engine_files.txt`](scripts/apache_engine_files.txt).
-The header tool and Apache dependency checker use that same list. Shared
-generated OpenAPI contracts are owned by the embedded, client, inference, and
-server-API Apache packages according to their consumers; their schema inputs
-are covered by `specs/LICENSE`.
+First-party engine sources live in `zig/pkg/antfly-embedded`, inference execution
+in `zig/pkg/inference`, and reusable libraries in `zig/lib`. This includes native
+Parquet/Iceberg lake readers and SQL cursors, and shared AWS/Google authentication.
+The server package `zig/pkg/antfly` remains ELv2 and has no Apache source exceptions.
+The source map [`scripts/source_license_roots.json`](scripts/source_license_roots.json)
+declares package roots; [`scripts/apache_engine_files.txt`](scripts/apache_engine_files.txt)
+records additional Apache files outside those roots. Shared build composition lives
+in `zig/build_support`. Shared generated OpenAPI contracts belong to the embedded,
+client, inference and server-API Apache packages according to their consumers;
+their authored schema inputs are covered by `specs/LICENSE`.
 
 The inference package, shared `zig/lib` implementations, client SDKs, Lite
 bindings, and their existing Apache packages remain Apache. The full license
@@ -88,11 +91,13 @@ include the Apache LICENSE, source map, asset manifest, and canonical third-part
 notices. The SciPy-derived assignment solver retains its BSD-3-Clause notice in
 source and in native and WASM distributions.
 
-The public C API uses `capi/db.zig`, `capi/handles.zig`, and
-`capi_embedded_root.zig`. Private server operations use the ELv2
+The public C API lives under `zig/pkg/antfly-embedded/src/local/capi` and
+uses the embedded package’s `public_capi_root.zig` and `capi_embedded_root.zig`. Private server operations use the ELv2
 `capi/server_owner.zig` and `storage/server_db_adapter.zig`. Borrowed read
 consistency is local storage code; quorum tracking and Raft snapshot protocol
 adapters remain server code. Explicit test-only imports do not expand a
-product’s production license closure. The full Zig suite validates the Apache
-Lite, inference, public C API, and WASM builds with ELv2 implementations replaced
-by compile-time traps. Any live ELv2 dependency fails that build.
+product’s production license closure. The full Zig suite builds Lite, public C API, native lake readers and WASM
+with the entire server package omitted, and builds the independent inference
+product in the same staged tree. There are no server stubs. Import audits also
+reject production dependencies on server sources and unreviewed assets. This
+validation runs in the full suite on main merges rather than on every PR.

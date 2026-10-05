@@ -324,7 +324,7 @@ pub const Kernel = struct {
     scalars: [4]f32 = @splat(0),
 
     pub fn params(self: Kernel) Params {
-        return .{ .kind = @intFromEnum(self.kind), .dims = self.dims, .scalars = self.scalars };
+        return .{ .kind = @backingInt(self.kind), .dims = self.dims, .scalars = self.scalars };
     }
 
     pub fn layout(self: Kernel) !Layout {

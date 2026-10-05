@@ -685,12 +685,12 @@ test "side info parsing rejects a sample rate the band tables do not cover" {
         .padding = false,
         .channel_mode = .mono,
     };
-    const side_info_bytes = [_]u8{0} ** 9;
+    const side_info_bytes = @as([9]u8, @splat(0));
     try std.testing.expectError(error.Mp3UnsupportedSampleRate, parseLayer3SideInfo(header, &side_info_bytes));
 }
 
 test "skip id3v2 header" {
-    const bytes = [_]u8{ 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 16 } ++ ([_]u8{0} ** 16);
+    const bytes = [_]u8{ 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 16 } ++ (@as([16]u8, @splat(0)));
     try std.testing.expectEqual(@as(usize, 26), skipId3v2(&bytes));
 }
 

@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Physical local-query provider. The storage archive owns and closes the DB;
 //! this component borrows that opaque handle for one complete query and returns
@@ -23,11 +23,11 @@ const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const query_api = @import("../api/query.zig");
+const query_api = @import("antfly_local_sources").api_query;
 const local_query = @import("antfly_source_root").antfly_sources.local_query;
-const distributed_graph = @import("../api/local_graph.zig");
+const distributed_graph = @import("../api/distributed_graph.zig");
 const aggregation_plan = @import("../api/aggregation_plan.zig");
-const local_query_contract = @import("../api/local_query_contract.zig");
+const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 
 pub fn execute(
     request: *const abi.LocalQueryRequest,
@@ -63,6 +63,8 @@ fn executeSearch(
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
     const alloc = std.heap.c_allocator;
+    if (request.dialect == .public) query_api.validateStoragePublicQueryRequest(alloc, request.request_json.slice()) catch |err|
+        return fail(err, parseOperation(request.dialect), out_failure);
     var owned = switch (request.dialect) {
         .internal => query_api.parseQueryRequest(
             alloc,
@@ -79,7 +81,7 @@ fn executeSearch(
     } catch |err| return fail(err, parseOperation(request.dialect), out_failure);
     defer owned.deinit(alloc);
 
-    @import("local_query_controls.zig").applyExecutionOptions(&owned.req, request.execution_options);
+    @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
     if (request.has_execution_deadline != 0) {
         owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed_deadline|
             @min(parsed_deadline, request.execution_deadline_ns)
@@ -87,7 +89,7 @@ fn executeSearch(
             request.execution_deadline_ns;
     }
     owned.req.cancellation = requestCancellationToken(request);
-    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
+    @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
     // The owner has already established read safety. Keep aggregation's page
@@ -125,7 +127,7 @@ fn executeSearch(
         held.release();
         lease = null;
     }
-    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
+    @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
     var response = query_api.encodeQueryResponses(
@@ -135,7 +137,7 @@ fn executeSearch(
         meta,
         result,
     ) catch |err| return fail(err, encodeOperation(request.dialect), out_failure);
-    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err| {
+    @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err| {
         response.deinit(alloc);
         return fail(err, executeOperation(request.dialect), out_failure);
     };
@@ -340,7 +342,7 @@ fn fail(
         err,
         .local_query,
         abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }

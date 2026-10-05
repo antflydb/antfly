@@ -110,7 +110,7 @@ const EncoderState = struct {
         };
     }
 
-    fn deinit(self: *EncoderState) void {
+    pub fn deinit(self: *EncoderState) void {
         self.allocator.free(self.magnitudes);
         self.allocator.free(self.signs);
         self.allocator.free(self.flags);

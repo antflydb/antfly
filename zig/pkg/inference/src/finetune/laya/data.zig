@@ -323,13 +323,13 @@ test "laya stage-two synthesis keeps the gold label, renormalizes the target, an
 test "laya training split separation catches renamed text and token duplicates" {
     const r = Record{ .id = "a", .group_id = "g", .text = "text", .kind = .choice, .instruction = "choose", .labels = &.{ "a", "b" }, .target = &.{ 1, 0 } };
     const e = training.Example{ .ids = &.{ 1, 2 }, .markers = &.{ 0, 1 }, .kind = .choice, .target = &.{ 1, 0 } };
-    const left = Dataset{ .records = &.{r}, .examples = &.{e}, .placements = &.{.{ .example = 0, .question = 0 }}, .sha256 = [_]u8{0} ** 32 };
+    const left = Dataset{ .records = &.{r}, .examples = &.{e}, .placements = &.{.{ .example = 0, .question = 0 }}, .sha256 = @as([32]u8, @splat(0)) };
     var changed = r;
     changed.id = "b";
     changed.group_id = "h";
     var other = e;
     other.ids = &.{ 3, 4 };
-    var right = Dataset{ .records = &.{changed}, .examples = &.{other}, .placements = &.{.{ .example = 0, .question = 0 }}, .sha256 = [_]u8{0} ** 32 };
+    var right = Dataset{ .records = &.{changed}, .examples = &.{other}, .placements = &.{.{ .example = 0, .question = 0 }}, .sha256 = @as([32]u8, @splat(0)) };
     try std.testing.expectError(error.LayaDatasetOverlap, disjoint(std.testing.allocator, left, right));
     changed.text = "different text";
     right.records = &.{changed};

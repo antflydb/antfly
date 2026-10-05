@@ -444,7 +444,7 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         {
             const batch = try shared.requestBytes(a, name, case.schema, &.{
                 .{ .id = "decoded-first", .content = case.text },
-                .{ .id = "rejected-second", .content = "x " ** 4097 },
+                .{ .id = "rejected-second", .content = z17RepeatString("x ", 4097) },
             });
             defer a.free(batch);
             var response = try transport.post(batch);
@@ -490,4 +490,15 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
     // Both network executors, listener, request owners and managed model are
     // destroyed before rehashing all five immutable source artifacts.
     try shared.verifyFiles(a, directory, pins);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

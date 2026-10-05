@@ -38,9 +38,9 @@ def check(base: str, head: str) -> list[str]:
         return []
     errors = []
     for commit in git("rev-list", "--no-merges", f"{base}..{head}").splitlines():
-        author, email, message = git("show", "-s", "--format=%an%n%ae%n%B", commit).split(
-            "\n", 2
-        )
+        author, email, message = git(
+            "show", "-s", "--format=%an%n%ae%n%B", commit
+        ).split("\n", 2)
         expected = f"Signed-off-by: {author} <{email}>"
         if expected not in message.splitlines():
             errors.append(f"{commit[:12]}: missing author sign-off ({expected})")

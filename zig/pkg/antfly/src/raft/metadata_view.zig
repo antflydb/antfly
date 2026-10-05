@@ -135,7 +135,7 @@ const TransitionState = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *TransitionState) void {
+    pub fn deinit(self: *TransitionState) void {
         var split_it = self.split.valueIterator();
         while (split_it.next()) |record| deinitSplitRecord(self.alloc, record);
         self.split.deinit(self.alloc);

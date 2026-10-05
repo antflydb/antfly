@@ -401,7 +401,7 @@ pub const TranscriptionPipeline = struct {
         compression_ratio: f32,
         temperature: f32,
 
-        fn deinit(self: *Attempt, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Attempt, allocator: std.mem.Allocator) void {
             self.generated.deinit(allocator);
         }
     };

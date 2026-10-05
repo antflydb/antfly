@@ -261,9 +261,9 @@ const resampler_up2_hq_1 = [3]i32{ 6854, 25769, 55542 - 65536 };
 // Resampler (silk/resampler.c, IIR_FIR + up2_HQ), decoder direction only
 
 const Resampler = struct {
-    s_iir: [6]i32 = [_]i32{0} ** 6,
-    s_fir: [resampler_order_fir_12]i16 = [_]i16{0} ** resampler_order_fir_12,
-    delay_buf: [96]i16 = [_]i16{0} ** 96,
+    s_iir: [6]i32 = @as([6]i32, @splat(0)),
+    s_fir: [resampler_order_fir_12]i16 = @as([resampler_order_fir_12]i16, @splat(0)),
+    delay_buf: [96]i16 = @as([96]i16, @splat(0)),
     copy_only: bool = true,
     batch_size: usize = 0,
     inv_ratio_q16: i32 = 0,
@@ -400,9 +400,9 @@ const Resampler = struct {
 // Decoder state
 
 const SideInfoIndices = struct {
-    gains_indices: [max_nb_subfr]i8 = [_]i8{0} ** max_nb_subfr,
-    ltp_index: [max_nb_subfr]i8 = [_]i8{0} ** max_nb_subfr,
-    nlsf_indices: [max_lpc_order + 1]i8 = [_]i8{0} ** (max_lpc_order + 1),
+    gains_indices: [max_nb_subfr]i8 = @as([max_nb_subfr]i8, @splat(0)),
+    ltp_index: [max_nb_subfr]i8 = @as([max_nb_subfr]i8, @splat(0)),
+    nlsf_indices: [max_lpc_order + 1]i8 = @as([(max_lpc_order + 1)]i8, @splat(0)),
     lag_index: i32 = 0,
     contour_index: i32 = 0,
     signal_type: i32 = 0,
@@ -414,18 +414,18 @@ const SideInfoIndices = struct {
 };
 
 const DecoderControl = struct {
-    pitch_l: [max_nb_subfr]i32 = [_]i32{0} ** max_nb_subfr,
-    gains_q16: [max_nb_subfr]i32 = [_]i32{0} ** max_nb_subfr,
-    pred_coef_q12: [2][max_lpc_order]i16 = [_][max_lpc_order]i16{[_]i16{0} ** max_lpc_order} ** 2,
-    ltp_coef_q14: [ltp_order * max_nb_subfr]i16 = [_]i16{0} ** (ltp_order * max_nb_subfr),
+    pitch_l: [max_nb_subfr]i32 = @as([max_nb_subfr]i32, @splat(0)),
+    gains_q16: [max_nb_subfr]i32 = @as([max_nb_subfr]i32, @splat(0)),
+    pred_coef_q12: [2][max_lpc_order]i16 = @as([2][max_lpc_order]i16, @splat(@as([max_lpc_order]i16, @splat(0)))),
+    ltp_coef_q14: [ltp_order * max_nb_subfr]i16 = @as([(ltp_order * max_nb_subfr)]i16, @splat(0)),
     ltp_scale_q14: i32 = 0,
 };
 
 const ChannelState = struct {
     prev_gain_q16: i32 = 65536,
-    exc_q14: [max_frame_length]i32 = [_]i32{0} ** max_frame_length,
-    slpc_q14_buf: [max_lpc_order]i32 = [_]i32{0} ** max_lpc_order,
-    out_buf: [max_frame_length + 2 * max_sub_frame_length]i16 = [_]i16{0} ** (max_frame_length + 2 * max_sub_frame_length),
+    exc_q14: [max_frame_length]i32 = @as([max_frame_length]i32, @splat(0)),
+    slpc_q14_buf: [max_lpc_order]i32 = @as([max_lpc_order]i32, @splat(0)),
+    out_buf: [max_frame_length + 2 * max_sub_frame_length]i16 = @as([(max_frame_length + 2 * max_sub_frame_length)]i16, @splat(0)),
     lag_prev: i32 = 0,
     last_gain_index: i32 = 0,
     fs_khz: i32 = 0,
@@ -435,7 +435,7 @@ const ChannelState = struct {
     subfr_length: usize = 0,
     ltp_mem_length: usize = 0,
     lpc_order: usize = 0,
-    prev_nlsf_q15: [max_lpc_order]i16 = [_]i16{0} ** max_lpc_order,
+    prev_nlsf_q15: [max_lpc_order]i16 = @as([max_lpc_order]i16, @splat(0)),
     first_frame_after_reset: bool = true,
     pitch_lag_low_bits_icdf: []const u8 = &t.silk_uniform8_iCDF,
     pitch_contour_icdf: []const u8 = &t.silk_pitch_contour_iCDF,
@@ -689,7 +689,7 @@ pub const Decoder = struct {
 fn decodeFrame(ps: *ChannelState, dec: *RangeDecoder, out: []i16, cond_coding: i32) !usize {
     const l = ps.frame_length;
     var ctl = DecoderControl{};
-    var pulses: [max_frame_length]i16 = [_]i16{0} ** max_frame_length;
+    var pulses: [max_frame_length]i16 = @as([max_frame_length]i16, @splat(0));
     try decodeIndices(ps, dec, ps.n_frames_decoded, false, cond_coding);
     try decodePulses(dec, &pulses, ps.indices.signal_type, ps.indices.quant_offset_type, l);
     try decodeParameters(ps, &ctl, cond_coding);
@@ -790,8 +790,8 @@ fn decodePulses(dec: *RangeDecoder, pulses: *[max_frame_length]i16, signal_type:
     const rate_level_index: usize = try dec.decodeIcdf(t.silk_rate_levels_iCDF[@as(usize, @intCast(signal_type >> 1)) * 9 ..][0..9]);
     var iter = frame_length >> log2_shell_codec_frame_length;
     if (iter * shell_codec_frame_length < frame_length) iter += 1;
-    var sum_pulses: [max_nb_shell_blocks]i32 = [_]i32{0} ** max_nb_shell_blocks;
-    var n_lshifts: [max_nb_shell_blocks]i32 = [_]i32{0} ** max_nb_shell_blocks;
+    var sum_pulses: [max_nb_shell_blocks]i32 = @as([max_nb_shell_blocks]i32, @splat(0));
+    var n_lshifts: [max_nb_shell_blocks]i32 = @as([max_nb_shell_blocks]i32, @splat(0));
     const cdf = t.silk_pulses_per_block_iCDF[rate_level_index * 18 ..][0..18];
     for (0..iter) |i| {
         n_lshifts[i] = 0;

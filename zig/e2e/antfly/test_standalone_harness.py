@@ -902,6 +902,29 @@ def _replicated_cluster_snapshot(table_id=7, groups=(71, 72, 73)):
     }
 
 
+def test_cluster_restore_refreshes_physical_identity_before_topology(monkeypatch):
+    response = SimpleNamespace(
+        status_code=200,
+        raise_for_status=lambda: None,
+        json=lambda: {"table_id": 8},
+    )
+    monkeypatch.setattr(backups.requests, "get", lambda *_args, **_kwargs: response)
+    cluster = SimpleNamespace(
+        data_api_urls=["http://data/db/v1"],
+        table_ids={"docs": 7},
+        assert_processes_alive=lambda: None,
+        metadata_snapshots=lambda: [
+            _replicated_cluster_snapshot(table_id=8, groups=(81, 82, 83))
+            for _ in range(3)
+        ],
+    )
+    assert backups.ThreeByThreeBackupCluster.refresh_table_identity(cluster, "docs")
+    assert cluster.table_ids["docs"] == 8
+    assert backups.ThreeByThreeBackupCluster.fully_replicated_topology(
+        cluster, "docs"
+    ) == (8, {81, 82, 83})
+
+
 def test_cluster_replication_returns_topology_without_a_second_probe():
     observations = iter(
         [[_replicated_cluster_snapshot() for _ in range(3)], [None] * 3]
@@ -909,6 +932,7 @@ def test_cluster_replication_returns_topology_without_a_second_probe():
     cluster = SimpleNamespace(
         assert_processes_alive=lambda: None,
         metadata_snapshots=lambda: next(observations),
+        table_ids={},
     )
     topology = backups.ThreeByThreeBackupCluster.fully_replicated_topology(
         cluster, "docs"
@@ -938,7 +962,9 @@ def test_cluster_replication_requires_matching_ready_topology_on_every_node(defe
     else:
         snapshots[2] = None
     cluster = SimpleNamespace(
-        assert_processes_alive=lambda: None, metadata_snapshots=lambda: snapshots
+        assert_processes_alive=lambda: None,
+        metadata_snapshots=lambda: snapshots,
+        table_ids={},
     )
     assert (
         backups.ThreeByThreeBackupCluster.fully_replicated_topology(cluster, "docs")

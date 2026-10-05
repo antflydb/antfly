@@ -15,9 +15,9 @@
 
 const std = @import("std");
 const foreign_mod = @import("../foreign/mod.zig");
-const secrets = @import("../common/secrets.zig");
-const aggregations_mod = @import("../storage/db/aggregations_contract.zig");
-const json_helpers = @import("json_helpers.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
+const aggregations_mod = @import("antfly_local_sources").storage_db_aggregations_contract;
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 
 const Allocator = std.mem.Allocator;
 

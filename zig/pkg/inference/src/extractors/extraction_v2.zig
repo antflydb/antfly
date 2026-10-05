@@ -129,7 +129,7 @@ pub const Options = struct {
             out.classification_solver.beam_width = @min(common.classification_solver.beam_width, width);
             out.joint_solver.beam_width = @min(common.joint_solver.beam_width, width);
         }
-        inline for (@typeInfo(JointOptions).@"struct".fields) |field| @field(out.joint_candidates, field.name) = @field(self.joint_ie, field.name);
+        inline for (comptime std.meta.fieldNames(JointOptions)) |reflected_name| @field(out.joint_candidates, reflected_name) = @field(self.joint_ie, reflected_name);
         return out;
     }
 };
@@ -992,7 +992,7 @@ test "extraction v2 wire JointIE endpoint identity retains overlapping entity ty
 test "extraction v2 wire output bounds account for JSON escaping before allocation" {
     var writer = ResponseWriter.init(std.testing.allocator, 64, 0);
     defer writer.deinit();
-    const control_bytes = [_]u8{1} ** 64;
+    const control_bytes = @as([64]u8, @splat(1));
     try std.testing.expectError(error.ExtractionOutputLimitExceeded, writer.begin(&control_bytes));
     try std.testing.expect(writer.output.bytes.capacity <= 64);
     try std.testing.expect(writer.output.bytes.items.len <= 64);

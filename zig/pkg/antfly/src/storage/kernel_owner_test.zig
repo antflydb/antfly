@@ -165,7 +165,7 @@ test "opaque owner standalone rewrite authority is durable and cannot be selecte
             \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         ),
     };
-    const wire = @import("db/online_merge_io_contract.zig");
+    const wire = @import("antfly_local_sources").storage_db_online_merge_io_contract;
     const request: wire.Request = .{
         .scope = .{ .authority = .native, .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 0, .admission_epoch = 0, .owner_group_id = 72, .peer_group_id = 82, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(0) }, .receiver_namespace = .{ .table_id = 8, .shard_id = 82, .range_id = 82 }, .consumer_epoch = 0, .copy_attempt = .{} },
         .operation = .{ .admission = .donor },
@@ -179,7 +179,7 @@ test "opaque owner standalone rewrite authority is durable and cannot be selecte
         defer response.deinit();
         const facts = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, response.bytes(), .{});
         defer facts.deinit();
-        try std.testing.expectEqual(@import("db/online_source_contract.zig").Authority.native, facts.value.authority);
+        try std.testing.expectEqual(@import("antfly_local_sources").storage_db_online_source_contract.Authority.native, facts.value.authority);
         try std.testing.expectEqual(@as(u64, 0), facts.value.donor_term);
         try std.testing.expect(facts.value.eligible);
         try std.testing.expectEqual(@as(usize, 1), facts.value.source_schemas.len);
@@ -195,10 +195,10 @@ test "opaque owner standalone rewrite authority is durable and cannot be selecte
 
 test "opaque owner cold reopen preserves frozen document and relational backup cohorts" {
     const alloc = std.testing.allocator;
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const json = @import("db/relational_integrity_handoff_contract.zig");
-    const transition = @import("db/relational_transition_contract.zig");
-    const seal = @import("db/native_backup_seal_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const json = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
     const Read = struct {
         fn call(comptime T: type, handle: ?*anyopaque, request: transition.Request) !std.json.Parsed(T) {
             const body = try json.encode(std.testing.allocator, request);
@@ -312,7 +312,7 @@ test "local query identity relay preserves origin and attributes protocol defect
         error.InvalidQueryRequest,
         .local_query,
         abi.abi_version,
-        @intFromEnum(abi.LocalQueryOperation.parse_internal_request),
+        @backingInt(abi.LocalQueryOperation.parse_internal_request),
     );
     var forwarded: abi.FailureIdentity = .{};
     try local_query_client.acceptProviderFailure(
@@ -323,7 +323,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     );
     try std.testing.expectEqualDeep(failure, forwarded);
 
-    @import("../test_error_logs.zig").expectErrorLogs(1);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     var malformed = failure;
     malformed.operation = 0;
     var replacement: abi.FailureIdentity = .{};
@@ -340,7 +340,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
     try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.validate_provider_response),
+        @backingInt(abi.LocalQueryOperation.validate_provider_response),
         replacement.operation,
     );
     try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
@@ -348,12 +348,12 @@ test "local query identity relay preserves origin and attributes protocol defect
 
 test "opaque owner source artifact transfer resumes across replicas without donor inode authority" {
     const alloc = std.testing.allocator;
-    const transfer = @import("db/source_artifact_transfer.zig");
-    const contract = @import("../api/local_query_contract.zig");
-    const batch = @import("../api/batch.zig");
-    const source = @import("db/online_source_contract.zig");
+    const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const batch = @import("antfly_local_sources").api_batch;
+    const source = @import("antfly_local_sources").storage_db_online_source_contract;
     const Call = struct {
-        fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("../api/operation.zig").RequestContext) ![]u8 {
+        fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
             try context.ensureActive();
             try std.testing.expectEqual(@as(u64, 7201), group);
             try std.testing.expectEqualStrings("docs", table);
@@ -371,7 +371,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
             defer response.deinit();
             return std.json.parseFromSlice(T, std.testing.allocator, response.bytes(), .{ .allocate = .alloc_always });
         }
-        fn apply(owner: *client.Owner, request: @import("db/types.zig").BatchRequest, index: u64) !void {
+        fn apply(owner: *client.Owner, request: @import("antfly_local_sources").storage_db_types.BatchRequest, index: u64) !void {
             const json = try batch.encodeBatchRequest(std.testing.allocator, request);
             defer std.testing.allocator.free(json);
             var response = try owner.replicatedBatchAtRaftEntryJson("docs", json, 1, index);
@@ -404,7 +404,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     defer alloc.free(identity_request);
     var identity_response = try donor.lookupJson("docs", identity_request);
     defer identity_response.deinit();
-    var identity = try std.json.parseFromSlice(@import("db/relational_integrity_topology_contract.zig").Identity, alloc, identity_response.bytes(), .{});
+    var identity = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, identity_response.bytes(), .{});
     defer identity.deinit();
     const scope: source.Scope = .{ .fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = 57, .attempt = 1, .owner_group_id = 7201, .peer_group_id = 7202, .role = .merge_source, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest }, .receiver_namespace = .{ .table_id = 72, .shard_id = 7202, .range_id = 7202 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
     for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .online_source = .{ .admit = .{ .scope = scope } } }, 2);
@@ -412,13 +412,13 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     defer alloc.free(pin_json);
     var publication = try donor.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
     defer publication.deinit();
-    var certificate = try std.json.parseFromSlice(@import("source_snapshot.zig").Certificate, alloc, publication.bytes(), .{});
+    var certificate = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, publication.bytes(), .{});
     defer certificate.deinit();
     for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate.value } } }, 3);
     // Simulate native-state transfer containing the durable published ledger
     // but none of another replica's filesystem pins or local stat receipts.
     target.deinit();
-    const target_pin = try @import("db/source_pin.zig").pathAlloc(alloc, target_path, scope);
+    const target_pin = try @import("antfly_local_sources").storage_db_source_pin.pathAlloc(alloc, target_path, scope);
     defer alloc.free(target_pin);
     try std.Io.Dir.cwd().deleteTree(std.testing.io, target_pin);
     target = try client.Owner.open(target_options);
@@ -549,9 +549,9 @@ test "opaque owner source artifact transfer resumes across replicas without dono
 
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const batch = @import("../api/batch.zig");
-    const source = @import("db/online_source_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const batch = @import("antfly_local_sources").api_batch;
+    const source = @import("antfly_local_sources").storage_db_online_source_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-source-controls", .{tmp.sub_path});
@@ -572,7 +572,7 @@ test "opaque owner online source controls and status survive compiled boundary r
     defer alloc.free(identity_request);
     var identity_response = try owner.lookupJson("docs", identity_request);
     defer identity_response.deinit();
-    var identity = try std.json.parseFromSlice(@import("db/relational_integrity_topology_contract.zig").Identity, alloc, identity_response.bytes(), .{});
+    var identity = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, identity_response.bytes(), .{});
     defer identity.deinit();
     const scope: source.Scope = .{
         .fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = 19, .attempt = 2, .owner_group_id = 7101, .peer_group_id = 7102, .role = .merge_source, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest },
@@ -606,7 +606,7 @@ test "opaque owner online source controls and status survive compiled boundary r
     defer alloc.free(pin_json);
     var publication = try owner.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
     defer publication.deinit();
-    var certificate = try std.json.parseFromSlice(@import("source_snapshot.zig").Certificate, alloc, publication.bytes(), .{});
+    var certificate = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, publication.bytes(), .{});
     defer certificate.deinit();
     try std.testing.expectEqual(@as(u64, 1), certificate.value.cut.applied_index);
     try std.testing.expect(certificate.value.cut.namespace.eql(scope.fence.namespace));
@@ -623,12 +623,19 @@ test "opaque owner online source controls and status survive compiled boundary r
 
 test "opaque owner relational handoff preserves binary proofs across the compiled boundary" {
     const alloc = std.testing.allocator;
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const handoff = @import("db/relational_integrity_handoff_contract.zig");
-    const contract = @import("db/relational_transition_contract.zig");
-    const path = "/tmp/antfly-kernel-relational-handoff";
-    cleanup(path);
-    defer cleanup(path);
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const contract = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, surfacing spurious
+    // GenerationTransitionActive failures. Use a per-run unique directory
+    // like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/relational-handoff", .{root});
+    defer alloc.free(path);
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"uq","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}}}}
     ;
@@ -718,11 +725,11 @@ test "opaque owner relational handoff preserves binary proofs across the compile
 
 test "opaque owner exports exact backup seals and reclaims pins without opening the source" {
     const alloc = std.testing.allocator;
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const handoff = @import("db/relational_integrity_handoff_contract.zig");
-    const transition = @import("db/relational_transition_contract.zig");
-    const seal = @import("db/native_backup_seal_contract.zig");
-    const backup = @import("../api/backup_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
+    const backup = @import("antfly_local_sources").api_backup_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -775,7 +782,7 @@ test "opaque owner exports exact backup seals and reclaims pins without opening 
         const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, @tagName(format) });
         defer alloc.free(destination);
         var exported = try owner.backupWithControl(.{
-            .format = @intFromEnum(format),
+            .format = @backingInt(format),
             .table_name = .fromSlice("docs"),
             .backup_root = .fromSlice(destination),
             .backup_id = .fromSlice("cut"),
@@ -849,9 +856,9 @@ test "opaque ordinary owner range initialization preserves durable authority and
             defer unbounded.deinit();
             try Driver.put(&unbounded, if (std.mem.eql(u8, scenario, "outside")) "z" else "b");
             if (comptime std.mem.eql(u8, scenario, "frozen")) {
-                const topology = @import("db/relational_integrity_topology_contract.zig");
-                const handoff = @import("db/relational_integrity_handoff_contract.zig");
-                const identity_request = try handoff.encode(alloc, @as(@import("db/relational_transition_contract.zig").Request, .identity));
+                const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+                const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+                const identity_request = try handoff.encode(alloc, @as(@import("antfly_local_sources").storage_db_relational_transition_contract.Request, .identity));
                 defer alloc.free(identity_request);
                 var identity_response: abi.OwnedBytes = .{};
                 defer abi.antfly_storage_owner_buffer_destroy(&identity_response);
@@ -923,13 +930,13 @@ test "opaque ordinary owner range initialization preserves durable authority and
 
 test "opaque portable and native restore preserve bounded range through captured replicated pages" {
     const alloc = std.testing.allocator;
-    const staging = @import("db/restore_staging_contract.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
     const restore = @import("../api/restore_owner_contract.zig");
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const handoff = @import("db/relational_integrity_handoff_contract.zig");
-    const transition = @import("db/relational_transition_contract.zig");
-    const seal = @import("db/native_backup_seal_contract.zig");
-    const batch_wire = @import("../api/batch.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
+    const batch_wire = @import("antfly_local_sources").api_batch;
     const Driver = struct {
         owner: *client.Owner,
         index: u64 = 0,
@@ -965,8 +972,8 @@ test "opaque portable and native restore preserve bounded range through captured
     var context = client.Context{};
     try context.ensure();
     defer context.deinit();
-    const schema_bytes = try @import("schema.zig").serializeSchema(scratch, .{});
-    const source_namespace: @import("db/doc_identity.zig").Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
+    const schema_bytes = try @import("antfly_local_sources").storage_schema.serializeSchema(scratch, .{});
+    const source_namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
     const source_path = try std.fmt.allocPrint(scratch, "{s}/source", .{root});
     var source = try client.Owner.open(.{
         .context = context.handle,
@@ -1012,14 +1019,14 @@ test "opaque portable and native restore preserve bounded range through captured
     inline for (.{ abi.BackupFormat.portable, abi.BackupFormat.native }) |format| {
         const backup_id = "bounded-" ++ @tagName(format);
         var exported = try source.backupWithControl(.{
-            .format = @intFromEnum(format),
+            .format = @backingInt(format),
             .table_name = .fromSlice("docs"),
             .backup_root = .fromSlice(root),
             .backup_id = .fromSlice(backup_id),
             .sealed_handle_json = .fromSlice(pin.bytes()),
         });
         defer exported.deinit();
-        const shards = try std.json.parseFromSliceLeaky([]@import("../api/backup_contract.zig").ShardSnapshot, scratch, exported.bytes(), .{});
+        const shards = try std.json.parseFromSliceLeaky([]@import("antfly_local_sources").api_backup_contract.ShardSnapshot, scratch, exported.bytes(), .{});
         try std.testing.expectEqual(@as(usize, 1), shards.len);
         try std.testing.expectEqualStrings("a", shards[0].start_key);
         var digest: [32]u8 = undefined;
@@ -1084,7 +1091,7 @@ test "opaque portable and native restore preserve bounded range through captured
 
 test "opaque hidden restore prepares without mutation and reopens exact canceled scope" {
     const alloc = std.testing.allocator;
-    const staging = @import("db/restore_staging_contract.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
     const restore = @import("../api/restore_owner_contract.zig");
     const Prepared = struct { response: restore.Response, batch_json: ?[]const u8 = null };
     const path = "/tmp/antfly-kernel-hidden-restore";
@@ -1096,7 +1103,7 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     var storage_context = client.Context{};
     try storage_context.ensure();
     defer storage_context.deinit();
-    const schema_bytes = try @import("schema.zig").serializeSchema(alloc, .{});
+    const schema_bytes = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, .{});
     defer alloc.free(schema_bytes);
     const scope: staging.Scope = .{
         .plan_id = @splat(1),
@@ -1243,8 +1250,8 @@ const TestWalOptions = struct {
     backend: ?Backend = null,
     storage: ?*anyopaque = null,
     lsm_options: Empty = .{},
-    clock: @import("sim_runtime.zig").Clock = @import("sim_runtime.zig").real_clock,
-    commit_scheduler: @import("sim_runtime.zig").CompletionScheduler = @import("sim_runtime.zig").real_completion_scheduler,
+    clock: @import("antfly_local_sources").storage_sim_runtime.Clock = @import("antfly_local_sources").storage_sim_runtime.real_clock,
+    commit_scheduler: @import("antfly_local_sources").storage_sim_runtime.CompletionScheduler = @import("antfly_local_sources").storage_sim_runtime.real_completion_scheduler,
     artificial_sync_delay_ns: u64 = 0,
     group_commit_window_ns: u64 = 0,
     group_commit_max_requests: usize = 64,
@@ -1266,7 +1273,7 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     cleanup(root);
     defer cleanup(root);
 
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
     var wal = try wal_client.WAL.open(path_z.ptr, TestWalOptions{});
     defer wal.close();
@@ -1297,13 +1304,13 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     try std.testing.expectEqual(@as(u64, 3), stats.logical_entries);
     try std.testing.expectError(error.Overflow, wal.truncateAfter(std.math.maxInt(u64)));
 
-    const bootstrap_z = try std.testing.allocator.dupeZ(u8, bootstrap_path);
+    const bootstrap_z = try std.testing.allocator.dupeSentinel(u8, bootstrap_path, 0);
     defer std.testing.allocator.free(bootstrap_z);
     var bootstrap = try wal_client.WAL.open(bootstrap_z.ptr, TestWalOptions{});
     defer bootstrap.close();
     try std.testing.expectEqual(@as(u64, 7), try bootstrap.appendAt(7, "timeline"));
 
-    const read_only_z = try std.testing.allocator.dupeZ(u8, read_only_path);
+    const read_only_z = try std.testing.allocator.dupeSentinel(u8, read_only_path, 0);
     defer std.testing.allocator.free(read_only_z);
     {
         var writable = try wal_client.WAL.open(read_only_z.ptr, TestWalOptions{});
@@ -1467,7 +1474,7 @@ test "opaque storage context owns Lite system namespaces auth and table owners" 
 
 test "opaque storage owner preserves source-vector policy and status across reopen" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-vectors");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-source-vectors");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
     for ([_]abi.DenseEmbeddingStorage{ .vector_store, .persisted }, 0..) |policy, iteration| {
@@ -1501,7 +1508,7 @@ test "opaque storage owner preserves source-vector policy and status across reop
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_open(&.{
         .path = .fromSlice(path),
         .table_name = .fromSlice("docs"),
-        .dense_embedding_storage = @enumFromInt(999),
+        .dense_embedding_storage = @fromBackingInt(999),
     }, &invalid_owner));
     try std.testing.expect(invalid_owner == null);
 }
@@ -1515,7 +1522,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
         fn notify(ptr: ?*anyopaque, table: abi.BorrowedBytes, group: u64, sequence: u64, has_sequence: u8, json: abi.BorrowedBytes) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (!std.mem.eql(u8, table.slice(), "docs") or group != 7001 or has_sequence == 0 or sequence == 0) self.invalid.store(true, .release);
-            var targets = std.json.parseFromSlice([]@import("db/types.zig").IndexTargetVisibility, std.heap.page_allocator, json.slice(), .{}) catch {
+            var targets = std.json.parseFromSlice([]@import("antfly_local_sources").storage_db_types.IndexTargetVisibility, std.heap.page_allocator, json.slice(), .{}) catch {
                 self.invalid.store(true, .release);
                 return;
             };
@@ -1531,7 +1538,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
         }
     };
     var observer = Observer{};
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-target-observer");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-target-observer");
     defer directory.cleanup();
     var owner = try client.Owner.open(.{
         .path = .fromSlice(std.mem.span(directory.path().ptr)),
@@ -1554,7 +1561,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
 test "opaque storage owner schedules source verification after reopen without traffic" {
     const alloc = std.testing.allocator;
     const time = @import("antfly_platform").time;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-maintenance");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-source-maintenance");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
     {
@@ -1615,6 +1622,28 @@ fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     }
 }
 
+// textMemoryJson is, by design, an observational read that tries the owner's
+// apply lock without waiting (storageOwnerTextMemoryJson ->
+// trySnapshotTextMemoryAttributionStats): a concurrent background checkpoint
+// or compaction worker from a preceding reconcile/full-index batch can hold
+// that lock just long enough to surface a transient StorageBusy here, the
+// same category of contention ownerStatusEventually already retries for
+// runtimeStatusJson.
+fn ownerTextMemoryEventually(owner: *client.Owner, table_name: []const u8) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.textMemoryJson(table_name) catch |err| switch (err) {
+            error.StorageBusy => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 test "opaque storage owner preserves dense profiles and captured identity" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-owner-dense-profile";
@@ -1631,8 +1660,11 @@ test "opaque storage owner preserves dense profiles and captured identity" {
         .indexes_json = .fromSlice("{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
     });
     defer owner.deinit();
+    // _embeddings-only writes are artifact patches and preserve an existing
+    // source row; they do not create one. Seed source documents so presence
+    // filtering can return the members whose profiling we are exercising.
     var batch = try owner.batchJson("docs",
-        \\{"inserts":{"doc:a":{"_embeddings":{"vec":[1,0,0]}},"doc:b":{"_embeddings":{"vec":[0,1,0]}}},"sync_level":"full_index"}
+        \\{"inserts":{"doc:a":{"title":"alpha","_embeddings":{"vec":[1,0,0]}},"doc:b":{"title":"beta","_embeddings":{"vec":[0,1,0]}}},"sync_level":"full_index"}
     );
     defer batch.deinit();
     var identity: ?u64 = null;
@@ -1651,6 +1683,8 @@ test "opaque storage owner preserves dense profiles and captured identity" {
         try std.testing.expectEqual(@as(usize, 2), hits.len);
         try std.testing.expectEqualStrings("doc:a", hits[0].object.get("_id").?.string);
         try std.testing.expectEqualStrings("doc:b", hits[1].object.get("_id").?.string);
+        for (hits) |hit| if (hit.object.get("_source")) |source|
+            try std.testing.expect(source == .null);
         if (profile) {
             const profile_value = body.get("profile") orelse return error.MissingQueryProfile;
             const dense = (profile_value.object.get("dense_search") orelse return error.MissingDenseProfile).object;
@@ -1667,12 +1701,19 @@ test "opaque storage owner preserves dense profiles and captured identity" {
 }
 
 test "opaque storage owner performs coarse batch and query on one live DB" {
-    const path = "/tmp/antfly-storage-kernel-owner-batch-query";
-    const backup_root = "/tmp/antfly-storage-kernel-owner-backups";
-    cleanup(path);
-    cleanup(backup_root);
-    defer cleanup(path);
-    defer cleanup(backup_root);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, racing the storage
+    // owner's process-wide generation/lease lifecycle and surfacing spurious
+    // StorageBusy/LsmRootWriterAlreadyOpen failures. Use a per-run unique
+    // directory like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/batch-query", .{root});
+    defer std.testing.allocator.free(path);
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/backups", .{root});
+    defer std.testing.allocator.free(backup_root);
 
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
@@ -1722,7 +1763,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
             self.rows += 1;
             if (self.stop_on_row) return error.ConsumerStoppedAfterRow;
         }
-        fn sink(self: *@This()) @import("../runtime_scan_sink.zig").ScanStreamSink {
+        fn sink(self: *@This()) @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink {
             return .{ .context = self, .start_fn = start, .write_fn = write };
         }
     };
@@ -1894,7 +1935,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         const label = try std.testing.allocator.dupe(u8, "tenant.public.events");
         defer std.testing.allocator.free(label);
         const response = try owner.queryJsonWithOptions("docs", query_json, .{
-            .execution = @import("local_query_controls.zig").executionOptions(.{ .response_table_name = label }),
+            .execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(.{ .response_table_name = label }),
         });
         @memset(label, 0xaa);
         break :label_scope response;
@@ -1946,7 +1987,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.parse_internal_request),
+        @backingInt(abi.LocalQueryOperation.parse_internal_request),
         invalid_query_failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidQueryRequest", invalid_query_failure.errorName());
@@ -1966,7 +2007,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(invalid_abi_status, invalid_abi_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_abi_failure.boundary);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.validate_request),
+        @backingInt(abi.LocalQueryOperation.validate_request),
         invalid_abi_failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
@@ -1987,7 +2028,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.algebraic_partials),
+        @backingInt(abi.LocalQueryOperation.algebraic_partials),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2003,7 +2044,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.text_stats),
+        @backingInt(abi.LocalQueryOperation.text_stats),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2019,7 +2060,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.preflight),
+        @backingInt(abi.LocalQueryOperation.preflight),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2035,7 +2076,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.parse_graph_expand),
+        @backingInt(abi.LocalQueryOperation.parse_graph_expand),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2048,7 +2089,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_aggregation_status != .ok);
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, operation_failure.boundary);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.parse_aggregation),
+        @backingInt(abi.LocalQueryOperation.parse_aggregation),
         operation_failure.operation,
     );
 
@@ -2139,7 +2180,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
     );
     defer indexed_batch.deinit();
-    var text_memory = try owner.textMemoryJson("docs");
+    var text_memory = try ownerTextMemoryEventually(&owner, "docs");
     defer text_memory.deinit();
     try std.testing.expect(std.mem.indexOf(u8, text_memory.bytes(), "\"text_indexes\":1") != null);
     var dense_response = try owner.queryJson(
@@ -2419,11 +2460,11 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_wait_for_sync(null, &invalid_sync),
     );
-    var invalid_ha: abi.HAReplicationRecordRequest = .{};
-    invalid_ha.version = abi.abi_version + 1;
+    var invalid_hot_standby: abi.HAReplicationRecordRequest = .{};
+    invalid_hot_standby.version = abi.abi_version + 1;
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_ha),
+        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_hot_standby),
     );
     var invalid_backup: abi.BackupRequest = .{};
     invalid_backup.version = abi.abi_version + 1;
@@ -2623,6 +2664,25 @@ test "opaque storage owner transaction recovery crosses callback ABI" {
     try std.testing.expect(cleaned);
 }
 
+test "opaque storage context reports the configured process budget" {
+    const services = @import("kernel_runtime_services.zig");
+    // Borrowed I/O makes budget resolution deterministic instead of clamping
+    // the explicit limit to whichever host/container runs this regression.
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    var small = client.Context{};
+    try small.ensureWithRuntime(.{ .memory_limit_bytes = 64 * 1024 * 1024, .io = &executor });
+    defer small.deinit();
+    var large = client.Context{};
+    try large.ensureWithRuntime(.{ .memory_limit_bytes = 128 * 1024 * 1024, .io = &executor });
+    defer large.deinit();
+    const small_metrics = try small.metrics();
+    const large_metrics = try large.metrics();
+    try std.testing.expect(small_metrics.resource_memory.hard_limit_bytes > 0);
+    try std.testing.expect(large_metrics.resource_memory.hard_limit_bytes > small_metrics.resource_memory.hard_limit_bytes);
+    try std.testing.expect(small_metrics.resource_slice_count > 0);
+    try std.testing.expect(small_metrics.resource_slice_count <= small_metrics.resource_slices.len);
+}
+
 test "opaque storage context enforces owner lifetime and shares process storage state" {
     const first_path = "/tmp/antfly-storage-kernel-context-first";
     const second_path = "/tmp/antfly-storage-kernel-context-second";
@@ -2634,11 +2694,22 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     var context: ?*anyopaque = null;
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{}, &context));
     try std.testing.expect(context != null);
-    var metrics: abi.ContextMetricsResult = undefined;
+    var metrics: abi.ContextMetricsResult = .{};
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_context_metrics(null, &metrics));
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
+    for (71..abi.abi_version) |version| {
+        const old_version: u32 = @intCast(version);
+        // Reject every earlier layout, including main's independent ABI
+        // changes, without writing past the version word.
+        var old_caller: [@sizeOf(abi.ContextMetricsResult)]u8 align(@alignOf(abi.ContextMetricsResult)) = @splat(0xaa);
+        std.mem.writeInt(u32, old_caller[0..4], old_version, .native);
+        const as_result: *abi.ContextMetricsResult = @ptrCast(&old_caller);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_metrics(context, as_result));
+        try std.testing.expectEqual(old_version, std.mem.readInt(u32, old_caller[0..4], .native));
+        for (old_caller[4..]) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+    }
     try std.testing.expectEqual(
         abi.Status.invalid_argument,
         abi.antfly_storage_context_attach_inference_provider(context, null),
@@ -3183,7 +3254,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
     defer primary.close();
     var target = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/target" });
     defer target.deinit();
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     const key = "\x00\x00__api_restore_jobs__:000000000000002a";
     const initial = "{\"job_id\":42,\"phase\":\"queued\"}";
     const updated = "{\"job_id\":42,\"phase\":\"importing\"}";
@@ -3201,41 +3272,41 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         // An opaque owner cannot retain a pointer to this stack-local Port;
         // only its heap-owned creator adapter survives each completed bind.
         try std.testing.expect(transition.tryLock());
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
         transition.unlock();
         try std.testing.expectError(error.MetadataHAMigrationAfterBinding, source.migrateStandaloneRestoreJobs(&.{}));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = initial } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
-        try target.applyHARecord(first.record);
-        try target.applyHARecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
         const actual = (try target.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(initial, actual);
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.HASyncCommitWouldBlock, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = updated } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, root ++ "/checkpoint"));
+        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint"));
         try std.testing.expect(transition.tryLock());
         transition.unlock();
     }
     {
         var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
         defer source.deinit();
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
-        try source.flushHAOutbox();
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
+        try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        const checkpoint = try source.exportHACheckpoint(io, root ++ "/checkpoint");
+        const checkpoint = try source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint");
         var restored = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/restored" });
         defer restored.deinit();
-        try restored.importHACheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes);
+        try restored.importHotStandbyCheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes);
         const actual = (try restored.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(updated, actual);
         var second = (try primary.log.entryAt(alloc, 2)).?;
         defer second.deinit(alloc);
-        try restored.applyHARecord(second.record);
-        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHACheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes));
+        try restored.applyHotStandbyRecord(second.record);
+        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHotStandbyCheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes));
         // Catalog outcomes cross the separately compiled owner boundary too.
         // A stale bootstrap CAS is definitely rejected, while a failed remote
         // acknowledgement after the exact catalog commit is ambiguous.
@@ -3243,8 +3314,8 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         try std.testing.expect(revision > 0);
         try std.testing.expectError(error.TableLifecycleConflict, source.replaceStandaloneCatalog(group, revision - 1, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision, try source.standaloneRevision());
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
-        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
+        try std.testing.expectError(error.MetadataReplicationPending, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision + 1, try source.standaloneRevision());
         const catalog = (try source.loadStandaloneCatalog(alloc)).?;
         defer alloc.free(catalog);
@@ -3284,32 +3355,31 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     var promote: Promote = .{ .gate = &gate, .transition = &transition };
     var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
     defer source.deinit();
-    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{
-        .publisher = hot_standby_publisher_adapter.bind(&primary),
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{
         .transition_mutex = &transition,
         .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"standby-a"} },
         .sync_wait_ctx = &promote,
         .sync_wait_fn = Promote.wait,
-    });
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    }));
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{
         .key = "\x00\x00__api_restore_jobs__:000000000000002a",
         .value = "{\"job_id\":42,\"phase\":\"queued\"}",
     } }));
-    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint"));
+    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint"));
     try std.testing.expect(transition.tryLock());
     transition.unlock();
     const prior_lsn = primary.lastLsn();
-    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
-    try source.flushHAOutbox();
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
+    try source.flushHotStandbyOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
-    _ = try source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint");
+    _ = try source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint");
 }
 
 test "opaque metadata initial FK reservation preserves placement authority across snapshot" {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -3320,7 +3390,7 @@ test "opaque metadata initial FK reservation preserves placement authority acros
     defer alloc.free(restored_path);
     var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = source_path, .no_sync = true });
     defer store.deinit();
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
@@ -3399,7 +3469,7 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
     defer alloc.free(restored_path);
     var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = source_path, .no_sync = true });
     defer store.deinit();
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     const target: staging.Target = .{ .source_table_id = 1, .table = .{ .table_id = 11, .name = "private", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} };
     const plan: staging.Plan = .{ .id = @splat(255), .cohort_digest = @splat(9), .targets = &.{target} };
     try Helper.apply(&store, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
@@ -3420,7 +3490,7 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
 
     var binary_digest: staging.Digest = @splat(255);
     binary_digest[0] = 0;
-    const utf8_digest: staging.Digest = ([_]u8{ 0xc3, 0xa9, 0, 127 } ** 8);
+    const utf8_digest: staging.Digest = (z17RepeatArray([_]u8{ 0xc3, 0xa9, 0, 127 }, 8));
     const plan_digest = try plan.digest(alloc);
     try Helper.apply(&store, group, .{ .id = plan.id, .action = .imported, .expected_revision = 1, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = plan_digest, .completion_digest = binary_digest } });
     const imported = (try store.loadRestoreStagingProgress(alloc, group, plan.id)).?;
@@ -3456,7 +3526,7 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
 test "opaque metadata compound rewrite admission preserves job and source reservation across native snapshot" {
     const alloc = std.testing.allocator;
     const stages = @import("../metadata/restore_staging.zig");
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -3469,7 +3539,7 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     const range: @import("../metadata/table_manager.zig").RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
     try source.applyStandaloneCommand(group, .{ .upsert_table = original });
     try source.applyStandaloneCommand(group, .{ .upsert_range = range });
-    const scope: @import("db/online_source_contract.zig").Scope = .{
+    const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
         .receiver_namespace = .{ .table_id = 10, .shard_id = 401, .range_id = 401 },
         .consumer_epoch = 1,
@@ -3486,8 +3556,18 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
             .replace = .{ .table = original, .ranges = &.{range}, .fences = &.{scope.fence} },
             .rewrite_sources = &.{scope},
             .rewrite = .{ .preserve_document = true, .source_schemas = &.{original.schema_json}, .target_schema = original.schema_json, .program_digest = @splat(6) },
+            .generation_handoffs = &.{.{
+                .source_group_id = 301,
+                .target_group_id = 401,
+                .source_namespace = scope.fence.namespace,
+                .admissions = &.{},
+                .admissions_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(scope.fence.namespace, &.{}),
+                .retired_digest = @splat(8),
+                .retired_count = 0,
+            }},
         }},
     };
+    try plan.validate(alloc);
     const plan_json = try std.json.Stringify.valueAlloc(a, plan, .{});
     const key = "\x00\x00__api_restore_jobs__:0000000000000007";
     const value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
@@ -3498,7 +3578,7 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     defer replacement.deinit();
     try std.testing.expect(try replacement.snapshotBuilder().installSnapshot(alloc, group, 1, encoded));
     for ([_]*metadata_apply_client.RaftApplyStore{ &source, &replacement }) |owner| {
-        const stored = (try owner.getRestoreJobValue(alloc, group, key)).?;
+        const stored = (try owner.getRestoreJobValue(alloc, group, key)) orelse return error.TestExpectedRestoreJob;
         defer alloc.free(stored);
         try std.testing.expectEqualStrings(value, stored);
         var admitted = (try owner.loadRestoreStaging(alloc, group, plan.id)).?;
@@ -3714,7 +3794,7 @@ test "storage kernel status registry is unique and lossless" {
             expected,
             .local_query,
             abi.abi_version,
-            @intFromEnum(abi.LocalQueryOperation.execute_internal_query),
+            @backingInt(abi.LocalQueryOperation.execute_internal_query),
         );
         var forwarded: abi.FailureIdentity = .{};
         try local_query_client.acceptProviderFailure(failure.status, failure, .validate_provider_response, &forwarded);
@@ -3725,7 +3805,7 @@ test "storage kernel status registry is unique and lossless" {
         try std.testing.expectEqual(expected, received);
         const public_status = runtime_error.statusFromError(received);
         const expected_code: runtime_error.Code = if (expected == error.TableTopologyProtocolUpgradeRequired) .unavailable else .retryable;
-        try std.testing.expectEqual(@intFromEnum(expected_code), public_status.code);
+        try std.testing.expectEqual(@backingInt(expected_code), public_status.code);
         try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
     }
 }
@@ -3757,7 +3837,7 @@ test "failed owner configuration releases its writer and context lease" {
 }
 
 test "status text preserves its string wire representation and rejects oversized input" {
-    const Text = @import("db/types.zig").InlineStatusText(4);
+    const Text = @import("antfly_local_sources").storage_db_types.InlineStatusText(4);
     const alloc = std.testing.allocator;
     const json = try std.json.Stringify.valueAlloc(alloc, Text.init("test"), .{});
     defer alloc.free(json);
@@ -3768,7 +3848,7 @@ test "status text preserves its string wire representation and rejects oversized
 }
 
 test "interactive admission state is shared with the physical owner" {
-    const activity = @import("db/enrichment/enrichment_types.zig");
+    const activity = @import("antfly_local_sources").storage_db_enrichment_enrichment_types;
     const before = abi.antfly_storage_interactive_activity(0, 0);
     _ = activity.interactive_embed_inflight.fetchAdd(1, .monotonic);
     defer _ = activity.interactive_embed_inflight.fetchSub(1, .monotonic);
@@ -3781,9 +3861,9 @@ test "interactive admission state is shared with the physical owner" {
 
 test "storage query wire preserves empty projection and decoded sort profile lifetime" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const query = @import("../api/query_contract.zig");
-    const types = @import("db/types.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const query = @import("antfly_local_sources").api_query_contract;
+    const types = @import("antfly_local_sources").storage_db_types;
     const wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
         .include_all_fields = false,
         .include_stored = false,
@@ -3829,7 +3909,7 @@ test "storage query wire preserves empty projection and decoded sort profile lif
     defer allocation_wire.deinit(alloc);
     try std.testing.checkAllAllocationFailures(alloc, struct {
         fn decode(failing: std.mem.Allocator, bytes: []const u8) !void {
-            var result = try @import("../api/local_query_contract.zig").parseStorageKernelSearchResult(failing, bytes);
+            var result = try @import("antfly_local_sources").api_local_query_contract.parseStorageKernelSearchResult(failing, bytes);
             defer result.deinit();
             try result.setOwnedSortProfile(result.sort_profile.?);
         }
@@ -3838,8 +3918,8 @@ test "storage query wire preserves empty projection and decoded sort profile lif
 
 test "storage and shard query contracts preserve search effort" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const query = @import("../api/query_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const query = @import("antfly_local_sources").api_query_contract;
     // Start at the public request parser, as the benchmark adapter does.
     // Both the in-process storage boundary and shard forwarding re-encode it.
     for ([_]?f32{ null, 0, 0.35, 0.5, 1 }) |effort| {
@@ -3866,11 +3946,45 @@ test "storage and shard query contracts preserve search effort" {
     }
 }
 
+test "storage query contract embedding numbers preserve relationship precision" {
+    const alloc = std.testing.allocator;
+    const query = @import("antfly_local_sources").api_query_contract;
+    const body =
+        \\{"embeddings":{"dense":[1,0.5,1e-3],"sparse":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["dense","sparse"],"limit":9,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+    ;
+    var public = try query.parsePublicQueryRequest(alloc, null, "docs", body);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0.5, 0.001 }, public.req.dense_queries[0].query.vector);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, public.req.sparse_queries[0].query.indices);
+    try std.testing.expectEqual(@as(u32, 4), public.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", public.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const wire = try contract.encodeStorageKernelQueryRequest(alloc, public.req);
+    defer alloc.free(wire);
+    var internal = try query.parseQueryRequest(alloc, null, "docs", wire);
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, public.req.dense_queries[0].query.vector, internal.req.dense_queries[0].query.vector);
+    try std.testing.expectEqual(@as(u32, 4), internal.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", internal.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    for ([_][]const u8{
+        \\{"embeddings":{"s":{"indices":[-1],"values":[1]}}}
+        ,
+        \\{"embeddings":{"s":{"indices":[1],"values":[1],"k":4294967296}}}
+        ,
+        \\{"embeddings":{"d":[1e100]}}
+        ,
+        \\{"embeddings":{"d":"AACAfw=="}}
+        ,
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidQueryRequest, query.parsePublicQueryRequest(alloc, null, "docs", invalid));
+    }
+}
+
 test "storage query contract preserves each vector candidate budget" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const query = @import("../api/query_contract.zig");
-    const controls = @import("local_query_controls.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const query = @import("antfly_local_sources").api_query_contract;
+    const controls = @import("antfly_local_sources").storage_local_query_controls;
     const wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
         .limit = 100,
         .dense_queries = &.{
@@ -4003,7 +4117,7 @@ test "opaque context stores use the borrowed VOPR filesystem and release handles
 
 test "opaque owner lookup and typed scans preserve metadata scope digest and row versions" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
     const path = "/tmp/antfly-kernel-relational-lookup-scan";
     cleanup(path);
     defer cleanup(path);
@@ -4097,7 +4211,7 @@ test "opaque WAL rejects custom simulation hooks even without a context pointer"
 
 test "opaque metadata secret collection preserves binary ciphertext across owner ABI" {
     const alloc = std.testing.allocator;
-    const records = @import("../common/secret_record.zig");
+    const records = @import("antfly_local_sources").common_secret_record;
     const collections = @import("../common/secret_collection.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4135,4 +4249,10 @@ test "opaque metadata secret collection preserves binary ciphertext across owner
     var opened = try records.open(alloc, keys.provider(), identity, decoded.entries[0].envelope);
     defer opened.deinit(alloc);
     try std.testing.expectEqualSlices(u8, "\x00\xff\xfe\x01", opened.bytes);
+}
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
 }

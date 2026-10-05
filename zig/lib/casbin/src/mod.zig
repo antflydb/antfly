@@ -73,7 +73,7 @@ pub const Model = struct {
         self.* = undefined;
     }
 
-    fn validate(self: *const Model) !void {
+    pub fn validate(self: *const Model) !void {
         const request = self.request_definitions.get("r") orelse return error.MissingRequestDefinition;
         const policy = self.policy_definitions.get("p") orelse return error.MissingPolicyDefinition;
         const grouping = self.role_definitions.get("g") orelse return error.MissingRoleDefinition;

@@ -88,7 +88,7 @@ pub fn Scenario(comptime hostile_budget: u64) type {
             ever_had_leader: bool = false,
             replicated_after_heal: bool = false,
 
-            fn deinit(self: *State) void {
+            pub fn deinit(self: *State) void {
                 for (&self.applied) |*items| items.deinit(self.allocator);
                 self.faults.deinit();
                 self.cluster.deinit();
@@ -280,7 +280,7 @@ pub fn Scenario(comptime hostile_budget: u64) type {
             for (peers, 0..) |node_id, index| {
                 const status = state.cluster.node(node_id).status();
                 try addNodeObservation(builder, allocator, "raft.group.node.term", node_id, @intCast(status.hard.current_term));
-                try addNodeObservation(builder, allocator, "raft.group.node.role", node_id, @intFromEnum(status.soft.role));
+                try addNodeObservation(builder, allocator, "raft.group.node.role", node_id, @backingInt(status.soft.role));
                 try addNodeObservation(builder, allocator, "raft.group.node.leader", node_id, @intCast(status.soft.leader_id orelse 0));
                 try addNodeObservation(builder, allocator, "raft.group.node.commit", node_id, @intCast(status.hard.commit_index));
                 const durable = state.cluster.stores[index].hard_state;
@@ -428,7 +428,7 @@ fn identicalOccurrence(prior: []const Message, target: Message) u64 {
 
 fn messageDigest(msg: Message) u64 {
     var digest = vopr.id.derive("raft.message.endpoints", msg.from, msg.to);
-    digest = vopr.id.derive("raft.message.type", digest, @intFromEnum(msg.msg_type));
+    digest = vopr.id.derive("raft.message.type", digest, @backingInt(msg.msg_type));
     digest = vopr.id.derive("raft.message.term", digest, msg.term);
     digest = vopr.id.derive("raft.message.index", digest, msg.log_index);
     digest = vopr.id.derive("raft.message.commit", digest, msg.commit_index);

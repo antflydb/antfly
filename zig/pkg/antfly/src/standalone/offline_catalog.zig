@@ -17,13 +17,13 @@
 //! Only the selected table and epoch change; resources, extensions, range and
 //! listing indexes remain in the original transactionally durable store.
 const std = @import("std");
-const lsm = @import("../storage/lsm_backend.zig");
-const erased = @import("../storage/backend_erased.zig");
+const lsm = @import("antfly_local_sources").storage_lsm_backend;
+const erased = @import("antfly_local_sources").storage_backend_erased;
 const files = @import("../common/migration_files.zig");
-const domain = @import("../system_catalog/domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const format = @import("catalog_format.zig");
 const NativeCatalog = @import("../metadata/storage/mod.zig").RaftApplyStore;
-const metadata_group = @import("../common/group_ids.zig").main_metadata_group_id;
+const metadata_group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
 
 pub const Catalog = struct {
     alloc: std.mem.Allocator,

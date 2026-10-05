@@ -15,7 +15,7 @@
 
 //! Creator-owned hot standby publication for the compiled metadata store. No Primary,
 //! allocator, file, or Io implementation is dereferenced across this boundary.
-const callback = @import("../runtime_callback_abi.zig");
+const callback = @import("antfly_local_sources").runtime_callback_abi;
 
 pub const Identity = struct { next_lsn: u64, timeline_id: u64, epoch: u64 };
 pub const VTable = struct {

@@ -13,11 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const local_query_contract = @import("local_query_contract.zig");
+const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 const aggregation_plan = @import("aggregation_plan.zig");
 const physical_local_query = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_query;
 const std = @import("std");
-const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const builtin = @import("builtin");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
@@ -29,69 +29,69 @@ const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
-const common_secrets = @import("../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const execution_context = @import("antfly_inference_execution_context");
 const inference_request_context = @import("antfly_inference_execution_context");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = if (control_only_storage_sources)
-    @import("../storage/db/control_root.zig")
+    @import("antfly_local_sources").storage_db_control_root
 else
     @import("antfly_source_root").antfly_sources.selected_db;
-const doc_set = @import("../storage/db/doc_set.zig");
-const doc_identity = if (control_only_storage_sources) struct {} else @import("../storage/db/doc_identity.zig");
-const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
-const ha_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
-const ha_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
+const doc_set = @import("antfly_local_sources").storage_db_doc_set;
+const doc_identity = if (control_only_storage_sources) struct {} else @import("antfly_local_sources").storage_db_doc_identity;
+const db_embedder = if (control_only_storage_sources) struct {} else @import("antfly_local_sources").storage_db_enrichment_embedder;
+const hot_standby_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
+const hot_standby_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
 const hot_standby_standby_mod = @import("../storage/hot_standby/standby.zig");
-const storage_schema = @import("../storage/schema.zig");
-const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
-const hbc_mod = @import("../storage/hbc_adapter.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const storage_schema = @import("antfly_local_sources").storage_schema;
+const dynamic_field_capability = @import("antfly_local_sources").storage_db_dynamic_field_capability;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const hierarchy_navigation = @import("antfly_local_sources").storage_hierarchy_navigation;
+const hbc_mod = @import("antfly_local_sources").storage_hbc_adapter;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const db_query_search = if (control_only_storage_sources)
-    @import("../storage/db/query/control_contract.zig")
+    @import("antfly_local_sources").storage_db_query_control_contract
 else
-    @import("../storage/db/query/search_exec.zig");
-const index_manager_mod = if (control_only_storage_sources) struct {} else @import("../storage/db/catalog/index_manager.zig");
-const text_analysis_config = @import("../storage/db/text_analysis_config.zig");
-const introducer_mod = @import("../introducer.zig");
-const graph_mod = @import("../graph/graph.zig");
-const graph_edge_type = @import("../graph/edge_type.zig");
-const graph_edge_weight = @import("../graph/edge_weight.zig");
-const graph_node_identity = @import("../graph/node_identity.zig");
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_paths = @import("../graph/paths.zig");
-const graph_query_mod = @import("../graph/query.zig");
+    @import("antfly_local_sources").storage_db_query_search_exec;
+const index_manager_mod = if (control_only_storage_sources) struct {} else @import("antfly_local_sources").storage_db_catalog_index_manager;
+const text_analysis_config = @import("antfly_local_sources").storage_db_text_analysis_config;
+const introducer_mod = @import("antfly_local_sources").introducer;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const graph_edge_type = @import("antfly_local_sources").graph_edge_type;
+const graph_edge_weight = @import("antfly_local_sources").graph_edge_weight;
+const graph_node_identity = @import("antfly_local_sources").graph_node_identity;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_paths = @import("antfly_local_sources").graph_paths;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
 const reranking_runtime = @import("../reranking/mod.zig");
-const template_mod = @import("../template.zig");
+const template_mod = @import("antfly_local_sources").template;
 const template_remote = if (builtin.os.tag == .freestanding)
-    @import("../storage/db/template_remote_stub.zig")
+    @import("antfly_local_sources").storage_db_template_remote_stub
 else
-    @import("../template_remote.zig");
+    @import("antfly_local_sources").template_remote;
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const public_limits = @import("antfly_public_limits");
 const distributed_graph = @import("distributed_graph.zig");
-const runtime_status = @import("runtime_status.zig");
-const table_read_source = @import("table_read_source.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
+const table_read_source = @import("antfly_local_sources").api_table_read_source;
 const linked_storage = control_only_storage_sources;
 const kernel_owner_client = if (control_only_storage_sources)
     @import("../storage/kernel_owner_client.zig")
 else
     struct {};
-const aggregation_contract = @import("../storage/db/aggregations_contract.zig");
+const aggregation_contract = @import("antfly_local_sources").storage_db_aggregations_contract;
 const table_read_graph = @import("table_reads/graph.zig");
 
 fn earliestDeadline(a: ?u64, b: ?u64) ?u64 {
@@ -130,12 +130,11 @@ fn catalogRouteFenceForGroup(
 /// Each adapter borrows its runtime/resident owners but owns its routing lease.
 fn JoinReadBinding(comptime Source: type) type {
     return struct {
-        view: @import("table_read_source.zig").JoinReadView,
-        session: table_catalog.RoutingSession,
+        view: @import("antfly_local_sources").api_table_read_source.JoinReadView,
         alloc: std.mem.Allocator,
         routed: Source,
         session: table_catalog.RoutingSession,
-        fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("table_read_source.zig").JoinReadView {
+        fn acquire(ptr: *anyopaque, alloc: std.mem.Allocator, budget: table_router.RouteBudget) !*@import("antfly_local_sources").api_table_read_source.JoinReadView {
             try budget.check();
             const source: *Source = @ptrCast(@alignCast(ptr));
             const self = try alloc.create(@This());
@@ -154,7 +153,7 @@ fn JoinReadBinding(comptime Source: type) type {
             self.view.source = self.routed.source();
             return &self.view;
         }
-        fn destroy(view: *@import("table_read_source.zig").JoinReadView) void {
+        fn destroy(view: *@import("antfly_local_sources").api_table_read_source.JoinReadView) void {
             const self: *@This() = @fieldParentPtr("view", view);
             self.session.deinit();
             self.alloc.destroy(self);
@@ -220,8 +219,8 @@ const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
 const http_routes = @import("http_routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
-const distributed_stats_mod = @import("../search/distributed_stats.zig");
-const fusion_mod = @import("../search/fusion.zig");
+const distributed_stats_mod = @import("antfly_local_sources").search_distributed_stats;
+const fusion_mod = @import("antfly_local_sources").search_fusion;
 
 /// Normalize known read-transport failures before they cross a compiled
 /// boundary. Reads have no ambiguous mutation outcome; unavailable peers must
@@ -274,10 +273,10 @@ pub fn normalizeDistributedQueryOperationalError(err: anyerror) anyerror {
     };
 }
 
-const regex_mod = @import("../search/regex.zig");
+const regex_mod = @import("antfly_local_sources").search_regex;
 const httpx = @import("httpx");
 const Io = std.Io;
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
@@ -373,7 +372,7 @@ const AuthoritativePayloadLookup = struct {
     options: db_mod.types.LookupOptions,
     owned_fields: []const []const u8 = &.{},
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.owned_fields.len > 0) alloc.free(self.owned_fields);
         self.* = undefined;
     }
@@ -465,7 +464,7 @@ const ScanResponseCapture = struct {
         return .{ .alloc = alloc, .max_bytes = if (opts.isRelational()) 16 * 1024 * 1024 else std.math.maxInt(usize) };
     }
 
-    fn deinit(self: *ScanResponseCapture) void {
+    pub fn deinit(self: *ScanResponseCapture) void {
         self.bytes.deinit(self.alloc);
     }
 
@@ -559,6 +558,7 @@ pub const testing = if (builtin.is_test) struct {
 
 const ControlProvisionedTableReadCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -573,6 +573,7 @@ const PhysicalProvisionedTableReadCache = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -642,7 +643,7 @@ const PhysicalProvisionedTableReadCache = struct {
         active_leases: usize = 0,
         retired: bool = false,
 
-        fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             self.db.close();
             alloc.free(self.table_name);
             self.* = undefined;
@@ -690,7 +691,7 @@ const PhysicalProvisionedTableReadCache = struct {
         identity_namespace: ?db_mod.DocIdentityNamespace = null,
         table_name: []u8,
 
-        fn deinit(self: *PendingOpen, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PendingOpen, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             self.* = undefined;
         }
@@ -766,6 +767,7 @@ const PhysicalProvisionedTableReadCache = struct {
         return .{
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, &@constCast(self).remote_capability_cache),
+            .decision_registry = self.decision_registry,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -1544,12 +1546,12 @@ pub const GraphReadBarrier = struct {
     }
 };
 
-pub const HAReadGate = union(enum) {
+pub const HotStandbyReadGate = union(enum) {
     standby: *const hot_standby_standby_mod.Standby,
-    shared: *const ha_public_gate_state.State,
+    shared: *const hot_standby_public_gate_state.State,
 
-    pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
-        const request = ha_read_gate_mod.Request{
+    pub fn check(self: HotStandbyReadGate, consistency: raft_mod.ReadConsistency) !void {
+        const request = hot_standby_read_gate_mod.Request{
             .consistency = switch (consistency) {
                 .stale => .stale_ok,
                 .leader_lease, .read_index => .primary,
@@ -1558,7 +1560,7 @@ pub const HAReadGate = union(enum) {
         switch (self) {
             .shared => |state| try state.checkRead(request),
             .standby => |standby| {
-                const decision = try ha_read_gate_mod.evaluateStandby(standby, request);
+                const decision = try hot_standby_read_gate_mod.evaluateStandby(standby, request);
                 switch (decision.action) {
                     .serve_standby => {},
                     .wait_for_apply => return error.HAReadWaitForApply,
@@ -1807,7 +1809,7 @@ const PhysicalLocalQueryDbOwner = union(enum) {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .resident => |*resident| resident.lease.release(resident.alloc),
             .cached => |*cached| cached.release(),
@@ -1825,7 +1827,7 @@ const LocalQueryDbOwner = if (control_only_storage_sources) struct {
         unreachable;
     }
 
-    fn deinit(_: *@This()) void {
+    pub fn deinit(_: *@This()) void {
         unreachable;
     }
 } else PhysicalLocalQueryDbOwner;
@@ -2183,14 +2185,14 @@ const FanoutIo = struct {
 };
 
 fn ioAsyncLimitWidth(io_impl: FanoutIo, group_count: usize) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return @max(@as(usize, 1), group_count);
     return @max(@as(usize, 1), @min(group_count, raw));
 }
 
 fn ioAsyncLimitCap(io_impl: FanoutIo) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return std.math.maxInt(usize);
     return @max(@as(usize, 1), raw);
@@ -2442,6 +2444,7 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
 }
 
 pub const BoundTableReadSource = struct {
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     table_name: []const u8,
     db: *db_mod.DB,
     reads: raft_mod.FeatureDBReads,
@@ -2583,14 +2586,14 @@ pub const BoundTableReadSource = struct {
         return try controlledLookupResponseAlloc(alloc, result.json, if (integrityLookupMode(opts)) 0 else result.version orelse try self.db.getTimestamp(alloc, key), opts, result.expected_content_digest);
     }
 
-    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try self.reads.reads.prepareScanWithConsistency(self.reads.group_id, from_key, to_key, opts, consistency);
         return try self.openPreparedRelationalRead(alloc, from_key, to_key, opts);
     }
 
-    fn openPreparedRelationalRead(self: *BoundTableReadSource, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions) !@import("table_read_source.zig").RelationalReadView {
+    fn openPreparedRelationalRead(self: *BoundTableReadSource, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         var epoch = self.db.core.acquireSchemaView();
         defer if (epoch) |*view| view.release();
         if (epoch == null or epoch.?.storageMode() == .document) {
@@ -2603,7 +2606,7 @@ pub const BoundTableReadSource = struct {
 
     const RetainedStatementRead = struct {
         alloc: std.mem.Allocator,
-        views: []@import("table_read_source.zig").RelationalReadView,
+        views: []@import("antfly_local_sources").api_table_read_source.RelationalReadView,
         opened: usize = 0,
 
         fn close(ptr: *anyopaque) void {
@@ -2620,7 +2623,7 @@ pub const BoundTableReadSource = struct {
     const CoordinatedStatementSnapshot = struct {
         alloc: std.mem.Allocator,
         prepared: ProvisionedTableReadSource.PreparedSpanRead,
-        snapshots: []@import("../storage/statement_read_fence.zig").Snapshot,
+        snapshots: []@import("antfly_local_sources").storage_statement_read_fence.Snapshot,
         table: []u8,
         schema_version: u32,
         cancellation: ?@import("antfly_cancellation").CancellationToken,
@@ -2632,18 +2635,18 @@ pub const BoundTableReadSource = struct {
             if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
 
-        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalReadView {
+        fn open(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             return error.SqlRangeTrackingRequired;
         }
 
-        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalStatementSnapshot.GuardedRead {
+        fn openGuarded(ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot.GuardedRead {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.check();
             if (!std.mem.eql(u8, input.table, self.table) or self.opened >= 64 or !input.opts.include_range_proofs) return error.SqlStatementSnapshotRequired;
             const row_query = input.opts.relational_query orelse return error.SqlStatementSnapshotRequired;
             if (row_query.schema_version != self.schema_version or row_query.index != null or row_query.auto_index) return error.SqlStatementSnapshotRequired;
-            const View = @import("table_read_source.zig").RelationalReadView;
-            const OwnerProof = @import("range_read_guards.zig").OwnerRangeProof;
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+            const OwnerProof = @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof;
             const views = try alloc.alloc(View, self.snapshots.len);
             defer alloc.free(views);
             var opened: usize = 0;
@@ -2699,7 +2702,7 @@ pub const BoundTableReadSource = struct {
             if (self.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         }
 
-        fn open(raw: *anyopaque, alloc: std.mem.Allocator, input: @import("table_read_source.zig").RelationalStatementScan) !@import("table_read_source.zig").RelationalReadView {
+        fn open(raw: *anyopaque, alloc: std.mem.Allocator, input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.check();
             if (!std.mem.eql(u8, input.table, self.table_name)) return error.TableNotFound;
@@ -2727,7 +2730,7 @@ pub const BoundTableReadSource = struct {
         }
     };
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table)) return error.TableNotFound;
         if (consistency != .read_index) return error.SqlStatementSnapshotRequired;
@@ -2754,7 +2757,7 @@ pub const BoundTableReadSource = struct {
         return .{ .ptr = retained, .vtable = &.{ .open = DynamicStatementSnapshot.open, .close = DynamicStatementSnapshot.close } };
     }
 
-    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("table_read_source.zig").RelationalStatementRead {
+    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
         // Complete read-index admission before taking the short write fence;
@@ -2767,7 +2770,7 @@ pub const BoundTableReadSource = struct {
         }
         const owner = try alloc.create(RetainedStatementRead);
         errdefer alloc.destroy(owner);
-        const views = try alloc.alloc(@import("table_read_source.zig").RelationalReadView, scans.len);
+        const views = try alloc.alloc(@import("antfly_local_sources").api_table_read_source.RelationalReadView, scans.len);
         errdefer alloc.free(views);
         owner.* = .{ .alloc = alloc, .views = views };
         errdefer for (owner.views[0..owner.opened]) |view| view.deinit();
@@ -2789,7 +2792,7 @@ pub const BoundTableReadSource = struct {
         return .{ .ptr = owner, .views = views, .vtable = &.{ .close = RetainedStatementRead.close } };
     }
 
-    fn nextDocumentPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("table_read_source.zig").RelationalReadView.Page {
+    fn nextDocumentPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
         const session: *db_mod.DB.DocumentReadSession = @ptrCast(@alignCast(ptr));
         return session.next(alloc, limit);
     }
@@ -2804,8 +2807,8 @@ pub const BoundTableReadSource = struct {
         return session.normalizeRows(alloc, writes);
     }
 
-    fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("table_read_source.zig").RelationalReadView.Page {
-        const View = @import("table_read_source.zig").RelationalReadView;
+    fn nextRelationalPage(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
+        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
         var page = try session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
         errdefer page.deinit();
@@ -2823,7 +2826,7 @@ pub const BoundTableReadSource = struct {
         session.deinit();
     }
 
-    fn relationalRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+    fn relationalRangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
         const session: *db_mod.DB.RelationalReadSession = @ptrCast(@alignCast(ptr));
         return session.rangeProofs(alloc);
     }
@@ -2882,11 +2885,12 @@ pub const BoundTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        try validateDecisionRequest(alloc, req, self.decision_registry);
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try checkQueryDeadline(req);
 
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = collection_req orelse req;
+        const search_req = decisionCollectionRequest(collection_req orelse req);
         const start_ns = platform_time.monotonicNs();
         const phase_profile = benchQueryApiPhaseProfileEnabled();
         const prepare_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
@@ -2950,6 +2954,7 @@ pub const BoundTableReadSource = struct {
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
             .source_table = table_name,
+            .decision_registry = self.decision_registry,
             .backend_runtime = self.db.backend_runtime,
         });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
@@ -3211,15 +3216,26 @@ fn queryRoutingDeadline(catalog: table_catalog.CatalogSource, req: db_mod.types.
     return catalog.deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
 }
 
+// A missing route is a metadata observation, not an owner absence proof.
+// Public catalog binding resolves truly unknown tables before this boundary.
+fn lookupWithoutRoute(consistency: raft_mod.ReadConsistency) !?LookupResponse {
+    if (consistency == .read_index) return error.StorageReadTemporarilyUnavailable;
+    return null;
+}
+
 fn lookupRoutingDeadline(catalog: table_catalog.CatalogSource, opts: db_mod.types.LookupOptions) ?u64 {
     return catalog.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io });
+}
+
+fn scanRoutingDeadline(catalog: table_catalog.CatalogSource, opts: db_mod.types.ScanOptions) ?u64 {
+    return catalog.deadlineFrom(.{ .deadline_ns = opts.execution_deadline_ns });
 }
 
 fn provisionedConsistencyDeadline(catalog: table_catalog.CatalogSource, request: ProvisionedConsistencyRequest) ?u64 {
     return switch (request) {
         .search => |req| queryRoutingDeadline(catalog, req),
         .lookup => |lookup| lookupRoutingDeadline(catalog, lookup.opts),
-        .scan => null,
+        .scan => |scan_request| scanRoutingDeadline(catalog, scan_request.opts),
     };
 }
 
@@ -3267,8 +3283,9 @@ pub const ProvisionedTableReadSource = struct {
     prepare_for_read: ?ReadPreparation = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     resident_db: ?ResidentDbSource = null,
-    ha_read_gate: ?HAReadGate = null,
+    hot_standby_read_gate: ?HotStandbyReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -3310,7 +3327,7 @@ pub const ProvisionedTableReadSource = struct {
             self.activity = null;
         }
 
-        fn deinit(self: *PreparedKeyRead) void {
+        pub fn deinit(self: *PreparedKeyRead) void {
             self.releaseActivity();
         }
 
@@ -3351,7 +3368,7 @@ pub const ProvisionedTableReadSource = struct {
             self.activity = null;
         }
 
-        fn deinit(self: *PreparedSpanRead) void {
+        pub fn deinit(self: *PreparedSpanRead) void {
             self.releaseActivity();
             self.alloc.free(self.routes);
             self.routes = &.{};
@@ -3457,6 +3474,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.backend_runtime = self.backend_runtime;
         hosted.group_visible_root_generation = self.group_visible_root_generation;
         hosted.antfly_provider = self.antfly_provider;
+        hosted.decision_registry = self.decision_registry;
         hosted.inference_api_url = self.inference_api_url;
         hosted.secret_store = self.secret_store;
         hosted.remote_content = self.remote_content;
@@ -3541,11 +3559,11 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
-    pub fn withHAReadGate(
+    pub fn withHotStandbyReadGate(
         self: *ProvisionedTableReadSource,
-        gate: ?HAReadGate,
+        gate: ?HotStandbyReadGate,
     ) *ProvisionedTableReadSource {
-        self.ha_read_gate = gate;
+        self.hot_standby_read_gate = gate;
         return self;
     }
 
@@ -3621,6 +3639,7 @@ pub const ProvisionedTableReadSource = struct {
     fn physicalSource(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
+            .strict_read_index_absence = true,
             .vtable = &.{
                 .lookup = unsupportedPhysicalTopLevelLookup,
                 .scan = unsupportedPhysicalTopLevelScan,
@@ -3642,16 +3661,16 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn ensureHAReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
-        if (self.ha_read_gate) |gate| try gate.check(consistency);
+    fn ensureHotStandbyReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
+        if (self.hot_standby_read_gate) |gate| try gate.check(consistency);
     }
 
     const RetainedSingleOwnerRead = struct {
         alloc: std.mem.Allocator,
         prepared: PreparedSpanRead,
-        view: @import("table_read_source.zig").RelationalReadView,
+        view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
 
-        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("table_read_source.zig").RelationalReadView.Page {
+        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !@import("antfly_local_sources").api_table_read_source.RelationalReadView.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.next(alloc, limit);
         }
@@ -3667,9 +3686,9 @@ pub const ProvisionedTableReadSource = struct {
         }
     };
 
-    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             const Single = struct {
                 alloc: std.mem.Allocator,
@@ -3716,9 +3735,9 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = retained, .vtable = &.{ .next = RetainedSingleOwnerRead.next, .close = RetainedSingleOwnerRead.close, .normalize = RetainedSingleOwnerRead.normalize } };
     }
 
-    fn openCoordinatedRelationalRead(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, prepared: *PreparedSpanRead, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !@import("table_read_source.zig").RelationalReadView {
-        const ReadView = @import("table_read_source.zig").RelationalReadView;
-        const Fence = @import("table_read_source.zig").StatementReadFence;
+    fn openCoordinatedRelationalRead(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, prepared: *PreparedSpanRead, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions) !@import("antfly_local_sources").api_table_read_source.RelationalReadView {
+        const ReadView = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
         if (prepared.group_ids.len > 256) return error.SqlProgramLimitExceeded;
         // Native automatic indexes need not emit primary-key order. Merge
         // only explicit primary-order streams; unordered SQL scans concatenate
@@ -3781,7 +3800,7 @@ pub const ProvisionedTableReadSource = struct {
         proofs: []const []const table_read_source.RelationalStatementRead.OwnerRangeProof = &.{},
         alloc: std.mem.Allocator,
         prepared: []PreparedSpanRead,
-        views: []@import("table_read_source.zig").RelationalReadView,
+        views: []@import("antfly_local_sources").api_table_read_source.RelationalReadView,
         prepared_count: usize = 0,
         view_count: usize = 0,
 
@@ -3804,19 +3823,19 @@ pub const ProvisionedTableReadSource = struct {
                 alloc.free(result);
             }
             for (self.proofs[scan_index], result) |owner, *out| {
-                out.* = .{ .fence = owner.fence, .proofs = try alloc.dupe(@import("range_read_guards.zig").Proof, owner.proofs) };
+                out.* = .{ .fence = owner.fence, .proofs = try alloc.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, owner.proofs) };
                 initialized += 1;
             }
             return result;
         }
     };
 
-    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("table_read_source.zig").RelationalStatementRead {
+    fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null and self.distributed_router == null) return error.SqlStatementSnapshotRequired;
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
-        const View = @import("table_read_source.zig").RelationalReadView;
+        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
         const retained = try alloc.create(RetainedStatementRead);
         errdefer alloc.destroy(retained);
         const prepared_reads = try alloc.alloc(PreparedSpanRead, scans.len);
@@ -3834,9 +3853,9 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
+    fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
         const opts: db_mod.types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = deadline_ns };
         var prepared = try self.prepareRoutedSpanRead(alloc, table, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, consistency, .general);
@@ -3869,7 +3888,7 @@ pub const ProvisionedTableReadSource = struct {
                 .remote => |remote| try @import("retained_read_client.zig").Client.admit(alloc, self.distributedInternalExecutor(), remote.base_uri, table, prepared.fenceAt(index, deadline_ns, cancellation), schema_version, deadline_ns),
             };
         }
-        const Fence = @import("table_read_source.zig").StatementReadFence;
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
         const fences = try temp.alloc(Fence, routes.len);
         var held: usize = 0;
         defer for (fences[0..held]) |fence| fence.deinit();
@@ -3891,7 +3910,7 @@ pub const ProvisionedTableReadSource = struct {
             held = 0;
             try wait_budget.sleepNs(std.time.ns_per_ms);
         }
-        const snapshots = try alloc.alloc(@import("../storage/statement_read_fence.zig").Snapshot, fences.len);
+        const snapshots = try alloc.alloc(@import("antfly_local_sources").storage_statement_read_fence.Snapshot, fences.len);
         var captured: usize = 0;
         errdefer {
             for (snapshots[0..captured]) |snapshot| snapshot.deinit();
@@ -3909,9 +3928,9 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = owned, .vtable = &.{ .open = BoundTableReadSource.CoordinatedStatementSnapshot.open, .open_guarded = BoundTableReadSource.CoordinatedStatementSnapshot.openGuarded, .close = BoundTableReadSource.CoordinatedStatementSnapshot.close } };
     }
 
-    fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("table_read_source.zig").RelationalStatementRead {
-        const View = @import("table_read_source.zig").RelationalReadView;
-        const Fence = @import("table_read_source.zig").StatementReadFence;
+    fn finishRelationalStatement(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, scans: []const @import("antfly_local_sources").api_table_read_source.RelationalStatementScan, consistency: raft_mod.ReadConsistency, retained: *RetainedStatementRead) !@import("antfly_local_sources").api_table_read_source.RelationalStatementRead {
+        const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+        const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
@@ -4026,7 +4045,7 @@ pub const ProvisionedTableReadSource = struct {
                 opened += 1;
                 if (proof_groups) |groups| {
                     const native_proofs = try view.rangeProofs(temporary);
-                    const proofs = try retained.proof_arena.allocator().alloc(@import("range_read_guards.zig").Proof, native_proofs.len);
+                    const proofs = try retained.proof_arena.allocator().alloc(@import("antfly_local_sources").api_range_read_guards.Proof, native_proofs.len);
                     for (native_proofs, proofs) |native_proof, *proof| proof.* = native_proof;
                     groups[owner_index] = .{ .fence = retained.prepared[scan_index].fenceAt(owner_index, null, null), .proofs = proofs };
                 }
@@ -4043,7 +4062,7 @@ pub const ProvisionedTableReadSource = struct {
                 const upper = row_query.upper orelse return error.UnsupportedSqlExecution;
                 if (!input.opts.include_range_proofs or row_query.after != null or !lower.inclusive or !upper.inclusive or
                     lower.values.len == 0 or lower.values.len != upper.values.len) return error.UnsupportedSqlExecution;
-                const tracking = @import("../storage/range_protection.zig");
+                const tracking = @import("antfly_local_sources").storage_range_protection;
                 var span: ?tracking.IndexSpan = null;
                 for (proof_groups orelse return error.UnsupportedSqlExecution) |owner| {
                     if (owner.proofs.len != 1) return error.UnsupportedSqlExecution;
@@ -4063,16 +4082,16 @@ pub const ProvisionedTableReadSource = struct {
         return .{ .ptr = retained, .views = retained.views, .vtable = &.{ .close = RetainedStatementRead.close, .range_proofs = RetainedStatementRead.rangeProofs } };
     }
 
-    fn openRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null) return null;
         return self.groupLocalSourceWithFence(fence).openRelationalReadGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
     }
 
-    fn tryStatementReadFenceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").StatementReadFence {
+    fn tryStatementReadFenceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.StatementReadFence {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
         return self.groupLocalSourceWithFence(fence).tryStatementReadFenceGroupLocal(alloc, group_id, table_name, opts, consistency);
     }
@@ -4080,7 +4099,7 @@ pub const ProvisionedTableReadSource = struct {
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
-            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
+            .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else !control_only_storage_sources,
             .remote_statement_fences_safe = if (self.local_read_source) |local| local.remote_statement_fences_safe else false,
             .supports_sql_range_guards = true,
             .vtable = &.{
@@ -4145,7 +4164,7 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("antfly_local_sources").api_table_read_source.IncomingGraphRouteCache) void {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
@@ -4193,6 +4212,7 @@ pub const ProvisionedTableReadSource = struct {
                 self.antfly_provider,
                 if (comptime control_only_storage_sources) null else if (self.cache) |cache| &cache.remote_capability_cache else null,
             ),
+            .decision_registry = self.decision_registry,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -4241,7 +4261,7 @@ pub const ProvisionedTableReadSource = struct {
         if (consistency == .stale or group_ids.len == 0) return;
         const strict_relational = request == .scan and request.scan.opts.isRelational();
         const allow_stale_fallback = !strict_relational and !(consistency == .read_index and request == .lookup and
-            (if (self.local_read_source) |local| local.strict_read_index_absence else false));
+            self.source().strict_read_index_absence);
         const plan = planFanout(.query, self.io_impl, group_ids.len);
         if (!plan.parallel) {
             for (group_ids) |group_id| {
@@ -4337,7 +4357,7 @@ pub const ProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (try ordered_rows.isIndexScan(alloc, opts)) {
             var result = (try scan(ptr, alloc, table_name, from_key, to_key, opts, consistency)) orelse return false;
             defer result.deinit(alloc);
@@ -4597,13 +4617,13 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkLookupOptionsActive(opts);
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.catalog.vtable.restore_scope_for_group != null) {
             // The standalone restore validator pins the same unpublished
             // catalog as the distributed adapter. Admit only its exact owner
             // scope, never an ordinary named-table open.
             const routed = try table_catalog.routedGroupSnapshotUntil(alloc, self.catalog, table_name, key, lookupRoutingDeadline(self.catalog, opts));
-            const fence = routed.fence() orelse return null;
+            const fence = routed.fence() orelse return lookupWithoutRoute(consistency);
             // Routing views forward this optional capability even for normal
             // published tables. Only a returned scope authorizes staging;
             // restore catalogs reject unknown owners instead of returning null.
@@ -4624,7 +4644,7 @@ pub const ProvisionedTableReadSource = struct {
             var prepared = try self.prepareRoutedKeyRead(alloc, table_name, key, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general);
             defer prepared.deinit();
             try checkLookupOptionsActive(opts);
-            const route = prepared.route orelse return null;
+            const route = prepared.route orelse return lookupWithoutRoute(consistency);
             const group_id = route.group_id;
             const result = if (comptime control_only_storage_sources)
                 self.groupLocalSourceWithFence(prepared.fence(.{ .deadline_ns = opts.execution_deadline_ns, .io = opts.execution_io }, opts.cancellation).?).lookupGroupLocal(alloc, group_id, table_name, key, opts, .stale)
@@ -4654,7 +4674,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.documentArtifactManifest(
@@ -4699,7 +4719,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.documentArtifactManifests(
@@ -4745,7 +4765,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.scan(&hosted, alloc, table_name, from_key, to_key, opts, consistency);
@@ -4811,7 +4831,8 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try validateDecisionRequest(alloc, req, self.decision_registry);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.query(&hosted, alloc, table_name, req, consistency);
@@ -4877,7 +4898,7 @@ pub const ProvisionedTableReadSource = struct {
                 // results below through the same routed physical provider.
             } else {
                 const local_collection_req = aggregationOnlyCollectionRequest(req);
-                const local_search_req = graphScopedSearchRequest(local_collection_req orelse req, group_ids.len, table_name);
+                const local_search_req = graphScopedSearchRequest(decisionCollectionRequest(local_collection_req orelse req), group_ids.len, table_name);
                 var execution = queryHostedLocalDetailed(routed.resident_db, routed.cache, routed.replica_root_dir, routed.catalog, routed.read_safety_barrier, alloc, group_ids[0], routed.visibleRootGeneration(group_ids[0]), routed.managedReadRuntimeConfig(), table_name, local_search_req, .stale, prepared.activity != null) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
@@ -4996,7 +5017,7 @@ pub const ProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = graphScopedSearchRequest(collection_req orelse req, group_ids.len, table_name);
+        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
         var merged = queryProvisionedAcrossGroups(routed, alloc, group_ids, search_req, table_name, .stale) catch |err| switch (err) {
             error.ResidentDbRetryRequired => {
                 prepared.releaseActivity();
@@ -5038,7 +5059,7 @@ pub const ProvisionedTableReadSource = struct {
     /// Ordinary single-shard aggregation is finalized by the physical provider
     /// under one read lease, before its captured generation is released.
     fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
-        return req.reranker != null or req.pruner != null or
+        return req.evaluation_limit > 0 or req.reranker != null or req.pruner != null or
             std.mem.indexOf(u8, req.aggregations_json, "\"algebraic_join\"") != null;
     }
 
@@ -5051,7 +5072,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.preflightQuery(
@@ -5235,7 +5256,7 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     fn lookupRestoreStaging(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, fence: ?metadata_api.CatalogRouteFence) !?LookupResponse {
-        try self.ensureHAReadAllowed(.read_index);
+        try self.ensureHotStandbyReadAllowed(.read_index);
         try checkLookupOptionsActive(opts);
         if (comptime control_only_storage_sources) {
             var local = self.local_read_source orelse return error.StorageKernelOwnerUnavailable;
@@ -5279,7 +5300,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, null);
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general, 0);
@@ -5329,7 +5350,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
@@ -5371,7 +5392,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
@@ -5413,7 +5434,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             // A routed data-Raft query may run on a leader that only recently
@@ -5499,7 +5520,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general, 0);
@@ -5561,7 +5582,7 @@ pub const ProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general, 0);
@@ -5606,7 +5627,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn queryGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             const fence = try self.coordinatorGroupFence(alloc, group_id, table_name, req);
             var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5620,7 +5641,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn searchResultGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             const fence = try self.coordinatorGroupFence(alloc, group_id, table_name, req);
             var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5641,7 +5662,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
@@ -5717,7 +5738,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
@@ -5978,7 +5999,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         return try self.groupLocalSource().graphExpandGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
@@ -6004,7 +6025,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         return try self.groupLocalSource().graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
@@ -6030,7 +6051,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         return try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
@@ -6210,6 +6231,7 @@ pub const HostedProvisionedTableReadSource = struct {
     internal_service_issuer: ?[]const u8 = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -6311,6 +6333,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, self.remote_capability_cache),
+            .decision_registry = self.decision_registry,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -6898,7 +6921,7 @@ pub const HostedProvisionedTableReadSource = struct {
         };
     }
 
-    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("table_read_source.zig").IncomingGraphRouteCache) void {
+    fn bindIncomingGraphRoutes(ptr: *anyopaque, cache: *@import("antfly_local_sources").api_table_read_source.IncomingGraphRouteCache) void {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         _ = self.withIncomingGraphRoutes(@ptrCast(@alignCast(cache)));
     }
@@ -6920,7 +6943,7 @@ pub const HostedProvisionedTableReadSource = struct {
             key,
             lookupRoutingDeadline(hosted.catalog, opts),
         );
-        const fence = routed.fence() orelse return null;
+        const fence = routed.fence() orelse return lookupWithoutRoute(consistency);
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
         var pinned = routePinnedCatalogForFence(hosted.catalog, table_name, fence, &route_storage);
         var routed_source = hosted.*;
@@ -7103,6 +7126,11 @@ pub const HostedProvisionedTableReadSource = struct {
                 else => return err,
             }
         }
+        // Exhausting replicas is not a ReadIndex absence proof. An unmarked
+        // HTTP miss or a failed endpoint can occur while a published owner is
+        // still converging. Keep that uncertainty on the availability path so
+        // callers re-resolve their fenced route within the existing budget.
+        if (consistency == .read_index) return error.StorageReadTemporarilyUnavailable;
         return null;
     }
 
@@ -7177,10 +7205,10 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{ .ptr = owner, .vtable = &.{ .next = Owner.next, .close = Owner.close, .normalize = Owner.normalize } };
     }
 
-    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
+    fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_table_read_source.RelationalReadView {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.local_read_source == null) return try self.openRemoteRelationalRead(alloc, table, from, to, opts, consistency);
-        var snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table, from, to, opts.execution_deadline_ns);
+        var snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table, from, to, scanRoutingDeadline(self.catalog, opts));
         defer snapshot.deinit(alloc);
         if (snapshot.group_ids.len != 1) return try self.openRemoteRelationalRead(alloc, table, from, to, opts, consistency);
         const group = snapshot.group_ids[0];
@@ -7193,7 +7221,7 @@ pub const HostedProvisionedTableReadSource = struct {
         const local_source = self.groupLocalSourceWithFence(fence);
         const view = (try local_source.openRelationalReadGroupLocal(alloc, group, table, from, to, opts, consistency)) orelse return null;
         errdefer view.deinit();
-        try table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table, snapshot.topology_epoch, opts.execution_deadline_ns);
+        try table_catalog.validatePinnedTopologyEpochUntil(alloc, self.catalog, table, snapshot.topology_epoch, scanRoutingDeadline(self.catalog, opts));
         return view;
     }
 
@@ -7224,12 +7252,12 @@ pub const HostedProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, opts.execution_deadline_ns);
+        var routing_session = try table_catalog.RoutingSession.initForRoute(alloc, hosted.catalog, table_name, .{ .span = .{ .from_key = from_key, .to_key = to_key } }, scanRoutingDeadline(hosted.catalog, opts));
         defer routing_session.deinit();
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, opts.execution_deadline_ns);
+        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, from_key, to_key, scanRoutingDeadline(self.catalog, opts));
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return false;
@@ -7272,7 +7300,7 @@ pub const HostedProvisionedTableReadSource = struct {
             if (ordered) |*merge| try merge.endGroup();
         }
         if (ordered) |*merge| {
-            try table_catalog.validatePinnedTopologyEpochUntil(alloc, hosted.catalog, table_name, route_snapshot.topology_epoch, opts.execution_deadline_ns);
+            try table_catalog.validatePinnedTopologyEpochUntil(alloc, hosted.catalog, table_name, route_snapshot.topology_epoch, scanRoutingDeadline(hosted.catalog, opts));
             const result = try merge.finishAlloc();
             defer alloc.free(result);
             _ = try scanRemainingTimeoutMs(opts);
@@ -7292,6 +7320,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try validateDecisionRequest(alloc, req, hosted.decision_registry);
         const timed_req = graphTimedSearchRequest(req);
         // A graph retry re-runs its base scan and every shard fanout. Keep the
         // public retry budget to one fresh topology snapshot so churn cannot
@@ -7400,7 +7429,7 @@ pub const HostedProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = graphScopedSearchRequest(collection_req orelse req, group_ids.len, table_name);
+        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, search_req, table_name, consistency);
         try checkQueryDeadline(req);
         defer merged.deinit();
@@ -8122,6 +8151,7 @@ fn routeDeadlineFromTimeoutMs(catalog: table_catalog.CatalogSource, timeout_ms: 
 const ManagedReadRuntimeConfig = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -8156,7 +8186,7 @@ const TextStatsFanoutSlot = struct {
         };
     }
 
-    fn deinit(self: *TextStatsFanoutSlot) void {
+    pub fn deinit(self: *TextStatsFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -8173,7 +8203,7 @@ const SearchFanoutSlot = struct {
         };
     }
 
-    fn deinit(self: *SearchFanoutSlot) void {
+    pub fn deinit(self: *SearchFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -8190,7 +8220,7 @@ const PreflightFanoutSlot = struct {
         };
     }
 
-    fn deinit(self: *PreflightFanoutSlot) void {
+    pub fn deinit(self: *PreflightFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -8559,7 +8589,60 @@ fn queryHostedAcrossGroupsParallel(
     return merged;
 }
 
+fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry) !void {
+    if (req.evaluation_limit == 0) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var empty_registry = @import("antfly_local_sources").common_provider_registry.Registry.init(a);
+    defer empty_registry.deinit();
+    const configs = registry orelse &empty_registry;
+    const raw = try std.json.parseFromSliceLeaky(std.json.Value, a, req.evaluation_json, .{});
+    const plan = try @import("antfly_local_sources").functions_expressions.Plan.parse(a, raw);
+    if (plan.graph_query) |name| {
+        var found = false;
+        for (req.graph_queries) |graph| if (std.mem.eql(u8, graph.name, name)) {
+            found = true;
+            if (graph.query.match_pattern == null or graph.query.aggregates.len > 0 or !graph.query.include_documents) return error.UnsupportedQueryRequest;
+            for (plan.required_fields) |field| {
+                const end = std.mem.indexOfScalar(u8, field, '.') orelse field.len;
+                var known = false;
+                for (graph.query.return_aliases) |alias| if (std.mem.eql(u8, alias, field[0..end])) {
+                    known = true;
+                    break;
+                };
+                if (!known) return error.UnknownFunctionBinding;
+            }
+        };
+        if (!found) return error.InvalidFunctionExpression;
+    }
+
+    const Validate = struct {
+        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value) !void {
+            const cfgs: *const @import("antfly_local_sources").common_provider_registry.Registry = @ptrCast(@alignCast(ptr));
+            const cfg = try cfgs.getDeciderConfig(name);
+            try @import("antfly_local_sources").functions_decisions.validateQuestions(questions, @import("antfly_local_sources").functions_decisions.capabilities(cfg.provider));
+        }
+        fn unavailable(_: *anyopaque, _: std.mem.Allocator, _: []const @import("antfly_local_sources").functions_decisions.Request) ![]const std.json.Value {
+            return error.DecisionProviderUnavailable;
+        }
+    };
+    const provider: @import("antfly_local_sources").functions_decisions.DecisionProvider = .{ .ptr = @constCast(configs), .validate_fn = Validate.call, .evaluate_batch_fn = Validate.unavailable };
+    try @import("antfly_local_sources").functions_expressions.validatePlanProviders(a, plan, provider);
+}
+
+fn decisionCollectionRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    var copy = req;
+    if (req.hasHitEvaluation()) {
+        copy.limit = req.evaluation_limit;
+        copy.offset = 0;
+        copy.count_only = false;
+    }
+    return copy;
+}
+
 fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
+    if (req.hasHitEvaluation()) return req.evaluation_limit;
     if (req.graph_metric_rerank) |rerank| {
         return db_mod.types.graphMetricRerankCandidateCount(rerank, req.offset, req.limit);
     }
@@ -8582,7 +8665,7 @@ const DistributedCoordinatorPaging = struct {
 /// Graph-metric reranking is computed against shard-local published vectors,
 /// then merged by final score using the caller's page at the coordinator.
 fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoordinatorPaging {
-    if (req.reranker != null or req.pruner != null) return .{
+    if (req.hasHitEvaluation() or req.reranker != null or req.pruner != null) return .{
         .offset = 0,
         .limit = distributedSearchShardLimit(req),
     };
@@ -8748,6 +8831,10 @@ fn distributedSearchShardRequest(
     // Provider calls are coordinator-owned. In particular, a remote shard
     // must never rerank independently and then be reranked a second time after
     // the global merge.
+    copy.evaluation_json = "";
+    copy.evaluation_limit = 0;
+    copy.evaluation_matches = false;
+    copy.evaluation_graph = false;
     copy.reranker = null;
     copy.reranker_query_text = "";
     // Graph-metric scoring remains shard-local because its published vector is
@@ -9738,7 +9825,7 @@ const HierarchyNavigationLookupSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
-    fn deinit(self: *HierarchyNavigationLookupSlot) void {
+    pub fn deinit(self: *HierarchyNavigationLookupSlot) void {
         if (self.response) |*response| response.deinit(self.arena.allocator());
         self.arena.deinit();
         self.* = undefined;
@@ -9869,7 +9956,7 @@ fn hydrateDistributedGroupedUnitHits(
             return .{ .arena = std.heap.ArenaAllocator.init(inner_alloc) };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             const arena = self.arena.allocator();
             if (self.stored_response) |*response| response.deinit(arena);
             if (self.unit_response) |*response| response.deinit(arena);
@@ -11400,7 +11487,7 @@ fn lookupProvisionedHostedLocal(
     expected_identity_namespace: ?db_mod.DocIdentityNamespace,
 ) !?LookupResponse {
     return lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, consistency, read_activity_held, expected_identity_namespace) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale, read_activity_held, expected_identity_namespace),
+        error.NotLeader => if (consistency != .leader_lease) err else try lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, read_safety_barrier, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale, read_activity_held, expected_identity_namespace),
         else => err,
     };
 }
@@ -11663,7 +11750,7 @@ fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
     if (req.graph_metric_queries.len > 0 or req.graph_metric_rerank != null) return null;
     if (req.dense_queries.len > 1) return null;
     if (req.merge_config != null) return null;
-    if (req.reranker != null or req.pruner != null) return null;
+    if (req.evaluation_limit > 0 or req.reranker != null or req.pruner != null) return null;
     if (req.dense_queries.len == 1) {
         var dense_req = req;
         dense_req.index_name = req.dense_queries[0].index_name;
@@ -11692,7 +11779,7 @@ fn isDenseOnlyQuery(req: db_mod.types.SearchRequest) bool {
     if (req.sparse != null or req.sparse_queries.len > 0) return false;
     if (req.graph_queries.len > 0) return false;
     if (req.graph_metric_queries.len > 0 or req.graph_metric_rerank != null) return false;
-    if (req.reranker != null or req.pruner != null) return false;
+    if (req.evaluation_limit > 0 or req.reranker != null or req.pruner != null) return false;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return false;
 
     const query_is_dense_or_neutral = switch (req.query) {
@@ -13217,7 +13304,7 @@ const RangeCardinalityPlan = struct {
     ranges: []db_mod.algebraic.index.CardinalityRangeRequest,
     children: []db_mod.algebraic.index.CardinalityChildRequest,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.ranges) |range| {
             alloc.free(@constCast(range.name));
             if (range.start) |value| alloc.free(@constCast(value));
@@ -13235,7 +13322,7 @@ const HistogramCardinalityPlan = struct {
     date_bucket: []const u8 = "",
     children: []db_mod.algebraic.index.CardinalityChildRequest,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.date_bucket.len > 0) alloc.free(@constCast(self.date_bucket));
         if (self.children.len > 0) alloc.free(self.children);
         self.* = undefined;
@@ -14690,7 +14777,7 @@ fn collectSignificantTermsFromHits(
     alloc: std.mem.Allocator,
     hits: []const db_mod.types.SearchHit,
     field: []const u8,
-    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    analyzer: *const @import("antfly_local_sources").search_analysis.Analyzer,
     candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
@@ -14701,7 +14788,7 @@ fn collectSignificantTermsFromStoredAlloc(
     alloc: std.mem.Allocator,
     stored: []const u8,
     field: []const u8,
-    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    analyzer: *const @import("antfly_local_sources").search_analysis.Analyzer,
     candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
@@ -14713,7 +14800,7 @@ fn collectSignificantTermsFromStoredAlloc(
 fn collectSignificantTermsFromValue(
     alloc: std.mem.Allocator,
     value: std.json.Value,
-    analyzer: *const @import("../search/analysis.zig").Analyzer,
+    analyzer: *const @import("antfly_local_sources").search_analysis.Analyzer,
     candidate_limit: usize,
     seen_terms: *std.StringHashMapUnmanaged(void),
 ) !void {
@@ -14721,7 +14808,7 @@ fn collectSignificantTermsFromValue(
         .array => |arr| for (arr.items) |item| try collectSignificantTermsFromValue(alloc, item, analyzer, candidate_limit, seen_terms),
         .string => {
             const tokens = try analyzer.analyze(alloc, value.string);
-            defer @import("../search/analysis.zig").Analyzer.freeTokens(alloc, tokens);
+            defer @import("antfly_local_sources").search_analysis.Analyzer.freeTokens(alloc, tokens);
             for (tokens) |tok| {
                 if (!seen_terms.contains(tok.term) and seen_terms.count() >= candidate_limit)
                     return error.QueryCandidateBudgetExceeded;
@@ -14737,7 +14824,7 @@ fn collectSignificantTermsFromValue(
 fn tableAggregationAnalyzerForField(
     cfg: *const introducer_mod.TextAnalysisConfig,
     field: []const u8,
-) !*const @import("../search/analysis.zig").Analyzer {
+) !*const @import("antfly_local_sources").search_analysis.Analyzer {
     var analyzer_name: ?[]const u8 = null;
     for (cfg.field_analyzers) |item| {
         if (!std.mem.eql(u8, item.field_name, field)) continue;
@@ -15212,6 +15299,10 @@ fn applyQueryPostProcessing(
     meta: *query_api.QueryResponseMeta,
     runtime_cfg: ManagedReadRuntimeConfig,
 ) !void {
+    if (req.evaluation_limit > 0) {
+        try @import("antfly_local_sources").functions_query_eval.apply(alloc, req, result, meta, runtime_cfg);
+        return;
+    }
     if ((req.reranker == null and req.pruner == null) or result.hits.len == 0) return;
     const candidate_count = if (req.reranker != null)
         try applyReranker(alloc, req, result, meta, runtime_cfg)
@@ -15457,7 +15548,7 @@ const RerankerDocuments = struct {
         return .{ .alloc = alloc, .texts = texts, .owned_parts = owned_parts, .text_parts = text_parts, .parts_view = parts_view };
     }
 
-    fn deinit(self: *RerankerDocuments) void {
+    pub fn deinit(self: *RerankerDocuments) void {
         for (self.texts[0..self.initialized]) |text| self.alloc.free(text);
         for (self.owned_parts) |maybe_parts| if (maybe_parts) |parts| template_mod.freeContentParts(self.alloc, parts);
         self.alloc.free(self.texts);
@@ -16783,8 +16874,8 @@ fn consumerTests() type {
     if (!(builtin.is_test and !implementation_tests_only)) return struct {};
     const Suite = struct {
         test "relational statement retries unavailable capture and releases fences before pages or deadline" {
-            const View = @import("table_read_source.zig").RelationalReadView;
-            const Fence = @import("table_read_source.zig").StatementReadFence;
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+            const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
             const Fixture = struct {
                 admission: *TopologyReadAdmissionTracker,
                 held: bool = false,
@@ -16811,7 +16902,7 @@ fn consumerTests() type {
                     self.opens_since_capture = 0;
                     return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = release } };
                 }
-                fn validate(ptr: *anyopaque) !void {
+                pub fn validate(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(self.held);
                     if (self.fail_final_validation and self.opens_since_capture == 2) {
@@ -16826,10 +16917,10 @@ fn consumerTests() type {
                     self.opens_since_capture += 1;
                     return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .range_proofs = proofs } };
                 }
-                fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+                fn proofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(self.held);
-                    return alloc.dupe(@import("../storage/range_protection.zig").Proof, &.{.{ .bucket = 101, .generation = 7 }});
+                    return alloc.dupe(@import("antfly_local_sources").storage_range_protection.Proof, &.{.{ .bucket = 101, .generation = 7 }});
                 }
                 fn release(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -16859,7 +16950,7 @@ fn consumerTests() type {
                 .prepare_for_read = admission.iface(),
                 .local_read_source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } },
             };
-            const input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true } };
+            const input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true } };
             const statement = try routed.source().openRelationalStatement(std.testing.allocator, &.{ input, input }, .stale);
             try std.testing.expectEqual(@as(usize, 2), fixture.captures);
             try std.testing.expectEqual(@as(usize, 2), fixture.opens);
@@ -16888,16 +16979,16 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             try std.testing.expect(!fixture.held);
             fixture.persistently_unavailable = true;
-            const deadline_input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true, .execution_deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms } };
+            const deadline_input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan = .{ .table = "docs", .opts = .{ .relational_query = .{ .fields = &.{} }, .include_range_proofs = true, .execution_deadline_ns = platform_time.monotonicNs() +| 250 * std.time.ns_per_ms } };
             try std.testing.expectError(error.SqlStatementReadUnavailable, routed.source().openRelationalStatement(std.testing.allocator, &.{ deadline_input, deadline_input }, .stale));
             try std.testing.expectEqual(@as(usize, 0), admission.active);
             try std.testing.expect(!fixture.held);
         }
 
         test "relational row query full-key index proof requires every routed owner" {
-            const View = @import("table_read_source.zig").RelationalReadView;
-            const Fence = @import("table_read_source.zig").StatementReadFence;
-            const tracking = @import("../storage/range_protection.zig");
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
+            const Fence = @import("antfly_local_sources").api_table_read_source.StatementReadFence;
+            const tracking = @import("antfly_local_sources").storage_range_protection;
             const Catalog = struct {
                 tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = "{}" }},
                 ranges: [2]metadata_table_manager.RangeRecord = .{
@@ -16944,7 +17035,7 @@ fn consumerTests() type {
                     fixture: *Self,
                     group: u64,
                     held: bool = false,
-                    fn validate(ptr: *anyopaque) !void {
+                    pub fn validate(ptr: *anyopaque) !void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
                         try std.testing.expect(self.held);
                     }
@@ -16954,7 +17045,7 @@ fn consumerTests() type {
                         self.fixture.opens += 1;
                         return .{ .ptr = self, .vtable = &.{ .next = next, .close = close, .range_proofs = proofs } };
                     }
-                    fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+                    fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
                         try validate(ptr);
                         try std.testing.expect(self.fixture.owners[0].held and self.fixture.owners[1].held);
@@ -17021,7 +17112,7 @@ fn consumerTests() type {
                 .local_read_source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } },
             };
             const values = [_]std.json.Value{ .{ .string = "joint" }, .{ .integer = 7 } };
-            const input: @import("table_read_source.zig").RelationalStatementScan = .{ .table = "docs", .opts = .{
+            const input: @import("antfly_local_sources").api_table_read_source.RelationalStatementScan = .{ .table = "docs", .opts = .{
                 .include_range_proofs = true,
                 .relational_query = .{ .fields = &.{}, .index = "label_tenant_idx", .lower = .{ .values = &values }, .upper = .{ .values = &values }, .schema_version = 1 },
             } };
@@ -17086,7 +17177,7 @@ fn consumerTests() type {
         }
 
         test "relational row query retained owner holds admission and releases failed opens" {
-            const View = @import("table_read_source.zig").RelationalReadView;
+            const View = @import("antfly_local_sources").api_table_read_source.RelationalReadView;
             const Fixture = struct {
                 admission: *TopologyReadAdmissionTracker,
                 fail_open: bool = false,
@@ -17218,6 +17309,7 @@ fn consumerTests() type {
                 barrier_calls: usize = 0,
                 activity_active: usize = 0,
                 route_unavailable: bool = false,
+                catalog_route_missing: bool = false,
                 fn readIndexBeforeAdmission(ptr: *anyopaque, _: u64, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     // Raft apply needs exclusive admission. A second barrier
@@ -17261,6 +17353,9 @@ fn consumerTests() type {
                     if (!self.remote) return error.UnexpectedReplicaRead;
                     return try alloc.dupe(u8, "http://worker");
                 }
+                fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64, _: table_router.RouteBudget) ![]u64 {
+                    return try alloc.dupe(u64, &.{ 2, 3 });
+                }
                 fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
                     return error.UnexpectedPlacementRefresh;
                 }
@@ -17279,7 +17374,9 @@ fn consumerTests() type {
                     headers[1] = .{ .name = try alloc.dupe(u8, metadata_api.read_index_absence_header), .value = try alloc.dupe(u8, self.absence) };
                     return .{ .status = self.status, .headers = headers, .body = try alloc.dupe(u8, "not found") };
                 }
-                fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.catalog_route_missing) return .not_found;
                     const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
                     groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
                     return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
@@ -17306,6 +17403,12 @@ fn consumerTests() type {
             _ = hosted.withLocalReadSource(.{ .ptr = &fixture, .strict_read_index_absence = true, .vtable = &.{ .lookup = unsupportedPhysicalTopLevelLookup, .scan = unsupportedPhysicalTopLevelScan, .query = unsupportedPhysicalTopLevelQuery, .lookup_group_local_routed = Fixture.lookup } });
             for (0..36) |_| try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            // A catalog miss does not certify absence of a row in an owner.
+            fixture.catalog_route_missing = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+            try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .stale)) == null);
+            try std.testing.expectEqual(@as(usize, 36), fixture.reads);
+            fixture.catalog_route_missing = false;
             var unavailable_router = router;
             var unavailable_vtable = router.vtable.*;
             unavailable_vtable.resolve_group_routes = Fixture.resolveRoutes;
@@ -17321,6 +17424,9 @@ fn consumerTests() type {
             provisioned_view.distributed_router = router;
             provisioned_view.distributed_executor = hosted.executor;
             provisioned_view.local_read_source = hosted.local_read_source;
+            fixture.catalog_route_missing = true;
+            try std.testing.expectError(error.StorageReadTemporarilyUnavailable, provisioned_view.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+            fixture.catalog_route_missing = false;
             try std.testing.expect((try provisioned_view.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
             // No absence is inferred from failed barriers; stale reads retain
             // the existing fallback behavior instead of claiming authority.
@@ -17345,6 +17451,28 @@ fn consumerTests() type {
             fixture.status = 500;
             try std.testing.expectError(error.UnexpectedPlacementRefresh, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
 
+            // A bounded placement list can be exhausted successfully while
+            // every endpoint returns an unproved miss or server failure. That
+            // must not turn into a public 404 after publication.
+            var bounded_vtable = router.vtable.*;
+            bounded_vtable.group_node_ids = Fixture.groupNodeIds;
+            var bounded_router = router;
+            bounded_router.vtable = &bounded_vtable;
+            hosted.router = bounded_router;
+            fixture.absence = "";
+            inline for (.{ @as(u16, 404), @as(u16, 500) }) |status| {
+                fixture.status = status;
+                fixture.reads = 0;
+                try std.testing.expectError(error.StorageReadTemporarilyUnavailable, hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index));
+                try std.testing.expectEqual(@as(usize, 2), fixture.reads);
+            }
+            fixture.status = 404;
+            fixture.absence = "1";
+            fixture.reads = 0;
+            try std.testing.expect((try hosted.source().lookup(std.testing.allocator, "rows", "absent", .{}, .read_index)) == null);
+            try std.testing.expectEqual(@as(usize, 1), fixture.reads);
+            hosted.router = router;
+
             // A raw client must not accept even valid headers for a stale
             // request, or an absence marker without its route ACK.
             fixture.status = 404;
@@ -17359,7 +17487,7 @@ fn consumerTests() type {
             const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
             const fence_json = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
             defer std.testing.allocator.free(fence_json);
-            const context: @import("operation.zig").RequestContext = .{ .catalog_route_fence_json = fence_json };
+            const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .catalog_route_fence_json = fence_json };
             const input: operations_module.LookupInput = .{ .group_id = 7, .table_name = "rows", .key = "absent" };
             try std.testing.expectError(error.AuthoritativeLookupMissing, operations.lookup(std.testing.allocator, context, input));
             operations.reads.?.strict_read_index_absence = false;
@@ -17369,6 +17497,13 @@ fn consumerTests() type {
             stale_input.consistency = .stale;
             try std.testing.expectError(error.NotFound, operations.lookup(std.testing.allocator, context, stale_input));
             var provisioned = ProvisionedTableReadSource.init("unused", catalog, .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.notLeader } });
+            // The embedded physical owner must prove read-index absence too;
+            // its admission cannot fall back to a stale read on leader loss.
+            if (comptime !control_only_storage_sources) {
+                try std.testing.expect(provisioned.source().strict_read_index_absence);
+                try std.testing.expect(provisioned.physicalSource().strict_read_index_absence);
+                try std.testing.expectError(error.NotLeader, provisioned.prepareGroupsForReadAdmission(std.testing.allocator, &.{7}, .{ .lookup = .{ .key = "absent", .opts = .{} } }, .read_index));
+            }
             _ = provisioned.withLocalReadSource(hosted.local_read_source.?);
             try std.testing.expect(provisioned.source().strict_read_index_absence);
             try std.testing.expect(hosted.source().strict_read_index_absence);
@@ -17392,7 +17527,7 @@ fn consumerTests() type {
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
-                    const digest = std.fmt.bytesToHex([_]u8{0xab} ** 32, .lower);
+                    const digest = std.fmt.bytesToHex(@as([32]u8, @splat(0xab)), .lower);
                     const headers = try allocator.alloc(http_common.Header, if (self.mode == .missing) 1 else 2);
                     headers[0] = .{ .name = try allocator.dupe(u8, "X-Antfly-Version"), .value = try allocator.dupe(u8, "77") };
                     if (headers.len == 2) headers[1] = .{
@@ -17407,7 +17542,7 @@ fn consumerTests() type {
             var response = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index)).?;
             defer response.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 77), response.version);
-            try std.testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), &response.expected_content_digest.?);
+            try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xab))), &response.expected_content_digest.?);
             capture.mode = .missing;
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
             capture.mode = .invalid;
@@ -17658,7 +17793,7 @@ fn consumerTests() type {
                 starts: usize = 0,
                 bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-                fn deinit(self: *@This()) void {
+                pub fn deinit(self: *@This()) void {
                     self.bytes.deinit(self.alloc);
                 }
 
@@ -18509,6 +18644,17 @@ fn consumerTests() type {
             try std.testing.expect(deadline > routing_now);
             try std.testing.expect(deadline <= routing_now + 5 * ns);
             try std.testing.expectEqual(native_deadline, req.execution_deadline_ns.?);
+            const scan_opts = db_mod.types.ScanOptions{ .execution_deadline_ns = native_deadline };
+            const scan_deadline = scanRoutingDeadline(catalog, scan_opts).?;
+            try std.testing.expect(scan_deadline > routing_now);
+            try std.testing.expect(scan_deadline <= routing_now + 5 * ns);
+            try std.testing.expectEqual(native_deadline, scan_opts.execution_deadline_ns.?);
+            try catalog.budget(scan_deadline).checkpoint();
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(scanRoutingDeadline(catalog, .{ .execution_deadline_ns = 0 })).checkpoint());
+            try std.testing.expect(scanRoutingDeadline(catalog, .{}) == null);
+            const consistency_scan_deadline = provisionedConsistencyDeadline(catalog, .{ .scan = .{ .from_key = "", .to_key = "", .opts = scan_opts } }).?;
+            try std.testing.expect(consistency_scan_deadline > routing_now);
+            try std.testing.expect(consistency_scan_deadline <= routing_now + 5 * ns);
             try catalog.budget(deadline).checkpoint();
             try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, catalog.budget(queryRoutingDeadline(catalog, .{ .execution_deadline_ns = 0 })).checkpoint());
             try std.testing.expect(queryRoutingDeadline(catalog, .{}) == null);
@@ -18577,6 +18723,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, 123), lookupRoutingDeadline(catalog, .{ .execution_deadline_ns = 123, .execution_io = catalog.io }));
             const native_routes = table_catalog.CatalogSource{ .ptr = undefined, .vtable = undefined };
             try std.testing.expectEqual(native_deadline, queryRoutingDeadline(native_routes, req).?);
+            try std.testing.expectEqual(native_deadline, scanRoutingDeadline(native_routes, scan_opts).?);
         }
 
         test "graph table queries have one fresh-topology retry" {
@@ -18639,6 +18786,27 @@ fn consumerTests() type {
             try std.testing.expect(capability.sortable);
             try std.testing.expectEqualStrings("observed_declared", capability.doc_value_coverage);
             try std.testing.expectEqualStrings("declared", capability.queryability_state);
+        }
+
+        test "api query contract graph evaluation preserves base hit paging and shard windows" {
+            const req: db_mod.types.SearchRequest = .{ .limit = 2, .offset = 3, .evaluation_limit = 20, .evaluation_graph = true };
+            const collection = decisionCollectionRequest(req);
+            try std.testing.expectEqual(@as(u32, 2), collection.limit);
+            try std.testing.expectEqual(@as(u32, 3), collection.offset);
+            const shard = distributedSearchShardRequest(req, &.{}, false);
+            try std.testing.expectEqual(@as(u32, 5), shard.limit);
+            try std.testing.expectEqual(@as(u32, 0), shard.offset);
+            try std.testing.expect(!shard.evaluation_graph);
+            const coordinator = distributedCoordinatorPaging(req);
+            try std.testing.expectEqual(@as(u32, 3), coordinator.offset);
+            try std.testing.expectEqual(@as(u32, 2), coordinator.limit);
+            var count = req;
+            count.count_only = true;
+            try std.testing.expect(decisionCollectionRequest(count).count_only);
+            var hits = req;
+            hits.evaluation_graph = false;
+            try std.testing.expectEqual(@as(u32, 20), decisionCollectionRequest(hits).limit);
+            try std.testing.expectEqual(@as(u32, 0), distributedCoordinatorPaging(hits).offset);
         }
 
         test "distributed reranking widens retrieval and stays coordinator owned" {
@@ -21222,7 +21390,7 @@ fn consumerTests() type {
                     for (scores, 0..) |*score, i| score.* = @floatFromInt(i);
                     return scores;
                 }
-                fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const template_mod.ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
+                pub fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const template_mod.ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
                     const state: *@This() = @ptrCast(@alignCast(ptr));
                     state.document_calls += 1;
                     try std.testing.expectEqual(@as(usize, 2), documents.len);
@@ -21621,8 +21789,7 @@ fn consumerTests() type {
                 .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
             }));
 
-            const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
-                (graph_pattern_mod.max_pattern_hops + 2);
+            const too_many_path_nodes = @as([(graph_pattern_mod.max_pattern_hops + 2)]indexes_openapi.GraphPathEndpoint, @splat(.{ .key = "node" }));
             try std.testing.expectError(
                 error.InvalidRemoteResponse,
                 validateRemoteCanonicalGraphPathNodes(&too_many_path_nodes),
@@ -21698,7 +21865,7 @@ fn consumerTests() type {
                 error.InvalidRemoteResponse,
                 validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
             );
-            edges[0].type = "x" ** (graph_edge_type.max_bytes + 1);
+            edges[0].type = z17RepeatString("x", (graph_edge_type.max_bytes + 1));
             try std.testing.expectError(
                 error.InvalidRemoteResponse,
                 validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
@@ -21835,11 +22002,11 @@ fn consumerTests() type {
 
             const receive_path_raw = try std.fmt.allocPrint(alloc, "{s}/received.wal", .{root});
             defer alloc.free(receive_path_raw);
-            const receive_path = try alloc.dupeZ(u8, receive_path_raw);
+            const receive_path = try alloc.dupeSentinel(u8, receive_path_raw, 0);
             defer alloc.free(receive_path);
             const progress_path_raw = try std.fmt.allocPrint(alloc, "{s}/progress.wal", .{root});
             defer alloc.free(progress_path_raw);
-            const progress_path = try alloc.dupeZ(u8, progress_path_raw);
+            const progress_path = try alloc.dupeSentinel(u8, progress_path_raw, 0);
             defer alloc.free(progress_path);
 
             var standby = try hot_standby_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
@@ -21873,7 +22040,7 @@ fn consumerTests() type {
             };
 
             var source = ProvisionedTableReadSource.init("/tmp/unused-antfly-ha-read-gate", NoCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
-            _ = source.withHAReadGate(.{ .standby = &standby });
+            _ = source.withHotStandbyReadGate(.{ .standby = &standby });
 
             try std.testing.expectError(
                 error.HAReadRequiresPrimary,
@@ -23065,6 +23232,28 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
         }
 
+        test "storage-kernel query request preserves final projection while raw retrieval defers it" {
+            const alloc = std.testing.allocator;
+            var original = try query_api.parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match_all":{}},"fields":["title"]}
+            );
+            defer original.deinit(alloc);
+            try std.testing.expect(original.req.defer_stored_projection);
+            for ([_]bool{ false, true }) |raw| {
+                const encoded = try local_query_contract.encodeStorageKernelQueryRequestForExecution(alloc, original.req, raw);
+                defer alloc.free(encoded);
+                var parsed = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+                defer parsed.deinit(alloc);
+                if (raw) {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.fields.len);
+                    try std.testing.expectEqualStrings("title", parsed.req.fields[0]);
+                    try std.testing.expect(parsed.req.defer_stored_projection);
+                }
+            }
+        }
+
         test "storage-kernel query request encodes singleton vector index identity" {
             const alloc = std.testing.allocator;
             const encoded = try encodeStorageKernelQueryRequest(alloc, .{
@@ -23788,8 +23977,8 @@ fn consumerTests() type {
             var validates_generation_projection: usize = 0;
             var fail_closed_before_fanout: usize = 0;
 
-            inline for (std.meta.fields(DocIdentityInternalWorkerBoundary)) |field| {
-                const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field.name);
+            inline for (comptime std.meta.fieldNames(DocIdentityInternalWorkerBoundary)) |reflected_name| {
+                const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, reflected_name);
                 switch (docIdentityInternalWorkerPolicy(boundary)) {
                     .carries_shard_doc_set => carries_shard_doc_set += 1,
                     .validates_generation_projection => validates_generation_projection += 1,
@@ -26268,7 +26457,7 @@ fn consumerTests() type {
             }
             try std.testing.expectError(
                 error.QueryCandidateBudgetExceeded,
-                collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &@import("../search/analysis.zig").default_analyzer, 1, &seen),
+                collectSignificantTermsFromValue(alloc, .{ .string = "alpha beta" }, &@import("antfly_local_sources").search_analysis.default_analyzer, 1, &seen),
             );
         }
 
@@ -26982,7 +27171,7 @@ fn implementationTests() type {
             ;
             try left.setSchemaJson(alloc, schema_json);
             try right.setSchemaJson(alloc, schema_json);
-            const txn_id: @import("../storage/transactions.zig").TxnId = @splat(33);
+            const txn_id: @import("antfly_local_sources").storage_transactions.TxnId = @splat(33);
             _ = try left.beginTransactionWithId(txn_id, 10);
             _ = try right.beginTransactionWithId(txn_id, 10);
             try left.writeIntents(txn_id, &.{.{ .key = "a", .value = "{\"id\":1}" }}, &.{});
@@ -29321,7 +29510,7 @@ fn implementationTests() type {
             try std.testing.expectEqualStrings("snapshot_idx", statuses.items[0].stats.indexes[0].name);
         }
 
-        test "provisioned table read source falls back from read_index to stale on not leader" {
+        test "provisioned table read source rejects uncertified point reads and permits explicit stale reads" {
             const alloc = std.testing.allocator;
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -29434,7 +29623,9 @@ fn implementationTests() type {
             var source = ProvisionedTableReadSource.init(path, FakeCatalog.iface(), barrier.barrier());
             source.prepare_for_read = reads.iface();
 
-            var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
+            try std.testing.expectError(error.NotLeader, source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index));
+            try std.testing.expectEqual(@as(usize, 0), reads.begins);
+            var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .stale)).?;
             defer lookup.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 4321), lookup.version);
             const LookupDocument = struct {
@@ -29810,7 +30001,7 @@ fn implementationTests() type {
             // the caller's effort. Not the whole index, the page, or text alone.
             // Vector windows come from single-index searches on the same DB, so
             // approximate tail ordering cannot make the expectation flaky.
-            var in_domain = [_]bool{false} ** 2200;
+            var in_domain = @as([2200]bool, @splat(false));
             for (0..2200) |i| in_domain[i] = i % 50 == 0;
             for (req.dense_queries) |dense_query| {
                 var window = try db.search(alloc, .{ .dense_queries = &.{dense_query}, .limit = 30 });
@@ -33681,7 +33872,7 @@ fn implementationTests() type {
         }
 
         test "hosted cross-range graph metric fan-in merges compatible hits pair" {
-            var allocator_state: @import("../storage/test_allocator.zig").TestAllocator = .{};
+            var allocator_state: @import("antfly_local_sources").storage_test_allocator.TestAllocator = .{};
             defer allocator_state.deinit();
             const alloc = allocator_state.allocator();
             var path_tmp = try TestDirectory.initFast("hosted-cross-range-graph-metric-hits-pair");
@@ -34494,4 +34685,15 @@ fn expectGraphMetricJsonStatus(
         },
     }
     try ant_json.testing.expectSubsetJsonText(alloc, expected_out.written(), actual_json);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

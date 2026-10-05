@@ -24,10 +24,10 @@ const raft_host = @import("../raft/host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
-const metadata_incarnation = @import("incarnation.zig");
+const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
 const reallocation_request = @import("reallocation_request.zig");
 
-pub const MetadataClusterIncarnation = @import("catalog_mutation_stamp.zig").MetadataClusterIncarnation;
+pub const MetadataClusterIncarnation = @import("antfly_local_sources").metadata_catalog_mutation_stamp.MetadataClusterIncarnation;
 
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
@@ -35,8 +35,11 @@ pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint
 /// The Raft log index is comparable only inside the same metadata namespace;
 /// carrying that namespace with the receipt prevents delayed callbacks from a
 /// replaced metadata group from superseding current control-plane work.
-pub const CatalogMutationStamp = @import("catalog_mutation_stamp.zig").CatalogMutationStamp;
+pub const CatalogMutationStamp = @import("antfly_local_sources").metadata_catalog_mutation_stamp.CatalogMutationStamp;
 
+/// Allocation-free subset of `/status` used by rolling-upgrade admission
+/// probes. Keeping this separate from MetadataStatus avoids parsing and
+/// retaining unrelated status strings on every table DDL operation.
 pub const TableTopologyProtocolStatus = struct {
     metadata_group_id: u64,
     table_topology_protocol_version: u16 = 0,
@@ -380,18 +383,18 @@ pub const CatalogRouteQuery = struct {
     group_id: u64 = 0,
 };
 
-pub const CatalogIdentityNamespace = @import("catalog_route_contract.zig").CatalogIdentityNamespace;
-pub const CatalogGroupRoute = @import("catalog_route_contract.zig").CatalogGroupRoute;
-pub const catalog_route_fence_protocol_current = @import("catalog_route_contract.zig").catalog_route_fence_protocol_current;
-pub const catalog_route_fence_header = @import("catalog_route_contract.zig").catalog_route_fence_header;
-pub const catalog_route_fence_ack_header = @import("catalog_route_contract.zig").catalog_route_fence_ack_header;
-pub const catalog_route_fence_ack_value = @import("catalog_route_contract.zig").catalog_route_fence_ack_value;
-pub const read_index_absence_header = @import("catalog_route_contract.zig").read_index_absence_header;
-pub const read_index_absence_value = @import("catalog_route_contract.zig").read_index_absence_value;
-pub const catalog_route_deadline_ms_header = @import("catalog_route_contract.zig").catalog_route_deadline_ms_header;
-pub const catalog_route_default_deadline_ms = @import("catalog_route_contract.zig").catalog_route_default_deadline_ms;
-pub const catalog_route_max_deadline_ms = @import("catalog_route_contract.zig").catalog_route_max_deadline_ms;
-pub const CatalogRouteFence = @import("catalog_route_contract.zig").CatalogRouteFence;
+pub const CatalogIdentityNamespace = @import("antfly_local_sources").metadata_catalog_route_contract.CatalogIdentityNamespace;
+pub const CatalogGroupRoute = @import("antfly_local_sources").metadata_catalog_route_contract.CatalogGroupRoute;
+pub const catalog_route_fence_protocol_current = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_protocol_current;
+pub const catalog_route_fence_header = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_header;
+pub const catalog_route_fence_ack_header = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_ack_header;
+pub const catalog_route_fence_ack_value = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_ack_value;
+pub const read_index_absence_header = @import("antfly_local_sources").metadata_catalog_route_contract.read_index_absence_header;
+pub const read_index_absence_value = @import("antfly_local_sources").metadata_catalog_route_contract.read_index_absence_value;
+pub const catalog_route_deadline_ms_header = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_deadline_ms_header;
+pub const catalog_route_default_deadline_ms = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_default_deadline_ms;
+pub const catalog_route_max_deadline_ms = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_max_deadline_ms;
+pub const CatalogRouteFence = @import("antfly_local_sources").metadata_catalog_route_contract.CatalogRouteFence;
 
 pub const CatalogRoutePlan = struct {
     metadata_group_id: u64,
@@ -530,7 +533,7 @@ pub const CatalogProjectionIndex = struct {
             self.table_name_indexes.putAssumeCapacity(table.name, index);
             self.table_topologies.putAssumeCapacity(table.table_id, .{
                 .range_count = 0,
-                .digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .digest = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
             });
         }
         for (ranges, 0..) |range, index| {
@@ -720,7 +723,7 @@ pub fn catalogTableTopologyResolution(
     table_id: u64,
     ranges: []const table_manager.RangeRecord,
 ) CatalogTableTopologyResolution {
-    var accumulator = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    var accumulator = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
     var range_count: u64 = 0;
     var single_group_id: ?u64 = null;
     for (ranges) |range| {
@@ -1243,7 +1246,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(records);
         }
 
-        fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
+        pub fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
             const records = try alloc.alloc(table_manager.StoreRecord, 1);
             const group_statuses = try alloc.alloc(table_manager.GroupStatusReport, 1);
             group_statuses[0] = .{
@@ -1271,7 +1274,7 @@ test "metadata admin snapshot captures projected metadata state" {
             return records;
         }
 
-        fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
+        pub fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
             for (records) |record| table_manager.freeStore(alloc, record);
             alloc.free(records);
         }
@@ -1290,7 +1293,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(intents);
         }
 
-        fn listLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator) ![]raft_host.BootstrapStatus {
+        pub fn listLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator) ![]raft_host.BootstrapStatus {
             const statuses = try alloc.alloc(raft_host.BootstrapStatus, 1);
             statuses[0] = .{
                 .group_id = 10,
@@ -1305,7 +1308,7 @@ test "metadata admin snapshot captures projected metadata state" {
             return statuses;
         }
 
-        fn freeLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator, statuses: []raft_host.BootstrapStatus) void {
+        pub fn freeLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator, statuses: []raft_host.BootstrapStatus) void {
             for (statuses) |bootstrap_status| {
                 if (bootstrap_status.last_error) |msg| alloc.free(msg);
                 if (bootstrap_status.backup_id) |value| alloc.free(value);
@@ -1314,7 +1317,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(statuses);
         }
 
-        fn listProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator) ![]table_manager.RestoreProgressRecord {
+        pub fn listProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator) ![]table_manager.RestoreProgressRecord {
             const records = try alloc.alloc(table_manager.RestoreProgressRecord, 1);
             records[0] = .{
                 .table_id = 1,
@@ -1325,12 +1328,12 @@ test "metadata admin snapshot captures projected metadata state" {
             return records;
         }
 
-        fn freeProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator, records: []table_manager.RestoreProgressRecord) void {
+        pub fn freeProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator, records: []table_manager.RestoreProgressRecord) void {
             for (records) |record| table_manager.freeRestoreProgress(alloc, record);
             alloc.free(records);
         }
 
-        fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
+        pub fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
             const records = try alloc.alloc(table_manager.ReplicationSourceStatusRecord, 1);
             records[0] = .{
                 .table_id = 1,
@@ -1358,7 +1361,7 @@ test "metadata admin snapshot captures projected metadata state" {
             return records;
         }
 
-        fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
+        pub fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
             for (records) |record| table_manager.freeReplicationSourceStatus(alloc, record);
             alloc.free(records);
         }
@@ -1394,7 +1397,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(records);
         }
 
-        fn observeSplitTransition(_: @This(), transition_id: u64) !?transition_state.SplitObservation {
+        pub fn observeSplitTransition(_: @This(), transition_id: u64) !?transition_state.SplitObservation {
             if (transition_id != 9001) return null;
             return .{
                 .status = .{
@@ -1411,7 +1414,7 @@ test "metadata admin snapshot captures projected metadata state" {
             };
         }
 
-        fn observeMergeTransition(_: @This(), transition_id: u64) !?transition_state.MergeObservation {
+        pub fn observeMergeTransition(_: @This(), transition_id: u64) !?transition_state.MergeObservation {
             if (transition_id != 9002) return null;
             return .{
                 .donor = .{
@@ -1566,12 +1569,12 @@ test "metadata admin snapshot derives replication source action hints for reseed
             alloc.free(records);
         }
 
-        fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
+        pub fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
             const records = try alloc.alloc(table_manager.StoreRecord, 0);
             return records;
         }
 
-        fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
+        pub fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
             alloc.free(records);
         }
 
@@ -1584,7 +1587,7 @@ test "metadata admin snapshot derives replication source action hints for reseed
             alloc.free(records);
         }
 
-        fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
+        pub fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
             const records = try alloc.alloc(table_manager.ReplicationSourceStatusRecord, 1);
             records[0] = .{
                 .table_id = 9,
@@ -1599,7 +1602,7 @@ test "metadata admin snapshot derives replication source action hints for reseed
             return records;
         }
 
-        fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
+        pub fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
             for (records) |record| table_manager.freeReplicationSourceStatus(alloc, record);
             alloc.free(records);
         }

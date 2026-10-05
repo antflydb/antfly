@@ -143,9 +143,9 @@ pub const Weights = struct {
 
 /// Recurrent state plus the 64-sample context carried between chunks.
 pub const State = struct {
-    h: [hidden]f32 = [_]f32{0} ** hidden,
-    c: [hidden]f32 = [_]f32{0} ** hidden,
-    context: [context_samples]f32 = [_]f32{0} ** context_samples,
+    h: [hidden]f32 = @as([hidden]f32, @splat(0)),
+    c: [hidden]f32 = @as([hidden]f32, @splat(0)),
+    context: [context_samples]f32 = @as([context_samples]f32, @splat(0)),
 
     pub fn reset(self: *State) void {
         self.* = .{};
@@ -411,7 +411,7 @@ test "silero vad matches onnxruntime on deterministic noise" {
 }
 
 test "silero state reset clears recurrence and context" {
-    var state = State{ .h = [_]f32{1} ** hidden, .c = [_]f32{2} ** hidden, .context = [_]f32{3} ** context_samples };
+    var state = State{ .h = @as([hidden]f32, @splat(1)), .c = @as([hidden]f32, @splat(2)), .context = @as([context_samples]f32, @splat(3)) };
     state.reset();
     try std.testing.expectEqual(@as(f32, 0), state.h[0]);
     try std.testing.expectEqual(@as(f32, 0), state.c[hidden - 1]);

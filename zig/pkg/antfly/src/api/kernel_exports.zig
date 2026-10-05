@@ -18,13 +18,13 @@ const ant_json = @import("antfly-json");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
-const distributed_txn_contract = @import("distributed_txn_contract.zig");
-const table_reads = @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
+const distributed_txn_contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
 const restore_jobs = @import("restore_jobs.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const hot_standby_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
@@ -236,9 +236,9 @@ pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
-pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(?ha_http_operation.Executor, void, context)) |failure| return failure;
-    serverState(context).server.setHAInternalExecutor(input(?ha_http_operation.Executor, context).*);
+pub fn setHotStandbyExecutor(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(?hot_standby_http_operation.Executor, void, context)) |failure| return failure;
+    serverState(context).server.setHotStandbyInternalExecutor(input(?hot_standby_http_operation.Executor, context).*);
     return .ok;
 }
 
@@ -550,7 +550,7 @@ const function_table: abi.FunctionTable = .{
     .query_admission_stats = &queryAdmissionStats,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
-    .set_ha_executor = &setHAExecutor,
+    .set_ha_executor = &setHotStandbyExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
     .resume_restore_jobs = &resumeRestoreJobs,
@@ -789,7 +789,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     api_server.* = server_mod.ApiHttpServer.init(
         alloc,
         .{
-            .ha_failover_safe_mutations_only = true,
+            .hot_standby_failover_safe_mutations_only = true,
             .internal_service_secret = "kernel-ingress-test-internal-secret-v1",
             .internal_service_issuer = "kernel-ingress-test",
         },
@@ -873,7 +873,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     // Linked dispatch starts the transaction deadline before policy work, but
     // malformed metadata must not let an unauthenticated caller distinguish
     // an internal route. Validation runs only after service authentication.
-    api_server.cfg.ha_failover_safe_mutations_only = false;
+    api_server.cfg.hot_standby_failover_safe_mutations_only = false;
     const invalid_deadline_headers = [_]abi.HeaderView{.{
         .name = abi.Bytes.init(distributed_txn_contract.pre_decision_remaining_ms_header),
         .value = abi.Bytes.init("5001"),
@@ -952,7 +952,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
 }
 
 test "API kernel create rejects raw owner runtime without transferred capabilities" {
-    const background = @import("../storage/background_runtime.zig");
+    const background = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
         .borrowed_io = .{ .general = std.testing.io },
@@ -1024,7 +1024,7 @@ test "API kernel failed fallible create releases unpublished state" {
         const writes: ?table_writes.TableWriteSource = null;
         var handle: ?*anyopaque = null;
         var request_alloc: ?*const abi.memory_abi.Allocator = null;
-        @import("../test_error_logs.zig").expectErrorLogs(1);
+        @import("antfly_test_error_logs").expectErrorLogs(1);
         const result = create(&.{
             .abi_version = abi.abi_version,
             .owner_alloc = &owner_alloc,
@@ -1086,7 +1086,7 @@ test "API kernel runtime I/O receiver keeps imported unavailable views null" {
 }
 
 test "API kernel create enforces owner I/O capabilities and preserves their lifetime" {
-    const background = @import("../storage/background_runtime.zig");
+    const background = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
         .borrowed_io = .{ .general = std.testing.io },
@@ -1141,17 +1141,17 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
     try std.testing.expect(handle == null);
     borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
     const Dispatch = @FieldType(abi.native_abi.IoBorrow, "dispatch");
-    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".params;
+    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
     const Forward = struct {
         var owner_dispatch: Dispatch = undefined;
 
         fn dispatch(
-            owner: Parameters[0].type.?,
-            operation: Parameters[1].type.?,
-            arguments: Parameters[2].type.?,
-            out_value: Parameters[3].type.?,
-            reader: Parameters[4].type.?,
-            error_names: Parameters[5].type.?,
+            owner: Parameters[0].?,
+            operation: Parameters[1].?,
+            arguments: Parameters[2].?,
+            out_value: Parameters[3].?,
+            reader: Parameters[4].?,
+            error_names: Parameters[5].?,
         ) callconv(.c) void {
             owner_dispatch(owner, operation, arguments, out_value, reader, error_names);
         }

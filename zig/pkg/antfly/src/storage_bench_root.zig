@@ -14,35 +14,35 @@
 // limitations.
 
 pub const platform_time = @import("antfly_platform").time;
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-pub const mem_backend = @import("storage/mem_backend.zig");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
-pub const paths = @import("graph/paths.zig");
+pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
+pub const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+pub const paths = @import("antfly_local_sources").graph_paths;
 
-pub const resource_manager = @import("storage/resource_manager.zig");
-pub const roaring = @import("encoding/roaring.zig");
+pub const resource_manager = @import("antfly_local_sources").storage_resource_manager;
+pub const roaring = @import("antfly_local_sources").encoding_roaring;
 
 pub const db = struct {
     pub const OpenMode = @import("antfly_source_root").antfly_sources.physical_db.OpenMode;
     pub const ReplayProgress = @import("antfly_source_root").antfly_sources.physical_db.ReplayProgress;
-    pub const embedder = @import("storage/db/enrichment/embedder.zig");
-    pub const replay_stream = @import("storage/db/derived/replay_stream.zig");
-    pub const backfill_state = @import("storage/db/backfill_state.zig");
-    pub const freeDBStats = @import("storage/db/types.zig").freeDBStats;
-    pub const doc_identity = @import("storage/db/doc_identity.zig");
-    pub const doc_set = @import("storage/db/doc_set.zig");
+    pub const embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+    pub const replay_stream = @import("antfly_local_sources").storage_db_derived_replay_stream;
+    pub const backfill_state = @import("antfly_local_sources").storage_db_backfill_state;
+    pub const freeDBStats = @import("antfly_local_sources").storage_db_types.freeDBStats;
+    pub const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
+    pub const doc_set = @import("antfly_local_sources").storage_db_doc_set;
     pub const BatchProfile = @import("antfly_source_root").antfly_sources.physical_db.BatchProfile;
     pub const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db.OpenOptions;
     pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
-    pub const IndexManager = @import("storage/db/catalog/index_manager.zig").IndexManager;
-    pub const aggregations = @import("storage/db/aggregations.zig");
-    pub const algebraic = @import("storage/db/algebraic/mod.zig");
-    pub const derived_types = @import("storage/db/derived/derived_types.zig");
-    pub const docstore = @import("storage/docstore.zig");
-    pub const types = @import("storage/db/types.zig");
+    pub const IndexManager = @import("antfly_local_sources").storage_db_catalog_index_manager.IndexManager;
+    pub const aggregations = @import("antfly_local_sources").storage_db_aggregations;
+    pub const algebraic = @import("antfly_local_sources").storage_db_algebraic_mod;
+    pub const derived_types = @import("antfly_local_sources").storage_db_derived_derived_types;
+    pub const docstore = @import("antfly_local_sources").storage_docstore;
+    pub const types = @import("antfly_local_sources").storage_db_types;
 };
 
-pub const hbc = @import("storage/hbc_adapter.zig");
+pub const hbc = @import("antfly_local_sources").storage_hbc_adapter;
 pub const vectorindex = @import("antfly_vectorindex");
 pub const vector = @import("antfly_vector").vector;
 pub const storage_lsm = @import("storage/lsm/mod.zig");
@@ -53,3 +53,6 @@ pub const raft = @import("raft/mod.zig");
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

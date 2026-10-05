@@ -24,7 +24,7 @@ pub fn openRegular(io: std.Io, directory: std.Io.Dir, path: []const u8, control:
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedSnapshotPlatform;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidSnapshotPath;
     var buffer: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const terminated = try std.fmt.bufPrintZ(&buffer, "{s}", .{path});
+    const terminated = try std.fmt.bufPrintSentinel(&buffer, "{s}", .{path}, 0);
     const fd = try std.posix.openatZ(directory.handle, terminated, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true }, 0);
     const file = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = true } };
     errdefer file.close(io);

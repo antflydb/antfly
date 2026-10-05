@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 
@@ -23,8 +23,8 @@ pub const Artifact = struct {
 
     pub fn run(self: Artifact, b: *std.Build) *std.Build.Step.Run {
         const step = b.addRunArtifact(self.executable);
-        @import("test_support.zig").configureTestRun(step);
-        @import("test_support.zig").addRuntimeTestFilters(b, step, self.object.filters);
+        @import("../../../build_support/antfly/test_support.zig").configureTestRun(step);
+        @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters(b, step, self.object.filters);
         return step;
     }
 };
@@ -33,7 +33,7 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
-        .path = b.path("pkg/antfly/src/test_runner.zig"),
+        .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
         .mode = .simple,
     };
     const module = b.createModule(.{
@@ -61,7 +61,7 @@ pub const Pair = struct {
 
 pub fn addPair(b: *std.Build, options: std.Build.TestOptions, implementation: *std.Build.Step.Compile) Pair {
     var consumer_options = options;
-    consumer_options.filters = @import("test_support.zig").selectTestFilters(b, options.filters);
+    consumer_options.filters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters(b, options.filters);
     return .{ .consumer = add(b, consumer_options), .implementation = implementation };
 }
 
@@ -77,9 +77,9 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
     for (consumer.object.filters) |filter| filters.put(b.allocator, filter, {}) catch @panic("OOM");
     implementation.filters = b.allocator.dupe([]const u8, filters.keys()) catch @panic("OOM");
     const audit = b.addSystemCommand(&.{"python3"});
-    audit.addFileArg(b.path("tools/audit_test_selection.py"));
+    audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
     for (consumer.object.filters) |filter| audit.addArgs(&.{ "--filter", filter });
-    const args = b.args orelse &.{};
+    const args = buildArguments(b) orelse &.{};
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--allow-empty-test-filter")) {
@@ -96,13 +96,15 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
         const inventory = b.addRunArtifact(artifact);
         inventory.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
         audit.addArg("--inventory");
-        audit.addFileArg(inventory.captureStdErr(.{}));
+        audit.addFileArg2(inventory.captureStdErr(.{}), .{ .make_absolute = true });
     }
-    const implementation_run = @import("test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters(b, implementation, consumer.object.filters);
-    implementation_run.addArg("--allow-empty-test-filter");
+    audit.addArg("--");
+    audit.addPassthruArgs();
+    const implementation_run = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters(b, implementation, consumer.object.filters);
+    implementation_run.addArgs(&.{ "--allow-empty-test-filter", "--allow-empty-owner" });
     implementation_run.step.dependOn(&audit.step);
     const consumer_run = consumer.run(b);
-    consumer_run.addArg("--allow-empty-test-filter");
+    consumer_run.addArgs(&.{ "--allow-empty-test-filter", "--allow-empty-owner" });
     consumer_run.step.dependOn(&implementation_run.step);
     return consumer_run;
 }
@@ -146,5 +148,21 @@ fn splitNativeSources(
     }
     for (original.import_table.keys(), original.import_table.values()) |key, dependency|
         copy.addImport(key, splitNativeSources(b, dependency, final, name, clones));
+    @import("../../antfly-embedded/build/source_owner.zig").adopt(copy);
     return copy;
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

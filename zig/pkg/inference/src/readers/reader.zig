@@ -708,7 +708,7 @@ pub fn probeManifest(
 fn detectParserKind(allocator: std.mem.Allocator, model_path: []const u8) !ParserKind {
     _ = allocator;
     inline for (.{ "donut", "florence", "moondream", "pix2struct" }) |name| {
-        if (std.ascii.indexOfIgnoreCase(model_path, name) != null) return @field(ParserKind, name);
+        if (@import("../util/ascii_compat.zig").indexOfIgnoreCase(model_path, name) != null) return @field(ParserKind, name);
     }
     return .default;
 }

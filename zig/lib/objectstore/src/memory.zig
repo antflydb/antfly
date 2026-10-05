@@ -23,7 +23,7 @@ const StoredObject = struct {
     etag: []u8,
     content_type: ?[]u8 = null,
 
-    fn deinit(self: *StoredObject, alloc: Allocator) void {
+    pub fn deinit(self: *StoredObject, alloc: Allocator) void {
         alloc.free(self.body);
         alloc.free(self.etag);
         if (self.content_type) |value| alloc.free(value);

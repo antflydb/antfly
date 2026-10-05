@@ -105,7 +105,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         selected_count += 1;
 
         if (progress) |p| p.record("START", test_fn.name);
-        std.testing.allocator_instance = .{};
+        std.testing.allocator_instance = .init(std.heap.page_allocator, .{});
         std.testing.io_instance = .init(std.testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -134,7 +134,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (progress) |p| p.record("IO_DEINIT", test_fn.name);
         std.testing.io_instance.deinit();
         if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);
-        if (std.testing.allocator_instance.deinit() == .leak) leak_count += 1;
+        if (std.testing.allocator_instance.deinit() != 0) leak_count += 1;
         if (progress) |p| p.record("DONE", test_fn.name);
         if (log_err_count != 0) fail_count += 1;
     }
@@ -301,10 +301,10 @@ pub fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         log_err_count +|= 1;
     }
-    if (@intFromEnum(message_level) <= @intFromEnum(std.testing.log_level)) {
+    if (@backingInt(message_level) <= @backingInt(std.testing.log_level)) {
         std.debug.print(
             "[" ++ @tagName(scope) ++ "] (" ++ @tagName(message_level) ++ "): " ++ format ++ "\n",
             args,

@@ -432,7 +432,7 @@ pub const Broker = struct {
     allocator: std.mem.Allocator,
     /// Independent model/task cohorts never contend on one process-wide lock.
     /// Exact-key grouping remains unchanged within a shard.
-    shards: [broker_shard_count]BrokerShard = [_]BrokerShard{.{}} ** broker_shard_count,
+    shards: [broker_shard_count]BrokerShard = @as([broker_shard_count]BrokerShard, @splat(.{})),
     next_execution_id: std.atomic.Value(u64) = .init(1),
 
     pub fn init(allocator: std.mem.Allocator) Broker {
@@ -1093,8 +1093,8 @@ test "microbatch broker preserves bounded native waves without spare workers" {
         defer broker.deinit();
         var executor = TestExecutor{};
         const inputs = [_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
-        const shapes = [_]Shape{.{ .bytes = 1, .pixels = 1, .tokens = 1 }} ** inputs.len;
-        const identities = [_]Identity{.{}} ** inputs.len;
+        const shapes = @as([inputs.len]Shape, @splat(.{ .bytes = 1, .pixels = 1, .tokens = 1 }));
+        const identities = @as([inputs.len]Identity, @splat(.{}));
         const results = try broker.submitBatchControlled(usize, usize, io_impl.io(), allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = 4, .max_pixels = 4, .max_tokens = 4, .max_wait_us = wait_us }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
         defer allocator.free(results);
         try std.testing.expectEqual(@as(usize, 3), executor.calls.load(.monotonic));
@@ -1115,9 +1115,9 @@ test "microbatch native wave splits resource limits and isolates oversized items
         defer broker.deinit();
         var executor = TestExecutor{};
         const inputs = [_]usize{ 1, 2, 3, 4, 5 };
-        var shapes = [_]Shape{.{ .bytes = 1, .pixels = 1, .tokens = 1 }} ** inputs.len;
+        var shapes = @as([inputs.len]Shape, @splat(.{ .bytes = 1, .pixels = 1, .tokens = 1 }));
         shapes[2] = .{ .bytes = 99, .pixels = 99, .tokens = 99 };
-        const identities = [_]Identity{.{}} ** inputs.len;
+        const identities = @as([inputs.len]Identity, @splat(.{}));
         const results = try broker.submitBatchControlled(usize, usize, io_impl.io(), allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 5, .max_items = 5, .max_bytes = if (dimension == 0) 2 else 1000, .max_pixels = if (dimension == 1) 2 else 1000, .max_tokens = if (dimension == 2) 2 else 1000 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
         defer allocator.free(results);
         try std.testing.expectEqual(@as(usize, 2), executor.calls.load(.monotonic));
@@ -1135,8 +1135,8 @@ test "microbatch array enrollment drains groups on allocation failure" {
             defer broker.deinit();
             var executor = TestExecutor{};
             const inputs = [_]usize{ 1, 2, 3, 4, 5 };
-            const shapes = [_]Shape{.{ .bytes = 1 }} ** inputs.len;
-            const identities = [_]Identity{.{}} ** inputs.len;
+            const shapes = @as([inputs.len]Shape, @splat(.{ .bytes = 1 }));
+            const identities = @as([inputs.len]Identity, @splat(.{}));
             const results = try broker.submitBatchControlled(usize, usize, std.testing.io, allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = 2 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
             defer allocator.free(results);
             for (results) |result| switch (result.result) {
@@ -1160,8 +1160,8 @@ test "microbatch concurrent array tails coalesce without item workers" {
         output: ?[]ItemResult(usize) = null,
         err: ?anyerror = null,
         fn run(self: *@This()) std.Io.Cancelable!void {
-            const shapes = [_]Shape{.{ .bytes = 1 }} ** 2;
-            const identities = [_]Identity{.{ .source_fingerprint = self.source }} ** 2;
+            const shapes = @as([2]Shape, @splat(.{ .bytes = 1 }));
+            const identities = @as([2]Identity, @splat(.{ .source_fingerprint = self.source }));
             self.output = self.broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_wait_us = 500_000 }, &shapes, &identities, null, .{}, &self.input, self.executor, TestExecutor.run) catch |err| {
                 self.err = err;
                 return;
@@ -1205,8 +1205,8 @@ test "microbatch array rechecks cancellation between bounded waves" {
     };
     var executor = Executor{};
     const inputs = [_]usize{ 1, 2, 3, 4 };
-    const shapes = [_]Shape{.{}} ** 4;
-    const identities = [_]Identity{.{}} ** 4;
+    const shapes = @as([4]Shape, @splat(.{}));
+    const identities = @as([4]Identity, @splat(.{}));
     const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &shapes, &identities, null, Cancellation.fromAtomic(&executor.canceled), &inputs, &executor, Executor.run);
     defer std.testing.allocator.free(results);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);

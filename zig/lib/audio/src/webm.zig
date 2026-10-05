@@ -1823,7 +1823,7 @@ test "webm demux reconstructs frames for all three lacing modes" {
     // Byte-level fidelity check, independent of any codec's ability to
     // decode the payloads: this exercises the lace/delace arithmetic itself
     // (varied frame lengths for Xiph/EBML, equal lengths for fixed-size).
-    const long_frame = [_]u8{'x'} ** 300; // Forces multi-byte (0xFF-continued) Xiph lace sizes.
+    const long_frame = @as([300]u8, @splat('x')); // Forces multi-byte (0xFF-continued) Xiph lace sizes.
     const varied_frames = [_][]const u8{ "a", "bb", &long_frame, "dddd" };
     const equal_frames = [_][]const u8{ "wxyz", "1234", "!@#$", "z9y8" };
 

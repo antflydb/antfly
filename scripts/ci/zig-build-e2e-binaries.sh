@@ -30,7 +30,7 @@ export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/antfly-ci-zig-global}"
 mkdir -p "$HOME" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
 cpu="${ANTFLY_CI_ZIG_CPU:-baseline}"
-optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-Debug}"
+optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-debug}"
 build_args=(build)
 if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
   build_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")
@@ -78,11 +78,6 @@ fi
 zig version
 
 build_steps=(antfly)
-case "${ANTFLY_CI_BUILD_FK_RECOVERY:-false}" in
-  true) build_steps+=(antfly-hosted-fk-recovery-binaries) ;;
-  false) ;;
-  *) echo "ANTFLY_CI_BUILD_FK_RECOVERY must be true or false" >&2; exit 2 ;;
-esac
 if [[ "$build_capi" == "true" ]]; then
   build_steps+=(capi capi-smoke)
 fi

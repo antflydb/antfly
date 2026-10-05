@@ -17,7 +17,7 @@
 //! primary-range concatenation is never valid for a secondary ordered index.
 //! Keeps only the best K rows, plus one incoming line. No retained cursors.
 const std = @import("std");
-const cursor = @import("../storage/db/relational_row_cursor.zig");
+const cursor = @import("antfly_local_sources").storage_db_relational_row_cursor;
 const Allocator = std.mem.Allocator;
 const max_bytes = 16 * 1024 * 1024;
 
@@ -28,7 +28,7 @@ pub fn isIndexQuery(alloc: Allocator, json: []const u8) !bool {
     return parsed.value.index != null;
 }
 
-pub fn isIndexScan(alloc: Allocator, opts: @import("../storage/db/types.zig").ScanOptions) !bool {
+pub fn isIndexScan(alloc: Allocator, opts: @import("antfly_local_sources").storage_db_types.ScanOptions) !bool {
     if (opts.relational_query) |query| return query.index != null;
     return isIndexQuery(alloc, opts.relational_query_json);
 }
@@ -37,7 +37,7 @@ const Row = struct {
     line: []u8,
     token: []u8,
 
-    fn deinit(row: Row, alloc: Allocator) void {
+    pub fn deinit(row: Row, alloc: Allocator) void {
         alloc.free(row.line);
         alloc.free(row.token);
     }
@@ -159,7 +159,7 @@ test "relational row query fan-in globally orders owner prefixes and keeps bound
     const alloc = std.testing.allocator;
     var merge = try Merger.init(alloc, 2);
     defer merge.deinit();
-    const identity = cursor.identity(1, "by_id", .{0} ** 32);
+    const identity = cursor.identity(1, "by_id", @splat(0));
     for ([_][]const u8{ "bz", "ac", "dy" }) |keys| {
         merge.beginGroup();
         for (keys) |key| {
@@ -182,9 +182,9 @@ test "relational row query fan-in globally orders owner prefixes and keeps bound
 
 test "relational row query fan-in rejects changed logical index duplicate ownership and malformed streams" {
     const alloc = std.testing.allocator;
-    const first = try cursor.encode(alloc, cursor.identity(1, "by_id", .{0} ** 32), "a");
+    const first = try cursor.encode(alloc, cursor.identity(1, "by_id", @splat(0)), "a");
     defer alloc.free(first);
-    const changed = try cursor.encode(alloc, cursor.identity(1, "by_other_id", .{0} ** 32), "b");
+    const changed = try cursor.encode(alloc, cursor.identity(1, "by_other_id", @splat(0)), "b");
     defer alloc.free(changed);
     const first_line = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"cursor\":\"{s}\"}}\n", .{first});
     defer alloc.free(first_line);

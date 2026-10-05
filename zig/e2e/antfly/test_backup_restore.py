@@ -1347,6 +1347,21 @@ class ThreeByThreeBackupCluster:
                 return False
         return True
 
+    def refresh_table_identity(self, table_name: str) -> bool:
+        # Restore publishes a fresh physical owner behind the logical name.
+        # Capture its authoritative public binding before topology convergence.
+        for base in self.data_api_urls:
+            try:
+                response = requests.get(f"{base}/tables/{table_name}", timeout=1.0)
+            except requests.RequestException:
+                continue
+            if response.status_code in (404, 503):
+                continue
+            response.raise_for_status()
+            self.table_ids[table_name] = int(response.json()["table_id"])
+            return True
+        return False
+
     def fully_replicated_topology(self, table_name: str) -> tuple[int, set[int]] | None:
         self.assert_processes_alive()
         expected_node_ids = set(range(4, 7))
@@ -2177,6 +2192,7 @@ def _exercise_online_document_merge(
     table_name=None,
     schema=None,
     documents=None,
+    timings=None,
 ) -> str:
     table_name = table_name or f"online_merge_{time.time_ns()}"
     session = requests.Session()
@@ -2193,11 +2209,15 @@ def _exercise_online_document_merge(
         table_name,
         table_config,
     )
+    if timings:
+        timings.mark("parent.create")
     assert wait_until(
         lambda: cluster.fully_replicated_topology(table_name) or None,
         timeout_s=90.0,
         interval_s=0.5,
     ), cluster.debug_logs()
+    if timings:
+        timings.mark("parent.replicated_topology")
     if schema and (schema.get("unique_constraints") or schema.get("foreign_keys")):
 
         def enforced():
@@ -2211,6 +2231,8 @@ def _exercise_online_document_merge(
             return False
 
         assert wait_until(enforced, timeout_s=90), cluster.debug_logs()
+    if timings:
+        timings.mark("parent.constraints_enforced")
     documents = (
         documents
         if documents is not None
@@ -2235,17 +2257,19 @@ def _exercise_online_document_merge(
         table_name,
         {key: value for key, value in documents.items() if key != "0:large"},
     )
+    if timings:
+        timings.mark("parent.seed")
     if before_merge is not None:
         before_merge(cluster, session, table_name, documents)
     leader = cluster.metadata_stable_leader_id(timeout_s=20.0)
     assert leader is not None, cluster.debug_logs()
     snapshot = cluster.metadata_snapshot(leader - 1)
+    # Creation records the authoritative identity; logical-name annotations on
+    # diagnostic snapshots are best effort and can be absent during recovery.
+    table_id = cluster.table_ids[table_name]
     catalog_table = next(
-        value
-        for value in snapshot["tables"]
-        if value.get("logical_name", value["name"]) == table_name
+        value for value in snapshot["tables"] if int(value["table_id"]) == table_id
     )
-    table_id = int(catalog_table["table_id"])
     physical_name = quote(catalog_table["name"], safe="")
     ranges = sorted(
         (value for value in snapshot["ranges"] if int(value["table_id"]) == table_id),
@@ -2260,6 +2284,8 @@ def _exercise_online_document_merge(
     ):
         assert expected_range["start_key"] <= key
         assert expected_range["end_key"] is None or key < expected_range["end_key"]
+    if timings:
+        timings.mark("merge.discover_donor_receiver")
     accepted = session.post(
         f"{cluster.metadata_admin_urls[leader - 1]}/internal/v1/tables/{physical_name}/merge",
         headers=internal_service_headers(),
@@ -2273,14 +2299,19 @@ def _exercise_online_document_merge(
     assert accepted.status_code == 202, (
         f"{accepted.status_code}: {accepted.text}\n{cluster.debug_logs()}"
     )
+    if timings:
+        timings.mark("merge.admission")
     observed_online: dict | None = None
     if after_accept is not None:
         observed_online = after_accept(
             cluster, table_id, donor, receiver, table_name, documents
         )
+    if timings:
+        timings.mark("merge.fault_callback_complete")
     initial_scope = observed_online["scope"] if observed_online is not None else None
     last_transition: dict | None = None
     saw_completed = False
+    last_observed_phase = None
     deadline = time.monotonic() + 180.0
     while time.monotonic() < deadline:
         leader = cluster.metadata_leader_id_once(request_timeout_s=1.0)
@@ -2310,6 +2341,10 @@ def _exercise_online_document_merge(
                 assert last_transition.get("online") is None, last_transition
             if last_transition.get("online") is not None:
                 observed_online = last_transition["online"]
+                phase = observed_online.get("phase")
+                if timings and phase != last_observed_phase:
+                    timings.observe("merge.transition", merge_phase=phase)
+                    last_observed_phase = phase
                 if initial_scope is None:
                     initial_scope = observed_online["scope"]
                 assert observed_online["scope"] == initial_scope, (
@@ -2347,6 +2382,8 @@ def _exercise_online_document_merge(
         f"{'online' if expect_online else 'guarded'} merge did not release source: "
         f"{last_transition!r}\n{cluster.debug_logs()}"
     )
+    if timings:
+        timings.mark("merge.complete_and_source_released")
     remaining = {
         int(value["group_id"])
         for value in snapshot["ranges"]
@@ -2395,6 +2432,8 @@ def _exercise_online_document_merge(
             assert matches, (
                 f"restored online row mismatch {key!r}: {observations}\n{cluster.debug_logs()}"
             )
+    if timings:
+        timings.mark("verify.parent_rows")
     session.close()
     return table_name
 
@@ -2638,6 +2677,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     assert restore["committed_table_count"] == 1
     assert restore["failed_table_count"] == 0
 
+    assert wait_until(lambda: cluster.refresh_table_identity(table_name), timeout_s=30)
     restored_topology = wait_until(
         lambda: cluster.fully_replicated_topology(table_name),
         timeout_s=90.0,
@@ -2966,6 +3006,9 @@ def test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_
         assert completed["result"]["committed_table_count"] == 2, completed
         assert completed["result"]["failed_table_count"] == 0, completed
         for table in tables:
+            assert wait_until(
+                lambda table=table: cluster.refresh_table_identity(table), timeout_s=30
+            )
             current = wait_until(
                 lambda table=table: cluster.fully_replicated_topology(table),
                 timeout_s=90,
@@ -3565,6 +3608,6 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
                 "restore_mode": "fail_if_exists",
             },
         )
-        cluster_job = _wait_for_terminal_restore_job(backup_api, cluster_restore)
-        assert cluster_job["phase"] == "failed"
-        assert cluster_job["error"] == "InvalidRequest"
+        # Cluster restore also validates repository admission before creating a job.
+        assert cluster_restore.status_code == 400, cluster_restore.text
+        assert "error" in cluster_restore.json(), cluster_restore.text

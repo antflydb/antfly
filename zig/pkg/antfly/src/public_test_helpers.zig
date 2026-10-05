@@ -54,3 +54,6 @@ pub fn expectSingleServerlessHit(result: serverless.QuerySearchResult, doc_id: [
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings(doc_id, result.hits[0].doc_id);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

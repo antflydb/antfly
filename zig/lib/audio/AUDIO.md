@@ -170,7 +170,7 @@ Remaining MP3 work:
 > **Relocated:** The dated single-run benchmark baseline that previously lived here (28 lines, 2026-04-14) is preserved verbatim in [docs/design/audio/history/benchmark-baseline-2026-04.md](../../../docs/design/audio/history/benchmark-baseline-2026-04.md).
 
 Run with:
-`zig build -Doptimize=ReleaseFast bench-audio -- --bench all --warmup-iters 2 --measure-iters 20`
+`zig build -Doptimize=fast bench-audio -- --bench all --warmup-iters 2 --measure-iters 20`
 
 Implemented SIMD/algorithmic work:
 

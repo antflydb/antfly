@@ -147,37 +147,48 @@ pub const Suffix = enum(u8) {
 pub fn encodeNodeKey(buf: *[12]u8, node_id: u64, suffix: Suffix) []u8 {
     buf[0] = 'n';
     buf[1] = ':';
-    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, node_id));
+    buf[2..10].* = @bitCast(@byteSwap(@as(u64, node_id)));
     buf[10] = ':';
-    buf[11] = @intFromEnum(suffix);
+    buf[11] = @backingInt(suffix);
     return buf;
+}
+
+test "node key bytes preserve big endian ordering at compile time" {
+    const encoded = comptime blk: {
+        var buf: [12]u8 = undefined;
+        _ = encodeNodeKey(&buf, 0x0123456789abcdef, .header);
+        if (!std.mem.eql(u8, "n:\x01\x23\x45\x67\x89\xab\xcd\xef:h", &buf))
+            @compileError("HBC node keys must preserve big endian ordering on every target");
+        break :blk buf;
+    };
+    try std.testing.expectEqualSlices(u8, "n:\x01\x23\x45\x67\x89\xab\xcd\xef:h", &encoded);
 }
 
 pub fn encodeVecKey(buf: *[10]u8, vector_id: u64) []u8 {
     buf[0] = 'v';
     buf[1] = ':';
-    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, vector_id));
+    buf[2..10].* = @bitCast(@byteSwap(@as(u64, vector_id)));
     return buf;
 }
 
 pub fn encodeVecLeafKey(buf: *[10]u8, vector_id: u64) []u8 {
     buf[0] = 'l';
     buf[1] = ':';
-    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, vector_id));
+    buf[2..10].* = @bitCast(@byteSwap(@as(u64, vector_id)));
     return buf;
 }
 
 pub fn encodeVecMetaKey(buf: *[10]u8, vector_id: u64) []u8 {
     buf[0] = 'm';
     buf[1] = ':';
-    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, vector_id));
+    buf[2..10].* = @bitCast(@byteSwap(@as(u64, vector_id)));
     return buf;
 }
 
 pub fn encodeQuantKey(buf: *[10]u8, node_id: u64) []u8 {
     buf[0] = 'q';
     buf[1] = ':';
-    buf[2..10].* = @bitCast(std.mem.nativeToBig(u64, node_id));
+    buf[2..10].* = @bitCast(@byteSwap(@as(u64, node_id)));
     return buf;
 }
 
@@ -188,8 +199,8 @@ pub const NodeHeader = struct {
 
     pub fn encode(self: *const NodeHeader, buf: *[11]u8) []u8 {
         buf[0] = if (self.is_leaf) 1 else 0;
-        buf[1..3].* = @bitCast(std.mem.nativeToLittle(u16, self.level));
-        buf[3..11].* = @bitCast(std.mem.nativeToLittle(u64, self.parent));
+        buf[1..3].* = @bitCast(@as(u16, self.level));
+        buf[3..11].* = @bitCast(@as(u64, self.parent));
         return buf;
     }
 
@@ -270,12 +281,12 @@ pub fn decodePackedNodeValue(data: []const u8) !PackedNodeValue {
 }
 
 fn writeU32LE(buf: []u8, pos: *usize, val: u32) void {
-    buf[pos.*..][0..4].* = @bitCast(std.mem.nativeToLittle(u32, val));
+    buf[pos.*..][0..4].* = @bitCast(@as(u32, val));
     pos.* += 4;
 }
 
 fn writeU64LE(buf: []u8, pos: *usize, val: u64) void {
-    buf[pos.*..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, val));
+    buf[pos.*..][0..8].* = @bitCast(@as(u64, val));
     pos.* += 8;
 }
 

@@ -323,7 +323,7 @@ const FailureAggregate = struct {
 const FailureAccumulator = struct {
     groups: std.AutoHashMapUnmanaged(u64, FailureAggregate) = .empty,
 
-    fn deinit(self: *FailureAccumulator, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FailureAccumulator, alloc: std.mem.Allocator) void {
         self.groups.deinit(alloc);
         self.* = undefined;
     }
@@ -521,7 +521,7 @@ fn failureDomainPriority(domain: FailureDomain) u8 {
 }
 
 fn failureDomainBit(domain: FailureDomain) u8 {
-    return @as(u8, 1) << @intCast(@intFromEnum(domain));
+    return @as(u8, 1) << @intCast(@backingInt(domain));
 }
 
 fn failureFromRetryState(group_id: u64, state: FailureRetryState) ReconcileFailure {
@@ -1167,7 +1167,7 @@ pub const Reconciler = struct {
             @as(usize, self.policy_retries.count()) +| intent_count,
         ) orelse return error.TooManyPlacementIntents;
         try self.policy_retries.ensureTotalCapacity(self.alloc, policy_retry_capacity);
-        const failure_slots = std.math.mul(usize, intent_count, @typeInfo(FailureDomain).@"enum".fields.len) catch
+        const failure_slots = std.math.mul(usize, intent_count, @typeInfo(FailureDomain).@"enum".field_names.len) catch
             return error.TooManyPlacementIntents;
         const failure_retry_capacity = std.math.cast(
             u32,
@@ -1564,7 +1564,7 @@ pub const Reconciler = struct {
         else
             1;
         const next_retry_ns = if (classification == .retryable)
-            self.host.monotonicNs() +| routeRetryDelayNs(group_id ^ @intFromEnum(phase), attempts)
+            self.host.monotonicNs() +| routeRetryDelayNs(group_id ^ @backingInt(phase), attempts)
         else
             0;
         self.failure_retries.putAssumeCapacity(key, .{
@@ -1605,10 +1605,10 @@ pub const Reconciler = struct {
     }
 
     fn clearAllGroupFailures(self: *Reconciler, group_id: u64) void {
-        inline for (@typeInfo(FailureDomain).@"enum".fields) |field| {
+        inline for (@typeInfo(FailureDomain).@"enum".field_names, @typeInfo(FailureDomain).@"enum".field_values) |_, field_value| {
             _ = self.removeFailure(.{
                 .group_id = group_id,
-                .domain = @enumFromInt(field.value),
+                .domain = @fromBackingInt(field_value),
             });
         }
     }
@@ -2279,10 +2279,10 @@ fn hashIntent(intent: PlacementIntent) u64 {
     hashU64(&hasher, intent.record.group_id);
     hashU64(&hasher, intent.record.replica_id);
     hashU64(&hasher, intent.record.local_node_id);
-    hashU64(&hasher, @as(u64, @intFromEnum(intent.record.bootstrap_mode)));
+    hashU64(&hasher, @as(u64, @backingInt(intent.record.bootstrap_mode)));
     hashU64(&hasher, intent.record.metadata_version);
     hashU64(&hasher, intent.store_id);
-    hashU64(&hasher, @intFromEnum(intent.serving_state));
+    hashU64(&hasher, @backingInt(intent.serving_state));
     hashU64(&hasher, intent.relocation_generation);
     hashU64(&hasher, intent.relocation_source_node_id);
     hashU64(&hasher, intent.relocation_source_store_id);

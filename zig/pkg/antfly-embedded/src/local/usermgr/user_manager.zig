@@ -1,0 +1,2291 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+const catalog_names = @import("../system_catalog/domain.zig");
+const io_abi = @import("antfly_runtime_abi").io_abi;
+const casbin = @import("antfly_casbin");
+
+const Allocator = std.mem.Allocator;
+const bcrypt = std.crypto.pwhash.bcrypt;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+pub const default_rbac_model_text =
+    \\[request_definition]
+    \\r = sub, typ, obj, act
+    \\[policy_definition]
+    \\p = sub, typ, obj, act
+    \\p2 = sub, obj, filter
+    \\[role_definition]
+    \\g = _, _
+    \\[matchers]
+    \\m = g(r.sub, p.sub) && (r.typ == p.typ || p.typ == "*") && (r.obj == p.obj || p.obj == "*") && (r.act == p.act || p.act == "*")
+;
+
+pub const ResourceType = enum {
+    database,
+    namespace,
+    tablespace,
+    table,
+    user,
+    inference,
+    @"*",
+
+    pub fn fromSlice(raw: []const u8) !ResourceType {
+        if (std.mem.eql(u8, raw, "database")) return .database;
+        if (std.mem.eql(u8, raw, "namespace")) return .namespace;
+        if (std.mem.eql(u8, raw, "tablespace")) return .tablespace;
+        if (std.mem.eql(u8, raw, "table")) return .table;
+        if (std.mem.eql(u8, raw, "user")) return .user;
+        if (std.mem.eql(u8, raw, "inference")) return .inference;
+        if (std.mem.eql(u8, raw, "*")) return .@"*";
+        return error.InvalidResourceType;
+    }
+
+    pub fn slice(self: ResourceType) []const u8 {
+        return switch (self) {
+            .database => "database",
+            .namespace => "namespace",
+            .tablespace => "tablespace",
+            .table => "table",
+            .user => "user",
+            .inference => "inference",
+            .@"*" => "*",
+        };
+    }
+};
+
+test "inference resource type round trips through persisted strings" {
+    try std.testing.expectEqual(ResourceType.inference, try ResourceType.fromSlice("inference"));
+    try std.testing.expectEqualStrings("inference", ResourceType.inference.slice());
+}
+
+pub const PermissionType = enum {
+    read,
+    write,
+    admin,
+
+    pub fn fromSlice(raw: []const u8) !PermissionType {
+        if (std.mem.eql(u8, raw, "read")) return .read;
+        if (std.mem.eql(u8, raw, "write")) return .write;
+        if (std.mem.eql(u8, raw, "admin")) return .admin;
+        return error.InvalidPermissionType;
+    }
+
+    pub fn slice(self: PermissionType) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const Permission = struct {
+    resource: []u8,
+    resource_type: ResourceType,
+    type: PermissionType,
+
+    pub fn initOwned(
+        alloc: Allocator,
+        resource_type: ResourceType,
+        resource: []const u8,
+        permission_type: PermissionType,
+    ) !Permission {
+        return .{
+            .resource = try alloc.dupe(u8, resource),
+            .resource_type = resource_type,
+            .type = permission_type,
+        };
+    }
+
+    pub fn deinit(self: *Permission, alloc: Allocator) void {
+        alloc.free(self.resource);
+        self.* = undefined;
+    }
+};
+
+pub const User = struct {
+    username: []u8,
+    password_hash: []u8,
+    metadata_json: []u8 = &.{},
+
+    pub fn clone(self: User, alloc: Allocator) !User {
+        return .{
+            .username = try alloc.dupe(u8, self.username),
+            .password_hash = try alloc.dupe(u8, self.password_hash),
+            .metadata_json = if (self.metadata_json.len > 0) try alloc.dupe(u8, self.metadata_json) else &.{},
+        };
+    }
+
+    pub fn deinit(self: *User, alloc: Allocator) void {
+        alloc.free(self.username);
+        alloc.free(self.password_hash);
+        if (self.metadata_json.len > 0) alloc.free(self.metadata_json);
+        self.* = undefined;
+    }
+};
+
+pub const RowFilterEntry = struct {
+    table: []u8,
+    filter: []u8,
+
+    pub fn initOwned(alloc: Allocator, table: []const u8, filter: []const u8) !RowFilterEntry {
+        return .{
+            .table = try alloc.dupe(u8, table),
+            .filter = try alloc.dupe(u8, filter),
+        };
+    }
+
+    pub fn deinit(self: *RowFilterEntry, alloc: Allocator) void {
+        alloc.free(self.table);
+        alloc.free(self.filter);
+        self.* = undefined;
+    }
+};
+
+pub const AuthSubjectKind = enum {
+    user,
+    role,
+    group,
+    subject,
+
+    pub fn slice(self: AuthSubjectKind) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const AuthSubjectEntry = struct {
+    subject: []u8,
+    kind: AuthSubjectKind,
+
+    pub fn initOwned(alloc: Allocator, subject: []const u8, kind: AuthSubjectKind) !AuthSubjectEntry {
+        return .{
+            .subject = try alloc.dupe(u8, subject),
+            .kind = kind,
+        };
+    }
+
+    pub fn deinit(self: *AuthSubjectEntry, alloc: Allocator) void {
+        alloc.free(self.subject);
+        self.* = undefined;
+    }
+};
+
+pub const ApiKey = struct {
+    key_id: []u8,
+    username: []u8,
+    name: []u8,
+    permissions: []Permission,
+    row_filter: []RowFilterEntry,
+    created_at_ns: u64,
+    expires_at_ns: ?u64 = null,
+
+    pub fn clone(self: ApiKey, alloc: Allocator) !ApiKey {
+        var permissions = try alloc.alloc(Permission, self.permissions.len);
+        errdefer alloc.free(permissions);
+        var filled_perms: usize = 0;
+        errdefer {
+            for (permissions[0..filled_perms]) |*perm| perm.deinit(alloc);
+        }
+        for (self.permissions, 0..) |perm, i| {
+            permissions[i] = try Permission.initOwned(alloc, perm.resource_type, perm.resource, perm.type);
+            filled_perms += 1;
+        }
+
+        var row_filter = try alloc.alloc(RowFilterEntry, self.row_filter.len);
+        errdefer alloc.free(row_filter);
+        var filled_filters: usize = 0;
+        errdefer {
+            for (row_filter[0..filled_filters]) |*entry| entry.deinit(alloc);
+        }
+        for (self.row_filter, 0..) |entry, i| {
+            row_filter[i] = try RowFilterEntry.initOwned(alloc, entry.table, entry.filter);
+            filled_filters += 1;
+        }
+
+        return .{
+            .key_id = try alloc.dupe(u8, self.key_id),
+            .username = try alloc.dupe(u8, self.username),
+            .name = try alloc.dupe(u8, self.name),
+            .permissions = permissions,
+            .row_filter = row_filter,
+            .created_at_ns = self.created_at_ns,
+            .expires_at_ns = self.expires_at_ns,
+        };
+    }
+
+    pub fn deinit(self: *ApiKey, alloc: Allocator) void {
+        alloc.free(self.key_id);
+        alloc.free(self.username);
+        alloc.free(self.name);
+        for (self.permissions) |*perm| perm.deinit(alloc);
+        alloc.free(self.permissions);
+        for (self.row_filter) |*entry| entry.deinit(alloc);
+        alloc.free(self.row_filter);
+        self.* = undefined;
+    }
+};
+
+pub const CreatedApiKey = struct {
+    key: ApiKey,
+    key_secret: []u8,
+    encoded: []u8,
+
+    pub fn deinit(self: *CreatedApiKey, alloc: Allocator) void {
+        self.key.deinit(alloc);
+        alloc.free(self.key_secret);
+        alloc.free(self.encoded);
+        self.* = undefined;
+    }
+};
+
+pub const ApiKeyRecord = struct {
+    key: ApiKey,
+    secret_hash: []u8,
+    secret_salt: []u8,
+
+    pub fn clone(self: ApiKeyRecord, alloc: Allocator) !ApiKeyRecord {
+        return .{
+            .key = try self.key.clone(alloc),
+            .secret_hash = try alloc.dupe(u8, self.secret_hash),
+            .secret_salt = try alloc.dupe(u8, self.secret_salt),
+        };
+    }
+
+    pub fn deinit(self: *ApiKeyRecord, alloc: Allocator) void {
+        self.key.deinit(alloc);
+        alloc.free(self.secret_hash);
+        alloc.free(self.secret_salt);
+        self.* = undefined;
+    }
+
+    pub fn publicClone(self: ApiKeyRecord, alloc: Allocator) !ApiKey {
+        return try self.key.clone(alloc);
+    }
+};
+
+pub const ValidatedApiKey = struct {
+    username: []u8,
+    permissions: []Permission,
+    row_filter: []RowFilterEntry,
+    metadata_json: []u8 = &.{},
+    roles: [][]u8 = &.{},
+
+    pub fn deinit(self: *ValidatedApiKey, alloc: Allocator) void {
+        alloc.free(self.username);
+        for (self.permissions) |*perm| perm.deinit(alloc);
+        alloc.free(self.permissions);
+        for (self.row_filter) |*entry| entry.deinit(alloc);
+        alloc.free(self.row_filter);
+        if (self.metadata_json.len > 0) alloc.free(self.metadata_json);
+        freeOwnedStrings(alloc, self.roles);
+        self.* = undefined;
+    }
+};
+
+pub const UserStore = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        load_users: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror![]User,
+        save_user: *const fn (ptr: *anyopaque, alloc: Allocator, user: *const User) anyerror!void,
+        delete_user: *const fn (ptr: *anyopaque, username: []const u8) anyerror!bool,
+        load_api_keys: *const fn (ptr: *anyopaque, alloc: Allocator) anyerror![]ApiKeyRecord,
+        save_api_key: *const fn (ptr: *anyopaque, alloc: Allocator, record: *const ApiKeyRecord) anyerror!void,
+        delete_api_key: *const fn (ptr: *anyopaque, key_id: []const u8) anyerror!bool,
+        export_portable_seed: ?*const fn (ptr: *anyopaque, alloc: Allocator, generation: []const u8) anyerror![]u8 = null,
+    };
+
+    pub fn loadUsers(self: UserStore, alloc: Allocator) ![]User {
+        return try self.vtable.load_users(self.ptr, alloc);
+    }
+
+    pub fn saveUser(self: UserStore, alloc: Allocator, user: *const User) !void {
+        return try self.vtable.save_user(self.ptr, alloc, user);
+    }
+
+    pub fn deleteUser(self: UserStore, username: []const u8) !bool {
+        return try self.vtable.delete_user(self.ptr, username);
+    }
+
+    pub fn loadApiKeys(self: UserStore, alloc: Allocator) ![]ApiKeyRecord {
+        return try self.vtable.load_api_keys(self.ptr, alloc);
+    }
+
+    pub fn saveApiKey(self: UserStore, alloc: Allocator, record: *const ApiKeyRecord) !void {
+        return try self.vtable.save_api_key(self.ptr, alloc, record);
+    }
+
+    pub fn deleteApiKey(self: UserStore, key_id: []const u8) !bool {
+        return try self.vtable.delete_api_key(self.ptr, key_id);
+    }
+
+    pub fn exportPortableSeed(self: UserStore, alloc: Allocator, generation: []const u8) ![]u8 {
+        const export_fn = self.vtable.export_portable_seed orelse return error.PortableAuthSeedUnsupported;
+        return try export_fn(self.ptr, alloc, generation);
+    }
+};
+
+pub const AuthLifecyclePhase = enum {
+    user_persisted,
+    user_published,
+    password_persisted,
+    password_published,
+    api_key_persisted,
+    api_key_published,
+    api_key_revoked,
+    permission_changed,
+    row_filter_changed,
+};
+
+pub const AuthLifecycleEvent = struct {
+    phase: AuthLifecyclePhase,
+    username: []const u8,
+    key_id: []const u8 = "",
+};
+
+pub const AuthLifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (*anyopaque, AuthLifecycleEvent) anyerror!void,
+
+    pub fn reach(self: @This(), event: AuthLifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
+
+pub const MemoryStore = struct {
+    alloc: Allocator,
+    users: std.ArrayList(User) = .empty,
+    api_keys: std.ArrayList(ApiKeyRecord) = .empty,
+
+    const iface_vtable: UserStore.VTable = .{
+        .load_users = loadUsers,
+        .save_user = saveUser,
+        .delete_user = deleteUser,
+        .load_api_keys = loadApiKeys,
+        .save_api_key = saveApiKey,
+        .delete_api_key = deleteApiKey,
+    };
+
+    pub fn init(alloc: Allocator) MemoryStore {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *MemoryStore) void {
+        for (self.users.items) |*user| user.deinit(self.alloc);
+        self.users.deinit(self.alloc);
+        for (self.api_keys.items) |*record| record.deinit(self.alloc);
+        self.api_keys.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn iface(self: *MemoryStore) UserStore {
+        return .{
+            .ptr = self,
+            .vtable = &iface_vtable,
+        };
+    }
+
+    fn loadUsers(ptr: *anyopaque, alloc: Allocator) ![]User {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        const out = try alloc.alloc(User, self.users.items.len);
+        errdefer alloc.free(out);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*user| user.deinit(alloc);
+        }
+        for (self.users.items, 0..) |user, i| {
+            out[i] = try user.clone(alloc);
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn saveUser(ptr: *anyopaque, alloc: Allocator, user: *const User) !void {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        _ = alloc;
+        for (self.users.items) |*existing| {
+            if (!std.mem.eql(u8, existing.username, user.username)) continue;
+            self.alloc.free(existing.password_hash);
+            existing.password_hash = try self.alloc.dupe(u8, user.password_hash);
+            if (existing.metadata_json.len > 0) self.alloc.free(existing.metadata_json);
+            existing.metadata_json = if (user.metadata_json.len > 0) try self.alloc.dupe(u8, user.metadata_json) else &.{};
+            return;
+        }
+        try self.users.append(self.alloc, try user.clone(self.alloc));
+    }
+
+    pub fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        var i: usize = 0;
+        while (i < self.users.items.len) {
+            if (!std.mem.eql(u8, self.users.items[i].username, username)) {
+                i += 1;
+                continue;
+            }
+            self.users.items[i].deinit(self.alloc);
+            _ = self.users.swapRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    fn loadApiKeys(ptr: *anyopaque, alloc: Allocator) ![]ApiKeyRecord {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        const out = try alloc.alloc(ApiKeyRecord, self.api_keys.items.len);
+        errdefer alloc.free(out);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |*record| record.deinit(alloc);
+        }
+        for (self.api_keys.items, 0..) |record, i| {
+            out[i] = try record.clone(alloc);
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn saveApiKey(ptr: *anyopaque, alloc: Allocator, record: *const ApiKeyRecord) !void {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        _ = alloc;
+        for (self.api_keys.items) |*existing| {
+            if (!std.mem.eql(u8, existing.key.key_id, record.key.key_id)) continue;
+            existing.deinit(self.alloc);
+            existing.* = try record.clone(self.alloc);
+            return;
+        }
+        try self.api_keys.append(self.alloc, try record.clone(self.alloc));
+    }
+
+    pub fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
+        const self: *MemoryStore = @ptrCast(@alignCast(ptr));
+        var i: usize = 0;
+        while (i < self.api_keys.items.len) {
+            if (!std.mem.eql(u8, self.api_keys.items[i].key.key_id, key_id)) {
+                i += 1;
+                continue;
+            }
+            self.api_keys.items[i].deinit(self.alloc);
+            _ = self.api_keys.swapRemove(i);
+            return true;
+        }
+        return false;
+    }
+};
+
+pub const UserManager = struct {
+    alloc: Allocator,
+    // The manager is shared by standalone and API runtime archives. Each
+    // synchronous method receives I/O in its own error domain; receivers live
+    // through mutex unlock and are never retained in this movable object.
+    io_borrow: io_abi.Borrow,
+    store: UserStore,
+    enforcer: casbin.Enforcer,
+    users: std.StringHashMapUnmanaged([]u8) = .{},
+    user_metadata: std.StringHashMapUnmanaged([]u8) = .{},
+    api_keys: std.StringHashMapUnmanaged(ApiKeyRecord) = .{},
+    mutation_mutex: std.Io.Mutex = .init,
+    // Local role-graph revision for statement admission. It is deliberately
+    // not a distributed revocation oracle: already admitted statements have
+    // a bounded lease, while subsequent admissions pin the new graph.
+    role_revision: u64 = 1,
+    lifecycle_hook: ?AuthLifecycleHook = null,
+
+    pub fn setLifecycleHook(self: *UserManager, hook: ?AuthLifecycleHook) void {
+        self.lifecycle_hook = hook;
+    }
+
+    fn reachLifecycle(self: *UserManager, event: AuthLifecycleEvent) !void {
+        if (self.lifecycle_hook) |hook| try hook.reach(event);
+    }
+
+    /// Held by HA seed capture from before auth export until the complete
+    /// data+auth generation has been durably published. All auth mutations use
+    /// the same mutex, so no mutation can land in only one side of the seed.
+    pub const SeedCaptureLease = struct {
+        manager: *UserManager,
+
+        pub fn release(self: *@This()) void {
+            var receiver = self.manager.io_borrow.receive() catch @panic("invalid UserManager executor");
+            self.manager.mutation_mutex.unlock(receiver.io());
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireSeedCaptureLease(self: *UserManager) SeedCaptureLease {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        return .{ .manager = self };
+    }
+
+    pub fn exportPortableSeedWithLease(
+        self: *UserManager,
+        alloc: Allocator,
+        generation: []const u8,
+        lease: *const SeedCaptureLease,
+    ) ![]u8 {
+        if (lease.manager != self) return error.InvalidAuthSeedCaptureLease;
+        return try self.store.exportPortableSeed(alloc, generation);
+    }
+
+    pub fn init(alloc: Allocator, store: UserStore, enforcer: casbin.Enforcer) !UserManager {
+        return initWithIo(alloc, std.Options.debug_io, store, enforcer);
+    }
+
+    pub fn initWithIo(alloc: Allocator, io: std.Io, store: UserStore, enforcer: casbin.Enforcer) !UserManager {
+        var manager = UserManager{
+            .alloc = alloc,
+            .io_borrow = .init(&io),
+            .store = store,
+            .enforcer = enforcer,
+        };
+        errdefer manager.deinit();
+
+        const loaded = try store.loadUsers(alloc);
+        defer {
+            for (loaded) |*user| user.deinit(alloc);
+            alloc.free(loaded);
+        }
+
+        for (loaded) |user| {
+            try manager.users.put(alloc, try alloc.dupe(u8, user.username), try alloc.dupe(u8, user.password_hash));
+            try manager.user_metadata.put(
+                alloc,
+                try alloc.dupe(u8, user.username),
+                if (user.metadata_json.len > 0) try alloc.dupe(u8, user.metadata_json) else try alloc.dupe(u8, "{}"),
+            );
+        }
+
+        const loaded_api_keys = try store.loadApiKeys(alloc);
+        defer {
+            for (loaded_api_keys) |*record| record.deinit(alloc);
+            alloc.free(loaded_api_keys);
+        }
+        for (loaded_api_keys) |record| {
+            try manager.api_keys.put(alloc, try alloc.dupe(u8, record.key.key_id), try record.clone(alloc));
+        }
+        manager.enforcer.enableAutoSave(true);
+        return manager;
+    }
+
+    pub fn deinit(self: *UserManager) void {
+        self.enforcer.deinit();
+        var it = self.users.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.users.deinit(self.alloc);
+        var metadata_it = self.user_metadata.iterator();
+        while (metadata_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.user_metadata.deinit(self.alloc);
+        var api_key_it = self.api_keys.iterator();
+        while (api_key_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.alloc);
+        }
+        self.api_keys.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn createUser(
+        self: *UserManager,
+        username: []const u8,
+        password: []const u8,
+        initial_policies: []const Permission,
+    ) !User {
+        return try self.createUserWithMetadata(username, password, initial_policies, "{}");
+    }
+
+    pub fn createUserWithMetadata(
+        self: *UserManager,
+        username: []const u8,
+        password: []const u8,
+        initial_policies: []const Permission,
+        metadata_json: []const u8,
+    ) !User {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.createUserWithMetadataUnlocked(username, password, initial_policies, metadata_json);
+    }
+
+    fn createUserWithMetadataUnlocked(
+        self: *UserManager,
+        username: []const u8,
+        password: []const u8,
+        initial_policies: []const Permission,
+        metadata_json: []const u8,
+    ) !User {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        if (self.users.contains(username)) return error.UserExists;
+
+        var stored = blk: {
+            const password_hash = try hashPassword(self.alloc, io, password);
+            errdefer self.alloc.free(password_hash);
+            const normalized_metadata = try normalizeMetadataJson(self.alloc, metadata_json);
+            errdefer self.alloc.free(normalized_metadata);
+            const owned_username = try self.alloc.dupe(u8, username);
+            errdefer self.alloc.free(owned_username);
+            break :blk User{
+                .username = owned_username,
+                .password_hash = password_hash,
+                .metadata_json = normalized_metadata,
+            };
+        };
+        errdefer stored.deinit(self.alloc);
+
+        try self.store.saveUser(self.alloc, &stored);
+        errdefer {
+            if (self.users.fetchRemove(username)) |removed| {
+                self.alloc.free(removed.key);
+                self.alloc.free(removed.value);
+            }
+            if (self.user_metadata.fetchRemove(username)) |removed| {
+                self.alloc.free(removed.key);
+                self.alloc.free(removed.value);
+            }
+            _ = self.store.deleteUser(username) catch {};
+        }
+        try self.reachLifecycle(.{ .phase = .user_persisted, .username = username });
+        try self.users.put(self.alloc, try self.alloc.dupe(u8, stored.username), try self.alloc.dupe(u8, stored.password_hash));
+        try self.user_metadata.put(self.alloc, try self.alloc.dupe(u8, stored.username), try self.alloc.dupe(u8, stored.metadata_json));
+        try self.reachLifecycle(.{ .phase = .user_published, .username = username });
+
+        if (initial_policies.len > 0) {
+            var policy_fields = try self.alloc.alloc([]const []const u8, initial_policies.len);
+            defer self.alloc.free(policy_fields);
+            var policy_storage = try self.alloc.alloc([4][]const u8, initial_policies.len);
+            defer self.alloc.free(policy_storage);
+            for (initial_policies, 0..) |perm, i| {
+                policy_storage[i] = .{
+                    username,
+                    perm.resource_type.slice(),
+                    perm.resource,
+                    perm.type.slice(),
+                };
+                policy_fields[i] = policy_storage[i][0..];
+            }
+            _ = try self.enforcer.addPolicies(policy_fields);
+        }
+
+        const result = try stored.clone(self.alloc);
+        stored.deinit(self.alloc);
+        self.role_revision +|= 1;
+        return result;
+    }
+
+    pub fn getUser(self: *const UserManager, username: []const u8) !User {
+        const password_hash = self.users.get(username) orelse return error.UserNotFound;
+        const metadata_json = self.user_metadata.get(username) orelse "{}";
+        const owned_username = try self.alloc.dupe(u8, username);
+        errdefer self.alloc.free(owned_username);
+        const owned_hash = try self.alloc.dupe(u8, password_hash);
+        errdefer self.alloc.free(owned_hash);
+        return .{
+            .username = owned_username,
+            .password_hash = owned_hash,
+            .metadata_json = try self.alloc.dupe(u8, metadata_json),
+        };
+    }
+
+    pub fn authenticateUser(self: *const UserManager, username: []const u8, password: []const u8) !User {
+        const password_hash = self.users.get(username) orelse return error.UserNotFound;
+        const metadata_json = self.user_metadata.get(username) orelse "{}";
+        try verifyPassword(password_hash, password);
+        return .{
+            .username = try self.alloc.dupe(u8, username),
+            .password_hash = try self.alloc.dupe(u8, password_hash),
+            .metadata_json = try self.alloc.dupe(u8, metadata_json),
+        };
+    }
+
+    pub fn updatePassword(self: *UserManager, username: []const u8, new_password: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        const existing = self.users.getPtr(username) orelse return error.UserNotFound;
+        const metadata_json = self.user_metadata.get(username) orelse "{}";
+        const new_hash = try hashPassword(self.alloc, io, new_password);
+        errdefer self.alloc.free(new_hash);
+        var stored = User{
+            .username = @constCast(username),
+            .password_hash = new_hash,
+            .metadata_json = @constCast(metadata_json),
+        };
+        try self.store.saveUser(self.alloc, &stored);
+        try self.reachLifecycle(.{ .phase = .password_persisted, .username = username });
+        self.alloc.free(existing.*);
+        existing.* = new_hash;
+        try self.reachLifecycle(.{ .phase = .password_published, .username = username });
+    }
+
+    pub fn deleteUser(self: *UserManager, username: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        const removed = self.users.fetchRemove(username) orelse return error.UserNotFound;
+        defer {
+            self.alloc.free(removed.key);
+            self.alloc.free(removed.value);
+        }
+        if (self.user_metadata.fetchRemove(username)) |metadata| {
+            self.alloc.free(metadata.key);
+            self.alloc.free(metadata.value);
+        }
+        _ = try self.store.deleteUser(username);
+        self.role_revision +|= 1;
+        var owned_key_ids = std.ArrayList([]u8).empty;
+        defer {
+            for (owned_key_ids.items) |key_id| self.alloc.free(key_id);
+            owned_key_ids.deinit(self.alloc);
+        }
+        var api_key_it = self.api_keys.iterator();
+        while (api_key_it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.key.username, username)) continue;
+            try owned_key_ids.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
+        }
+        for (owned_key_ids.items) |key_id| try self.deleteApiKeyUnlocked(username, key_id);
+        _ = try self.enforcer.removeFilteredPolicy(0, &.{username});
+        _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{username});
+    }
+
+    pub fn listUsers(self: *const UserManager) ![][]u8 {
+        var out = try self.alloc.alloc([]u8, self.users.count());
+        errdefer self.alloc.free(out);
+        var i: usize = 0;
+        var it = self.users.keyIterator();
+        while (it.next()) |username| : (i += 1) {
+            out[i] = try self.alloc.dupe(u8, username.*);
+        }
+        return out;
+    }
+
+    pub fn enforce(
+        self: *const UserManager,
+        username: []const u8,
+        resource_type: ResourceType,
+        resource: []const u8,
+        permission_type: PermissionType,
+    ) !bool {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        return try self.enforcer.enforce(username, resource_type.slice(), resource, permission_type.slice());
+    }
+
+    pub fn addPermissionToSubject(self: *UserManager, subject: []const u8, permission: Permission) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.addPermissionToSubjectUnlocked(subject, permission);
+    }
+
+    fn addPermissionToSubjectUnlocked(self: *UserManager, subject: []const u8, permission: Permission) !void {
+        _ = try self.enforcer.addPolicy(&.{
+            subject,
+            permission.resource_type.slice(),
+            permission.resource,
+            permission.type.slice(),
+        });
+        try self.reachLifecycle(.{ .phase = .permission_changed, .username = subject });
+    }
+
+    pub fn addPermissionToUser(self: *UserManager, username: []const u8, permission: Permission) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+        try self.addPermissionToSubjectUnlocked(username, permission);
+    }
+
+    pub fn removePermissionFromUser(
+        self: *UserManager,
+        username: []const u8,
+        resource_name: []const u8,
+        resource_type: ResourceType,
+    ) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+        const removed = if (std.mem.eql(u8, resource_name, "*"))
+            try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice() })
+        else
+            try self.enforcer.removeFilteredPolicy(0, &.{ username, resource_type.slice(), resource_name });
+        if (!removed) return error.RoleNotFound;
+    }
+
+    pub fn getPermissionsForUser(self: *const UserManager, username: []const u8) ![]Permission {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        const rules = try self.enforcer.getPermissionsForUser(self.alloc, username);
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+
+        var out = std.ArrayList(Permission).empty;
+        errdefer {
+            for (out.items) |*perm| perm.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 4) continue;
+            try out.append(self.alloc, try Permission.initOwned(
+                self.alloc,
+                try ResourceType.fromSlice(rule.fields[1]),
+                rule.fields[2],
+                try PermissionType.fromSlice(rule.fields[3]),
+            ));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    /// Re-check one permission against the current policy under the same
+    /// mutation lock used by policy updates. Long-running request paths use
+    /// this to intersect their admitted credential scope with live revocation:
+    /// a later grant cannot broaden the request, while a later revoke takes
+    /// effect before the next protected operation.
+    pub fn permissionCurrentlyAllowed(
+        self: *UserManager,
+        username: []const u8,
+        resource_type: ResourceType,
+        resource: []const u8,
+        permission_type: PermissionType,
+    ) !bool {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return false;
+        const permissions = try self.getPermissionsForUser(username);
+        defer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(permissions);
+        }
+        for (permissions) |permission| {
+            const resource_type_matches = permission.resource_type == .@"*" or
+                permission.resource_type == resource_type;
+            const resource_matches = if (resource_type == .table)
+                catalog_names.tableResourceMatches(permission.resource, resource)
+            else
+                std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+            const permission_matches = permission.type == .admin or
+                permission.type == permission_type;
+            if (resource_type_matches and resource_matches and permission_matches) return true;
+        }
+        return false;
+    }
+
+    pub fn addRoleToSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.addRoleToSubjectUnlocked(subject, role);
+    }
+
+    fn addRoleToSubjectUnlocked(self: *UserManager, subject: []const u8, role: []const u8) !void {
+        if (subject.len == 0 or role.len == 0) return error.InvalidRole;
+        _ = try self.enforcer.addNamedPolicy("g", &.{ subject, role });
+        self.role_revision +|= 1;
+    }
+
+    pub fn addRoleToUser(self: *UserManager, username: []const u8, role: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+        try self.addRoleToSubjectUnlocked(username, role);
+    }
+
+    pub fn removeRoleFromSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.removeRoleFromSubjectUnlocked(subject, role);
+    }
+
+    fn removeRoleFromSubjectUnlocked(self: *UserManager, subject: []const u8, role: []const u8) !void {
+        const removed = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{ subject, role });
+        if (!removed) return error.RoleNotFound;
+        self.role_revision +|= 1;
+    }
+
+    pub fn removeRoleFromUser(self: *UserManager, username: []const u8, role: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+        try self.removeRoleFromSubjectUnlocked(username, role);
+    }
+
+    pub fn getRolesForUser(self: *const UserManager, username: []const u8) ![][]u8 {
+        if (!self.users.contains(username)) return error.UserNotFound;
+
+        var queue = std.ArrayList([]const u8).empty;
+        defer queue.deinit(self.alloc);
+        var visited = std.StringHashMapUnmanaged(void){};
+        defer {
+            var it = visited.iterator();
+            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+            visited.deinit(self.alloc);
+        }
+        var out = std.ArrayList([]u8).empty;
+        errdefer {
+            for (out.items) |role| self.alloc.free(role);
+            out.deinit(self.alloc);
+        }
+
+        const owned_username = try self.alloc.dupe(u8, username);
+        visited.put(self.alloc, owned_username, {}) catch |err| {
+            self.alloc.free(owned_username);
+            return err;
+        };
+        try queue.append(self.alloc, owned_username);
+
+        var index: usize = 0;
+        while (index < queue.items.len) : (index += 1) {
+            const current = queue.items[index];
+            const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "g", 0, &.{current});
+            defer {
+                for (rules) |*rule| rule.deinit(self.alloc);
+                self.alloc.free(rules);
+            }
+
+            for (rules) |rule| {
+                if (rule.fields.len < 2) continue;
+                const role = rule.fields[1];
+                if (visited.contains(role)) continue;
+                const owned_role = try self.alloc.dupe(u8, role);
+                visited.put(self.alloc, owned_role, {}) catch |err| {
+                    self.alloc.free(owned_role);
+                    return err;
+                };
+                try queue.append(self.alloc, owned_role);
+                const out_role = try self.alloc.dupe(u8, role);
+                out.append(self.alloc, out_role) catch |err| {
+                    self.alloc.free(out_role);
+                    return err;
+                };
+            }
+        }
+
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    /// Recheck the previously admitted credential and table permission under
+    /// the same mutex as role mutations. The front end must additionally
+    /// intersect with its request-start permission snapshot: new grants must
+    /// not broaden a request that was already admitted with narrower scope.
+    pub fn signRowPolicyRolesAuthorized(
+        self: *UserManager,
+        alloc: Allocator,
+        authenticated_username: []const u8,
+        credential_principal: []const u8,
+        logical_table: []const u8,
+        permission_type: PermissionType,
+        secret: []const u8,
+        issuer: []const u8,
+        scope: @import("row_policy_authority.zig").Scope,
+        now_seconds: i64,
+    ) ![]u8 {
+        const authority = @import("row_policy_authority.zig");
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(authenticated_username)) return error.Forbidden;
+        const current_permissions = if (std.mem.startsWith(u8, credential_principal, "basic:")) blk: {
+            if (!std.mem.eql(u8, credential_principal["basic:".len..], authenticated_username)) return error.Forbidden;
+            break :blk try self.getPermissionsForUser(authenticated_username);
+        } else if (std.mem.startsWith(u8, credential_principal, "api-key:")) blk: {
+            const key_id = credential_principal["api-key:".len..];
+            const record = self.api_keys.get(key_id) orelse return error.Forbidden;
+            if (!std.mem.eql(u8, record.key.username, authenticated_username)) return error.Forbidden;
+            break :blk try self.effectiveApiKeyPermissionsUnlocked(key_id);
+        } else return error.Forbidden;
+        defer {
+            for (current_permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(current_permissions);
+        }
+        var allowed = false;
+        for (current_permissions) |permission| {
+            if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
+                catalog_names.tableResourceMatches(permission.resource, logical_table) and
+                (permission.type == .admin or permission.type == permission_type))
+            {
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) return error.Forbidden;
+        const roles = try self.getRolesForUser(authenticated_username);
+        defer freeOwnedStrings(self.alloc, roles);
+        const role_views = try alloc.alloc([]const u8, roles.len);
+        defer alloc.free(role_views);
+        for (roles, 0..) |role, index| role_views[index] = role;
+        std.mem.sort([]const u8, role_views, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        return authority.sign(alloc, secret, issuer, .{
+            .principal = authenticated_username,
+            .roles = role_views,
+            .auth_revision = self.role_revision,
+        }, scope, now_seconds);
+    }
+
+    pub fn listAuthSubjects(self: *const UserManager) ![]AuthSubjectEntry {
+        var subjects = std.StringArrayHashMapUnmanaged(AuthSubjectKind){};
+        defer {
+            var it = subjects.iterator();
+            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+            subjects.deinit(self.alloc);
+        }
+
+        var user_it = self.users.keyIterator();
+        while (user_it.next()) |username| {
+            try putAuthSubject(self.alloc, &subjects, username.*, .user);
+        }
+
+        try self.collectAuthSubjectsFromPolicy(&subjects, "p");
+        try self.collectAuthSubjectsFromPolicy(&subjects, "p2");
+        try self.collectAuthSubjectsFromPolicy(&subjects, "g");
+
+        var out = std.ArrayList(AuthSubjectEntry).empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var it = subjects.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, try AuthSubjectEntry.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn collectAuthSubjectsFromPolicy(
+        self: *const UserManager,
+        subjects: *std.StringArrayHashMapUnmanaged(AuthSubjectKind),
+        ptype: []const u8,
+    ) !void {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, ptype, 0, &.{});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len == 0) continue;
+            try putAuthSubject(self.alloc, subjects, rule.fields[0], inferAuthSubjectKind(rule.fields[0]));
+            if (std.mem.eql(u8, ptype, "g") and rule.fields.len >= 2) {
+                try putAuthSubject(self.alloc, subjects, rule.fields[1], inferAuthSubjectKind(rule.fields[1]));
+            }
+        }
+    }
+
+    pub fn setSubjectRowFilter(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.setSubjectRowFilterUnlocked(subject, table, filter_json);
+    }
+
+    fn setSubjectRowFilterUnlocked(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{});
+        parsed.deinit();
+        _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{ subject, table });
+        _ = try self.enforcer.addNamedPolicy("p2", &.{ subject, table, filter_json });
+        try self.reachLifecycle(.{ .phase = .row_filter_changed, .username = subject });
+    }
+
+    pub fn setRowFilter(self: *UserManager, username: []const u8, table: []const u8, filter_json: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+        try self.setSubjectRowFilterUnlocked(username, table, filter_json);
+    }
+
+    pub fn removeSubjectRowFilter(self: *UserManager, subject: []const u8, table: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.removeSubjectRowFilterUnlocked(subject, table);
+    }
+
+    fn removeSubjectRowFilterUnlocked(self: *UserManager, subject: []const u8, table: []const u8) !void {
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{ subject, table });
+        if (!removed) return error.RowFilterNotFound;
+        try self.reachLifecycle(.{ .phase = .row_filter_changed, .username = subject });
+    }
+
+    pub fn removeRowFilter(self: *UserManager, username: []const u8, table: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+        try self.removeSubjectRowFilterUnlocked(username, table);
+    }
+
+    pub fn getSubjectRowFilter(self: *const UserManager, subject: []const u8, table: []const u8) ![]u8 {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{ subject, table });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 3) return error.RowFilterNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[2]);
+    }
+
+    pub fn getRowFilter(self: *const UserManager, username: []const u8, table: []const u8) ![]u8 {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        return try self.getSubjectRowFilter(username, table);
+    }
+
+    pub fn listSubjectRowFilters(self: *const UserManager, subject: []const u8) ![]RowFilterEntry {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{subject});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        var out = std.ArrayList(RowFilterEntry).empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            try out.append(self.alloc, try RowFilterEntry.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        return try self.listSubjectRowFilters(username);
+    }
+
+    pub fn getRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        const listed = try self.listSubjectRowFilters(username);
+        defer {
+            for (listed) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(listed);
+        }
+        const roles = try self.getRolesForUser(username);
+        defer freeOwnedStrings(self.alloc, roles);
+
+        var merged = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = merged.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            merged.deinit(self.alloc);
+        }
+
+        for (listed) |entry| {
+            try mergeRowFilterEntry(self.alloc, &merged, entry);
+        }
+
+        for (roles) |role| {
+            const role_filters = try self.listSubjectRowFilters(role);
+            defer {
+                for (role_filters) |*entry| entry.deinit(self.alloc);
+                self.alloc.free(role_filters);
+            }
+            for (role_filters) |entry| {
+                try mergeRowFilterEntry(self.alloc, &merged, entry);
+            }
+        }
+
+        var out = std.ArrayList(RowFilterEntry).empty;
+        errdefer {
+            for (out.items) |*entry| entry.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+
+        var it = merged.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, .{
+                .table = try self.alloc.dupe(u8, entry.key_ptr.*),
+                .filter = try self.alloc.dupe(u8, entry.value_ptr.*),
+            });
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn createApiKey(
+        self: *UserManager,
+        username: []const u8,
+        name: []const u8,
+        permissions: []const Permission,
+        row_filter: []const RowFilterEntry,
+        expires_at_ns: ?u64,
+    ) !CreatedApiKey {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        if (!self.users.contains(username)) return error.UserNotFound;
+
+        for (permissions) |perm| {
+            const allowed = try self.enforce(username, perm.resource_type, perm.resource, perm.type);
+            if (!allowed) return error.PrivilegeEscalation;
+        }
+
+        for (row_filter) |entry| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, entry.filter, .{});
+            parsed.deinit();
+        }
+
+        const key_id = try generateRandomAlphanumeric(self.alloc, io, 20);
+        defer self.alloc.free(key_id);
+        const secret_raw = try randomBytes(self.alloc, io, 16);
+        defer self.alloc.free(secret_raw);
+        const key_secret = try encodeBase64UrlNoPad(self.alloc, secret_raw);
+        errdefer self.alloc.free(key_secret);
+        const salt = try randomBytes(self.alloc, io, 16);
+        const secret_hash = try hashApiKeySecret(self.alloc, salt, secret_raw);
+
+        var api_key = ApiKey{
+            .key_id = try self.alloc.dupe(u8, key_id),
+            .username = try self.alloc.dupe(u8, username),
+            .name = try self.alloc.dupe(u8, name),
+            .permissions = try clonePermissions(self.alloc, permissions),
+            .row_filter = try cloneRowFilters(self.alloc, row_filter),
+            .created_at_ns = nowNs(io),
+            .expires_at_ns = expires_at_ns,
+        };
+        errdefer api_key.deinit(self.alloc);
+
+        var record = ApiKeyRecord{
+            .key = api_key,
+            .secret_hash = secret_hash,
+            .secret_salt = salt,
+        };
+        defer record.deinit(self.alloc);
+
+        try self.store.saveApiKey(self.alloc, &record);
+        try self.reachLifecycle(.{ .phase = .api_key_persisted, .username = username, .key_id = key_id });
+        try self.api_keys.put(self.alloc, try self.alloc.dupe(u8, key_id), try record.clone(self.alloc));
+        try self.reachLifecycle(.{ .phase = .api_key_published, .username = username, .key_id = key_id });
+
+        const encoded = try encodeBasicCredential(self.alloc, key_id, key_secret);
+        return .{
+            .key = try record.publicClone(self.alloc),
+            .key_secret = key_secret,
+            .encoded = encoded,
+        };
+    }
+
+    pub fn validateApiKey(self: *const UserManager, key_id: []const u8, key_secret: []const u8) !ValidatedApiKey {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        const mutable: *UserManager = @constCast(self);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
+        const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+        const secret_size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(key_secret) catch {
+            return error.ApiKeyInvalid;
+        };
+        const secret_raw = try self.alloc.alloc(u8, secret_size);
+        defer self.alloc.free(secret_raw);
+        std.base64.url_safe_no_pad.Decoder.decode(secret_raw, key_secret) catch {
+            return error.ApiKeyInvalid;
+        };
+        const computed_hash = try hashApiKeySecret(self.alloc, record.secret_salt, secret_raw);
+        defer self.alloc.free(computed_hash);
+        if (!std.mem.eql(u8, computed_hash, record.secret_hash)) return error.ApiKeyInvalid;
+        if (record.key.expires_at_ns) |expires_at_ns| {
+            if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
+        }
+        const owner_row_filter = try self.getRowFilters(record.key.username);
+        defer {
+            for (owner_row_filter) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(owner_row_filter);
+        }
+        const effective_permissions = try self.effectiveApiKeyPermissionsUnlocked(key_id);
+        errdefer {
+            for (effective_permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(effective_permissions);
+        }
+
+        return .{
+            .username = try self.alloc.dupe(u8, record.key.username),
+            .permissions = effective_permissions,
+            .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
+            .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
+            .roles = try self.getRolesForUser(record.key.username),
+        };
+    }
+
+    /// Resolve the current authority of an existing API-key identity without
+    /// requiring its bearer secret. Durable background grants use this only
+    /// after admission has authenticated the secret and bound the key id into
+    /// catalog metadata. Deletion, expiry, and owner revocation all fail
+    /// closed on the next worker authorization check.
+    pub fn effectiveApiKeyPermissions(self: *const UserManager, key_id: []const u8) ![]Permission {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        const mutable: *UserManager = @constCast(self);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
+        return try self.effectiveApiKeyPermissionsUnlocked(key_id);
+    }
+
+    /// Recheck the restrictions attached to an already authenticated durable
+    /// credential. No bearer secret is retained by background generation jobs.
+    pub fn durableCredentialRowFilters(self: *const UserManager, principal: []const u8) ![]RowFilterEntry {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        const mutable: *UserManager = @constCast(self);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
+        if (std.mem.startsWith(u8, principal, "basic:")) return self.getRowFilters(principal["basic:".len..]);
+        if (!std.mem.startsWith(u8, principal, "api-key:")) return error.ApiKeyInvalid;
+        const key = principal["api-key:".len..];
+        const permissions = try self.effectiveApiKeyPermissionsUnlocked(key);
+        defer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(permissions);
+        }
+        const record = self.api_keys.get(key) orelse return error.ApiKeyNotFound;
+        const owner = try self.getRowFilters(record.key.username);
+        defer {
+            for (owner) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(owner);
+        }
+        return combineLayeredRowFilters(self.alloc, owner, record.key.row_filter);
+    }
+
+    fn effectiveApiKeyPermissionsUnlocked(self: *const UserManager, key_id: []const u8) ![]Permission {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+        if (record.key.expires_at_ns) |expires_at_ns| {
+            if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
+        }
+        const owner_permissions = try self.getPermissionsForUser(record.key.username);
+        defer {
+            for (owner_permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(owner_permissions);
+        }
+        return if (record.key.permissions.len > 0)
+            try intersectPermissions(self.alloc, record.key.permissions, owner_permissions)
+        else
+            try clonePermissions(self.alloc, owner_permissions);
+    }
+
+    /// Produce a server-only authenticator for durable authorization records.
+    /// The key material is the persisted verifier for the credential, never
+    /// the bearer secret itself. Password rotation, API-key deletion, and key
+    /// rotation therefore invalidate old records without introducing another
+    /// operator-managed cluster secret.
+    pub fn destinationGrantMac(
+        self: *const UserManager,
+        principal: []const u8,
+        payload: []const u8,
+    ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        const mutable: *UserManager = @constCast(self);
+        mutable.mutation_mutex.lockUncancelable(io);
+        defer mutable.mutation_mutex.unlock(io);
+        const key = if (std.mem.startsWith(u8, principal, "basic:")) blk: {
+            const username = principal["basic:".len..];
+            if (username.len == 0) return error.InvalidDestinationGrantPrincipal;
+            break :blk self.users.get(username) orelse return error.UserNotFound;
+        } else if (std.mem.startsWith(u8, principal, "api-key:")) blk: {
+            const key_id = principal["api-key:".len..];
+            if (key_id.len == 0) return error.InvalidDestinationGrantPrincipal;
+            const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+            if (record.key.expires_at_ns) |expires_at_ns| {
+                if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
+            }
+            break :blk record.secret_hash;
+        } else return error.InvalidDestinationGrantPrincipal;
+
+        var mac: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, payload, key);
+        return mac;
+    }
+
+    pub fn listApiKeys(self: *const UserManager, username: []const u8) ![]ApiKey {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        var out = std.ArrayList(ApiKey).empty;
+        errdefer {
+            for (out.items) |*item| item.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var it = self.api_keys.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.value_ptr.key.username, username)) continue;
+            try out.append(self.alloc, try entry.value_ptr.publicClone(self.alloc));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn deleteApiKey(self: *UserManager, username: []const u8, key_id: []const u8) !void {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        const io = receiver.io();
+        self.mutation_mutex.lockUncancelable(io);
+        defer self.mutation_mutex.unlock(io);
+        return try self.deleteApiKeyUnlocked(username, key_id);
+    }
+
+    fn deleteApiKeyUnlocked(self: *UserManager, username: []const u8, key_id: []const u8) !void {
+        const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
+        if (!std.mem.eql(u8, record.key.username, username)) return error.ApiKeyNotFound;
+        const removed = self.api_keys.fetchRemove(key_id) orelse return error.ApiKeyNotFound;
+        defer {
+            self.alloc.free(removed.key);
+            var owned = removed.value;
+            owned.deinit(self.alloc);
+        }
+        _ = try self.store.deleteApiKey(key_id);
+        try self.reachLifecycle(.{ .phase = .api_key_revoked, .username = username, .key_id = key_id });
+    }
+};
+
+/// Bootstrap only from an operator-supplied credential. Existing credentials
+/// are preserved, except the legacy public admin:admin credential is retired.
+pub fn ensureDefaultAdminUser(manager: *UserManager, bootstrap_password: ?[]const u8) !void {
+    var existing = manager.getUser("admin") catch |err| switch (err) {
+        error.UserNotFound => {
+            var admin_permission = [_]Permission{
+                try Permission.initOwned(manager.alloc, .@"*", "*", .admin),
+            };
+            defer admin_permission[0].deinit(manager.alloc);
+            var user = try manager.createUser("admin", try validatedBootstrapPassword(bootstrap_password), &admin_permission);
+            user.deinit(manager.alloc);
+            return;
+        },
+        else => return err,
+    };
+    defer existing.deinit(manager.alloc);
+    verifyPassword(existing.password_hash, "admin") catch return;
+    try manager.updatePassword("admin", try validatedBootstrapPassword(bootstrap_password));
+}
+
+fn validatedBootstrapPassword(password: ?[]const u8) ![]const u8 {
+    const value = password orelse return error.BootstrapAdminPasswordRequired;
+    // bcrypt rejects passwords over 72 bytes; never silently truncate them.
+    if (value.len < 12 or value.len > 72) return error.InvalidBootstrapAdminPassword;
+    return value;
+}
+
+pub fn initDefaultEnforcer(alloc: Allocator, adapter: casbin.Adapter) !casbin.Enforcer {
+    return try casbin.Enforcer.init(alloc, try casbin.Model.fromString(alloc, default_rbac_model_text), adapter);
+}
+
+fn normalizeMetadataJson(alloc: Allocator, metadata_json: []const u8) ![]u8 {
+    const raw = if (metadata_json.len == 0) "{}" else metadata_json;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidMetadata;
+    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
+}
+
+fn hashPassword(alloc: Allocator, io: std.Io, password: []const u8) ![]u8 {
+    var salt: [bcrypt.salt_length]u8 = undefined;
+    try io.randomSecure(&salt);
+    var buf: [256]u8 = undefined;
+    const hashed = try bcrypt.strHashWithSalt(
+        password,
+        .{ .params = bcrypt.Params.owasp, .encoding = .phc },
+        &buf,
+        salt,
+    );
+    return try alloc.dupe(u8, hashed);
+}
+
+/// Verify an owned credential snapshot outside the user-manager mutation lock.
+/// Callers retaining authenticated sessions must revalidate the live verifier
+/// before publishing authority; password verification alone is not a lease.
+pub fn verifyPassword(password_hash: []const u8, password: []const u8) !void {
+    bcrypt.strVerify(password_hash, password, .{ .silently_truncate_password = false }) catch {
+        return error.InvalidPassword;
+    };
+}
+
+fn clonePermissions(alloc: Allocator, permissions: []const Permission) ![]Permission {
+    const out = try alloc.alloc(Permission, permissions.len);
+    errdefer alloc.free(out);
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |*perm| perm.deinit(alloc);
+    for (permissions, 0..) |perm, i| {
+        out[i] = try Permission.initOwned(alloc, perm.resource_type, perm.resource, perm.type);
+        filled += 1;
+    }
+    return out;
+}
+
+fn permissionIntersection(left: Permission, right: Permission) ?struct {
+    resource_type: ResourceType,
+    resource: []const u8,
+    permission_type: PermissionType,
+} {
+    const resource_type: ResourceType = if (left.resource_type == .@"*")
+        right.resource_type
+    else if (right.resource_type == .@"*")
+        left.resource_type
+    else if (left.resource_type == right.resource_type)
+        left.resource_type
+    else
+        return null;
+    const resource = if (std.mem.eql(u8, left.resource, "*"))
+        right.resource
+    else if (std.mem.eql(u8, right.resource, "*"))
+        left.resource
+    else if (std.mem.eql(u8, left.resource, right.resource))
+        left.resource
+    else if (resource_type == .table and catalog_names.tableScopeContains(left.resource, right.resource))
+        right.resource
+    else if (resource_type == .table and catalog_names.tableScopeContains(right.resource, left.resource))
+        left.resource
+    else
+        return null;
+    const permission_type: PermissionType = if (left.type == .admin)
+        right.type
+    else if (right.type == .admin)
+        left.type
+    else if (left.type == right.type)
+        left.type
+    else
+        return null;
+    return .{
+        .resource_type = resource_type,
+        .resource = resource,
+        .permission_type = permission_type,
+    };
+}
+
+/// API-key grants are an immutable upper bound, while the owner's effective
+/// grants are the live upper bound. Materialize their intersection at every
+/// authentication so role and direct-policy revocation take effect without
+/// rotating the key. Pairwise intersection also correctly narrows wildcard
+/// grants rather than treating them as all-or-nothing records.
+fn intersectPermissions(
+    alloc: Allocator,
+    key_permissions: []const Permission,
+    owner_permissions: []const Permission,
+) ![]Permission {
+    var out = std.ArrayList(Permission).empty;
+    errdefer {
+        for (out.items) |*permission| permission.deinit(alloc);
+        out.deinit(alloc);
+    }
+    for (key_permissions) |key_permission| {
+        for (owner_permissions) |owner_permission| {
+            const intersection = permissionIntersection(key_permission, owner_permission) orelse continue;
+            var duplicate = false;
+            for (out.items) |existing| {
+                if (existing.resource_type == intersection.resource_type and
+                    existing.type == intersection.permission_type and
+                    std.mem.eql(u8, existing.resource, intersection.resource))
+                {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try out.append(alloc, try Permission.initOwned(
+                alloc,
+                intersection.resource_type,
+                intersection.resource,
+                intersection.permission_type,
+            ));
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn cloneRowFilters(alloc: Allocator, row_filter: []const RowFilterEntry) ![]RowFilterEntry {
+    const out = try alloc.alloc(RowFilterEntry, row_filter.len);
+    errdefer alloc.free(out);
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |*entry| entry.deinit(alloc);
+    for (row_filter, 0..) |entry, i| {
+        out[i] = try RowFilterEntry.initOwned(alloc, entry.table, entry.filter);
+        filled += 1;
+    }
+    return out;
+}
+
+fn freeOwnedStrings(alloc: Allocator, values: []const []u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(@constCast(values));
+}
+
+fn mergeRowFilterEntry(
+    alloc: Allocator,
+    merged: *std.StringArrayHashMapUnmanaged([]u8),
+    entry: RowFilterEntry,
+) !void {
+    const gop = try merged.getOrPut(alloc, entry.table);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try alloc.dupe(u8, entry.table);
+        gop.value_ptr.* = try alloc.dupe(u8, entry.filter);
+        return;
+    }
+
+    const combined = try std.fmt.allocPrint(
+        alloc,
+        "{{\"conjuncts\":[{s},{s}]}}",
+        .{ gop.value_ptr.*, entry.filter },
+    );
+    alloc.free(gop.value_ptr.*);
+    gop.value_ptr.* = combined;
+}
+
+fn inferAuthSubjectKind(subject: []const u8) AuthSubjectKind {
+    if (std.mem.startsWith(u8, subject, "role:")) return .role;
+    if (std.mem.startsWith(u8, subject, "group:")) return .group;
+    return .subject;
+}
+
+fn authSubjectKindRank(kind: AuthSubjectKind) u8 {
+    return switch (kind) {
+        .subject => 0,
+        .role, .group => 1,
+        .user => 2,
+    };
+}
+
+fn putAuthSubject(
+    alloc: Allocator,
+    subjects: *std.StringArrayHashMapUnmanaged(AuthSubjectKind),
+    subject: []const u8,
+    kind: AuthSubjectKind,
+) !void {
+    if (subject.len == 0) return;
+    const owned_subject = try alloc.dupe(u8, subject);
+    errdefer alloc.free(owned_subject);
+    const gop = try subjects.getOrPut(alloc, owned_subject);
+    if (gop.found_existing) {
+        alloc.free(owned_subject);
+        if (authSubjectKindRank(kind) > authSubjectKindRank(gop.value_ptr.*)) {
+            gop.value_ptr.* = kind;
+        }
+        return;
+    }
+    gop.key_ptr.* = owned_subject;
+    gop.value_ptr.* = kind;
+}
+
+fn combineLayeredRowFilters(
+    alloc: Allocator,
+    base: []const RowFilterEntry,
+    overlay: []const RowFilterEntry,
+) ![]RowFilterEntry {
+    var tables = std.StringArrayHashMapUnmanaged(void){};
+    defer {
+        var it = tables.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        tables.deinit(alloc);
+    }
+
+    try collectExplicitRowFilterTables(alloc, &tables, base);
+    try collectExplicitRowFilterTables(alloc, &tables, overlay);
+
+    var out = std.ArrayList(RowFilterEntry).empty;
+    errdefer {
+        for (out.items) |*entry| entry.deinit(alloc);
+        out.deinit(alloc);
+    }
+
+    var table_it = tables.iterator();
+    while (table_it.next()) |entry| {
+        if (try combineSelectedRowFilterForTable(alloc, base, overlay, entry.key_ptr.*)) |filter| {
+            const table = alloc.dupe(u8, entry.key_ptr.*) catch |err| {
+                alloc.free(filter);
+                return err;
+            };
+            var out_entry = RowFilterEntry{
+                .table = table,
+                .filter = filter,
+            };
+            out.append(alloc, out_entry) catch |err| {
+                out_entry.deinit(alloc);
+                return err;
+            };
+        }
+    }
+
+    if (try combineExactRowFilterForTable(alloc, base, overlay, "*")) |filter| {
+        const table = alloc.dupe(u8, "*") catch |err| {
+            alloc.free(filter);
+            return err;
+        };
+        var out_entry = RowFilterEntry{
+            .table = table,
+            .filter = filter,
+        };
+        out.append(alloc, out_entry) catch |err| {
+            out_entry.deinit(alloc);
+            return err;
+        };
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectExplicitRowFilterTables(
+    alloc: Allocator,
+    tables: *std.StringArrayHashMapUnmanaged(void),
+    row_filters: []const RowFilterEntry,
+) !void {
+    for (row_filters) |entry| {
+        if (std.mem.eql(u8, entry.table, "*")) continue;
+        const gop = try tables.getOrPut(alloc, entry.table);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try alloc.dupe(u8, entry.table);
+            gop.value_ptr.* = {};
+        }
+    }
+}
+
+fn combineSelectedRowFilterForTable(
+    alloc: Allocator,
+    base: []const RowFilterEntry,
+    overlay: []const RowFilterEntry,
+    table: []const u8,
+) !?[]u8 {
+    return try combineOptionalRowFilterJson(
+        alloc,
+        selectedRowFilterForTable(base, table),
+        selectedRowFilterForTable(overlay, table),
+    );
+}
+
+fn combineExactRowFilterForTable(
+    alloc: Allocator,
+    base: []const RowFilterEntry,
+    overlay: []const RowFilterEntry,
+    table: []const u8,
+) !?[]u8 {
+    return try combineOptionalRowFilterJson(
+        alloc,
+        exactRowFilterForTable(base, table),
+        exactRowFilterForTable(overlay, table),
+    );
+}
+
+fn selectedRowFilterForTable(row_filters: []const RowFilterEntry, table: []const u8) ?[]const u8 {
+    if (exactRowFilterForTable(row_filters, table)) |filter| return filter;
+    return exactRowFilterForTable(row_filters, "*");
+}
+
+fn exactRowFilterForTable(row_filters: []const RowFilterEntry, table: []const u8) ?[]const u8 {
+    for (row_filters) |entry| {
+        if (!std.mem.eql(u8, entry.table, table)) continue;
+        if (std.mem.eql(u8, entry.filter, "null")) return null;
+        return entry.filter;
+    }
+    return null;
+}
+
+fn combineOptionalRowFilterJson(
+    alloc: Allocator,
+    base: ?[]const u8,
+    overlay: ?[]const u8,
+) !?[]u8 {
+    if (base) |base_filter| {
+        if (overlay) |overlay_filter| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "{{\"conjuncts\":[{s},{s}]}}",
+                .{ base_filter, overlay_filter },
+            );
+        }
+        return try alloc.dupe(u8, base_filter);
+    }
+    if (overlay) |overlay_filter| return try alloc.dupe(u8, overlay_filter);
+    return null;
+}
+
+fn randomBytes(alloc: Allocator, io: std.Io, len: usize) ![]u8 {
+    const out = try alloc.alloc(u8, len);
+    errdefer alloc.free(out);
+    try io.randomSecure(out);
+    return out;
+}
+
+fn generateRandomAlphanumeric(alloc: Allocator, io: std.Io, len: usize) ![]u8 {
+    const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const random = try randomBytes(alloc, io, len);
+    defer alloc.free(random);
+    const out = try alloc.alloc(u8, len);
+    for (random, 0..) |byte, i| {
+        out[i] = alphabet[byte % alphabet.len];
+    }
+    return out;
+}
+
+fn hashApiKeySecret(alloc: Allocator, salt: []const u8, secret_raw: []const u8) ![]u8 {
+    var hasher = Sha256.init(.{});
+    hasher.update(salt);
+    hasher.update(secret_raw);
+    var out: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&out);
+    return try alloc.dupe(u8, &out);
+}
+
+fn encodeBase64UrlNoPad(alloc: Allocator, raw: []const u8) ![]u8 {
+    const size = std.base64.url_safe_no_pad.Encoder.calcSize(raw.len);
+    const out = try alloc.alloc(u8, size);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out, raw);
+    return out;
+}
+
+fn encodeBasicCredential(alloc: Allocator, key_id: []const u8, key_secret: []const u8) ![]u8 {
+    const joined = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ key_id, key_secret });
+    defer alloc.free(joined);
+    const size = std.base64.standard.Encoder.calcSize(joined.len);
+    const out = try alloc.alloc(u8, size);
+    _ = std.base64.standard.Encoder.encode(out, joined);
+    return out;
+}
+
+fn nowNs(io: std.Io) u64 {
+    return @intCast(@max(std.Io.Timestamp.now(io, .real).toNanoseconds(), 0));
+}
+
+test "usermgr create authenticate and persist users through store" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var created = try manager.createUserWithMetadata("alice", "secret", &.{}, "{\"tenant_id\":\"acme\"}");
+    defer created.deinit(alloc);
+    try std.testing.expectEqualStrings("alice", created.username);
+    try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", created.metadata_json);
+    try std.testing.expect(!std.mem.eql(u8, created.password_hash, "secret"));
+
+    var authed = try manager.authenticateUser("alice", "secret");
+    defer authed.deinit(alloc);
+    try std.testing.expectEqualStrings("alice", authed.username);
+    try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", authed.metadata_json);
+    try std.testing.expectError(error.InvalidPassword, manager.authenticateUser("alice", "wrong"));
+
+    var reloaded = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer reloaded.deinit();
+    var loaded = try reloaded.getUser("alice");
+    defer loaded.deinit(alloc);
+    try std.testing.expectEqualStrings("alice", loaded.username);
+    try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", loaded.metadata_json);
+}
+
+test "usermgr current permission check observes revocation" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var table_read = try Permission.initOwned(alloc, .table, "tenant_docs", .read);
+    defer table_read.deinit(alloc);
+    var created = try manager.createUser("alice", "secret", &.{table_read});
+    defer created.deinit(alloc);
+
+    try std.testing.expect(try manager.permissionCurrentlyAllowed("alice", .table, "tenant_docs", .read));
+    try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "other_docs", .read));
+    try manager.removePermissionFromUser("alice", "tenant_docs", .table);
+    try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "tenant_docs", .read));
+}
+
+test "usermgr HA seed lease excludes auth mutations until capture completes" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(alloc, store.iface(), try initDefaultEnforcer(alloc, policy_store.iface()));
+    defer manager.deinit();
+    var alice = try manager.createUser("alice", "before", &.{});
+    defer alice.deinit(alloc);
+
+    var started = std.atomic.Value(bool).init(false);
+    var finished = std.atomic.Value(bool).init(false);
+    const Context = struct {
+        manager: *UserManager,
+        started: *std.atomic.Value(bool),
+        finished: *std.atomic.Value(bool),
+
+        fn run(ctx: *@This()) void {
+            ctx.started.store(true, .release);
+            ctx.manager.updatePassword("alice", "after") catch @panic("auth mutation failed");
+            ctx.finished.store(true, .release);
+        }
+    };
+    var ctx = Context{ .manager = &manager, .started = &started, .finished = &finished };
+    var lease = manager.acquireSeedCaptureLease();
+    var lease_active = true;
+    defer if (lease_active) lease.release();
+    var thread = try std.testing.io.concurrent(Context.run, .{&ctx});
+    defer {
+        if (lease_active) {
+            lease.release();
+            lease_active = false;
+        }
+        thread.await(std.testing.io);
+    }
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    var attempts: usize = 0;
+    while (attempts < 1024) : (attempts += 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    try std.testing.expect(!finished.load(.acquire));
+    lease.release();
+    lease_active = false;
+    thread.await(std.testing.io);
+    try std.testing.expect(finished.load(.acquire));
+    var authenticated = try manager.authenticateUser("alice", "after");
+    defer authenticated.deinit(alloc);
+}
+
+test "usermgr default admin seed is idempotent and grants admin" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    try std.testing.expectError(error.BootstrapAdminPasswordRequired, ensureDefaultAdminUser(&manager, null));
+    try std.testing.expectError(error.InvalidBootstrapAdminPassword, ensureDefaultAdminUser(&manager, "admin"));
+    try ensureDefaultAdminUser(&manager, "test-bootstrap-password");
+    try ensureDefaultAdminUser(&manager, null);
+    try ensureDefaultAdminUser(&manager, "different-bootstrap-password");
+
+    try std.testing.expectError(error.InvalidPassword, manager.authenticateUser("admin", "admin"));
+    var authed = try manager.authenticateUser("admin", "test-bootstrap-password");
+    defer authed.deinit(alloc);
+    try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
+}
+
+test "usermgr bootstrap retires legacy default credentials without silently reopening access" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(alloc, store.iface(), try initDefaultEnforcer(alloc, policy_store.iface()));
+    defer manager.deinit();
+    const permissions = [_]Permission{.{ .resource_type = .@"*", .resource = @constCast("*"), .type = .admin }};
+    var legacy = try manager.createUser("admin", "admin", &permissions);
+    legacy.deinit(alloc);
+    try std.testing.expectError(error.BootstrapAdminPasswordRequired, ensureDefaultAdminUser(&manager, null));
+    try std.testing.expectError(error.InvalidBootstrapAdminPassword, ensureDefaultAdminUser(&manager, "admin"));
+    try ensureDefaultAdminUser(&manager, "replacement-admin-password");
+    try std.testing.expectError(error.InvalidPassword, manager.authenticateUser("admin", "admin"));
+    var authed = try manager.authenticateUser("admin", "replacement-admin-password");
+    defer authed.deinit(alloc);
+    try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
+}
+
+test "usermgr permissions and row filters mirror go semantics" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var initial = [_]Permission{
+        try Permission.initOwned(alloc, .table, "docs", .read),
+    };
+    defer initial[0].deinit(alloc);
+
+    var user = try manager.createUser("bob", "secret", &initial);
+    defer user.deinit(alloc);
+
+    try std.testing.expect(try manager.enforce("bob", .table, "docs", .read));
+    try std.testing.expect(!(try manager.enforce("bob", .table, "docs", .write)));
+
+    var extra = try Permission.initOwned(alloc, .table, "docs", .write);
+    defer extra.deinit(alloc);
+    try manager.addPermissionToUser("bob", extra);
+    try std.testing.expect(try manager.enforce("bob", .table, "docs", .write));
+
+    const perms = try manager.getPermissionsForUser("bob");
+    defer {
+        for (perms) |*perm| perm.deinit(alloc);
+        alloc.free(perms);
+    }
+    try std.testing.expectEqual(@as(usize, 2), perms.len);
+
+    try manager.setRowFilter("bob", "docs", "{\"term\":{\"department\":\"eng\"}}");
+    try manager.setRowFilter("bob", "docs", "{\"term\":{\"region\":\"us\"}}");
+    const filters = try manager.getRowFilters("bob");
+    defer {
+        for (filters) |*entry| entry.deinit(alloc);
+        alloc.free(filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"region\":\"us\"") != null);
+
+    try manager.removePermissionFromUser("bob", "docs", .table);
+    try std.testing.expect(!(try manager.enforce("bob", .table, "docs", .read)));
+}
+
+test "usermgr roles inherit permissions and row filters" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUserWithMetadata("alice", "secret", &.{}, "{\"tenant_id\":\"acme\"}");
+    defer user.deinit(alloc);
+
+    var read_docs = try Permission.initOwned(alloc, .table, "docs", .read);
+    defer read_docs.deinit(alloc);
+    try manager.addPermissionToSubject("role:tenant_reader", read_docs);
+    try manager.addRoleToUser("alice", "role:tenant_reader");
+    try manager.addRoleToSubject("role:tenant_reader", "group:eng");
+
+    try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
+
+    const roles = try manager.getRolesForUser("alice");
+    defer freeOwnedStrings(alloc, roles);
+    try std.testing.expectEqual(@as(usize, 2), roles.len);
+    try std.testing.expect(std.mem.indexOf(u8, roles[0], "role:tenant_reader") != null or std.mem.indexOf(u8, roles[1], "role:tenant_reader") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roles[0], "group:eng") != null or std.mem.indexOf(u8, roles[1], "group:eng") != null);
+
+    const row_authority = @import("row_policy_authority.zig");
+    const role_key = "1234567890abcdef1234567890abcdef";
+    const scope: row_authority.Scope = .{ .table_id = 7, .table = "docs", .database = "main", .policy_generation = 2, .catalog_epoch = 9 };
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyRolesAuthorized(alloc, "alice", "basic:bob", "docs", .read, role_key, "cluster-a", scope, 100));
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyRolesAuthorized(alloc, "alice", "basic:alice", "other", .read, role_key, "cluster-a", scope, 100));
+    const before_revocation = try manager.signRowPolicyRolesAuthorized(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 100);
+    defer alloc.free(before_revocation);
+    var pinned = try row_authority.verify(alloc, role_key, "cluster-a", scope, 100, before_revocation);
+    const first_revision = pinned.value.auth_revision;
+    try std.testing.expectEqual(@as(usize, 2), pinned.value.roles.len);
+    pinned.deinit();
+    try manager.removeRoleFromSubject("role:tenant_reader", "group:eng");
+    const after_revocation = try manager.signRowPolicyRolesAuthorized(alloc, "alice", "basic:alice", "docs", .read, role_key, "cluster-a", scope, 101);
+    defer alloc.free(after_revocation);
+    var updated = try row_authority.verify(alloc, role_key, "cluster-a", scope, 101, after_revocation);
+    defer updated.deinit();
+    try std.testing.expect(updated.value.auth_revision > first_revision);
+    try std.testing.expectEqual(@as(usize, 1), updated.value.roles.len);
+    try std.testing.expectEqualStrings("role:tenant_reader", updated.value.roles[0]);
+    // An admitted statement may complete under its bounded old lease. A
+    // newly admitted statement always gets the post-revocation role graph.
+    try manager.addRoleToSubject("role:tenant_reader", "group:eng");
+
+    const subjects = try manager.listAuthSubjects();
+    defer {
+        for (subjects) |*entry| entry.deinit(alloc);
+        alloc.free(subjects);
+    }
+    var found_alice = false;
+    var found_role = false;
+    var found_group = false;
+    for (subjects) |entry| {
+        if (std.mem.eql(u8, entry.subject, "alice") and entry.kind == .user) found_alice = true;
+        if (std.mem.eql(u8, entry.subject, "role:tenant_reader") and entry.kind == .role) found_role = true;
+        if (std.mem.eql(u8, entry.subject, "group:eng") and entry.kind == .group) found_group = true;
+    }
+    try std.testing.expect(found_alice);
+    try std.testing.expect(found_role);
+    try std.testing.expect(found_group);
+
+    try manager.setSubjectRowFilter("role:tenant_reader", "docs", "{\"term\":{\"tenant_id\":{\"$auth\":\"metadata.tenant_id\"}}}");
+    try manager.setSubjectRowFilter("group:eng", "docs", "{\"term\":{\"acl.groups\":\"eng\"}}");
+    try manager.setRowFilter("alice", "docs", "{\"term\":{\"owner\":{\"$auth\":\"username\"}}}");
+
+    const filters = try manager.getRowFilters("alice");
+    defer {
+        for (filters) |*entry| entry.deinit(alloc);
+        alloc.free(filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"owner\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"tenant_id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filters[0].filter, "\"acl.groups\"") != null);
+
+    const direct = try manager.listRowFilters("alice");
+    defer {
+        for (direct) |*entry| entry.deinit(alloc);
+        alloc.free(direct);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct.len);
+    try std.testing.expect(std.mem.indexOf(u8, direct[0].filter, "\"owner\"") != null);
+}
+
+test "usermgr api keys validate and persist creator-scoped permissions" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var initial = [_]Permission{
+        try Permission.initOwned(alloc, .table, "docs", .read),
+    };
+    defer initial[0].deinit(alloc);
+    var user = try manager.createUser("alice", "secret", &initial);
+    defer user.deinit(alloc);
+    try manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant_id\":\"acme\"}}");
+
+    var row_filter = [_]RowFilterEntry{
+        try RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"team\":\"eng\"}}"),
+    };
+    defer row_filter[0].deinit(alloc);
+    var created = try manager.createApiKey("alice", "ci", &initial, &row_filter, null);
+    defer created.deinit(alloc);
+
+    const listed = try manager.listApiKeys("alice");
+    defer {
+        for (listed) |*entry| entry.deinit(alloc);
+        alloc.free(listed);
+    }
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("ci", listed[0].name);
+
+    var validated = try manager.validateApiKey(created.key.key_id, created.key_secret);
+    defer validated.deinit(alloc);
+    try std.testing.expectEqualStrings("alice", validated.username);
+    try std.testing.expectEqualStrings("{}", validated.metadata_json);
+    try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
+    try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+    try std.testing.expect(std.mem.indexOf(u8, validated.row_filter[0].filter, "\"tenant_id\":\"acme\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, validated.row_filter[0].filter, "\"team\":\"eng\"") != null);
+    try std.testing.expectError(error.ApiKeyInvalid, manager.validateApiKey(created.key.key_id, "bad"));
+
+    const credential = try std.fmt.allocPrint(alloc, "api-key:{s}", .{created.key.key_id});
+    defer alloc.free(credential);
+    const scope: @import("row_policy_authority.zig").Scope = .{ .table_id = 7, .table = "docs", .database = "main", .policy_generation = 2, .catalog_epoch = 9 };
+    const proof = try manager.signRowPolicyRolesAuthorized(alloc, "alice", credential, "docs", .read, "1234567890abcdef1234567890abcdef", "cluster-a", scope, 100);
+    defer alloc.free(proof);
+
+    try manager.removePermissionFromUser("alice", "docs", .table);
+    try std.testing.expectError(error.Forbidden, manager.signRowPolicyRolesAuthorized(alloc, "alice", credential, "docs", .read, "1234567890abcdef1234567890abcdef", "cluster-a", scope, 101));
+    var revoked = try manager.validateApiKey(created.key.key_id, created.key_secret);
+    defer revoked.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), revoked.permissions.len);
+
+    var escalated = [_]Permission{
+        try Permission.initOwned(alloc, .table, "docs", .admin),
+    };
+    defer escalated[0].deinit(alloc);
+    try std.testing.expectError(error.PrivilegeEscalation, manager.createApiKey("alice", "admin", &escalated, &.{}, null));
+}
+
+test "usermgr api key permission intersection narrows owner and key wildcards" {
+    const alloc = std.testing.allocator;
+    var key_permissions = [_]Permission{
+        try Permission.initOwned(alloc, .table, "*", .admin),
+    };
+    defer key_permissions[0].deinit(alloc);
+    var owner_permissions = [_]Permission{
+        try Permission.initOwned(alloc, .table, "docs", .read),
+        try Permission.initOwned(alloc, .table, "private", .write),
+    };
+    defer for (&owner_permissions) |*permission| permission.deinit(alloc);
+
+    const effective = try intersectPermissions(alloc, &key_permissions, &owner_permissions);
+    defer {
+        for (effective) |*permission| permission.deinit(alloc);
+        alloc.free(effective);
+    }
+    try std.testing.expectEqual(@as(usize, 2), effective.len);
+    try std.testing.expectEqualStrings("docs", effective[0].resource);
+    try std.testing.expectEqual(PermissionType.read, effective[0].type);
+    try std.testing.expectEqualStrings("private", effective[1].resource);
+    try std.testing.expectEqual(PermissionType.write, effective[1].type);
+}
+
+test "system catalog key intersection narrows namespace grants and rejects dotted lookalikes" {
+    const alloc = std.testing.allocator;
+    const scope = try (catalog_names.TableScope{ .database = "tenant" }).keyAlloc(alloc);
+    defer alloc.free(scope);
+    const exact = try (catalog_names.Target{ .database = "tenant", .table = "events" }).resourceNameAlloc(alloc);
+    defer alloc.free(exact);
+    const left = Permission{ .resource_type = .table, .resource = @constCast(scope), .type = .admin };
+    const right = Permission{ .resource_type = .table, .resource = @constCast(exact), .type = .read };
+    try std.testing.expectEqualStrings(exact, permissionIntersection(left, right).?.resource);
+    try std.testing.expectEqual(PermissionType.read, permissionIntersection(right, left).?.permission_type);
+    try std.testing.expect(permissionIntersection(left, .{ .resource_type = .table, .resource = @constCast("tenant.public.events"), .type = .read }) == null);
+}

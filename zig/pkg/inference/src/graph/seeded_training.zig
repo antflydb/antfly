@@ -106,16 +106,16 @@ pub fn cutProgram(a: Allocator, graph: *const ml.Graph, cuts: []const Id, output
         const offset = std.math.cast(u32, strings.items.len) orelse return error.TrainingTapeLimitExceeded;
         try strings.appendSlice(a, name);
         nodes[id].op = .{ .parameter = .{ .name_offset = offset, .name_len = @intCast(name.len) } };
-        nodes[id].inputs = .{ml.null_node} ** 4;
+        nodes[id].inputs = @splat(ml.null_node);
         nodes[id].num_inputs = 0;
         nodes[id].vjp_alternate = ml.null_node;
         try parameters.append(a, id);
     }
     var view = graph.*;
-    view.nodes = .{ .items = nodes, .capacity = nodes.len };
+    view.nodes = .{ .items = nodes, .capacity = nodes.len, .pointer_stability = .{} };
     view.string_table = strings;
     view.parameters = parameters;
-    view.outputs = .{ .items = @constCast(outputs), .capacity = outputs.len };
+    view.outputs = .{ .items = @constCast(outputs), .capacity = outputs.len, .pointer_stability = .{} };
     return ml.lower.lower(a, &view);
 }
 

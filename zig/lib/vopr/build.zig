@@ -32,12 +32,12 @@ pub fn build(b: *std.Build) void {
     const benchmark_module = b.createModule(.{
         .root_source_file = b.path("src/benchmark_main.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
-    benchmark_module.addImport("vopr", if (optimize == .ReleaseSafe) module else b.createModule(.{
+    benchmark_module.addImport("vopr", if (optimize == .safe) module else b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     }));
     const benchmark_exe = b.addExecutable(.{ .name = "vopr-benchmark", .root_module = benchmark_module });
     const benchmark_step = b.step("benchmark", "Run deterministic VOPR search-efficiency benchmarks");

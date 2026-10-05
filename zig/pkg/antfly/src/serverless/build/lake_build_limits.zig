@@ -16,7 +16,7 @@
 //! Total-work admission for lake sidecar builds and their replay buffers.
 
 const std = @import("std");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const Limits = struct {
     max_batches: usize = 100_000,
@@ -152,6 +152,12 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
     for (batch.columns) |column| {
         total = addOrMax(total, addOrMax(column.name.len, column.nulls.bytes.len));
         const value_bytes = switch (column.values) {
+            .dictionary_bytes => |values| blk: {
+                var bytes = std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch break :blk std.math.maxInt(usize);
+                bytes = addOrMax(bytes, std.math.mul(usize, values.values.len, @sizeOf([]const u8)) catch break :blk std.math.maxInt(usize));
+                for (values.values) |value| bytes = addOrMax(bytes, value.len);
+                break :blk bytes;
+            },
             .bytes, .json => |values| blk: {
                 var bytes = std.math.mul(usize, values.len, @sizeOf([]const u8)) catch break :blk std.math.maxInt(usize);
                 for (values) |value| bytes = std.math.add(usize, bytes, value.len) catch break :blk std.math.maxInt(usize);

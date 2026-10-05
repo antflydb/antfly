@@ -154,7 +154,7 @@ def strict_provenance_fixture() -> dict:
             "returncode": 0,
             "path": "/tools/zig",
             "sha256": digest,
-            "version": "0.16.0",
+            "version": "0.17.0",
         },
         "nvcc": {
             "returncode": 0,
@@ -755,7 +755,7 @@ class CandidateParityTest(unittest.TestCase):
             {name: wrong_toolchain["toolchains"][name] for name in ("zig", "nvcc")}
         )
         errors = strict_qualification_provenance_errors(wrong_toolchain)
-        self.assertTrue(any("Zig 0.16.0" in error for error in errors))
+        self.assertTrue(any("Zig 0.17.0" in error for error in errors))
 
         wrong_gpu = json.loads(json.dumps(provenance))
         wrong_gpu["gpu"]["execution_state"]["selected_gpus"][0]["name"] = (
@@ -1082,7 +1082,7 @@ class CandidateParityTest(unittest.TestCase):
             self.assertIn("-Dcuda=true", command)
             self.assertIn("-Dmetal=false", command)
             self.assertIn("-Dcuda-artifacts=sm89", command)
-            self.assertIn("-Doptimize=ReleaseFast", command)
+            self.assertIn("-Doptimize=fast", command)
 
             args.binary = pathlib.Path(temporary) / "unbound-binary"
             result = run_controlled_release_build(args)

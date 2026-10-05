@@ -80,7 +80,7 @@ pub const Classifier = struct {
     /// zero-padded for Silero.
     pub fn isSpeech(self: *Classifier, samples: []const f32) bool {
         if (!self.neural) return frameIsSpeech(samples, self.config);
-        var chunk: [silero_vad.chunk_samples]f32 = [_]f32{0} ** silero_vad.chunk_samples;
+        var chunk: [silero_vad.chunk_samples]f32 = @as([silero_vad.chunk_samples]f32, @splat(0));
         const n = @min(samples.len, chunk.len);
         @memcpy(chunk[0..n], samples[0..n]);
         return silero_vad.probability(self.config.silero.?, &self.state, &chunk) >= self.config.silero_threshold;

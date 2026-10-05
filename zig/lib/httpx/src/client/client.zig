@@ -165,6 +165,7 @@ pub const RequestOptions = struct {
     /// one body representation may be set.
     borrowed_body_segments: ?[]const []const u8 = null,
     json: ?[]const u8 = null,
+    /// Total request budget, including retries and redirects. Zero disables it.
     timeout_ms: ?u64 = null,
     follow_redirects: ?bool = null,
     /// Per-request response ceiling, unless max_error_response_size applies.
@@ -581,13 +582,21 @@ fn isSafeUnsentRetryError(err: anyerror) bool {
     };
 }
 
-fn isRetryableTransportError(err: anyerror) bool {
+/// Classifies transient transport failures, independently of replay safety.
+/// Callers must still gate retries by operation semantics and a total deadline.
+pub fn isRetryableTransportError(err: anyerror) bool {
     return switch (err) {
         // std.Io reports SERVFAIL / EAI_AGAIN with this name, not the
         // application-level DnsResolutionFailed alias. NXDOMAIN and malformed
         // resolver configuration remain terminal. The method/retry-policy and
         // whole-request deadline gates still apply before replaying anything.
         error.NameServerFailure,
+        error.ConnectionReset,
+        error.ConnectionResetByPeer,
+        error.ConnectionAborted,
+        error.ConnectionTimedOut,
+        error.ConnectionTimeout,
+        error.BrokenPipe,
         error.ConnectionClosed,
         error.ConnectionRefused,
         error.Closed,
@@ -822,7 +831,7 @@ const RequestLease = struct {
     gate: *RequestGate,
     io: Io,
 
-    fn deinit(self: *RequestLease) void {
+    pub fn deinit(self: *RequestLease) void {
         self.gate.release(self.io);
         self.* = undefined;
     }
@@ -980,14 +989,15 @@ pub const Client = struct {
 
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
+        const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
-        if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0);
+        if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0, deadline_ms);
 
         var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
         var coordinated = reqOpts;
         coordinated.cancellation = cancellation.token();
-        return self.requestInternal(method, url, coordinated, 0);
+        return self.requestInternal(method, url, coordinated, 0, deadline_ms);
     }
 
     /// Makes an HTTP request and streams the response body to `writer`.
@@ -1001,14 +1011,15 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
+        const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
-        if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0);
+        if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0, deadline_ms);
 
         var cancellation = CombinedCancellation{ .gate = &self.request_gate, .external = reqOpts.cancellation };
         var coordinated = reqOpts;
         coordinated.cancellation = cancellation.token();
-        return self.requestToWriterInternal(method, url, coordinated, writer, progress_cb, progress_ctx, 0);
+        return self.requestToWriterInternal(method, url, coordinated, writer, progress_cb, progress_ctx, 0, deadline_ms);
     }
 
     pub fn getToWriter(
@@ -1022,7 +1033,8 @@ pub const Client = struct {
         return self.requestToWriter(.GET, url, reqOpts, writer, progress_cb, progress_ctx);
     }
 
-    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32) !Response {
+    fn requestInternal(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions, depth: u32, deadline_ms: ?i64) !Response {
+        try ensureRequestDeadline(self.io, deadline_ms);
         const owned_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
@@ -1093,9 +1105,11 @@ pub const Client = struct {
         var response = try self.executeRequest(
             &req,
             reqOpts.timeout_ms,
+            deadline_ms,
             reqOpts.cancellation orelse self.config.request_cancellation,
         );
-        errdefer response.deinit();
+        var response_owned = true;
+        errdefer if (response_owned) response.deinit();
 
         if (cookies_enabled) try self.storeCookies(&response);
 
@@ -1109,12 +1123,10 @@ pub const Client = struct {
             self.config.redirect_policy.follow_redirects;
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
-                response.deinit();
                 return error.TooManyRedirects;
             }
 
             const location = response.headers.get(HeaderName.LOCATION) orelse {
-                response.deinit();
                 return error.InvalidResponse;
             };
 
@@ -1122,8 +1134,11 @@ pub const Client = struct {
             defer self.allocator.free(next_url);
 
             const next_method = self.config.redirect_policy.getRedirectMethod(response.status.code, req.method);
+            // Release this hop before following; a continuation error must
+            // not run cleanup again on the already released response.
             response.deinit();
-            return self.requestInternal(next_method, next_url, reqOpts, depth + 1);
+            response_owned = false;
+            return self.requestInternal(next_method, next_url, reqOpts, depth + 1, deadline_ms);
         }
 
         return response;
@@ -1138,7 +1153,9 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
         depth: u32,
+        deadline_ms: ?i64,
     ) !Response {
+        try ensureRequestDeadline(self.io, deadline_ms);
         const owned_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
@@ -1208,12 +1225,14 @@ pub const Client = struct {
         var response = try self.executeRequestToWriter(
             &req,
             reqOpts.timeout_ms,
+            deadline_ms,
             writer,
             progress_cb,
             progress_ctx,
             reqOpts.cancellation orelse self.config.request_cancellation,
         );
-        errdefer response.deinit();
+        var response_owned = true;
+        errdefer if (response_owned) response.deinit();
 
         if (cookies_enabled) try self.storeCookies(&response);
 
@@ -1227,12 +1246,10 @@ pub const Client = struct {
             self.config.redirect_policy.follow_redirects;
         if (should_follow and response.isRedirect()) {
             if (depth >= self.config.redirect_policy.max_redirects) {
-                response.deinit();
                 return error.TooManyRedirects;
             }
 
             const location = response.headers.get(HeaderName.LOCATION) orelse {
-                response.deinit();
                 return error.InvalidResponse;
             };
 
@@ -1240,20 +1257,22 @@ pub const Client = struct {
             defer self.allocator.free(next_url);
 
             const next_method = self.config.redirect_policy.getRedirectMethod(response.status.code, req.method);
+            // Release this hop before following; a continuation error must
+            // not run cleanup again on the already released response.
             response.deinit();
-            return self.requestToWriterInternal(next_method, next_url, reqOpts, writer, progress_cb, progress_ctx, depth + 1);
+            response_owned = false;
+            return self.requestToWriterInternal(next_method, next_url, reqOpts, writer, progress_cb, progress_ctx, depth + 1, deadline_ms);
         }
 
         return response;
     }
 
     /// Executes the actual HTTP request.
-    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, cancellation: ?CancellationToken) !Response {
-        if (cancellation) |signal| return self.executeRequestCancellable(req, timeout_override_ms, signal);
-        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
-        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+    fn executeRequest(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, cancellation: ?CancellationToken) !Response {
+        if (cancellation) |signal| return self.executeRequestCancellable(req, timeout_override_ms, deadline_ms, signal);
+        try ensureRequestDeadline(self.io, deadline_ms);
         var interrupt: RequestInterrupt = .{};
-        if (timeout_ms == 0) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms, &interrupt);
+        if (deadline_ms == null) return self.executeRequestWithRetries(req, timeout_override_ms, deadline_ms, &interrupt);
 
         const RequestResult = anyerror!Response;
         const SelectResult = union(enum) {
@@ -1326,11 +1345,11 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
         cancellation: CancellationToken,
     ) !Response {
         if (cancellation.isCancelled()) return error.Cancelled;
-        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
-        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        try ensureRequestDeadline(self.io, deadline_ms);
         var interrupt: RequestInterrupt = .{ .external_cancellation = cancellation };
         // Own the complete request attempt in a cancellable std.Io task for
         // every protocol. The socket interrupt handles established HTTP/1 and
@@ -1452,16 +1471,16 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
         cancellation: ?CancellationToken,
     ) !Response {
-        if (cancellation) |signal| return self.executeRequestToWriterCancellable(req, timeout_override_ms, writer, progress_cb, progress_ctx, signal);
-        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
-        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        if (cancellation) |signal| return self.executeRequestToWriterCancellable(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, signal);
+        try ensureRequestDeadline(self.io, deadline_ms);
         var interrupt: RequestInterrupt = .{};
-        if (timeout_ms == 0) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt);
+        if (deadline_ms == null) return self.executeRequestToWriterWithRetries(req, timeout_override_ms, deadline_ms, writer, progress_cb, progress_ctx, &interrupt);
 
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
@@ -1538,14 +1557,14 @@ pub const Client = struct {
         self: *Self,
         req: *Request,
         timeout_override_ms: ?u64,
+        deadline_ms: ?i64,
         writer: anytype,
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
         cancellation: CancellationToken,
     ) !Response {
         if (cancellation.isCancelled()) return error.Cancelled;
-        const timeout_ms = timeout_override_ms orelse self.config.timeouts.request_ms;
-        const deadline_ms = requestDeadlineMs(self.io, timeout_ms);
+        try ensureRequestDeadline(self.io, deadline_ms);
         var interrupt: RequestInterrupt = .{ .external_cancellation = cancellation };
         const Writer = @TypeOf(writer);
         const RequestResult = anyerror!Response;
@@ -3004,7 +3023,9 @@ pub const Client = struct {
             }
 
             parser.finishEof();
-            if (!parser.isComplete()) return error.InvalidResponse;
+            // EOF before complete headers is transport truncation. Parser
+            // syntax errors still propagate from feed as terminal failures.
+            if (!parser.isComplete()) return error.UnexpectedEof;
 
             if (parser.status_code) |code| {
                 if (code >= 100 and code < 200) {
@@ -3067,7 +3088,9 @@ pub const Client = struct {
             }
 
             parser.finishEof();
-            if (!parser.isComplete()) return error.InvalidResponse;
+            // EOF before complete headers is transport truncation. Parser
+            // syntax errors still propagate from feed as terminal failures.
+            if (!parser.isComplete()) return error.UnexpectedEof;
 
             if (parser.status_code) |code| {
                 if (code >= 100 and code < 200) {
@@ -3210,6 +3233,17 @@ pub const Client = struct {
         return res;
     }
 
+    /// Recover errors hidden by Io.Reader's narrow error set. In particular,
+    /// incomplete framing is retryable transport truncation; invalid chunk
+    /// syntax is a terminal protocol error. TLS errors are checked first.
+    fn checkBodyFramingError(parser: *const Parser, content_length: *const ContentLengthReader, chunked: *const ChunkedBodyReader) !void {
+        if (parser.chunked) {
+            try chunked.checkReadError();
+        } else if (parser.content_length != null) {
+            try content_length.checkReadError();
+        }
+    }
+
     /// Builds a Response by streaming the body through an Io.Reader chain.
     /// After headers are parsed, the chain is: leftover bytes → network → framing → decompress → output.
     fn buildStreamingResponse(
@@ -3296,6 +3330,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3324,6 +3359,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3415,6 +3451,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3432,6 +3469,7 @@ pub const Client = struct {
             while (encoded_prefix_len < encoded_prefix.len) {
                 const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3453,6 +3491,7 @@ pub const Client = struct {
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
                         return error.InvalidResponse;
@@ -3491,6 +3530,7 @@ pub const Client = struct {
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
                         if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
                         return error.DecompressionFailed;
@@ -3513,6 +3553,7 @@ pub const Client = struct {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
                     if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
                     return error.InvalidResponse;
@@ -3537,6 +3578,21 @@ pub const Client = struct {
             _ = res.headers.remove(HeaderName.CONTENT_LENGTH);
         }
 
+        // A decoder can finish before the HTTP terminal chunk/trailers.
+        // Validate that framing without buffering or publishing extra bytes.
+        if (content_coding != null and (parser.chunked or parser.content_length != null)) {
+            var discarded: usize = 0;
+            while (true) {
+                const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
+                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
+                    if (err == error.EndOfStream) break;
+                    return err;
+                };
+                if (n == 0) break;
+                discarded = try checkedResponseSize(discarded, n, max_response_size);
+            }
+        }
         return res;
     }
 
@@ -4737,6 +4793,7 @@ const python_redirect_writer_server_script =
     "    allow_reuse_address = True\n" ++
     "\n" ++
     "with ReuseTCPServer(('127.0.0.1', port), Handler) as httpd:\n" ++
+    "    print(httpd.server_address[1], flush=True)\n" ++
     "    httpd.serve_forever()\n";
 
 const python_tls_fixed_keepalive_server_script =
@@ -5552,24 +5609,19 @@ test "requestToWriter follows redirects without streaming intermediate redirect 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const port = try reserveEphemeralPort(io);
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_redirect_writer_server_script });
-
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
 
     var child = std.process.spawn(io, .{
         .argv = &.{
             "python3",
             "server.py",
-            port_arg,
+            "0",
         },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
-        .stdout = .inherit,
+        .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -5577,7 +5629,12 @@ test "requestToWriter follows redirects without streaming intermediate redirect 
     };
     defer child.kill(io);
 
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+    // The child owns the listening port and signals readiness after bind.
+    // Reserving/releasing a port and sleeping cannot establish either fact.
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+    const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+    const port = try std.fmt.parseUnsigned(u16, port_line, 10);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/redirect", .{port});
     defer allocator.free(url);
@@ -5899,7 +5956,7 @@ test "H1 error envelopes use actual status for buffered and writer responses" {
         .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "+404" },
         .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "4_04" },
     };
-    const payload = [_]u8{'e'} ** 4097;
+    const payload = @as([4097]u8, @splat('e'));
     for (cases) |case| {
         client.config.max_error_response_size = case.error_limit;
         for ([_]bool{ false, true }) |to_writer| {
@@ -5978,7 +6035,7 @@ test "error envelope writer preserves upstream response start ordering" {
     defer client.deinit();
     var session = TlsSession.init(TlsConfig.insecure(allocator), std.testing.io);
     defer session.deinit();
-    const payload = [_]u8{'e'} ** 4097;
+    const payload = @as([4097]u8, @splat('e'));
     for (cases) |case| {
         var writer: Writer = .{ .reject = case.reject };
         var parser = Parser.initResponse(allocator);
@@ -6112,5 +6169,235 @@ test "residual terminal TLS errors remain outside PUT retry aliases" {
     inline for (.{ error.Timeout, error.Canceled, error.Cancelled, error.TlsTransportReadFailed, error.TlsAlert, error.TlsBadLength, error.TlsBadRecordMac, error.TlsConnectionTruncated, error.TlsDecodeError, error.TlsRecordOverflow, error.TlsUnexpectedMessage, error.TlsIllegalParameter, error.TlsSequenceOverflow }) |err| {
         try std.testing.expect(!isRetryableTransportError(err));
         try std.testing.expect(!isSafeUnsentRetryError(err));
+    }
+}
+
+test "request redirects share a deadline for buffered streaming and cancellable requests" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]bool{ false, true }) |coordinated| {
+            var server = try TestServer.start(alloc, io, &.{
+                .{ .path = "/first", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/second" }}, .delay_ns = 80 * std.time.ns_per_ms } },
+                .{ .path = "/second", .respond = .{ .status = 307, .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 80 * std.time.ns_per_ms } },
+                .{ .path = "/final", .respond = .{ .body = "ready", .delay_ns = 500 * std.time.ns_per_ms } },
+            });
+            defer server.deinit();
+            const Task = struct {
+                fn serve(ts: *TestServer) Io.Cancelable!void {
+                    for (0..3) |_| ts.handleOne() catch return;
+                }
+            };
+            var group: Io.Group = .init;
+            try group.concurrent(io, Task.serve, .{&server});
+            defer group.cancel(io);
+            var client = Client.initWithConfig(alloc, io, .{
+                .keep_alive = false,
+                .cancel_in_flight_on_shutdown = coordinated,
+                .retry_policy = .{ .max_retries = 0 },
+                .timeouts = .{ .request_ms = 250 },
+            });
+            defer client.deinit();
+            const url = try std.fmt.allocPrint(alloc, "{s}/first", .{server.baseUrl()});
+            defer alloc.free(url);
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(alloc);
+            const start = common.milliTimestamp(io);
+            // Exercise both default and per-request budgets.
+            const opts: RequestOptions = .{ .timeout_ms = if (coordinated) 250 else null };
+            if (to_writer) {
+                try std.testing.expectError(error.Timeout, client.getToWriter(url, opts, arrayListWriter(&output, alloc), null, null));
+                try std.testing.expectEqual(@as(usize, 0), output.items.len);
+            } else {
+                try std.testing.expectError(error.Timeout, client.get(url, opts));
+            }
+            try std.testing.expect(common.milliTimestamp(io) - start < 350);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1, 1 }, server.route_hits);
+            try std.testing.expectEqual(@as(usize, 0), client.activeRequestCount());
+        }
+    }
+}
+
+test "request redirect error paths release responses exactly once" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { location: ?[]const u8, max_redirects: u32 = 10, expected: anyerror };
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]Case{
+            .{ .location = null, .expected = error.InvalidResponse },
+            .{ .location = "/final", .max_redirects = 0, .expected = error.TooManyRedirects },
+            .{ .location = "/final", .expected = error.UnexpectedEof },
+        }) |case| {
+            var header: [1]@import("../testing.zig").HeaderPair = .{.{ .name = "Location", .value = case.location orelse "" }};
+            var server = try TestServer.start(alloc, io, &.{
+                .{ .path = "/redirect", .respond = .{ .status = 307, .body = "redirect-body", .headers = if (case.location != null) &header else &.{} } },
+                .{ .path = "/final", .respond = .{ .disconnect_before_response = true } },
+            });
+            defer server.deinit();
+            const Task = struct {
+                fn serve(ts: *TestServer) Io.Cancelable!void {
+                    for (0..2) |_| ts.handleOne() catch return;
+                }
+            };
+            var group: Io.Group = .init;
+            try group.concurrent(io, Task.serve, .{&server});
+            defer group.cancel(io);
+            var client = Client.initWithConfig(alloc, io, .{
+                .keep_alive = false,
+                .retry_policy = .{ .max_retries = 0 },
+                .redirect_policy = .{ .max_redirects = case.max_redirects },
+            });
+            defer client.deinit();
+            const url = try std.fmt.allocPrint(alloc, "{s}/redirect", .{server.baseUrl()});
+            defer alloc.free(url);
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(alloc);
+            if (to_writer) {
+                try std.testing.expectError(case.expected, client.getToWriter(url, .{}, arrayListWriter(&output, alloc), null, null));
+                try std.testing.expectEqual(@as(usize, 0), output.items.len);
+            } else {
+                try std.testing.expectError(case.expected, client.get(url, .{}));
+            }
+        }
+    }
+}
+
+test "request redirects preserve unlimited budgets and successful response ownership" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |to_writer| {
+        var server = try TestServer.start(alloc, io, &.{
+            .{ .path = "/redirect", .respond = .{ .status = 307, .body = "redirect-body", .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 20 * std.time.ns_per_ms } },
+            .{ .path = "/final", .respond = .{ .body = "ready" } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *TestServer) Io.Cancelable!void {
+                for (0..2) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{&server});
+        defer group.cancel(io);
+        var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .timeouts = .{ .request_ms = 1 } });
+        defer client.deinit();
+        const url = try std.fmt.allocPrint(alloc, "{s}/redirect", .{server.baseUrl()});
+        defer alloc.free(url);
+        var output = std.ArrayListUnmanaged(u8).empty;
+        defer output.deinit(alloc);
+        var response = if (to_writer)
+            try client.getToWriter(url, .{ .timeout_ms = 0 }, arrayListWriter(&output, alloc), null, null)
+        else
+            try client.get(url, .{ .timeout_ms = 0 });
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings("ready", if (to_writer) output.items else response.body.?);
+    }
+}
+
+test "client body framing preserves truncation and syntax errors without replaying streamed output" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Case = struct { body: []const u8, chunked: bool = false, truncate: ?usize = null, expected: anyerror };
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]Case{
+            .{ .body = "ready", .truncate = 2, .expected = error.UnexpectedEof },
+            .{ .body = "5\r\nready\r\n", .chunked = true, .expected = error.UnexpectedEof },
+            .{ .body = "5\r\nre", .chunked = true, .expected = error.UnexpectedEof },
+            .{ .body = "0\r\n", .chunked = true, .expected = error.UnexpectedEof },
+            .{ .body = "z\r\n", .chunked = true, .expected = error.InvalidResponse },
+            .{ .body = "1\r\nx!", .chunked = true, .expected = error.InvalidResponse },
+        }) |case| {
+            var server = try TestServer.start(alloc, io, &.{
+                .{ .path = "/", .respond = .{ .body = case.body, .chunked = case.chunked, .truncate_body_at = case.truncate } },
+            });
+            defer server.deinit();
+            var serving = try io.concurrent(TestServer.handleOne, .{&server});
+            defer serving.cancel(io) catch {};
+            var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = if (to_writer) 3 else 0 } });
+            defer client.deinit();
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(alloc);
+            if (to_writer) {
+                try std.testing.expectError(case.expected, client.getToWriter(server.baseUrl(), .{}, arrayListWriter(&output, alloc), null, null));
+            } else {
+                try std.testing.expectError(case.expected, client.get(server.baseUrl(), .{}));
+            }
+            try std.testing.expectEqualSlices(usize, &.{1}, server.route_hits);
+        }
+    }
+}
+
+test "client compressed bodies validate complete HTTP framing before success" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    // gzip.compress(b"ready", mtime=0), including its checksum/footer.
+    const encoded = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x4a\x4d\x4c\xa9\x04\x00\xaf\x85\x95\x28\x05\x00\x00\x00";
+    const complete = try std.fmt.allocPrint(alloc, "{x}\r\n{s}\r\n0\r\n\r\n", .{ encoded.len, encoded });
+    defer alloc.free(complete);
+    for ([_]bool{ false, true }) |to_writer| {
+        for ([_]bool{ false, true }) |chunked| {
+            for ([_]bool{ false, true }) |truncated| {
+                const wire = if (chunked) complete else encoded;
+                var server = try TestServer.start(alloc, io, &.{
+                    .{ .path = "/", .respond = .{ .body = wire, .chunked = chunked, .truncate_body_at = if (truncated) wire.len - (if (chunked) @as(usize, 5) else 2) else null, .headers = &.{.{ .name = "Content-Encoding", .value = "gzip" }} } },
+                });
+                defer server.deinit();
+                var serving = try io.concurrent(TestServer.handleOne, .{&server});
+                defer serving.cancel(io) catch {};
+                var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+                defer client.deinit();
+                var output = std.ArrayListUnmanaged(u8).empty;
+                defer output.deinit(alloc);
+                const result = if (to_writer)
+                    client.getToWriter(server.baseUrl(), .{}, arrayListWriter(&output, alloc), null, null)
+                else
+                    client.get(server.baseUrl(), .{});
+                if (truncated) {
+                    try std.testing.expectError(error.UnexpectedEof, result);
+                } else {
+                    var response = try result;
+                    defer response.deinit();
+                    try std.testing.expectEqualStrings("ready", if (to_writer) output.items else response.body.?);
+                }
+            }
+        }
+    }
+}
+
+test "client body replay preserves method safety after truncation" {
+    const TestServer = @import("../testing.zig").TestServer;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]types.Method{ .GET, .POST }) |method| {
+        var server = try TestServer.start(alloc, io, &.{
+            .{ .method = method, .path = "/", .max_uses = 1, .respond = .{ .body = "ready", .truncate_body_at = 2 } },
+            .{ .method = method, .path = "/", .respond = .{ .body = "ready" } },
+        });
+        defer server.deinit();
+        const Task = struct {
+            fn serve(ts: *TestServer) Io.Cancelable!void {
+                for (0..2) |_| ts.handleOne() catch return;
+            }
+        };
+        var group: Io.Group = .init;
+        try group.concurrent(io, Task.serve, .{&server});
+        defer group.cancel(io);
+        var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .initial_delay_ms = 1 } });
+        defer client.deinit();
+        if (method == .GET) {
+            var response = try client.request(method, server.baseUrl(), .{});
+            defer response.deinit();
+            try std.testing.expectEqualStrings("ready", response.body.?);
+            try std.testing.expectEqualSlices(usize, &.{ 1, 1 }, server.route_hits);
+        } else {
+            try std.testing.expectError(error.UnexpectedEof, client.request(method, server.baseUrl(), .{}));
+            try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
+        }
     }
 }

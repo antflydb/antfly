@@ -486,12 +486,14 @@ type graphAggregatesResultValidation struct {
 }
 
 type graphPathEdgeValidation struct {
-	Direction graphRequiredJSONValue[GraphPathEdgeDirection] `json:"direction"`
-	From      GraphPathEndpoint                              `json:"from"`
-	Metadata  graphOpaqueJSONObject                          `json:"metadata,omitempty"`
-	To        GraphPathEndpoint                              `json:"to"`
-	Type      string                                         `json:"type"`
-	Weight    graphRequiredJSONValue[float64]                `json:"weight"`
+	EdgeId        graphOptionalNonNullString                     `json:"edge_id,omitempty"`
+	OwnerDocument graphOptionalNonNullString                     `json:"owner_document,omitempty"`
+	Direction     graphRequiredJSONValue[GraphPathEdgeDirection] `json:"direction"`
+	From          GraphPathEndpoint                              `json:"from"`
+	Metadata      graphOpaqueJSONObject                          `json:"metadata,omitempty"`
+	To            GraphPathEndpoint                              `json:"to"`
+	Type          string                                         `json:"type"`
+	Weight        graphRequiredJSONValue[float64]                `json:"weight"`
 }
 
 type graphPathValidation struct {
@@ -1006,6 +1008,9 @@ func validateGraphPathEdgePayload(edge *graphPathEdgeValidation, from, to GraphP
 	if !edge.Direction.present || !edge.Weight.present {
 		return fmt.Errorf("graph path edge requires direction and weight")
 	}
+	if err := validateGraphRelationshipIdentity(edge.EdgeId.pointer(), edge.OwnerDocument.pointer()); err != nil {
+		return err
+	}
 	return validateGraphPathEdgeFields(edge.Direction.value, edge.Type, edge.Weight.value, maxWeightProduct)
 }
 
@@ -1417,7 +1422,29 @@ func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint
 	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
 		return fmt.Errorf("graph path edge does not match adjacent nodes")
 	}
+	if err := validateGraphRelationshipIdentity(optionalGraphIdentity(edge.EdgeId), optionalGraphIdentity(edge.OwnerDocument)); err != nil {
+		return err
+	}
 	return validateGraphPathEdgeFields(edge.Direction, string(edge.Type), edge.Weight, maxWeightProduct)
+}
+
+func optionalGraphIdentity(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func validateGraphRelationshipIdentity(id, owner *string) error {
+	for _, value := range []*string{id, owner} {
+		if value != nil && (*value == "" || !utf8.ValidString(*value)) {
+			return fmt.Errorf("graph relationship identity must be a nonempty UTF-8 string")
+		}
+	}
+	if owner != nil && id == nil {
+		return fmt.Errorf("graph owner_document requires edge_id")
+	}
+	return nil
 }
 
 func validateGraphPathEdgeFields(direction GraphPathEdgeDirection, edgeType string, weight float64, maxWeightProduct bool) error {

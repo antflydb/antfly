@@ -22,7 +22,7 @@
 //! to drift from the runtime classifier.
 
 const std = @import("std");
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const routes = @import("../../api/http_routes.zig");
 
 pub const Disposition = enum {
@@ -57,7 +57,7 @@ pub const Surface = enum {
     artifact_reprocess,
     backup,
     read_like_post,
-    ha_control,
+    hot_standby_control,
     storage_maintenance,
     protocol_action,
     restore_job,
@@ -75,6 +75,14 @@ pub const Surface = enum {
     enrichment_worker,
     resolution_worker,
     compaction_worker,
+
+    /// Preserve certification and diagnostic wire names across internal renames.
+    pub fn wireName(self: Surface) []const u8 {
+        return switch (self) {
+            .hot_standby_control => "ha_control",
+            else => @tagName(self),
+        };
+    }
 };
 
 pub const Entry = struct {
@@ -115,7 +123,7 @@ pub const entries = [_]Entry{
     .{ .surface = .artifact_reprocess, .disposition = .reject, .path_pattern = "/tables/{table}/.../reprocess[-jobs]", .methods = post_delete, .reason = "reprocess job checkpoints and derived effects do not share one replicated acknowledgement" },
     .{ .surface = .backup, .disposition = .reject, .path_pattern = "/backup | /tables/{table}/backup", .methods = post, .reason = "requires the shared durable cohort driver with primary-epoch authority, replicated write fences, immutable seals, and fenced repository publication" },
     .{ .surface = .read_like_post, .disposition = .read_only, .path_pattern = "/query | /tables/{table}/{query|documents|repair/issues} | /eval | /agents/{query-builder|retrieval|research} | /ard/v1/{search|explore}", .methods = post, .reason = "these POST requests only compute or inspect state" },
-    .{ .surface = .ha_control, .disposition = .local_operational, .path_pattern = "/admin/v1/standby/... | /admin/v1/ha/... | /internal/v1/standby/replication/... | /internal/v1/ha/replication/...", .methods = post_put_delete, .reason = "authenticated HA control and replication endpoints implement the topology protocol itself" },
+    .{ .surface = .hot_standby_control, .disposition = .local_operational, .path_pattern = "/admin/v1/standby/... | /admin/v1/ha/... | /internal/v1/standby/replication/... | /internal/v1/ha/replication/...", .methods = post_put_delete, .reason = "authenticated HA control and replication endpoints implement the topology protocol itself" },
     .{ .surface = .storage_maintenance, .disposition = .local_operational, .path_pattern = "/admin/v1/maintenance/...", .methods = post_delete, .reason = "maintenance rewrites physical local representation without changing logical promoted state" },
     .{ .surface = .protocol_action, .disposition = .reject, .path_pattern = "/mcp/v1/... | /a2a | /agents/v1/extensions/...", .methods = post_delete, .reason = "protocol tool calls are payload-dispatched and cannot prove every invoked mutation enters RemoteApply" },
     .{ .surface = .restore_job, .disposition = .reject, .path_pattern = "/restore/jobs/{id}", .methods = &.{.DELETE}, .reason = "restore workflow cancellation mutates primary-local durable job state" },
@@ -149,7 +157,7 @@ pub fn classify(method: http_common.Method, path: []const u8) ?Classification {
         std.mem.startsWith(u8, path, "/admin/v1/ha/") or
         std.mem.startsWith(u8, path, "/internal/v1/standby/replication/") or
         std.mem.startsWith(u8, path, "/internal/v1/ha/replication/"))
-        return classified(.ha_control, .local_operational);
+        return classified(.hot_standby_control, .local_operational);
     if (std.mem.startsWith(u8, path, "/admin/v1/maintenance/"))
         return classified(.storage_maintenance, .local_operational);
 
@@ -249,7 +257,7 @@ test "hot-standby mutation inventory JSON exactly covers runtime surfaces and di
     defer parsed.deinit();
     try std.testing.expectEqual(entries.len, parsed.value.len);
     for (entries, parsed.value) |expected, actual| {
-        try std.testing.expectEqualStrings(@tagName(expected.surface), actual.surface);
+        try std.testing.expectEqualStrings(expected.surface.wireName(), actual.surface);
         try std.testing.expectEqualStrings(@tagName(expected.disposition), actual.disposition);
         try std.testing.expectEqualStrings(expected.path_pattern, actual.path_pattern);
         try std.testing.expectEqualStrings(expected.reason, actual.reason);
@@ -348,10 +356,10 @@ test "hot-standby public non-GET route matrix has an explicit durability disposi
     };
     const cases = [_]Case{
         // HA and node-local physical administration.
-        .{ .method = .POST, .path = "/admin/v1/standby/promote", .surface = .ha_control, .disposition = .local_operational },
-        .{ .method = .POST, .path = "/admin/v1/ha/standby/promote", .surface = .ha_control, .disposition = .local_operational },
-        .{ .method = .POST, .path = "/internal/v1/standby/replication/pull", .surface = .ha_control, .disposition = .local_operational },
-        .{ .method = .POST, .path = "/internal/v1/ha/replication/pull", .surface = .ha_control, .disposition = .local_operational },
+        .{ .method = .POST, .path = "/admin/v1/standby/promote", .surface = .hot_standby_control, .disposition = .local_operational },
+        .{ .method = .POST, .path = "/admin/v1/ha/standby/promote", .surface = .hot_standby_control, .disposition = .local_operational },
+        .{ .method = .POST, .path = "/internal/v1/standby/replication/pull", .surface = .hot_standby_control, .disposition = .local_operational },
+        .{ .method = .POST, .path = "/internal/v1/ha/replication/pull", .surface = .hot_standby_control, .disposition = .local_operational },
         .{ .method = .POST, .path = "/admin/v1/maintenance/compact", .surface = .storage_maintenance, .disposition = .local_operational },
         .{ .method = .DELETE, .path = "/admin/v1/maintenance/jobs/7", .surface = .storage_maintenance, .disposition = .local_operational },
 

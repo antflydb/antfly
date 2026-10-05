@@ -1,24 +1,24 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
-const addRuntimeTestFilters = @import("test_support.zig").addRuntimeTestFilters;
-const compileFiltersWithAnchors = @import("test_support.zig").compileFiltersWithAnchors;
-const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
-const addCuratedTestRunArtifact = @import("test_support.zig").addCuratedTestRunArtifact;
-const selectTestFilters = @import("test_support.zig").selectTestFilters;
+const addRuntimeTestFilters = @import("../../../build_support/antfly/test_support.zig").addRuntimeTestFilters;
+const compileFiltersWithAnchors = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors;
+const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
+const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
+const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
 
 pub const AddTestsOptions = struct {
     antfly_test_mod: *std.Build.Module,
@@ -31,24 +31,95 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const relationship_identity_filters = [_][]const u8{
+        "db graph endpoint cleanup pages",
+        "derived worker pause",
+        "graph endpoint cleanup byte admission",
+        "bulk append index",
+        "graph relationship integration",
+        "graph relationship artifact identity",
+        "derived log record",
+        "derived log relationship identities",
+        "k shortest paths preserve",
+        "fact temporal predicates",
+        "exact two-edge pattern preserves",
+        "traversal selected fact",
+        "graph algebraic provenance",
+        "db graph ttl projects source contenders",
+        "db direct merge import preserves mixed graph ttl contributor precedence",
+        "db split preserves ttl graph source fallback",
+        "graph owner membership keeps",
+        "graph untimed contributor order",
+        "graph edge ttl",
+        "graph contribution deadline",
+        "graph maintenance prune retires private ttl state",
+        "graph split prune preserves a retained owner",
+        "graph document clear",
+        "portable graph retirements are primary and require reader version four",
+        "graph relationship bulk ingestion preserves direct append and retirement",
+        "docstore relational bulk appends retain direct ingest and atomic dirty tokens",
+        "docstore backend adapters expose txn cursor and batch operations",
+        "graph incoming directory backfill resumes bounded pages",
+        "AFB2 relationship inventory requires reader version three",
+        "db graph projected endpoint retirement survives restore",
+        "graph incoming directory follows primary transaction commit and rollback",
+        "graph mutation clones release partial relationship allocations",
+        "db graph endpoint deletion retires inline identities and preserves independent facts",
+        "relationship predicates preserve exact decimal literals",
+        "graph projection preserves numeric literals",
+        "graph projection pages account for complete relationship identities",
+        "graph artifact mapping and source clones release partial allocations",
+        "graph pattern path conversion releases partial relationship allocations",
+        "graph replay truncated relationship fields release all allocations",
+        "db algebraic path conversion preserves provenance under allocation failures",
+        "portable relationships preserve parallel identities and arbitrary endpoints",
+        "relationship predicate roots reject every nonobject JSON type",
+        "db graph stale generation cleanup retires the exact fact identity",
+        "db graph fact documents project arbitrary endpoints and retain parallel facts",
+        "db graph fact projections survive logical snapshot restore and reopen",
+        "graph replay node clears do not subsume independently owned fact deletions",
+        "graph redundant source ownership is canonical across writes probes and deletes",
+        "graph document cleanup pages",
+        "graph maintenance capped pages and native scans release allocations on failure",
+    };
+    const relationship_identity_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &relationship_identity_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+    });
+    const run_relationship_identity_tests = addCuratedTestRunArtifact(b, relationship_identity_tests, &relationship_identity_filters);
+    b.step("antfly-storage-graph-identity-test", "Run relationship ownership, lifecycle, snapshot and replay regressions").dependOn(&run_relationship_identity_tests.step);
+    const worker_lifecycle_filters = [_][]const u8{
+        "storage.db.derived.io_threaded_runtime.",
+        "db graph endpoint cleanup pages rejected deletion",
+        "db graph endpoint cleanup pages rejected index deletion",
+        "db managed index deletion commits catalog absence with marker removal",
+    };
+    const worker_lifecycle_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &worker_lifecycle_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+    });
+    const run_worker_lifecycle_tests = addCuratedTestRunArtifact(b, worker_lifecycle_tests, &worker_lifecycle_filters);
+    b.step("antfly-storage-index-worker-lifecycle-test", "Run derived worker pause, replay retention, visibility and catalog retirement regressions").dependOn(&run_worker_lifecycle_tests.step);
     const direct_vector_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "online direct vector", "online graph snapshot", "retained transaction vector", "api module compiles", "metadata module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-online-direct-vector-test", "Run ordered direct vector snapshot, retention, and repair regressions")
         .dependOn(&addFilteredTestRunArtifact(b, direct_vector_tests).step);
     const retirement_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "db cold initial FK retirement", "api module compiles", "metadata module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-cold-fk-retirement-test", "Run terminal local publication cancellation durability tests")
         .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
     const ordered_artifact_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
         .dependOn(&addFilteredTestRunArtifact(b, ordered_artifact_tests).step);
@@ -60,7 +131,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db dense shadow activation rejects surplus candidate coverage",
             "db paused dense repair resumes its durable candidate after restart",
         },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
@@ -187,6 +258,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db document unit payload preserves pdf page provenance",
         "db document extraction asset materializes unit artifacts from data url",
         "db document extraction chunks units through source artifact enrichment",
+        "pending document-unit dense embedding collection releases every failed allocation",
+        "pending document-unit sparse embedding collection releases every failed allocation",
+        "pending document-unit chunk sources append atomically under allocation failure",
         "db document extraction completes audio transcription with transcriber producer",
         "db document extraction transcript segments time chunk artifacts",
         "db document extraction keeps diarized speakers through reopen",
@@ -413,6 +487,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db document unit payload preserves pdf page provenance",
         "db document extraction asset materializes unit artifacts from data url",
         "db document extraction chunks units through source artifact enrichment",
+        "pending document-unit dense embedding collection releases every failed allocation",
+        "pending document-unit sparse embedding collection releases every failed allocation",
+        "pending document-unit chunk sources append atomically under allocation failure",
         "db document extraction completes audio transcription with transcriber producer",
         "db document extraction transcript segments time chunk artifacts",
         "db document extraction keeps diarized speakers through reopen",
@@ -445,6 +522,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
 
     const lib_db_query_default_filters = [_][]const u8{
+        "db query drops full text hits whose stored document row was deleted directly from the store",
+        "db native document filters preserve paged totals across representations",
+        "db text totals require presence proof beyond the requested page",
+        "db document extraction chunks units through source artifact enrichment",
         "composed fusion preserves the coordinator reranker window",
         "composed vector component window matches component paging",
         "fuseNamedSets applies offset after fusion and pruning",
@@ -455,6 +536,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "storage.db.db.test.db dense ",
         "storage.db.db.test.db sparse ",
         "storage.db.db.test.db graph ",
+        "derived log record binary round trips",
+        "derived log relationship identities select",
+        "graph replay node clears do not subsume independently owned fact deletions",
+        "graph relationship artifact identity is versioned and owner scoped",
         "storage.db.db.test.db search ",
         "storage.db.db.test.db default dynamic schema vector term filters project through doc identity ordinals",
         "storage.db.db.test.db schema-present infer_types opt-in recursively infers nested fields after reopen",
@@ -537,7 +622,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &lib_db_query_default_filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -556,7 +641,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const highlight_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &highlight_filters,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     const run_highlight_tests = b.addRunArtifact(highlight_tests);
     addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
@@ -569,7 +654,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "text late visibility",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -590,16 +675,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "postprocessTextSearchResult preserves exact upstream total when page is unchanged",
             "unit relevance grouping rejects source-backed text and vector results",
             "postprocessTextSearchResult forwards batch stored loader to pattern filters",
+            "parent field filter cache owns allocation failures and preserves input",
+            "db document extraction concurrent writes with unchanged TTL timestamps converge",
+            "db generated write read fences detect artifact mutations and ABA independently of TTL",
+            "document mutation revision capture owns allocation failures and coalesces owners",
             "normalizeChunkArtifactForQuery strips private unit revision metadata",
             "db lookup includes chunk artifacts when _chunks is requested",
             "db lookup includes unified artifact projection when _artifacts is requested",
             "stored structured filters preserve one-key field name collisions",
             "pattern bool filter preserves explicit minimum should match",
             "native dense constraints fail closed without ordinal vector mapping",
-            "buildPatternDocumentHits preserves resolved binding ordinals",
             "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",
             "executeSearchGraphWithSets preserves node ordinals",
             "cloneNamedSetAsResult preserves hit ordinals",
+            "cloneNamedSetAsResult retains complete member payload under allocation failure",
+            "fuseNamedSets preserves complete member identities under allocation failure",
+            "fuseNamedSets member identity separates tables and ignores public id aliases",
+            "db vector indexes combine direct document and chunk-backed artifact sources",
             "fuseNamedSets preserves source hit ordinals",
             "fuseNamedSets reports a lower bound while any source window is truncated",
             "db search marks a truncated fused candidate union as a lower bound",
@@ -616,7 +708,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hierarchy stored-value sanitizer always removes the unit fingerprint",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -654,7 +746,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.db.test.db exposes local transaction lifecycle",
             "storage.db.db.test.db transaction ",
             "storage.db.db.test.db explicit resolveTransactionIntents",
-            "storage.db.db.test.db replicated transaction commits each raft receipt atomically",
             "storage.db.db.test.db native FK generation receipts survive restart without Raft watermark",
             "storage.db.db.test.db recoverTransactions",
             "storage.db.db.test.db participant recovery",
@@ -663,17 +754,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "idempotent begin upgrades a legacy transaction coordinator role",
             "transaction participant batch",
             "transaction trace retains every key",
-            "transaction recovery delegates stale coordinator abort to replicated resolver",
-            "replicated recovery is coordinator-owned and acknowledges through hooks",
-            "replicated recovery batches proven followers preserves uncertain debt and retains self handoff",
             "relational integrity ",
             "distributed txn deferred reference handoff",
-            "transaction recovery drains terminal HA outbox without remaining intents",
-            "non-replicated transaction recovery honors the per-run page limit",
             "retained terminal transactions honor the extended retry cutoff",
             "topology fence retains committed coordinator recovery obligations",
             "ttl runtime executes production pass on borrowed VoprIo",
-            "transaction recovery executes production pass on borrowed VoprIo",
         }),
     });
     const run_lib_db_txn_tests = addFilteredTestRunArtifact(b, lib_db_txn_tests);

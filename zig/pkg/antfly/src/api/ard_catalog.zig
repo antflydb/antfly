@@ -415,7 +415,7 @@ const AgentOutput = struct {
     display_name: []u8,
     media_type: []const u8,
 
-    fn deinit(self: *AgentOutput, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *AgentOutput, alloc: std.mem.Allocator) void {
         alloc.free(self.json);
         alloc.free(self.identifier);
         alloc.free(self.display_name);
@@ -517,7 +517,7 @@ const FacetAccumulator = struct {
         try self.buckets.append(alloc, .{ .value = owned_value, .count = 1 });
     }
 
-    fn deinit(self: *FacetAccumulator, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FacetAccumulator, alloc: std.mem.Allocator) void {
         for (self.buckets.items) |bucket| alloc.free(bucket.value);
         self.buckets.deinit(alloc);
     }
@@ -1826,7 +1826,7 @@ const ParsedExtensionSkill = struct {
     representative_query_values: [max_representative_queries][]const u8 = undefined,
     representative_query_count: usize = 0,
 
-    fn deinit(self: *ParsedExtensionSkill) void {
+    pub fn deinit(self: *ParsedExtensionSkill) void {
         self.parsed.deinit();
     }
 
@@ -1882,7 +1882,7 @@ const ParsedExtensionAgent = struct {
     representative_query_values: [max_representative_queries][]const u8 = undefined,
     representative_query_count: usize = 0,
 
-    fn deinit(self: *ParsedExtensionAgent) void {
+    pub fn deinit(self: *ParsedExtensionAgent) void {
         self.parsed.deinit();
     }
 

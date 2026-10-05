@@ -45,7 +45,7 @@ const PreprocessStage = union(enum) {
         }
     }
 
-    fn deinit(self: *PreprocessStage) void {
+    pub fn deinit(self: *PreprocessStage) void {
         switch (self.*) {
             .scaler => |*s| s.deinit(),
             .imputer => |*i| i.deinit(),
@@ -58,7 +58,7 @@ const ModelStage = union(enum) {
     linear: linear.LinearEngine,
     svm: svm.SvmEngine,
 
-    fn deinit(self: *ModelStage) void {
+    pub fn deinit(self: *ModelStage) void {
         switch (self.*) {
             .tree => |*t| t.deinit(),
             .linear => |*l| l.deinit(),

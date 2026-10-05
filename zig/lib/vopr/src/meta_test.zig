@@ -223,7 +223,7 @@ fn proveMetaBug(comptime bug: Bug) !void {
 }
 
 test "systematic meta-suite discovers replays and reduces required bug shapes" {
-    inline for (@typeInfo(Bug).@"enum".fields) |field| {
-        try proveMetaBug(@field(Bug, field.name));
+    inline for (@typeInfo(Bug).@"enum".field_names) |reflected_name| {
+        try proveMetaBug(@field(Bug, reflected_name));
     }
 }

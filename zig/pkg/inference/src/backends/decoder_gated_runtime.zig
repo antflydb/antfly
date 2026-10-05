@@ -27,7 +27,7 @@ const metal_compute_mod = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 const native_blas = @import("native.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = std.c;
 
 pub const TimingStats = struct {
     prepare_calls: u64 = 0,
@@ -1059,7 +1059,7 @@ const ReservedHiddenCarrier = struct {
         self.active_front = !self.active_front;
     }
 
-    fn deinit(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, keep_active: bool) void {
+    pub fn deinit(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, keep_active: bool) void {
         if (keep_active) {
             cb.free(self.inactive());
         } else {
@@ -1486,7 +1486,7 @@ const BackendOwnedGreedyTokenResult = struct {
     token_id: i64,
     final_hidden: ?ops.CT = null,
 
-    fn deinit(self: *BackendOwnedGreedyTokenResult, cb: *const ops.ComputeBackend) void {
+    pub fn deinit(self: *BackendOwnedGreedyTokenResult, cb: *const ops.ComputeBackend) void {
         if (self.final_hidden) |hidden| cb.free(hidden);
         self.* = undefined;
     }

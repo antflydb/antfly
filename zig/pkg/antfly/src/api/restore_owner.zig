@@ -15,9 +15,9 @@
 
 //! Public-control adapter for the private compiled restore owner operation.
 const std = @import("std");
-const operation = @import("operation.zig");
-const db_types = @import("../storage/db/types.zig");
-const callback_abi = @import("../runtime_callback_abi.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
 pub const Source = @import("restore_owner_contract.zig").Source;
 pub const Request = @import("restore_owner_contract.zig").Request;
 pub const Response = @import("restore_owner_contract.zig").Response;

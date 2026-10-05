@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const db_types = @import("../storage/db/types.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
 const read_state_observer_mod = @import("antfly_read_state_observer");
 
 /// Tracks quorum ReadIndex requests until the matching ReadState has crossed
@@ -218,7 +218,7 @@ pub const AppliedReadTracker = struct {
     }
 };
 
-const read_contract = @import("../storage/read_consistency.zig");
+const read_contract = @import("antfly_local_sources").storage_read_consistency;
 pub const EnrichmentReadKind = read_contract.EnrichmentReadKind;
 pub const ReadConsistency = read_contract.ReadConsistency;
 pub const ReadIndexRequester = read_contract.ReadIndexRequester;

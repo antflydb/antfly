@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const replication_record = @import("../db/replication_record.zig");
+pub const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 pub const metadata_effects = @import("metadata_effects.zig");
 pub const metadata_effect_chunks = @import("metadata_effect_chunks.zig");
 pub const replay_floor = @import("replay_floor.zig");

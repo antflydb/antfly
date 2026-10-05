@@ -31,19 +31,35 @@ import license_headers as policy
 class LicenseHeaderTests(unittest.TestCase):
     def test_product_groups(self):
         self.assertEqual(
-            policy.group_for("zig/pkg/antfly/src/lite_main.zig", "all"), "apache"
+            policy.group_for("zig/pkg/antfly-embedded/src/local/lite_main.zig", "all"),
+            "apache",
         )
         self.assertEqual(policy.group_for("zig/pkg/antfly/src/main.zig", "all"), "elv2")
         self.assertEqual(
             policy.group_for("zig/pkg/inference/src/main.zig", "all"), "apache"
         )
-        self.assertEqual(
-            policy.group_for("zig/lib/lmdb/src/root.zig", "all"), "apache"
-        )
+        self.assertEqual(policy.group_for("zig/lib/lmdb/src/root.zig", "all"), "apache")
         self.assertIsNone(policy.group_for("zig/deps/lmdb/mdb.c", "all"))
         self.assertEqual(
             (policy.ROOT / "zig/lib/lmdb/LICENSE").read_bytes(),
             (policy.ROOT / "LICENSES/Apache-2.0.txt").read_bytes(),
+        )
+
+    def test_physical_package_roots_have_no_server_exceptions(self):
+        for name in policy.APACHE_FILES:
+            self.assertFalse(name.startswith("zig/pkg/antfly/"), name)
+        for name in (
+            "zig/pkg/antfly-embedded/src/local/storage/db/db.zig",
+            "zig/pkg/antfly-embedded/src/local/lake.zig",
+            "zig/lib/credentials/src/aws.zig",
+            "zig/build_support/antfly/dependencies.zig",
+        ):
+            self.assertEqual(policy.group_for(name, "all"), "apache")
+        self.assertEqual(
+            policy.group_for(
+                "zig/pkg/antfly/src/storage/hot_standby/primary.zig", "all"
+            ),
+            "elv2",
         )
 
     def test_preserves_shebang_and_is_idempotent(self):

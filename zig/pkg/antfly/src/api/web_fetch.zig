@@ -394,9 +394,20 @@ test "fetched page titles are truncated on a UTF-8 boundary" {
     defer arena.deinit();
     const a = arena.allocator();
     // 1023 ASCII bytes then a 3-byte code point straddles the 1024 limit.
-    const title = try std.mem.concat(a, u8, &.{ "x" ** 1023, "\u{4e2d}\u{6587}" });
+    const title = try std.mem.concat(a, u8, &.{ z17RepeatString("x", 1023), "\u{4e2d}\u{6587}" });
     const hit = try toHit(a, "https://example.com", "text/html", .{ .title = title, .text = "t", .truncated = false });
     const stored = hit._source.?.map.get("title").?.string;
     try std.testing.expect(std.unicode.utf8ValidateSlice(stored));
     try std.testing.expectEqual(@as(usize, 1023), stored.len);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

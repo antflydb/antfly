@@ -233,7 +233,7 @@ test "inference MIME registry contains only decodable formats" {
 }
 
 test "inspectEncoded reports dimensions without decoding pixels" {
-    var header = [_]u8{0} ** 24;
+    var header = @as([24]u8, @splat(0));
     @memcpy(header[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, header[16..20], 320, .big);
     std.mem.writeInt(u32, header[20..24], 200, .big);

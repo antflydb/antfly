@@ -21,7 +21,7 @@ const std = @import("std");
 const cancellation = @import("antfly_cancellation");
 
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
-const backup_contract = @import("backup_contract.zig");
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 
 pub const PrepareRequest = struct {
     /// Trusted compiled raw-store handle. Native snapshots prepare both stores

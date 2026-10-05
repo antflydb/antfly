@@ -318,7 +318,7 @@ test "inference worker provider attachments preserve bytes and per-item provenan
     var context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = &numeric,
-        .operation = @intFromEnum(bridge.ProviderOperation.embed_dense_rasters),
+        .operation = @backingInt(bridge.ProviderOperation.embed_dense_rasters),
         .request_json = .init("{\"image_count\":2}"),
         .deadline_ns = 42,
         .has_deadline = 1,

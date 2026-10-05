@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import importlib.util
 import sys
@@ -36,6 +50,37 @@ class StorageTestShardAuditTest(unittest.TestCase):
         self.write("db/query/scan.zig", 'test "scan" {}\n')
         self.write("test_manifest.zig", '_ = @import("db/query/scan.zig");\n')
         self.assertEqual([], self.audit(["storage.db.query."]))
+
+    def test_mixed_manifest_audits_each_physical_owner(self):
+        self.write("server/storage/owner.zig", 'test "server" {}\n')
+        self.write("local/storage/db/query.zig", 'test "local" {}\n')
+        self.write(
+            "local/source_catalog.zig",
+            'pub const local_query = @import("storage/db/query.zig");\n',
+        )
+        self.write(
+            "server/storage/test_manifest.zig",
+            '_ = @import("owner.zig");\n_ = @import("antfly_local_sources").local_query;\n',
+        )
+        manifest = self.root / "server/storage/test_manifest.zig"
+        catalog = self.root / "local/source_catalog.zig"
+        for owner in ("server", "local"):
+            self.assertEqual(
+                [],
+                audit.audit_manifest(
+                    self.root / owner / "storage",
+                    manifest,
+                    ["storage.owner.", "storage.db."],
+                    catalog=catalog,
+                ),
+            )
+        manifest.write_text('_ = @import("owner.zig");\n')
+        self.assertEqual(
+            ["test source missing from manifest: db/query.zig"],
+            audit.audit_manifest(
+                self.root / "local/storage", manifest, ["storage.db."], catalog=catalog
+            ),
+        )
 
     def test_rejects_unimported_test_under_an_owned_directory(self):
         self.write("db/query/scan.zig", 'test "scan" {}\n')

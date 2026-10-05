@@ -18,12 +18,12 @@
 //! policy programs or a caller-authored receipt. The owner fetches the exact
 //! metadata snapshot itself before proposing its isolated Raft command.
 const std = @import("std");
-const callback_abi = @import("../runtime_callback_abi.zig");
-const operation = @import("operation.zig");
-const policies = @import("../system_catalog/policies.zig");
+const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
+const operation = @import("antfly_local_sources").api_operation;
+const policies = @import("antfly_local_sources").system_catalog_policies;
 
 pub const Request = policies.InstallRequest;
-pub const Response = @import("../storage/db/row_policy_bundle.zig").Receipt;
+pub const Response = @import("antfly_local_sources").storage_db_row_policy_bundle.Receipt;
 
 pub fn validate(request: Request, group_id: u64) !void {
     if (request.table_id == 0 or request.owner_group_id != group_id or group_id == 0 or

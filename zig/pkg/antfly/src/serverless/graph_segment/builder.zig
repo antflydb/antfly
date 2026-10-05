@@ -18,13 +18,13 @@
 const std = @import("std");
 const wire = @import("packed.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const edge_type = @import("../../graph/edge_type.zig");
+const edge_type = @import("antfly_local_sources").graph_edge_type;
 const Allocator = std.mem.Allocator;
 
 const Dictionary = struct {
     values: std.StringArrayHashMapUnmanaged(bool) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.values.keys()) |key| alloc.free(key);
         self.values.deinit(alloc);
     }

@@ -249,7 +249,7 @@ See the crate's rustdoc for the full method list.
     scan/lookup/stats/run-until-idle concurrently, close racing in-flight
     calls, and `busy_timeout` behavior.
   - `tests/conformance.rs`: runs every case under
-    `zig/pkg/antfly/capi-conformance/cases/*.json` (see that directory's
+    `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` (see that directory's
     README), the same declarative suite every language binding runs, plus a
     standalone test that restores a backup into directory storage and
     reopens it.

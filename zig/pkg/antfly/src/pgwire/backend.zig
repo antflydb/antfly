@@ -50,7 +50,7 @@ pub const Request = struct {
     /// Parse-time setting catalog epoch for prepared current_setting plans.
     setting_epoch: ?u64 = null,
     /// Connection-owned, identity-fenced setting values for this statement.
-    setting_overlay: []const @import("../sql/setting_catalog.zig").OverlayEntry = &.{},
+    setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
 
     pub fn check(self: Request) !void {
         try self.io.checkCancel();
@@ -125,7 +125,7 @@ pub const Backend = struct {
         describe: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Description,
         execute: *const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!Result,
         /// Authenticated catalog snapshot for typed dotted-name SET/SHOW/RESET.
-        load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("../sql/setting_catalog.zig").RawSnapshot = null,
+        load_settings: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!@import("antfly_local_sources").sql_setting_catalog.RawSnapshot = null,
         validate_namespace: ?*const fn (*anyopaque, std.mem.Allocator, Identity, Request) anyerror!void = null,
         /// Evaluate SQL EXECUTE arguments as scalar expressions without any
         /// catalog/table access. Values are owned by the supplied allocator.
@@ -143,6 +143,8 @@ pub const Backend = struct {
     };
 };
 
+/// Result pages must be released before close or detach: native page arenas
+/// may borrow the stream's shared memory admission and retained column metadata.
 pub const ReadStream = struct {
     context: *anyopaque,
     columns: []const Column,

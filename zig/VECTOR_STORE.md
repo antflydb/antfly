@@ -470,14 +470,14 @@ depend on an unretained file in the old shard.
 
 The branch already contains relevant machinery:
 
-- [vector_block_store.zig](pkg/antfly/src/storage/vector_block_store.zig):
+- [vector_block_store.zig](pkg/antfly-embedded/src/local/storage/vector_block_store.zig):
   table-level exact-vector blocks, committed WAL batches, `CURRENT`
   publication, and retained readers.
-- [vector_wal_view.zig](pkg/antfly/src/storage/vector_wal_view.zig): vector WAL
+- [vector_wal_view.zig](pkg/antfly-embedded/src/local/storage/vector_wal_view.zig): vector WAL
   read/version machinery.
 - [vector_block_manifest.zig](lib/vectorindex/src/vector_block_manifest.zig):
   vector generation metadata and coverage.
-- [artifact_codec.zig](pkg/antfly/src/storage/db/enrichment/artifact_codec.zig):
+- [artifact_codec.zig](pkg/antfly-embedded/src/local/storage/db/enrichment/artifact_codec.zig):
   existing embedding artifact representation and source metadata.
 - [VECTORDBBENCH_FINDINGS.md](VECTORDBBENCH_FINDINGS.md): measured primary-store
   costs, shared exact-vector experiments, and current qualification limits.

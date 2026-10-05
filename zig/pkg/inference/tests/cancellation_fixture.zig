@@ -70,7 +70,7 @@ const Fixture = struct {
             }
         };
         const control = Control{ .io = ctx.io, .ptr = ctx, .check_fn = Check.check };
-        const documents = [_][]const u8{"ab"} ** 30;
+        const documents = @as([30][]const u8, @splat("ab"));
         const scores = try self.node.rerankTextsDirectWithContext(
             ctx.allocator,
             ctx.io,

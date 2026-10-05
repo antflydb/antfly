@@ -87,7 +87,7 @@ pub const Entry = struct {
     pod_uid: ?[]u8,
     authoritative_state: AuthoritativeState,
 
-    fn deinit(self: *Entry, alloc: Allocator) void {
+    pub fn deinit(self: *Entry, alloc: Allocator) void {
         alloc.free(self.generation);
         alloc.free(self.slot_name);
         alloc.free(self.topology_id);
@@ -108,7 +108,7 @@ pub const OwnedRuntimeObservation = struct {
     fenced: bool,
     observed_at_unix_ns: u64,
 
-    fn deinit(self: *OwnedRuntimeObservation, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedRuntimeObservation, alloc: Allocator) void {
         if (self.node_id) |value| alloc.free(value);
         if (self.pod_uid) |value| alloc.free(value);
         self.* = undefined;
@@ -225,7 +225,7 @@ pub const Ledger = struct {
         if (options.max_events == 0) return error.InvalidLifecycleRetention;
         const raw_path = try std.fs.path.join(alloc, &.{ lifecycle_root, ledger_dir_name });
         defer alloc.free(raw_path);
-        const path = try alloc.dupeZ(u8, raw_path);
+        const path = try alloc.dupeSentinel(u8, raw_path, 0);
         errdefer alloc.free(path);
         const root = try alloc.dupe(u8, lifecycle_root);
         errdefer alloc.free(root);

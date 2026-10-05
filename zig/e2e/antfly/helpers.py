@@ -17,6 +17,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -27,6 +29,48 @@ import requests
 
 HTTP_SERVER_POLL_INTERVAL_S = 0.02
 T = TypeVar("T")
+
+
+class PhaseTimings:
+    """Report sequential scenario milestones without changing wait deadlines."""
+
+    def __init__(self, scenario: str):
+        self.scenario = scenario
+        self.started = self.previous = time.monotonic()
+        self.enabled = os.environ.get("ANTFLY_E2E_PHASE_TIMINGS") == "1"
+
+    def mark(self, phase: str):
+        now = time.monotonic()
+        if self.enabled:
+            print(
+                "E2E phase "
+                + json.dumps(
+                    {
+                        "scenario": self.scenario,
+                        "phase": phase,
+                        "seconds": round(now - self.previous, 6),
+                        "elapsed_seconds": round(now - self.started, 6),
+                    }
+                ),
+                flush=True,
+            )
+        self.previous = now
+
+    def observe(self, phase: str, **fields):
+        """Record state changes without moving the sequential phase clock."""
+        if self.enabled:
+            print(
+                "E2E observation "
+                + json.dumps(
+                    {
+                        "scenario": self.scenario,
+                        "phase": phase,
+                        "elapsed_seconds": round(time.monotonic() - self.started, 6),
+                        **fields,
+                    }
+                ),
+                flush=True,
+            )
 
 
 def start_http_server(server: BaseServer) -> threading.Thread:

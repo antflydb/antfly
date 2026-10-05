@@ -14,10 +14,10 @@
 // limitations.
 
 const std = @import("std");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const catalog = @import("catalog.zig");
-const ast = @import("ast.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
 const Backend = struct {
     checkpoints: usize = 0,
     cancel_after: usize = std.math.maxInt(usize),
@@ -83,7 +83,7 @@ test "SQL named windows and exclusions release allocation failures" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "SQL unused named windows validate without evaluating discarded expressions" {
@@ -179,14 +179,14 @@ test "SQL window input preparation releases every allocation failure" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "SQL window shape infers frame value and offset parameters before execution" {
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT sum($1) OVER (ORDER BY 0 ROWS BETWEEN $2 PRECEDING AND CURRENT ROW)+1, lag(4,$3,$4) OVER (), ntile($5) OVER ()", .{});
     defer compiled.deinit();
-    var description = try @import("describe.zig").describe(std.testing.allocator, backend.backend(), &compiled, &.{});
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
     defer description.deinit();
     for (description.binding.parameter_types) |kind| try std.testing.expectEqual(ast.ColumnType.integer, kind.?);
     var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{ .{ .integer = 7 }, .{ .integer = 2 }, .{ .integer = 1 }, .{ .integer = 9 }, .{ .integer = 2 } }, .{});
@@ -199,7 +199,7 @@ test "SQL window invalid function types fail during catalog binding" {
     for ([_][]const u8{ "SELECT sum('bad') OVER ()", "SELECT bool_and(1) OVER ()", "SELECT ntile('bad') OVER ()", "SELECT lag(1,'bad') OVER ()" }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.SqlTypeMismatch, @import("describe.zig").describe(std.testing.allocator, backend.backend(), &compiled, &.{}));
+        try std.testing.expectError(error.SqlTypeMismatch, @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{}));
     }
 }
 
@@ -227,6 +227,40 @@ test "SQL window calls cannot be evaluated in pre-window clauses" {
     for ([_][]const u8{ "SELECT 1 WHERE row_number() OVER ()>0", "SELECT 1 GROUP BY row_number() OVER ()", "SELECT sum(1) HAVING sum(1) OVER ()>0" }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.SqlGroupingError, @import("describe.zig").describe(std.testing.allocator, backend.backend(), &compiled, &.{}));
+        try std.testing.expectError(error.SqlGroupingError, @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{}));
     }
+}
+
+test "SQL prefix window reuse preserves weak peers and navigation tie order" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT x,y,rank() OVER (ORDER BY x),rank() OVER (ORDER BY x,y),sum(y) OVER (ORDER BY x),lag(y) OVER (ORDER BY x) FROM (SELECT 1 AS x,3 AS y UNION ALL SELECT 1,1 UNION ALL SELECT 2,2) t ORDER BY x,y", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    const expected = [_][5]i64{ .{ 1, 1, 1, 1, 4 }, .{ 1, 3, 1, 2, 4 }, .{ 2, 2, 3, 3, 6 } };
+    for (result.output.rows, expected) |row, want| for (row[0..5], want) |value, number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, value.string, 10));
+    // LAG still uses arrival order within the x=1 peers, not stronger y order.
+    try std.testing.expectEqualStrings("3", result.output.rows[0][5].string);
+    try std.testing.expect(result.output.sql_nulls.?[1][5]);
+    try std.testing.expectEqualStrings("1", result.output.rows[2][5].string);
+}
+
+test "SQL compatible window prefixes share one actual permutation and preserve peer aggregates" {
+    const a = std.testing.allocator;
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(a, "SELECT x,y,rank() OVER (ORDER BY x),rank() OVER (ORDER BY x,y),sum(y) OVER (ORDER BY x) FROM (SELECT 1 AS x,3 AS y UNION ALL SELECT 1,1 UNION ALL SELECT 2,2) t ORDER BY x,y", .{});
+    defer compiled.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(a, backend.backend(), &compiled, &.{});
+    defer description.deinit();
+    const bound = description.binding.window.?;
+    try std.testing.expectEqual(@as(usize, 2), bound.sorts.len);
+    const roots = try @import("antfly_local_sources").sql_ordering_reuse.plan(a, bound);
+    defer a.free(roots);
+    var permutations: usize = 0;
+    for (roots, 0..) |root, index| permutations += @intFromBool(root == index);
+    try std.testing.expectEqual(@as(usize, 1), permutations);
+    var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    const expected = [_][5]i64{ .{ 1, 1, 1, 1, 4 }, .{ 1, 3, 1, 2, 4 }, .{ 2, 2, 3, 3, 6 } };
+    for (result.output.rows, expected) |row, want| for (row, want) |value, number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, value.string, 10));
 }

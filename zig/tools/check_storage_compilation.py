@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Verify source ownership with the real compiler, archives, and owner tests.
 
@@ -12,6 +24,7 @@ Every mutation lives in an isolated source overlay; the checkout is read only.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import re
@@ -44,7 +57,36 @@ CONSUMERS = {
     "api-table-write-lifecycle-tests",
     "data-runtime-tests",
 }
-COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) Debug \S+ (cached|success)\b")
+COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) debug \S+ (cached|success)\b")
+
+
+# Cache manifests track literal imports even in unselected test bodies. Skip
+# comments and strings, but deliberately retain imports inside tests/branches.
+IMPORT_TOKENS = re.compile(
+    r"//[^\n]*|(?m:^[ \t]*\\\\[^\n]*)|'(?:\\.|[^'\\])*'|"
+    r'"(?:\\.|[^"\\])*"|'
+    r'@import\s*\(\s*"(?P<path>[^"\\\n]+)"\s*\)'
+)
+
+
+def literal_import_path(root: Path, target: Path) -> list[Path] | None:
+    """Find an authored relative-import path that invalidates a source owner."""
+    root, target = root.resolve(), target.resolve()
+    pending = deque([(root, [root])])
+    seen = set()
+    while pending:
+        source, path = pending.popleft()
+        if source == target:
+            return path
+        if source in seen or not source.is_file():
+            continue
+        seen.add(source)
+        for token in IMPORT_TOKENS.finditer(source.read_text()):
+            relative = token.group("path")
+            if relative is not None and relative.endswith(".zig"):
+                imported = (source.parent / relative).resolve()
+                pending.append((imported, [*path, imported]))
+    return None
 
 
 def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
@@ -184,6 +226,16 @@ def own(root: Path, relative: str) -> Path:
     return path
 
 
+def source_owner_path(relative: str) -> str:
+    embedded = {
+        "storage/db/db.zig",
+        "storage/query.zig",
+        "storage/kernel_owner_abi.zig",
+    }
+    owner = "antfly-embedded/src/local" if relative in embedded else "antfly/src"
+    return f"zig/pkg/{owner}/{relative}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
@@ -236,7 +288,7 @@ def main() -> None:
             ),
             (
                 "physical local query",
-                "storage/local_query.zig",
+                "storage/query.zig",
                 {"antfly-storage-kernel"},
                 (ARCHIVES - {"antfly-storage-kernel"})
                 | {
@@ -277,7 +329,7 @@ def main() -> None:
         # Establish the overlay layout before the baseline. A mutation changes
         # file contents only, not symlink resolution or compiler source paths.
         for _, relative, _, _ in cases:
-            own(root, f"zig/pkg/antfly/src/{relative}")
+            own(root, source_owner_path(relative))
         local_cache = work / "cache"
         global_cache = work / "global-cache"
         global_cache.mkdir()
@@ -287,7 +339,7 @@ def main() -> None:
             arguments = [
                 "build",
                 "check-storage-compilation",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Donnx=false",
@@ -392,7 +444,7 @@ def main() -> None:
                 1 << 30
             ):
                 restart_cache(label)
-            path = own(root, f"zig/pkg/antfly/src/{relative}")
+            path = own(root, source_owner_path(relative))
             # Keep earlier edits in this private overlay. Restoring one would
             # itself invalidate Zig's most recent manifest and confound the
             # next case, even if it restores bytes from the cold build.

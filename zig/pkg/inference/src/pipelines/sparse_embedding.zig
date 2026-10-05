@@ -1066,7 +1066,7 @@ const FakeSparseTokenizer = struct {
         return 256;
     }
 
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
 };
 
 fn freeSparseVectorSlice(allocator: std.mem.Allocator, vectors: []SparseVector) void {

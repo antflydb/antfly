@@ -17,7 +17,7 @@
 
 pub const common = @import("../common/mod.zig");
 pub const extensions = @import("../extensions/mod.zig");
-pub const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 pub const metadata = @import("domain.zig");
 pub const metadata_api = @import("api.zig");
 pub const metadata_server = @import("server.zig");
@@ -25,7 +25,7 @@ pub const metadata_service = @import("service.zig");
 pub const public_api = @import("../api/runtime.zig");
 pub const raft = @import("../raft/mod.zig");
 pub const readers = @import("antfly_readers");
-pub const storage_backend_erased = @import("../storage/backend_erased.zig");
+pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
 pub const synthesizing = @import("antfly_synthesizing");
 pub const transcribing = @import("antfly_transcribing");
 pub const usermgr = @import("../usermgr/mod.zig");

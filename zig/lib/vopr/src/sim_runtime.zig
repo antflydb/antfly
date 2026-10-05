@@ -257,7 +257,7 @@ pub const SimRuntime = struct {
         return result;
     }
 
-    fn quiescent(ptr: *anyopaque) bool {
+    pub fn quiescent(ptr: *anyopaque) bool {
         const self: *SimRuntime = @ptrCast(@alignCast(ptr));
         return self.tasks.items.len == 0 and self.timers.items.len == 0;
     }

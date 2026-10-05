@@ -1,24 +1,24 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Physical provider for the opaque runtime WAL boundary.
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const wal_mod = @import("wal.zig");
+const wal_mod = @import("antfly_local_sources").storage_wal;
 const wire = @import("kernel_wal_wire.zig");
 
 const alloc = std.heap.c_allocator;
@@ -37,7 +37,7 @@ pub fn open(
         !validBool(request.model_commit_backend_completions) or request.path.len == 0)
         return .invalid_argument;
 
-    const path = alloc.dupeZ(u8, request.path.slice()) catch return .out_of_memory;
+    const path = alloc.dupeSentinel(u8, request.path.slice(), 0) catch return .out_of_memory;
     defer alloc.free(path);
     const group_commit_max_requests = std.math.cast(usize, request.group_commit_max_requests) orelse
         return .invalid_argument;

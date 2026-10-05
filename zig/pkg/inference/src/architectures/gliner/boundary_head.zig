@@ -232,7 +232,7 @@ fn dimension(value: usize) !i32 {
     return std.math.cast(i32, value) orelse error.InvalidInputShape;
 }
 
-fn validate(config: *const boundary.Config, input: Input, limits: Limits) !void {
+pub fn validate(config: *const boundary.Config, input: Input, limits: Limits) !void {
     try config.head.validate();
     if (config.version != boundary.config_version or config.architecture_version != boundary.architecture_version)
         return error.UnsupportedGlinerBoundaryVersion;

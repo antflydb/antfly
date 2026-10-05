@@ -17,7 +17,7 @@
 //! Owns at most one native page; staged state is borrowed from the serialized
 //! statement. Native rows shadowed by any staged write/delete never leak out.
 const std = @import("std");
-const catalog = @import("../sql/catalog.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
 const transactions = @import("transactions.zig");
 const Json = std.json.Value;
 
@@ -30,7 +30,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
         alloc.destroy(cursor);
     }
     const arena = cursor.arena.allocator();
-    var row_filter = if (row_filter_json) |filter| try @import("../search/pattern_filter.zig").PreparedPatternFilter.init(alloc, filter) else null;
+    var row_filter = if (row_filter_json) |filter| try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, filter) else null;
     defer if (row_filter) |*filter| filter.deinit();
     var rows: std.ArrayList(catalog.Row) = .empty;
     for (staged.tables) |entry| {
@@ -53,7 +53,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
                     if (std.mem.eql(u8, field, column.path)) break true;
                 } else false;
                 sql_null.* = raw == .null and !json_null;
-                const typed = if (raw == .null) raw else try @import("../sql/describe.zig").coerce(raw, column.type);
+                const typed = if (raw == .null) raw else try @import("antfly_local_sources").sql_describe.coerce(raw, column.type);
                 try object.put(arena, column.path, typed);
             }
             const observed = for (entry.predicates.items) |predicate| {
@@ -93,7 +93,7 @@ fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
             continue;
         }
         if (cell.sql_null or condition.value == .null) return false;
-        const order = try @import("../sql/scalar.zig").compare(cell.value, condition.value);
+        const order = try @import("antfly_local_sources").sql_scalar.compare(cell.value, condition.value);
         if (!switch (condition.op) {
             .eq => order == .eq,
             .neq => order != .eq,
@@ -147,7 +147,7 @@ const Cursor = struct {
             if (native == null and staged == null) break;
             const take_staged = staged != null and (native == null or std.mem.lessThan(u8, staged.?.id, native.?.id));
             const row = if (take_staged) staged.? else native.?;
-            try rows.append(alloc, .{ .id = try alloc.dupe(u8, row.id), .version = row.version, .value = try @import("../storage/typed_json.zig").clone(alloc, row.value), .sql_nulls = if (row.sql_nulls) |flags| try alloc.dupe(bool, flags) else null, .expected_content_digest = row.expected_content_digest, .document = if (row.document) |document| try @import("../storage/typed_json.zig").clone(alloc, document) else null });
+            try rows.append(alloc, .{ .id = try alloc.dupe(u8, row.id), .version = row.version, .value = try @import("antfly_local_sources").storage_typed_json.clone(alloc, row.value), .sql_nulls = if (row.sql_nulls) |flags| try alloc.dupe(bool, flags) else null, .expected_content_digest = row.expected_content_digest, .document = if (row.document) |document| try @import("antfly_local_sources").storage_typed_json.clone(alloc, document) else null });
             if (take_staged) self.staged_index += 1 else self.page_index += 1;
         }
         const more = self.staged_index < self.staged.len or (try self.peek()) != null;
@@ -230,7 +230,7 @@ test "SQL document session overlay retains full postimage and original conflict 
     try std.testing.expect(!(try page.rows[0].cell("j")).sql_null);
     try std.testing.expect((try page.rows[0].cell("missing")).sql_null);
     try std.testing.expectEqual(@as(u64, 7), page.rows[0].version);
-    try std.testing.expectEqual([_]u8{42} ** 32, page.rows[0].expected_content_digest.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(42)), page.rows[0].expected_content_digest.?);
     try std.testing.expectEqualStrings("9007199254740993", page.rows[0].document.?.object.get("extra").?.number_string);
     var wrong_epoch = table;
     wrong_epoch.schema_version = 3;

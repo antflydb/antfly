@@ -16,7 +16,7 @@
 //! Transport-neutral metadata node lifecycle operations.
 
 const std = @import("std");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_api = @import("api.zig");
 const metadata_authority = @import("authority.zig");

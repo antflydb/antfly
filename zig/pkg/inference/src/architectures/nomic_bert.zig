@@ -117,11 +117,11 @@ const linear_specs = [_]struct {
 };
 
 fn linearSlot(layer: usize, kind: LinearSlotKind) usize {
-    return layer * linear_specs.len + @intFromEnum(kind);
+    return layer * linear_specs.len + @backingInt(kind);
 }
 
 fn layerNormSlot(layer: usize, kind: LayerNormSlotKind) usize {
-    return layer * 2 + @intFromEnum(kind);
+    return layer * 2 + @backingInt(kind);
 }
 
 pub const Config = struct {

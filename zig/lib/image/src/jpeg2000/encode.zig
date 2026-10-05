@@ -1685,7 +1685,7 @@ test "validateEncodeParams rejects custom MCT offsets that cannot be serialized"
 }
 
 test "encoder rejects a singular custom MCT before building component planes" {
-    const singular = [_]f32{0} ** 9;
+    const singular = @as([9]f32, @splat(0));
     const identity = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
     const offsets = [_]f32{ 0, 0, 0 };
     const matrix = color_transform.CustomMctMatrix{
@@ -1702,7 +1702,7 @@ test "encoder rejects a singular custom MCT before building component planes" {
         .multiple_component_transform = true,
         .custom_mct = matrix,
     };
-    const pixels = [_]u8{0} ** 12;
+    const pixels = @as([12]u8, @splat(0));
     try std.testing.expectError(error.InvalidCustomMct, encodeU8Bytes(std.testing.allocator, &pixels, &params));
 }
 
@@ -1734,7 +1734,7 @@ test "encoder rejects a finite custom MCT that can overflow centered samples" {
         .multiple_component_transform = true,
         .custom_mct = matrix,
     };
-    const pixels = [_]u8{0} ** 12;
+    const pixels = @as([12]u8, @splat(0));
     try std.testing.expectError(error.InvalidCustomMct, encodeU8Bytes(std.testing.allocator, &pixels, &params));
 }
 

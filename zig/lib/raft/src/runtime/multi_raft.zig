@@ -48,6 +48,9 @@ pub const RuntimeConfig = struct {
     snapshot_transport_completion_timeout_ms: u64 = 10 * 60_000,
     max_pending_apply_tasks: usize = std.math.maxInt(usize),
     max_pending_apply_bytes: usize = std.math.maxInt(usize),
+    max_pending_persistence_tasks: usize = 4,
+    max_pending_persistence_bytes: usize = 16 * 1024 * 1024,
+    max_single_persistence_bytes: usize = 64 * 1024 * 1024,
     /// Hard ceiling for the one-Ready liveness exception when the apply queue
     /// is empty. Operators should size this above the largest accepted entry
     /// or snapshot representation while keeping it below an OOM-scale value.
@@ -192,6 +195,9 @@ pub const HostMetrics = struct {
     pending_snapshot_submissions: usize = 0,
     pending_apply_tasks: usize = 0,
     pending_apply_bytes: usize = 0,
+    pending_persistence_tasks: usize = 0,
+    pending_persistence_bytes: usize = 0,
+    pending_persistence_age_ms: u64 = 0,
     pending_snapshot_bytes: usize = 0,
     snapshot_admission_denials: usize = 0,
     transport_queue_denials: usize = 0,
@@ -250,6 +256,7 @@ const ReadyRecoveryAttempt = struct {
     group_id: core.types.GroupId,
     outbound: bool,
     apply: bool,
+    persistence: bool = false,
     spent: bool = false,
 
     fn crossIrreversibleBoundary(self: *@This()) void {
@@ -258,6 +265,8 @@ const ReadyRecoveryAttempt = struct {
             self.host.consumeRecoveryPermit(self.group_id, .outbound_ready_too_large);
         if (self.apply)
             self.host.consumeRecoveryPermit(self.group_id, .apply_ready_too_large);
+        if (self.persistence)
+            self.host.consumeRecoveryPermit(self.group_id, .persistence_ready_too_large);
         self.spent = true;
     }
 };
@@ -275,7 +284,7 @@ const PendingApplyTask = struct {
     conf_state: ?core.types.ConfState,
     approx_bytes: usize,
 
-    fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);
@@ -292,7 +301,7 @@ const SnapshotBuildRequest = struct {
     source: storage_iface.SnapshotSource,
     metadata: core.types.SnapshotMetadata,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.source.deinit();
         self.metadata.deinit(std.heap.page_allocator);
         self.* = undefined;
@@ -315,7 +324,7 @@ const SnapshotBuildResult = union(enum) {
         cause: anyerror,
     },
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .success => |*result| {
                 result.metadata.deinit(std.heap.page_allocator);
@@ -351,7 +360,7 @@ const SnapshotBuildWorker = struct {
         self.future = try self.io_impl.io().concurrent(run, .{self});
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const io = self.io_impl.io();
         self.mutex.lockUncancelable(io);
         self.stopping = true;
@@ -490,7 +499,7 @@ const SnapshotCandidate = struct {
     retry_attempt: u8 = 0,
     retry_after_ns: u64 = 0,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.conf_state.deinit(alloc);
         self.* = undefined;
     }
@@ -515,6 +524,21 @@ fn snapshotRetryDelayNs(attempt: u8) u64 {
     return @min(snapshot_retry_base_ns << shift, snapshot_retry_max_ns);
 }
 
+const PendingPersistence = struct {
+    operation: storage_iface.PendingReadyPersistence,
+    ready: core.Ready,
+    incarnation: u64,
+    bytes: usize,
+    started_ns: u64,
+    kind: enum { ready, maintenance, snapshot } = .ready,
+    failure: ?anyerror = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.operation.deinit();
+        self.ready.deinit(alloc);
+    }
+};
+
 pub const MultiRaft = struct {
     alloc: std.mem.Allocator,
     cfg: RuntimeConfig,
@@ -532,6 +556,10 @@ pub const MultiRaft = struct {
         snapshot_transport_iface.SnapshotAttemptKey,
     ) = .empty,
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    pending_persistence: std.AutoHashMapUnmanaged(core.types.GroupId, PendingPersistence) = .empty,
+    pending_persistence_bytes: usize = 0,
+    oldest_pending_persistence_ns: std.atomic.Value(u64) = .init(0),
+    persistence_wake: ?storage_iface.PersistenceWake = null,
     apply_group_heads: std.AutoHashMapUnmanaged(core.types.GroupId, usize) = .empty,
     apply_cursor: usize = 0,
     pending_snapshot_bytes: std.atomic.Value(usize) = .init(0),
@@ -562,6 +590,9 @@ pub const MultiRaft = struct {
     }
 
     pub fn deinit(self: *MultiRaft) void {
+        var persistence = self.pending_persistence.valueIterator();
+        while (persistence.next()) |pending| pending.deinit(self.alloc);
+        self.pending_persistence.deinit(self.alloc);
         if (self.snapshot_worker) |worker| {
             worker.deinit();
             self.alloc.destroy(worker);
@@ -594,6 +625,7 @@ pub const MultiRaft = struct {
     pub fn addGroup(self: *MultiRaft, cfg: group_mod.GroupConfig) !void {
         if (self.groups.count() >= self.cfg.max_groups) return error.MaxGroupsExceeded;
         if (self.groups.contains(cfg.group_id)) return error.GroupAlreadyExists;
+        try self.pending_persistence.ensureTotalCapacity(self.alloc, @intCast(self.groups.count() + 1));
 
         // A drain can quarantine at most one entry per registered group. Pay
         // this allocation on infrequent topology admission, not once per Raft
@@ -786,6 +818,12 @@ pub const MultiRaft = struct {
     pub fn removeGroup(self: *MultiRaft, group_id: core.types.GroupId) bool {
         const incarnation = self.group_incarnations.get(group_id) orelse return false;
         const removed = self.groups.fetchRemove(group_id) orelse return false;
+        if (self.pending_persistence.fetchRemove(group_id)) |entry| {
+            var pending = entry.value;
+            self.pending_persistence_bytes -= pending.bytes;
+            self.refreshPersistenceAge();
+            pending.deinit(self.alloc);
+        }
         _ = self.group_incarnations.remove(group_id);
         self.removeSnapshotCandidate(group_id);
         if (self.snapshot_worker) |worker| worker.retireGroup(group_id, incarnation);
@@ -802,6 +840,7 @@ pub const MultiRaft = struct {
         self.cancelPendingSnapshotSubmissionsForGroup(group_id, incarnation);
         _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .outbound_ready_too_large });
         _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .apply_ready_too_large });
+        _ = self.recovery_permits.remove(.{ .group_id = group_id, .reason = .persistence_ready_too_large });
         var grp = removed.value;
         grp.deinit();
         _ = self.scheduler.unregisterGroup(group_id);
@@ -846,6 +885,7 @@ pub const MultiRaft = struct {
         const configured_limit = switch (quarantine.reason) {
             .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes,
             .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
+            .persistence_ready_too_large => self.cfg.max_single_persistence_bytes,
         };
         if (options.new_limit_bytes) |new_limit| {
             if (new_limit < quarantine.observed_bytes or
@@ -904,6 +944,7 @@ pub const MultiRaft = struct {
             const configured_limit = switch (quarantine.reason) {
                 .outbound_ready_too_large => self.cfg.max_single_outbound_ready_bytes,
                 .apply_ready_too_large => self.cfg.max_single_apply_ready_bytes,
+                .persistence_ready_too_large => self.cfg.max_single_persistence_bytes,
             };
             statuses[initialized] = .{
                 .group_id = group_id.*,
@@ -970,6 +1011,15 @@ pub const MultiRaft = struct {
 
     pub fn tickGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        if (self.pending_persistence.get(group_id)) |pending| {
+            const hard = grp.status().hard;
+            // A timeout cannot start another local election before this one
+            // has durably recorded its term/vote and sent the retained vote
+            // messages. Inbound traffic still progresses; established-term
+            // leaders retain their heartbeat and quorum clocks.
+            if (hard.current_term != pending.operation.durable_term or
+                hard.voted_for != pending.operation.durable_vote) return;
+        }
         grp.tick();
         if (grp.hasReady()) self.scheduler.noteReady(group_id);
     }
@@ -1071,9 +1121,32 @@ pub const MultiRaft = struct {
 
     pub fn metricsSnapshot(self: *const MultiRaft) HostMetrics {
         var snapshot = self.metrics;
+        snapshot.pending_persistence_tasks = self.pending_persistence.count();
+        snapshot.pending_persistence_bytes = self.pending_persistence_bytes;
+        const oldest = self.oldest_pending_persistence_ns.load(.acquire);
+        snapshot.pending_persistence_age_ms = if (oldest == 0) 0 else (clock.monotonicNs() -| oldest) / std.time.ns_per_ms;
         snapshot.pending_snapshot_bytes = self.pending_snapshot_bytes.load(.acquire);
         snapshot.snapshot_admission_denials = self.snapshot_admission_denials.load(.acquire);
         return snapshot;
+    }
+
+    /// Safe for lock-free health probes; these never inspect the host-owned map.
+    pub fn persistenceIsStalled(self: *const MultiRaft, timeout_ns: u64) bool {
+        return self.persistenceIsStalledAt(clock.monotonicNs(), timeout_ns);
+    }
+
+    pub fn persistenceIsStalledAt(self: *const MultiRaft, now_ns: u64, timeout_ns: u64) bool {
+        const oldest = self.oldest_pending_persistence_ns.load(.acquire);
+        return oldest != 0 and now_ns -| oldest >= timeout_ns;
+    }
+
+    fn refreshPersistenceAge(self: *MultiRaft) void {
+        var oldest: u64 = 0;
+        var it = self.pending_persistence.valueIterator();
+        while (it.next()) |pending| {
+            if (oldest == 0 or pending.started_ns < oldest) oldest = pending.started_ns;
+        }
+        self.oldest_pending_persistence_ns.store(oldest, .release);
     }
 
     pub fn stepWithDisposition(self: *MultiRaft, group_id: core.types.GroupId, msg: core.Message) !StepDisposition {
@@ -1245,7 +1318,7 @@ pub const MultiRaft = struct {
         while (it.next()) |entry| {
             if (out.items.len >= max_groups) break;
             if (self.scheduler.isQuiesced(entry.key_ptr.*)) continue;
-            if (!entry.value_ptr.hasReady()) continue;
+            if (!entry.value_ptr.hasReady() and !self.pending_persistence.contains(entry.key_ptr.*)) continue;
             try out.append(alloc, entry.key_ptr.*);
         }
 
@@ -1262,6 +1335,7 @@ pub const MultiRaft = struct {
         var oversized_ready_groups = std.ArrayListUnmanaged(OversizedReadyGroup){
             .items = oversized_ready_group_buf[0..0],
             .capacity = oversized_ready_group_buf.len,
+            .pointer_stability = .{},
         };
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (batch != null) self.metrics.persist_batches += 1;
@@ -1464,13 +1538,90 @@ pub const MultiRaft = struct {
         oversized_ready_groups: *std.ArrayListUnmanaged(OversizedReadyGroup),
     ) !bool {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
+        if (self.pending_persistence.getPtr(group_id)) |pending| {
+            if (pending.failure) |err| return err;
+            if (pending.operation.isComplete()) {
+                const pressure = summarizeReady(group_id, pending.ready);
+                const apply_tasks: usize = if (pending.ready.snapshot != null or pending.ready.committed_entries.len != 0 or pending.ready.read_states.len != 0) 1 else 0;
+                const apply_bytes = pressure.snapshot_bytes +| pressure.committed_entry_bytes +| approxReadStatesSize(pending.ready.read_states);
+                const outbound_admitted = self.hasOutboundCapacity(outbox.len() +| pressure.message_count, outbox.approxBytes() +| pressure.message_bytes) or
+                    (self.pending_outbox.isEmpty() and outbox.isEmpty() and pressure.message_count <= self.cfg.max_pending_outbound_messages);
+                const apply_admitted = self.hasApplyCapacity(apply_tasks, apply_bytes) or
+                    (self.pending_apply.items.len == 0 and apply_tasks <= self.cfg.max_pending_apply_tasks);
+                if (outbound_admitted and apply_admitted) {
+                    pending.operation.complete() catch |err| {
+                        pending.failure = err;
+                        return err;
+                    };
+                    if (pending.kind == .ready) self.handleAsyncReady(group_id, grp, pending.ready, pending.ready.messages, outbox, false, diagnostics) catch |err| {
+                        pending.failure = err;
+                        return err;
+                    };
+                    if (pending.kind == .snapshot) {
+                        const completed = &self.snapshot_publish.?.success;
+                        try grp.compactAppliedLogTo(completed.compact_index);
+                        self.metrics.snapshot_compaction_completions += 1;
+                        self.metrics.snapshot_compaction_bytes += @intCast(completed.payload.len());
+                        self.metrics.snapshot_compaction_build_ns += completed.build_ns;
+                    }
+                    const entry = self.pending_persistence.fetchRemove(group_id).?;
+                    var completed = entry.value;
+                    const published_snapshot = completed.kind == .snapshot;
+                    self.pending_persistence_bytes -= completed.bytes;
+                    self.refreshPersistenceAge();
+                    completed.deinit(self.alloc);
+                    if (published_snapshot) self.clearSnapshotPublish(&self.snapshot_publish.?);
+                    self.scheduler.completeReady(group_id, true);
+                    return true;
+                }
+            }
+            // Completed I/O can still wait for apply/transport capacity. Keep
+            // durability-independent heartbeats live in both waiting states.
+            const heartbeat_messages = self.cfg.max_pending_outbound_messages -| self.pending_outbox.len() -| outbox.len();
+            const heartbeat_bytes = if (self.pending_outbox.isEmpty() and outbox.isEmpty())
+                @max(self.cfg.max_pending_outbound_bytes, self.cfg.max_single_outbound_ready_bytes)
+            else
+                self.cfg.max_pending_outbound_bytes -| self.pending_outbox.approxBytes() -| outbox.approxBytes();
+            const heartbeats = try grp.raw_node.takeDurabilityIndependentControl(self.alloc, pending.operation.durable_term, pending.operation.durable_index, pending.kind != .ready, heartbeat_messages, heartbeat_bytes);
+            defer core.message.freeMessages(self.alloc, heartbeats);
+            try outbox.appendMessages(self.alloc, group_id, pending.incarnation, heartbeats);
+            var reads_progressed = false;
+            if (pending.kind != .ready and self.hasApplyCapacity(1, approxReadStatesSize(grp.raw_node.raft.read_states.items))) {
+                const reads = try grp.raw_node.takeDurableReadStates(self.alloc, pending.operation.durable_index);
+                defer {
+                    for (reads) |*read| read.deinit(self.alloc);
+                    self.alloc.free(reads);
+                }
+                if (reads.len != 0) {
+                    try self.enqueueApply(group_id, null, &.{}, reads, grp.status().conf_state);
+                    reads_progressed = true;
+                }
+            }
+            self.scheduler.deferReady(group_id);
+            return heartbeats.len != 0 or reads_progressed;
+        }
+        if (grp.asyncStorageWrites() and persist_batch == null and self.pending_persistence.count() < self.cfg.max_pending_persistence_tasks) {
+            if (self.hooks.group_storage) |storage| if (storage.vtable.begin_maintenance) |begin| {
+                var admission = self.persistenceAdmission(group_id);
+                if (try begin(storage.ptr, group_id, &admission, self.persistence_wake)) |operation| {
+                    self.consumeRecoveryPermit(group_id, .persistence_ready_too_large);
+                    self.retainMaintenance(group_id, operation, .maintenance);
+                    return true;
+                }
+                if (admission.observed_bytes > admission.max_bytes) {
+                    if (self.pending_persistence.count() == 0) oversized_ready_groups.appendAssumeCapacity(.{ .group_id = group_id, .reason = .persistence_ready_too_large, .observed_bytes = admission.observed_bytes, .configured_limit = self.cfg.max_single_persistence_bytes });
+                    self.scheduler.deferReady(group_id);
+                    return false;
+                }
+            };
+        }
         if (!grp.hasReady()) {
             self.scheduler.completeReady(group_id, false);
             return false;
         }
 
         const ready_build_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        var ready = grp.ready();
+        var ready = grp.raw_node.prepareReady();
         if (diagnostics) |diag| diag.ready_build_elapsed_ns = clock.elapsedSinceNs(ready_build_start_ns);
         if (ready.isEmpty()) {
             self.scheduler.completeReady(group_id, false);
@@ -1479,6 +1630,31 @@ pub const MultiRaft = struct {
 
         const ready_pressure = summarizeReady(group_id, ready);
         const async_storage_writes = grp.asyncStorageWrites();
+        const persistence_bytes = ownedMessageBytes(ready.messages) +| (3 *| ready_pressure.unstable_entry_bytes) +| ready_pressure.committed_entry_bytes +| approxReadStatesSize(ready.read_states) +| (if (ready.snapshot) |snapshot| if (snapshot.shared_data == null) 2 *| snapshot.data.len else 0 else 0) +| 1024;
+        const has_async_persistence = async_storage_writes and persist_batch == null and
+            self.hooks.group_storage != null and self.hooks.group_storage.?.vtable.begin_ready != null;
+        const persistence_recovery_permit = has_async_persistence and
+            persistence_bytes > self.cfg.max_single_persistence_bytes and
+            self.recoveryPermitAllows(group_id, .persistence_ready_too_large, persistence_bytes);
+        if (has_async_persistence and ready.requiresPersistence() and
+            persistence_bytes > self.cfg.max_single_persistence_bytes and !persistence_recovery_permit)
+        {
+            oversized_ready_groups.appendAssumeCapacity(.{
+                .group_id = group_id,
+                .reason = .persistence_ready_too_large,
+                .observed_bytes = persistence_bytes,
+                .configured_limit = self.cfg.max_single_persistence_bytes,
+            });
+            return false;
+        }
+        if (has_async_persistence and ready.requiresPersistence() and
+            (self.pending_persistence.count() >= self.cfg.max_pending_persistence_tasks or
+                (self.pending_persistence.count() != 0 and
+                    persistence_bytes > self.cfg.max_pending_persistence_bytes -| self.pending_persistence_bytes)))
+        {
+            self.scheduler.deferReady(group_id);
+            return false;
+        }
         if (diagnostics) |diag| {
             diag.message_count = ready_pressure.message_count;
             diag.message_bytes = ready_pressure.message_bytes;
@@ -1614,6 +1790,7 @@ pub const MultiRaft = struct {
             .group_id = group_id,
             .outbound = outbound_recovery_permit,
             .apply = apply_recovery_permit,
+            .persistence = persistence_recovery_permit,
         };
 
         const snapshot_throttle_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
@@ -1645,7 +1822,10 @@ pub const MultiRaft = struct {
         const clone_messages_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         var owned_ready_messages: ?[]core.Message = null;
         defer if (owned_ready_messages) |messages| core.message.freeMessages(self.alloc, messages);
-        const ready_messages = if (async_storage_writes or containsConfChange(ready.committed_entries)) blk: {
+        var retained_ready: ?core.Ready = if (has_async_persistence) try ready.clone(self.alloc) else null;
+        defer if (retained_ready) |*retained| retained.deinit(self.alloc);
+        if (retained_ready) |retained| ready = retained;
+        const ready_messages = if (!has_async_persistence and (async_storage_writes or containsConfChange(ready.committed_entries))) blk: {
             owned_ready_messages = try core.message.cloneMessages(self.alloc, ready.messages);
             break :blk owned_ready_messages.?;
         } else ready.messages;
@@ -1664,9 +1844,37 @@ pub const MultiRaft = struct {
 
         if (try grp.applyCommittedConfChanges(ready.committed_entries)) {
             ready.conf_state = grp.status().conf_state;
+            if (retained_ready) |*retained| {
+                const conf = try ready.conf_state.?.clone(self.alloc);
+                if (retained.conf_state) |*previous| previous.deinit(self.alloc);
+                retained.conf_state = conf;
+                ready.conf_state = conf;
+            }
         }
 
         const persist_ready_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+        if (async_storage_writes and ready.requiresPersistence() and persist_batch == null) {
+            if (self.hooks.group_storage) |storage| {
+                if (storage.vtable.begin_ready) |begin| {
+                    if (try begin(storage.ptr, group_id, ready, self.persistence_wake)) |operation| {
+                        grp.raw_node.acceptPreparedReady(ready);
+                        self.pending_persistence.putAssumeCapacity(group_id, .{
+                            .operation = operation,
+                            .ready = retained_ready.?,
+                            .incarnation = self.group_incarnations.get(group_id).?,
+                            .bytes = persistence_bytes,
+                            .started_ns = @max(1, clock.monotonicNs()),
+                        });
+                        self.refreshPersistenceAge();
+                        retained_ready = null;
+                        self.pending_persistence_bytes += persistence_bytes;
+                        self.scheduler.deferReady(group_id);
+                        return true;
+                    }
+                }
+            }
+        }
+        grp.raw_node.acceptPreparedReady(ready);
         if (ready.requiresPersistence()) {
             if (persist_batch) |batch| {
                 if (diagnostics) |diag| diag.persist_ready_detail.used_batch = true;
@@ -2257,6 +2465,27 @@ pub const MultiRaft = struct {
                     return;
                 }
                 const group_storage = self.hooks.group_storage orelse return;
+                if (self.scheduler.isQuiesced(completed.group_id)) return;
+                if (self.pending_persistence.contains(completed.group_id)) return;
+                if (grp.asyncStorageWrites()) {
+                    if (group_storage.vtable.begin_compact_snapshot) |begin| {
+                        if (self.pending_persistence.count() >= self.cfg.max_pending_persistence_tasks) return;
+                        var admission = self.persistenceAdmission(completed.group_id);
+                        const operation = begin(group_storage.ptr, completed.group_id, completed.metadata, completed.payload, completed.compact_index, &admission, self.persistence_wake) catch |err| {
+                            try self.deferSnapshotPublication(result, err);
+                            return;
+                        };
+                        if (operation) |pending| {
+                            self.consumeRecoveryPermit(completed.group_id, .persistence_ready_too_large);
+                            self.retainMaintenance(completed.group_id, pending, .snapshot);
+                            return;
+                        }
+                        if (admission.observed_bytes > admission.max_bytes) {
+                            if (self.pending_persistence.count() == 0) try self.scheduler.quarantineGroup(completed.group_id, .persistence_ready_too_large, admission.observed_bytes, self.cfg.max_single_persistence_bytes);
+                            return;
+                        }
+                    }
+                }
                 const publish_result = switch (completed.payload) {
                     .bytes => |bytes| group_storage.compactSnapshot(completed.group_id, .{
                         .metadata = completed.metadata,
@@ -2271,27 +2500,7 @@ pub const MultiRaft = struct {
                     ),
                 };
                 publish_result catch |err| {
-                    self.metrics.snapshot_compaction_failures += 1;
-                    self.snapshot_publish_retry_attempt +|= 1;
-                    self.snapshot_publish_retry_after_ns = clock.monotonicNs() + snapshotRetryDelayNs(self.snapshot_publish_retry_attempt);
-                    self.metrics.snapshot_compaction_retries += 1;
-                    std.log.warn("raft snapshot compaction publish deferred group_id={d} applied_index={d} attempt={d} error={s}", .{
-                        completed.group_id,
-                        completed.metadata.index,
-                        self.snapshot_publish_retry_attempt,
-                        @errorName(err),
-                    });
-                    if (self.snapshot_publish_retry_attempt >= snapshot_publish_inline_retry_limit) {
-                        try self.queueSnapshotCandidate(
-                            completed.group_id,
-                            completed.metadata.index,
-                            completed.incarnation,
-                            completed.metadata.conf_state,
-                            true,
-                        );
-                        self.clearSnapshotPublish(result);
-                        self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
-                    }
+                    try self.deferSnapshotPublication(result, err);
                     return;
                 };
                 try grp.compactAppliedLogTo(completed.compact_index);
@@ -2301,6 +2510,41 @@ pub const MultiRaft = struct {
                 self.clearSnapshotPublish(result);
             },
         }
+    }
+
+    fn deferSnapshotPublication(self: *MultiRaft, result: *SnapshotBuildResult, err: anyerror) !void {
+        const completed = &result.success;
+        self.metrics.snapshot_compaction_failures += 1;
+        self.snapshot_publish_retry_attempt +|= 1;
+        self.snapshot_publish_retry_after_ns = clock.monotonicNs() + snapshotRetryDelayNs(self.snapshot_publish_retry_attempt);
+        self.metrics.snapshot_compaction_retries += 1;
+        std.log.warn("raft snapshot compaction publish deferred group_id={d} applied_index={d} attempt={d} error={s}", .{
+            completed.group_id,
+            completed.metadata.index,
+            self.snapshot_publish_retry_attempt,
+            @errorName(err),
+        });
+        if (self.snapshot_publish_retry_attempt >= snapshot_publish_inline_retry_limit) {
+            try self.queueSnapshotCandidate(completed.group_id, completed.metadata.index, completed.incarnation, completed.metadata.conf_state, true);
+            self.clearSnapshotPublish(result);
+            self.metrics.snapshot_compaction_candidates = self.snapshot_candidates.count();
+        }
+    }
+
+    fn persistenceAdmission(self: *MultiRaft, group_id: core.types.GroupId) storage_iface.PersistenceAdmission {
+        var limit = self.cfg.max_single_persistence_bytes;
+        if (self.recovery_permits.get(.{ .group_id = group_id, .reason = .persistence_ready_too_large })) |permit| {
+            if (self.scheduler.round() <= permit.expires_after_round) limit = @max(limit, permit.allowance_bytes);
+        }
+        if (self.pending_persistence.count() != 0) limit = @min(limit, self.cfg.max_pending_persistence_bytes -| self.pending_persistence_bytes);
+        return .{ .max_bytes = limit };
+    }
+
+    fn retainMaintenance(self: *MultiRaft, group_id: core.types.GroupId, operation: storage_iface.PendingReadyPersistence, kind: @FieldType(PendingPersistence, "kind")) void {
+        self.pending_persistence.putAssumeCapacity(group_id, .{ .operation = operation, .ready = .{}, .kind = kind, .incarnation = self.group_incarnations.get(group_id).?, .bytes = operation.owned_bytes, .started_ns = @max(1, clock.monotonicNs()) });
+        self.pending_persistence_bytes +|= operation.owned_bytes;
+        self.refreshPersistenceAge();
+        self.scheduler.noteReady(group_id);
     }
 
     fn clearSnapshotPublish(self: *MultiRaft, result: *SnapshotBuildResult) void {
@@ -2777,6 +3021,18 @@ fn approxReadStatesSize(read_states: []const core.ReadState) usize {
     return total;
 }
 
+fn ownedMessageBytes(messages: []const core.Message) usize {
+    var bytes: usize = 0;
+    for (messages) |msg| {
+        bytes +|= @sizeOf(core.Message) +| msg.context.len +| core.types.entriesApproxEncodedSize(msg.entries);
+        if (msg.snapshot) |snapshot| if (snapshot.shared_data == null) {
+            bytes +|= snapshot.data.len;
+        };
+        bytes +|= ownedMessageBytes(msg.responses);
+    }
+    return bytes;
+}
+
 test "snapshot candidate coalescing ignores later read-only apply work" {
     var host = MultiRaft.init(std.testing.allocator, .{ .applied_log_retained_entries = 2 }, .{});
     defer host.deinit();
@@ -2837,7 +3093,7 @@ const GroupBatchBuilder = struct {
     group_id: core.types.GroupId,
     messages: std.ArrayListUnmanaged(core.Message) = .empty,
 
-    fn deinit(self: *GroupBatchBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GroupBatchBuilder, alloc: std.mem.Allocator) void {
         self.messages.deinit(alloc);
         self.* = undefined;
     }
@@ -2848,7 +3104,7 @@ const PeerBatchBuilder = struct {
     groups: std.ArrayListUnmanaged(GroupBatchBuilder) = .empty,
     group_indexes: std.AutoHashMapUnmanaged(core.types.GroupId, usize) = .empty,
 
-    fn deinit(self: *PeerBatchBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PeerBatchBuilder, alloc: std.mem.Allocator) void {
         for (self.groups.items) |*group| group.deinit(alloc);
         self.groups.deinit(alloc);
         self.group_indexes.deinit(alloc);
@@ -2864,7 +3120,7 @@ const TransportOutbox = struct {
     snapshot_cursor: usize = 0,
     approx_bytes: usize = 0,
 
-    fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
         for (self.snapshot_items.items) |*item| item.message.deinit(alloc);
         self.items.deinit(alloc);

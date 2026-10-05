@@ -15,8 +15,8 @@
 
 const std = @import("std");
 
-const graph_query_mod = @import("../../graph/query.zig");
-const db_mod = @import("../../storage/db/control_root.zig");
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const db_mod = @import("antfly_local_sources").storage_db_control_root;
 
 pub const GraphMetricFanInShardRequest = struct {
     req: db_mod.types.SearchRequest,

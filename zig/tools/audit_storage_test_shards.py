@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Audit authoritative storage-test discovery and exactly-one shard ownership."""
 
 from __future__ import annotations
@@ -32,9 +47,24 @@ def test_modules(root: Path) -> Iterable[tuple[Path, tuple[str, ...]]]:
             yield source, module_names(root, source)
 
 
-def manifest_sources(root: Path, manifest: Path) -> list[Path]:
+def manifest_sources(
+    root: Path, manifest: Path, catalog: Path | None = None
+) -> list[Path]:
     imports = MANIFEST_IMPORT.findall(manifest.read_text(encoding="utf-8"))
-    return [(manifest.parent / imported).resolve() for imported in imports]
+    sources = [(manifest.parent / imported).resolve() for imported in imports]
+    if catalog is None:
+        return sources
+    entries = dict(
+        re.findall(r'pub const (\w+) = @import\("([^"\n]+)"\);', catalog.read_text())
+    )
+    names = re.findall(
+        r'_\s*=\s*@import\("antfly_local_sources"\)\.(\w+);', manifest.read_text()
+    )
+    for name in names:
+        if name not in entries:
+            raise ValueError(f"unknown local source in storage manifest: {name}")
+        sources.append((catalog.parent / entries[name]).resolve())
+    return [source for source in sources if source.is_relative_to(root)]
 
 
 def audit_manifest(
@@ -42,11 +72,12 @@ def audit_manifest(
     manifest: Path,
     filters: Sequence[str],
     dedicated_sources: Sequence[Path] = (),
+    catalog: Path | None = None,
 ) -> list[str]:
     root = root.resolve()
     manifest = manifest.resolve()
     declared = {source.resolve(): names for source, names in test_modules(root)}
-    imported = manifest_sources(root, manifest)
+    imported = manifest_sources(root, manifest, catalog)
     counts = Counter(imported)
     failures: list[str] = []
 
@@ -148,6 +179,8 @@ def main() -> int:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--filter", action="append", default=[])
+    parser.add_argument("--local-root", type=Path)
+    parser.add_argument("--local-catalog", type=Path)
     parser.add_argument(
         "--dedicated",
         type=Path,
@@ -165,7 +198,17 @@ def main() -> int:
             "--runtime-partition-source and --runtime-partition-filter must be used together"
         )
 
-    failures = audit_manifest(args.root, args.manifest, args.filter, args.dedicated)
+    if bool(args.local_root) != bool(args.local_catalog):
+        parser.error("--local-root and --local-catalog must be used together")
+    failures = audit_manifest(
+        args.root, args.manifest, args.filter, args.dedicated, args.local_catalog
+    )
+    if args.local_root:
+        failures.extend(
+            audit_manifest(
+                args.local_root, args.manifest, args.filter, catalog=args.local_catalog
+            )
+        )
     if args.runtime_partition_source:
         failures.extend(
             audit_runtime_partition(

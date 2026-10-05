@@ -1950,6 +1950,152 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         )
 
 
+@pytest.mark.parametrize(
+    "index_after_chunks", [False, True], ids=["before_rows", "after_chunks"]
+)
+def test_artifact_chunk_embeddings_complete_background_publication(
+    stateful_api, openai_embedder, index_after_chunks
+):
+    """#934: searchable chunk vectors must autonomously settle complete readiness."""
+    table_name = f"artifact_chunk_publication_{time.time_ns()}"
+    index_name = "document_vectors"
+    embedding_name = "document_chunk_dense_v1"
+    stateful_api.create_table(table_name, num_shards=1)
+    _provision_artifact_full_text(stateful_api, table_name, chunk_size=128)
+
+    rows = {}
+    for i in range(8):
+        text = "\n\n".join(
+            f"Document {i} paragraph {p}. "
+            + "garden ledger harbor copper meadow lantern invoice railway violin compost "
+            * 6
+            for p in range(4)
+        )
+        rows[f"doc-{i}"] = {
+            "filename": f"document-{i}.txt",
+            "mime_type": "text/plain",
+            "version": "1",
+            "url": "data:text/plain;base64," + base64.b64encode(text.encode()).decode(),
+        }
+
+    def write_rows():
+        # Ordinary asynchronous ingestion is essential: full_index or an idle
+        # drain can perform the final publication that the background path owes.
+        written = stateful_api.batch_write(table_name, inserts=rows, sync_level="write")
+        assert written["inserted"] == len(rows)
+
+    def chunk_manifests():
+        manifests = {
+            key: _manifest_ready(stateful_api, table_name, key) for key in rows
+        }
+        if any(
+            manifest is None or manifest.get("chunk_count", 0) <= 1
+            for manifest in manifests.values()
+        ):
+            return None
+        return manifests
+
+    if index_after_chunks:
+        write_rows()
+        assert wait_until(chunk_manifests, timeout_s=90.0, interval_s=0.5) is not None
+
+    stateful_api.put(
+        f"{_table_artifact_path(table_name, embedding_name)}/enrichment",
+        {
+            "kind": "embedding",
+            "field": "text",
+            "source_artifact_name": "document_chunks_v1",
+            "expected_dims": 3,
+            "producer_json": {
+                "provider": "openai",
+                "model": "text-embedding-3-small",
+                "url": openai_embedder,
+            },
+        },
+    )
+    assert (
+        wait_until(
+            lambda: _table_has_artifact_enrichment(
+                stateful_api, table_name, embedding_name, "embedding"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+    assert_created_index(
+        stateful_api.create_index(
+            table_name,
+            index_name,
+            {
+                "type": "embeddings",
+                "dimension": 3,
+                "sources": [{"artifact": embedding_name}],
+            },
+        ),
+        index_name,
+        "embeddings",
+    )
+    if not index_after_chunks:
+        write_rows()
+
+    manifests = wait_until(chunk_manifests, timeout_s=90.0, interval_s=0.5)
+    assert manifests is not None
+    expected_vectors = sum(manifest["chunk_count"] for manifest in manifests.values())
+    assert expected_vectors > len(rows)
+    last_observation = {}
+
+    def complete_publication():
+        detail = stateful_api.get_index(table_name, index_name)
+        last_observation["detail"] = detail
+        status = detail.get("status", {})
+        if (
+            status.get("backfill_state") == "ready"
+            and status.get("readiness", {}).get("state") == "ready"
+            and status.get("searchable_vectors") == expected_vectors
+        ):
+            return detail
+        return None
+
+    detail = wait_until(complete_publication, timeout_s=120.0, interval_s=0.5)
+    assert detail is not None, json.dumps(last_observation, indent=2, sort_keys=True)
+    status = detail["status"]
+    assert status["backfill_active"] is False
+    assert status["rebuilding"] is False
+    assert status["backfill_progress"] == 1.0
+    assert status["dense_publish_pending"] is False
+    assert status["publication"] == {
+        "target_vectors": expected_vectors,
+        "searchable_vectors": expected_vectors,
+        "complete": True,
+    }
+    assert (
+        status["dense_replay_applied_sequence"]
+        >= status["dense_replay_target_sequence"]
+    )
+    assert status["coverage"]["complete"] is True
+    assert status["coverage"]["healthy"] is True
+    assert status["coverage"]["source_total"] == len(rows)
+    assert status["coverage"]["covered"] == len(rows)
+    assert status["readiness"]["pending_reasons"] == []
+    assert status["milestones"]["complete"]["reached"] is True
+    sources = status["readiness"]["sources"]
+    assert len(sources) == 1
+    assert sources[0]["artifact"] == embedding_name
+    assert sources[0]["state"] == "ready"
+    assert sources[0]["pending_reasons"] == []
+
+    result = stateful_api.query_table(
+        table_name,
+        {
+            "semantic_search": "garden harbor",
+            "indexes": [index_name],
+            "limit": expected_vectors,
+        },
+    )
+    assert set(_query_hit_ids(result)) == set(rows)
+
+
 def test_artifact_backed_chunk_embeddings_are_semantic_searchable(
     stateful_api, openai_embedder
 ):

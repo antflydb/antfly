@@ -18,14 +18,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const admin_api = @import("../../admin/mod.zig");
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const routes = @import("../../raft/transport/routes.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 
@@ -145,7 +145,7 @@ pub const Client = struct {
         base_uri: []const u8,
         options: PrimaryStatusOptions,
     ) !ParsedOutput(admin_api.HAPrimaryStatusResponse) {
-        var uri = try join(self.alloc, base_uri, admin_api.routes.ha_primary_status);
+        var uri = try join(self.alloc, base_uri, admin_api.routes.hot_standby_primary_status);
         defer self.alloc.free(uri);
         if (options.max_lag_lsn) |max_lag_lsn| {
             uri = try appendQueryU64(self.alloc, uri, "max_lag_lsn", max_lag_lsn);
@@ -171,7 +171,7 @@ pub const Client = struct {
         base_uri: []const u8,
         upstream_lsn: ?u64,
     ) !ParsedOutput(admin_api.HAStandbyStatusResponse) {
-        var uri = try join(self.alloc, base_uri, admin_api.routes.ha_standby_status);
+        var uri = try join(self.alloc, base_uri, admin_api.routes.hot_standby_standby_status);
         defer self.alloc.free(uri);
         if (upstream_lsn) |lsn| {
             uri = try appendQueryU64(self.alloc, uri, "upstream_lsn", lsn);
@@ -191,7 +191,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HACommitCheckResponse,
             base_uri,
-            admin_api.routes.ha_commit_check,
+            admin_api.routes.hot_standby_commit_check,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -207,7 +207,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HACommitAppendResponse,
             base_uri,
-            admin_api.routes.ha_commit_append,
+            admin_api.routes.hot_standby_commit_append,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -223,7 +223,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAReadCheckResponse,
             base_uri,
-            admin_api.routes.ha_read_check,
+            admin_api.routes.hot_standby_read_check,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -239,7 +239,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAWriteCheckResponse,
             base_uri,
-            admin_api.routes.ha_write_check,
+            admin_api.routes.hot_standby_write_check,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -255,7 +255,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAOwnerJobCheckResponse,
             base_uri,
-            admin_api.routes.ha_owner_job_check,
+            admin_api.routes.hot_standby_owner_job_check,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -267,7 +267,7 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
     ) !ParsedOutput(admin_api.HAReplicationSlotListResponse) {
-        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
+        const uri = try join(self.alloc, base_uri, admin_api.routes.hot_standby_replication_slots);
         defer self.alloc.free(uri);
         var result = try self.executeJson(admin_api.HAReplicationSlotListResponse, .{
             .method = .GET,
@@ -285,7 +285,7 @@ pub const Client = struct {
         initial_lsn: ?u64,
     ) !ParsedOutput(admin_api.HAReplicationSlotActionResponse) {
         try validateClientSlotName(slot_name);
-        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_replication_slots);
+        const uri = try join(self.alloc, base_uri, admin_api.routes.hot_standby_replication_slots);
         defer self.alloc.free(uri);
         const body = try std.json.Stringify.valueAlloc(
             self.alloc,
@@ -344,7 +344,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HABaseBackupBeginResponse,
             base_uri,
-            admin_api.routes.ha_base_backups,
+            admin_api.routes.hot_standby_base_backups,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -360,7 +360,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HABaseBackupFinishResponse,
             base_uri,
-            admin_api.routes.ha_base_backups_finish,
+            admin_api.routes.hot_standby_base_backups_finish,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -376,7 +376,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAStandbyBootstrapResponse,
             base_uri,
-            admin_api.routes.ha_standby_bootstrap,
+            admin_api.routes.hot_standby_standby_bootstrap,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -394,7 +394,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAStandbyUpstreamResponse,
             base_uri,
-            admin_api.routes.ha_standby_upstream,
+            admin_api.routes.hot_standby_standby_upstream,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -410,7 +410,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAFenceResponse,
             base_uri,
-            admin_api.routes.ha_fence,
+            admin_api.routes.hot_standby_fence,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -422,7 +422,7 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
     ) !ParsedOutput(admin_api.HACurrentFenceResponse) {
-        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_fence_current);
+        const uri = try join(self.alloc, base_uri, admin_api.routes.hot_standby_fence_current);
         defer self.alloc.free(uri);
         var result = try self.executeJson(admin_api.HACurrentFenceResponse, .{
             .method = .GET,
@@ -441,7 +441,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAPromotionAssessResponse,
             base_uri,
-            admin_api.routes.ha_promotion_assess,
+            admin_api.routes.hot_standby_promotion_assess,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -453,7 +453,7 @@ pub const Client = struct {
         self: *Client,
         base_uri: []const u8,
     ) !ParsedOutput(admin_api.HAPromotionResponse) {
-        const uri = try join(self.alloc, base_uri, admin_api.routes.ha_promotion_current_fence);
+        const uri = try join(self.alloc, base_uri, admin_api.routes.hot_standby_promotion_current_fence);
         defer self.alloc.free(uri);
         var result = try self.executeJson(admin_api.HAPromotionResponse, .{
             .method = .POST,
@@ -472,7 +472,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HAPromotionResponse,
             base_uri,
-            admin_api.routes.ha_promotion,
+            admin_api.routes.hot_standby_promotion,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -488,7 +488,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HARejoinAssessResponse,
             base_uri,
-            admin_api.routes.ha_rejoin_assess,
+            admin_api.routes.hot_standby_rejoin_assess,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -504,7 +504,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HARejoinAssessResponse,
             base_uri,
-            admin_api.routes.ha_rejoin_rewind,
+            admin_api.routes.hot_standby_rejoin_rewind,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -520,7 +520,7 @@ pub const Client = struct {
         var result = try self.postJson(
             admin_api.HARejoinAssessResponse,
             base_uri,
-            admin_api.routes.ha_rejoin_reseed,
+            admin_api.routes.hot_standby_rejoin_reseed,
             request,
         );
         errdefer result.deinit(self.alloc);
@@ -1333,7 +1333,7 @@ const TestPaths = struct {
     fence_wal: [:0]u8,
     backup_root: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.former_primary_log);
@@ -1372,13 +1372,13 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
-        .former_primary_log = try alloc.dupeZ(u8, former_primary_log),
-        .standby_log = try alloc.dupeZ(u8, standby_log),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress),
-        .fence_wal = try alloc.dupeZ(u8, fence_wal),
-        .backup_root = try alloc.dupeZ(u8, backup_root),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
+        .former_primary_log = try alloc.dupeSentinel(u8, former_primary_log, 0),
+        .standby_log = try alloc.dupeSentinel(u8, standby_log, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress, 0),
+        .fence_wal = try alloc.dupeSentinel(u8, fence_wal, 0),
+        .backup_root = try alloc.dupeSentinel(u8, backup_root, 0),
     };
 }
 
@@ -2632,7 +2632,7 @@ test "storage.hot_standby http client maps admin errors" {
 test "storage.hot_standby http client renders primary status sync query with OpenAPI enum spelling" {
     const alloc = std.testing.allocator;
     const standby_names = [_][]const u8{ "standby-a", "standby.b:z" };
-    var uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.ha_primary_status});
+    var uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.hot_standby_primary_status});
     uri = try appendQuerySyncPolicy(alloc, uri, .{
         .mode = .remote_write,
         .selection = .first,
@@ -2650,7 +2650,7 @@ test "storage.hot_standby http client renders primary status sync query with Ope
     try expectContains(uri, "sync_standby=standby.b%3Az");
 
     const all_names = [_][]const u8{ "standby-a", "standby-b" };
-    var all_uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.ha_primary_status});
+    var all_uri = try std.fmt.allocPrint(alloc, "http://ha-admin.test{s}", .{admin_api.routes.hot_standby_primary_status});
     all_uri = try appendQuerySyncPolicy(alloc, all_uri, .{
         .mode = .remote_apply,
         .selection = .all,

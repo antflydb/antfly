@@ -30,7 +30,7 @@ const BenchFst = struct {
     data: []u8,
     fst: fst.FST,
 
-    fn deinit(self: *BenchFst, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *BenchFst, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
     }
 };

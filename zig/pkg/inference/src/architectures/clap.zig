@@ -1312,7 +1312,7 @@ const LinearTripleData = struct {
     second: []f32,
     third: []f32,
 
-    fn deinit(self: LinearTripleData, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: LinearTripleData, allocator: std.mem.Allocator) void {
         allocator.free(self.first);
         allocator.free(self.second);
         allocator.free(self.third);

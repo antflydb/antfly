@@ -21,7 +21,7 @@
 //!
 //!   ANTFLY_ANTENNA_TIMING_GLINER25=<gliner2.5-base dir> ANTFLY_ANTENNA_TIMING_LAYA=<laya dir> \
 //!   ANTFLY_ANTENNA_TIMING_BACKEND=native|metal \
-//!     zig build test -Doptimize=ReleaseFast -- --test-filter "antenna encoder timing"
+//!     zig build test -Doptimize=fast -- --test-filter "antenna encoder timing"
 //!
 //! GLiNER2.5 is timed through its serving encoders: `encodeNative` on CPU and
 //! `encodeDevice` on Metal (the resident `optimized_v2` policy when the
@@ -184,7 +184,7 @@ fn timeLaya(a: Allocator, dir: []const u8, backend: Backend) !void {
 }
 
 test "antenna encoder timing for GLiNER2.5 base and Laya ModernBERT-large" {
-    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    if (builtin.mode != .fast) return error.SkipZigTest;
     const gliner = platform.env.getenv("ANTFLY_ANTENNA_TIMING_GLINER25");
     const laya = platform.env.getenv("ANTFLY_ANTENNA_TIMING_LAYA");
     if (gliner == null and laya == null) return error.SkipZigTest;

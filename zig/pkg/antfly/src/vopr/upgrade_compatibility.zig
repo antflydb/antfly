@@ -22,10 +22,10 @@ const std = @import("std");
 const vopr = @import("vopr");
 const data_format = @import("../common/data_format.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const storage_ha = @import("../storage/hot_standby/mod.zig");
+const storage_hot_standby = @import("../storage/hot_standby/mod.zig");
 const head_coordination = @import("../serverless/head_coordination.zig");
-const external_codec = @import("../serverless/external_source/codec.zig");
-const external_types = @import("../serverless/external_source/types.zig");
+const external_codec = @import("antfly_local_sources").serverless_external_source_codec;
+const external_types = @import("antfly_local_sources").serverless_external_source_types;
 const manifest_codec = @import("../serverless/manifest/codec.zig");
 const manifest_types = @import("../serverless/manifest/types.zig");
 
@@ -117,7 +117,7 @@ pub const Scenario = struct {
 
         fn run(self: *State, mode: Mode) !void {
             switch (mode) {
-                .storage_hot_standby_v1_golden => try storage_ha.compat.validateV1Fixtures(self.allocator),
+                .storage_hot_standby_v1_golden => try storage_hot_standby.compat.validateV1Fixtures(self.allocator),
                 .data_dir_legacy_rejected => try self.legacyDataDirRejected(),
                 .data_dir_future_rejected => try self.futureDataDirRejected(),
                 .data_dir_crash_then_forward => try self.crashDataDirMigration(),

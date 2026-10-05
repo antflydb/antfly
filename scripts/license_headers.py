@@ -34,43 +34,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 REPO_ROOT = ROOT
 
-ELV2_ROOTS = (
-    "zig/pkg/antfly",
-    "zig/e2e/antfly",
+SOURCE_LICENSE_ROOTS = json.loads(
+    (SCRIPT_DIR / "source_license_roots.json").read_text()
 )
+ELV2_ROOTS = tuple(SOURCE_LICENSE_ROOTS["Elastic-2.0"])
+APACHE_ROOTS = tuple(SOURCE_LICENSE_ROOTS["Apache-2.0"])
 
-APACHE_ROOTS = (
-    "zig/build.zig",
-    "zig/build.zig.zon",
-    "zig/build_support",
-    "zig/pkg/antfly-embedded",
-    "zig/pkg/antfly-client",
-    "zig/pkg/antfly-server-api",
-    "zig/pkg/inference",
-    "zig/pkg/inference-client",
-    "zig/lib",
-    "zig/e2e/inference",
-    "go/pkg/embedded",
-    "py/packages/embedded",
-    "ts/packages/embedded",
-    "rs",
-    "examples",
-    "go/pkg/docsaf",
-    "go/pkg/evalaf",
-    "go/pkg/genkit",
-    "go/pkg/memoryaf",
-    "go/pkg/operator",
-    "go/pkg/proxy",
-    "go/pkg/sdk",
-    "scripts",
-    "tools",
-    "specs",
-    "bench",
-    "compat",
-)
-
-# Files inside an ELv2 root that are Apache-2.0 anyway. The public C ABI
-# header is vendored or transcribed by the Apache-licensed Lite bindings.
+# Additional first-party Apache files outside the package roots. Server sources
+# have no per-file Apache exceptions after the physical package separation.
 APACHE_FILES = {
     line.strip()
     for line in (SCRIPT_DIR / "apache_engine_files.txt").read_text().splitlines()

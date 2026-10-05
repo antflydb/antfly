@@ -19,8 +19,8 @@
 //! Shutdown drains acquisitions/leases before deinit. All mutex operations use
 //! std.Io; callers must use compatible Io executors for this shared mutex.
 const std = @import("std");
-const compiler = @import("compiler.zig");
-const Budget = @import("memory_budget.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const Budget = @import("antfly_local_sources").sql_memory_budget;
 const Digest = [32]u8;
 
 pub const Config = struct {

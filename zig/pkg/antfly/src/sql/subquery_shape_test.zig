@@ -14,10 +14,10 @@
 // limitations.
 
 const std = @import("std");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const catalog = @import("catalog.zig");
-const ast = @import("ast.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
 
 const Backend = struct {
     calls: usize = 0,

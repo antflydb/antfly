@@ -31,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 import requests
 import test_backup_restore as backups
-from helpers import wait_until
+from helpers import PhaseTimings, wait_until
 
 three_by_three_backup_cluster = backups.three_by_three_backup_cluster
 
@@ -913,6 +913,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
 ):
     """Actual UNIQUE owners move FK references; neither side is a fake catalog."""
     cluster, fault = faulted_merge_cluster, owner_link_fault
+    timings = PhaseTimings(f"fk_merge:{fault.window}:{crash}")
     merge_child = crash == "child_owner"
     parent = f"online_fk_parent_{time.time_ns()}"
     child = f"online_fk_child_{time.time_ns()}"
@@ -961,7 +962,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         backups._create_cluster_table_when_admitted(
             owner, session, child, {"num_shards": 3, "schema": child_schema}
         )
+        timings.mark("child.create")
         assert wait_until(lambda: owner.fully_replicated_topology(child), timeout_s=90)
+        timings.mark("child.replicated_topology")
 
         def ready():
             response = session.get(
@@ -973,15 +976,18 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             )
 
         assert wait_until(ready, timeout_s=90), owner.debug_logs()
+        timings.mark("child.constraints_enforced")
         children.update(
             {f"z:child:{row['id']}": {"id": row["id"]} for row in rows.values()}
         )
         backups._seed_online_merge_setup_docs(owner, session, child, children)
+        timings.mark("child.seed")
 
     def interrupt(owner, table_id, donor, receiver, table, rows):
         assert wait_until(fault.observed, timeout_s=90, interval_s=0.1), (
             owner.debug_logs()
         )
+        timings.mark("fault.wait_snapshot_blocked")
         leader = owner.metadata_stable_leader_id(timeout_s=30)
         assert leader is not None, owner.debug_logs()
         state = owner.metadata_snapshot(leader - 1)
@@ -997,6 +1003,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             fault.heal_with_lost_reply()
             assert fault.reply_dropped.wait(30), owner.debug_logs()
             return online
+        timings.mark("fault.inspect_transition")
         with requests.Session() as session:
             session.headers["Connection"] = "close"
             tail = {"0:small": {"id": 2, "title": "updated after certified cut"}}
@@ -1017,6 +1024,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                     owner, session, child, references
                 )
             children.update(references)
+            timings.mark("fault.retained_tail_inserts")
             removed = session.post(
                 f"{owner.data_api_urls[0]}/tables/{table}/batch",
                 json={"deletes": [deleted_parent], "sync_level": "write"},
@@ -1025,11 +1033,13 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             assert removed.status_code in (200, 201, 202), removed.text
             rows.pop(deleted_parent)
             children.pop(deleted_child)
+        timings.mark("fault.retained_cascade_delete")
         # Kill the current donor leader only after the source has retained
         # inserts, replacement, cascading deletes and companion reference effects.
         status = owner.wait_for_group_leader(donor, timeout_s=30)
         index = int(status["leader_store_id"]) - 4
         assert 0 <= index < len(owner.data_procs)
+        timings.mark("fault.discover_donor_leader")
         owner.data_procs[index].kill()
         owner.data_procs[index].wait(timeout=10)
         fault.clear_observed()
@@ -1038,7 +1048,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 lambda: fault.observed() - {index}, timeout_s=45, interval_s=0.1
             ), owner.debug_logs()
         finally:
+            timings.mark("fault.successor_reaches_snapshot")
             owner.restart_crashed_node(metadata=False, index=index)
+            timings.mark("fault.restart_donor")
             fault.heal()
         return online
 
@@ -1072,6 +1084,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
         documents=documents,
         before_merge=None if merge_child else setup_children,
         after_accept=interrupt,
+        timings=timings,
     )
     with requests.Session() as session:
         session.headers["Connection"] = "close"
@@ -1083,6 +1096,7 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 timeout_s=30,
             )
             assert actual is not None and actual["id"] == row["id"], (key, actual)
+        timings.mark("verify.child_rows")
         if fault.window == "snapshot":
             absent = [(child, deleted_child)]
             if not merge_child:
@@ -1095,7 +1109,9 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
                 assert response.status_code == 404, response.text
         # Probe every live tuple: routing hashes spread claims over all source
         # ranges, so row-only preservation cannot accidentally satisfy this.
+        timings.mark("verify.deleted_rows")
         backups._assert_unique_claims_rejected(cluster, parent, documents.values())
+        timings.mark("verify.all_unique_claims")
         backups._assert_constraint_rejected(
             cluster,
             session,
@@ -1103,10 +1119,12 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             {"8:orphan": {"id": 999999}},
             "ForeignKeyParentMissing",
         )
+        timings.mark("verify.orphan_rejection")
         # Imported references must also drive a new post-cutover action job.
         backups._batch_cluster_docs_when_writable(
             cluster, session, parent, deletes=("0:small",)
         )
+        timings.mark("verify.post_cutover_delete")
         cascade_child = "0:small" if merge_child else "z:child:2"
         assert wait_until(
             lambda: (
@@ -1118,3 +1136,4 @@ def test_online_fk_merge_preserves_shadow_claims_and_retained_references(
             ),
             timeout_s=60,
         ), cluster.debug_logs()
+        timings.mark("verify.post_cutover_cascade")

@@ -14,7 +14,10 @@
 // limitations.
 
 pub const bloom = @import("bloom");
-pub const inverted = @import("section/inverted.zig");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const inverted = @import("antfly_local_sources").section_inverted;
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 pub const platform_time = @import("antfly_platform").time;
-pub const segment = @import("segment.zig");
+pub const segment = @import("antfly_local_sources").segment;
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

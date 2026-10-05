@@ -628,7 +628,7 @@ const ExactLoRAAdamState = struct {
         return .{ .allocator = allocator, .m_a = m_a, .v_a = v_a, .m_b = m_b, .v_b = v_b, .z_a = z_a, .z_b = z_b, .step = 0 };
     }
 
-    fn deinit(self: *ExactLoRAAdamState) void {
+    pub fn deinit(self: *ExactLoRAAdamState) void {
         self.allocator.free(self.m_a);
         self.allocator.free(self.v_a);
         self.allocator.free(self.m_b);
@@ -670,7 +670,7 @@ const BertExactTopLayerRuntime = struct {
     value_lora_adam: ?ExactLoRAAdamState = null,
     output_dense_lora_adam: ?ExactLoRAAdamState = null,
 
-    fn deinit(self: *BertExactTopLayerRuntime) void {
+    pub fn deinit(self: *BertExactTopLayerRuntime) void {
         self.allocator.free(self.query_weight);
         self.allocator.free(self.query_bias);
         self.allocator.free(self.key_weight);
@@ -712,7 +712,7 @@ const BertLastLayerForwardCache = struct {
     output_norm_input: []f32,
     out: []f32,
 
-    fn deinit(self: *BertLastLayerForwardCache) void {
+    pub fn deinit(self: *BertLastLayerForwardCache) void {
         self.allocator.free(self.query);
         self.allocator.free(self.key);
         self.allocator.free(self.value);
@@ -764,7 +764,7 @@ const DebertaExactTopLayerRuntime = struct {
     value_lora_adam: ?ExactLoRAAdamState = null,
     output_dense_lora_adam: ?ExactLoRAAdamState = null,
 
-    fn deinit(self: *DebertaExactTopLayerRuntime) void {
+    pub fn deinit(self: *DebertaExactTopLayerRuntime) void {
         self.allocator.free(self.rel_embeddings);
         self.allocator.free(self.query_weight);
         self.allocator.free(self.query_bias);
@@ -810,7 +810,7 @@ const DebertaLastLayerForwardCache = struct {
     output_norm_input: []f32,
     out: []f32,
 
-    fn deinit(self: *DebertaLastLayerForwardCache) void {
+    pub fn deinit(self: *DebertaLastLayerForwardCache) void {
         self.allocator.free(self.rel_embeddings);
         self.allocator.free(self.query);
         self.allocator.free(self.key);
@@ -2594,8 +2594,9 @@ fn backwardLinearRowsInputWithLoRA(
             grad_in_row[i] += sum;
         }
         if (pair) |lora_pair| {
-            var tmp_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
-            const alloc = tmp_rank.get();
+            var tmp_rank_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+            var tmp_rank: std.heap.BufferFirstAllocator = .init(&tmp_rank_buffer, std.heap.page_allocator);
+            const alloc = tmp_rank.allocator();
             const tmp = alloc.alloc(f32, lora_pair.rank) catch continue;
             defer alloc.free(tmp);
             const scale = lora_alpha / @as(f32, @floatFromInt(lora_pair.rank));
@@ -2721,8 +2722,9 @@ fn scoreAdaptedExample(
     pooled: []const f32,
     head: *const reranker_head.RerankerHead,
 ) f64 {
-    var transformed = std.heap.stackFallback(8192, std.heap.page_allocator);
-    const alloc = transformed.get();
+    var transformed_buffer: [8192]u8 align(@alignOf(f32)) = undefined;
+    var transformed: std.heap.BufferFirstAllocator = .init(&transformed_buffer, std.heap.page_allocator);
+    const alloc = transformed.allocator();
     const output = alloc.alloc(f32, layer.output_dim) catch return reranker_head.scoreHead(head, pooled);
     defer alloc.free(output);
     computeLinearOutput(output, pooled, layer.base_weight, layer.input_dim, layer.output_dim);
@@ -2750,8 +2752,9 @@ fn applyAdapterDelta(
     alpha: f32,
 ) void {
     const scale = alpha / @as(f32, @floatFromInt(rank));
-    var low_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
-    const alloc = low_rank.get();
+    var low_rank_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+    var low_rank: std.heap.BufferFirstAllocator = .init(&low_rank_buffer, std.heap.page_allocator);
+    const alloc = low_rank.allocator();
     const tmp = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp);
     @memset(tmp, 0);
@@ -2829,7 +2832,7 @@ fn resolveLayerSelection(
 
 fn countDistinctAdapterLayersInRange(layers: []const LoadedLoRALayer, start_layer_idx: usize, end_layer_exclusive: usize) usize {
     var count: usize = 0;
-    var seen: [256]bool = [_]bool{false} ** 256;
+    var seen: [256]bool = @as([256]bool, @splat(false));
     for (layers) |layer| {
         const layer_idx = parseEncoderLayerIndex(layer.base_tensor_name) orelse continue;
         if (layer_idx < start_layer_idx or layer_idx >= end_layer_exclusive) continue;
@@ -2846,28 +2849,28 @@ test "reranker lora bootstrap inspect load save materialize" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_reranker_lora_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const config_path = try std.fs.path.join(allocator, &.{ root, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"xlm-roberta\",\"hidden_size\":8,\"num_hidden_layers\":2,\"num_attention_heads\":2}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"xlm-roberta\",\"hidden_size\":8,\"num_hidden_layers\":2,\"num_attention_heads\":2}" });
     const tokenizer_path = try std.fs.path.join(allocator, &.{ root, tokenizer_file_name });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_path, .data = "{}" });
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "roberta.encoder.layer.0.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.0.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.0.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
-        .{ .name = "roberta.encoder.layer.1.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &[_]f32{0} ** 64 },
+        .{ .name = "roberta.encoder.layer.0.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.0.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.0.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.0.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.self.query.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.self.key.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.self.value.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
+        .{ .name = "roberta.encoder.layer.1.attention.output.dense.weight", .shape = &.{ 8, 8 }, .data = &@as([64]f32, @splat(0)) },
     });
 
     const adapter_dir = try std.fs.path.join(allocator, &.{ root, "adapter" });

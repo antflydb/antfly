@@ -1,22 +1,98 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 // Aggregate-only exclusions. The inventory audit compares the selected union
 // before/after these rules and rejects both lost coverage and repeated names.
-// Namespace rules end in `.test.` so anonymous reachability tests are retained.
+// Implementation rules use `.test.` where possible to retain reachability
+// anchors; whole module families stay with their explicit collection owner.
 pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
+    .{
+        .source = "pkg/antfly/src/root.zig",
+        .artifact = "test",
+        .selection = "compiled CHECK",
+        .skip = &.{
+            "api.runtime_status.consumerTests.Suite.test.",
+            "api.http_server.test.authoritative catalog mutation boundaries reject orphaned semantic producers",
+            "api.indexes.consumerTests.Suite.test.actionable repair remains visible while retained generation stays queryable",
+            "api.indexes.consumerTests.Suite.test.complete partial embeddings coverage is ready after active generation proof",
+            "api.indexes.consumerTests.Suite.test.managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
+            "api.indexes.consumerTests.Suite.test.missing target observation preserves serving snapshot and blocks only completion",
+            "api.indexes.consumerTests.Suite.test.partial coverage embeddings readiness counts skipped source units",
+            "api.indexes.consumerTests.Suite.test.partial coverage embeddings readiness does not mask pending enrichment",
+            "api.indexes.consumerTests.Suite.test.progressive embeddings readiness exposes a queryable partial generation",
+            "api.indexes.consumerTests.Suite.test.public index config encoders omit root write-only producer documents",
+            "api.indexes.consumerTests.Suite.test.public index config encoders preserve enrichment objects on read",
+            "api.indexes.consumerTests.Suite.test.public index config encoders redact coverage incarnation",
+            "api.indexes.consumerTests.Suite.test.public index config encoders redact nested credentials",
+            "api.indexes.consumerTests.Suite.test.readiness completion fences include every observation dimension",
+            "api.indexes.consumerTests.Suite.test.readiness evaluation cannot complete while convergence work remains",
+            "api.indexes.consumerTests.Suite.test.serviceable full text replacement remains queryable while rebuilding",
+            "api.openapi_contract.test.",
+            "api.public_table_http.test.query dependency errors expose a stable JSON retry contract",
+            "api.table_reads.consumerTests.Suite.test.api query contract graph evaluation preserves base hit paging and shard windows",
+            "api.restore_jobs.test.",
+            "api.table_writes.implementationTests.Suite.test.provisioned table write source drop table waits for active read cache lease",
+            "api.table_writes.implementationTests.Suite.test.write cache retirement is allocation-free after entry installation",
+            "api.table_writes.implementationTests.Suite.test.write cache transition locks use stable cache roles instead of addresses",
+            "asset_producer_runtime.test.",
+            "common.http.http_common.test.",
+            "common.http.mod.test.",
+            "common.http.std_http_executor.test.",
+            "graph.graph.test.graph bounded adjacency pages preserve order and fail before budget overflow",
+            "graph.graph.test.graph durable writes reject invalid edge types before mutation",
+            "graph.graph.test.graph edge encoding round-trip",
+            "graph.query.test.",
+            "index.test.typed doc values coverage admission honors cancellation deadline and contention",
+            "inference.managed_embedder.test.managed embedder admission follows the selected attachment transport",
+            "inference.managed_embedder.test.managed embedder binds execution to catalog semantic producer identity",
+            "inference.managed_embedder.test.managed embedder catalog ownership rejects orphaned semantic producers",
+            "inference.managed_embedder.test.managed embedder metadata ceiling splits mixed batches before dispatch",
+            "inference.managed_embedder.test.managed embedder metadata envelope sizing includes binary framing and payload",
+            "inference.managed_embedder.test.managed embedder metadata sizing matches wire JSON at every prefix",
+            "inference.managed_embedder.test.managed embedder metadata text-only windows respect the complete envelope limit",
+            "inference.managed_embedder.test.managed embedder partitions and validates inline image data URIs",
+            "inference.managed_embedder.test.managed embedder preserves coverage policy in storage config",
+            "inference.managed_embedder.test.managed embedder rejects unsupported execution namespaces",
+            "inference.managed_embedder.test.managed embedder reuses an executable owner for producerless artifact consumers",
+            "inference.managed_embedder.test.managed embedder routes antfly without api_url to local provider",
+            "inference.managed_embedder.test.managed embedder separates index and artifact lookup namespaces with different configs",
+            "inference.managed_embedder.test.managed embedder validates sparse config with probe during normalization",
+            "inference.mod.test.managed embedder artifact backed embedding translation",
+            "inference.mod.test.managed embedder cancels an in-flight remote embedding request",
+            "inference.mod.test.managed embedder deadlines bound provider pacing and transport",
+            "inference.mod.test.managed embedder dimension probe validation modes",
+            "inference.mod.test.managed embedder normalizes local admission overload across embedding modes",
+            "inference.mod.test.managed embedder rejects malformed provider vectors",
+            "inference.mod.test.managed embedder sends antfly media parts when local provider is configured",
+            "runtime_callback_abi.test.",
+            "search.geo.test.",
+            "section.typed_doc_values.test.",
+            "segment.test.",
+            "standalone.runtime.test.",
+            "storage.background_runtime.test.",
+            "storage.db.enrichment.asset_producer.test.",
+            "storage.db.enrichment.embedder.test.",
+            "api.distributed_graph.test.distributed graph edges response round trips owned edges",
+        },
+    },
+    .{
+        .source = "pkg/antfly/src/root.zig",
+        .artifact = "test",
+        .selection = "audio runtime",
+        .skip = &.{"common.secrets.test."},
+    },
     .{
         .source = "pkg/antfly/src/api_derived_coverage_test_root.zig",
         .artifact = "test",
@@ -56,6 +132,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "query parser accepts direct graph metric reads",
         .skip = &.{
+            "api.runtime_status.consumerTests.Suite.test.",
             "api.openapi_contract.test.client openapi module resolves shared refs through owner modules",
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
@@ -67,10 +144,22 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     .{
         .source = "pkg/antfly/src/api_http_runtime_test_root.zig",
         .artifact = "test",
-        .selection = "backup heartbeat ",
+        .selection = "storage-kernel query request preserves final projection while raw retrieval defers it",
         .skip = &.{
+            "api.sql_catalog.test.SQL catalog ALTER submits native schema CAS without client generations",
+            "api.sql_catalog.test.SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
+            "api.sql_catalog.test.SQL catalog DDL schema validates through native public admission",
+            "api.sql_session_overlay.test.SQL session overlay merges pages and suppresses replaced and deleted rows",
+            "api.sql_session_overlay.test.SQL session overlay preserves JSON null independently of SQL NULL",
+            "api.sql_execution.test.",
+            "api.sql_pgwire.test.",
+            "api.sql_schema_cache.test.",
+            "api.sql_session.test.",
+            "api.transactions.test.SQL",
+            "metadata.http_server.test.",
+            "sql.ddl_runtime.test.",
             "metadata.storage.raft_apply_store.test.",
-            // The generating lane owns conversation and backend contracts,
+            // The explicit generating server owner owns conversation contracts,
             // even when this HTTP root imports them through agent tools.
             "api.agent_tools.test.agent conversation",
             "generating.mod.test.generating backend",
@@ -113,12 +202,15 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "api-table-write-implementation-tests",
         .selection = "provisioned table write source drop table",
         .skip = &.{
+            // Status contracts belong to derived coverage; scheduler contracts belong to DB core.
+            "api.runtime_status.consumerTests.Suite.test.",
+            "storage.db.index_repair_scheduler.test.",
             "api.table_reads.implementationTests.Suite.test.",
             "metadata.table_provisioner.implementationTests.Suite.test.",
             "storage.db.db.test.",
             "storage.db.db.DB.test.",
             "storage.db.generation_lifecycle.test.",
-            "storage.local_write.test.",
+            "storage.write.test.",
         },
     },
     .{
@@ -156,6 +248,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "data-runtime-implementation-tests",
         .selection = "data ownership fallback requires a single store across all roles",
         .skip = &.{
+            "data.raft_batch.test.",
             "raft.hosted_shard_ops.test.",
             "storage.db.db.test.",
             "storage.db.enrichment.enrichment_runtime.test.",
@@ -186,6 +279,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "graph.query.",
         .skip = &.{
+            "storage.hot_standby.native_topology_receipt_integration_test.test.",
             "storage.backend_erased.test.",
             "storage.db.db.test.",
             "storage.db.lease.test.",
@@ -207,7 +301,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/introducer.zig",
+        .source = "pkg/antfly-embedded/src/local/introducer.zig",
         .artifact = "test",
         .selection = "all",
         .skip = &.{
@@ -219,6 +313,11 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "lake",
         .skip = &.{
+            // Sidecar terminology does not make engine or segment contracts Lake-owned.
+            "segment.test.",
+            "sparse.sparse.test.",
+            "storage.db.",
+            "storage.hbc_adapter.test.",
             "serverless.build.builder.test.",
             "serverless.build.external_publication_metadata.test.",
             "serverless.build.external_source_publish.test.",
@@ -226,6 +325,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "serverless.manifest.codec.test.",
             "storage.resource_manager.test.",
             "storage.rowsource.external.test.",
+            "storage.rowsource.identity.test.",
+            "sql.disk_rows.test.",
         },
     },
     .{
@@ -233,6 +334,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "host restores through an explicitly authorized bootstrap owner",
         .skip = &.{
+            "storage.backup_restore.test.prepared native restore repair reuses target backend admission",
+            "storage.backup_restore.test.restore binding pins the authenticated native generation manifest",
             "raft.host.test.",
             "raft.managed_host.test.",
             "raft.storage.catalog.test.",
@@ -254,6 +357,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "storage-db-core-tests",
         .selection = "storage.db.aggregations.",
         .skip = &.{
+            "storage.db.db.test.db native FK generation receipts",
+            "storage.db.db.test.db owner reopen pins old child schema",
             "storage.db.dense_exact.test.",
             "storage.db.doc_filter_wire.test.",
             "storage.db.enrichment.enrichment_runtime.test.",
@@ -267,7 +372,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .selection = "storage.",
         .skip = &.{
             "storage.admission_waiter.test.",
-            "storage.db.query.projection.test.",
+            "storage.db.query.projection.test.normalizeChunkArtifactForQuery strips private unit revision metadata",
             "storage.dense_work_admission.test.",
             "storage.maintenance_signal.test.",
             "storage.projection_page_cache.test.",
@@ -382,6 +487,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "dedupeSearchHitsById uses ordinals when hit page is complete",
         .skip = &.{
+            "storage.document_mutation_revision.test.",
             "storage.db.db.test.",
             "storage.db.query.graph_exec.test.",
             "storage.db.query.result_shape.test.",
@@ -413,7 +519,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/root.zig",
+        .source = "pkg/antfly/src/generating_test_root.zig",
         .artifact = "test",
         .selection = "generating backend",
         .skip = &.{
@@ -440,9 +546,14 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
-        .selection = "public openapi contract module is generated and wired",
+        .artifact = "public-api-parity",
+        .selection = "SQL API cross-table MERGE retains both source and target range proofs",
         .skip = &.{
+            "api.httpx_handler.test.httpx SQL",
+            "api.httpx_handler.test.httpx FK source control rejects missing service token in legacy internal mode",
+            "api.httpx_handler.test.httpx hidden handoff receipt rejects public caller even in legacy internal mode",
+            "api.internal_group_operations.test.hidden generation handoff",
+            "api.openapi_contract.test.usermgr openapi module generates extractor surface for routed endpoints",
             "api.httpx_handler.test.httpx antfly schema update owns self partial support and requires coordinated publication",
             "api.httpx_handler.test.httpx antfly schema update returns full table status after projection",
             "api.httpx_handler.test.httpx relational row query mutation endpoints enforce exact versions and schema epochs",
@@ -466,6 +577,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "raft.",
         .skip = &.{
+            // The explicit transport owner includes its reachability contracts.
+            "raft.transport.",
             "raft.storage.file_snapshot_store.test.file snapshot maintenance uses borrowed scheduling for deadlines wakeups and shutdown",
             "raft.shard_ops.test.",
             "raft.storage.backup_restore.test.",

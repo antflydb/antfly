@@ -109,7 +109,7 @@ fn chunkWav(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkCo
 }
 
 fn chunkGif(alloc: Allocator, binary: types.BinaryInput, cfg: types.FixedChunkConfig, max_owned_output_bytes: usize) ![]types.Chunk {
-    const max_frames = if (cfg.max_chunks > 0) cfg.max_chunks else (types.FixedChunkConfig{}).max_chunks;
+    const max_frames = if (cfg.max_chunks > 0) cfg.max_chunks else types.default_gif_max_frames;
     const frames = antfly_image.gif.decodeFramesAllocBounded(
         alloc,
         binary.data,
@@ -215,4 +215,11 @@ test "fixed multimodal chunks animated gif frames" {
             .data = &gif_bytes,
         } }, .{ .max_chunks = 1 }, 1),
     );
+}
+
+test "fixed multimodal gif chunking keeps its own default frame cap" {
+    // #932 made FixedChunkConfig.max_chunks default to 0 (unlimited) for text
+    // and WAV. GIF frame decoding must keep a real safety cap regardless, so
+    // it reads this named constant instead of the struct default.
+    try std.testing.expectEqual(@as(usize, 50), types.default_gif_max_frames);
 }

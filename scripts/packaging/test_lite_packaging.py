@@ -78,6 +78,9 @@ class LitePackagingTests(unittest.TestCase):
                 stage = root / ("stage-" + platform.key)
                 (stage / "lib").mkdir(parents=True)
                 (stage / "include").mkdir()
+                (stage / "scripts").mkdir()
+                for name in package.SOURCE_LICENSE_FILES:
+                    shutil.copy2(ROOT / "scripts" / name, stage / "scripts" / name)
                 (stage / "LICENSES/third-party").mkdir(parents=True)
                 (stage / "antfly-lite").write_text("lite executable")
                 (stage / "antfly-inference-worker").write_text("worker executable")
@@ -127,6 +130,11 @@ class LitePackagingTests(unittest.TestCase):
                 self.assertTrue((npm / "lib/antfly-inference-worker").is_file())
                 self.assertFalse((npm / "bin").exists())
                 self.assertTrue((npm / "LICENSES/third-party/example.txt").is_file())
+                for name in package.SOURCE_LICENSE_FILES:
+                    self.assertEqual(
+                        (npm / "LICENSES/source-map" / name).read_bytes(),
+                        (ROOT / "scripts" / name).read_bytes(),
+                    )
                 wheel = (
                     root
                     / "out/python"
@@ -136,15 +144,28 @@ class LitePackagingTests(unittest.TestCase):
                     names = set(archive.namelist())
                     self.assertIn("antfly_embedded/_lib/antfly-inference-worker", names)
                     self.assertIn(
-                        "antfly_embedded/_lib/" + package.lite_library_name(platform), names
+                        "antfly_embedded/_lib/" + package.lite_library_name(platform),
+                        names,
                     )
-                    self.assertFalse(any(name.startswith("antfly_embedded/_bin/") for name in names))
-                    self.assertFalse(any(name.endswith("/entry_points.txt") for name in names))
+                    self.assertFalse(
+                        any(name.startswith("antfly_embedded/_bin/") for name in names)
+                    )
+                    self.assertFalse(
+                        any(name.endswith("/entry_points.txt") for name in names)
+                    )
                     self.assertIn(
                         "antfly_embedded-1.2.3.dist-info/LICENSES/third-party/example.txt",
                         names,
                     )
+                    for name in package.SOURCE_LICENSE_FILES:
+                        self.assertEqual(
+                            archive.read(
+                                f"antfly_embedded-1.2.3.dist-info/LICENSES/source-map/{name}"
+                            ),
+                            (ROOT / "scripts" / name).read_bytes(),
+                        )
                     metadata = archive.read("antfly_embedded-1.2.3.dist-info/METADATA")
+                    self.assertIn(b"Metadata-Version: 2.4", metadata)
                     self.assertIn(b"License-Expression: Apache-2.0", metadata)
 
             if sys.version_info >= (3, 11):
@@ -172,9 +193,7 @@ class LitePackagingTests(unittest.TestCase):
                     check=True,
                     capture_output=True,
                 )
-                for location in (
-                    "_lib/antfly-inference-worker",
-                ):
+                for location in ("_lib/antfly-inference-worker",):
                     installed = install_dir / "antfly_embedded" / location
                     self.assertTrue(
                         os.access(installed, os.X_OK),
@@ -228,6 +247,9 @@ class LitePackagingTests(unittest.TestCase):
             (stage / "lib").mkdir(parents=True)
             (stage / "include").mkdir()
             (stage / "LICENSES").mkdir()
+            (stage / "scripts").mkdir()
+            for name in package.SOURCE_LICENSE_FILES:
+                shutil.copy2(ROOT / "scripts" / name, stage / "scripts" / name)
             for name in (
                 "antfly",
                 "antfly-lite",

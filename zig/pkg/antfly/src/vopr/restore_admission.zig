@@ -17,7 +17,7 @@
 //! replicas using the production generation locks and import-proof validator.
 const std = @import("std");
 const vopr = @import("vopr");
-const lifecycle = @import("../storage/db/generation_lifecycle.zig");
+const lifecycle = @import("antfly_local_sources").storage_db_generation_lifecycle;
 const admission = @import("../storage/restore_admission.zig");
 const Identity = @import("../storage/restore_identity.zig").Identity;
 
@@ -181,7 +181,7 @@ pub const Scenario = struct {
             },
             .complete => return error.InvalidRestoreAdmissionTransition,
         }
-        state.phases[replica] = @enumFromInt(@intFromEnum(state.phases[replica]) + 1);
+        state.phases[replica] = @fromBackingInt(@backingInt(state.phases[replica]) + 1);
         state.progress += 1;
     }
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, alloc: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
@@ -208,7 +208,7 @@ pub const Scenario = struct {
     pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
         try builder.addNamed(alloc, name ++ ".progress", @intCast(world.state.progress));
         inline for (0..9) |replica| {
-            try builder.addNamed(alloc, std.fmt.comptimePrint("replica-{d}", .{replica}), @intFromEnum(world.state.phases[replica]));
+            try builder.addNamed(alloc, std.fmt.comptimePrint("replica-{d}", .{replica}), @backingInt(world.state.phases[replica]));
             try builder.addNamed(alloc, std.fmt.comptimePrint("probes-{d}", .{replica}), world.state.probes_remaining[replica]);
         }
     }

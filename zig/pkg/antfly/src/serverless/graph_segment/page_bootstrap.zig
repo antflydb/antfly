@@ -110,7 +110,7 @@ const Sorter = struct {
     runs: [max_levels][fan_in]tree.Ref = undefined,
     counts: [max_levels]usize = @splat(0),
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.buffered.items) |*key| key.deinit(self.alloc);
         self.buffered.deinit(self.alloc);
     }
@@ -193,7 +193,7 @@ const MergeSource = struct {
     cursors: [fan_in]tree.Cursor = undefined,
     heads: [fan_in]?tree.Cursor.Record = @splat(null),
     previous: ?usize = null,
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.cursors[0..self.initialized]) |*cursor| cursor.deinit();
     }
     pub fn next(self: *@This()) !?tree.Cursor.Record {
@@ -220,7 +220,7 @@ const FinalSource = struct {
     edges: u64 = 0,
     prior_node: std.ArrayListUnmanaged(u8) = .empty,
     scratch: std.ArrayListUnmanaged(u8) = .empty,
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.prior_node.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
     }

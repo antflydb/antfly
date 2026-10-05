@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Exercise runtime selection against a small compiled test inventory."""
 
 import os
@@ -12,7 +27,7 @@ ZIG_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestRunnerSelection(unittest.TestCase):
-    runner_path = ZIG_ROOT / "pkg/antfly/src/test_runner.zig"
+    runner_path = ZIG_ROOT / "pkg/antfly-embedded/src/local/test_runner.zig"
     progress_prefix = "test"
 
     @classmethod
@@ -30,6 +45,7 @@ class TestRunnerSelection(unittest.TestCase):
             'test "timed body" { try std.testing.io.sleep(.fromMilliseconds(20), .awake); }\n'
             'test "progress body" { try std.testing.io.sleep(.fromSeconds(2), .awake); }\n'
             'test "error logging" { std.log.err("visible error", .{}); }\n'
+            'test "environment unavailable" { return error.SkipZigTest; }\n'
         )
         cls.binary = root / "tests"
         subprocess.run(
@@ -38,8 +54,11 @@ class TestRunnerSelection(unittest.TestCase):
                 "test",
                 "--dep",
                 "antfly_platform",
+                "--dep",
+                "antfly_test_error_logs",
                 f"-Mroot={source}",
                 f"-Mantfly_platform={ZIG_ROOT / 'lib/platform/src/root.zig'}",
+                f"-Mantfly_test_error_logs={ZIG_ROOT / 'pkg/antfly-embedded/src/local/test_error_logs.zig'}",
                 "--test-runner",
                 str(cls.runner_path),
                 "--test-no-exec",
@@ -63,6 +82,60 @@ class TestRunnerSelection(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_required_execution_rejects_skips_but_inventory_still_lists(self):
+        for required, owner, expected in (
+            (False, False, 0),
+            (True, False, 1),
+            (True, True, 1),
+        ):
+            args = [str(self.binary), "--test-filter", "environment unavailable"]
+            if required:
+                args.append("--require-no-skips")
+            if owner:
+                args.extend(("--allow-empty-test-filter", "--allow-empty-owner"))
+            result = subprocess.run(args, text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertIn("1 skipped", result.stderr)
+        result = subprocess.run(
+            args + ["--list-tests", "--timeout-ms=1"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST\tselection.test.environment unavailable", result.stderr)
+        result = subprocess.run(
+            [
+                str(self.binary),
+                "--test-filter",
+                "does not exist",
+                "--allow-empty-test-filter",
+                "--require-no-skips",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("matched no runnable tests", result.stderr)
+
+    def test_execution_budget_excludes_compilation_and_bounds_a_stuck_test(self):
+        for limit, expected in ((20, 124), (5000, 0)):
+            result = subprocess.run(
+                [
+                    str(self.binary),
+                    "--test-filter",
+                    "progress body",
+                    f"--timeout-ms={limit}",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=7,
+            )
+            self.assertEqual(result.returncode, expected, result.stderr)
+            if expected:
+                self.assertIn("test execution timed out", result.stderr)
 
     def test_timings_measure_body_and_cleanup(self):
         result = subprocess.run(

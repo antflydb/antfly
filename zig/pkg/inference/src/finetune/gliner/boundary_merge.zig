@@ -283,7 +283,7 @@ const Access = struct {
         for (self.tensors, names) |tensor, *name| name.* = tensor.descriptor.name;
         return names;
     }
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
 };
 
 fn execute(a: Allocator, io: std.Io, source: View, prepared: Prepared, output: []const u8, provenance: Provenance, limits: Limits, control: ?Control) !Result {

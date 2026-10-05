@@ -26,8 +26,8 @@ const metric_segment = @import("../graph_metric_segment/mod.zig");
 const metric_kernel = @import("lake_graph_metric.zig");
 const artifacts = @import("../artifacts/mod.zig");
 const sources = @import("../search_sources.zig");
-const external_binding = @import("../external_source/catalog_binding.zig");
-const base_source = @import("../manifest/base_source.zig");
+const external_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const NamedAction = struct {
     kind: manifests.ArtifactKind,
@@ -361,7 +361,7 @@ fn rejectionPlanUnchanged(alloc: Allocator, specs: []const metrics.IndexSpec, re
     return metric_kernel.admissionPlanUnchanged(alloc, requests.items, previous, .{});
 }
 
-fn snapshot(kind: @import("../../storage/rowsource/types.zig").SourceKind, source: manifests.ExternalBaseSource, source_id: []const u8) lake.LakeSourceSnapshot {
+fn snapshot(kind: @import("antfly_local_sources").storage_rowsource_types.SourceKind, source: manifests.ExternalBaseSource, source_id: []const u8) lake.LakeSourceSnapshot {
     return .{ .source_kind = kind, .source_id = source_id, .snapshot_id = source.snapshot_id, .schema_fingerprint = source.schema_fingerprint };
 }
 
@@ -416,12 +416,12 @@ pub const testing = struct {
 
     pub fn fixtureAlloc(alloc: Allocator, document_count: u64) !manifests.Manifest {
         const refs = [_]manifests.ArtifactRef{
-            .{ .kind = .external_base_source, .name = "docs.external-files", .artifact_id = "inventory-docs", .checksum = "a" ** 64, .byte_len = 128 },
-            .{ .kind = .text_segment, .name = "body_text", .artifact_id = "sha256:" ++ "b" ** 64, .checksum = "b" ** 64, .byte_len = 128 },
-            .{ .kind = .vector_segment, .name = "vec", .artifact_id = "sha256:" ++ "c" ** 64, .checksum = "c" ** 64, .byte_len = 128 },
-            .{ .kind = .graph_segment, .name = "graph_idx", .artifact_id = "sha256:" ++ "a" ** 64, .checksum = "a" ** 64, .byte_len = 128, .edge_generation = 3 },
-            .{ .kind = .graph_metric_segment, .name = "9:graph_idx6:degree", .artifact_id = "sha256:" ++ "d" ** 64, .checksum = "d" ** 64, .byte_len = 4096, .metadata_version = metric_segment.wire_version, .published_generation = 5, .edge_generation = 3, .computed_at_ms = 42, .graph_metric_control_len = 128, .graph_metric_routing_footer_len = 128, .graph_metric_source_checksum = @splat(0xaa) },
-            .{ .kind = .graph_metric_segment, .name = "9:graph_idx4:rank", .artifact_id = "sha256:" ++ "e" ** 64, .checksum = "e" ** 64, .byte_len = 4096, .metadata_version = metric_segment.wire_version, .published_generation = 5, .edge_generation = 3, .computed_at_ms = 42, .graph_metric_control_len = 128, .graph_metric_routing_footer_len = 128, .graph_metric_source_checksum = @splat(0xaa) },
+            .{ .kind = .external_base_source, .name = "docs.external-files", .artifact_id = "inventory-docs", .checksum = z17RepeatString("a", 64), .byte_len = 128 },
+            .{ .kind = .text_segment, .name = "body_text", .artifact_id = "sha256:" ++ z17RepeatString("b", 64), .checksum = z17RepeatString("b", 64), .byte_len = 128 },
+            .{ .kind = .vector_segment, .name = "vec", .artifact_id = "sha256:" ++ z17RepeatString("c", 64), .checksum = z17RepeatString("c", 64), .byte_len = 128 },
+            .{ .kind = .graph_segment, .name = "graph_idx", .artifact_id = "sha256:" ++ z17RepeatString("a", 64), .checksum = z17RepeatString("a", 64), .byte_len = 128, .edge_generation = 3 },
+            .{ .kind = .graph_metric_segment, .name = "9:graph_idx6:degree", .artifact_id = "sha256:" ++ z17RepeatString("d", 64), .checksum = z17RepeatString("d", 64), .byte_len = 4096, .metadata_version = metric_segment.wire_version, .published_generation = 5, .edge_generation = 3, .computed_at_ms = 42, .graph_metric_control_len = 128, .graph_metric_routing_footer_len = 128, .graph_metric_source_checksum = @splat(0xaa) },
+            .{ .kind = .graph_metric_segment, .name = "9:graph_idx4:rank", .artifact_id = "sha256:" ++ z17RepeatString("e", 64), .checksum = z17RepeatString("e", 64), .byte_len = 4096, .metadata_version = metric_segment.wire_version, .published_generation = 5, .edge_generation = 3, .computed_at_ms = 42, .graph_metric_control_len = 128, .graph_metric_routing_footer_len = 128, .graph_metric_source_checksum = @splat(0xaa) },
         };
         var result = try manifests.cloneManifest(alloc, .{
             .namespace = "docs",
@@ -512,10 +512,10 @@ test "serverless external metadata allocation failures release every owned snaps
             defer result.deinit(alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{current});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{current});
     var singular_sources = current;
     singular_sources.stats.published_search_sources.items = null;
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{singular_sources});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{singular_sources});
 }
 
 test "serverless external metadata rejections retain only the complete unchanged admission plan" {
@@ -654,7 +654,7 @@ test "serverless external metadata plan reports exact named work and converges a
 }
 
 test "serverless external source identity separates selectors from resolved evidence" {
-    for ([_]@import("../external_source/types.zig").Format{ .parquet, .iceberg, .lance }) |format| {
+    for ([_]@import("antfly_local_sources").serverless_external_source_types.Format{ .parquet, .iceberg, .lance }) |format| {
         const before: external_binding.Binding = .{
             .table_id = "docs",
             .format = format,
@@ -752,5 +752,16 @@ test "serverless external metadata plan handles bootstrap source changes and ter
             defer result.deinit(alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{table});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{table});
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

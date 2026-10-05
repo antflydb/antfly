@@ -14,7 +14,7 @@
 // limitations.
 
 //! API import facade for the durable metadata-owned cohort protocol.
-const cohort = @import("../metadata/backup_cohort.zig");
+const cohort = @import("antfly_local_sources").metadata_backup_cohort;
 pub const Phase = cohort.Phase;
 pub const Result = cohort.Result;
 pub const Owner = cohort.Owner;

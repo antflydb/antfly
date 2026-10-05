@@ -60,7 +60,7 @@ pub const Example = struct {
     fn tokenKind(self: Example, i: usize) ?Kind {
         const p = self.packed_row orelse return self.kind;
         const kind = p.row.kinds[i];
-        return if (kind == tree.trunk_kind) null else @enumFromInt(kind);
+        return if (kind == tree.trunk_kind) null else @fromBackingInt(@intCast(kind));
     }
 };
 pub const Question = struct { markers: []const i64, kind: Kind, target: []const f32 };
@@ -91,8 +91,12 @@ pub fn floatValues(a: std.mem.Allocator, tensor: Tensor) ![]f32 {
 /// A `.lora_A`/`.lora_B` adapter has no source value to freeze to, so
 /// `freeze_layers` never covers it: it stays trainable even under a frozen
 /// layer, which is an ordinary LoRA-on-a-frozen-base configuration.
+/// `whole_encoder` freezes every `encoder.*` tensor, the final norm included,
+/// so the encoder's output is exactly the source's (a head trained on a
+/// shared trunk); a job asks for it with `freeze_layers = num_hidden_layers + 1`.
 pub fn frozen(name: []const u8, layers: u32, lora: ?architecture.Lora) bool {
     const adapter = std.mem.endsWith(u8, name, ".lora_A") or std.mem.endsWith(u8, name, ".lora_B");
+    if (layers == whole_encoder and !adapter and std.mem.startsWith(u8, name, "encoder.")) return true;
     if (layers > 0 and !adapter) {
         if (std.mem.startsWith(u8, name, "encoder.embeddings.")) return true;
         const prefix = "encoder.layers.";
@@ -106,6 +110,8 @@ pub fn frozen(name: []const u8, layers: u32, lora: ?architecture.Lora) bool {
     if (lora) |cfg| if (architecture.isLoraFrozen(name, cfg.targets)) return true;
     return false;
 }
+
+pub const whole_encoder = std.math.maxInt(u32);
 
 /// A frozen parameter's value, owned by the caller for the whole run and
 /// bound by name into every program. It is never updated or freed by a step.
@@ -269,7 +275,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         for (0..l.sequence) |i| {
             // Padding repeats the row's last logical position; keys mask it.
             const kind = if (i < e.ids.len) e.tokenKind(i) else if (e.packed_row == null) e.kind else null;
-            kinds[row * l.sequence + i] = if (kind) |k| @intFromEnum(k) else 0;
+            kinds[row * l.sequence + i] = if (kind) |k| @backingInt(k) else 0;
             @memset(type_mask[(row * l.sequence + i) * cfg.hidden_size ..][0..cfg.hidden_size], if (kind != null) 1 else 0);
             positions[row * l.sequence + i] = if (i < e.ids.len) e.position(i) else @intCast(i);
         }

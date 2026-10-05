@@ -16,30 +16,30 @@
 const std = @import("std");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
-const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const backups_api = @import("../api/backups.zig");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const metadata_api = @import("api.zig");
 const table_manager = @import("table_manager.zig");
 const raft_catalog = @import("../raft/storage/catalog.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const coverage_policy = @import("../api/coverage_policy.zig");
-const table_index_config = @import("../api/table_index_config.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const change_journal_mod = @import("antfly_local_sources").storage_db_derived_change_journal;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 const indexes_api = @import("../api/indexes.zig");
-const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+const enrichment_config_validation = @import("antfly_local_sources").storage_db_enrichment_config_validation;
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
 const raft_mod = @import("../raft/mod.zig");
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const shard_db_adapter_mod = @import("shard_db_adapter.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 
 pub const ProvisionSummary = @import("antfly_provision_contract").ProvisionSummary;
@@ -222,7 +222,7 @@ pub fn reconcileReplicaRootWithOptions(
 
         const schema_json = tables_api.effectiveSchemaJson(table.schema_json);
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, schema_json);
-        defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
+        defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, runtime_schema);
         var open_options = provisioningDbOpenOptions();
         open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
@@ -255,7 +255,7 @@ pub fn reconcileReplicaRootWithOptions(
     return summary;
 }
 
-fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !@import("../storage/schema.zig").TableSchema {
+fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !@import("antfly_local_sources").storage_schema.TableSchema {
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
     return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -269,13 +269,13 @@ pub fn reconcileDbIndexes(
     return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
 }
 
-pub const IndexReconcileSummary = @import("local_index_reconcile.zig").IndexReconcileSummary;
+pub const IndexReconcileSummary = @import("antfly_local_sources").metadata_local_index_reconcile.IndexReconcileSummary;
 
-pub const ReconcileDbIndexOptions = @import("local_index_reconcile.zig").ReconcileDbIndexOptions;
+pub const ReconcileDbIndexOptions = @import("antfly_local_sources").metadata_local_index_reconcile.ReconcileDbIndexOptions;
 
-const dbIndexReconciliationCanMutate = @import("local_index_reconcile.zig").dbIndexReconciliationCanMutate;
+const dbIndexReconciliationCanMutate = @import("antfly_local_sources").metadata_local_index_reconcile.dbIndexReconciliationCanMutate;
 
-pub const reconcileDbIndexesWithOptions = @import("local_index_reconcile.zig").reconcileDbIndexesWithOptions;
+pub const reconcileDbIndexesWithOptions = @import("antfly_local_sources").metadata_local_index_reconcile.reconcileDbIndexesWithOptions;
 
 pub fn reconcileDbIndexTarget(
     alloc: std.mem.Allocator,
@@ -286,7 +286,7 @@ pub fn reconcileDbIndexTarget(
     return try reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{});
 }
 
-pub const reconcileDbIndexTargetWithOptions = @import("local_index_reconcile.zig").reconcileDbIndexTargetWithOptions;
+pub const reconcileDbIndexTargetWithOptions = @import("antfly_local_sources").metadata_local_index_reconcile.reconcileDbIndexTargetWithOptions;
 
 pub fn collectLocalSchemaProgress(
     alloc: std.mem.Allocator,
@@ -809,45 +809,45 @@ fn resolveRestoreIntent(
     return null;
 }
 
-const removeMissingIndexes = @import("local_index_reconcile.zig").removeMissingIndexes;
+const removeMissingIndexes = @import("antfly_local_sources").metadata_local_index_reconcile.removeMissingIndexes;
 
-const IndexEnsureSummary = @import("local_index_reconcile.zig").IndexEnsureSummary;
+const IndexEnsureSummary = @import("antfly_local_sources").metadata_local_index_reconcile.IndexEnsureSummary;
 
-const ensureIndexes = @import("local_index_reconcile.zig").ensureIndexes;
+const ensureIndexes = @import("antfly_local_sources").metadata_local_index_reconcile.ensureIndexes;
 
-const ensureIndexDefinition = @import("local_index_reconcile.zig").ensureIndexDefinition;
+const ensureIndexDefinition = @import("antfly_local_sources").metadata_local_index_reconcile.ensureIndexDefinition;
 
-const desiredIndexContains = @import("local_index_reconcile.zig").desiredIndexContains;
+const desiredIndexContains = @import("antfly_local_sources").metadata_local_index_reconcile.desiredIndexContains;
 
-const indexDefinitionName = @import("local_index_reconcile.zig").indexDefinitionName;
+const indexDefinitionName = @import("antfly_local_sources").metadata_local_index_reconcile.indexDefinitionName;
 
-const indexDefinitionConfigValue = @import("local_index_reconcile.zig").indexDefinitionConfigValue;
+const indexDefinitionConfigValue = @import("antfly_local_sources").metadata_local_index_reconcile.indexDefinitionConfigValue;
 
-const findIndexConfig = @import("local_index_reconcile.zig").findIndexConfig;
+const findIndexConfig = @import("antfly_local_sources").metadata_local_index_reconcile.findIndexConfig;
 
-const indexConfigsEqual = @import("local_index_reconcile.zig").indexConfigsEqual;
+const indexConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.indexConfigsEqual;
 
-const indexKindConfigReconcileDeferred = @import("local_index_reconcile.zig").indexKindConfigReconcileDeferred;
+const indexKindConfigReconcileDeferred = @import("antfly_local_sources").metadata_local_index_reconcile.indexKindConfigReconcileDeferred;
 
-const fullTextIndexConfigsEqual = @import("local_index_reconcile.zig").fullTextIndexConfigsEqual;
+const fullTextIndexConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.fullTextIndexConfigsEqual;
 
-const algebraicIndexConfigsEqual = @import("local_index_reconcile.zig").algebraicIndexConfigsEqual;
+const algebraicIndexConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.algebraicIndexConfigsEqual;
 
-const jsonValuesEqualIgnoringTopLevelEnrichments = @import("local_index_reconcile.zig").jsonValuesEqualIgnoringTopLevelEnrichments;
+const jsonValuesEqualIgnoringTopLevelEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.jsonValuesEqualIgnoringTopLevelEnrichments;
 
-const collectDesiredEnrichmentsFromJson = @import("local_index_reconcile.zig").collectDesiredEnrichmentsFromJson;
+const collectDesiredEnrichmentsFromJson = @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredEnrichmentsFromJson;
 
-const EnrichmentEnsureSummary = @import("local_index_reconcile.zig").EnrichmentEnsureSummary;
+const EnrichmentEnsureSummary = @import("antfly_local_sources").metadata_local_index_reconcile.EnrichmentEnsureSummary;
 
-const ensureEnrichments = @import("local_index_reconcile.zig").ensureEnrichments;
+const ensureEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.ensureEnrichments;
 
-const dedupeDesiredEnrichments = @import("local_index_reconcile.zig").dedupeDesiredEnrichments;
+const dedupeDesiredEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.dedupeDesiredEnrichments;
 
-const removeMissingEnrichments = @import("local_index_reconcile.zig").removeMissingEnrichments;
+const removeMissingEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.removeMissingEnrichments;
 
-const removeAbsentEnrichments = @import("local_index_reconcile.zig").removeAbsentEnrichments;
+const removeAbsentEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.removeAbsentEnrichments;
 
-const findEnrichmentByName = @import("local_index_reconcile.zig").findEnrichmentByName;
+const findEnrichmentByName = @import("antfly_local_sources").metadata_local_index_reconcile.findEnrichmentByName;
 
 fn findEnrichment(
     configs: []const db_mod.types.EnrichmentConfig,
@@ -860,21 +860,21 @@ fn findEnrichment(
     return null;
 }
 
-const enrichmentConfigsEqual = @import("local_index_reconcile.zig").enrichmentConfigsEqual;
+const enrichmentConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.enrichmentConfigsEqual;
 
-pub const ResolverReconcileSummary = @import("local_index_reconcile.zig").ResolverReconcileSummary;
+pub const ResolverReconcileSummary = @import("antfly_local_sources").metadata_local_index_reconcile.ResolverReconcileSummary;
 
 pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !ResolverReconcileSummary {
     return try ensureResolversWithOptions(alloc, db, indexes_json, .{});
 }
 
-pub const EnsureResolverOptions = @import("local_index_reconcile.zig").EnsureResolverOptions;
+pub const EnsureResolverOptions = @import("antfly_local_sources").metadata_local_index_reconcile.EnsureResolverOptions;
 
-pub const ensureResolversWithOptions = @import("local_index_reconcile.zig").ensureResolversWithOptions;
+pub const ensureResolversWithOptions = @import("antfly_local_sources").metadata_local_index_reconcile.ensureResolversWithOptions;
 
-const desiredResolverContains = @import("local_index_reconcile.zig").desiredResolverContains;
+const desiredResolverContains = @import("antfly_local_sources").metadata_local_index_reconcile.desiredResolverContains;
 
-const collectDesiredResolvers = @import("local_index_reconcile.zig").collectDesiredResolvers;
+const collectDesiredResolvers = @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredResolvers;
 
 fn localRangeHasSchemaVersionIndex(
     alloc: std.mem.Allocator,
@@ -1015,7 +1015,18 @@ fn runtimeHasReadySchemaVersionIndex(
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
     if (target_full_text) {
         const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
-        if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
+        // A chunk/artifact-sourced full-text index routes member documents
+        // (e.g. chunks) into the same index, so its doc_count is primary rows
+        // plus members and can never equal live_ordinals once a chunk
+        // enrichment targets it. The equality check historically existed only
+        // to reject a freshly-created or catalog-only placeholder index that
+        // looks idle before its own rebuild starts; findReadyRuntimeFullTextIndex
+        // above already requires backfill_active=false and replay caught up,
+        // which is the real proof that this incarnation's rebuild finished. A
+        // placeholder that has not started yet still reports doc_count=0 and
+        // is rejected by this bound; a 1:1 (no member documents) index still
+        // satisfies it at equality.
+        if (target.doc_count < runtime.doc_identity.live_ordinals) return false;
     } else {
         // An explicitly indexless relational table has no full-text rebuild
         // to wait for. Only a fresh owner observation of the exact applied
@@ -1110,11 +1121,11 @@ fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
     };
 }
 
-const parseIndexKind = @import("local_index_reconcile.zig").parseIndexKind;
+const parseIndexKind = @import("antfly_local_sources").metadata_local_index_reconcile.parseIndexKind;
 
-const embeddingIndexSparseFlag = @import("local_index_reconcile.zig").embeddingIndexSparseFlag;
+const embeddingIndexSparseFlag = @import("antfly_local_sources").metadata_local_index_reconcile.embeddingIndexSparseFlag;
 
-const looksLikeStoredAlgebraicIndexConfig = @import("local_index_reconcile.zig").looksLikeStoredAlgebraicIndexConfig;
+const looksLikeStoredAlgebraicIndexConfig = @import("antfly_local_sources").metadata_local_index_reconcile.looksLikeStoredAlgebraicIndexConfig;
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
@@ -1122,13 +1133,13 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     return try extractIndexConfigJsonForKind(alloc, index_name, kind, value);
 }
 
-const extractIndexConfigJsonForKind = @import("local_index_reconcile.zig").extractIndexConfigJsonForKind;
+const extractIndexConfigJsonForKind = @import("antfly_local_sources").metadata_local_index_reconcile.extractIndexConfigJsonForKind;
 
-const extractStoredIndexConfigJson = @import("local_index_reconcile.zig").extractStoredIndexConfigJson;
+const extractStoredIndexConfigJson = @import("antfly_local_sources").metadata_local_index_reconcile.extractStoredIndexConfigJson;
 
-const skipPublicIndexMetadataField = @import("local_index_reconcile.zig").skipPublicIndexMetadataField;
+const skipPublicIndexMetadataField = @import("antfly_local_sources").metadata_local_index_reconcile.skipPublicIndexMetadataField;
 
-const appendJsonString = @import("local_index_reconcile.zig").appendJsonString;
+const appendJsonString = @import("antfly_local_sources").metadata_local_index_reconcile.appendJsonString;
 
 fn findRange(ranges: []const table_manager.RangeRecord, group_id: u64) ?table_manager.RangeRecord {
     for (ranges) |record| {
@@ -1145,7 +1156,7 @@ fn findTable(tables: []const table_manager.TableRecord, table_id: u64) ?table_ma
 }
 
 fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
-    var path_tmp = try @import("../common/test_directory.zig").TestDirectory.initFast("backfill");
+    var path_tmp = try @import("antfly_local_sources").common_test_directory.TestDirectory.initFast("backfill");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
     const platform = @import("antfly_platform");
@@ -1194,7 +1205,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
 
         fn afterSnapshot(_: *anyopaque, _: *db_mod.DB, _: []const u8, _: u64) !void {}
 
-        fn afterPhase(ptr: *anyopaque, _: *db_mod.DB, _: u128, phase: @import("../storage/db/derived/index_repair_state.zig").Phase) !void {
+        fn afterPhase(ptr: *anyopaque, _: *db_mod.DB, _: u128, phase: @import("antfly_local_sources").storage_db_derived_index_repair_state.Phase) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (phase == .activating and !self.fired) {
                 self.fired = true;
@@ -3683,6 +3694,54 @@ fn implementationTests() type {
             runtime.doc_identity.live_ordinals = 0;
             indexes[1].doc_count = 0;
             try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+        }
+
+        test "table provisioner accepts chunk-inflated target full-text doc count" {
+            const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{
+                .{
+                    .name = "full_text_index_v0",
+                    .kind = "full_text",
+                    .doc_count = 1000,
+                    .replay_applied_sequence = 7,
+                    .replay_target_sequence = 7,
+                },
+                .{
+                    // 1000 primary rows + 500 chunk members routed in by a chunk
+                    // enrichment with full_text_index: true.
+                    .name = "full_text_index_v1",
+                    .kind = "full_text",
+                    .doc_count = 1500,
+                    .replay_applied_sequence = 7,
+                    .replay_target_sequence = 7,
+                },
+            };
+            const runtime = table_manager.RuntimeGroupStatusReport{
+                .table_id = range.table_id,
+                .group_id = range.group_id,
+                .freshness = "fresh",
+                .doc_count = 1000,
+                .doc_identity = .{
+                    .namespace_table_id = range.table_id,
+                    .namespace_shard_id = range.group_id,
+                    .namespace_range_id = range.group_id,
+                    .next_ordinal = 1001,
+                    .allocated_ordinals = 1000,
+                    .live_ordinals = 1000,
+                },
+                .indexes = &indexes,
+            };
+
+            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+
+            // A rebuild still genuinely in progress (fewer full-text docs than
+            // primary identities) must still be rejected.
+            indexes[1].doc_count = 400;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+
+            // A brand-new placeholder index (nothing written yet) is still rejected.
+            indexes[1].doc_count = 0;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
         }
 
         test "table provisioner indexless relational schema cutover requires exact fresh owner epoch" {

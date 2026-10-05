@@ -38,6 +38,7 @@ pub const LiteStorageStatus = support.lite.backend.StorageStatus;
 pub const LiteStatus = support.lite.backend.FullStatus;
 
 pub const OpenOptions = struct {
+    lite_reclamation: support.lite.backend.ReclamationOptions = .{},
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
@@ -104,6 +105,7 @@ pub const DB = struct {
 
     pub fn openLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         var lite_backend = try support.lite.backend.Handle.open(alloc, path, .{
+            .reclamation = opts.lite_reclamation,
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
@@ -114,6 +116,7 @@ pub const DB = struct {
     pub fn createLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         if (!openModeCanWrite(opts.open_mode)) return error.InvalidArgument;
         var lite_backend = try support.lite.backend.Handle.createWithOptions(alloc, path, .{
+            .reclamation = opts.lite_reclamation,
             .exclusive = true,
             .no_sync = opts.no_sync,
             .io = liteIo(opts),
@@ -618,7 +621,9 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expectEqualStrings("native_single_file", status.storage.engine);
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.storage.replay_layout);
     try std.testing.expectEqualStrings("__antfly_lite", status.storage.index_namespace.?);
-    try std.testing.expectEqual(@as(?u32, support.lite.native.format_version), status.storage.format_version);
+    // Fresh Lite files use the indexed-reclamation format, rather than the
+    // legacy native format version. The public status must report that format.
+    try std.testing.expectEqual(@as(?u32, 4), status.storage.format_version);
     try std.testing.expectEqual(@as(?u32, 4096), status.storage.page_size);
     try std.testing.expect(status.storage.active_checkpoint != null);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_count);

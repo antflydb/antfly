@@ -212,11 +212,11 @@ preparation and decode remain request-local.
 From `zig/pkg/inference`:
 
 ```sh
-ZIG=../../../.tools/zig-x86_64-linux-0.16.0/zig
+ZIG=../../../.tools/zig-x86_64-linux-0.17.0/zig
 MODEL=/absolute/path/to/fp16-gliner2-gguf-directory
 
 $ZIG build -Dcuda=true -Dcuda-artifacts=sm89 -Dcuda-libs=auto \
-  -Doptimize=ReleaseFast bench-gliner2-e2e -- \
+  -Doptimize=fast bench-gliner2-e2e -- \
   --model-dir "$MODEL" --backend cuda --task entities \
   --text-file scripts/gliner2/fixtures/gliner2_256.txt \
   --expect-encoder-seq-len 256 --batch-size 8 \

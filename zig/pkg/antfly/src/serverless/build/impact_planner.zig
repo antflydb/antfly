@@ -216,17 +216,17 @@ fn graphMetricsChanged(alloc: std.mem.Allocator, before: std.json.Value, after: 
         const after_value = after_object.get(entry.key_ptr.*) orelse continue;
         if (classifyIndexFamily(after_value) != .graph) continue;
         const before_metrics = try graph_metric_config.parseMetricConfigsAlloc(alloc, entry.value_ptr.*);
-        defer @import("../../graph/graph.zig").freeGraphMetricConfigs(alloc, before_metrics);
+        defer @import("antfly_local_sources").graph_graph.freeGraphMetricConfigs(alloc, before_metrics);
         const after_metrics = try graph_metric_config.parseMetricConfigsAlloc(alloc, after_value);
-        defer @import("../../graph/graph.zig").freeGraphMetricConfigs(alloc, after_metrics);
+        defer @import("antfly_local_sources").graph_graph.freeGraphMetricConfigs(alloc, after_metrics);
         if (!canonicalGraphMetricsEql(before_metrics, after_metrics)) return true;
     }
     return false;
 }
 
 fn canonicalGraphMetricsEql(
-    lhs: []const @import("../../graph/graph.zig").GraphMetricConfig,
-    rhs: []const @import("../../graph/graph.zig").GraphMetricConfig,
+    lhs: []const @import("antfly_local_sources").graph_graph.GraphMetricConfig,
+    rhs: []const @import("antfly_local_sources").graph_graph.GraphMetricConfig,
 ) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs, rhs) |left, right| {
@@ -281,7 +281,7 @@ fn classifyIndexFamily(value: std.json.Value) ?ArtifactFamily {
 }
 
 fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (@intFromEnum(lhs) != @intFromEnum(rhs)) return false;
+    if (@backingInt(lhs) != @backingInt(rhs)) return false;
     return switch (lhs) {
         .null => true,
         .bool => |value| value == rhs.bool,

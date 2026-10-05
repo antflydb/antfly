@@ -26,6 +26,8 @@ comptime {
 
 pub const std_options: std.Options = .{
     .logFn = wasmLog,
+    .allow_stack_tracing = false,
+    .networking = false,
 };
 
 fn wasmLog(

@@ -66,7 +66,7 @@
 //! ───────
 //!     zig build test-gliner2-backend-grad-parity
 //!     TERMITE_REQUIRE_CUDA_TESTS=1 zig build test-gliner2-backend-grad-parity \
-//!       -Dcuda=true -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast
+//!       -Dcuda=true -Dcuda-artifacts=sm89 -Doptimize=fast
 //!
 //! Skips (rather than fails) when Metal is not compiled in or no Metal device
 //! is present, matching the convention used by the `metal_compute.zig` audits.
@@ -376,7 +376,7 @@ const NativeStore = struct {
         return self;
     }
 
-    fn deinit(self: *NativeStore) void {
+    pub fn deinit(self: *NativeStore) void {
         var it = self.store.resident_weights.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit();
         self.store.resident_weights.deinit(self.allocator);
@@ -420,7 +420,7 @@ const MetalStore = struct {
         return self;
     }
 
-    fn deinit(self: *MetalStore) void {
+    pub fn deinit(self: *MetalStore) void {
         if (comptime !build_options.enable_metal) return;
         metal_compute.deinitPrefetchQueue(&self.store);
         metal_compute.deinitSharedNativeProvider(&self.store);
@@ -474,7 +474,7 @@ const GradCapture = struct {
         return null;
     }
 
-    fn deinit(self: *GradCapture) void {
+    pub fn deinit(self: *GradCapture) void {
         for (self.names.items) |name| self.allocator.free(name);
         for (self.grads.items) |data| self.allocator.free(data);
         self.names.deinit(self.allocator);
@@ -488,7 +488,7 @@ const RunResult = struct {
     capture: GradCapture,
     device_peak_bytes: u64,
 
-    fn deinit(self: *RunResult) void {
+    pub fn deinit(self: *RunResult) void {
         self.capture.deinit();
     }
 };
@@ -705,7 +705,7 @@ const Batch = struct {
     targets: []f32,
     targets_shape: Shape,
 
-    fn deinit(self: *Batch) void {
+    pub fn deinit(self: *Batch) void {
         self.allocator.free(self.input_ids);
         self.allocator.free(self.attention_mask);
         self.allocator.free(self.targets);
@@ -1535,7 +1535,7 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
     defer allocator.free(expected_path);
     const actual_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/cuda_actual.safetensors", .{tmp.sub_path});
     defer allocator.free(actual_path);
-    const fingerprint = [_]u8{0xC7} ** 32;
+    const fingerprint = @as([32]u8, @splat(0xC7));
 
     var uninterrupted_loss: f32 = undefined;
     var uninterrupted_norm: f32 = undefined;
@@ -1643,9 +1643,9 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
         try trainer.saveTrainingState(actual_path, &fingerprint, null);
     }
 
-    const expected = try compat.cwd().readFileAlloc(compat.io(), expected_path, allocator, .unlimited);
+    const expected = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), expected_path, allocator, .unlimited);
     defer allocator.free(expected);
-    const actual = try compat.cwd().readFileAlloc(compat.io(), actual_path, allocator, .unlimited);
+    const actual = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), actual_path, allocator, .unlimited);
     defer allocator.free(actual);
     // Byte equality covers every LoRA weight, both Adam moments, per-slot Adam
     // steps, and global micro-batch/optimizer counters in the safetensors file.

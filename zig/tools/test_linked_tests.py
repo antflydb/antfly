@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Compile/link and runner contracts for independently compiled consumer tests."""
 
 import platform
@@ -98,7 +111,7 @@ test "fixture consumer" {
         return output
 
     def assert_compile(self, output, kind, name, state):
-        self.assertRegex(output, rf"compile {kind} fixture-{name} Debug \S+ {state}")
+        self.assertRegex(output, rf"compile {kind} fixture-{name} debug \S+ {state}")
 
     def test_cache_and_linked_behavior(self):
         self.assertIn("provider-value=42", self.build("test"))

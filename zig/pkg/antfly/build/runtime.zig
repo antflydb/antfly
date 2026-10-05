@@ -1,28 +1,22 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
-const AntflyRootImports = @import("imports.zig").AntflyRootImports;
+const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 
-pub const RuntimeArtifactRole = enum {
-    cli,
-    data,
-    inference,
-    metadata,
-    standalone,
-};
+pub const RuntimeArtifactRole = @import("../../../build_support/antfly/runtime_roles.zig").RuntimeArtifactRole;
 
 const runtime_memory = @import("runtime_memory.zig");
 pub const RuntimeLibraryUnit = runtime_memory.RuntimeLibraryUnit;
@@ -45,12 +39,12 @@ pub const runtime_library_link_order = [_]RuntimeLibraryUnit{
 };
 
 comptime {
-    const unit_count = std.meta.fields(RuntimeLibraryUnit).len;
+    const unit_count = @typeInfo(RuntimeLibraryUnit).@"enum".field_names.len;
     if (runtime_library_link_order.len != unit_count)
         @compileError("runtime_library_link_order must contain every runtime library unit exactly once");
-    var seen = [_]bool{false} ** unit_count;
+    var seen = @as([unit_count]bool, @splat(false));
     for (runtime_library_link_order) |unit| {
-        const index = @intFromEnum(unit);
+        const index = @backingInt(unit);
         if (seen[index])
             @compileError("runtime_library_link_order contains a duplicate runtime library unit");
         seen[index] = true;
@@ -70,7 +64,7 @@ const addMacosSdkPaths = @import("../../../lib/platform/build_support.zig").addM
 
 pub const AddRuntimeOptions = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     link_libc: bool,
     sanitize_thread: bool,
@@ -88,8 +82,7 @@ pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
     antfly_main: *std.Build.Step.Compile,
     run_linked_inference_abi_integration: *std.Build.Step.Run,
-    runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
-    lite_storage: *std.Build.Step.Compile,
+    runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile,
 };
 
 pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
@@ -124,7 +117,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const antfly_main_tests = b.addTest(.{
         .root_module = b.createModule(main_module_options),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -138,18 +131,16 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .root_module = antfly_main_mod,
     });
 
-    var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
+    var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
-        // Server and focused artifacts reuse their runtime owners. The Apache
-        // C API and Lite CLI use the separate local owner below.
+        // The server executable and focused server artifacts reuse their owning
+        // runtime units. Public embedded products have independent owners.
         const role_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
-            // These owners also link into the Apache libantfly shared ABI.
-            // Linux cannot relocate a non-PIC inference archive into it.
-            .pic = if (unit == .storage_kernel or unit == .enrichment_compute or unit == .inference) true else null,
+            .pic = if (unit == .storage_kernel or unit == .enrichment_compute) true else null,
         });
         var role_imports = production_antfly_imports;
         role_imports.boundary_profile = switch (unit) {
@@ -167,11 +158,20 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
         role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .enrichment_compute, true, role_imports.boundary_profile);
+        if (unit == .inference) {
+            const native_exports = b.createModule(.{
+                .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            production_antfly_imports.configureInference(b, native_exports, link_libc);
+            role_mod.addImport("antfly_inference_native_exports", native_exports);
+        }
         if (unit == .storage_kernel) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
-            // The server storage archive and separate Apache Lite owner both
-            // link the inference runtime archive
+            // This archive is shared by the default `libantfly` and by the
+            // `antfly` executable. Both link the inference runtime archive
             // in-process (see `link_anchor.zig` and the `.inference` unit
             // linked into `libantfly_link_mod` below), so the
             // embedded-inference construction path is always available.
@@ -213,7 +213,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
         );
         runtime_unit_step.dependOn(&role_artifact.step);
-        runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
+        runtime_library_artifacts[@backingInt(unit)] = role_artifact;
         if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
@@ -223,59 +223,14 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_artifact.link_data_sections = true;
         }
         // Zig's build runner uses these claims to run as many LLVM codegen
-        // steps concurrently as fit in available RAM. Server storage and Lite
-        // have separate owners over the shared engine implementation.
+        // steps concurrently as fit in available RAM. The server storage
+        // archive owns private operations used by the executable.
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();
             setStripRecursively(role_mod, &visited);
         }
     }
-
-    // Compile the Apache embedding surface independently of the ELv2 server
-    // owner exports. Both owners consume the same local engine implementation.
-    const lite_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/runtime_lite_kernel_root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .sanitize_thread = sanitize_thread,
-        .pic = true,
-        .strip = strip,
-    });
-    production_antfly_imports.configureStorage(b, lite_mod, link_libc);
-    production_antfly_imports.storage_boundary.configureProfile(lite_mod, false, true, .all);
-    lite_mod.addImport("antfly_storage_root", lite_mod);
-    lite_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    const lite_capi_options = b.addOptions();
-    lite_capi_options.addOption(bool, "linked_storage", true);
-    lite_capi_options.addOption(bool, "inference_enabled", true);
-    lite_mod.addOptions("capi_build_options", lite_capi_options);
-    production_antfly_imports.build_info.link(lite_mod);
-    addMacosSdkPaths(b, lite_mod, target);
-    const lite_storage = b.addLibrary(.{
-        .name = "antfly-lite-kernel",
-        .root_module = lite_mod,
-        .linkage = .static,
-        .max_rss = runtimeCompileMaxRss(.storage_kernel, .{
-            .host = b.graph.host.result,
-            .target = target.result,
-            .optimize = optimize,
-            .strip = strip,
-            .cpu_inference = options.cpu_inference,
-            .sanitize_thread = sanitize_thread,
-        }),
-    });
-    lite_storage.link_function_sections = true;
-    lite_storage.link_data_sections = true;
-    libantfly_link_mod.linkLibrary(lite_storage);
-
-    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
-    // libantfly embeds the standalone inference runtime in-process, the same
-    // as the `antfly` executable (2026-09-17 product decision: Lite hosts
-    // get local inference without a separate runtime). This is why
-    // `link_anchor.zig` no longer traps
-    // `antfly_standalone_inference_get_function_table`.
-    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
 
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot
@@ -295,12 +250,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .root_module = linked_inference_abi_integration_mod,
     });
     linked_inference_abi_integration.root_module.linkLibrary(
-        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?,
+        runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
-        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
+        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
 
     if (runtime_artifact_role) |role| {
@@ -308,7 +263,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_options.addOption(RuntimeArtifactRole, "role", role);
 
         const role_mod = b.createModule(.{
-            .root_source_file = b.path(if (role == .inference) "pkg/antfly/src/runtime_inference_main.zig" else "pkg/antfly/src/runtime_artifact_main.zig"),
+            .root_source_file = b.path("pkg/antfly/src/runtime_artifact_main.zig"),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = sanitize_thread,
@@ -328,26 +283,26 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_exe.link_gc_sections = true;
         switch (role) {
             .cli => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.cli)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
             },
             .data, .metadata => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?);
             },
             .inference => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
             },
             .standalone => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
             },
         }
         if (role != .inference) {
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.storage_kernel)].?);
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.storage_kernel)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
         }
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -357,9 +312,6 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         const install_role = b.addInstallArtifact(role_exe, .{});
         const role_step = b.step("runtime-artifact", "Build and install one focused server runtime artifact");
         role_step.dependOn(&install_role.step);
-        if (role == .inference) {
-            role_step.dependOn(@import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-inference", "share/licenses/antfly-inference"));
-        }
     }
     if (strip) {
         var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -372,6 +324,5 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .antfly_main = antfly_main,
         .run_linked_inference_abi_integration = run_linked_inference_abi_integration,
         .runtime_library_artifacts = runtime_library_artifacts,
-        .lite_storage = lite_storage,
     };
 }

@@ -198,7 +198,7 @@ const SegmentedAttachmentBody = struct {
     metadata: []u8,
     envelope: httpx.attachment_envelope.EncodedSegments,
 
-    fn deinit(self: *SegmentedAttachmentBody, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SegmentedAttachmentBody, alloc: std.mem.Allocator) void {
         self.envelope.deinit();
         alloc.free(self.metadata);
         self.* = undefined;

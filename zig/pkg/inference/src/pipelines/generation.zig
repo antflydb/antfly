@@ -1248,7 +1248,7 @@ const SamplingPenaltyState = struct {
         return .{ .enabled = enabled };
     }
 
-    fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
         self.counts.deinit(allocator);
         self.* = .{};
     }
@@ -1390,7 +1390,7 @@ const Gemma4MtpPositionMode = enum {
     target_constant,
     legacy_one,
 
-    fn name(self: Gemma4MtpPositionMode) []const u8 {
+    pub fn name(self: Gemma4MtpPositionMode) []const u8 {
         return switch (self) {
             .target_absolute => "target_absolute",
             .target_constant => "target_constant",
@@ -1403,7 +1403,7 @@ const Gemma4MtpTargetHiddenSource = enum {
     final,
     pre_norm,
 
-    fn name(self: Gemma4MtpTargetHiddenSource) []const u8 {
+    pub fn name(self: Gemma4MtpTargetHiddenSource) []const u8 {
         return switch (self) {
             .final => "final",
             .pre_norm => "pre_norm",
@@ -7347,7 +7347,7 @@ pub const NativeGenerationPipeline = struct {
         pre_norm_hidden: []f32,
         rows: usize,
 
-        fn deinit(self: *ForwardAllWithHiddenHost) void {
+        pub fn deinit(self: *ForwardAllWithHiddenHost) void {
             self.allocator.free(self.logits);
             self.allocator.free(self.hidden);
             self.allocator.free(self.pre_norm_hidden);
@@ -7362,7 +7362,7 @@ pub const NativeGenerationPipeline = struct {
         pre_norm_hidden: ops.CT,
         rows: usize,
 
-        fn deinit(self: *ForwardAllWithHiddenDevice) void {
+        pub fn deinit(self: *ForwardAllWithHiddenDevice) void {
             self.cb.free(self.logits);
             self.cb.free(self.hidden);
             self.cb.free(self.pre_norm_hidden);
@@ -7379,7 +7379,7 @@ pub const NativeGenerationPipeline = struct {
         prepared_tail_choices: ?[]u32 = null,
         choices_allocator: ?std.mem.Allocator = null,
 
-        fn deinit(self: *ForwardHiddenDevice) void {
+        pub fn deinit(self: *ForwardHiddenDevice) void {
             self.cb.free(self.hidden);
             if (self.pre_norm_hidden) |pre_norm| self.cb.free(pre_norm);
             if (self.prepared_tail_choices) |choices| self.choices_allocator.?.free(choices);
@@ -7405,7 +7405,7 @@ pub const NativeGenerationPipeline = struct {
         pending_unmaterialized: bool = false,
         draft_embedding_cache: std.ArrayListUnmanaged(DraftEmbeddingCacheEntry) = .empty,
 
-        fn deinit(self: *Gemma4MtpActivationState) void {
+        pub fn deinit(self: *Gemma4MtpActivationState) void {
             if (self.host) |activation| self.allocator.free(activation);
             if (self.device) |tensor| self.draft_cb.free(tensor);
             for (self.draft_embedding_cache.items) |entry| self.draft_cb.free(entry.tensor);
@@ -8538,7 +8538,7 @@ pub const NativeGenerationPipeline = struct {
         try mtp_activation.validateKvTokensInSync(decode_state, seq_len.*);
 
         var draft_tokens: [16]i64 = undefined;
-        var draft_logits: [16]?[]f32 = [_]?[]f32{null} ** 16;
+        var draft_logits: [16]?[]f32 = @as([16]?[]f32, @splat(null));
         defer for (draft_logits) |maybe_logits| {
             if (maybe_logits) |logits| allocator.free(logits);
         };
@@ -8584,11 +8584,11 @@ pub const NativeGenerationPipeline = struct {
         // chain vars above become borrows of these slots) so a correction or
         // bonus round can adopt the committed position's chain activation
         // instead of running the materialize forward.
-        var draft_step_device_activations: [16]?ops.CT = [_]?ops.CT{null} ** 16;
+        var draft_step_device_activations: [16]?ops.CT = @as([16]?ops.CT, @splat(null));
         defer for (&draft_step_device_activations) |*slot| {
             if (slot.*) |tensor| draft_pipeline.cb.free(tensor);
         };
-        var draft_step_host_activations: [16]?[]f32 = [_]?[]f32{null} ** 16;
+        var draft_step_host_activations: [16]?[]f32 = @as([16]?[]f32, @splat(null));
         defer for (&draft_step_host_activations) |*slot| {
             if (slot.*) |activation| allocator.free(activation);
         };
@@ -9005,7 +9005,7 @@ pub const NativeGenerationPipeline = struct {
                     // when the prepared-slot argmax already produced the
                     // choices, the plain accept path below consumes them at a
                     // fraction of the cost.
-                    var eos_token_ids_buf: [1 + gpt_mod.max_extra_eos_token_ids]i32 = [_]i32{-1} ** (1 + gpt_mod.max_extra_eos_token_ids);
+                    var eos_token_ids_buf: [1 + gpt_mod.max_extra_eos_token_ids]i32 = @as([(1 + gpt_mod.max_extra_eos_token_ids)]i32, @splat(-1));
                     var eos_token_ids_len: usize = 0;
                     if (!config.ignore_eos and self.gpt_config.eos_token_id >= 0) {
                         eos_token_ids_buf[eos_token_ids_len] = self.gpt_config.eos_token_id;
@@ -10846,7 +10846,7 @@ const DecodeStepDriver = struct {
         return stepBudgetFromState(self.scheduler, self.decode_state);
     }
 
-    fn preStep(self: *DecodeStepDriver) void {
+    pub fn preStep(self: *DecodeStepDriver) void {
         if (self.pipeline.execution_lock != null) return;
         self.pipeline.cb.drainPrefetchBudget(NativeGenerationPipeline.prefetch_drain_budget_per_step);
     }
@@ -11258,7 +11258,7 @@ test "native generation prompt limit reserves output media and draft context" {
 }
 
 test "Qwen3-VL media admission uses exact image geometry before scheduling" {
-    var png_header = [_]u8{0} ** 24;
+    var png_header = @as([24]u8, @splat(0));
     @memcpy(png_header[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png_header[8..12], 13, .big);
     @memcpy(png_header[12..16], "IHDR");
@@ -12227,7 +12227,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
             return self.coordinator.defaultStepBudget();
         }
 
-        fn preStep(self: *@This()) void {
+        pub fn preStep(self: *@This()) void {
             self.prestep_calls += 1;
         }
 
@@ -13286,14 +13286,14 @@ const PromotedEnvGuard = struct {
 
     fn captureAndClear(allocator: std.mem.Allocator, name: [:0]const u8) !PromotedEnvGuard {
         const saved: ?[:0]u8 = if (platform.env.getenv(name.ptr)) |value|
-            try allocator.dupeZ(u8, value)
+            try allocator.dupeSentinel(u8, value, 0)
         else
             null;
         _ = unsetenv(name.ptr);
         return .{ .name = name, .saved = saved };
     }
 
-    fn restore(self: *PromotedEnvGuard, allocator: std.mem.Allocator) void {
+    pub fn restore(self: *PromotedEnvGuard, allocator: std.mem.Allocator) void {
         if (self.saved) |value| {
             _ = setenv(self.name.ptr, value.ptr, 1);
             allocator.free(value);
@@ -15052,7 +15052,7 @@ test "qwen image placeholders encode from config token ids" {
             return 256;
         }
 
-        fn deinit(_: *anyopaque) void {}
+        pub fn deinit(_: *anyopaque) void {}
     };
 
     var byte_tokenizer = ByteTokenizer{};
@@ -15338,7 +15338,7 @@ const PreparedEmbeddingsTestModel = struct {
         self.compute = native_compute.NativeCompute.init(allocator, &self.store, null);
     }
 
-    fn deinit(self: *PreparedEmbeddingsTestModel, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PreparedEmbeddingsTestModel, allocator: std.mem.Allocator) void {
         self.compute.deinit();
         native_compute.deinitPrefetchQueue(&self.store);
         var it = self.store.resident_weights.iterator();

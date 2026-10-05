@@ -15,8 +15,8 @@
 
 //! Immutable restore-owner wire values and pure catalog projection.
 const std = @import("std");
-const native = @import("../db/restore_staging_contract.zig");
-const records = @import("../../common/topology_records.zig");
+const native = @import("antfly_local_sources").storage_db_restore_staging_contract;
+const records = @import("antfly_local_sources").common_topology_records;
 
 /// Resolve private restore authority from a configured node-local root. Never
 /// infer a deployment layout by walking ancestors: custom replica roots may
@@ -35,9 +35,9 @@ pub const max_owners = 65_536;
 
 pub const OwnerRef = struct {
     scope: native.Scope,
-    byte_range: @import("../byte_range.zig").ByteRange,
+    byte_range: @import("antfly_local_sources").storage_byte_range.ByteRange,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("../db/relational_integrity_json.zig").write(self, jw);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
     }
 };
 

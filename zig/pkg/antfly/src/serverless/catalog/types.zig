@@ -17,7 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vector_types = @import("antfly_vector").vector;
 const search_sources = @import("../search_sources.zig");
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
 
 pub const FullTextSourceMode = full_text_indexes.FullTextSourceMode;
 

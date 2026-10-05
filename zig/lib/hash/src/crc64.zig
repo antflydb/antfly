@@ -40,7 +40,7 @@ pub const Crc64Nvme = struct {
     }
 };
 
-pub const Oracle = std.hash.crc.Crc(u64, .{
+pub const Oracle = std.hash.crc.Generic(u64, .{
     .polynomial = 0xad93d23594c93659,
     .initial = 0xffffffffffffffff,
     .reflect_input = true,

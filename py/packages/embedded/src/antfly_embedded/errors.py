@@ -16,7 +16,7 @@
 """Stable Antfly C ABI error codes (antfly_error_code in antfly.h).
 
 The name/description tables here are a pure-Python mirror of
-zig/pkg/antfly/src/capi/types.zig's errorCodeName/errorCodeDescription (and
+zig/pkg/antfly-embedded/src/local/capi/types.zig's errorCodeName/errorCodeDescription (and
 go/pkg/embedded/errors.go), so error classification works even when the native
 library is not loaded. test_errors.py cross-checks these tables against the
 loaded C library's antfly_error_code_name/antfly_error_code_description for

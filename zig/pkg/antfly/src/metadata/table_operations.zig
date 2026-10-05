@@ -16,7 +16,7 @@
 //! Transport-neutral metadata table lifecycle operations.
 
 const std = @import("std");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const backups_api = @import("../api/backups.zig");
 const tables_api = @import("../api/tables.zig");
 const table_manager = @import("table_manager.zig");

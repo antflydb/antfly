@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const catalog_binding = @import("../external_source/catalog_binding.zig");
+const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source_manifest = @import("external_source_manifest.zig");
 
 pub const ResolveRequest = struct {
@@ -28,7 +28,7 @@ pub const ResolveRequest = struct {
     /// Borrowed, request-local publication authority. Discovery must not keep
     /// a shared mutable artifact-store pointer or upload before fencing.
     artifacts: *@import("../artifacts/store.zig").ArtifactStore,
-    previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
+    previous_artifacts: []const @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = &.{},
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 

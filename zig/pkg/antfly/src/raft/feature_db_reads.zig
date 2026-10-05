@@ -14,8 +14,8 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const db_query_search = @import("../storage/db/query/search_exec.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const db_query_search = @import("antfly_local_sources").storage_db_query_search_exec;
 const feature_reads = @import("feature_reads.zig");
 const read_gate = @import("read_gate.zig");
 
@@ -162,7 +162,7 @@ pub const FeatureDBReads = struct {
 test "feature db reads honor per-read consistency" {
     const Recorder = struct {
         group_ids: [3]u64 = .{ 0, 0, 0 },
-        contexts: [3][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 3,
+        contexts: [3][32]u8 = @as([3][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [3]usize = .{ 0, 0, 0 },
         count: usize = 0,
 

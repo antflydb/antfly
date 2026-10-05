@@ -17,7 +17,7 @@
     .fingerprint = 0xa5e861444f15318e,
     .name = .onnx,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .protobuf = .{
             .path = "../protobuf",

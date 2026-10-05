@@ -26,7 +26,7 @@ const table_catalog = @import("table_catalog.zig");
 
 /// A borrowed request budget, including its clock authority. Routers must keep
 /// admission, refresh and endpoint selection within this same budget.
-pub const RouteBudget = @import("routing_budget.zig").RouteBudget;
+pub const RouteBudget = @import("antfly_local_sources").api_routing_budget.RouteBudget;
 
 pub const HostedGroupRouter = struct {
     ptr: *anyopaque,

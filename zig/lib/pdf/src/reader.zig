@@ -14,6 +14,14 @@
 // limitations under the License.
 
 const std = @import("std");
+
+fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes.len * count]u8 {
+    var repeated: [bytes.len * count]u8 = undefined;
+    for (0..count) |i| {
+        @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+    }
+    return repeated;
+}
 const syntax = @import("syntax.zig");
 const text_encoding = @import("text_encoding.zig");
 const jbig2 = @import("jbig2.zig");
@@ -154,7 +162,7 @@ const ImageSampleRows = struct {
 const PreparedMatteMask = struct {
     image: DecodedRgbaImage,
 
-    fn deinit(self: *PreparedMatteMask, alloc: Allocator) void {
+    pub fn deinit(self: *PreparedMatteMask, alloc: Allocator) void {
         alloc.free(self.image.rgba);
         self.* = undefined;
     }
@@ -219,7 +227,7 @@ const ResolvedIndexedPalette = struct {
         return 0;
     }
 
-    fn deinit(self: *ResolvedIndexedPalette, alloc: Allocator) void {
+    pub fn deinit(self: *ResolvedIndexedPalette, alloc: Allocator) void {
         if (self.decoded_lookup) |bytes| alloc.free(bytes);
         if (self.lookup_owner) |*owner| owner.deinit(alloc);
         self.* = undefined;
@@ -262,7 +270,7 @@ const ImageTransparencyPlan = union(enum) {
         metadata: MaskImageMetadata,
     },
 
-    fn deinit(self: *ImageTransparencyPlan, alloc: Allocator) void {
+    pub fn deinit(self: *ImageTransparencyPlan, alloc: Allocator) void {
         switch (self.*) {
             .explicit_mask => |*mask| mask.object.deinit(alloc),
             .soft_mask => |*mask| mask.object.deinit(alloc),
@@ -312,7 +320,7 @@ const ImageDecodeContext = struct {
 
     active_mask_refs: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
-    fn deinit(self: *ImageDecodeContext, alloc: Allocator) void {
+    pub fn deinit(self: *ImageDecodeContext, alloc: Allocator) void {
         self.active_mask_refs.deinit(alloc);
     }
 
@@ -350,7 +358,7 @@ pub const DecodeLimits = struct {
     max_decoded_stream_bytes: usize = default_max_decoded_stream_bytes,
     max_working_set_bytes: usize = default_max_decode_working_set_bytes,
 
-    fn validate(self: DecodeLimits) !void {
+    pub fn validate(self: DecodeLimits) !void {
         if (self.max_decoded_stream_bytes == 0 or self.max_working_set_bytes == 0)
             return error.InvalidPdfDecodeLimits;
     }
@@ -492,13 +500,13 @@ const CodeSpaceRange = struct {
 const FontDecoder = struct {
     code_bytes: usize = 1,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
-    differences: [256]?[]u8 = [_]?[]u8{null} ** 256,
-    difference_codepoints: [256]?u21 = [_]?u21{null} ** 256,
-    difference_defined: [256]bool = [_]bool{false} ** 256,
+    differences: [256]?[]u8 = @as([256]?[]u8, @splat(null)),
+    difference_codepoints: [256]?u21 = @as([256]?u21, @splat(null)),
+    difference_defined: [256]bool = @as([256]bool, @splat(false)),
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
-    fn deinit(self: *FontDecoder, alloc: Allocator) void {
+    pub fn deinit(self: *FontDecoder, alloc: Allocator) void {
         for (self.differences) |mapping| if (mapping) |bytes| alloc.free(bytes);
         for (self.to_unicode) |entry| alloc.free(entry.dst);
         if (self.to_unicode.len > 0) alloc.free(self.to_unicode);
@@ -603,7 +611,7 @@ const PageFont = struct {
     outline_fallback: bool = false,
     borrowed: bool = false,
 
-    fn deinit(self: *PageFont, alloc: Allocator) void {
+    pub fn deinit(self: *PageFont, alloc: Allocator) void {
         alloc.free(self.name);
         if (self.borrowed) {
             self.* = undefined;
@@ -711,7 +719,7 @@ const Type1Glyph = struct {
     advance: f64,
     owns_data: bool = true,
 
-    fn deinit(self: *Type1Glyph, alloc: Allocator) void {
+    pub fn deinit(self: *Type1Glyph, alloc: Allocator) void {
         if (self.owns_data) {
             alloc.free(self.name);
             alloc.free(self.charstring);
@@ -725,7 +733,7 @@ const Type1Font = struct {
     glyphs: []Type1Glyph = &.{},
     missing_width: f64 = 0,
 
-    fn deinit(self: *Type1Font, alloc: Allocator) void {
+    pub fn deinit(self: *Type1Font, alloc: Allocator) void {
         for (self.local_subrs) |subr| alloc.free(subr);
         if (self.local_subrs.len > 0) alloc.free(self.local_subrs);
         for (self.glyphs) |*glyph| glyph.deinit(alloc);
@@ -768,7 +776,7 @@ const CidEncoding = struct {
     codespace_ranges: []CodeSpaceRange = &.{},
     mappings: []CidEncodingRange = &.{},
 
-    fn deinit(self: *CidEncoding, alloc: Allocator) void {
+    pub fn deinit(self: *CidEncoding, alloc: Allocator) void {
         if (self.codespace_ranges.len > 0) alloc.free(self.codespace_ranges);
         if (self.mappings.len > 0) alloc.free(self.mappings);
         self.* = undefined;
@@ -841,7 +849,7 @@ const TrueTypeFont = struct {
     cid_vertical_metrics: ?CidVerticalMetrics = null,
     vertical: bool = false,
 
-    fn deinit(self: *TrueTypeFont, alloc: Allocator) void {
+    pub fn deinit(self: *TrueTypeFont, alloc: Allocator) void {
         self.font.deinit(alloc);
         if (self.cid_to_gid) |*map| map.deinit(alloc);
         if (self.cid_encoding) |*encoding| encoding.deinit(alloc);
@@ -858,7 +866,7 @@ const CidToGidMap = union(enum) {
     identity,
     table: []u16,
 
-    fn deinit(self: *CidToGidMap, alloc: Allocator) void {
+    pub fn deinit(self: *CidToGidMap, alloc: Allocator) void {
         switch (self.*) {
             .identity => {},
             .table => |map| if (map.len > 0) alloc.free(map),
@@ -946,7 +954,7 @@ const CidWidthRange = struct {
     uniform_width: ?f64 = null,
     widths: []f64 = &.{},
 
-    fn deinit(self: *CidWidthRange, alloc: Allocator) void {
+    pub fn deinit(self: *CidWidthRange, alloc: Allocator) void {
         if (self.widths.len > 0) alloc.free(self.widths);
         self.* = undefined;
     }
@@ -962,7 +970,7 @@ const CidWidths = struct {
     default_width: f64 = 1000,
     ranges: []CidWidthRange = &.{},
 
-    fn deinit(self: *CidWidths, alloc: Allocator) void {
+    pub fn deinit(self: *CidWidths, alloc: Allocator) void {
         for (self.ranges) |*range| range.deinit(alloc);
         if (self.ranges.len > 0) alloc.free(self.ranges);
         self.* = undefined;
@@ -995,7 +1003,7 @@ const CidVerticalMetricRange = struct {
     uniform_metric: ?CidVerticalMetric = null,
     metrics: []CidVerticalMetric = &.{},
 
-    fn deinit(self: *CidVerticalMetricRange, alloc: Allocator) void {
+    pub fn deinit(self: *CidVerticalMetricRange, alloc: Allocator) void {
         if (self.metrics.len > 0) alloc.free(self.metrics);
         self.* = undefined;
     }
@@ -1015,7 +1023,7 @@ const CidVerticalMetrics = struct {
     default_v1_y: f64 = 880,
     ranges: []CidVerticalMetricRange = &.{},
 
-    fn deinit(self: *CidVerticalMetrics, alloc: Allocator) void {
+    pub fn deinit(self: *CidVerticalMetrics, alloc: Allocator) void {
         for (self.ranges) |*range| range.deinit(alloc);
         if (self.ranges.len > 0) alloc.free(self.ranges);
         self.* = undefined;
@@ -1044,7 +1052,7 @@ const CffOpenTypeFont = struct {
     cid_vertical_metrics: ?CidVerticalMetrics = null,
     vertical: bool = false,
 
-    fn deinit(self: *CffOpenTypeFont, alloc: Allocator) void {
+    pub fn deinit(self: *CffOpenTypeFont, alloc: Allocator) void {
         self.cff.deinit(alloc);
         self.sfnt.deinit(alloc);
         if (self.glyphs.len > 0) alloc.free(self.glyphs);
@@ -1098,7 +1106,7 @@ const EmbeddedCffFont = struct {
     cid_vertical_metrics: ?CidVerticalMetrics = null,
     vertical: bool = false,
 
-    fn deinit(self: *EmbeddedCffFont, alloc: Allocator) void {
+    pub fn deinit(self: *EmbeddedCffFont, alloc: Allocator) void {
         self.font.deinit(alloc);
         alloc.free(self.glyphs);
         if (self.cid_encoding) |*encoding| encoding.deinit(alloc);
@@ -1165,7 +1173,7 @@ const Type3Glyph = struct {
     vectorizable: bool = true,
     outline_only: bool = true,
 
-    fn deinit(self: *Type3Glyph, alloc: Allocator) void {
+    pub fn deinit(self: *Type3Glyph, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.content);
         self.* = undefined;
@@ -1184,7 +1192,7 @@ const Type3Font = struct {
     color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
-    fn deinit(self: *Type3Font, alloc: Allocator) void {
+    pub fn deinit(self: *Type3Font, alloc: Allocator) void {
         for (self.glyphs) |*glyph| glyph.deinit(alloc);
         if (self.glyphs.len > 0) alloc.free(self.glyphs);
         for (self.fonts) |*font| font.deinit(alloc);
@@ -1242,8 +1250,8 @@ pub const PageRenderDiagnostics = struct {
     vector_text_runs: u32 = 0,
     fallback_text_runs: u32 = 0,
     first_fallback_reason: ?TextFallbackReason = null,
-    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".fields.len]u32 =
-        [_]u32{0} ** @typeInfo(TextFallbackReason).@"enum".fields.len,
+    fallback_reason_counts: [@typeInfo(TextFallbackReason).@"enum".field_names.len]u32 =
+        @as([@typeInfo(TextFallbackReason).@"enum".field_names.len]u32, @splat(0)),
     text_materialization_bytes: u64 = 0,
     peak_operator_materialization_bytes: u64 = 0,
     remaining_edge_tests: u64 = 0,
@@ -1259,7 +1267,7 @@ pub const PageRenderDiagnostics = struct {
     fn recordFallback(self: *PageRenderDiagnostics, reason: TextFallbackReason, run_count: usize) void {
         self.fallback_text_groups +|= 1;
         self.fallback_text_runs +|= @intCast(@min(run_count, std.math.maxInt(u32)));
-        self.fallback_reason_counts[@intFromEnum(reason)] +|= 1;
+        self.fallback_reason_counts[@backingInt(reason)] +|= 1;
         if (self.first_fallback_reason == null) self.first_fallback_reason = reason;
     }
 };
@@ -1354,7 +1362,7 @@ const LayoutTextRun = struct {
     paint_order: usize = 0,
     output_span: ?TextOutputSpan = null,
 
-    fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
+    pub fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
         alloc.free(self.text);
         self.* = undefined;
     }
@@ -1417,7 +1425,7 @@ const DecodedImageCache = struct {
         self.retained_bytes = 0;
     }
 
-    fn deinit(self: *DecodedImageCache, alloc: Allocator) void {
+    pub fn deinit(self: *DecodedImageCache, alloc: Allocator) void {
         self.clear(alloc);
         self.entries.deinit(alloc);
         self.* = undefined;
@@ -1515,11 +1523,11 @@ pub const ShadingRun = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
-    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
-    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
+    color_samples: [shading_color_sample_capacity][4]u8 = @as([shading_color_sample_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0),
     color_sample_count: u8 = 0,
-    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
-    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @as([shading_discontinuity_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0),
     exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
@@ -1709,7 +1717,7 @@ const GlyphOutlineCache = struct {
         return self.cancellation.check();
     }
 
-    fn deinit(self: *GlyphOutlineCache) void {
+    pub fn deinit(self: *GlyphOutlineCache) void {
         var values = self.entries.valueIterator();
         while (values.next()) |entry| entry.outline.deinit(self.alloc);
         self.entries.deinit(self.alloc);
@@ -2088,7 +2096,7 @@ const TextRunStackEntry = struct {
     clip_points: ?[]const [2]f64,
     clip_fill_rule: FillRule,
 
-    fn deinit(self: *TextRunStackEntry, alloc: Allocator) void {
+    pub fn deinit(self: *TextRunStackEntry, alloc: Allocator) void {
         if (self.clip_points) |points| alloc.free(points);
         self.* = undefined;
     }
@@ -2130,7 +2138,7 @@ const ImageSampleDecode = struct {
     default_decode: ?[4]ColorComponentRange = null,
     clamp_count: u8 = 0,
     clamps: [max_image_color_space_decode_depth][4]ColorComponentRange =
-        [_][4]ColorComponentRange{.{ .{}, .{}, .{}, .{} }} ** max_image_color_space_decode_depth,
+        @as([max_image_color_space_decode_depth][4]ColorComponentRange, @splat(.{ .{}, .{}, .{}, .{} })),
 
     fn encodedValue(self: *const ImageSampleDecode, sample: u8, component_index: usize) f64 {
         const unit = @as(f64, @floatFromInt(sample)) / 255.0;
@@ -2242,7 +2250,7 @@ const ImageTintTransform = union(enum) {
     sampled: *GraphicsSampledTintTransform,
     calculator: CalculatorTintTransform,
 
-    fn deinit(self: *ImageTintTransform, alloc: Allocator) void {
+    pub fn deinit(self: *ImageTintTransform, alloc: Allocator) void {
         switch (self.*) {
             .exponential => |*transform| transform.deinit(alloc),
             .sampled => |transform| transform.deinit(alloc),
@@ -2250,7 +2258,7 @@ const ImageTintTransform = union(enum) {
         }
     }
 
-    fn evaluate(self: *const ImageTintTransform, tint: f64, output: []f64) void {
+    pub fn evaluate(self: *const ImageTintTransform, tint: f64, output: []f64) void {
         switch (self.*) {
             .exponential => |*transform| {
                 for (output, 0..) |*value, component|
@@ -2276,12 +2284,12 @@ const CalculatorTintTransform = struct {
     instructions: []CalculatorTintInstruction,
     ranges: [4]ColorComponentRange,
 
-    fn deinit(self: *CalculatorTintTransform, alloc: Allocator) void {
+    pub fn deinit(self: *CalculatorTintTransform, alloc: Allocator) void {
         alloc.free(self.instructions);
         self.* = undefined;
     }
 
-    fn evaluate(self: *const CalculatorTintTransform, tint: f64, output: []f64) void {
+    pub fn evaluate(self: *const CalculatorTintTransform, tint: f64, output: []f64) void {
         var stack: [64]f64 = undefined;
         var depth: usize = 1;
         stack[0] = std.math.clamp(tint, 0.0, 1.0);
@@ -2330,7 +2338,7 @@ const GraphicsSampledTintTransform = struct {
     domain_min: f64,
     domain_max: f64,
 
-    fn deinit(self: *GraphicsSampledTintTransform, alloc: Allocator) void {
+    pub fn deinit(self: *GraphicsSampledTintTransform, alloc: Allocator) void {
         alloc.free(self.values);
         alloc.destroy(self);
     }
@@ -2353,7 +2361,7 @@ const GraphicsTintColorSpace = struct {
     alternate_calibrated: ?CalibratedColorSpace,
     function: GraphicsTintFunction,
 
-    fn deinit(self: *GraphicsTintColorSpace, alloc: Allocator) void {
+    pub fn deinit(self: *GraphicsTintColorSpace, alloc: Allocator) void {
         switch (self.function) {
             .exponential => {},
             .sampled => |sampled| sampled.deinit(alloc),
@@ -2382,7 +2390,7 @@ const PageColorSpace = struct {
     name: []u8,
     selection: ColorSpaceSelection,
 
-    fn deinit(self: *PageColorSpace, alloc: Allocator) void {
+    pub fn deinit(self: *PageColorSpace, alloc: Allocator) void {
         deinitColorSpaceSelection(&self.selection, alloc);
         alloc.free(self.name);
         self.* = undefined;
@@ -2656,7 +2664,7 @@ const ShapeStackEntry = struct {
     clip_points: []const [2]f64,
     clip_fill_rule: FillRule,
 
-    fn deinit(self: *ShapeStackEntry, alloc: Allocator) void {
+    pub fn deinit(self: *ShapeStackEntry, alloc: Allocator) void {
         alloc.free(self.dash_array);
         alloc.free(self.clip_points);
         self.* = undefined;
@@ -2668,7 +2676,7 @@ const ImageStackEntry = struct {
     clip_points: []const [2]f64,
     clip_fill_rule: FillRule,
 
-    fn deinit(self: *ImageStackEntry, alloc: Allocator) void {
+    pub fn deinit(self: *ImageStackEntry, alloc: Allocator) void {
         alloc.free(self.clip_points);
         self.* = undefined;
     }
@@ -2684,7 +2692,7 @@ const PageImage = struct {
     bilevel: bool = false,
     image_mask: bool = false,
 
-    fn deinit(self: *PageImage, alloc: Allocator) void {
+    pub fn deinit(self: *PageImage, alloc: Allocator) void {
         alloc.free(self.name);
         if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
         self.* = undefined;
@@ -2798,16 +2806,16 @@ const PageShading = struct {
     r1: f64 = 0,
     c0: [4]u8,
     c1: [4]u8,
-    color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity,
-    color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity,
+    color_samples: [shading_color_sample_capacity][4]u8 = @as([shading_color_sample_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0),
     color_sample_count: u8 = 0,
-    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity,
-    exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity,
+    exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @as([shading_discontinuity_capacity][4]u8, @splat(.{ 0, 0, 0, 0xff })),
+    exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0),
     exact_boundary_count: u8 = 0,
     extend_start: bool = false,
     extend_end: bool = false,
 
-    fn deinit(self: *PageShading, alloc: Allocator) void {
+    pub fn deinit(self: *PageShading, alloc: Allocator) void {
         alloc.free(self.name);
         self.* = undefined;
     }
@@ -2821,7 +2829,7 @@ const PageExtGState = struct {
     soft_mask: ?PageSoftMask = null,
     soft_mask_specified: bool = false,
 
-    fn deinit(self: *PageExtGState, alloc: Allocator) void {
+    pub fn deinit(self: *PageExtGState, alloc: Allocator) void {
         if (self.soft_mask) |*mask| mask.deinit(alloc);
         alloc.free(self.name);
         self.* = undefined;
@@ -2837,7 +2845,7 @@ const PageSoftMask = struct {
     interpolate: bool,
     matrix: GraphicsMatrix,
 
-    fn deinit(self: *PageSoftMask, alloc: Allocator) void {
+    pub fn deinit(self: *PageSoftMask, alloc: Allocator) void {
         self.shared_rgba.release(alloc);
         self.* = undefined;
     }
@@ -2861,7 +2869,7 @@ const PagePattern = struct {
     color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
-    fn deinit(self: *PagePattern, alloc: Allocator) void {
+    pub fn deinit(self: *PagePattern, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.content);
         if (self.shading) |*shading| shading.deinit(alloc);
@@ -2899,7 +2907,7 @@ const PageForm = struct {
     color_spaces: []PageColorSpace = &.{},
     forms: []PageForm = &.{},
 
-    fn deinit(self: *PageForm, alloc: Allocator) void {
+    pub fn deinit(self: *PageForm, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.content);
         for (self.fonts) |*font| font.deinit(alloc);
@@ -2928,7 +2936,7 @@ const ExponentialTintTransform = struct {
     c1: []f64,
     ranges: ?[]ColorComponentRange = null,
 
-    fn deinit(self: *ExponentialTintTransform, alloc: Allocator) void {
+    pub fn deinit(self: *ExponentialTintTransform, alloc: Allocator) void {
         alloc.free(self.c0);
         alloc.free(self.c1);
         if (self.ranges) |ranges| alloc.free(ranges);
@@ -2944,7 +2952,7 @@ const ShadingColorFunction = union(enum) {
     sampled: *GraphicsSampledTintTransform,
     stitching: *ShadingStitchingFunction,
 
-    fn deinit(self: *ShadingColorFunction, alloc: Allocator) void {
+    pub fn deinit(self: *ShadingColorFunction, alloc: Allocator) void {
         switch (self.*) {
             .exponential => |*function| function.deinit(alloc),
             .sampled => |function| function.deinit(alloc),
@@ -2953,7 +2961,7 @@ const ShadingColorFunction = union(enum) {
         self.* = undefined;
     }
 
-    fn evaluate(self: *const ShadingColorFunction, input: f64, output: []f64) void {
+    pub fn evaluate(self: *const ShadingColorFunction, input: f64, output: []f64) void {
         switch (self.*) {
             .exponential => |*function| {
                 for (output, 0..) |*value, component|
@@ -3051,7 +3059,7 @@ const ShadingStitchingFunction = struct {
     domain_min: f64,
     domain_max: f64,
 
-    fn deinit(self: *ShadingStitchingFunction, alloc: Allocator) void {
+    pub fn deinit(self: *ShadingStitchingFunction, alloc: Allocator) void {
         for (self.functions) |*function| function.deinit(alloc);
         alloc.free(self.functions);
         alloc.free(self.bounds);
@@ -3059,7 +3067,7 @@ const ShadingStitchingFunction = struct {
         alloc.destroy(self);
     }
 
-    fn evaluate(self: *const ShadingStitchingFunction, input: f64, output: []f64) void {
+    pub fn evaluate(self: *const ShadingStitchingFunction, input: f64, output: []f64) void {
         const clamped = std.math.clamp(input, self.domain_min, self.domain_max);
         var function_index: usize = self.functions.len - 1;
         for (self.bounds, 0..) |bound, index| {
@@ -3131,7 +3139,7 @@ const PositionedTextParser = struct {
         return self;
     }
 
-    fn deinit(self: *PositionedTextParser) void {
+    pub fn deinit(self: *PositionedTextParser) void {
         clearContentOperands(self.alloc, &self.operands);
         self.operands.deinit(self.alloc);
         self.retained_pattern_names.deinit(self.alloc);
@@ -3975,7 +3983,7 @@ pub const Reader = struct {
         visited: std.AutoHashMapUnmanaged(u64, void) = .empty,
         nodes: usize = 0,
 
-        fn deinit(self: *TraversalGuard, alloc: Allocator) void {
+        pub fn deinit(self: *TraversalGuard, alloc: Allocator) void {
             self.visited.deinit(alloc);
         }
 
@@ -4241,7 +4249,7 @@ pub const Reader = struct {
         if (revision >= 3) {
             for (0..50) |_| digest = std.crypto.hash.Md5.hashResult(digest[0..file_key_len]);
         }
-        var file_key = [_]u8{0} ** 16;
+        var file_key = @as([16]u8, @splat(0));
         @memcpy(file_key[0..file_key_len], digest[0..file_key_len]);
 
         const user_key = switch ((encrypt.get("U") orelse return error.UnsupportedPdfEncryption).*) {
@@ -6432,7 +6440,7 @@ pub const Reader = struct {
         points: [][2]f64,
         subpath_starts: []usize,
 
-        fn deinit(self: *FlattenedGlyphPath, alloc: Allocator) void {
+        pub fn deinit(self: *FlattenedGlyphPath, alloc: Allocator) void {
             alloc.free(self.points);
             alloc.free(self.subpath_starts);
             self.* = undefined;
@@ -8310,8 +8318,8 @@ pub const Reader = struct {
         }
         var discontinuities: [shading_discontinuity_capacity]f64 = undefined;
         var discontinuity_count: usize = 0;
-        var exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_discontinuity_capacity;
-        var exact_boundary_positions: [shading_discontinuity_capacity]f64 = [_]f64{0} ** shading_discontinuity_capacity;
+        var exact_boundary_colors: [shading_discontinuity_capacity][4]u8 = @splat(.{ 0, 0, 0, 0xff });
+        var exact_boundary_positions: [shading_discontinuity_capacity]f64 = @splat(0);
         var exact_boundary_count: usize = 0;
         try function.appendDiscontinuities(
             &discontinuities,
@@ -8359,8 +8367,8 @@ pub const Reader = struct {
                 sample_points[insert] = sample_points[insert - 1];
             sample_points[insert] = value;
         }
-        var color_samples: [shading_color_sample_capacity][4]u8 = [_][4]u8{.{ 0, 0, 0, 0xff }} ** shading_color_sample_capacity;
-        var color_sample_positions: [shading_color_sample_capacity]f64 = [_]f64{0} ** shading_color_sample_capacity;
+        var color_samples: [shading_color_sample_capacity][4]u8 = @splat(.{ 0, 0, 0, 0xff });
+        var color_sample_positions: [shading_color_sample_capacity]f64 = @splat(0);
         for (sample_points[0..sample_count], 0..) |sample, sample_index| {
             var values = [4]f64{ 0, 0, 0, 0 };
             // Clamp explicitly here as well so custom evaluator additions
@@ -11260,7 +11268,7 @@ pub const Reader = struct {
         defer resolved_charprocs.deinit(self.alloc);
         if (resolved_charprocs != .dict) return font;
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
         var resolved_differences: ?syntax.Object = null;
@@ -11569,7 +11577,7 @@ pub const Reader = struct {
             }
         } else {
             var base_encoding = SimpleCffBaseEncoding.embedded;
-            var code_to_name = [_]?[]const u8{null} ** 256;
+            var code_to_name = @as([256]?[]const u8, @splat(null));
             var resolved_encoding: ?syntax.Object = null;
             defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
             var resolved_differences: ?syntax.Object = null;
@@ -12044,7 +12052,7 @@ pub const Reader = struct {
         }
         try self.checkCancellation();
 
-        var code_to_name = [_]?[]const u8{null} ** 256;
+        var code_to_name = @as([256]?[]const u8, @splat(null));
         var base_encoding = text_encoding.NamedEncoding.standard;
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
@@ -14696,7 +14704,7 @@ const TextContentParser = struct {
         return .{ .alloc = alloc, .out = out };
     }
 
-    fn deinit(self: *TextContentParser) void {
+    pub fn deinit(self: *TextContentParser) void {
         clearContentOperands(self.alloc, &self.operands);
         self.operands.deinit(self.alloc);
         self.* = undefined;
@@ -14794,7 +14802,7 @@ const ContentNameInterner = struct {
     names: std.StringHashMapUnmanaged([]u8) = .empty,
     name_bytes: usize = 0,
 
-    fn deinit(self: *ContentNameInterner, alloc: Allocator) void {
+    pub fn deinit(self: *ContentNameInterner, alloc: Allocator) void {
         var iterator = self.names.keyIterator();
         while (iterator.next()) |name| alloc.free(name.*);
         self.names.deinit(alloc);
@@ -17464,7 +17472,7 @@ const TextLayoutLine = struct {
     first_index: usize,
     bounds: TextRunBounds,
 
-    fn deinit(self: *TextLayoutLine, alloc: Allocator) void {
+    pub fn deinit(self: *TextLayoutLine, alloc: Allocator) void {
         self.run_indices.deinit(alloc);
     }
 };
@@ -18180,7 +18188,7 @@ const ReferencedResourceNames = struct {
     uses_device_rgb: bool = false,
     uses_device_cmyk: bool = false,
 
-    fn deinit(self: *ReferencedResourceNames, alloc: Allocator) void {
+    pub fn deinit(self: *ReferencedResourceNames, alloc: Allocator) void {
         var iterator = self.names.iterator();
         while (iterator.next()) |entry| alloc.free(entry.key_ptr.*);
         self.names.deinit(alloc);
@@ -19599,7 +19607,7 @@ const IccToneCurve = union(enum) {
     gamma: f64,
     table: []const u8,
 
-    fn evaluate(self: IccToneCurve, encoded: f64) !f64 {
+    pub fn evaluate(self: IccToneCurve, encoded: f64) !f64 {
         const x = std.math.clamp(encoded, 0.0, 1.0);
         return switch (self) {
             .identity => x,
@@ -20305,7 +20313,7 @@ test "content parsing and pixel conversion observe cancellation" {
     defer shapes.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.Canceled,
-        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, "0 " ** 300 ++ "m", &.{}, &.{}, content_cancellation),
+        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, repeatBytesComptime("0 ", 300) ++ "m", &.{}, &.{}, content_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), content_cancel.checks);
 
@@ -20317,7 +20325,7 @@ test "content parsing and pixel conversion observe cancellation" {
     var rgba: [4097 * 4]u8 = undefined;
     try std.testing.expectError(
         error.Canceled,
-        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &([_]u8{0} ** 4097), "DeviceGray", null, pixel_cancellation),
+        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &(@as([4097]u8, @splat(0))), "DeviceGray", null, pixel_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), pixel_cancel.checks);
 }
@@ -20580,8 +20588,8 @@ test "reader can decode ascii85 stream object" {
 
 test "image row streaming preserves predictors masks and native pixels above stream materialization limit" {
     const alloc = std.testing.allocator;
-    const pixels = [_]u8{ 10, 30, 50, 20, 60, 100, 50, 40, 90, 250, 210, 150 } ** 4;
-    const alpha = [_]u8{ 0, 64, 128, 255 } ** 4;
+    const pixels = z17RepeatArray([_]u8{ 10, 30, 50, 20, 60, 100, 50, 40, 90, 250, 210, 150 }, 4);
+    const alpha = z17RepeatArray([_]u8{ 0, 64, 128, 255 }, 4);
     for ([_]u8{ 1, 2, 10, 11, 12, 13, 14, 15 }) |predictor| {
         var predicted = std.ArrayList(u8).empty;
         defer predicted.deinit(alloc);
@@ -21581,7 +21589,7 @@ test "unfiltered terminal read decrypts AES lazily within working limits" {
     const key = objectEncryptionKey(context.file_key, context.file_key_len, ptr, context.method);
     var encrypted: [32]u8 = undefined;
     encrypted[0..16].* = .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f };
-    var padded = [_]u8{13} ** 16;
+    var padded = @as([16]u8, @splat(13));
     @memcpy(padded[0..3], "abc");
     for (&padded, encrypted[0..16]) |*value, iv| value.* ^= iv;
     const aes = std.crypto.core.aes.Aes128.initEnc(key.bytes);
@@ -22848,7 +22856,7 @@ test "Type1 and Type3 spacing follows horizontal scaling in measurement and geom
 
 test "simple TrueType PDF widths fall back to MissingWidth" {
     const alloc = std.testing.allocator;
-    var widths = [_]f64{-1} ** 256;
+    var widths = @as([256]f64, @splat(-1));
     widths['A'] = 600;
     try std.testing.expectEqual(@as(?f64, 600), simpleTrueTypePdfWidth(&widths, 375, 'A'));
     try std.testing.expectEqual(@as(?f64, 375), simpleTrueTypePdfWidth(&widths, 375, 'B'));
@@ -26244,7 +26252,7 @@ test "Indexed palette stream decode reserves retained image working set" {
 
 test "Indexed palette stream metadata is bounded before payload decode" {
     const alloc = std.testing.allocator;
-    const oversized_header_value = "x" ** 4096;
+    const oversized_header_value = @as([4096]u8, @splat('x'));
     const palette_object = try std.fmt.allocPrint(
         alloc,
         "3 0 obj\n<< /Length 3 /Unused ({s}) >>\nstream\nabc\nendstream\nendobj\n",
@@ -26297,7 +26305,7 @@ test "Indexed indirect lookup strings resolve within the aggregate working set" 
     defer palette.deinit(alloc);
     try std.testing.expectEqualStrings("abc", palette.lookup);
 
-    const oversized_lookup = "a" ** 128;
+    const oversized_lookup = @as([128]u8, @splat('a'));
     const oversized_object = try std.fmt.allocPrint(
         alloc,
         "3 0 obj\n({s})\nendobj\n",
@@ -26727,7 +26735,7 @@ test "JBIG2 coverage reduction polling scales with total sampled work" {
         }
     };
 
-    const encoded = [_]u8{0} ** (64 * 64 / 8);
+    const encoded = @as([(64 * 64 / 8)]u8, @splat(0));
     var probe_state = ProbeState{};
     const reduced = try reduceJbig2CoverageAlloc(
         std.testing.allocator,
@@ -27148,7 +27156,7 @@ test "resampled soft mask alpha updates multiple pixels" {
 }
 
 test "interpolated soft mask uses pixel-center bilinear sampling" {
-    var rgba = [_]u8{ 0, 0, 0, 255 } ** 3;
+    var rgba = [_]u8{ 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255 };
     const smask = [_]u8{
         0,   0,   0,   255,
         255, 255, 255, 255,
@@ -27243,7 +27251,7 @@ test "JP2 matrix ICC gray profile converts through PCS" {
             u32be(bytes, offset, @bitCast(signed));
         }
     };
-    var profile = [_]u8{0} ** 190;
+    var profile = @as([190]u8, @splat(0));
     Write.u32be(&profile, 0, profile.len);
     @memcpy(profile[16..20], "GRAY");
     @memcpy(profile[20..24], "XYZ ");
@@ -29611,7 +29619,7 @@ test "type1 RD parsers advance across slash and binary delimiters" {
     try std.testing.expectEqual(@as(usize, 1), subrs.len);
     try std.testing.expectEqualStrings("abc", subrs[0]);
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 375);
     defer {
@@ -29632,7 +29640,7 @@ test "type1 RD parser accepts compact charstrings without dup" {
         "/B 3 RD abc ND\n" ++
         "end\n";
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     code_to_name['B'] = "B";
     const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
@@ -29654,7 +29662,7 @@ test "type1 aliases share programs and only seac-reachable helpers survive" {
         "/unreachable 3 RD def ND\n" ++
         "end\n";
 
-    var code_to_name = [_]?[]const u8{null} ** 256;
+    var code_to_name = @as([256]?[]const u8, @splat(null));
     code_to_name['A'] = "A";
     code_to_name['B'] = "A";
     code_to_name[194] = "different";
@@ -29925,7 +29933,7 @@ test "dense low complexity Type1 text remains native within measured budget" {
         .decoder = .{},
         .type1 = .{ .glyphs = &glyphs },
     }};
-    var text = [_]u8{'A'} ** 32;
+    var text = @as([32]u8, @splat('A'));
     var run = TextRun{
         .text = &text,
         .raw_text = &text,
@@ -30704,7 +30712,7 @@ test "type1 font parsing is allocation-failure safe" {
                 if (subrs.len > 0) alloc.free(subrs);
             }
 
-            var code_to_name = [_]?[]const u8{null} ** 256;
+            var code_to_name = @as([256]?[]const u8, @splat(null));
             code_to_name['A'] = "A";
             code_to_name[194] = "different";
             const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
@@ -31049,4 +31057,10 @@ test "reader preserves PDF table rows and split-word provenance" {
     defer render_runs.deinit(alloc);
     try std.testing.expectEqualStrings("Alice", render_runs.text_runs[2].text);
     try std.testing.expectEqualStrings("City", render_runs.text_runs[3].text);
+}
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
 }

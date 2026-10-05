@@ -17,7 +17,7 @@
 //! code schedules whole maintenance quanta through this interface and never
 //! imports the DB, LSM, or index maintenance implementations.
 
-pub const PostingRefreshProgress = @import("../storage/posting_refresh_progress.zig").Progress;
+pub const PostingRefreshProgress = @import("antfly_local_sources").storage_posting_refresh_progress.Progress;
 
 pub const RoundResult = struct {
     progressed: bool = false,
@@ -37,7 +37,7 @@ pub const Source = struct {
     pub const VTable = struct {
         run_lsm_round: *const fn (*anyopaque, bool) anyerror!RoundResult,
         run_dense_posting_round: *const fn (*anyopaque) anyerror!PostingRefreshProgress,
-        publish_dense_checkpoints: *const fn (*anyopaque) anyerror!@import("../storage/db/types.zig").NativePublicationResult,
+        publish_dense_checkpoints: *const fn (*anyopaque) anyerror!@import("antfly_local_sources").storage_db_types.NativePublicationResult,
         run_vector_block_round: *const fn (*anyopaque) anyerror!usize,
         publish_runtime_statuses: ?*const fn (*anyopaque) void = null,
         snapshot: *const fn (*anyopaque, bool) anyerror!Snapshot,
@@ -51,7 +51,7 @@ pub const Source = struct {
         return try self.vtable.run_dense_posting_round(self.ptr);
     }
 
-    pub fn publishDenseCheckpoints(self: Source) !@import("../storage/db/types.zig").NativePublicationResult {
+    pub fn publishDenseCheckpoints(self: Source) !@import("antfly_local_sources").storage_db_types.NativePublicationResult {
         return try self.vtable.publish_dense_checkpoints(self.ptr);
     }
 

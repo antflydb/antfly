@@ -14,16 +14,16 @@
 // limitations.
 
 const std = @import("std");
-const driver = @import("db/maintenance/transaction_recovery_driver.zig");
+const driver = @import("antfly_local_sources").storage_db_maintenance_transaction_recovery_driver;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const backend_erased = @import("backend_erased.zig");
-const lsm_backend = @import("lsm_backend.zig");
-const mem_backend = @import("mem_backend.zig");
-const transactions_mod = @import("transactions.zig");
-const types = @import("db/types.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const types = @import("antfly_local_sources").storage_db_types;
 const platform_clock = @import("antfly_platform").clock;
-const background_runtime_mod = @import("background_runtime.zig");
+const background_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 
 pub const Config = @import("server_transaction_recovery_contract.zig").Config;
 
@@ -322,7 +322,7 @@ test "transaction recovery drains terminal HA outbox without remaining intents" 
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "ha-outbox" });
     defer runtime_store.deinit();
 
-    const txn_id: transactions_mod.TxnId = .{5} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(5);
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
     try manager.initTransaction(txn_id, 1_000);
@@ -368,9 +368,9 @@ test "transaction recovery advances past a failed local resolution" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "local-resolution-fairness" });
     defer runtime_store.deinit();
 
-    const poison_txn: transactions_mod.TxnId = .{1} ** 16;
-    const healthy_txn: transactions_mod.TxnId = .{2} ** 16;
-    const later_txn: transactions_mod.TxnId = .{3} ** 16;
+    const poison_txn: transactions_mod.TxnId = @splat(1);
+    const healthy_txn: transactions_mod.TxnId = @splat(2);
+    const later_txn: transactions_mod.TxnId = @splat(3);
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
     try manager.initTransactionWithParticipants(poison_txn, 1_000, &.{"remote"});
@@ -441,9 +441,9 @@ test "transaction recovery advances past a failed replicated cleanup" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "replicated-cleanup-fairness" });
     defer runtime_store.deinit();
 
-    const poison_txn: transactions_mod.TxnId = .{1} ** 16;
-    const healthy_txn: transactions_mod.TxnId = .{2} ** 16;
-    const later_txn: transactions_mod.TxnId = .{3} ** 16;
+    const poison_txn: transactions_mod.TxnId = @splat(1);
+    const healthy_txn: transactions_mod.TxnId = @splat(2);
+    const later_txn: transactions_mod.TxnId = @splat(3);
     const owner = "owner";
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
@@ -505,7 +505,7 @@ test "non-replicated transaction recovery honors the per-run page limit" {
 
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
-    const txn_ids = [_]transactions_mod.TxnId{ .{1} ** 16, .{2} ** 16, .{3} ** 16 };
+    const txn_ids = [_]transactions_mod.TxnId{ @splat(1), @splat(2), @splat(3) };
     for (txn_ids) |txn_id| {
         try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 1_000, &.{}, true);
     }
@@ -560,7 +560,7 @@ test "transaction recovery delegates stale coordinator abort to replicated resol
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "coordinator" });
     defer runtime_store.deinit();
 
-    const txn_id: transactions_mod.TxnId = .{7} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(7);
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
     try manager.initTransactionWithParticipantsCreatedAtAndRole(
@@ -606,7 +606,7 @@ test "replicated recovery is coordinator-owned and acknowledges through hooks" {
     var runtime_store = try backend.runtimeStore(alloc, .{ .name = "replicated-coordinator" });
     defer runtime_store.deinit();
 
-    const txn_id: transactions_mod.TxnId = .{6} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(6);
     const coordinator = "table2:4:docs:group:7";
     const remote = "table2:4:docs:group:8";
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
@@ -717,7 +717,7 @@ test "transaction recovery executes production pass on borrowed VoprIo" {
     defer runtime_store.deinit();
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
-    const txn_id: transactions_mod.TxnId = .{6} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(6);
     try manager.initTransaction(txn_id, 1_000);
 
     var runtime_owners_closed = false;
@@ -866,7 +866,7 @@ test "replicated recovery batches proven followers preserves uncertain debt and 
     }
 }
 
-pub fn runDbRecoveryOnce(self: *@import("db/db.zig").DB, config: Config) !types.TransactionRecoveryStats {
+pub fn runDbRecoveryOnce(self: *@import("antfly_source_root").antfly_sources.physical_db.DB, config: Config) !types.TransactionRecoveryStats {
     var replication_mutation = try self.admitTransactionRecovery();
     defer if (replication_mutation) |*lease| lease.release();
     if (!config.enabled) return .{};
@@ -943,7 +943,7 @@ pub fn runDbRecoveryOnce(self: *@import("db/db.zig").DB, config: Config) !types.
     return recovery_stats;
 }
 
-const local_contract = @import("db/transaction_recovery_contract.zig");
+const local_contract = @import("antfly_local_sources").storage_db_transaction_recovery_contract;
 
 /// Config and its callback contexts must outlive DB initialization. The
 /// constructed runtime snapshots Config and retains only its borrowed contexts.
@@ -984,7 +984,7 @@ const OwnedServerRuntime = struct {
     fn owner(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self = owner(ptr);
         const alloc = self.alloc;
         self.runtime.deinit();
@@ -1033,7 +1033,7 @@ const OwnedServerRuntime = struct {
 
 /// Inspect the owned server configuration only in server integration fixtures.
 pub const test_support = if (builtin.is_test) struct {
-    pub fn runtimeConfig(runtime: *@import("db/maintenance/transaction_runtime.zig").Runtime) Config {
+    pub fn runtimeConfig(runtime: *@import("antfly_local_sources").storage_db_maintenance_transaction_runtime.Runtime) Config {
         return OwnedServerRuntime.owner(runtime.external.?.ptr).runtime.config;
     }
 } else struct {};

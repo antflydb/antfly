@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Record standalone ReleaseFast representative kernel evidence, not QPS."""
+"""Record standalone fast representative kernel evidence, not QPS."""
 
 import argparse
 import hashlib

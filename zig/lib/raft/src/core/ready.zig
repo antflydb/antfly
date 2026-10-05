@@ -46,6 +46,39 @@ pub const Ready = struct {
             self.snapshot != null or
             self.entries.len > 0;
     }
+
+    pub fn clone(self: Ready, alloc: std.mem.Allocator) !Ready {
+        var owned = Ready{ .soft_state = self.soft_state, .hard_state = self.hard_state };
+        errdefer owned.deinit(alloc);
+        if (self.conf_state) |conf| owned.conf_state = try conf.clone(alloc);
+        if (self.snapshot) |snapshot| owned.snapshot = try snapshot.clone(alloc);
+        owned.entries = try types.cloneEntries(alloc, self.entries);
+        owned.committed_entries = try types.cloneEntries(alloc, self.committed_entries);
+        owned.messages = try message.cloneMessages(alloc, self.messages);
+        const reads = try alloc.alloc(types.ReadState, self.read_states.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (reads[0..initialized]) |*read| read.deinit(alloc);
+            alloc.free(reads);
+        }
+        for (self.read_states, 0..) |read, i| {
+            reads[i] = try read.clone(alloc);
+            initialized += 1;
+        }
+        owned.read_states = reads;
+        return owned;
+    }
+
+    pub fn deinit(self: *Ready, alloc: std.mem.Allocator) void {
+        if (self.conf_state) |*conf| conf.deinit(alloc);
+        if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
+        types.freeEntries(alloc, @constCast(self.entries));
+        types.freeEntries(alloc, @constCast(self.committed_entries));
+        message.freeMessages(alloc, @constCast(self.messages));
+        for (@constCast(self.read_states)) |*read| read.deinit(alloc);
+        alloc.free(self.read_states);
+        self.* = undefined;
+    }
 };
 
 test "ready persistence predicate only includes durable raft state" {

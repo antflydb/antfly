@@ -169,7 +169,7 @@ const ModelArtifactNamespace = struct {
     owner: []u8,
     model: []u8,
 
-    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
         allocator.free(self.owner);
         allocator.free(self.model);
     }

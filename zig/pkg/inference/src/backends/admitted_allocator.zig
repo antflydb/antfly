@@ -42,7 +42,7 @@ pub const AdmittedAllocator = struct {
         return std.mem.alignForward(usize, @sizeOf(Header), alignment.toByteUnits());
     }
 
-    fn ensureCapacity(self: *@This(), extra: usize) !void {
+    pub fn ensureCapacity(self: *@This(), extra: usize) !void {
         const needed = try std.math.add(usize, try std.math.add(usize, self.live_bytes, self.metadata_bytes), extra);
         if (needed <= self.reserved_bytes) return;
         const minimum = try std.math.add(usize, needed - self.reserved_bytes, @sizeOf(Reservation));

@@ -65,7 +65,7 @@ const Harness = struct {
         const trainer = try train.controller.Trainer.init(a, &owner.cb, parameters, .{ .execution = .native, .limits = .{ .max_state_bytes = 1024 * 1024 * 1024 }, .groups = &.{ .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } }, .{ .schedule = .{ .constant = 0 } } } });
         return .{ .program = program, .owner = owner, .trainer = trainer, .store = store, .vtable = vtable };
     }
-    fn deinit(self: *Harness) void {
+    pub fn deinit(self: *Harness) void {
         self.trainer.deinit();
         self.owner.deinit();
         self.program.deinit();

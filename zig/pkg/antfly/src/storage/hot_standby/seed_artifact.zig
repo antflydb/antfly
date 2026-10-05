@@ -26,7 +26,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backup_manifest = @import("backup_manifest.zig");
-const object_storage = @import("../object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const seed_namespace_control = @import("seed_namespace_control.zig");
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
@@ -268,7 +268,7 @@ const GenerationCandidate = struct {
     generation: []u8,
     checkpoint_lsn: u64,
 
-    fn deinit(self: *GenerationCandidate, alloc: Allocator) void {
+    pub fn deinit(self: *GenerationCandidate, alloc: Allocator) void {
         alloc.free(self.generation);
         self.* = undefined;
     }
@@ -291,7 +291,7 @@ const OwnedFileReceipt = struct {
         };
     }
 
-    fn deinit(self: *OwnedFileReceipt, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedFileReceipt, alloc: Allocator) void {
         alloc.free(self.path);
         alloc.free(self.sha256);
         for (self.chunks) |chunk| alloc.free(chunk.sha256);

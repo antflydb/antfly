@@ -103,7 +103,7 @@ pub const DropoutDescriptor = struct {
     probability: f32,
 
     pub fn streamId(self: DropoutDescriptor) u64 {
-        return (@as(u64, self.site.layer) << 32) | (@as(u64, @intFromEnum(self.site.kind)) + 1);
+        return (@as(u64, self.site.layer) << 32) | (@as(u64, @backingInt(self.site.kind)) + 1);
     }
 };
 /// A stable counter tuple. Reusing it reproduces every dropout bit, including
@@ -153,7 +153,7 @@ pub const Built = struct {
 
     /// Call after graph sorting/lowering if a trainer retains these NodeIds.
     pub fn remap(self: *Built, ids: []const NodeId) !void {
-        inline for (std.meta.fields(RoutedNodes)) |field| try remapOne(&@field(self.nodes, field.name), ids);
+        inline for (comptime std.meta.fieldNames(RoutedNodes)) |reflected_name| try remapOne(&@field(self.nodes, reflected_name), ids);
         try remapOne(&self.inputs.input_ids, ids);
         try remapOne(&self.inputs.embedding_valid, ids);
         try remapOne(&self.inputs.attention_valid, ids);
@@ -491,7 +491,7 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
         route.* = .{ .width = width };
         if (width == 0) continue;
         var name_buffer: [128]u8 = undefined;
-        const kind: RouteKind = @enumFromInt(index);
+        const kind: RouteKind = @fromBackingInt(@intCast(index));
         const count = try rows(layout.batch, width);
         route.indices = try bld.parameter(try std.fmt.bufPrint(&name_buffer, "__gliner25.encoder.route.{s}.indices", .{@tagName(kind)}), Shape.init(.i32, &.{@intCast(count)}));
         route.valid = try bld.parameter(try std.fmt.bufPrint(&name_buffer, "__gliner25.encoder.route.{s}.valid", .{@tagName(kind)}), Shape.init(.f32, &.{ @intCast(count), 1 }));
@@ -537,7 +537,7 @@ pub fn buildWithEmbeddingArithmetic(bld: *Builder, config: *const boundary.Confi
         .none => encoder_output,
         .linear => try trunk.linear(bld, encoder_output, boundary.neck_prefix, bs, e.hidden_size, e.hidden_size, true),
     };
-    var routed: [6]NodeId = .{null_node} ** 6;
+    var routed: [6]NodeId = @splat(null_node);
     for (inputs.routes, 0..) |route, index| {
         if (route.width == 0) continue;
         const gathered = try bld.gather(head_input, route.indices, Shape.init(.f32, &.{ try rows(layout.batch, route.width), e.hidden_size }));
@@ -750,7 +750,8 @@ fn bindPreparedInternal(allocator: Allocator, built: *const Built, config: *cons
         try fillDropout(descriptor, replay, values);
         try list.append(a, .{ .node = descriptor.node, .shape = descriptor.shape, .values = .{ .f32 = values } });
     };
-    return .{ .allocator = allocator, .arena = arena, .bindings = try list.toOwnedSlice(a) };
+    const owned_result_bindings = try list.toOwnedSlice(a);
+    return .{ .allocator = allocator, .arena = arena, .bindings = owned_result_bindings };
 }
 
 fn testConfig() boundary.Config {
@@ -902,7 +903,7 @@ fn allocationFailureCase(allocator: Allocator) !void {
 }
 
 test "GLiNER2.5 encoder training graph and bindings clean up allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationFailureCase, .{});
 }
 
 test "GLiNER2.5 replay encoder uses compact integer control full relative tables and source dropout streams" {

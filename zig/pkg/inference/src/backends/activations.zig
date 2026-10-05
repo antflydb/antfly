@@ -271,7 +271,7 @@ pub fn layerNorm(
         while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
             const v: F32xN = row[i..][0..VEC_LEN].*;
             sum_acc += v;
-            sumsq_acc = @mulAdd(F32xN, v, v, sumsq_acc);
+            sumsq_acc = linalg_primitives.mulAdd(F32xN, v, v, sumsq_acc);
         }
         var sum: f32 = @reduce(.Add, sum_acc);
         var sumsq: f32 = @reduce(.Add, sumsq_acc);
@@ -295,7 +295,7 @@ pub fn layerNorm(
             const g: F32xN = gamma[i..][0..VEC_LEN].*;
             const bt: F32xN = beta[i..][0..VEC_LEN].*;
             const scale = g * inv_std_splat;
-            row[i..][0..VEC_LEN].* = @mulAdd(F32xN, v - mean_splat, scale, bt);
+            row[i..][0..VEC_LEN].* = linalg_primitives.mulAdd(F32xN, v - mean_splat, scale, bt);
         }
         while (i < dim) : (i += 1) {
             row[i] = gamma[i] * (row[i] - mean) * inv_std + beta[i];
@@ -665,7 +665,7 @@ test "exact gelu SIMD agrees with independent f64 erf across vector and tail bou
     // f32 rounding. This is far tighter than the inference confidence gate.
     for (0..reference.len) |offset| {
         for (0..2 * VEC_LEN + 2) |len| {
-            var storage = [_]f32{777} ** (2 * VEC_LEN + 3);
+            var storage = @as([(2 * VEC_LEN + 3)]f32, @splat(777));
             const values = storage[1..][0..len];
             for (values, 0..) |*value, i| value.* = @floatCast(reference[(offset + i) % reference.len][0]);
             geluExact(values);
@@ -716,7 +716,7 @@ test "exact gelu SIMD preserves exceptional lanes signed zero and finite saturat
     for (inputs) |x| {
         const expected = 0.5 * x * (1.0 + erfApproxF32(x * 0.7071067811865476));
         for (0..2 * VEC_LEN + 3) |position| {
-            var values = [_]f32{0} ** (2 * VEC_LEN + 3);
+            var values = @as([(2 * VEC_LEN + 3)]f32, @splat(0));
             values[position] = x;
             geluExact(&values);
             if (std.math.isNan(expected)) {
@@ -793,7 +793,7 @@ test "vectorized activations match libm scalar reference" {
 }
 
 test "vectorized activations handle non-finite lanes" {
-    var sigmoid_data = [_]f32{0.0} ** VEC_LEN;
+    var sigmoid_data = @as([VEC_LEN]f32, @splat(0.0));
     sigmoid_data[0] = std.math.inf(f32);
     sigmoid_data[1] = -std.math.inf(f32);
     sigmoid_data[2] = std.math.nan(f32);
@@ -802,7 +802,7 @@ test "vectorized activations handle non-finite lanes" {
     try std.testing.expectEqual(@as(f32, 0.0), sigmoid_data[1]);
     try std.testing.expect(std.math.isNan(sigmoid_data[2]));
 
-    var silu_data = [_]f32{0.0} ** VEC_LEN;
+    var silu_data = @as([VEC_LEN]f32, @splat(0.0));
     silu_data[0] = std.math.inf(f32);
     silu_data[1] = -std.math.inf(f32);
     silu_data[2] = std.math.nan(f32);
@@ -811,7 +811,7 @@ test "vectorized activations handle non-finite lanes" {
     try std.testing.expect(std.math.isNan(silu_data[1]));
     try std.testing.expect(std.math.isNan(silu_data[2]));
 
-    var quick_gelu_data = [_]f32{0.0} ** VEC_LEN;
+    var quick_gelu_data = @as([VEC_LEN]f32, @splat(0.0));
     quick_gelu_data[0] = std.math.inf(f32);
     quick_gelu_data[1] = -std.math.inf(f32);
     quick_gelu_data[2] = std.math.nan(f32);
@@ -867,7 +867,7 @@ test "silu" {
 }
 
 test "silu remains finite for larger positive activation range" {
-    var data = [_]f32{0.0} ** (VEC_LEN * 2);
+    var data = @as([(VEC_LEN * 2)]f32, @splat(0.0));
     data[0] = 11.367456;
     data[VEC_LEN] = 11.367456;
     silu(&data);

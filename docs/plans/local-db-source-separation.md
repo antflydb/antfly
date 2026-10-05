@@ -1,5 +1,11 @@
 # Local database source separation
 
+The structural extraction and physical separation are merged into main. License
+preservation notes below describe those refactor PRs; #893 applies the Apache
+transition. Current ownership and licensing are documented in
+[embedded source ownership](../design/embedded-source-ownership.md) and
+[LICENSING.md](../../LICENSING.md).
+
 This refactor targets main before the Lite/inference licensing and release PR
 (#893). Existing source licenses remain unchanged; moved files keep their
 original headers. License-header tooling records ELv2 files that moved into
@@ -9,7 +15,7 @@ behavior changes belong to #893.
 ## Source owners
 
 - `zig/pkg/antfly-embedded` owns embedded facades, shared schema types, and
-  Antfly inference provider adapters (including Vertex and Bedrock).
+  Antfly Inference provider adapters (including Vertex and Bedrock).
 - `zig/pkg/inference/src/host` owns inference host/worker implementation and
   portable request/execution contracts.
 - `zig/lib/runtime` owns borrowed runtime ABIs, cancellation, cache budgets,
@@ -17,15 +23,16 @@ behavior changes belong to #893.
 - `zig/pkg/antfly-server-api` owns generated server routers and extractors;
   shared generated types live in embedded. Authored schemas stay in
   `specs/openapi`, with the generator importing shared type modules.
-- Local API helpers and catalog/index reconciliation contracts remain under
-  `zig/pkg/antfly` until the local database owner can move as a complete unit.
-  Server replica catalogs, provisioning summaries, and coordination remain
-  with the server.
+- Local DB, API helpers, catalog/index reconciliation and portable lake execution
+  live under `zig/pkg/antfly-embedded/src/local`. Native embedded lake querying
+  includes Parquet/Iceberg readers and shared SQL cursors; server credential
+  resolution and distributed publication are adapters. Server replica catalogs,
+  provisioning DTOs and coordination remain with `zig/pkg/antfly`.
 
 ## Database and hot standby contracts
 
-`storage/db` owns apply receipts, durable outbox storage, replication policy
-values, effect codecs, and publication sequencing. Borrowed publisher and
+`storage/db` owns apply receipts, durable outbox storage, adapter-declared local
+commit requirements, effect codecs, and publication sequencing. Borrowed publisher and
 write-gate interfaces keep concrete hot standby runtimes outside DB production code.
 `storage/hot_standby` supplies the primary, standby, fencing, policy/metrics,
 and synchronous wait adapters. These interfaces preserve durable frame formats
@@ -44,9 +51,10 @@ their existing store transactions and apply fences.
 Native Raft snapshot wire transport lives in `raft/storage/native_snapshot.zig`
 and runs in the server Raft storage test suite. The physical DB exposes
 `OrderedApplyReceipt`, ordered mutation admission, and local snapshot document
-replacement, staging, and repair primitives. Existing server names remain
-source aliases; durable term/index bytes, persisted keys, and error identities
-remain unchanged.
+replacement, staging, and repair primitives. Server callers use these generic
+primitives through the server adapter;
+compatibility method aliases have been removed. Durable term/index bytes,
+persisted keys, and error identities remain unchanged.
 
 `storage/db/replication_ingress.zig`
 owns envelope decoding and temporary payload allocation. Apply receipts remain
@@ -99,12 +107,13 @@ dependency-owned modules using their owning builder, and the audit retains
 their declared imports back into Antfly sources.
 
 `python3 zig/tools/check_embedded_isolated_build.py` stages the working source
-inputs with server coordination and private C API implementations replaced
-by unconditional compile-time traps, then compiles the
-public C API and complete WASM artifact and checks their module graphs. It runs
+inputs with the entire server package omitted, then builds the native lake
+suite, file CLI, public C API and complete WASM artifact and checks their module
+graphs. It runs
 in `zig-full / x86_64` on main merges/full validation, not as a new per-PR gate.
-The traps satisfy Zig’s cache scans of dormant test imports; any live server
-import fails compilation and the module audit independently rejects its owner.
+No server stubs or copied implementations satisfy dormant imports. A live
+server import fails compilation and the module audit independently rejects its
+owner. Authored roots unused by the selected products remain lazy build inputs.
 
 Local index reconciliation has its own result summary; server provisioning
 keeps group/root counts separately. Local range observation limits and catalog
@@ -140,10 +149,13 @@ one-shot shortcut has been removed.
 Foreground writes and recovery share one heap-owned `LocalExecutionState` for
 admission, publication, mutable storage settings, visibility statistics, and
 synchronization. The stable recovery context retains explicit borrowed core,
-executor, runtime and immutable open resources. Each resolution constructs a
-synchronous execution view with private scratch state; it never copies the DB
-wrapper, caches, mutexes or atomics. Provider replacement is fenced while that
-view borrows providers, and the view cannot enqueue work retaining its address.
+executor, runtime and immutable open resources. Each resolution constructs a dedicated
+`LocalMutationExecution` receiver with private scratch state; it never creates
+a temporary DB wrapper. The receiver shares the local mutation implementation
+with foreground execution, fixes synchronization to `.propose`, and exposes no
+DB ownership or resident scheduling operations. Provider replacement is fenced
+while the receiver borrows providers. Resident retry scheduling remains with
+the serving owner.
 Recovery joins before shared publication caches or execution state are freed.
 Namespace and split shadow changes remain visible through their existing shared
 owners and apply fences.
@@ -158,18 +170,110 @@ the normal unit aggregate. Their white-box hooks are available only in test
 builds. Local maintenance regressions remain owned by the storage engine shard;
 `antfly-local-transaction-recovery-test` provides a focused run.
 
-## Remaining separation
+## Local mutation, collection, and read owners
 
-The physical DB and its complete local source closure must still move into
-`antfly-embedded`. The local source owner now uses shared APIs directly rather
-than server facades. Public C API and private server operation ownership are now separate. Keep
-the isolated native/WASM checks passing throughout the physical package move.
-The licensing PR applies Apache classification to the local source closure and
-extends the full-suite staged build to Lite, inference, public C API linkage,
-and WASM. This structural PR preserves existing source licenses.
+`storage/db/execution_resources.zig` owns the canonical local execution state,
+async/batch resource views, prepared-row allocator, contention statistics, memo
+models, and owned result types. DB aliases these definitions for compatibility;
+foreground and recovery use the same nominal types and shared resource owners.
+This module imports neither DB nor a mutation pipeline. Destruction helpers and
+small codecs required by these owners live with them.
+
+`storage/db/local_mutation.zig` composes three compile-time implementation
+families and retains the borrowed `Context`, invocation `Execution`, and
+operation-dependent scratch owners. `mutation_preparation.zig` owns request
+coalescing, pinned read checks, prepared rows, and generated memo preparation.
+`mutation_commit.zig` owns the authoritative commit path, admission, durable
+receipts, transaction resolution, and ordered publication.
+`mutation_materialization.zig` owns derived effects, artifact production,
+coverage, and replay materialization. Their calls resolve at compile time:
+there is no runtime dispatch, duplicate mutation pipeline, or additional
+allocation from this composition.
+
+Both foreground DB writes and synchronous recovery call those same operations.
+The remaining binding supplies open configuration, existing pure codec and
+collection entry points, and live cache/fault-injection pointers; shared
+execution and result types are imported from their canonical source owner.
+DB retains resource lifetime, resident scheduling, caller acknowledgement, and
+the ordered read/commit admission boundaries. Each invocation owns private
+scratch while borrowing stable resource pointers.
+
+`storage/db/replay_vector_collectors.zig` owns dense/sparse replay collectors,
+artifact identity decoding, sparse field reads, and result destruction. Numeric
+payloads and artifact keys retain their original borrowed lifetimes; cloned
+identities remain owned. Tombstone compaction preserves the allocation length
+needed to free the original array and does not turn deleted inputs into upserts.
+
+`storage/db/graph_field_plan.zig` uses one builder for live and pinned-snapshot
+field-derived graph writes. It allocates both merged output arrays before
+changing either extracted result. Errors leave the original contributions
+intact; successful publication transfers element ownership once. The shared
+`storage/db/owned_keys.zig` reserves list capacity before cloning a key, so list
+growth cannot leak a clone. Ordered collection preserves duplicates; unique
+collection deduplicates explicitly. Allocation sweeps cover both planners, existing
+contributions, empty field targets, deduplication, and public extraction with an
+actual configured graph index.
+
+`storage/db/relational_read_session.zig` owns retained relational readers,
+policy leases, proofs, cancellation/deadline checks and filter destruction.
+`storage/db/read_projection.zig` owns artifact projection and transaction/column
+materialization from a borrowed local core and pinned read transaction. DB still
+acquires the admitted snapshot, validates generations and holds statement/read
+fences; projection contexts retain no DB pointer. Document sessions retain their
+existing owner in `document_rows.zig`.
+Artifact projection adopts incoming values only after every fallible grouping
+step succeeds. Owned string/key insertion has a cleanup owner until adoption.
+Allocation sweeps cover first insertion, nested artifact references, conversion
+to a group, subsequent array growth, and ordered overwritten-key collection.
+
+The authored and resolved native/WASM boundary checks cover these owners. Their
+existing ELv2 headers are preserved until the licensing PR applies the Apache
+classification to the full embedded source closure.
+
+## Physical separation
+
+The DB and its complete local dependency closure now live under
+`zig/pkg/antfly-embedded/src/local`. The logical `storage/db/` paths above refer
+to that owner. The execution resources, mutation families, retained reads, and
+maintenance owners extracted in #969 move together with their local consumers.
+Server upload recovery scheduling, TTL routing, query visibility routing,
+child-range destination selection, and group metadata remain under
+`zig/pkg/antfly/src/storage` and consume local contracts through the private
+source catalog. Public C API and private server operation ownership are separate.
+
+The isolated product build omits the entire server package and builds Lite,
+the public C API, native lake tests, and WASM. The licensing PR still applies Apache classification
+to the local source closure; this structural PR preserves existing licenses.
 
 ## Review and merge order
 
-Merge this refactor into main first. The licensing PR applies its Apache
-boundary, packaging, and release changes on top. Its source moves and DB
-refactors should then disappear from its diff against main.
+The local-contract extraction (#969) is merged into main. Merge the physical
+separation (#953) next, before the licensing PR (#893), which applies its Apache
+boundary, packaging, and release changes on top. The source moves and DB
+refactors should then disappear from the licensing PR's diff against main.
+
+### Native lake capability and Zig 0.17 reconciliation
+
+The source split intentionally includes local lake analytics. The authoritative
+ownership and current API limitations are recorded in
+[embedded source ownership](../design/embedded-source-ownership.md). Portable
+Parquet/Iceberg execution and SQL cursors share one embedded owner with server
+consumers; node credential resolution and distributed publication are adapters.
+Provisioning DTOs stay server-owned. The independent `embedded-lake-test` target
+exercises this capability without the server source tree. Zig 0.17 migration
+changes must apply to the extracted build composition, source-owner partition
+collection, native C API, file CLI and browser build, not just server targets.
+
+### Public lake composition and shared AWS authentication
+
+Native package composition now uses the same dependency owner as C API and
+reader tests. The public-package consumer target opens a host-resolved source,
+scans through the SQL cursor and compiles SQL; it is part of isolated product
+validation and the ordinary unit aggregate. The public package is also audited
+by the native source-boundary check.
+
+Generic AWS credential sources, discovery, deadline propagation and cache leases
+live in `lib/credentials/src/aws.zig`. Lake, backups and Bedrock use that shared
+owner. Native credential regressions run in the unit aggregate. Existing source
+licenses remain preserved, including the explicit ELv2 exception for the extracted
+AWS implementation; #893 must include it in the Apache license audit.

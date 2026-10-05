@@ -16,7 +16,7 @@
 """Runs the shared libantfly conformance cases through the public
 antfly_embedded API.
 
-See zig/pkg/antfly/capi-conformance/README.md for the case format. This is a
+See zig/pkg/antfly-embedded/capi-conformance/README.md for the case format. This is a
 straight port of go/pkg/embedded/conformance_cgo_test.go's semantics: every
 runner (C, Go, Python, Rust) executes the same declarative cases so the
 bindings stay behaviorally identical.
@@ -97,7 +97,9 @@ def _writes(raw_writes: list[dict]) -> list[antfly_embedded.WriteIntent]:
             out.append(antfly_embedded.WriteIntent(key=w["key"], delete=True))
         else:
             out.append(
-                antfly_embedded.WriteIntent(key=w["key"], value=json.dumps(w.get("value"), separators=(",", ":")).encode())
+                antfly_embedded.WriteIntent(
+                    key=w["key"], value=json.dumps(w.get("value"), separators=(",", ":")).encode()
+                )
             )
     return out
 
@@ -340,7 +342,9 @@ def test_restore_backup_into_directory_storage_and_reopen(tmp_path: Path) -> Non
     dest_path = tmp_path / "restored-dir"
     antfly_embedded.restore(str(dest_path), backup, storage=antfly_embedded.Storage.DIRECTORY)
 
-    opts = antfly_embedded.OpenOptions(storage=antfly_embedded.Storage.DIRECTORY, mode=antfly_embedded.OpenMode.READONLY)
+    opts = antfly_embedded.OpenOptions(
+        storage=antfly_embedded.Storage.DIRECTORY, mode=antfly_embedded.OpenMode.READONLY
+    )
     with antfly_embedded.open_with_options(dest_path, opts) as restored:
         assert restored.lookup("doc:portable") == {"title": "restored into a directory"}
         status = restored.status()

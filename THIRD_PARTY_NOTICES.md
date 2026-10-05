@@ -394,7 +394,8 @@ distribute verbatim copies of this document is granted.
 ## Zig standard library adaptations
 
 The Zig standard library, compiler runtime, adapted SHA-256 implementation,
-and TLS client retain the Zig contributors’ MIT notices. Both original notice
+TLS client, and `zig/lib/platform/src/io_uring_compat.zig` adaptation retain
+the Zig contributors’ MIT notices. Both original notice
 variants are reproduced below and included in native and WASM distributions.
 
 ### Zig-SHA256-MIT

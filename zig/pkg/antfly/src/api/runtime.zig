@@ -16,11 +16,11 @@
 //! Production API surface shared by runtime entry points.
 //!
 //! Keep test harnesses and whole-module compile assertions in `mod.zig`; a
-//! production runtime importing this facade must not pull `e2e.zig` or another
+//! production runtime importing this facade must not pull `integration_test.zig` or another
 //! command runtime into its potential dependency graph.
 
 pub const cluster = @import("cluster.zig");
-pub const batch = @import("batch.zig");
+pub const batch = @import("antfly_local_sources").api_batch;
 pub const backups = @import("backups.zig");
 pub const restore_owner = @import("restore_owner.zig");
 pub const restore_parent_activation = @import("restore_parent_activation.zig");
@@ -29,16 +29,16 @@ pub const row_policy_install = @import("row_policy_install.zig");
 pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
 pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
 pub const linear_merge = @import("linear_merge.zig");
-pub const query = @import("query.zig");
-pub const query_contract = @import("query_contract.zig");
+pub const query = @import("antfly_local_sources").api_query;
+pub const query_contract = @import("antfly_local_sources").api_query_contract;
 pub const cluster_api_http = @import("cluster_api_http.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
 pub const public_table_http = @import("public_table_http.zig");
-pub const public_embedding_query = @import("public_embedding_query.zig");
+pub const public_embedding_query = @import("antfly_local_sources").api_public_embedding_query;
 pub const public_graph_query = @import("public_graph_query.zig");
-pub const public_search_request = @import("public_search_request.zig");
-pub const public_query_string = @import("public_query_string.zig");
-pub const public_text_query = @import("public_text_query.zig");
+pub const public_search_request = @import("antfly_local_sources").api_public_search_request;
+pub const public_query_string = @import("antfly_local_sources").api_public_query_string;
+pub const public_text_query = @import("antfly_local_sources").api_public_text_query;
 pub const query_builder_agent = @import("query_builder_agent.zig");
 pub const distributed_txn = @import("distributed_txn.zig");
 pub const transactions = @import("transactions.zig");
@@ -64,7 +64,7 @@ pub const internal_query_operations = @import("internal_query_operations.zig");
 pub const internal_transition_wire = @import("internal_transition_wire.zig");
 pub const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 pub const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
-pub const operation = @import("operation.zig");
+pub const operation = @import("antfly_local_sources").api_operation;
 pub const http_server = @import("http_server.zig");
 pub const kernel_bridge = @import("kernel_bridge.zig");
 pub const kernel_abi = @import("kernel_abi.zig");
@@ -85,7 +85,7 @@ pub const MemoryLimitSource = provisioned_storage.MemoryLimitSource;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
-pub const HAReadGate = table_reads.HAReadGate;
+pub const HotStandbyReadGate = table_reads.HotStandbyReadGate;
 pub const backend_current_root_generation = table_reads.backend_current_root_generation;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
 pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;

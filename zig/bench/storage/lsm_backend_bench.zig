@@ -70,7 +70,7 @@ const StorageSelection = enum {
 const KeySet = struct {
     keys: [][]u8,
 
-    fn deinit(self: *const KeySet, allocator: Allocator) void {
+    pub fn deinit(self: *const KeySet, allocator: Allocator) void {
         for (self.keys) |key| allocator.free(key);
         allocator.free(self.keys);
     }
@@ -104,7 +104,7 @@ const LatencyStats = struct {
     ops: u64 = 0,
     total_ns: u64 = 0,
     max_ns: u64 = 0,
-    buckets: [latency_bucket_count]u64 = [_]u64{0} ** latency_bucket_count,
+    buckets: [latency_bucket_count]u64 = @as([latency_bucket_count]u64, @splat(0)),
 
     fn record(self: *LatencyStats, ns: u64) void {
         self.ops += 1;
@@ -271,7 +271,7 @@ const StorageHarness = struct {
         return harness;
     }
 
-    fn deinit(self: *StorageHarness) void {
+    pub fn deinit(self: *StorageHarness) void {
         if (self.host_ctx) |host_ctx| self.allocator.destroy(host_ctx);
         self.backing.deinit();
         self.allocator.destroy(self.backing);
@@ -371,7 +371,7 @@ const Scenario = struct {
         return scenario;
     }
 
-    fn deinit(self: *Scenario) void {
+    pub fn deinit(self: *Scenario) void {
         self.closeRuntime();
         self.backend.close();
         if (self.cache_ptr) |cache| {

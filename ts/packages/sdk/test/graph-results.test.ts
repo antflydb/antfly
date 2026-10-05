@@ -38,6 +38,8 @@ describe("graph result admission", () => {
                     from: { key: "a" },
                     to: { key: "b" },
                     direction: "in",
+                    edge_id: "f".repeat(65_537),
+                    owner_document: "o".repeat(65_537),
                     type: "related",
                     weight: 1,
                   },

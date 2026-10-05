@@ -90,7 +90,7 @@ const NativePending = struct {
     m: ?[]f32 = null,
     v: ?[]f32 = null,
 
-    fn deinit(self: NativePending, a: Allocator) void {
+    pub fn deinit(self: NativePending, a: Allocator) void {
         if (self.v) |values| a.free(values);
         if (self.m) |values| a.free(values);
         if (self.weights) |values| a.free(values);
@@ -264,9 +264,9 @@ fn validateSchedule(schedule: optimizers.LearningRateSchedule) !void {
         .constant => |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidOptimizerGroup,
         inline else => |value| {
             if (value.total_steps == 0) return error.InvalidOptimizerGroup;
-            inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |field| {
-                if (field.type == f32) {
-                    const number = @field(value, field.name);
+            inline for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+                if (field_type == f32) {
+                    const number = @field(value, reflected_name);
                     if (!std.math.isFinite(number) or number < 0) return error.InvalidOptimizerGroup;
                 }
             }
@@ -774,7 +774,7 @@ pub const Trainer = struct {
             trainer: *Trainer,
             identity: Identity,
             accumulated: u32,
-            fn validate(raw: ?*const anyopaque, expected: u64) !void {
+            pub fn validate(raw: ?*const anyopaque, expected: u64) !void {
                 const epoch: *const @This() = @ptrCast(@alignCast(raw.?));
                 if (expected != epoch.identity.microbatch_step or !std.meta.eql(epoch.identity, epoch.trainer.identity()) or epoch.accumulated != epoch.trainer.owner.accum_count or epoch.trainer.active_binding) return error.TrainingTapeIdentityMismatch;
             }
@@ -1389,7 +1389,7 @@ test "seeded gradient trainer startup restore preserves partial accumulation and
     try std.testing.expectEqual(try trainer.stateFingerprint(@splat(69), null), try restored.stateFingerprint(@splat(69), null));
     try std.testing.expectError(error.TrainingStateFingerprintMismatch, Trainer.initRestored(a, &cb, &restore_parameters, config, path, @splat(70), null));
     const Reject = struct {
-        fn validate(_: ?*const anyopaque, identity: Identity, accumulated: u32) !void {
+        pub fn validate(_: ?*const anyopaque, identity: Identity, accumulated: u32) !void {
             try std.testing.expectEqual(@as(u64, 3), identity.microbatch_step);
             try std.testing.expectEqual(@as(u32, 1), accumulated);
             return error.RejectedStartupPosition;

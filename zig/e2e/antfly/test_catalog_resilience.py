@@ -763,11 +763,13 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
         while True:
             response = requests.post(
                 f"{api}/tables/{table}/query",
-                json={"full_text_search": {"match_all": {}}, "limit": 1},
+                json={"full_text_search": {"match_all": {}}, "count": True},
                 timeout=10,
             )
             response.raise_for_status()
-            total = response.json()["responses"][0]["hits"]["total"]["value"]
+            hits_total = response.json()["responses"][0]["hits"]["total"]
+            assert hits_total["relation"] == "exact", response.json()
+            total = hits_total["value"]
             if total == expected:
                 break
             assert time.monotonic() < deadline, (table, total, expected)

@@ -34,6 +34,9 @@ import subprocess
 import sys
 
 SCRIPTS_DIR = pathlib.Path(__file__).resolve().parent.parent
+ZIG_VERSION = json.loads(
+    (SCRIPTS_DIR.parents[3] / "scripts/ci/toolchain-policy.json").read_text()
+)["zig"]["version"]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import benchmark_gemma4_long_e2e_server as warm_server_provenance
@@ -1213,7 +1216,7 @@ def parse_args() -> argparse.Namespace:
         "--build-timeout-sec",
         type=int,
         default=1800,
-        help="strict-profile controlled ReleaseFast CUDA build timeout (separate from each model run)",
+        help="strict-profile controlled fast CUDA build timeout (separate from each model run)",
     )
     parser.add_argument(
         "--artifact-timeout-sec",
@@ -1471,7 +1474,7 @@ def strict_environment_provenance(
     git = release_provenance.git_provenance(pathlib.Path(__file__).resolve().parents[5])
     toolchains = release_provenance.toolchain_provenance()
     repo = pathlib.Path(__file__).resolve().parents[5]
-    pinned_zig = repo / ".tools/zig-x86_64-linux-0.16.0/zig"
+    pinned_zig = repo / ".tools/zig-x86_64-linux-0.17.0/zig"
     if pinned_zig.is_file():
         # This is the exact compiler selected by run_controlled_release_build;
         # hash it even though the reproducible tool bundle is gitignored.
@@ -1577,9 +1580,9 @@ def strict_qualification_provenance_errors(provenance: dict) -> list[str]:
                 f"strict qualification requires {name} path, hash, and version provenance"
             )
     zig_version = (toolchains.get("zig") or {}).get("version")
-    if zig_version and str(zig_version).strip() != "0.16.0":
+    if zig_version and str(zig_version).strip() != ZIG_VERSION:
         errors.append(
-            f"strict qualification requires Zig 0.16.0, observed {zig_version!r}"
+            f"strict qualification requires Zig {ZIG_VERSION}, observed {zig_version!r}"
         )
     nvcc_version = (toolchains.get("nvcc") or {}).get("version")
     if nvcc_version and "release 13.2" not in str(nvcc_version):
@@ -1848,7 +1851,7 @@ def run_controlled_release_build(args: argparse.Namespace) -> dict:
     repo = pathlib.Path(__file__).resolve().parents[5]
     canonical_binary = (inference / "zig-out/bin/antfly-inference").resolve()
     configured_binary = pathlib.Path(args.binary).resolve()
-    pinned_zig = repo / ".tools/zig-x86_64-linux-0.16.0/zig"
+    pinned_zig = repo / ".tools/zig-x86_64-linux-0.17.0/zig"
     zig = pinned_zig if pinned_zig.is_file() else pathlib.Path("zig")
     command = [
         str(zig),
@@ -1856,7 +1859,7 @@ def run_controlled_release_build(args: argparse.Namespace) -> dict:
         "-Dcuda=true",
         "-Dmetal=false",
         "-Dcuda-artifacts=sm89",
-        "-Doptimize=ReleaseFast",
+        "-Doptimize=fast",
         "--global-cache-dir",
         str(STRICT_ZIG_GLOBAL_CACHE_DIR),
     ]
@@ -1885,11 +1888,9 @@ def run_controlled_release_build(args: argparse.Namespace) -> dict:
         inference,
     )
     if returncode != 0:
-        errors.append(f"controlled ReleaseFast SM89 build exited {returncode}")
+        errors.append(f"controlled fast SM89 build exited {returncode}")
     if not canonical_binary.is_file():
-        errors.append(
-            "controlled ReleaseFast SM89 build did not produce the canonical binary"
-        )
+        errors.append("controlled fast SM89 build did not produce the canonical binary")
     return {
         "command": command,
         "cwd": str(inference),
@@ -1918,7 +1919,7 @@ def run_artifact_freshness_checks(
         "-Dcuda=true",
         "-Dmetal=false",
         "-Dcuda-artifacts=sm89",
-        "-Doptimize=ReleaseFast",
+        "-Doptimize=fast",
         "--",
         "--check",
     ]
@@ -1949,7 +1950,7 @@ def run_artifact_freshness_checks(
         "controlled_release_build": controlled_release_build
         or {
             "passed": False,
-            "errors": ["controlled ReleaseFast build result was not provided"],
+            "errors": ["controlled fast build result was not provided"],
         },
         "generated_sources": source_check,
         "canonical_cuda_artifacts": cuda_check,

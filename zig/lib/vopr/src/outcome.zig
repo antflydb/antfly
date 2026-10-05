@@ -115,7 +115,7 @@ pub const TransitionOutcome = struct {
     }
 
     pub fn fingerprint(self: TransitionOutcome) ids.StableId {
-        return ids.derive("failure.outcome", ids.stable("outcome", self.identity), @intFromEnum(self.class));
+        return ids.derive("failure.outcome", ids.stable("outcome", self.identity), @backingInt(self.class));
     }
 
     fn named(class: Class, identity: []const u8, payload_digest: u64) TransitionOutcome {

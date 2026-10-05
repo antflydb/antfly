@@ -228,7 +228,7 @@ pub const Scenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".state", @intFromEnum(state.supervisor.currentState()));
+        try builder.addNamed(allocator, name ++ ".state", @backingInt(state.supervisor.currentState()));
         try builder.addNamed(allocator, name ++ ".ready-generations", @intCast(state.ready_generations));
         try builder.addNamed(allocator, name ++ ".restarts", @intCast(state.restart_count));
         try builder.addNamed(allocator, name ++ ".public-running", @intFromBool(state.public_api.running));

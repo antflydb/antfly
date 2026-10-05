@@ -461,7 +461,7 @@ pub const Parser = struct {
         return types.ResponseOrRef{ .response = try self.parseResponse(val) };
     }
 
-    fn parseResponse(self: *Parser, val: std.json.Value) !types.Response {
+    pub fn parseResponse(self: *Parser, val: std.json.Value) !types.Response {
         const obj = try self.asObject(val);
         var resp = types.Response{
             .description = try self.getString(obj, "description"),

@@ -317,7 +317,7 @@ const HeldRequest = struct {
         self.handle.release();
     }
 
-    fn deinit(self: *HeldRequest) void {
+    pub fn deinit(self: *HeldRequest) void {
         // Registered after Loopback's defer: unlock and release the model
         // before any listener/client joins, including failed assertions or
         // failed socket reset. Joining under this mutex would deadlock.

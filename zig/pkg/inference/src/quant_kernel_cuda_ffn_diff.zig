@@ -125,7 +125,7 @@ const Module = struct {
         return .{ .module = module };
     }
 
-    fn deinit(self: *Module, ctx: *cuda_context.CudaContext) void {
+    pub fn deinit(self: *Module, ctx: *cuda_context.CudaContext) void {
         if (self.module != null) {
             ctx.makeCurrent() catch {};
             _ = ctx.driver.fns.cuModuleUnload(self.module);
@@ -176,7 +176,7 @@ fn validateVariant(variant: Variant) !void {
 
 fn loadFunction(ctx: *cuda_context.CudaContext, module: cuda_driver.CUmodule, name: []const u8) !cuda_driver.CUfunction {
     var name_buffer: [128]u8 = undefined;
-    const name_z = try std.fmt.bufPrintZ(&name_buffer, "{s}", .{name});
+    const name_z = try std.fmt.bufPrintSentinel(&name_buffer, "{s}", .{name}, 0);
     var function: cuda_driver.CUfunction = null;
     try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&function, module, name_z));
     return function orelse error.CudaKernelUnavailable;
@@ -253,7 +253,7 @@ fn nextSignedUnit(state: *u64) f32 {
 }
 
 fn fillHidden(dst: []f32, pattern: Pattern, seed: u64) void {
-    var state = seed ^ (@as(u64, @intFromEnum(pattern)) *% 0x9e37_79b9_7f4a_7c15);
+    var state = seed ^ (@as(u64, @backingInt(pattern)) *% 0x9e37_79b9_7f4a_7c15);
     for (dst, 0..) |*value, index| {
         value.* = switch (pattern) {
             .random => nextSignedUnit(&state) * 0.5,
@@ -267,7 +267,7 @@ fn fillHidden(dst: []f32, pattern: Pattern, seed: u64) void {
 }
 
 fn fillDownInput(dst: []f32, pattern: Pattern, seed: u64) void {
-    var state = seed ^ 0xd1b5_4a32_d192_ed03 ^ (@as(u64, @intFromEnum(pattern)) *% 0x94d0_49bb_1331_11eb);
+    var state = seed ^ 0xd1b5_4a32_d192_ed03 ^ (@as(u64, @backingInt(pattern)) *% 0x94d0_49bb_1331_11eb);
     for (dst, 0..) |*value, index| {
         value.* = switch (pattern) {
             .random => nextSignedUnit(&state) * 0.75,

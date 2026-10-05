@@ -1,8 +1,9 @@
 # Licensing maintenance
 
 See [LICENSING.md](../../LICENSING.md) for the license scope and
-[scripts/apache_engine_files.txt](../../scripts/apache_engine_files.txt) for the
-explicit shared source list.
+[source license roots](../../scripts/source_license_roots.json) for package
+ownership and [additional Apache files](../../scripts/apache_engine_files.txt)
+for files outside those roots.
 
 ## Products
 
@@ -31,18 +32,17 @@ remains Apache. It is distinct from the standalone database server.
 
 ## Implementation
 
-The engine remains in its existing source paths, with explicit Apache headers
-and an audited source list, so both products use one implementation. Mixed
-local and server modules now expose local helpers through separate Apache
-files; ELv2 server facades consume those helpers. Server integration tests have
-moved out of shared engine sources.
+The local DB, native SQL/lake readers, file CLI and public C API live in
+`zig/pkg/antfly-embedded/src/local`. Model execution lives in `zig/pkg/inference`;
+AWS and Google authentication mechanics live in shared libraries. Server Raft,
+hot standby, provisioning, managed credential resolution and cluster publication
+remain in `zig/pkg/antfly`. There are no per-file Apache exceptions in the server
+package and no duplicate engine implementation.
 
-`runtime_lite_kernel_root.zig` owns the Apache engine and public native C ABI.
-The Lite CLI and `libantfly` link this owner, enrichment, and inference. They
-no longer link database API or distributed runtime archives. The dedicated
-CLI uses a local dispatcher and retains inference worker re-execution.
-The full server continues to use its separate storage and server owners over
-the same engine code.
+`public_capi_root.zig` owns the public native C ABI, linking native enrichment
+and inference archives independently of the server storage owner. The independent
+CLI supports file commands and hidden worker re-execution. The full server
+consumes the same local implementation through its source catalog.
 
 The embedded package, inference package, shared libraries, schema inputs, and
 generated OpenAPI contracts have explicit Apache licenses. Lite installation
@@ -59,7 +59,9 @@ platform wheels for `antfly-embedded` and native npm packages for
 `@antfly/embedded`;
 the bindings discover these artifacts without using the ELv2 server packages.
 `verify_lite_release.py` compares each wheel and npm package with its Lite
-archive and rejects server executables and ELv2 license files. The immutable
+archive and rejects server executables and ELv2 license files. Both package
+formats carry the package roots, additional-file map, and asset manifest in
+`LICENSES/source-map`; verification compares those files with the archive. The immutable
 package snapshot is produced by `.github/workflows/lite-package.yml` as part
 of the release build. After a successful tagged release build, dispatch
 `.github/workflows/lite-release-publish.yml` on `main` with that tag and build
@@ -87,8 +89,8 @@ make apache-license-check
 python3 -m unittest discover -s scripts -p test_check_apache_boundary.py
 python3 -m unittest discover -s scripts/packaging -p 'test_*.py'
 cd zig
-zig build lite -Doptimize=Debug -Dmetal=false -j1
-zig build lite-native-test lite-cmd-test capi-smoke capi-conformance capi-test -Doptimize=Debug -Dmetal=false -j1
+zig build --build-file embedded.build.zig lite -Doptimize=Debug -Dmetal=false -j1
+zig build --build-file embedded.build.zig embedded-lake-test embedded-package-test aws-credentials-test capi-smoke capi-conformance embedded-capi-check wasm-test -Doptimize=Debug -Dmetal=false -j1
 cd pkg/inference
 zig build -Doptimize=Debug -Dmetal=false -j1
 zig build test-cli -Doptimize=Debug -Dmetal=false -j1
@@ -99,7 +101,7 @@ named modules. It verifies the Apache manifest's headers and detects retained
 ELv2 notices. Release assembly regression tests verify product build selection,
 archive licenses, native library/header inclusion, and third-party notices.
 
-A staged source build excludes server implementation files from the Apache
+A staged source build omits the entire server package from the Apache
 products' source tree. This supplements the static source check and catches
 hidden compile-time dependencies. Generated Snowball sources are retained with
 their upstream BSD license, independently of the first-party source list.
@@ -116,7 +118,7 @@ normalize their outputs with the same policy so regeneration preserves licensing
 ## Maintaining the boundary
 
 Keep local engine functionality in Apache owners and database serving or
-orchestration in ELv2 facades. Update the explicit source map when extracting
+orchestration in ELv2 facades. Update the package roots or additional-file source map when extracting
 shared helpers, then run both repository-wide and Apache boundary checks.
 
 The dependency checker tokenizes Zig source and traverses named modules,
@@ -129,7 +131,7 @@ Preserve upstream legal blocks, combined SPDX declarations, frozen qualification
 fixtures, and usage comments during header normalization. Re-run the provenance,
 asset, and packaging regressions when changing those materials.
 
-Browser database builds use ReleaseSafe; native product validation uses Debug.
+Browser database builds use Zig 0.17 `safe`; native product validation uses `Debug`.
 WASM debug stripping is optional. CI exercises the browser database and both
 wasm32 and wasm64 inference packages.
 

@@ -262,7 +262,7 @@ fn writeAllAtOffset(fd: std.posix.fd_t, bytes: []const u8, offset: usize) Error!
 
 fn processAlive(pid: u32) bool {
     if (pid == 0) return false;
-    switch (std.posix.errno(std.posix.system.kill(@intCast(pid), @enumFromInt(0)))) {
+    switch (std.posix.errno(std.posix.system.kill(@intCast(pid), @fromBackingInt(0)))) {
         .SUCCESS => return true,
         .SRCH => return false,
         .PERM => return true,

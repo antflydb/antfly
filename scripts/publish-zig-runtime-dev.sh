@@ -143,7 +143,7 @@ echo "Building $arch Zig runtime artifact for $zig_target"
   python3 tools/run_bounded_zig_build.py --zig zig -- build \
     antfly \
     -Dtarget="$zig_target" \
-    -Doptimize=ReleaseFast \
+    -Doptimize=fast \
     -Dcuda=true \
     -Dpjrt=true \
     --prefix "$out_dir" \

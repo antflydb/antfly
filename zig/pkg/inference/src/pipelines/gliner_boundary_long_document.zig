@@ -75,7 +75,7 @@ const Owner = struct {
         const failure = self.terminal orelse return err;
         return if (failure.kind == .declared_limit) error.MemoryBudgetExceeded else err;
     }
-    fn deinit(self: *Owner) void {
+    pub fn deinit(self: *Owner) void {
         const backing = self.backing;
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
@@ -269,9 +269,9 @@ fn planOwned(owner: *Owner, text: []const u8, schema_fingerprint: [32]u8, option
     if (options.inference_fingerprint) |profile| hash.update(&profile);
     hashNumber(&hash, text.len);
     hash.update(text);
-    hashNumber(&hash, @intFromEnum(options.word_splitter));
-    hashNumber(&hash, @intFromEnum(options.mode));
-    hashNumber(&hash, @intFromEnum(options.other_record_identity));
+    hashNumber(&hash, @backingInt(options.word_splitter));
+    hashNumber(&hash, @backingInt(options.mode));
+    hashNumber(&hash, @backingInt(options.other_record_identity));
     for (windows.items) |window| {
         hashNumber(&hash, window.bytes.start);
         hashNumber(&hash, window.bytes.end);
@@ -1209,7 +1209,7 @@ fn mergeLegacyStructuresOwned(owner: *Owner, document: Plan, compiled: *const sc
 }
 
 fn testOptions() PlanOptions {
-    return .{ .mode = .windowed, .max_window_body_words = 4, .overlap_words = 1, .inference_fingerprint = [_]u8{9} ** 32 };
+    return .{ .mode = .windowed, .max_window_body_words = 4, .overlap_words = 1, .inference_fingerprint = @as([32]u8, @splat(9)) };
 }
 fn testSource(start: usize, end: usize) pipeline.SourceSpan {
     return .{ .start = start, .end = end, .unit = .utf8_bytes, .byte_start = start, .byte_end = end };
@@ -1220,7 +1220,7 @@ fn testValue(text: []const u8, start: usize, end: usize, probability: f32) pipel
 
 test "gliner boundary long document planner is explicit source exact and accounts for synthetic words" {
     const a = std.testing.allocator;
-    const fingerprint = [_]u8{1} ** 32;
+    const fingerprint = @as([32]u8, @splat(1));
     try std.testing.expectError(error.LongDocumentWindowingRequired, plan(a, "A B C D E", fingerprint, .{ .max_window_body_words = 4, .overlap_words = 1 }));
     var document = try plan(a, "İ 😀 中 x y", fingerprint, testOptions());
     defer document.deinit();
@@ -1266,7 +1266,7 @@ test "gliner boundary long document planner is explicit source exact and account
 
 test "gliner boundary long document all declared owner caps preserve backing OOM and recovery" {
     const a = std.testing.allocator;
-    const fingerprint = [_]u8{7} ** 32;
+    const fingerprint = @as([32]u8, @splat(7));
     var capped = testOptions();
     capped.max_memory_bytes = 1;
     try std.testing.expectError(error.MemoryBudgetExceeded, plan(a, "A", fingerprint, capped));
@@ -1563,7 +1563,7 @@ test "gliner boundary long document allocation failures cancellation and recover
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     var options = testOptions();
     options.control = .{ .check_fn = Check.cancel };
-    try std.testing.expectError(error.Cancelled, plan(std.testing.allocator, "A B C D E", [_]u8{0} ** 32, options));
+    try std.testing.expectError(error.Cancelled, plan(std.testing.allocator, "A B C D E", @as([32]u8, @splat(0)), options));
     try Check.run(std.testing.allocator);
 }
 

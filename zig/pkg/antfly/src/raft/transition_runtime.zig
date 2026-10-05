@@ -674,7 +674,7 @@ test "transition runtime executes split and merge actions through local seams" {
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
         status: data.SplitTransitionStatus,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -740,7 +740,7 @@ test "transition runtime executes split and merge actions through local seams" {
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
         status: data.MergeTransitionStatus,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -933,7 +933,7 @@ test "multiplexed transition runtime dispatches by group ids" {
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
         status: data.SplitTransitionStatus,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -999,7 +999,7 @@ test "multiplexed transition runtime dispatches by group ids" {
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
         status: data.MergeTransitionStatus,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -1173,7 +1173,7 @@ test "metadata transition controller drives split runtime deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -1347,7 +1347,7 @@ test "metadata transition controller drives merge runtime deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }

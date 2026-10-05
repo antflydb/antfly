@@ -177,7 +177,7 @@ pub const CatalogProjectionReader = struct {
         reusable: bool = false,
         snapshot: ?*SharedSnapshot = null,
 
-        fn deinit(self: *Cache) void {
+        pub fn deinit(self: *Cache) void {
             if (self.snapshot) |snapshot| snapshot.release();
             self.* = .{};
         }

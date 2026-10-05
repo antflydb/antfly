@@ -14,20 +14,20 @@
 // limitations.
 
 //! Hot standby integration for local native_topology_receipt mutations.
-const engine = @import("../db/native_topology_receipt.zig");
-const authority = @import("../source_authority.zig");
+const engine = @import("antfly_local_sources").storage_db_native_topology_receipt;
+const authority = @import("antfly_local_sources").storage_source_authority;
 const key = engine.test_support.key;
-const replication_ingress = @import("../db/replication_ingress.zig");
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const stage = engine.stage;
 const std = @import("std");
-const topology = @import("../db/relational_integrity_topology_contract.zig");
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
 
 const hot_standby_publisher_adapter = @import("db_commit.zig");
 
 test "native topology receipts survive restart and exact standby replay without Raft watermarks" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db/db.zig");
-    const effects = @import("../db/replication_effects.zig");
+    const db_mod = @import("antfly_local_sources").storage_db_db;
+    const effects = @import("antfly_local_sources").storage_db_replication_effects;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const primary_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-topology-primary", .{tmp.sub_path});
@@ -40,10 +40,10 @@ test "native topology receipts survive restart and exact standby replay without 
     defer alloc.free(slots_path);
     var stream = try @import("primary.zig").Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 11, .shard_id = 12 }, .{});
     defer stream.close();
-    const ns: @import("../db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 13 };
+    const ns: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 13 };
     const options: db_mod.OpenOptions = .{ .identity_namespace = ns, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var primary_options = options;
-    primary_options.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&stream) };
+    primary_options.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&stream, .{});
     var primary = try db_mod.DB.open(alloc, primary_path, primary_options);
     var primary_open = true;
     defer if (primary_open) primary.close();
@@ -53,7 +53,7 @@ test "native topology receipts survive restart and exact standby replay without 
     try replica.setSchemaJson(alloc, "{}");
     const identity = try primary.relationalTopologyIdentity();
     const fence: topology.Fence = .{ .namespace = ns, .role = .rewrite_source, .owner_group_id = 12, .peer_group_id = 14, .transition_id = 15, .attempt = 1, .admission_epoch = identity.next_epoch, .catalog_digest = identity.catalog_digest };
-    const begin: @import("../db/types.zig").BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
+    const begin: @import("antfly_local_sources").storage_db_types.BatchRequest = .{ .relational_topology = .{ .fence = fence, .action = .begin } };
     try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, begin, .{ .term = 1, .index = 1 }));
     try primary.batch(begin);
     try primary.batch(begin); // Lost acknowledgement, identical position.
@@ -101,8 +101,8 @@ test "native topology receipts survive restart and exact standby replay without 
     try primary.batch(cancel);
     try std.testing.expect((try primary.relationalTopologyStatus()).fence == null);
     try std.testing.expect((try replica.relationalTopologyStatus()).fence == null);
-    try std.testing.expect((try primary.raftAppliedEntry()) == null);
-    try std.testing.expect((try replica.raftAppliedEntry()) == null);
+    try std.testing.expect((try primary.orderedApplyReceipt()) == null);
+    try std.testing.expect((try replica.orderedApplyReceipt()) == null);
     for ([_]*db_mod.DB{ &primary, &replica }) |owner| {
         var read = try owner.core.store.beginReadTxn();
         defer read.abort();
@@ -125,9 +125,9 @@ test "native topology receipts survive restart and exact standby replay without 
     {
         var txn = try replica.core.store.beginWriteTxn();
         defer txn.abort();
-        const adopted: @import("../db/doc_identity_namespace.zig").Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 23 };
-        const namespace_bytes = @import("../db/online_source_contract.zig").namespaceBytes(adopted);
-        try txn.put(&@import("../internal_keys.zig").identity_namespace_key, &namespace_bytes);
+        const adopted: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 23 };
+        const namespace_bytes = @import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(adopted);
+        try txn.put(&@import("antfly_local_sources").storage_internal_keys.identity_namespace_key, &namespace_bytes);
         try authority.bind(&txn, .native, namespace_bytes);
         var adopted_command = begin.relational_topology.?;
         adopted_command.fence.namespace = adopted;

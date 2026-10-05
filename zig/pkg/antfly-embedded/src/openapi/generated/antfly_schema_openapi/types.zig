@@ -311,6 +311,137 @@ pub const DynamicTemplate = struct {
     }
 };
 
+pub const ExternalLakeCredentialRef = struct {
+    /// Name of a configured external_io connection with lake_read capability.
+    ref: []const u8,
+    /// Allowed object prefix relative to the configured bucket or filesystem root.
+    scope: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "ref", "ref", false },
+        .{ "scope", "scope", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("ref");
+        try jw.write(self.ref);
+        if (self.scope) |value| {
+            try jw.objectField("scope");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExternalLakeSnapshotSelector = struct {
+    mode: []const u8,
+    /// Required for snapshot_id; selects an Iceberg snapshot.
+    id: ?[]const u8 = null,
+    /// Required for object_version_digest; pins a Parquet object inventory.
+    digest: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "id", "id", true },
+        .{ "digest", "digest", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.digest) |value| {
+            try jw.objectField("digest");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows.
+pub const ExternalLakeTableSource = struct {
+    kind: []const u8,
+    table_id: []const u8,
+    format: []const u8,
+    uri: []const u8,
+    schema_fingerprint: ?[]const u8 = null,
+    write_policy: ?[]const u8 = null,
+    credentials: ?ExternalLakeCredentialRef = null,
+    snapshot: ?ExternalLakeSnapshotSelector = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "table_id", "table_id", false },
+        .{ "format", "format", false },
+        .{ "uri", "uri", false },
+        .{ "schema_fingerprint", "schema_fingerprint", true },
+        .{ "write_policy", "write_policy", true },
+        .{ "credentials", "credentials", true },
+        .{ "snapshot", "snapshot", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("format");
+        try jw.write(self.format);
+        try jw.objectField("uri");
+        try jw.write(self.uri);
+        if (self.schema_fingerprint) |value| {
+            try jw.objectField("schema_fingerprint");
+            try jw.write(value);
+        }
+        if (self.write_policy) |value| {
+            try jw.objectField("write_policy");
+            try jw.write(value);
+        }
+        if (self.credentials) |value| {
+            try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        if (self.snapshot) |value| {
+            try jw.objectField("snapshot");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Field types accepted by detailed `x-antfly-field` and dynamic-template mappings. JSON-schema-oriented aliases are normalized to Antfly's corresponding runtime type: number/integer to numeric, bool to boolean, date/timestamp to datetime, geo_point to geopoint, and geo_shape to geoshape.
 pub const FieldMappingType = enum {
     text,
@@ -1263,6 +1394,8 @@ pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
     storage_mode: ?TableStorageMode = null,
+    /// External tables require relational storage mode and are read-only. Omit for native tables.
+    base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,
     /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. Changing, adding, or removing generated semantics through an existing table's schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Relational tables only.
@@ -1294,6 +1427,7 @@ pub const TableSchema = struct {
     pub const openApiFieldMetadata = .{
         .{ "version", "version", true },
         .{ "storage_mode", "storage_mode", true },
+        .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
         .{ "generated_columns", "generated_columns", true },
         .{ "checks", "checks", true },
@@ -1325,6 +1459,10 @@ pub const TableSchema = struct {
         }
         if (self.storage_mode) |value| {
             try jw.objectField("storage_mode");
+            try jw.write(value);
+        }
+        if (self.base_source) |value| {
+            try jw.objectField("base_source");
             try jw.write(value);
         }
         if (self.column_defaults) |value| {
@@ -1575,11 +1713,11 @@ fn openApiParseObject(
     @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
-    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (.object_begin != try source.next()) return error.UnexpectedToken;
 
     var result: T = undefined;
-    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
     while (true) {
         var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name = switch (name_token.?) {
@@ -1588,9 +1726,9 @@ fn openApiParseObject(
             else => return error.UnexpectedToken,
         };
 
-        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
-            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
             if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
@@ -1598,14 +1736,14 @@ fn openApiParseObject(
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
-                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            _ = try std.json.innerParse(Field, allocator, source, options);
                             break;
                         },
                         .@"error" => return error.DuplicateField,
                         .use_last => {},
                     }
                 }
-                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                @field(result, field_name_zig) = try std.json.innerParse(Field, allocator, source, options);
                 fields_seen[i] = true;
                 break;
             }
@@ -1628,19 +1766,19 @@ fn openApiParseObjectFromValue(
     @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
-    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (source != .object) return error.UnexpectedToken;
     var result: T = undefined;
-    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
     var it = source.object.iterator();
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
-            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
             if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
-                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                @field(result, field_name_zig) = try std.json.innerParseFromValue(Field, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
             }
@@ -1650,12 +1788,13 @@ fn openApiParseObjectFromValue(
     return result;
 }
 
-fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".field_names.len]bool) !void {
     @setEvalBranchQuota(100_000);
-    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
-        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+    const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
-            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+            if (field_attrs.defaultValue(Field)) |default| @field(result, field_name_zig) = default else return error.MissingField;
         }
     }
 }

@@ -317,7 +317,9 @@ options:
    compute.
 
 The plan starts with the GLiNER2 layout (the exact distillation target) and
-decides between these options at step 7, with measurements.
+decides between these options at step 7, with measurements. Measured
+2026-10-03: the shared trunk trades extraction for retrieval and stays far
+below a dedicated embedder, so option 3 is proposed (see Status).
 
 ### Expected cost
 
@@ -537,7 +539,7 @@ Independent of Antenna, serving span checkpoints (Decide) through the
 learned `classifier` would fix the legacy classification path. It is not on
 the critical path because step 0 can score Decide in PyTorch.
 
-## Status (2026-09-25)
+## Status (2026-10-03)
 
 ### Step 0: baselines (done)
 
@@ -608,6 +610,38 @@ different sizes; see the report for caveats).
   [docs/design/inference/history/antenna/2026-09-26-native-distillation.md](../../../../../docs/design/inference/history/antenna/2026-09-26-native-distillation.md).
   `scripts/antenna/distill_pool.py --wikipedia` adds encyclopedic passages to
   the text pool for held-out breadth.
+- **Native end to end:** distilling on a mixed pool (`distill_pool.py
+  --source`: web sentences with free-form types, commands, comments,
+  questions and abstracts next to news and Wikipedia; one epoch, 34,264
+  steps) and then fine-tuning on the pilot rows, all in Zig on resident
+  Metal, gives 0.734 / 0.368 classification and 0.719 / 0.629 NER F1.
+  gliner2.5-base fine-tuned the same way reaches 0.808 / 0.467 and
+  0.723 / 0.624: NER matches, and classification trails by 0.07-0.10. The
+  probe `scripts/antenna/gap_probe.py` places the remaining gap in the
+  classification label markers; the next pool adds real label sets.
+- **Clean recipe:** with permissively licensed data only, two distillation
+  epochs and stage 3 give 0.663 / 0.415 classification and 0.645 / 0.626 NER
+  F1 (run26). The second epoch adds 0.03 held-out classification and leaves
+  NER unchanged. Details:
+  [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
+- **Decision head:** a Laya decision head trained on the frozen Antenna trunk
+  (`scripts/antenna/init_decision_head.py`, `freeze_layers` set to the layer
+  count plus one; Open-Jev, then Laya's step-0 split) scores 0.511 on Laya's
+  step-0 typed-decision eval on the clean trunk, against
+  0.387 for released Laya-large and about 0.62 for Laya's full step-0
+  fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
+  heads. Fine-tuning the whole trunk does not beat it on average: 0.505
+  over three seeds on Laya's step-0 recipe, against 0.439 for plain
+  ModernBERT-base and 0.621 for Laya-large. Details: LAYA.md, "Base-size
+  encoder (step 2d)".
+- **Embeddings (step 7):** the shared trunk does not embed well.
+  - A head on the frozen trunk reaches 55% of granite-embedding-english-r2's
+    SQuAD retrieval NDCG@10 (0.454 against 0.823).
+  - Training the top eight layers reaches 69% and costs about 0.05 NER F1.
+  - Proposed: option 3, a separate pass with the embedder Antfly already ships
+    (Qwen3-Embedding-0.6B).
+  - Details:
+    [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
 
 ### Step 2: fused ModernBERT training attention (done)
 

@@ -136,7 +136,7 @@ test "CRC32 kernels agree across unaligned buffers tails and incremental updates
     random.random().bytes(&bytes);
     inline for (.{ false, true }) |castagnoli| {
         const Impl = Crc(castagnoli);
-        const Oracle = if (castagnoli) std.hash.crc.Crc32Iscsi else std.hash.Crc32;
+        const Oracle = if (castagnoli) std.hash.crc.@"CRC-32/ISCSI" else std.hash.Crc32;
         for (0..32) |offset| {
             for (0..513) |len| try check(Impl, Oracle, bytes[offset..][0..len]);
             for ([_]usize{ 1023, 1024, 1031, 4095, 4096, 16383, 16384, 65535, 65536 }) |len| {

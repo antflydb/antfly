@@ -19,7 +19,7 @@
 const std = @import("std");
 const vopr = @import("vopr");
 const metadata_service = @import("../metadata/service.zig");
-const backfill_state = @import("../storage/db/backfill_state.zig");
+const backfill_state = @import("antfly_local_sources").storage_db_backfill_state;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "backfill-marker-discovery";

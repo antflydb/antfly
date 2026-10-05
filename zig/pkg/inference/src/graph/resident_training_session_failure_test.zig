@@ -27,8 +27,8 @@ const fixture = @import("resident_training_fixture.zig");
 const ops = @import("../ops/ops.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const Allocator = std.mem.Allocator;
-const identity = seeded.StepIdentity{ .binding = .{0x42} ** 32, .optimizer_step = 0, .microbatch = 0 };
-const decisions = [_]u8{0x31} ** 32;
+const identity = seeded.StepIdentity{ .binding = @splat(0x42), .optimizer_step = 0, .microbatch = 0 };
+const decisions = @as([32]u8, @splat(0x31));
 
 const Session = union(enum) {
     direct: seeded.Session,
@@ -41,7 +41,7 @@ const Session = union(enum) {
             .multi => |*value| &value.base,
         };
     }
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         switch (self.*) {
             inline else => |*value| value.deinit(),
         }
@@ -85,15 +85,15 @@ fn attempt(a: Allocator, harness: Harness) !void {
         .staged => |*session| {
             var prefix = try session.forwardPrefix(harness.cb, harness.inputs[0..1], identity, null);
             defer prefix.deinit();
-            var tape = try prefix.forwardSuffix(identity, .{0x18} ** 32, harness.inputs[1..], null);
+            var tape = try prefix.forwardSuffix(identity, @splat(0x18), harness.inputs[1..], null);
             defer tape.deinit();
             try backward(harness.cb, &tape, harness.cotangent);
         },
         .multi => |*session| {
             var stages = try session.forward(harness.cb, harness.inputs[0..1], identity, null);
             defer stages.deinit();
-            try stages.advance(identity, .{0x18} ** 32, harness.inputs[1..2], null);
-            try stages.advance(identity, .{0x39} ** 32, harness.inputs[2..3], null);
+            try stages.advance(identity, @splat(0x18), harness.inputs[1..2], null);
+            try stages.advance(identity, @splat(0x39), harness.inputs[2..3], null);
             var tape = try stages.finish();
             defer tape.deinit();
             try backward(harness.cb, &tape, harness.cotangent);

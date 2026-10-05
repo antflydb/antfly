@@ -360,7 +360,7 @@ pub fn analyzeAlloc(
 }
 
 fn select(selected: []bool, roles: []Role, index: usize, role: Role) void {
-    if (!selected[index] or @intFromEnum(role) > @intFromEnum(roles[index])) roles[index] = role;
+    if (!selected[index] or @backingInt(role) > @backingInt(roles[index])) roles[index] = role;
     selected[index] = true;
 }
 

@@ -290,7 +290,7 @@ pub fn Command(comptime Model: type, comptime World: type) type {
 
         pub fn asTransition(self: Self) transition.Transition {
             return .{
-                .id = ids.derive("command.start", self.id, @intFromEnum(self.role)),
+                .id = ids.derive("command.start", self.id, @backingInt(self.role)),
                 .name = self.name,
                 .kind = .workload,
                 .resource_id = self.id,
@@ -518,7 +518,7 @@ pub fn Registry(comptime Model: type, comptime World: type) type {
         }
 
         pub fn enabledClasses(self: Self, model: *const Model) std.EnumSet(Class) {
-            var result = std.EnumSet(Class).initEmpty();
+            var result = std.EnumSet(Class).empty;
             for (self.commands) |command| if (command.enabled(model)) result.insert(command.class);
             return result;
         }
@@ -822,12 +822,12 @@ const ComposerReplayScenario = struct {
             if (selected.id == composer_replay_commands[1].asTransition().id) world.normal_runs += 1;
             try world.composer.complete(actor, &world.model);
         }
-        try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(world.composer.currentPhase()));
+        try events.emitNamed(allocator, .domain, selected.name, @backingInt(world.composer.currentPhase()));
         return .applied();
     }
 
     pub fn observe(world: *World, builder: *observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, "command-composer-replay.phase", @intFromEnum(world.composer.currentPhase()));
+        try builder.addNamed(allocator, "command-composer-replay.phase", @backingInt(world.composer.currentPhase()));
         try builder.addNamed(allocator, "command-composer-replay.normal-runs", @intCast(world.normal_runs));
     }
 

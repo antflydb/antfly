@@ -333,7 +333,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     var teacher_storage: teacher_mod.SourceTeacher = undefined;
     var teacher: ?*teacher_mod.SourceTeacher = null;
     if (teacher_source) |value| {
-        try teacher_storage.init(a, value, tokenization, trainer_limits.step.encoder.input);
+        try teacher_storage.init(a, value, tokenization, trainer_limits.step.encoder.input, io);
         teacher = &teacher_storage;
     }
     defer if (teacher) |value| value.deinit();
@@ -359,7 +359,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .gold_end = config.gold_end,
         .gold_hold_fraction = config.gold_hold_fraction,
         .require_gold_relation_coverage = config.require_gold_relation_coverage,
-        .distillation = if (teacher) |value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit } else null,
+        .distillation = if (teacher) |value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit, .prefetch = io } else null,
         .limits = trainer_limits,
     }, control);
     defer trainer.deinit();
@@ -709,7 +709,7 @@ test "boundary training job forwards resource overrides without changing semanti
 test "boundary training job cooperative pause combines callback and invocation limit" {
     const Flag = struct {
         requested: bool = false,
-        fn read(raw: ?*const anyopaque) bool {
+        pub fn read(raw: ?*const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
             return self.requested;
         }

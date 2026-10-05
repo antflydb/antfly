@@ -50,6 +50,13 @@ from package_cli_release import (  # noqa: E402
 )
 
 
+SOURCE_LICENSE_FILES = (
+    "apache_engine_files.txt",
+    "source_license_roots.json",
+    "embedded_asset_licenses.json",
+)
+
+
 def archive_name(version: str, platform: Platform) -> str:
     variant = f"_{platform.release_variant}" if platform.release_variant else ""
     return f"antfly-lite_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
@@ -71,6 +78,7 @@ def extract_lite_archive(
         dest / "LICENSE",
         dest / "THIRD_PARTY_NOTICES.md",
         dest / "LICENSES" / "Apache-2.0.txt",
+        *(dest / "scripts" / name for name in SOURCE_LICENSE_FILES),
     )
     for item in required:
         if not item.is_file():
@@ -104,7 +112,8 @@ def populate_npm_package(platform: Platform, extracted: Path, version: str) -> P
         ignore=lambda d, n: {x for x in n if is_packaging_noise(Path(x))},
     )
     shutil.copy2(
-        extracted / "antfly-inference-worker", package_dir / "lib" / "antfly-inference-worker"
+        extracted / "antfly-inference-worker",
+        package_dir / "lib" / "antfly-inference-worker",
     )
     shutil.copytree(extracted / "include", package_dir / "include")
     if (extracted / "share").is_dir():
@@ -114,6 +123,10 @@ def populate_npm_package(platform: Platform, extracted: Path, version: str) -> P
         extracted / "THIRD_PARTY_NOTICES.md", package_dir / "THIRD_PARTY_NOTICES.md"
     )
     shutil.copytree(extracted / "LICENSES", package_dir / "LICENSES")
+    source_map = package_dir / "LICENSES/source-map"
+    source_map.mkdir(parents=True, exist_ok=True)
+    for name in SOURCE_LICENSE_FILES:
+        shutil.copy2(extracted / "scripts" / name, source_map / name)
     return package_dir
 
 
@@ -144,7 +157,7 @@ def write_wheel(
         records.append((name, f"sha256={digest}", str(len(data))))
 
     metadata = Message()
-    metadata["Metadata-Version"] = "2.3"
+    metadata["Metadata-Version"] = "2.4"
     metadata["Name"] = "antfly-embedded"
     metadata["Version"] = version
     metadata["Summary"] = "Apache-2.0 embedded Antfly databases and inference"
@@ -183,6 +196,12 @@ def write_wheel(
                     f"{dist_info}/LICENSES/{item.relative_to(extracted / 'LICENSES').as_posix()}",
                     item.read_bytes(),
                 )
+        for name in SOURCE_LICENSE_FILES:
+            add_bytes(
+                archive,
+                f"{dist_info}/LICENSES/source-map/{name}",
+                (extracted / "scripts" / name).read_bytes(),
+            )
         add_bytes(archive, f"{dist_info}/METADATA", metadata.as_bytes())
         add_bytes(archive, f"{dist_info}/WHEEL", wheel.encode())
         buffer = io.StringIO()
@@ -203,7 +222,9 @@ def main() -> int:
         ROOT / "py" / "packages" / "embedded" / "pyproject.toml", python_version
     )
     update_json_version(
-        ROOT / "ts" / "packages" / "embedded" / "package.json", version, optional_deps=True
+        ROOT / "ts" / "packages" / "embedded" / "package.json",
+        version,
+        optional_deps=True,
     )
     for platform in PACKAGE_PLATFORMS:
         with tempfile.TemporaryDirectory() as raw:

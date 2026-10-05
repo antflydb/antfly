@@ -525,7 +525,7 @@ const Vp8FramePlanes = struct {
     y_padded_height: usize,
     uv_padded_height: usize,
 
-    fn deinit(self: *Vp8FramePlanes, alloc: Allocator) void {
+    pub fn deinit(self: *Vp8FramePlanes, alloc: Allocator) void {
         alloc.free(self.y);
         alloc.free(self.u);
         alloc.free(self.v);
@@ -536,15 +536,15 @@ const Vp8FramePlanes = struct {
 const Vp8CoeffProbs = [vp8_coeff_type_count][vp8_coeff_band_count][vp8_coeff_context_count][vp8_coeff_proba_count]u8;
 
 const Vp8CoeffBlock = struct {
-    coeffs: [vp8_coeff_block_size]i16 = .{0} ** vp8_coeff_block_size,
+    coeffs: [vp8_coeff_block_size]i16 = @splat(0),
     last_nonzero_plus_one: u5 = 0,
 };
 
 const Vp8MacroblockCoeffs = struct {
     y2: Vp8CoeffBlock = .{},
-    y: [16]Vp8CoeffBlock = [_]Vp8CoeffBlock{.{}} ** 16,
-    u: [4]Vp8CoeffBlock = [_]Vp8CoeffBlock{.{}} ** 4,
-    v: [4]Vp8CoeffBlock = [_]Vp8CoeffBlock{.{}} ** 4,
+    y: [16]Vp8CoeffBlock = @as([16]Vp8CoeffBlock, @splat(.{})),
+    u: [4]Vp8CoeffBlock = @as([4]Vp8CoeffBlock, @splat(.{})),
+    v: [4]Vp8CoeffBlock = @as([4]Vp8CoeffBlock, @splat(.{})),
 };
 
 const Vp8MacroblockFilterInfo = struct {
@@ -1156,7 +1156,7 @@ fn assembleVp8KeyframeRgba(
     var mode_reader = control.mode_reader;
     var above_luma4_modes = try alloc.alloc([4]Vp8Luma4Mode, grid_width);
     defer alloc.free(above_luma4_modes);
-    for (above_luma4_modes) |*modes| modes.* = [_]Vp8Luma4Mode{.dc} ** 4;
+    for (above_luma4_modes) |*modes| modes.* = @as([4]Vp8Luma4Mode, @splat(.dc));
 
     var above_token_contexts = try alloc.alloc(Vp8MacroblockTokenContext, grid_width);
     defer alloc.free(above_token_contexts);
@@ -1166,7 +1166,7 @@ fn assembleVp8KeyframeRgba(
     while (mb_y < grid_height) : (mb_y += 1) {
         try @import("work_control.zig").check();
         const row_partition = try vp8TokenPartitionForRow(@intCast(mb_y), control.syntax.token_partition_count);
-        var left_luma4_modes = [_]Vp8Luma4Mode{.dc} ** 4;
+        var left_luma4_modes = @as([4]Vp8Luma4Mode, @splat(.dc));
         var left_token_context = Vp8MacroblockTokenContext{};
 
         var mb_x: usize = 0;
@@ -1532,8 +1532,8 @@ fn vp8PredictTrueMotion(dst: []u8, stride: usize, size: usize, top: []const u8, 
 }
 
 fn vp8PredictLuma16(mode: Vp8Luma16Mode, dst: []u8, stride: usize, top: ?[]const u8, left: ?[]const u8, top_left: u8) !void {
-    const default_top = [_]u8{127} ** 16;
-    const default_left = [_]u8{129} ** 16;
+    const default_top = @as([16]u8, @splat(127));
+    const default_left = @as([16]u8, @splat(129));
     switch (mode) {
         .dc => try vp8PutBlock(dst, stride, 16, 16, try vp8PredictDcValue(top, left, 16)),
         .true_motion => try vp8PredictTrueMotion(dst, stride, 16, top orelse default_top[0..], left orelse default_left[0..], top_left),
@@ -1546,8 +1546,8 @@ fn vp8PredictLuma16(mode: Vp8Luma16Mode, dst: []u8, stride: usize, top: ?[]const
 }
 
 fn vp8PredictChroma(mode: Vp8ChromaMode, dst: []u8, stride: usize, top: ?[]const u8, left: ?[]const u8, top_left: u8) !void {
-    const default_top = [_]u8{127} ** 8;
-    const default_left = [_]u8{129} ** 8;
+    const default_top = @as([8]u8, @splat(127));
+    const default_left = @as([8]u8, @splat(129));
     switch (mode) {
         .dc => try vp8PutBlock(dst, stride, 8, 8, try vp8PredictDcValue(top, left, 8)),
         .true_motion => try vp8PredictTrueMotion(dst, stride, 8, top orelse default_top[0..], left orelse default_left[0..], top_left),
@@ -1973,7 +1973,7 @@ fn vp8Luma4ProbIndex(mode: Vp8Luma4Mode) usize {
         .down_left => 4,
         .down_right => 5,
         .vertical_right => 6,
-        else => @intFromEnum(mode),
+        else => @backingInt(mode),
     };
 }
 
@@ -2085,7 +2085,7 @@ fn vp8DefaultCoeffProbs() Vp8CoeffProbs {
 }
 
 fn vp8CoeffUpdateProbs() Vp8CoeffProbs {
-    var flat = [_]u8{255} ** vp8_coeff_probs_flat_count;
+    var flat = @as([vp8_coeff_probs_flat_count]u8, @splat(255));
     for (vp8_coeff_update_prob_overrides) |override| {
         flat[override.index] = override.value;
     }
@@ -2359,7 +2359,7 @@ const PrefixCode = struct {
     entry_count: usize = 0,
     max_bits: u4 = 0,
 
-    fn read(reader: *BitReader, alphabet_size: usize) !PrefixCode {
+    pub fn read(reader: *BitReader, alphabet_size: usize) !PrefixCode {
         if (alphabet_size == 0 or alphabet_size > max_vp8l_symbol_count) return error.WebpDecodeFailed;
         if ((try reader.readBits(1)) != 0) {
             return try readSimple(reader, alphabet_size);
@@ -2368,7 +2368,7 @@ const PrefixCode = struct {
     }
 
     fn readSimple(reader: *BitReader, alphabet_size: usize) !PrefixCode {
-        var lengths = [_]u8{0} ** max_vp8l_symbol_count;
+        var lengths = @as([max_vp8l_symbol_count]u8, @splat(0));
         const num_symbols = (try reader.readBits(1)) + 1;
         const is_first_8bits = try reader.readBits(1);
         const first_bits: u5 = if (is_first_8bits == 0) 1 else 8;
@@ -2386,7 +2386,7 @@ const PrefixCode = struct {
 
     fn readNormal(reader: *BitReader, alphabet_size: usize) !PrefixCode {
         const num_code_lengths = 4 + try reader.readBits(4);
-        var code_length_lengths = [_]u8{0} ** vp8l_code_length_code_count;
+        var code_length_lengths = @as([vp8l_code_length_code_count]u8, @splat(0));
         var i: usize = 0;
         while (i < num_code_lengths) : (i += 1) {
             code_length_lengths[vp8l_code_length_order[i]] = @intCast(try reader.readBits(3));
@@ -2401,7 +2401,7 @@ const PrefixCode = struct {
         };
         if (max_symbol == 0) return error.WebpDecodeFailed;
 
-        var lengths = [_]u8{0} ** max_vp8l_symbol_count;
+        var lengths = @as([max_vp8l_symbol_count]u8, @splat(0));
         var symbol_index: usize = 0;
         var previous_nonzero: ?u8 = null;
         while (symbol_index < max_symbol) {
@@ -2441,7 +2441,7 @@ const PrefixCode = struct {
     fn build(lengths: []const u8) !PrefixCode {
         if (lengths.len == 0 or lengths.len > max_vp8l_symbol_count) return error.WebpDecodeFailed;
 
-        var counts = [_]u16{0} ** (vp8l_max_code_bits + 1);
+        var counts = @as([(vp8l_max_code_bits + 1)]u16, @splat(0));
         var nonzero_count: usize = 0;
         var max_bits: u4 = 0;
         for (lengths) |raw_len| {
@@ -2460,7 +2460,7 @@ const PrefixCode = struct {
         }
         if (left != 0 and nonzero_count != 1) return error.WebpDecodeFailed;
 
-        var next_code = [_]u16{0} ** (vp8l_max_code_bits + 1);
+        var next_code = @as([(vp8l_max_code_bits + 1)]u16, @splat(0));
         var code: u16 = 0;
         for (1..vp8l_max_code_bits + 1) |bits| {
             code = (code + counts[bits - 1]) << 1;
@@ -2515,7 +2515,7 @@ const PrefixCodeGroup = struct {
     alpha: PrefixCode,
     distance: PrefixCode,
 
-    fn read(reader: *BitReader, color_cache_bits: u5) !PrefixCodeGroup {
+    pub fn read(reader: *BitReader, color_cache_bits: u5) !PrefixCodeGroup {
         const color_cache_size: usize = if (color_cache_bits == 0) 0 else @as(usize, 1) << color_cache_bits;
         return .{
             .green = try PrefixCode.read(reader, vp8l_literal_count + vp8l_length_code_count + color_cache_size),
@@ -2533,7 +2533,7 @@ const PrefixCodeGroups = struct {
     huffman_width: u32 = 0,
     group_indices: []u16 = &.{},
 
-    fn deinit(self: *PrefixCodeGroups, alloc: Allocator) void {
+    pub fn deinit(self: *PrefixCodeGroups, alloc: Allocator) void {
         alloc.free(self.groups);
         alloc.free(self.group_indices);
         self.* = undefined;
@@ -2597,7 +2597,7 @@ const ColorCache = struct {
         };
     }
 
-    fn deinit(self: *ColorCache, alloc: Allocator) void {
+    pub fn deinit(self: *ColorCache, alloc: Allocator) void {
         alloc.free(self.colors);
         self.* = undefined;
     }
@@ -2639,7 +2639,7 @@ const Vp8lTransform = union(enum) {
     cross_color: CrossColorTransform,
     color_indexing: ColorIndexingTransform,
 
-    fn deinit(self: *Vp8lTransform, alloc: Allocator) void {
+    pub fn deinit(self: *Vp8lTransform, alloc: Allocator) void {
         switch (self.*) {
             .predictor => |predictor| alloc.free(predictor.rgba),
             .cross_color => |cross_color| alloc.free(cross_color.rgba),
@@ -3446,7 +3446,7 @@ const TestBitWriter = struct {
     bytes: std.ArrayListUnmanaged(u8) = .empty,
     bit_pos: u3 = 0,
 
-    fn deinit(self: *TestBitWriter, alloc: Allocator) void {
+    pub fn deinit(self: *TestBitWriter, alloc: Allocator) void {
         self.bytes.deinit(alloc);
         self.* = undefined;
     }
@@ -4231,16 +4231,16 @@ test "vp8 frame planes allocate padded yuv buffers and crop rgba output" {
 }
 
 test "vp8 inverse dct add reconstructs dc-only and ac blocks" {
-    var coeffs = [_]i16{0} ** 16;
+    var coeffs = @as([16]i16, @splat(0));
     coeffs[0] = 32;
 
-    var dc_block = [_]u8{100} ** 16;
+    var dc_block = @as([16]u8, @splat(100));
     try vp8InverseDct4x4DcAdd(coeffs[0], dc_block[0..], 4);
-    try std.testing.expectEqualSlices(u8, &([_]u8{104} ** 16), dc_block[0..]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(104))), dc_block[0..]);
 
     @memset(dc_block[0..], 100);
     try vp8InverseDct4x4Add(&coeffs, dc_block[0..], 4);
-    try std.testing.expectEqualSlices(u8, &([_]u8{104} ** 16), dc_block[0..]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(104))), dc_block[0..]);
 
     const ac_coeffs = [_]i16{
         32, 16, -8, 4,
@@ -4248,7 +4248,7 @@ test "vp8 inverse dct add reconstructs dc-only and ac blocks" {
         5,  -3, 2,  -2,
         1,  -1, 1,  0,
     };
-    var ac_block = [_]u8{128} ** 16;
+    var ac_block = @as([16]u8, @splat(128));
     try vp8InverseDct4x4Add(&ac_coeffs, ac_block[0..], 4);
     try std.testing.expectEqualSlices(u8, &.{
         135, 135, 135, 134,
@@ -4279,9 +4279,9 @@ test "vp8 luma16 predictors cover dc vertical horizontal and true-motion modes" 
         0, 1, 2,  3,  4,  5,  6,  7,
         8, 9, 10, 11, 12, 13, 14, 15,
     };
-    const left = [_]u8{16} ** 16;
+    const left = @as([16]u8, @splat(16));
 
-    var block = [_]u8{0} ** (16 * 16);
+    var block = @as([(16 * 16)]u8, @splat(0));
     try vp8PredictLuma16(.dc, block[0..], 16, top[0..], left[0..], 10);
     try std.testing.expectEqual(@as(u8, 12), block[0]);
     try std.testing.expectEqual(@as(u8, 12), block[255]);
@@ -4291,7 +4291,7 @@ test "vp8 luma16 predictors cover dc vertical horizontal and true-motion modes" 
     try std.testing.expectEqualSlices(u8, top[0..], block[16 * 15 ..][0..16]);
 
     try vp8PredictLuma16(.horizontal, block[0..], 16, top[0..], left[0..], 10);
-    try std.testing.expectEqualSlices(u8, &([_]u8{16} ** 16), block[0..16]);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(16))), block[0..16]);
 
     try vp8PredictLuma16(.true_motion, block[0..], 16, top[0..], left[0..], 10);
     try std.testing.expectEqual(@as(u8, 6), block[0]);
@@ -4299,10 +4299,10 @@ test "vp8 luma16 predictors cover dc vertical horizontal and true-motion modes" 
 }
 
 test "vp8 chroma predictors cover dc vertical horizontal and true-motion modes" {
-    const top = [_]u8{20} ** 8;
-    const left = [_]u8{36} ** 8;
+    const top = @as([8]u8, @splat(20));
+    const left = @as([8]u8, @splat(36));
 
-    var block = [_]u8{0} ** (8 * 8);
+    var block = @as([(8 * 8)]u8, @splat(0));
     try vp8PredictChroma(.dc, block[0..], 8, top[0..], left[0..], 0);
     try std.testing.expectEqual(@as(u8, 28), block[0]);
     try std.testing.expectEqual(@as(u8, 28), block[63]);
@@ -4474,13 +4474,13 @@ test "vp8 frame assembly decodes cropped all-eob 16x16 intra keyframe" {
     const payload = try testBuildVp8Payload(alloc, 1, 1, &.{ 0, 0, 0, 0 }, &.{&.{0}});
     defer alloc.free(payload);
     const frame = try parseVp8FrameHeader(payload);
-    const token_payload = [_]u8{0} ** 32;
+    const token_payload = @as([32]u8, @splat(0));
     const expected = vp8YuvToRgba(128, 128, 128, 255);
 
     const decoded = try assembleVp8KeyframeDefaultRgba(alloc, frame, .{
         .syntax = testVp8Syntax(),
         .entropy = .{ .coeff_probs = testVp8CoeffProbs(255) },
-        .mode_reader = Vp8BoolReader.init(&([_]u8{144} ** 16)),
+        .mode_reader = Vp8BoolReader.init(&(@as([16]u8, @splat(144)))),
     }, &.{&token_payload});
     defer alloc.free(decoded.rgba);
 
@@ -4494,13 +4494,13 @@ test "vp8 frame assembly walks macroblocks in raster order and crops output" {
     const payload = try testBuildVp8Payload(alloc, 17, 1, &.{ 0, 0, 0, 0 }, &.{&.{0}});
     defer alloc.free(payload);
     const frame = try parseVp8FrameHeader(payload);
-    const token_payload = [_]u8{0} ** 64;
+    const token_payload = @as([64]u8, @splat(0));
     const expected = vp8YuvToRgba(128, 128, 128, 255);
 
     const decoded = try assembleVp8KeyframeDefaultRgba(alloc, frame, .{
         .syntax = testVp8Syntax(),
         .entropy = .{ .coeff_probs = testVp8CoeffProbs(255) },
-        .mode_reader = Vp8BoolReader.init(&([_]u8{158} ** 32)),
+        .mode_reader = Vp8BoolReader.init(&(@as([32]u8, @splat(158)))),
     }, &.{&token_payload});
     defer alloc.free(decoded.rgba);
 
@@ -4516,7 +4516,7 @@ test "vp8 frame assembly supports all-eob 4x4 luma macroblocks" {
     const payload = try testBuildVp8Payload(alloc, 1, 1, &.{ 0, 0, 0, 0 }, &.{&.{0}});
     defer alloc.free(payload);
     const frame = try parseVp8FrameHeader(payload);
-    const token_payload = [_]u8{0} ** 64;
+    const token_payload = @as([64]u8, @splat(0));
     const expected = vp8YuvToRgba(128, 128, 128, 255);
 
     const decoded = try assembleVp8KeyframeDefaultRgba(alloc, frame, .{
@@ -4536,7 +4536,7 @@ test "vp8 frame assembly accepts nonzero loop filter on smooth keyframe" {
     const payload = try testBuildVp8Payload(alloc, 1, 1, &.{ 0, 0, 0, 0 }, &.{&.{0}});
     defer alloc.free(payload);
     const frame = try parseVp8FrameHeader(payload);
-    const token_payload = [_]u8{0} ** 64;
+    const token_payload = @as([64]u8, @splat(0));
     const expected = vp8YuvToRgba(128, 128, 128, 255);
     var syntax = testVp8Syntax();
     syntax.loop_filter.level = 16;
@@ -4567,7 +4567,7 @@ test "vp8 4x4 macroblock reconstruction uses edge defaults and residuals" {
 
     try vp8ReconstructMacroblock4x4(&planes, 0, 0, .{
         .is_i4x4 = true,
-        .luma4_modes = [_]Vp8Luma4Mode{.dc} ** 16,
+        .luma4_modes = @as([16]Vp8Luma4Mode, @splat(.dc)),
         .chroma_mode = .dc,
     }, &coeffs);
 
@@ -4582,7 +4582,7 @@ test "vp8 luma4 directional predictors match scalar formulas" {
     const top = [_]u8{ 10, 20, 30, 40, 50, 60, 70, 80 };
     const left = [_]u8{ 90, 100, 110, 120 };
 
-    var block = [_]u8{0} ** 16;
+    var block = @as([16]u8, @splat(0));
     try vp8PredictLuma4(.down_left, block[0..], 4, top[0..], left[0..], 80);
     try std.testing.expectEqualSlices(u8, &.{
         20, 30, 40, 50,
@@ -4604,7 +4604,7 @@ test "vp8 macroblock mode trees decode 16x16 luma and chroma modes" {
     var low_luma = Vp8BoolReader.init(&.{0});
     try std.testing.expectEqual(Vp8Luma16Mode.dc, try vp8ReadLuma16Mode(&low_luma));
 
-    const high_mode_bits = [_]u8{255} ** 8;
+    const high_mode_bits = @as([8]u8, @splat(255));
     var high_luma = Vp8BoolReader.init(&high_mode_bits);
     try std.testing.expectEqual(Vp8Luma16Mode.true_motion, try vp8ReadLuma16Mode(&high_luma));
 
@@ -4626,11 +4626,11 @@ test "vp8 macroblock segment tree and skip flag feed 16x16 header parser" {
     var segment_low = Vp8BoolReader.init(&.{0});
     try std.testing.expectEqual(@as(u2, 0), try vp8ReadSegmentId(&segment_low, syntax.segmentation));
 
-    const high_segment_bits = [_]u8{255} ** 8;
+    const high_segment_bits = @as([8]u8, @splat(255));
     var segment_high = Vp8BoolReader.init(&high_segment_bits);
     try std.testing.expectEqual(@as(u2, 3), try vp8ReadSegmentId(&segment_high, syntax.segmentation));
 
-    const high_header_bits = [_]u8{255} ** 16;
+    const high_header_bits = @as([16]u8, @splat(255));
     var reader = Vp8BoolReader.init(&high_header_bits);
     const header = try vp8ReadMacroblockHeader16x16(&reader, syntax, 128);
     try std.testing.expectEqual(@as(u2, 3), header.segment);
@@ -4641,12 +4641,12 @@ test "vp8 macroblock segment tree and skip flag feed 16x16 header parser" {
 }
 
 test "vp8 luma4 mode tree decodes low and high branches" {
-    const probs = [_]u8{128} ** 9;
+    const probs = @as([9]u8, @splat(128));
 
     var low = Vp8BoolReader.init(&.{0});
     try std.testing.expectEqual(Vp8Luma4Mode.dc, try vp8ReadLuma4Mode(&low, &probs));
 
-    const high_luma4_bits = [_]u8{255} ** 8;
+    const high_luma4_bits = @as([8]u8, @splat(255));
     var high = Vp8BoolReader.init(&high_luma4_bits);
     try std.testing.expectEqual(Vp8Luma4Mode.horizontal_up, try vp8ReadLuma4Mode(&high, &probs));
 }
@@ -4665,21 +4665,21 @@ test "vp8 luma4 grid parser updates top and left prediction contexts" {
     var top_modes = [_]Vp8Luma4Mode{ .dc, .dc, .dc, .dc };
     var left_modes = [_]Vp8Luma4Mode{ .dc, .dc, .dc, .dc };
 
-    const low_grid_bits = [_]u8{0} ** 8;
+    const low_grid_bits = @as([8]u8, @splat(0));
     var low = Vp8BoolReader.init(&low_grid_bits);
     const low_modes = try vp8ReadLuma4ModeGrid(&low, &probs, &top_modes, &left_modes);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.dc} ** 16), low_modes[0..]);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.dc} ** 4), top_modes[0..]);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.dc} ** 4), left_modes[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([16]Vp8Luma4Mode, @splat(.dc))), low_modes[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([4]Vp8Luma4Mode, @splat(.dc))), top_modes[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([4]Vp8Luma4Mode, @splat(.dc))), left_modes[0..]);
 
     top_modes = [_]Vp8Luma4Mode{ .dc, .dc, .dc, .dc };
     left_modes = [_]Vp8Luma4Mode{ .dc, .dc, .dc, .dc };
-    const high_bits = [_]u8{255} ** 32;
+    const high_bits = @as([32]u8, @splat(255));
     var high = Vp8BoolReader.init(&high_bits);
     const high_modes = try vp8ReadLuma4ModeGrid(&high, &probs, &top_modes, &left_modes);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.horizontal_up} ** 16), high_modes[0..]);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.horizontal_up} ** 4), top_modes[0..]);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.horizontal_up} ** 4), left_modes[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([16]Vp8Luma4Mode, @splat(.horizontal_up))), high_modes[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([4]Vp8Luma4Mode, @splat(.horizontal_up))), top_modes[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([4]Vp8Luma4Mode, @splat(.horizontal_up))), left_modes[0..]);
 }
 
 test "vp8 macroblock header parser consumes 4x4 modes and chroma mode" {
@@ -4691,7 +4691,7 @@ test "vp8 macroblock header parser consumes 4x4 modes and chroma mode" {
     const header = try vp8ReadMacroblockHeader(&reader, testVp8Syntax(), null, &top_modes, &left_modes, &probs);
     try std.testing.expect(header.is_i4x4);
     try std.testing.expect(header.luma16_mode == null);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.dc} ** 16), header.luma4_modes.?[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([16]Vp8Luma4Mode, @splat(.dc))), header.luma4_modes.?[0..]);
     try std.testing.expectEqual(Vp8ChromaMode.dc, header.chroma_mode);
 }
 
@@ -4706,18 +4706,18 @@ test "vp8 coefficient reader handles eob and literal one token" {
     var eob_reader = Vp8BoolReader.init(&.{0});
     const eob = try vp8ReadCoeffBlock(&eob_reader, &probs, 0, 0, 0, .{ 3, 5 });
     try std.testing.expectEqual(@as(u5, 0), eob.last_nonzero_plus_one);
-    try std.testing.expectEqualSlices(i16, &([_]i16{0} ** 16), eob.coeffs[0..]);
+    try std.testing.expectEqualSlices(i16, &(@as([16]i16, @splat(0))), eob.coeffs[0..]);
 
-    var one_reader = Vp8BoolReader.init(&(.{0b1100_0000} ++ ([_]u8{0} ** 8)));
+    var one_reader = Vp8BoolReader.init(&(.{0b1100_0000} ++ (@as([8]u8, @splat(0)))));
     const one = try vp8ReadCoeffBlock(&one_reader, &probs, 0, 0, 0, .{ 3, 5 });
     try std.testing.expectEqual(@as(u5, 1), one.last_nonzero_plus_one);
     try std.testing.expectEqual(@as(i16, 3), one.coeffs[0]);
-    try std.testing.expectEqualSlices(i16, &([_]i16{0} ** 15), one.coeffs[1..]);
+    try std.testing.expectEqualSlices(i16, &(@as([15]i16, @splat(0))), one.coeffs[1..]);
 }
 
 test "vp8 coefficient reader applies zigzag ac position and sign" {
     const probs = testVp8CoeffProbs(128);
-    var reader = Vp8BoolReader.init(&(.{0b1101_0000} ++ ([_]u8{0} ** 8)));
+    var reader = Vp8BoolReader.init(&(.{0b1101_0000} ++ (@as([8]u8, @splat(0)))));
     const block = try vp8ReadCoeffBlock(&reader, &probs, 3, 2, 1, .{ 3, 7 });
     try std.testing.expectEqual(@as(u5, 2), block.last_nonzero_plus_one);
     try std.testing.expectEqual(@as(i16, -7), block.coeffs[1]);
@@ -4727,15 +4727,15 @@ test "vp8 coefficient reader applies zigzag ac position and sign" {
 test "vp8 coefficient reader decodes zero runs and large category entry points" {
     const probs = testVp8CoeffProbs(128);
 
-    var zero_run_reader = Vp8BoolReader.init(&(.{0b1010_0000} ++ ([_]u8{0} ** 8)));
+    var zero_run_reader = Vp8BoolReader.init(&(.{0b1010_0000} ++ (@as([8]u8, @splat(0)))));
     const zero_run = try vp8ReadCoeffBlock(&zero_run_reader, &probs, 0, 0, 0, .{ 3, 5 });
     try std.testing.expectEqual(@as(u5, 2), zero_run.last_nonzero_plus_one);
     try std.testing.expectEqual(@as(i16, 0), zero_run.coeffs[0]);
     try std.testing.expectEqual(@as(i16, 5), zero_run.coeffs[1]);
 
-    const low_large_bits = [_]u8{0} ** 8;
+    const low_large_bits = @as([8]u8, @splat(0));
     var large_reader = Vp8BoolReader.init(&low_large_bits);
-    const p = [_]u8{128} ** vp8_coeff_proba_count;
+    const p = @as([vp8_coeff_proba_count]u8, @splat(128));
     try std.testing.expectEqual(@as(i16, 2), try vp8ReadLargeCoeffValue(&large_reader, &p));
 }
 
@@ -4758,7 +4758,7 @@ test "vp8 macroblock coefficient reader resets token contexts for skipped blocks
         .chroma_mode = .dc,
     }, vp8BuildQuantMatrix(0, .{ .base_q = 0 }), &context);
 
-    try std.testing.expectEqualSlices(i16, &([_]i16{0} ** 16), coeffs.y2.coeffs[0..]);
+    try std.testing.expectEqualSlices(i16, &(@as([16]i16, @splat(0))), coeffs.y2.coeffs[0..]);
     try std.testing.expectEqual(Vp8MacroblockTokenContext{}, context);
 }
 
@@ -4778,25 +4778,25 @@ test "vp8 skipped i4x4 macroblocks preserve y2 token contexts" {
     const coeffs = try vp8ReadMacroblockCoeffs(&reader, &probs, .{
         .skip = true,
         .is_i4x4 = true,
-        .luma4_modes = [_]Vp8Luma4Mode{.dc} ** 16,
+        .luma4_modes = @as([16]Vp8Luma4Mode, @splat(.dc)),
         .chroma_mode = .dc,
     }, vp8BuildQuantMatrix(0, .{ .base_q = 0 }), &context);
 
     try std.testing.expectEqual(@as(u5, 0), coeffs.y2.last_nonzero_plus_one);
-    try std.testing.expectEqualSlices(u1, &([_]u1{0} ** 4), context.y_above[0..]);
-    try std.testing.expectEqualSlices(u1, &([_]u1{0} ** 4), context.y_left[0..]);
+    try std.testing.expectEqualSlices(u1, &(@as([4]u1, @splat(0))), context.y_above[0..]);
+    try std.testing.expectEqualSlices(u1, &(@as([4]u1, @splat(0))), context.y_left[0..]);
     try std.testing.expectEqual(@as(u1, 1), context.y2_above);
     try std.testing.expectEqual(@as(u1, 1), context.y2_left);
-    try std.testing.expectEqualSlices(u1, &([_]u1{0} ** 2), context.u_above[0..]);
-    try std.testing.expectEqualSlices(u1, &([_]u1{0} ** 2), context.u_left[0..]);
-    try std.testing.expectEqualSlices(u1, &([_]u1{0} ** 2), context.v_above[0..]);
-    try std.testing.expectEqualSlices(u1, &([_]u1{0} ** 2), context.v_left[0..]);
+    try std.testing.expectEqualSlices(u1, &(@as([2]u1, @splat(0))), context.u_above[0..]);
+    try std.testing.expectEqualSlices(u1, &(@as([2]u1, @splat(0))), context.u_left[0..]);
+    try std.testing.expectEqualSlices(u1, &(@as([2]u1, @splat(0))), context.v_above[0..]);
+    try std.testing.expectEqualSlices(u1, &(@as([2]u1, @splat(0))), context.v_left[0..]);
 }
 
 test "vp8 macroblock coefficient reader handles all-eob 16x16 blocks" {
     const probs = testVp8CoeffProbs(255);
     var context = Vp8MacroblockTokenContext{};
-    const payload = [_]u8{0} ** 16;
+    const payload = @as([16]u8, @splat(0));
     var reader = Vp8BoolReader.init(&payload);
     const coeffs = try vp8ReadMacroblockCoeffs(&reader, &probs, .{
         .luma16_mode = .dc,
@@ -4813,7 +4813,7 @@ test "vp8 macroblock coefficient reader handles all-eob 16x16 blocks" {
 test "vp8 macroblock coefficient reader decodes y2 before y1 and uv blocks" {
     const probs = testVp8CoeffProbs(128);
     var context = Vp8MacroblockTokenContext{};
-    const payload = [_]u8{0b1100_0000} ++ ([_]u8{0} ** 32);
+    const payload = [_]u8{0b1100_0000} ++ (@as([32]u8, @splat(0)));
     var reader = Vp8BoolReader.init(&payload);
     const quant = Vp8QuantMatrix{
         .y1 = .{ 3, 5 },
@@ -4835,7 +4835,7 @@ test "vp8 macroblock coefficient reader decodes y2 before y1 and uv blocks" {
 test "vp8 macroblock coefficient reader decodes 4x4 luma with y-without-y2 type" {
     const probs = testVp8CoeffProbs(128);
     var context = Vp8MacroblockTokenContext{};
-    const payload = [_]u8{0b1100_0000} ++ ([_]u8{0} ** 32);
+    const payload = [_]u8{0b1100_0000} ++ (@as([32]u8, @splat(0)));
     var reader = Vp8BoolReader.init(&payload);
     const quant = Vp8QuantMatrix{
         .y1 = .{ 3, 5 },
@@ -4845,7 +4845,7 @@ test "vp8 macroblock coefficient reader decodes 4x4 luma with y-without-y2 type"
     };
     const coeffs = try vp8ReadMacroblockCoeffs(&reader, &probs, .{
         .is_i4x4 = true,
-        .luma4_modes = [_]Vp8Luma4Mode{.dc} ** 16,
+        .luma4_modes = @as([16]Vp8Luma4Mode, @splat(.dc)),
         .chroma_mode = .dc,
     }, quant, &context);
 
@@ -4859,7 +4859,7 @@ test "vp8 macroblock coefficient reader decodes 4x4 luma with y-without-y2 type"
 test "vp8 entropy header preserves coefficient probabilities when no updates are present" {
     const base = testVp8CoeffProbs(42);
     const update_probs = testVp8CoeffProbs(255);
-    const payload = [_]u8{0} ** 200;
+    const payload = @as([200]u8, @splat(0));
     var reader = Vp8BoolReader.init(&payload);
 
     const entropy = try vp8ReadEntropyHeader(&reader, base, &update_probs);
@@ -4890,7 +4890,7 @@ test "vp8 coefficient update probabilities match reference table entries" {
 test "vp8 entropy header can preserve default coefficient probabilities" {
     const base = vp8DefaultCoeffProbs();
     const update_probs = testVp8CoeffProbs(255);
-    const payload = [_]u8{0} ** 200;
+    const payload = @as([200]u8, @splat(0));
     var reader = Vp8BoolReader.init(&payload);
 
     const entropy = try vp8ReadEntropyHeader(&reader, base, &update_probs);
@@ -4900,7 +4900,7 @@ test "vp8 entropy header can preserve default coefficient probabilities" {
 }
 
 test "vp8 default entropy header uses reference default and update probability tables" {
-    const payload = [_]u8{0} ** 200;
+    const payload = @as([200]u8, @splat(0));
     var reader = Vp8BoolReader.init(&payload);
 
     const entropy = try vp8ReadDefaultEntropyHeader(&reader);
@@ -4910,7 +4910,7 @@ test "vp8 default entropy header uses reference default and update probability t
 }
 
 test "vp8 keyframe control parser leaves reader at macroblock mode records" {
-    const first_partition = [_]u8{0} ** 200;
+    const first_partition = @as([200]u8, @splat(0));
     const control = try parseVp8KeyframeControl(&first_partition);
     try std.testing.expectEqual(@as(usize, 1), control.syntax.token_partition_count);
     try std.testing.expectEqual(@as(u7, 0), control.syntax.quant.base_q);
@@ -4931,7 +4931,7 @@ test "vp8 keyframe control parser leaves reader at macroblock mode records" {
     );
 
     try std.testing.expect(header.is_i4x4);
-    try std.testing.expectEqualSlices(Vp8Luma4Mode, &([_]Vp8Luma4Mode{.dc} ** 16), header.luma4_modes.?[0..]);
+    try std.testing.expectEqualSlices(Vp8Luma4Mode, &(@as([16]Vp8Luma4Mode, @splat(.dc))), header.luma4_modes.?[0..]);
     try std.testing.expectEqual(Vp8ChromaMode.dc, header.chroma_mode);
 }
 
@@ -5063,8 +5063,8 @@ test "probe vp8x alpha chunk before lossy image" {
 
 test "probe rejects alph chunk when vp8x alpha flag is clear" {
     const alloc = std.testing.allocator;
-    const first_partition = [_]u8{0} ** 200;
-    const token_partition = [_]u8{0} ** 64;
+    const first_partition = @as([200]u8, @splat(0));
+    const token_partition = @as([64]u8, @splat(0));
     const alpha_payload = [_]u8{ 0, 0x7d };
     const webp = try testBuildVp8xAlphVp8Webp(alloc, &alpha_payload, 1, 1, &first_partition, &.{&token_partition});
     defer alloc.free(webp);
@@ -5183,8 +5183,8 @@ test "decode rejects unsupported lossy vp8 frame flags" {
 
 test "decode minimal unfiltered vp8 keyframe to rgba" {
     const alloc = std.testing.allocator;
-    const first_partition = [_]u8{0} ** 200;
-    const token_partition = [_]u8{0} ** 64;
+    const first_partition = @as([200]u8, @splat(0));
+    const token_partition = @as([64]u8, @splat(0));
     const webp = try testBuildVp8Webp(alloc, 1, 1, &first_partition, &.{&token_partition});
     defer alloc.free(webp);
 
@@ -5199,8 +5199,8 @@ test "decode minimal unfiltered vp8 keyframe to rgba" {
 
 test "decode vp8 with raw alph chunk composes alpha plane" {
     const alloc = std.testing.allocator;
-    const first_partition = [_]u8{0} ** 200;
-    const token_partition = [_]u8{0} ** 64;
+    const first_partition = @as([200]u8, @splat(0));
+    const token_partition = @as([64]u8, @splat(0));
     const alpha_payload = [_]u8{ 0, 0x7d };
     const webp = try testBuildVp8xAlphVp8Webp(alloc, &alpha_payload, 1, 1, &first_partition, &.{&token_partition});
     defer alloc.free(webp);

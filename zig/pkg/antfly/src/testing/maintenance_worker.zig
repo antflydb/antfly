@@ -67,7 +67,7 @@ const CliConfig = struct {
     local_db_writer_lock: bool = false,
     help: bool = false,
 
-    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.worker_ids.deinit(alloc);
         self.* = undefined;
     }
@@ -326,7 +326,7 @@ const SupervisorConfig = struct {
     summary_dir: []const u8 = ".zig-cache/tmp",
     help: bool = false,
 
-    fn deinit(self: *SupervisorConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SupervisorConfig, alloc: std.mem.Allocator) void {
         self.worker_ids.deinit(alloc);
         self.* = undefined;
     }
@@ -415,7 +415,7 @@ const ChildArgv = struct {
     argv: std.ArrayListUnmanaged([]const u8) = .empty,
     owned: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *ChildArgv, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ChildArgv, alloc: std.mem.Allocator) void {
         for (self.owned.items) |item| alloc.free(item);
         self.owned.deinit(alloc);
         self.argv.deinit(alloc);
@@ -1954,7 +1954,7 @@ const FakeServiceMaintenanceClient = struct {
     captured_target: ?ServiceTarget = null,
     expect_ready_file_before_release: ?[]const u8 = null,
 
-    fn deinit(self: *FakeServiceMaintenanceClient, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FakeServiceMaintenanceClient, alloc: std.mem.Allocator) void {
         if (self.first_captured_body) |body| alloc.free(body);
         if (self.captured_body) |body| alloc.free(body);
         self.* = undefined;
@@ -2010,7 +2010,7 @@ const LoopbackSupervisorChildRunner = struct {
         var initialized: usize = 0;
         defer for (argv_z[0..initialized]) |arg| alloc.free(std.mem.span(arg));
         for (argv[2..], argv_z) |arg, *arg_z| {
-            arg_z.* = (try alloc.dupeZ(u8, arg)).ptr;
+            arg_z.* = (try alloc.dupeSentinel(u8, arg, 0)).ptr;
             initialized += 1;
         }
         var args = std.process.Args.Iterator.init(.{ .vector = argv_z });

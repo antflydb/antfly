@@ -60,7 +60,7 @@ const Inputs = struct {
         return .{ .qkv = qkv, .relative = relative, .control = control, .dout = dout };
     }
 
-    fn deinit(self: Inputs, cb: *const ops.ComputeBackend) void {
+    pub fn deinit(self: Inputs, cb: *const ops.ComputeBackend) void {
         cb.free(self.dout);
         cb.free(self.control);
         cb.free(self.relative);

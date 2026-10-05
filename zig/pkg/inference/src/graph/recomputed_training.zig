@@ -212,7 +212,7 @@ const Region = struct {
     gradients: []GradientRoute,
     duplicate_gradients: []?usize,
 
-    fn deinit(self: *Region, a: Allocator) void {
+    pub fn deinit(self: *Region, a: Allocator) void {
         if (self.session) |*session| session.deinit();
         self.initial_analysis.deinit(a);
         self.initial.deinit();
@@ -699,7 +699,7 @@ const Bindings = struct {
     values: []interpreter.RuntimeInput,
     generated: []ops.CT,
     allocator: Allocator,
-    fn deinit(self: *@This(), cb: *const ops.ComputeBackend) void {
+    pub fn deinit(self: *@This(), cb: *const ops.ComputeBackend) void {
         for (self.generated) |value| cb.free(value);
         self.allocator.free(self.generated);
         self.allocator.free(self.values);

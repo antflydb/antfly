@@ -1748,7 +1748,7 @@ const MapStore = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);

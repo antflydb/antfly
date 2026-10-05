@@ -49,7 +49,7 @@ fn decoderFeature(algorithm: anytype) policy.Feature {
 pub fn requiredFeaturesResolved(request: *const wire.Request, common: pipeline.Options, control: ?Control) !policy.Features {
     try check(control);
     if (request.items.len == 0) return error.InvalidExtractionRequest;
-    var result = policy.Features.initEmpty();
+    var result = policy.Features.empty;
     for (request.items) |item| {
         try check(control);
         const schema = item.compiled.schema;
@@ -289,12 +289,12 @@ test "boundary qualification distinguishes single-window source and explicit or 
         try std.testing.expectEqual(index == 5, actual.contains(.classification_single));
         try std.testing.expectEqual(index >= 6, actual.contains(.long_document));
     }
-    var union_expected = policy.Features.initEmpty();
+    var union_expected = policy.Features.empty;
     for ([_]policy.Feature{ .joint_ie, .classification_single, .joint_fastino_v1, .decoder_auto, .decoder_exact, .decoder_beam, .word_whitespace, .overlap_flat, .offset_utf8, .single_window, .long_document, .record_identity_occurrence }) |feature|
         union_expected.insert(feature);
     const actual_union = try requiredFeatures(&request, null);
-    inline for (@typeInfo(policy.Feature).@"enum".fields) |field| {
-        const feature: policy.Feature = @enumFromInt(field.value);
+    inline for (@typeInfo(policy.Feature).@"enum".field_names, @typeInfo(policy.Feature).@"enum".field_values) |_, field_value| {
+        const feature: policy.Feature = @fromBackingInt(field_value);
         try std.testing.expectEqual(union_expected.contains(feature), actual_union.contains(feature));
     }
 }
@@ -704,7 +704,7 @@ test "boundary qualification canonical feature matrix covers every task and opti
             .option_features = &.{ .word_whitespace, .overlap_flat, .offset_utf8, .decoder_auto, .long_document, .record_identity_occurrence },
         },
     };
-    var covered = policy.Features.initEmpty();
+    var covered = policy.Features.empty;
     for (cases) |case| {
         errdefer std.debug.print("qualification feature case: {s}\n", .{case.name});
         const Bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
@@ -721,7 +721,7 @@ test "boundary qualification canonical feature matrix covers every task and opti
         defer a.free(bytes);
         var request = try wire.parseJson(a, bytes, .{ .compiler = regex.compilerOptions(.{}) });
         defer request.deinit();
-        var expected = policy.Features.initEmpty();
+        var expected = policy.Features.empty;
         for (case.features) |feature| expected.insert(feature);
         for (case.option_features) |feature| expected.insert(feature);
         const before_fingerprint = request.items[0].compiled.fingerprint;
@@ -730,17 +730,17 @@ test "boundary qualification canonical feature matrix covers every task and opti
         // Derivation is allocation-free and cannot mutate compiled semantics.
         try std.testing.expectEqual(before_peak, bounded.peak);
         try std.testing.expectEqual(before_fingerprint, request.items[0].compiled.fingerprint);
-        inline for (@typeInfo(policy.Feature).@"enum".fields) |field| {
-            const feature: policy.Feature = @enumFromInt(field.value);
-            errdefer std.debug.print("qualification feature: {s}\n", .{field.name});
+        inline for (@typeInfo(policy.Feature).@"enum".field_names, @typeInfo(policy.Feature).@"enum".field_values) |reflected_name, field_value| {
+            const feature: policy.Feature = @fromBackingInt(field_value);
+            errdefer std.debug.print("qualification feature: {s}\n", .{reflected_name});
             try std.testing.expectEqual(expected.contains(feature), actual.contains(feature));
             if (actual.contains(feature)) covered.insert(feature);
         }
         try std.testing.expect(!bounded.denied);
     }
     // A new policy feature must acquire an actual canonical-wire test case.
-    inline for (@typeInfo(policy.Feature).@"enum".fields) |field| {
-        try std.testing.expect(covered.contains(@enumFromInt(field.value)));
+    inline for (@typeInfo(policy.Feature).@"enum".field_names, @typeInfo(policy.Feature).@"enum".field_values) |_, field_value| {
+        try std.testing.expect(covered.contains(@fromBackingInt(field_value)));
     }
 }
 

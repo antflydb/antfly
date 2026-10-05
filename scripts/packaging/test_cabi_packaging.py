@@ -805,8 +805,12 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
             self.assertIn("Requires-Python: >=3.11", metadata)
             self.assertIn("License-Expression: Elastic-2.0 AND Apache-2.0", metadata)
-            self.assertIn("antfly_cli-1.2.3.dist-info/licenses/LICENSES/Elastic-2.0.txt", names)
-            self.assertIn("antfly_cli-1.2.3.dist-info/licenses/LICENSES/Apache-2.0.txt", names)
+            self.assertIn(
+                "antfly_cli-1.2.3.dist-info/licenses/LICENSES/Elastic-2.0.txt", names
+            )
+            self.assertIn(
+                "antfly_cli-1.2.3.dist-info/licenses/LICENSES/Apache-2.0.txt", names
+            )
 
     def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

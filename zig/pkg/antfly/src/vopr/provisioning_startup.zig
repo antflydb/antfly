@@ -20,7 +20,7 @@ const vopr = @import("vopr");
 const data_format = @import("../common/data_format.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const provisioner = @import("../metadata/table_provisioner.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "provisioning-startup";

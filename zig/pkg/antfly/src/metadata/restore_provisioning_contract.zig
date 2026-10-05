@@ -1,35 +1,35 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Owned restore provisioning DTO shared across runtime archives and seed
 //! artifacts. No metadata service or physical storage implementation belongs
 //! in this contract.
 const std = @import("std");
-const records = @import("../common/topology_records.zig");
+const records = @import("antfly_local_sources").common_topology_records;
 
 pub const SourceArtifact = struct {
     target_group_id: u64,
-    source_namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
+    source_namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace,
     format: enum { native, portable },
     snapshot_path: []const u8,
     artifact_size_bytes: u64,
     artifact_sha256: [32]u8,
     native_manifest_size_bytes: u64 = 0,
     native_manifest_sha256: []const u8 = "",
-    cohort_seal: ?@import("../storage/db/native_backup_seal_contract.zig").Handle = null,
-    rewrite: ?@import("../storage/db/relational_rewrite_contract.zig").Binding = null,
+    cohort_seal: ?@import("antfly_local_sources").storage_db_native_backup_seal_contract.Handle = null,
+    rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Binding = null,
 
     pub fn digest(self: SourceArtifact, alloc: std.mem.Allocator) ![32]u8 {
         const encoded = try std.json.Stringify.valueAlloc(alloc, self, .{});
@@ -46,7 +46,7 @@ pub const ProvisioningProjection = struct {
         plan_digest: [32]u8,
         child_table_id: u64,
         child_group_id: u64,
-        namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
+        namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace,
         schema_version: u32,
         schema_digest: [32]u8,
         public_schema_json_digest: [32]u8,
@@ -65,7 +65,7 @@ pub const ProvisioningProjection = struct {
         try stream.objectField("tables");
         try stream.write(self.tables);
         try stream.objectField("ranges");
-        try @import("../storage/db/relational_integrity_json.zig").write(self.ranges, stream);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self.ranges, stream);
         try stream.objectField("jobs_json");
         try stream.write(self.jobs_json);
         try stream.objectField("initial_fk_owners");
@@ -87,28 +87,5 @@ pub const ProvisioningProjection = struct {
     }
 };
 
-pub fn freeTable(alloc: std.mem.Allocator, record: records.TableRecord) void {
-    if (record.storage_migration) |migration| alloc.free(migration.request.job_id);
-    alloc.free(record.relational_retirement_json);
-    alloc.free(record.name);
-    alloc.free(record.description);
-    alloc.free(record.schema_json);
-    alloc.free(record.read_schema_json);
-    alloc.free(record.indexes_json);
-    alloc.free(record.replication_sources_json);
-    alloc.free(record.placement_role);
-    alloc.free(record.restore_backup_id);
-    alloc.free(record.restore_location);
-}
-
-pub fn freeRange(alloc: std.mem.Allocator, record: records.RangeRecord) void {
-    alloc.free(record.start_key);
-    if (record.end_key) |key| alloc.free(key);
-    alloc.free(record.restore_backup_id);
-    alloc.free(record.restore_artifact_backup_id);
-    alloc.free(record.restore_location);
-    alloc.free(record.restore_snapshot_path);
-    alloc.free(record.restore_connection);
-    alloc.free(record.restore_artifact_sha256);
-    alloc.free(record.restore_native_manifest_sha256);
-}
+pub const freeTable = @import("antfly_local_sources").metadata_record_memory.freeTable;
+pub const freeRange = @import("antfly_local_sources").metadata_record_memory.freeRange;

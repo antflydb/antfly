@@ -1422,8 +1422,8 @@ fn batchedDotGeneralDirect(
     if (lhs_shape.dim(lhs_contracting) != rhs_shape.dim(rhs_contracting)) return error.InvalidDotGeneralShape;
 
     var out_dims: [shape_mod.max_rank]i64 = undefined;
-    var lhs_batch = [_]u8{0} ** shape_mod.max_rank;
-    var rhs_batch = [_]u8{0} ** shape_mod.max_rank;
+    var lhs_batch = @as([shape_mod.max_rank]u8, @splat(0));
+    var rhs_batch = @as([shape_mod.max_rank]u8, @splat(0));
     for (0..num_batch) |axis| {
         const batch_axis: u8 = @intCast(axis);
         if (lhs_shape.dim(batch_axis) != rhs_shape.dim(batch_axis)) return error.InvalidDotGeneralShape;
@@ -1614,7 +1614,7 @@ fn broadcastToShape(
 
     // Use broadcast_in_dim for shape expansion, mapping adjoint axes onto
     // the unreduced target axes.
-    var reduced_mask: [shape_mod.max_rank]bool = .{false} ** shape_mod.max_rank;
+    var reduced_mask: [shape_mod.max_rank]bool = @splat(false);
     for (reduced_axes) |axis| reduced_mask[axis] = true;
 
     var broadcast_axes: [shape_mod.max_rank]u8 = undefined;

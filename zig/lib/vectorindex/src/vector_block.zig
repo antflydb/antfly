@@ -528,7 +528,7 @@ pub const Writer = struct {
         try self.data.resize(alloc, header_size);
         @memcpy(self.data.items[0..magic.len], &magic);
         writeU16(self.data.items[8..10], version);
-        writeU16(self.data.items[10..12], @intFromEnum(encoding));
+        writeU16(self.data.items[10..12], @backingInt(encoding));
         writeU64(self.data.items[12..20], generation);
         writeU32(self.data.items[20..24], shard_id);
         writeU32(self.data.items[24..28], shard_count);
@@ -805,7 +805,7 @@ pub const Writer = struct {
         try appendU64(self.alloc, &self.data, self.generation);
         try appendU32(self.alloc, &self.data, Crc32.hash(self.index.items));
         try appendU16(self.alloc, &self.data, version);
-        try appendU16(self.alloc, &self.data, @intFromEnum(self.encoding));
+        try appendU16(self.alloc, &self.data, @backingInt(self.encoding));
         try appendU32(self.alloc, &self.data, self.shard_id);
         try appendU32(self.alloc, &self.data, self.shard_count);
         try appendU32(self.alloc, &self.data, Crc32.hash(self.data.items[footer_start..][0..48]));
@@ -898,7 +898,7 @@ pub const StreamingWriter = struct {
         const index_checksum = Crc32.hash(self.index.items);
         writeU32(footer[32..36], index_checksum);
         writeU16(footer[36..38], version);
-        writeU16(footer[38..40], @intFromEnum(self.page.encoding));
+        writeU16(footer[38..40], @backingInt(self.page.encoding));
         writeU32(footer[40..44], self.page.shard_id);
         writeU32(footer[44..48], self.page.shard_count);
         const footer_checksum = Crc32.hash(footer[0..48]);
@@ -1159,7 +1159,7 @@ pub const Reader = struct {
         if (!validShardCount(shard_count) or shard_id >= shard_count) return error.CorruptedVectorBlock;
         const footer = data[data.len - footer_size ..];
         if (!std.mem.eql(u8, footer[52..60], &magic)) return error.CorruptedVectorBlock;
-        if (readU16(footer[36..38]) != block_version or readU16(footer[38..40]) != @intFromEnum(encoding)) return error.UnsupportedVectorBlockVersion;
+        if (readU16(footer[36..38]) != block_version or readU16(footer[38..40]) != @backingInt(encoding)) return error.UnsupportedVectorBlockVersion;
         if (readU32(footer[48..52]) != Crc32.hash(footer[0..48])) return error.VectorBlockFooterChecksumMismatch;
         if (readU64(footer[24..32]) != generation) return error.CorruptedVectorBlock;
         if (readU32(footer[40..44]) != shard_id or readU32(footer[44..48]) != shard_count) return error.CorruptedVectorBlock;
@@ -1432,7 +1432,7 @@ pub const Reader = struct {
         return std.mem.order(u8, key, key_value);
     }
 
-    fn validate(self: Reader) !void {
+    pub fn validate(self: Reader) !void {
         var previous: ?Writer.OrderingKey = null;
         for (0..self.count) |i| {
             const current = try self.entry(i);

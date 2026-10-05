@@ -192,7 +192,7 @@ pub const CustomMctMatrix = struct {
     /// Per-component pre/post offsets (applied before forward / after inverse).
     offsets: []const f32,
 
-    fn validate(self: CustomMctMatrix) CustomMctError!void {
+    pub fn validate(self: CustomMctMatrix) CustomMctError!void {
         if (self.num_components == 0 or self.num_components > custom_mct_max_components)
             return error.TooManyComponents;
         const n: usize = self.num_components;
@@ -216,7 +216,7 @@ pub const CustomMctMatrixI32 = struct {
     shift: u5,
     offsets: []const i32,
 
-    fn validate(self: CustomMctMatrixI32) CustomMctError!void {
+    pub fn validate(self: CustomMctMatrixI32) CustomMctError!void {
         if (self.num_components == 0 or self.num_components > custom_mct_max_components)
             return error.TooManyComponents;
         if (self.shift > 16) return error.ShiftTooLarge;
@@ -794,8 +794,8 @@ test "custom MCT N=1 passthrough with offset" {
 
 test "custom MCT rejects too-many components" {
     const over: usize = @as(usize, custom_mct_max_components) + 1;
-    const forward = [_]f32{0} ** (17 * 17);
-    const offsets = [_]f32{0} ** 17;
+    const forward = @as([(17 * 17)]f32, @splat(0));
+    const offsets = @as([17]f32, @splat(0));
     const matrix = CustomMctMatrix{
         .num_components = @intCast(over),
         .forward = forward[0..],

@@ -58,5 +58,8 @@
   },
   "zig/pkg/inference/src/pipelines/extraction_casefold_data.zig": {
     "file": "LICENSES/third-party/Unicode-V3.txt"
+  },
+  "zig/lib/platform/src/io_uring_compat.zig": {
+    "file": "LICENSES/third-party/Zig-SHA256-MIT.txt"
   }
 }

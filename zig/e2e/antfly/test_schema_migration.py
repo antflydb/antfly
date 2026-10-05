@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -153,6 +154,207 @@ def test_schema_migration_full_text_rebuild(stateful_api):
     assert doc["title"] == "Document 500"
     assert "searchable text" in doc["content"]
     timings.finish(stateful_api)
+
+
+def _document_extraction_units_enrichment() -> dict:
+    """Asset enrichment extracting the plain-text ``src`` data: URI field."""
+
+    producer = {
+        "type": "document_extraction",
+        "config": {
+            "routes": [
+                {
+                    "match": {"content_type": "text/plain"},
+                    "extractor": {"type": "text", "unit": "text"},
+                }
+            ],
+            "source": {
+                "filename_field": "name",
+                "content_type_field": "ctype",
+                "etag_field": "sha",
+                "version_field": "sha",
+            },
+        },
+    }
+    return {
+        "kind": "asset",
+        "field": "src",
+        "content_type": "application/json",
+        "producer_json": json.dumps(producer, separators=(",", ":")),
+    }
+
+
+def _table_has_artifact_enrichment(
+    api, table_name: str, artifact_name: str, kind: str
+) -> dict | None:
+    try:
+        table = api.get_table(table_name)
+    except Exception:
+        return None
+    for enrichment in table.get("artifact_enrichments", []):
+        if enrichment.get("name") == artifact_name and enrichment.get("kind") == kind:
+            return table
+    return None
+
+
+def _chunk_row_text(doc_index: int, word_count: int = 300) -> str:
+    return " ".join(f"word{doc_index}x{j} alpha river stone" for j in range(word_count))
+
+
+def test_schema_migration_full_text_rebuild_with_chunk_enrichment(stateful_api):
+    """Regression test for #925.
+
+    A chunk enrichment with ``full_text_index: true`` routes its chunk member
+    documents into the same versioned full-text index as the table's primary
+    rows, so the target generation's ``doc_count`` is rows plus chunks and can
+    never equal the primary document identity count. That must not prevent
+    the schema migration from finalizing without a restart.
+    """
+
+    table_name = f"schema_migration_chunks_{time.time_ns()}"
+    num_docs = 50
+
+    keyword = {"type": "string", "x-antfly-types": ["keyword"]}
+    schema = {
+        "document_schemas": {
+            "doc": {
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "properties": {
+                        "name": keyword,
+                        "sha": keyword,
+                        "ctype": keyword,
+                        "title": {"type": "string", "x-antfly-types": ["text"]},
+                    },
+                }
+            }
+        },
+        "dynamic_templates": [
+            {
+                "name": "src_unindexed",
+                "path_match": "src",
+                "mapping": {"type": "keyword", "index": False},
+            }
+        ],
+        "default_type": "doc",
+    }
+    created = stateful_api.post(
+        f"/tables/{table_name}", {"schema": schema, "num_shards": 1}
+    )
+    assert created["name"] == table_name
+    assert "full_text_index_v0" in created["indexes"]
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/units/enrichment",
+            _document_extraction_units_enrichment(),
+        )
+        == {}
+    )
+    assert (
+        wait_until(
+            lambda: _table_has_artifact_enrichment(
+                stateful_api, table_name, "units", "asset"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+
+    assert (
+        stateful_api.put(
+            f"/tables/{table_name}/artifacts/chunks/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": "units",
+                "field": "text",
+                "chunk_size": 300,
+                "chunk_overlap": 40,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+    assert (
+        wait_until(
+            lambda: _table_has_artifact_enrichment(
+                stateful_api, table_name, "chunks", "chunk"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+
+    inserts = {
+        f"doc-{i:04d}": {
+            "src": "data:text/plain;base64,"
+            + base64.b64encode(_chunk_row_text(i).encode()).decode(),
+            "name": f"f{i}.txt",
+            "sha": f"h{i}",
+            "ctype": "text/plain",
+            "title": f"row {i}",
+        }
+        for i in range(num_docs)
+    }
+    batch = stateful_api.batch_write(table_name, inserts=inserts, sync_level="write")
+    assert batch["inserted"] == num_docs
+
+    def artifacts_and_index_settled() -> dict | None:
+        for i in range(num_docs):
+            try:
+                artifacts = stateful_api.get(
+                    f"/tables/{table_name}/documents/doc-{i:04d}/artifacts"
+                )
+            except Exception:
+                return None
+            names = {
+                entry.get("artifact_name") for entry in artifacts.get("artifacts", [])
+            }
+            if "units" not in names:
+                return None
+        return _ready_index(
+            stateful_api, table_name, "full_text_index_v0", expected_docs=num_docs
+        )
+
+    initial_index = wait_until(
+        artifacts_and_index_settled,
+        timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
+    )
+    assert initial_index is not None, (
+        "chunk-enriched full_text_index_v0 did not finish its initial build in time\n"
+        + _schema_migration_diagnostics(stateful_api, table_name, "full_text_index_v0")
+    )
+    assert initial_index["doc_count"] > num_docs, (
+        "expected chunk members to inflate full_text_index_v0 doc_count above the row count"
+    )
+
+    current_schema = stateful_api.get_table(table_name)["schema"]
+    current_schema.pop("version", None)
+    current_schema["document_schemas"]["doc"]["schema"]["properties"]["extra"] = keyword
+    updated = stateful_api.update_schema(table_name, current_schema)
+    assert updated["schema"]["version"] == 1
+
+    stable_table = wait_until(
+        lambda: _stable_table(stateful_api, table_name, expected_version=1),
+        timeout_s=SCHEMA_MIGRATION_REBUILD_TIMEOUT_S,
+        interval_s=1.0,
+    )
+    assert stable_table is not None, (
+        "schema migration with a chunk-routed full-text index did not finalize\n"
+        + _schema_migration_diagnostics(stateful_api, table_name, "full_text_index_v1")
+    )
+
+    stable_indexes = _index_names(stateful_api.list_indexes(table_name))
+    assert "full_text_index_v0" not in stable_indexes
+    assert "full_text_index_v1" in stable_indexes
+
+    rebuilt_index = _index_stats(
+        stateful_api.get_index(table_name, "full_text_index_v1")
+    )
+    assert rebuilt_index["doc_count"] > num_docs
 
 
 class _PhaseTimings:

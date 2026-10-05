@@ -31,7 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const hbs = @import("handlebars");
 const toon = @import("antfly_toon");
-const template = @import("../template.zig");
+const template = @import("antfly_local_sources").template;
 const Expression = @FieldType(hbs.Node, "expression");
 
 /// Source keys that carry retrieval metadata the prompt already states

@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const domain = @import("../system_catalog/domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const Cursor = struct {
     version: u8 = 1,
     database: []const u8,

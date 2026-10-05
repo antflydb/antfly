@@ -272,10 +272,10 @@ pub fn validate(config: Config) !void {
 }
 
 fn validateGroup(value: anytype, ceiling: @TypeOf(value)) !void {
-    inline for (std.meta.fields(@TypeOf(value))) |field| {
-        const current = @field(value, field.name);
-        const maximum = @field(ceiling, field.name);
-        switch (@typeInfo(field.type)) {
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+        const current = @field(value, reflected_name);
+        const maximum = @field(ceiling, reflected_name);
+        switch (@typeInfo(field_type)) {
             .@"struct" => try validateGroup(current, maximum),
             .int => {
                 if (current == 0) return error.InvalidBoundaryTrainingLimits;
@@ -289,9 +289,9 @@ fn validateGroup(value: anytype, ceiling: @TypeOf(value)) !void {
 /// Copy only the explicit numeric resource fields. Existing callback/context,
 /// execution, gradient strictness, sampling and optimizer options are retained.
 fn copyGroup(destination: anytype, source: anytype) void {
-    inline for (std.meta.fields(@TypeOf(source))) |field| switch (@typeInfo(field.type)) {
-        .@"struct" => copyGroup(&@field(destination.*, field.name), @field(source, field.name)),
-        .int => @field(destination.*, field.name) = @intCast(@field(source, field.name)),
+    inline for (@typeInfo(@TypeOf(source)).@"struct".field_names, @typeInfo(@TypeOf(source)).@"struct".field_types) |reflected_name, field_type| switch (@typeInfo(field_type)) {
+        .@"struct" => copyGroup(&@field(destination.*, reflected_name), @field(source, reflected_name)),
+        .int => @field(destination.*, reflected_name) = @intCast(@field(source, reflected_name)),
         else => @compileError("Only numeric resource fields can be mapped"),
     };
 }
@@ -309,16 +309,16 @@ pub fn apply(config: Config, base: native.Limits) !native.Limits {
 }
 
 fn checkEachBound(value: anytype, ceiling: @TypeOf(value)) !void {
-    inline for (std.meta.fields(@TypeOf(value))) |field| {
-        switch (@typeInfo(field.type)) {
-            .@"struct" => try checkEachBound(@field(value, field.name), @field(ceiling, field.name)),
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+        switch (@typeInfo(field_type)) {
+            .@"struct" => try checkEachBound(@field(value, reflected_name), @field(ceiling, reflected_name)),
             .int => {
                 var changed = value;
-                @field(changed, field.name) = 0;
+                @field(changed, reflected_name) = 0;
                 try std.testing.expectError(error.InvalidBoundaryTrainingLimits, validateGroup(changed, ceiling));
-                @field(changed, field.name) = @field(ceiling, field.name) + 1;
+                @field(changed, reflected_name) = @field(ceiling, reflected_name) + 1;
                 try std.testing.expectError(error.BoundaryTrainingLimitsExceeded, validateGroup(changed, ceiling));
-                @field(changed, field.name) = @field(ceiling, field.name);
+                @field(changed, reflected_name) = @field(ceiling, reflected_name);
                 try validateGroup(changed, ceiling);
             },
             else => unreachable,
@@ -327,9 +327,9 @@ fn checkEachBound(value: anytype, ceiling: @TypeOf(value)) !void {
 }
 
 fn expectMapped(source: anytype, destination: anytype) !void {
-    inline for (std.meta.fields(@TypeOf(source))) |field| switch (@typeInfo(field.type)) {
-        .@"struct" => try expectMapped(@field(source, field.name), @field(destination, field.name)),
-        .int => try std.testing.expectEqual(@field(source, field.name), @field(destination, field.name)),
+    inline for (@typeInfo(@TypeOf(source)).@"struct".field_names, @typeInfo(@TypeOf(source)).@"struct".field_types) |reflected_name, field_type| switch (@typeInfo(field_type)) {
+        .@"struct" => try expectMapped(@field(source, reflected_name), @field(destination, reflected_name)),
+        .int => try std.testing.expectEqual(@field(source, reflected_name), @field(destination, reflected_name)),
         else => unreachable,
     };
 }

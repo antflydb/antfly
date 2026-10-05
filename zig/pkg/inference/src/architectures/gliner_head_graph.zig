@@ -1684,11 +1684,11 @@ test "GLiNER graph batch fallback keeps exact sparse spans and per sample sessio
     const ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const labeled_ids = [_]i64{ 51, 2, 3, 4, 51, 6, 7, 8 };
     const mask = [_]i64{ 1, 1, 1, 1, 1, 1, 0, 0 };
-    const hidden = [_]f32{0} ** 16;
+    const hidden = @as([16]f32, @splat(0));
     const hidden_ct = try cb.fromFloat32Shape(&hidden, &.{ 8, 2 });
     defer cb.free(hidden_ct);
     const no_labels_words = [_]i64{ 0, 1, 1, 2, 0, 1, 0, 0 };
-    const no_words = [_]i64{0} ** 8;
+    const no_words = @as([8]i64, @splat(0));
     // Three spans per sample over two padded word slots. Deriving the count
     // from floor(spans / words) would incorrectly report four total spans.
     const spans = [_]i64{ 0, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1 };
@@ -1724,10 +1724,10 @@ test "GLiNER graph batch rejects incompatible preparation geometry and required 
     var compute = BatchRouteProbe.native.NativeCompute.init(a, &store, null);
     defer compute.deinit();
     const cb = compute.computeBackend();
-    const hidden = try cb.fromFloat32Shape(&([_]f32{0} ** 16), &.{ 8, 2 });
+    const hidden = try cb.fromFloat32Shape(&(@as([16]f32, @splat(0))), &.{ 8, 2 });
     defer cb.free(hidden);
     const ids = [_]i64{ 51, 52, 53, 11, 51, 52, 53, 21 };
-    const mask = [_]i64{1} ** 8;
+    const mask = @as([8]i64, @splat(1));
     const words = [_]i64{ 0, 0, 0, 1, 0, 0, 0, 1 };
     const spans = [_]i64{ 0, 0, 0, 0 };
     const config = Config{ .hidden_size = 2, .entity_token_id = 51 };

@@ -14,7 +14,7 @@
 // limitations.
 
 //! Hot standby integration for local online_source mutations.
-const engine = @import("../db/online_source.zig");
+const engine = @import("antfly_local_sources").storage_db_online_source;
 const Scope = engine.Scope;
 const std = @import("std");
 
@@ -68,8 +68,8 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
             .consumer_epoch = 1,
             .copy_attempt = .{ .donor_term = if (native_authority) 0 else 1, .sequence = 1 },
         };
-        db.local_execution.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
-        const request: @import("../db/types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
+        db.local_execution.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait });
+        const request: @import("antfly_local_sources").storage_db_types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
         try std.testing.expectError(error.InjectedSourceMirrorWaitFailure, if (native_authority) db.batch(request) else @import("../server_db_adapter.zig").applyOrdered(&db, request, .{ .term = 1, .index = 11 }));
         try std.testing.expectEqual(@as(u64, if (native_authority) 1 else 11), (try db.onlineSourceStatus(scope)).admitted_applied_index);
         try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
@@ -80,26 +80,26 @@ fn sourceOutboxRecovery(native_authority: bool) !void {
     {
         var db = try db_mod.DB.open(alloc, path, options);
         defer db.close();
-        db.local_execution.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait };
-        const request: @import("../db/types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
+        db.local_execution.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_write, .standby_names = &.{"standby"}, .failure_policy = .block }, .sync_wait_ctx = &ack, .sync_wait_fn = Ack.wait });
+        const request: @import("antfly_local_sources").storage_db_types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
         if (native_authority) try db.batch(request) else try @import("../server_db_adapter.zig").applyOrdered(&db, request, .{ .term = 1, .index = 11 });
         try std.testing.expect(ack.calls >= 2);
         try std.testing.expectEqual(@as(u64, if (native_authority) 2 else 1), primary.lastLsn());
         var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestUnexpectedResult;
         defer entry.deinit(alloc);
-        var decoded = try @import("../db/replication_effects.zig").decodeBatchMutationRequest(alloc, entry.record);
+        var decoded = try @import("antfly_local_sources").storage_db_replication_effects.decodeBatchMutationRequest(alloc, entry.record);
         defer decoded.deinit();
         try std.testing.expectEqual(@as(?u64, if (native_authority) 1 else 11), decoded.value.online_source_applied_index);
         try std.testing.expectEqualSlices(u8, &scope.pin(), &decoded.value.request.online_source.?.scope().pin());
         if (native_authority) {
             var retry = (try primary.log.entryAt(alloc, 2)).?;
             defer retry.deinit(alloc);
-            var retry_decoded = try @import("../db/replication_effects.zig").decodeBatchMutationRequest(alloc, retry.record);
+            var retry_decoded = try @import("antfly_local_sources").storage_db_replication_effects.decodeBatchMutationRequest(alloc, retry.record);
             defer retry_decoded.deinit();
             try std.testing.expectEqual(@as(?u64, 2), retry_decoded.value.online_source_applied_index);
             try std.testing.expectEqual(.native, retry_decoded.value.request.online_source.?.scope().authority);
             try std.testing.expectEqual(@as(u64, 1), (try db.onlineSourceStatus(scope)).admitted_applied_index);
-            try std.testing.expect((try db.raftAppliedEntry()) == null);
+            try std.testing.expect((try db.orderedApplyReceipt()) == null);
         }
     }
 }

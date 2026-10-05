@@ -26,7 +26,7 @@ const bootstrap = @import("bootstrap.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const rejoin = @import("rejoin.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 
@@ -39,7 +39,7 @@ const TestPaths = struct {
     standby_progress: [:0]u8,
     fence_wal: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
@@ -70,11 +70,11 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), fence_wal) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
-        .standby_log = try alloc.dupeZ(u8, standby_log),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress),
-        .fence_wal = try alloc.dupeZ(u8, fence_wal),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
+        .standby_log = try alloc.dupeSentinel(u8, standby_log, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress, 0),
+        .fence_wal = try alloc.dupeSentinel(u8, fence_wal, 0),
     };
 }
 
@@ -145,7 +145,7 @@ const ApplyCapture = struct {
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
     fail_at_lsn: u64 = 0,
 
-    fn deinit(self: *ApplyCapture) void {
+    pub fn deinit(self: *ApplyCapture) void {
         for (self.payloads.items) |payload| self.alloc.free(payload);
         self.payloads.deinit(self.alloc);
         self.* = undefined;

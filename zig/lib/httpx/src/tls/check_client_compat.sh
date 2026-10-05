@@ -28,7 +28,7 @@ hash_file() {
     fi
 }
 
-expected_upstream=1464bd0d53f799e7714fa073a0783cb94c68c10fb1ab4381246e01f9cb130c8a
+expected_upstream=c6fbf80138bcf5cf5e46090294e94159815e2e175df56256679ddec87cf64d2c
 actual_upstream=$(hash_file "$upstream")
 if [ "$actual_upstream" != "$expected_upstream" ]; then
     echo "Zig TLS upstream drift: expected $expected_upstream, found $actual_upstream" >&2
@@ -38,12 +38,12 @@ fi
 # Hash the two source files independently instead of hashing unified diff
 # output, whose formatting differs between BSD and GNU diff implementations.
 # With the upstream source pinned above, this also pins the exact patch.
-expected_compat=884465b5a3dfdd729455f1fac670abac98a21ce5e25361ad93e03a6551ac6946
+expected_compat=23316976277d5960102376254bf34d871ea0866e50456ba41d865d8f71bcb3af
 actual_compat=$(hash_file "$compat")
 if [ "$actual_compat" != "$expected_compat" ]; then
     echo "Zig TLS compatibility patch drift: expected compatibility source $expected_compat, found $actual_compat" >&2
     diff -u \
-        --label zig-0.16.0/std/crypto/tls/Client.zig \
+        --label zig-0.17.0/std/crypto/tls/Client.zig \
         --label lib/httpx/src/tls/client_compat.zig \
         "$upstream" "$compat" >&2 || true
     exit 1

@@ -214,11 +214,11 @@ pub const Outcome = struct {
     timed_out: bool = false,
     forced: bool = false,
     pub fn exitCode(self: Outcome) u8 {
-        if (self.interrupted) |signal| return @intCast(@min(255, 128 + @as(u32, @intFromEnum(signal))));
+        if (self.interrupted) |signal| return @intCast(@min(255, 128 + @as(u32, @backingInt(signal))));
         if (self.timed_out) return timeout_exit_code;
         return switch (self.term) {
             .exited => |code| code,
-            .signal, .stopped => |signal| @intCast(@min(255, 128 + @as(u32, @intFromEnum(signal)))),
+            .signal, .stopped => |signal| @intCast(@min(255, 128 + @as(u32, @backingInt(signal)))),
             .unknown => 1,
         };
     }
@@ -267,7 +267,7 @@ var signal_count: std.atomic.Value(u32) = .init(0);
 var first_signal: std.atomic.Value(u32) = .init(0);
 fn onSignal(signal: std.posix.SIG) callconv(.c) void {
     // No allocation, logging, IO, checkpointing, or teardown in signal context.
-    _ = first_signal.cmpxchgStrong(0, @intFromEnum(signal), .release, .monotonic);
+    _ = first_signal.cmpxchgStrong(0, @backingInt(signal), .release, .monotonic);
     if (signal_count.load(.monotonic) < 2) _ = signal_count.fetchAdd(1, .release);
 }
 const Signals = struct {
@@ -287,7 +287,7 @@ const Signals = struct {
         std.posix.sigaction(.PIPE, &ignored, &self.old_pipe);
         return self;
     }
-    fn deinit(self: *Signals) void {
+    pub fn deinit(self: *Signals) void {
         std.posix.sigaction(.INT, &self.old_int, null);
         std.posix.sigaction(.TERM, &self.old_term, null);
         std.posix.sigaction(.PIPE, &self.old_pipe, null);
@@ -382,7 +382,7 @@ test "one-shot carrier rejects missing tampered nested and excessive arguments" 
     try environment.put(original_argv_env, "[[[[]]]]");
     try std.testing.expectError(error.InvalidTrainingInvocation, originalArguments(a, synthetic, &environment, &.{"job.json"}));
     try std.testing.expectError(error.InvalidTrainingInvocation, validateArguments(&.{ "antfly", "bad\x00tail" }));
-    try std.testing.expectError(error.TrainingInvocationLimitExceeded, validateArguments(&([_]([]const u8){"x"} ** (max_arguments + 1))));
+    try std.testing.expectError(error.TrainingInvocationLimitExceeded, validateArguments(&(@as([(max_arguments + 1)]([]const u8), @splat("x")))));
     const excessive = try a.alloc(u8, max_argument_bytes + 1);
     defer a.free(excessive);
     @memset(excessive, 'x');
@@ -411,12 +411,12 @@ test "one-shot worker markers are paired and strict" {
 }
 
 test "one-shot deadlines distinguish completion timeout fatal exit and signals" {
-    const options = Options{ .timeout_ns = 100, .shutdown_grace_ns = 20, .fingerprint = .{3} ** 32 };
+    const options = Options{ .timeout_ns = 100, .shutdown_grace_ns = 20, .fingerprint = @splat(3) };
     const contract = try makeContract(options, 1000);
     try std.testing.expectEqual(@as(u64, 1100), contract.soft_deadline_ns);
     try std.testing.expectEqual(@as(u64, 1120), contract.hard_deadline_ns);
-    try std.testing.expectError(error.InvalidTrainingWorkerLimits, makeContract(.{ .timeout_ns = 0, .fingerprint = .{0} ** 32 }, 0));
-    try std.testing.expectError(error.InvalidTrainingWorkerLimits, makeContract(.{ .timeout_ns = 1, .shutdown_grace_ns = 301 * std.time.ns_per_s, .fingerprint = .{0} ** 32 }, 0));
+    try std.testing.expectError(error.InvalidTrainingWorkerLimits, makeContract(.{ .timeout_ns = 0, .fingerprint = @splat(0) }, 0));
+    try std.testing.expectError(error.InvalidTrainingWorkerLimits, makeContract(.{ .timeout_ns = 1, .shutdown_grace_ns = 301 * std.time.ns_per_s, .fingerprint = @splat(0) }, 0));
     try std.testing.expectError(error.InvalidTrainingWorkerLimits, makeContract(options, std.math.maxInt(u64)));
     try std.testing.expectEqual(@as(u8, 0), completedOutcome(.{ .exited = 0 }, null, contract, 1101).exitCode());
     try std.testing.expectEqual(@as(u8, 0), completedOutcome(.{ .exited = 0 }, null, contract, 1121).exitCode());
@@ -430,10 +430,10 @@ test "one-shot deadlines distinguish completion timeout fatal exit and signals" 
 
 test "one-shot worker identity and pause do not cancel the soft boundary" {
     const now = time.monotonicNs();
-    const contract = try makeContract(.{ .timeout_ns = std.time.ns_per_s, .shutdown_grace_ns = std.time.ns_per_s, .fingerprint = .{9} ** 32 }, now);
+    const contract = try makeContract(.{ .timeout_ns = std.time.ns_per_s, .shutdown_grace_ns = std.time.ns_per_s, .fingerprint = @splat(9) }, now);
     var worker = Worker{ .allocator = std.testing.allocator, .contract = contract, .signals = undefined, .hard_deadline = .init(contract.hard_deadline_ns) };
-    try worker.verifyFingerprint(.{9} ** 32);
-    try std.testing.expectError(error.TrainingWorkerConfigurationChanged, worker.verifyFingerprint(.{8} ** 32));
+    try worker.verifyFingerprint(@splat(9));
+    try std.testing.expectError(error.TrainingWorkerConfigurationChanged, worker.verifyFingerprint(@splat(8)));
     try std.testing.expect(!Worker.pauseRequested(&worker));
     worker.pause();
     try std.testing.expect(Worker.pauseRequested(&worker));
@@ -528,7 +528,7 @@ pub fn runParent(init: std.process.Init, arguments: []const []const u8, options:
         try init.io.checkCancel();
         const received = signal_count.load(.acquire);
         if (received != 0 and interrupted == null) {
-            interrupted = @enumFromInt(first_signal.load(.acquire));
+            interrupted = @fromBackingInt(first_signal.load(.acquire));
             signal_deadline = time.monotonicNs() +| contract.shutdown_grace_ns;
             // Only one byte is written, so a worker stalled before its reader
             // starts cannot fill the pipe. A dead child's EPIPE is harmless.

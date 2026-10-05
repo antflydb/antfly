@@ -1007,5 +1007,5 @@ const pages = [133][64]u8{
 pub inline fn classify(codepoint: u21) Class {
     const page = pages[page_index[codepoint >> 8]];
     const class_byte = page[(codepoint & 0xff) >> 2];
-    return @enumFromInt((class_byte >> @intCast((codepoint & 3) * 2)) & 3);
+    return @fromBackingInt(@as(u2, @truncate(class_byte >> @intCast((codepoint & 3) * 2))));
 }

@@ -324,9 +324,9 @@ test "retained read registry rejects every changed scope dimension and stale pro
     defer registry.deinit();
     const scope = Scope{ .principal = @splat(7), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
     const token = try registry.insert(scope, 1, 1, 100, .{ .ptr = &context, .close = Cleanup.close, .kind = .cursor });
-    inline for (std.meta.fields(Scope)) |field| {
+    inline for (comptime std.meta.fieldNames(Scope)) |reflected_name| {
         var changed = scope;
-        if (comptime std.mem.eql(u8, field.name, "principal")) changed.principal[0] += 1 else @field(changed, field.name) += 1;
+        if (comptime std.mem.eql(u8, reflected_name, "principal")) changed.principal[0] += 1 else @field(changed, reflected_name) += 1;
         try std.testing.expectError(error.RetainedReadScopeChanged, registry.borrow(token, changed, .cursor, 2));
         try std.testing.expectError(error.RetainedReadScopeChanged, registry.close(token, changed));
     }

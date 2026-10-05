@@ -19,3 +19,6 @@ pub const DerivedLog = root.DerivedLog;
 pub const FullStats = root.FullStats;
 pub const OpenOptions = root.OpenOptions;
 pub const platform_time = @import("antfly_platform").time;
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

@@ -13,5 +13,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const hbc = @import("storage/hbc_adapter.zig");
+pub const hbc = @import("antfly_local_sources").storage_hbc_adapter;
 pub const vector = @import("antfly_vector").vector;
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

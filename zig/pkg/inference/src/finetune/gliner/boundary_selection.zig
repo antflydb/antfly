@@ -120,7 +120,7 @@ const Work = struct {
     fn check(self: *const Work) !void {
         if (self.options.limits.control) |control| try control.check();
     }
-    fn validate(self: *Work, batch: usize, queries: usize, proposals: usize, word_counts: []const usize, query_mask: []const bool, gold: ?Gold) !usize {
+    pub fn validate(self: *Work, batch: usize, queries: usize, proposals: usize, word_counts: []const usize, query_mask: []const bool, gold: ?Gold) !usize {
         try self.check();
         const limits = self.options.limits;
         if (!std.math.isFinite(self.options.gold_injection_probability) or self.options.gold_injection_probability < 0 or self.options.gold_injection_probability > 1 or

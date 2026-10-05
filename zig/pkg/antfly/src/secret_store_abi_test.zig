@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const secrets = @import("common/secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 const error_abi = @import("antfly_runtime_abi").error_abi;
 
 extern fn secret_store_abi_create(*const std.mem.Allocator, [*]const u8, usize, *?*secrets.FileStore) callconv(.c) error_abi.Status;
@@ -167,8 +167,8 @@ test "secret store archive boundary transports injected cancellation without mut
     try std.testing.expect(!store.?.reloadFailed());
 }
 
-const secret_contract = @import("common/secret_contract.zig");
-const secret_record = @import("common/secret_record.zig");
+const secret_contract = @import("antfly_local_sources").common_secret_contract;
+const secret_record = @import("antfly_local_sources").common_secret_record;
 extern fn secret_foundation_abi_handles(*secret_contract.Source, *secret_contract.NativeStore.Writer, *secret_record.KeyProvider) callconv(.c) void;
 
 test "secret store archive boundary transports common contracts and key-provider errors" {
@@ -195,3 +195,6 @@ test "secret store archive boundary transports common contracts and key-provider
     const identity = secret_contract.Identity{ .scope = "scope", .key = "token", .revision = 10 };
     try std.testing.expectError(error.Unavailable, secret_record.seal(alloc, std.Options.debug_io, keys, identity, "new"));
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

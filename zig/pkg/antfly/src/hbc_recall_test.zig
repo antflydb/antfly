@@ -16,15 +16,15 @@
 const std = @import("std");
 const proto = @import("antfly_vector").proto;
 const vec = @import("antfly_vector").vector;
-const hbc = @import("storage/hbc_adapter.zig");
-const lsm_backend = @import("storage/lsm_backend/mod.zig");
+const hbc = @import("antfly_local_sources").storage_hbc_adapter;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 
 const OwnedVectorSet = struct {
     dims: usize,
     count: usize,
     data: []f32,
 
-    fn deinit(self: *OwnedVectorSet, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedVectorSet, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.* = undefined;
     }
@@ -87,7 +87,7 @@ const TruthCache = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *TruthCache) void {
+    pub fn deinit(self: *TruthCache) void {
         for (self.entries.items) |entry| self.alloc.free(entry.ids);
         self.entries.deinit(self.alloc);
         self.* = undefined;
@@ -441,3 +441,6 @@ fn betterTruthCandidate(candidate_distance: f32, candidate_offset: usize, curren
     if (candidate_distance != current_distance) return candidate_distance < current_distance;
     return candidate_offset < current_offset;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

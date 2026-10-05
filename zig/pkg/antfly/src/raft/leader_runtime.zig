@@ -157,7 +157,7 @@ test "leadership tracker emits gained and lost events" {
         alloc: std.mem.Allocator,
         events: std.ArrayListUnmanaged(LeadershipEvent) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.events.deinit(self.alloc);
             self.* = undefined;
         }
@@ -215,7 +215,7 @@ test "leadership tracker releaseAll emits lost for active groups" {
         alloc: std.mem.Allocator,
         events: std.ArrayListUnmanaged(LeadershipEvent) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.events.deinit(self.alloc);
             self.* = undefined;
         }

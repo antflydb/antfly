@@ -1,10 +1,14 @@
 # Physical source boundary for embedded Antfly
 
-The Lite, embedded C ABI, and inference products are Apache-2.0, but their
-build still reads Apache files from the mixed `zig/pkg/antfly` server package.
-The source boundary is complete when the Apache products build with the entire
-`zig/pkg/antfly` directory absent, and the server imports the embedded engine
-through declared Zig modules.
+Status: the structural extraction PRs, including #953, are merged. The local
+DB, native lake readers, file CLI and public C API live in `antfly-embedded`;
+model execution lives in `inference`; reusable credentials live in `lib/credentials`.
+#893 applies Apache package licensing and independent releases to those owners.
+The isolated build removes the whole server package. The historical phases below
+record the extraction sequence; current ownership is specified in
+[embedded source ownership](../design/embedded-source-ownership.md) and
+[LICENSING.md](../../LICENSING.md).
+
 
 ## Intended ownership
 

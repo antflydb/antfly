@@ -21,10 +21,10 @@ pub const artifact_sources_protocol_version: u16 = 1;
 pub const dense_native_storage_protocol_version: u16 = 1;
 pub const relational_topology_protocol_version: u16 = 2;
 pub const embedding_activity_protocol_version: u16 = 2;
-const group_ids = @import("../common/group_ids.zig");
-const topology_records = @import("../common/topology_records.zig");
-const index_repair_status = @import("../common/index_repair_status.zig");
-const dense_native_storage_phase = @import("../common/dense_native_storage_phase.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
+const topology_records = @import("antfly_local_sources").common_topology_records;
+const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
+const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
@@ -39,11 +39,27 @@ pub const PlacementClass = enum {
     archive,
 };
 
-pub const TableRecord = @import("local_catalog.zig").TableRecord;
+pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.TableRecord;
 
 pub const TableDefinition = TableRecord;
 
-pub const tableDefinitionsEqual = @import("local_catalog.zig").tableDefinitionsEqual;
+pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
+    return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+        lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
+        lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs.description, rhs.description) and
+        std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
+        std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
+        std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
+        std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
+        std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
+        std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        lhs.desired_replica_count == rhs.desired_replica_count and
+        lhs.min_ranges == rhs.min_ranges;
+}
 
 pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
@@ -61,9 +77,9 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
         hashTableDefinitionPart(&hasher, "vector-migration-v1");
         hashTableDefinitionPart(&hasher, migration.request.job_id);
         hashTableDefinitionPart(&hasher, @tagName(migration.request.mode));
-        inline for (std.meta.fields(@TypeOf(migration.request.budget))) |field| {
+        inline for (comptime std.meta.fieldNames(@TypeOf(migration.request.budget))) |reflected_name| {
             var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, @field(migration.request.budget, field.name), .little);
+            std.mem.writeInt(u64, &bytes, @field(migration.request.budget, reflected_name), .little);
             hasher.update(&bytes);
         }
     }
@@ -99,9 +115,9 @@ pub const RangeRecord = topology_records.RangeRecord;
 /// Canonical ordering for every complete table keyspace projection. Keeping
 /// this in the metadata domain lets backup admission, restore planning, and
 /// Raft apply enforce exactly the same bytewise routing contract.
-pub const sortKeyspaceRanges = @import("local_catalog.zig").sortKeyspaceRanges;
+pub const sortKeyspaceRanges = @import("antfly_local_sources").metadata_local_catalog.sortKeyspaceRanges;
 
-pub const validateCompleteKeyspaceRanges = @import("local_catalog.zig").validateCompleteKeyspaceRanges;
+pub const validateCompleteKeyspaceRanges = @import("antfly_local_sources").metadata_local_catalog.validateCompleteKeyspaceRanges;
 
 test "complete keyspace range validation requires both routing sentinels" {
     const complete = [_]RangeRecord{
@@ -306,7 +322,31 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     record.completed_restore_fingerprint = completed_restore_fingerprint;
 }
 
-pub const rangeRecordsEqual = @import("local_catalog.zig").rangeRecordsEqual;
+pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
+    return lhs.group_id == rhs.group_id and
+        lhs.range_id == rhs.range_id and
+        lhs.table_id == rhs.table_id and
+        std.mem.eql(u8, lhs.start_key, rhs.start_key) and
+        ((lhs.end_key == null and rhs.end_key == null) or
+            (lhs.end_key != null and rhs.end_key != null and std.mem.eql(u8, lhs.end_key.?, rhs.end_key.?))) and
+        lhs.doc_identity_shard_id == rhs.doc_identity_shard_id and
+        lhs.doc_identity_range_id == rhs.doc_identity_range_id and
+        lhs.split_attempt_epoch == rhs.split_attempt_epoch and
+        std.mem.eql(u8, lhs.restore_backup_id, rhs.restore_backup_id) and
+        std.mem.eql(u8, lhs.restore_artifact_backup_id, rhs.restore_artifact_backup_id) and
+        std.mem.eql(u8, lhs.restore_location, rhs.restore_location) and
+        std.mem.eql(u8, lhs.restore_snapshot_path, rhs.restore_snapshot_path) and
+        std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
+        lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
+        std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
+        lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
+        std.mem.eql(
+            u8,
+            &lhs.completed_restore_fingerprint,
+            &rhs.completed_restore_fingerprint,
+        );
+}
 
 /// Restore publication is monotonic: immediately after the catalog publishes
 /// an active restore intent, a data node may complete it and clear the
@@ -451,7 +491,7 @@ pub const GroupStatusReport = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     transition_pending: bool = false,
     replay_required: bool = false,
@@ -468,7 +508,7 @@ pub const ResolvedVoterSetEvidence = struct {
     voter_count: u16,
     from_leader: bool,
     voter_set_known: bool = false,
-    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     membership_index: u64 = 0,
 };
 
@@ -555,7 +595,7 @@ pub const VoterSetEvidence = struct {
     fallback_membership_index: u64 = 0,
     ambiguous_fallback_voter_count: bool = false,
     known_voter_count: ?u16 = null,
-    known_voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    known_voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     known_membership_index: u64 = 0,
     has_known_voter_set: bool = false,
     ambiguous_known_voter_set: bool = false,
@@ -664,7 +704,7 @@ test "table manager voter set evidence is order independent when newer reports l
         .group_id = 1,
         .voter_count = 3,
         .voter_set_known = true,
-        .voter_set_fingerprint = [_]u8{0x11} ** voter_set_fingerprint_len,
+        .voter_set_fingerprint = @as([voter_set_fingerprint_len]u8, @splat(0x11)),
         .raft_membership_index = 10,
     };
     const newer_unqualified: GroupStatusReport = .{
@@ -1262,11 +1302,11 @@ pub const ReplicationSourceStatusRecord = struct {
     /// acknowledgement must match it before provider state may be changed.
     cutover_authority_id: u64 = 0,
     cutover_config_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     /// Authenticated PostgreSQL cluster, database, and database-incarnation
     /// identity. This deliberately excludes connection credentials.
     cutover_provider_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     /// Provider resources from the authority superseded by the current claim.
     /// They remain durable until inactive cleanup succeeds; a newer claim is
     /// not admitted while this retirement is pending.
@@ -2076,8 +2116,9 @@ fn transitionTableContract(
 }
 
 pub fn parsePlacementClass(role: []const u8) ?PlacementClass {
-    inline for (comptime std.meta.fields(PlacementClass)) |field| {
-        if (std.mem.eql(u8, role, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(PlacementClass).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, role, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -2130,7 +2171,7 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
     if (value) |bytes| alloc.free(bytes);
 }
 
-pub const cloneTable = @import("local_catalog.zig").cloneTable;
+pub const cloneTable = @import("antfly_local_sources").metadata_local_catalog.cloneTable;
 
 pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const name = try alloc.dupe(u8, record.name);
@@ -2167,7 +2208,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     };
 }
 
-pub const freeTable = @import("local_catalog.zig").freeTable;
+pub const freeTable = @import("antfly_local_sources").metadata_local_catalog.freeTable;
 
 pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     const start_key = try alloc.dupe(u8, record.start_key);
@@ -2247,9 +2288,14 @@ pub fn cloneRoutingRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRe
     };
 }
 
-pub const rangeDocIdentityShardId = @import("local_catalog.zig").rangeDocIdentityShardId;
+pub fn rangeDocIdentityShardId(record: RangeRecord) u64 {
+    return if (record.doc_identity_shard_id == 0) record.group_id else record.doc_identity_shard_id;
+}
 
-pub const rangeDocIdentityRangeId = @import("local_catalog.zig").rangeDocIdentityRangeId;
+pub fn rangeDocIdentityRangeId(record: RangeRecord) u64 {
+    if (record.doc_identity_range_id != 0) return record.doc_identity_range_id;
+    return if (record.range_id == 0) record.group_id else record.range_id;
+}
 
 fn rangeMatchesTransitionIdentity(
     record: RangeRecord,

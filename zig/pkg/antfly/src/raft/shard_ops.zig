@@ -61,7 +61,7 @@ pub const ShardOperationAdapter = struct {
         rollback_merge: *const fn (ptr: *anyopaque, context_id: u64, op: RollbackMerge) anyerror!void,
     };
 
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
     pub fn topologyRead(self: ShardOperationAdapter, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("antfly_cancellation").CancellationToken) ![]u8 {
         const callback = self.vtable.topology_read orelse return error.UnsupportedOperation;
@@ -209,7 +209,7 @@ pub const OwnedShardOperationAdapter = struct {
     };
 
     var registry_buckets: [registry_bucket_count]RegistryBucket =
-        [_]RegistryBucket{.{}} ** registry_bucket_count;
+        @as([registry_bucket_count]RegistryBucket, @splat(.{}));
     var next_context_id: std.atomic.Value(u64) = .init(1);
 
     const AdmissionTest = if (builtin.is_test) struct {
@@ -254,7 +254,7 @@ pub const OwnedShardOperationAdapter = struct {
     const CallLease = struct {
         state: *State,
 
-        fn deinit(self: *CallLease) void {
+        pub fn deinit(self: *CallLease) void {
             const state = self.state;
             state.lock();
             std.debug.assert(state.active_calls > 0);

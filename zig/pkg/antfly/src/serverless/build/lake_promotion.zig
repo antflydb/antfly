@@ -16,7 +16,7 @@
 //! Adaptive promotion policy for Antfly-owned lake-native serving artifacts.
 
 const std = @import("std");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const Thresholds = struct {
     repeated_scan_count: u32 = 3,

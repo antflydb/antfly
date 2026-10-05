@@ -18,8 +18,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const persistent = @import("persistent.zig");
-const fixture = @import("persistent_sim_fixture.zig");
+const persistent = @import("antfly_local_sources").storage_persistent;
+const fixture = @import("antfly_local_sources").storage_persistent_sim_fixture;
 
 const segment_base = vopr.id.stable("transition", "storage.persistent.index_segment");
 const reopen_id = vopr.id.stable("transition", "storage.persistent.reopen");
@@ -63,7 +63,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                     .id = segmentId(spec),
                     .name = "storage.persistent.index_segment",
                     .kind = .workload,
-                    .parameter = @intFromEnum(spec),
+                    .parameter = @backingInt(spec),
                 });
             }
             try list.append(allocator, .{ .id = reopen_id, .name = "storage.persistent.reopen", .kind = .maintenance });
@@ -86,7 +86,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                 try events.emitNamed(allocator, .state_change, "storage.persistent.reopened", world.decisions);
                 return vopr.outcome.TransitionOutcome.applied();
             }
-            const spec: fixture.SegmentSpec = @enumFromInt(@as(u2, @intCast(selected.parameter)));
+            const spec: fixture.SegmentSpec = @fromBackingInt(@as(u2, @intCast(selected.parameter)));
             if (selected.id != segmentId(spec)) return error.UnknownPersistentVoprTransition;
             try world.harness.apply(.{ .index_segment = spec });
             try events.emitNamed(allocator, .client_response, "storage.persistent.segment_acknowledged", @intCast(selected.parameter));
@@ -136,7 +136,7 @@ pub fn replay(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !
 }
 
 fn segmentId(spec: fixture.SegmentSpec) u64 {
-    return vopr.id.derive("storage.persistent.segment", segment_base, @intFromEnum(spec));
+    return vopr.id.derive("storage.persistent.segment", segment_base, @backingInt(spec));
 }
 
 fn runRecordReplay(seed: u64) !void {

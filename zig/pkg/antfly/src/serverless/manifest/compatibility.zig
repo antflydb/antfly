@@ -18,8 +18,8 @@
 //! artifact family, or required stats sidecar it cannot safely interpret.
 
 const std = @import("std");
-const artifact_ref = @import("artifact_ref.zig");
-const base_source = @import("base_source.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const Policy = struct {
     require_row_fragment_stats: bool = true,

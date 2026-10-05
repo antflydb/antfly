@@ -14,9 +14,12 @@
 // limitations.
 
 test {
-    _ = @import("sparse/sparse.zig");
+    _ = @import("antfly_local_sources").sparse_sparse;
     // Explicit reachability for dependency fixtures formerly pulled in only
     // through imported integration tests.
-    _ = @import("storage/sim_runtime.zig");
-    _ = @import("common/test_directory.zig");
+    _ = @import("antfly_local_sources").storage_sim_runtime;
+    _ = @import("antfly_local_sources").common_test_directory;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

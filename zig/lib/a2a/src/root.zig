@@ -187,7 +187,7 @@ pub const InMemoryTaskStore = struct {
         tasks: std.StringHashMapUnmanaged(TaskState) = .empty,
         total_bytes: usize = 0,
 
-        fn deinit(self: *AuthorityState, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *AuthorityState, alloc: std.mem.Allocator) void {
             var it = self.tasks.iterator();
             while (it.next()) |entry| {
                 alloc.free(@constCast(entry.key_ptr.*));
@@ -1414,7 +1414,7 @@ test "a2a task store bounds memory and reclaims expired tasks" {
     const Clock = struct {
         var now_ns: std.atomic.Value(u64) = .init(100);
 
-        fn read() u64 {
+        pub fn read() u64 {
             return now_ns.load(.acquire);
         }
     };
@@ -1460,7 +1460,7 @@ test "a2a task store reclaims expired tasks under byte pressure" {
     const Clock = struct {
         var now_ns: std.atomic.Value(u64) = .init(100);
 
-        fn read() u64 {
+        pub fn read() u64 {
             return now_ns.load(.acquire);
         }
     };
@@ -1529,7 +1529,7 @@ test "a2a task store reuses expired ids and preserves per-authority capacity" {
     const Clock = struct {
         var now_ns: std.atomic.Value(u64) = .init(100);
 
-        fn read() u64 {
+        pub fn read() u64 {
             return now_ns.load(.acquire);
         }
     };

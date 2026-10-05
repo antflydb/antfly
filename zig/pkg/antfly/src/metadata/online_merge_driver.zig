@@ -20,22 +20,22 @@ const std = @import("std");
 const online = @import("online_merge.zig");
 const table = @import("table_manager.zig");
 const state_mod = @import("transition_state.zig");
-const io_contract = @import("../storage/db/online_merge_io_contract.zig");
-const types = @import("../storage/db/types.zig");
-const page = @import("../storage/db/merge_page_contract.zig");
+const io_contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
+const types = @import("antfly_local_sources").storage_db_types;
+const page = @import("antfly_local_sources").storage_db_merge_page_contract;
 const api = @import("../api/http_client.zig");
-const http = @import("../common/http/http_common.zig");
-const operation = @import("../api/operation.zig");
+const http = @import("antfly_local_sources").common_http_http_common;
+const operation = @import("antfly_local_sources").api_operation;
 const Allocator = std.mem.Allocator;
 
-fn artifactCatalogsCompatible(donor: ?@import("../storage/db/artifact_inventory.zig").Binding, receiver: ?@import("../storage/db/artifact_inventory.zig").Binding) bool {
+fn artifactCatalogsCompatible(donor: ?@import("antfly_local_sources").storage_db_artifact_inventory.Binding, receiver: ?@import("antfly_local_sources").storage_db_artifact_inventory.Binding) bool {
     const source_binding = donor orelse return false;
     const target_binding = receiver orelse return false;
     return source_binding.compatible(target_binding);
 }
 
 test "metadata ordered artifact inventory admission requires matching catalogs on both owners" {
-    const binding: @import("../storage/db/artifact_inventory.zig").Binding = .{ .epoch = 1, .digest = @splat(1), .semantic_digest = @splat(3) };
+    const binding: @import("antfly_local_sources").storage_db_artifact_inventory.Binding = .{ .epoch = 1, .digest = @splat(1), .semantic_digest = @splat(3) };
     try std.testing.expect(!artifactCatalogsCompatible(null, binding));
     try std.testing.expect(!artifactCatalogsCompatible(binding, null));
     try std.testing.expect(!artifactCatalogsCompatible(binding, .{ .epoch = 2, .digest = @splat(2), .semantic_digest = @splat(4) }));
@@ -67,16 +67,16 @@ pub fn create(service: anytype, executor: http.RequestExecutor, capabilities: on
 
 fn validatePreparedFields(request: types.BatchRequest, comptime allowed: []const []const u8) !void {
     const empty: types.BatchRequest = .{};
-    inline for (std.meta.fields(types.BatchRequest)) |field| {
+    inline for (@typeInfo(types.BatchRequest).@"struct".field_names, @typeInfo(types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
         const permitted = comptime blk: {
-            for (allowed) |name| if (std.mem.eql(u8, field.name, name)) break :blk true;
+            for (allowed) |name| if (std.mem.eql(u8, reflected_name, name)) break :blk true;
             break :blk false;
         };
         if (!permitted) {
-            const actual = @field(request, field.name);
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+            const actual = @field(request, reflected_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (actual.len != 0) return error.OnlineMergeReceiptMismatch;
-            } else if (!std.meta.eql(actual, @field(empty, field.name))) return error.OnlineMergeReceiptMismatch;
+            } else if (!std.meta.eql(actual, @field(empty, reflected_name))) return error.OnlineMergeReceiptMismatch;
         }
     }
 }
@@ -100,17 +100,17 @@ fn validatePrepared(state: online.State, operation_kind: @FieldType(io_contract.
         if (actual.kind == .accept and !std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{})) return error.OnlineMergeReceiptMismatch;
         if ((actual.kind == .accept or actual.kind == .rollback) and std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{})) expected.copy_attempt = .{};
         if (!std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{}) and !std.meta.eql(actual.copy_attempt, state.scope.copy_attempt)) return error.OnlineMergeReceiptMismatch;
-        inline for (std.meta.fields(types.MergeReplicationCheckpoint)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "page_source_catalogs")) {
+        inline for (@typeInfo(types.MergeReplicationCheckpoint).@"struct".field_names, @typeInfo(types.MergeReplicationCheckpoint).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime std.mem.eql(u8, reflected_name, "page_source_catalogs")) {
                 if ((actual.page_source_catalogs == null) != (expected.page_source_catalogs == null)) return error.OnlineMergeReceiptMismatch;
                 if (actual.page_source_catalogs) |left| {
                     const right = expected.page_source_catalogs.?;
                     if (!std.mem.eql(u8, left.indexes, right.indexes) or !std.mem.eql(u8, left.enrichments, right.enrichments) or
                         !std.mem.eql(u8, left.resolvers, right.resolvers)) return error.OnlineMergeReceiptMismatch;
                 }
-            } else if (comptime field.type == []const u8) {
-                if (!std.mem.eql(u8, @field(actual, field.name), @field(expected, field.name))) return error.OnlineMergeReceiptMismatch;
-            } else if (!std.meta.eql(@field(actual, field.name), @field(expected, field.name))) return error.OnlineMergeReceiptMismatch;
+            } else if (comptime field_type == []const u8) {
+                if (!std.mem.eql(u8, @field(actual, reflected_name), @field(expected, reflected_name))) return error.OnlineMergeReceiptMismatch;
+            } else if (!std.meta.eql(@field(actual, reflected_name), @field(expected, reflected_name))) return error.OnlineMergeReceiptMismatch;
         }
         return;
     }
@@ -298,8 +298,8 @@ fn Adapter(comptime Service: type) type {
         const ReplicaTransport = struct {
             self: *Self,
             uri: []const u8,
-            scope: @import("../storage/db/online_source_contract.zig").Scope,
-            pub fn onlineSourceArtifact(replica: *@This(), alloc: Allocator, group: u64, table_name: []const u8, request: @import("../storage/db/source_artifact_transfer.zig").Request, context: operation.RequestContext) ![]u8 {
+            scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope,
+            pub fn onlineSourceArtifact(replica: *@This(), alloc: Allocator, group: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_source_artifact_transfer.Request, context: operation.RequestContext) ![]u8 {
                 if (group != replica.scope.fence.owner_group_id or !std.meta.eql(request.scope(), replica.scope)) return error.OnlineSourceScopeChanged;
                 var transport = replica.self.client(alloc);
                 var cancel: http.RequestCancellation = .{ .borrowed_context = context.cancellation.ptr, .borrowed_is_cancelled = context.cancellation.is_cancelled_fn };
@@ -330,7 +330,7 @@ fn Adapter(comptime Service: type) type {
             var proposed = batch;
             if (proposed.merge_checkpoint) |*checkpoint_value| if (checkpoint_value.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
                 if (binding.effect_protocol == 15 and checkpoint_value.page_source_catalogs == null) {
-                    const catalogs = try self.fetch(@import("../storage/db/artifact_inventory.zig").Catalogs, owned, state, .source_catalog);
+                    const catalogs = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Catalogs, owned, state, .source_catalog);
                     if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
                     checkpoint_value.page_source_catalogs = catalogs;
                 }
@@ -343,12 +343,12 @@ fn Adapter(comptime Service: type) type {
                 unbound.scope.fence.attempt = 0;
                 unbound.scope.fence.admission_epoch = 0;
                 unbound.scope.fence.catalog_digest = @splat(0);
-                const catalog = try self.fetch(@import("../storage/db/artifact_inventory.zig").Command, owned, unbound, .{ .artifact_catalog = side });
+                const catalog = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Command, owned, unbound, .{ .artifact_catalog = side });
                 const expected = if (side == .donor) state.artifact_catalog else state.receiver_artifact_catalog;
-                if (!std.meta.eql(@as(?@import("../storage/db/artifact_inventory.zig").Binding, catalog.binding), expected)) return error.OnlineMergeArtifactCatalogChanged;
+                if (!std.meta.eql(@as(?@import("antfly_local_sources").storage_db_artifact_inventory.Binding, catalog.binding), expected)) return error.OnlineMergeArtifactCatalogChanged;
                 proposed.artifact_catalog = catalog;
             }
-            const body = try @import("../api/batch.zig").encodeBatchRequest(alloc, proposed);
+            const body = try @import("antfly_local_sources").api_batch.encodeBatchRequest(alloc, proposed);
             var transport = self.client(alloc);
             var cancellation: http.RequestCancellation = .{ .borrowed_context = owned.request.cancellation.ptr, .borrowed_is_cancelled = owned.request.cancellation.is_cancelled_fn };
             const timeout_ms = try timeout(owned.request);
@@ -415,7 +415,7 @@ fn Adapter(comptime Service: type) type {
             var prepared_operation = operation_kind;
             if (prepared_operation == .checkpoint) if (prepared_operation.checkpoint.page_source) |source_identity| if (source_identity.artifact_catalog) |binding| {
                 if (binding.effect_protocol == 15) {
-                    const catalogs = try self.fetch(@import("../storage/db/artifact_inventory.zig").Catalogs, owned, state, .source_catalog);
+                    const catalogs = try self.fetch(@import("antfly_local_sources").storage_db_artifact_inventory.Catalogs, owned, state, .source_catalog);
                     if (!std.mem.eql(u8, &catalogs.digest(), &binding.digest)) return error.OnlineMergeArtifactCatalogChanged;
                     prepared_operation.checkpoint.page_source_catalogs = catalogs;
                 }
@@ -440,7 +440,7 @@ fn Adapter(comptime Service: type) type {
                 .prepare_certificate => {
                     // Publication has a DB-owned lifetime: HTTP polls never
                     // restart a large immutable export at their deadline.
-                    if (try self.fetch(?@import("../storage/source_snapshot.zig").Certificate, owned, state, .publication) == null)
+                    if (try self.fetch(?@import("antfly_local_sources").storage_source_snapshot.Certificate, owned, state, .publication) == null)
                         return error.OnlineMergePublicationPending;
                 },
                 .freeze_and_drain => try self.submit(owned, state, state.scope.fence.owner_group_id, .{ .relational_topology = .{ .fence = state.scope.fence, .action = .begin } }),
@@ -534,7 +534,7 @@ test "metadata transition driver online artifact progress retains healthy peer a
 }
 
 test "metadata transition driver online constructs every native checkpoint without reassignment" {
-    const batch_wire = @import("../api/batch.zig");
+    const batch_wire = @import("antfly_local_sources").api_batch;
     const alloc = std.testing.allocator;
     var state: online.State = .{ .scope = .{
         .fence = .{ .transition_id = 9, .attempt = 1, .peer_group_id = 3, .owner_group_id = 2, .role = .merge_source, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .catalog_digest = @splat(7) },

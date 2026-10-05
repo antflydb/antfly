@@ -249,9 +249,9 @@ pub fn main(init: std.process.Init) !void {
 fn writeFile(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, file_name: []const u8, source: []const u8) !void {
     // Formatting belongs to generation so cached outputs are immutable and
     // callers do not need a second, in-place `zig fmt` step.
-    const terminated = try allocator.dupeZ(u8, source);
+    const terminated = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(terminated);
-    var tree = try std.zig.Ast.parse(allocator, terminated, .zig);
+    var tree = try std.zig.Ast.parse(allocator, terminated, .{ .mode = .zig });
     defer tree.deinit(allocator);
     if (tree.errors.len != 0) return error.InvalidGeneratedZig;
     const content = try tree.renderAlloc(allocator);

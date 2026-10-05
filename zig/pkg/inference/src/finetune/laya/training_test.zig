@@ -93,7 +93,7 @@ fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void
     }, scratch, try files.readFile(scratch, reference_path), .{});
     const ref = reference.value;
     const examples = try scratch.alloc(train.Example, ref.sequences.len);
-    for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @enumFromInt(seq.qtype), .target = target[0..seq.markers.len] };
+    for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @fromBackingInt(seq.qtype), .target = target[0..seq.markers.len] };
     const config_path = try std.fmt.allocPrint(scratch, "{s}/model/config.json", .{root});
     const config = try modern.parseConfig(scratch, try files.readFile(scratch, config_path));
     var program = try train.Program.initFrozenFused(a, config, try train.bucketedLayout(examples, config), 0, 0, null, use_fused_attention);
@@ -463,7 +463,7 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
             for (result.decisions, 0..) |decision, i| {
                 const index = if (mixed) (iteration * batch + i) % tasks.len else 0;
                 for (decision.probabilities, ref.probabilities[index]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 5e-5);
-                try std.testing.expectApproxEqAbs(ref.act_probabilities[index], decision.act_probability, 5e-5);
+                try std.testing.expectApproxEqAbs(ref.act_probabilities[index], decision.act_probability.?, 5e-5);
             }
         }
         const resident_after = factory.layaResidentStats(session);
@@ -494,7 +494,7 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
                     worst = @max(worst, @abs(want - got));
                     try std.testing.expectApproxEqAbs(want, got, 5e-5);
                 }
-                try std.testing.expectApproxEqAbs(act, actual.act_probability, 5e-5);
+                try std.testing.expectApproxEqAbs(act, actual.act_probability.?, 5e-5);
             }
         }
     }
@@ -510,6 +510,14 @@ test "laya frozen layers cover embeddings and the lowest encoder layers only" {
     try std.testing.expect(!train.frozen("encoder.layers.12.mlp.Wo.weight", 2, null));
     try std.testing.expect(!train.frozen("encoder.final_norm.weight", 22, null));
     try std.testing.expect(!train.frozen("head.layers.0.attn.Wqkv.weight", 22, null));
+    // The whole encoder, final norm included; the head and adapters still train.
+    try std.testing.expect(train.frozen("encoder.final_norm.weight", train.whole_encoder, null));
+    try std.testing.expect(train.frozen("encoder.layers.27.mlp.Wo.weight", train.whole_encoder, null));
+    try std.testing.expect(train.frozen("encoder.embeddings.tok_embeddings.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("head.layers.0.linear1.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("scorer.1.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("type_emb.weight", train.whole_encoder, null));
+    try std.testing.expect(!train.frozen("encoder.layers.3.attn.Wqkv.lora_A", train.whole_encoder, null));
 }
 
 test "laya lora freezes only its targeted linear weights and biases, on top of frozen layers" {

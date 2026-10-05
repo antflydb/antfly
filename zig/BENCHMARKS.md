@@ -2,7 +2,7 @@
 
 Run these commands from `zig/`. Artifact targets build and install into `zig-out`; execute the installed binary to run a benchmark or tool. Build flags belong to `zig build`, and runtime arguments belong to the binary.
 
-Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=ReleaseFast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
+Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=fast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
 
 `inference-bench-training` and `inference-bench-paged-attention` run native CPU
 workloads. Their shared constructor honors optimization and system BLAS settings;
@@ -75,7 +75,7 @@ The commands below preserve the former workload defaults. Replace the arguments 
 
 ## DB lifecycle workloads
 
-Build once with `zig build antfly-storage-bench -Doptimize=ReleaseFast`, then run
+Build once with `zig build antfly-storage-bench -Doptimize=fast`, then run
 `batch_bench`, `open_bench`, `replay_bench`, or `artifact_rebuild_bench`. These commands keep
 their previous flags, defaults, and output record names. Batch and replay now use
 the production storage dependencies; generated workloads still explicitly supply
@@ -102,7 +102,7 @@ background warmup and cleanup in addition to the DB workloads.
 ### Build measurements
 
 On an Apple M4 host with Zig 0.16.0 and
-`-Doptimize=ReleaseFast -Dmetal=false -Dsystem-blas=false`, a batch default-value
+`-Doptimize=fast -Dmetal=false -Dsystem-blas=false`, a batch default-value
 edit took 194 seconds in a standalone artifact and 349 seconds after folding it
 into `storage_bench`. The combined driver rebuilt in 0.7 seconds when cached, but
 its slower focused rebuild triggered the decision to retain separate artifacts
@@ -255,3 +255,10 @@ zig build antfly-storage-bench
 ./zig-out/bin/storage_bench hbc-write --samples 1 --vectors 5000 --dims 1536 --batch-size 500 --leaf-size 168 --storage host
 ./zig-out/bin/storage_bench ingest --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000
 ```
+
+## Threaded versus Evented storage I/O
+
+See [Evented qualification and comparison commands](lib/platform/EVENTED.md)
+for the positional I/O benchmark and optional LMDB async commit comparison.
+The runner saves raw samples, median elapsed times, backend identity, and host
+metadata; production storage defaults remain Threaded.

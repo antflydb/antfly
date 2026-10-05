@@ -36,7 +36,7 @@ pub const ResolvedMention = struct {
     end: usize,
     score: f32,
 
-    fn deinit(self: *ResolvedMention, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResolvedMention, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
     }
 };
@@ -97,7 +97,7 @@ const MentionRef = struct {
     entity_id: []const u8,
     text_index: usize,
 
-    fn deinit(self: *MentionRef, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *MentionRef, allocator: std.mem.Allocator) void {
         allocator.free(self.normalized_text);
     }
 };
@@ -115,7 +115,7 @@ const IndexedRelation = struct {
 const Cluster = struct {
     indices: std.ArrayListUnmanaged(usize) = .empty,
 
-    fn deinit(self: *Cluster, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Cluster, allocator: std.mem.Allocator) void {
         self.indices.deinit(allocator);
     }
 };

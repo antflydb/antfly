@@ -15,13 +15,13 @@
 
 const std = @import("std");
 const data_raft_protocol = @import("../../common/data_raft_protocol.zig");
-const backend_erased = @import("../../storage/backend_erased.zig");
-const docstore = @import("../../storage/docstore.zig");
-const internal_keys = @import("../../storage/internal_keys.zig");
-const range_state = @import("../../storage/db/range_state.zig");
-const db_types = @import("../../storage/db/types.zig");
-const merge_state = @import("../../storage/db/merge_state.zig");
-const shard_mod = @import("../../storage/shard.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const docstore = @import("antfly_local_sources").storage_docstore;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const range_state = @import("antfly_local_sources").storage_db_range_state;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const merge_state = @import("antfly_local_sources").storage_db_merge_state;
+const shard_mod = @import("antfly_local_sources").storage_shard;
 
 pub const AppliedDataKV = struct {
     key: []const u8,
@@ -1157,7 +1157,7 @@ fn validateGroupStateSnapshotEntryBounds(
     var spool_count: u32 = 0;
     var spool_manifest: ?u32 = null;
     var spool_seen_manifest = false;
-    var spool_assembly: ?@import("../../storage/db/merge_page_contract.zig").Assembly = null;
+    var spool_assembly: ?@import("antfly_local_sources").storage_db_merge_page_contract.Assembly = null;
     var protocol_version: u16 = 0;
     var controls = controls_iterator;
     while (try controls.next()) |control| {
@@ -1191,13 +1191,13 @@ fn validateGroupStateSnapshotEntryBounds(
             .merge_receiver => {},
             .online_topology => if (protocol_version < data_raft_protocol.batch_native_snapshot_protocol_version) return error.InvalidGroupStateSnapshot,
             .merge_page => {
-                var decoded = try @import("../../storage/db/merge_page_contract.zig").decode(alloc, control.value);
+                var decoded = try @import("antfly_local_sources").storage_db_merge_page_contract.decode(alloc, control.value);
                 defer decoded.deinit();
                 spool_assembly = decoded.value.assembly;
             },
             .merge_spool_slot => |slot| {
                 if (spool_seen_manifest or slot != spool_count) return error.InvalidGroupStateSnapshot;
-                if (spool_assembly) |assembly| if (slot < assembly.next_offset / @import("../../storage/db/merge_page_contract.zig").chunk_bytes and
+                if (spool_assembly) |assembly| if (slot < assembly.next_offset / @import("antfly_local_sources").storage_db_merge_page_contract.chunk_bytes and
                     !std.mem.eql(u8, control.value[0..32], &assembly.transfer_digest)) return error.InvalidGroupStateSnapshot;
                 spool_count += 1;
             },
@@ -1219,7 +1219,7 @@ fn validateGroupStateSnapshotEntryBounds(
     const source_sequence = sequence orelse 0;
     if (spool_count != (spool_manifest orelse 0)) return error.InvalidGroupStateSnapshot;
     if ((spool_count != 0 or spool_assembly != null) and protocol_version < data_raft_protocol.batch_merge_chunk_protocol_version) return error.InvalidGroupStateSnapshot;
-    if (spool_assembly) |assembly| if (assembly.next_offset / @import("../../storage/db/merge_page_contract.zig").chunk_bytes > spool_count) return error.InvalidGroupStateSnapshot;
+    if (spool_assembly) |assembly| if (assembly.next_offset / @import("antfly_local_sources").storage_db_merge_page_contract.chunk_bytes > spool_count) return error.InvalidGroupStateSnapshot;
     if ((delta_count > 0 and sequence == null) or
         max_delta_sequence > source_sequence or
         (delta_count > 0 and max_delta_sequence != source_sequence))
@@ -1339,7 +1339,7 @@ fn groupControlKind(group_id: u64, key: []const u8) ?GroupControlKind {
     if (std.mem.eql(u8, online_key, key)) return .online_topology;
     const spool_prefix = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_merge_spool:{d}:", .{group_id}) catch return null;
     if (std.mem.startsWith(u8, key, spool_prefix)) {
-        const chunks = @import("../../storage/db/merge_page_chunks.zig");
+        const chunks = @import("antfly_local_sources").storage_db_merge_page_chunks;
         const suffix = key[spool_prefix.len..];
         if (std.mem.eql(u8, suffix, chunks.manifest_key)) return .merge_spool_manifest;
         if (suffix.len == chunks.slot_prefix.len + 4 and std.mem.startsWith(u8, suffix, chunks.slot_prefix)) return .{ .merge_spool_slot = std.mem.readInt(u32, suffix[chunks.slot_prefix.len..][0..4], .big) };
@@ -1357,7 +1357,7 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
         },
         .merge_spool_slot => |slot| {
             if (slot >= 4096) return error.InvalidGroupStateSnapshot;
-            @import("../../storage/db/merge_page_chunks.zig").validateSlot(entry.value) catch return error.InvalidGroupStateSnapshot;
+            @import("antfly_local_sources").storage_db_merge_page_chunks.validateSlot(entry.value) catch return error.InvalidGroupStateSnapshot;
         },
         .merge_spool_manifest => {
             if (entry.value.len != 4 or std.mem.readInt(u32, entry.value[0..4], .little) > 4096) return error.InvalidGroupStateSnapshot;
@@ -1397,7 +1397,7 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
             state.deinit(alloc);
         },
         .merge_page => {
-            var progress = @import("../../storage/db/merge_page_contract.zig").decode(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
+            var progress = @import("antfly_local_sources").storage_db_merge_page_contract.decode(alloc, entry.value) catch return error.InvalidGroupStateSnapshot;
             defer progress.deinit();
             if (progress.value.receiver_group_id != group_id) return error.InvalidGroupStateSnapshot;
         },
@@ -1714,7 +1714,7 @@ fn groupStatePageProjected(
 
 test "group state range scan keys-only cleanup pages do not materialize wide values" {
     const alloc = std.testing.allocator;
-    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
     var directory = try TestDirectory.init("group-state-key-pages");
     defer directory.cleanup();
     var store = try docstore.DocStore.open(alloc, directory.path().ptr, .{});
@@ -1870,7 +1870,7 @@ const DeletePhysicalRangeScratch = struct {
         self.after_key.clearRetainingCapacity();
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.key_bytes.deinit(alloc);
         self.key_spans.deinit(alloc);
         self.after_key.deinit(alloc);
@@ -2094,9 +2094,9 @@ pub fn reconcileAuthoritativeGroupDocumentsPaged(
     // by one schema rather than the number of rows or historical epochs.
     var layout_arena = std.heap.ArenaAllocator.init(alloc);
     defer layout_arena.deinit();
-    const storage_schema = @import("../../storage/schema.zig");
-    const row_codec = @import("../../storage/db/algebraic/relational_row_codec.zig");
-    const relational_store = @import("../../storage/db/relational_store.zig");
+    const storage_schema = @import("antfly_local_sources").storage_schema;
+    const row_codec = @import("antfly_local_sources").storage_db_algebraic_relational_row_codec;
+    const relational_store = @import("antfly_local_sources").storage_db_relational_store;
     var schema: ?storage_schema.TableSchema = null;
     var layout: ?row_codec.PhysicalLayout = null;
     var source_cursor = try source_txn.openCursor();
@@ -2271,14 +2271,14 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
 
     const projected_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-reconcile-projected", .{tmp.sub_path});
     defer alloc.free(projected_path);
-    const projected_path_z = try alloc.dupeZ(u8, projected_path);
+    const projected_path_z = try alloc.dupeSentinel(u8, projected_path, 0);
     defer alloc.free(projected_path_z);
     var projected = try docstore.DocStore.open(alloc, projected_path_z.ptr, .{});
     defer projected.close();
 
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-reconcile-source", .{tmp.sub_path});
     defer alloc.free(source_path);
-    const source_path_z = try alloc.dupeZ(u8, source_path);
+    const source_path_z = try alloc.dupeSentinel(u8, source_path, 0);
     defer alloc.free(source_path_z);
     var source = try docstore.DocStore.open(alloc, source_path_z.ptr, .{});
     defer source.close();
@@ -2404,8 +2404,8 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
 
 test "paged authoritative reconciliation projects schema-bound relational rows across epochs" {
     const alloc = std.testing.allocator;
-    const schema_mod = @import("../../storage/schema.zig");
-    const relational = @import("../../storage/db/relational_store.zig");
+    const schema_mod = @import("antfly_local_sources").storage_schema;
+    const relational = @import("antfly_local_sources").storage_db_relational_store;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/relational-projection-source", .{tmp.sub_path}, 0);
@@ -2446,14 +2446,14 @@ test "paged authoritative reconciliation is allocation-failure safe" {
 
     const projected_path = try std.fmt.allocPrint(setup_alloc, ".zig-cache/tmp/{s}/paged-reconcile-oom-projected", .{tmp.sub_path});
     defer setup_alloc.free(projected_path);
-    const projected_path_z = try setup_alloc.dupeZ(u8, projected_path);
+    const projected_path_z = try setup_alloc.dupeSentinel(u8, projected_path, 0);
     defer setup_alloc.free(projected_path_z);
     var projected = try docstore.DocStore.open(setup_alloc, projected_path_z.ptr, .{});
     defer projected.close();
 
     const source_path = try std.fmt.allocPrint(setup_alloc, ".zig-cache/tmp/{s}/paged-reconcile-oom-source", .{tmp.sub_path});
     defer setup_alloc.free(source_path);
-    const source_path_z = try setup_alloc.dupeZ(u8, source_path);
+    const source_path_z = try setup_alloc.dupeSentinel(u8, source_path, 0);
     defer setup_alloc.free(source_path_z);
     var source = try docstore.DocStore.open(setup_alloc, source_path_z.ptr, .{});
     defer source.close();
@@ -2520,7 +2520,7 @@ test "group state range scan is allocation-failure safe" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/group-state-range-oom", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
     defer store.close();
@@ -2802,7 +2802,7 @@ pub fn appendOperationEffects(
         try currentRaftBatchProtocolVersion(store, alloc, group_id)
     else
         0;
-    const pages = @import("../../storage/db/merge_page_contract.zig");
+    const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
     var page_progress: ?std.json.Parsed(pages.Progress) = null;
     defer if (page_progress) |*value| value.deinit();
     if (needs_raft_batch_protocol) {
@@ -2846,7 +2846,7 @@ pub fn appendOperationEffects(
                     var rejection_buf: [176]u8 = undefined;
                     const owned_key = try alloc.dupe(u8, try arbitration.rejectionKey(&rejection_buf, group_id, guard.index));
                     errdefer alloc.free(owned_key);
-                    const owned_value = try alloc.dupe(u8, &.{@intFromEnum(rejection)});
+                    const owned_value = try alloc.dupe(u8, &.{@backingInt(rejection)});
                     errdefer alloc.free(owned_value);
                     try writes.append(alloc, .{ .key = owned_key, .value = owned_value });
                 } else if (!std.meta.eql(before, online_reservation)) {
@@ -2870,7 +2870,7 @@ pub fn appendOperationEffects(
                 const context = request.merge_replication orelse return error.InvalidMergePage;
                 merge_copy_allowed = merge_state.copyAllowed(merge_receiver_state, context);
                 if (!merge_copy_allowed) continue;
-                const required_page_protocol = if (request.merge_page.?.source.retention != null) data_raft_protocol.batch_source_scope_protocol_version else if (request.merge_page.?.source.integrity != null) data_raft_protocol.batch_relational_transfer_protocol_version else if (request.merge_page.?.next_snapshot_position != null) data_raft_protocol.batch_native_snapshot_protocol_version else if (request.merge_page.?.chunk != null) data_raft_protocol.batch_merge_chunk_protocol_version else data_raft_protocol.batch_merge_page_protocol_version;
+                const required_page_protocol = if (db_types.requiresGraphRelationshipProtocol(request)) data_raft_protocol.batch_merge_retirements_protocol_version else if (request.merge_page.?.source.retention != null) data_raft_protocol.batch_source_scope_protocol_version else if (request.merge_page.?.source.integrity != null) data_raft_protocol.batch_relational_transfer_protocol_version else if (request.merge_page.?.next_snapshot_position != null) data_raft_protocol.batch_native_snapshot_protocol_version else if (request.merge_page.?.chunk != null) data_raft_protocol.batch_merge_chunk_protocol_version else data_raft_protocol.batch_merge_page_protocol_version;
                 if (raft_batch_protocol_version < required_page_protocol) return error.RaftBatchMergeProtocolNotActivated;
                 if (page_progress == null) return error.MergePageSourceMissing;
                 try pages.validateRange(alloc, merge_receiver_state.?, request);
@@ -3584,7 +3584,7 @@ fn groupMergeChunkKey(alloc: std.mem.Allocator, group_id: u64, key: []const u8) 
 }
 
 fn clearMergeChunkEffects(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) !void {
-    const chunks = @import("../../storage/db/merge_page_chunks.zig");
+    const chunks = @import("antfly_local_sources").storage_db_merge_page_chunks;
     const manifest_key = try groupMergeChunkKey(alloc, group_id, chunks.manifest_key);
     defer alloc.free(manifest_key);
     for (deletes.items) |key| if (std.mem.eql(u8, key, manifest_key)) return;
@@ -3610,9 +3610,9 @@ fn clearMergeChunkEffects(store: *docstore.DocStore, alloc: std.mem.Allocator, g
     }
 }
 
-fn appendMergeChunkEffects(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, progress: @import("../../storage/db/merge_page_contract.zig").Progress, request: db_types.BatchRequest, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) !void {
-    const chunks = @import("../../storage/db/merge_page_chunks.zig");
-    const pages = @import("../../storage/db/merge_page_contract.zig");
+fn appendMergeChunkEffects(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64, progress: @import("antfly_local_sources").storage_db_merge_page_contract.Progress, request: db_types.BatchRequest, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) !void {
+    const chunks = @import("antfly_local_sources").storage_db_merge_page_chunks;
+    const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
     const Reader = struct {
         store: *docstore.DocStore,
         alloc: std.mem.Allocator,
@@ -3737,10 +3737,10 @@ fn mergeOverlayDeleted(deletes: []const []const u8, key: []const u8) bool {
     return false;
 }
 
-fn appendMergePageWrite(alloc: std.mem.Allocator, group_id: u64, progress: @import("../../storage/db/merge_page_contract.zig").Progress, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
+fn appendMergePageWrite(alloc: std.mem.Allocator, group_id: u64, progress: @import("antfly_local_sources").storage_db_merge_page_contract.Progress, writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair), deletes: *std.ArrayListUnmanaged([]u8)) ![]const u8 {
     const page_key = try groupMergePageKeyAlloc(alloc, group_id);
     errdefer alloc.free(page_key);
-    const encoded = try @import("../../storage/db/merge_page_contract.zig").encode(alloc, progress);
+    const encoded = try @import("antfly_local_sources").storage_db_merge_page_contract.encode(alloc, progress);
     errdefer alloc.free(encoded);
     removeOwnedWriteByKey(alloc, writes, page_key);
     removeDeleteByKey(alloc, deletes, page_key);
@@ -3754,7 +3754,7 @@ const merge_source_state_encoded_len = 1 + 1 + 8 + 8 + 8;
 fn encodeMergeSourceState(state: AppliedMergeSourceState) [merge_source_state_encoded_len]u8 {
     var encoded: [merge_source_state_encoded_len]u8 = undefined;
     encoded[0] = merge_source_state_format_version;
-    encoded[1] = @intFromEnum(state.phase);
+    encoded[1] = @backingInt(state.phase);
     std.mem.writeInt(u64, encoded[2..10], state.transition_id, .little);
     std.mem.writeInt(u64, encoded[10..18], state.receiver_group_id, .little);
     std.mem.writeInt(u64, encoded[18..26], state.applied_index, .little);
@@ -3882,7 +3882,7 @@ fn encodeSplitStateAlloc(alloc: std.mem.Allocator, state: AppliedSplitState) ![]
     const buf = try alloc.alloc(u8, total_len);
     errdefer alloc.free(buf);
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(state.phase);
+    buf[pos] = @backingInt(state.phase);
     pos += 1;
     std.mem.writeInt(u64, buf[pos..][0..8], state.transition_id, .little);
     pos += 8;
@@ -3942,7 +3942,7 @@ fn encodeSplitTerminalAlloc(alloc: std.mem.Allocator, terminal: AppliedSplitTerm
         return error.SplitTerminalTooLarge;
     const encoded = try alloc.alloc(u8, encoded_len);
     encoded[0] = split_terminal_format_version;
-    encoded[1] = @intFromEnum(terminal.outcome);
+    encoded[1] = @backingInt(terminal.outcome);
     std.mem.writeInt(u64, encoded[2..10], terminal.transition_id, .little);
     std.mem.writeInt(u64, encoded[10..18], terminal.attempt_epoch, .little);
     std.mem.writeInt(u64, encoded[18..26], terminal.destination_group_id, .little);
@@ -4057,7 +4057,7 @@ test "shard state store persists ranges and document state" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -4109,7 +4109,7 @@ test "shard state store persists split lifecycle and ownership" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-split", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -4308,7 +4308,7 @@ test "shard state store decodes legacy split acknowledgement layouts" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-split-ack", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
     defer store.close();
@@ -4486,7 +4486,7 @@ test "shard state snapshot round trips split control state" {
     defer source_tmp.cleanup();
     const source_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-source", .{source_tmp.sub_path});
     defer std.testing.allocator.free(source_path);
-    const source_path_z = try std.testing.allocator.dupeZ(u8, source_path);
+    const source_path_z = try std.testing.allocator.dupeSentinel(u8, source_path, 0);
     defer std.testing.allocator.free(source_path_z);
     var source = try docstore.DocStore.open(std.testing.allocator, source_path_z.ptr, .{});
     defer source.close();
@@ -4536,7 +4536,7 @@ test "shard state snapshot round trips split control state" {
     defer target_tmp.cleanup();
     const target_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-target", .{target_tmp.sub_path});
     defer std.testing.allocator.free(target_path);
-    const target_path_z = try std.testing.allocator.dupeZ(u8, target_path);
+    const target_path_z = try std.testing.allocator.dupeSentinel(u8, target_path, 0);
     defer std.testing.allocator.free(target_path_z);
     var target = try docstore.DocStore.open(std.testing.allocator, target_path_z.ptr, .{});
     defer target.close();
@@ -4630,7 +4630,7 @@ test "shard state store finalize split reclaims right-hand document range" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-finalize", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -4689,14 +4689,14 @@ test "shard state store records and replays split deltas" {
 
     const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-deltas-src", .{tmp.sub_path});
     defer std.testing.allocator.free(src_path);
-    const src_path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    const src_path_z = try std.testing.allocator.dupeSentinel(u8, src_path, 0);
     defer std.testing.allocator.free(src_path_z);
     var src = try docstore.DocStore.open(std.testing.allocator, src_path_z.ptr, .{});
     defer src.close();
 
     const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-deltas-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_path);
-    const dst_path_z = try std.testing.allocator.dupeZ(u8, dst_path);
+    const dst_path_z = try std.testing.allocator.dupeSentinel(u8, dst_path, 0);
     defer std.testing.allocator.free(dst_path_z);
     var dst = try docstore.DocStore.open(std.testing.allocator, dst_path_z.ptr, .{});
     defer dst.close();
@@ -4762,14 +4762,14 @@ test "shard state store captures right-hand split handoff and filters delta catc
 
     const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-handoff-src", .{tmp.sub_path});
     defer std.testing.allocator.free(src_path);
-    const src_path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    const src_path_z = try std.testing.allocator.dupeSentinel(u8, src_path, 0);
     defer std.testing.allocator.free(src_path_z);
     var src = try docstore.DocStore.open(std.testing.allocator, src_path_z.ptr, .{});
     defer src.close();
 
     const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-handoff-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_path);
-    const dst_path_z = try std.testing.allocator.dupeZ(u8, dst_path);
+    const dst_path_z = try std.testing.allocator.dupeSentinel(u8, dst_path, 0);
     defer std.testing.allocator.free(dst_path_z);
     var dst = try docstore.DocStore.open(std.testing.allocator, dst_path_z.ptr, .{});
     defer dst.close();

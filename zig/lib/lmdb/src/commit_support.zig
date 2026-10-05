@@ -592,9 +592,47 @@ test "positional writes use portable bounded chunks" {
 }
 
 fn writeAllAtOffsetAsyncIo(file: std.Io.File, io: std.Io, bytes: []const u8, offset: usize) Error!void {
-    file.writePositionalAll(io, bytes, offset) catch |err| switch (err) {
-        else => return error.Unexpected,
+    // Match the synchronous publisher: Darwin rejects pwritev requests larger
+    // than INT_MAX, including coalesced spans from large commits.
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const chunk_len = pwriteChunkLen(bytes.len - written);
+        file.writePositionalAll(io, bytes[written..][0..chunk_len], offset + written) catch return error.Unexpected;
+        written += chunk_len;
+    }
+}
+
+test "async positional publisher chunks large spans and propagates write failures" {
+    // Reserve address space without touching pages: this exercises the actual
+    // large-span boundary while keeping the test's physical memory bounded.
+    const bytes = try std.posix.mmap(null, max_pwrite_chunk_len + 4096, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(bytes);
+    const Recorder = struct {
+        calls: usize = 0,
+        offset: u64 = 17,
+        fail: bool = false,
+        fn write(userdata: ?*anyopaque, _: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            const self: *@This() = @ptrCast(@alignCast(userdata));
+            std.debug.assert(header.len == 0 and data.len == 1 and splat == 1);
+            std.debug.assert(data[0].len <= max_pwrite_chunk_len and offset == self.offset);
+            self.calls += 1;
+            if (self.fail and self.calls == 2) return error.InputOutput;
+            // Simulate a short first write; File.writePositionalAll must retry.
+            const n = if (self.calls == 1) data[0].len / 2 else data[0].len;
+            self.offset += n;
+            return n;
+        }
     };
+    var recorder: Recorder = .{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.fileWritePositional = Recorder.write;
+    const io: std.Io = .{ .userdata = &recorder, .vtable = &vtable };
+    const file: std.Io.File = .{ .handle = 0, .flags = .{ .nonblocking = false } };
+    try writeAllAtOffsetAsyncIo(file, io, bytes, 17);
+    try std.testing.expectEqual(@as(usize, 3), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 17 + bytes.len), recorder.offset);
+    recorder = .{ .fail = true };
+    try std.testing.expectError(error.Unexpected, writeAllAtOffsetAsyncIo(file, io, bytes, 17));
 }
 
 fn syncData(env: *env_mod.Environment) Error!void {

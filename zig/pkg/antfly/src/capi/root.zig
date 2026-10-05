@@ -13,5 +13,5 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const db = @import("db.zig");
-pub const types = @import("types.zig");
+pub const db = @import("antfly_local_sources").capi_db;
+pub const types = @import("antfly_local_sources").capi_types;

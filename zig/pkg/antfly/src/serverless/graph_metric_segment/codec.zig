@@ -16,9 +16,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const bounded_decode = @import("../bounded_decode.zig");
-const graph_mod = @import("../../graph/graph.zig");
-const artifact_ref = @import("../manifest/artifact_ref.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const types = @import("types.zig");
 
 pub const wire_magic = "AFGM";
@@ -50,7 +50,7 @@ const max_ranked_score_blocks = (max_persisted_top_entries + ranked_score_block_
 
 pub const Header = struct {
     version: u16,
-    kind: @import("../../graph/graph.zig").GraphMetricKind,
+    kind: @import("antfly_local_sources").graph_graph.GraphMetricKind,
     materialization_state: types.MaterializationState,
     rejection_reason: types.RejectionReason,
     config_fingerprint: u64,
@@ -628,7 +628,7 @@ pub fn decodeHeader(data: []const u8) !Header {
     const version = try readInt(u16, data, &pos);
     if (version != wire_version) return error.UnsupportedGraphMetricSegmentVersion;
     if (pos >= data.len) return error.InvalidGraphMetricSegment;
-    const kind = std.enums.fromInt(@import("../../graph/graph.zig").GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    const kind = std.enums.fromInt(@import("antfly_local_sources").graph_graph.GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;
     const materialization_state = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;
@@ -740,11 +740,11 @@ pub fn encodePreparedAlloc(alloc: Allocator, segment: types.Segment, cancellatio
     var pos: usize = 0;
     putBytes(data, &pos, wire_magic);
     putInt(u16, data, &pos, wire_version);
-    data[pos] = @intFromEnum(segment.kind);
+    data[pos] = @backingInt(segment.kind);
     pos += 1;
-    data[pos] = @intFromEnum(segment.materialization_state);
+    data[pos] = @backingInt(segment.materialization_state);
     pos += 1;
-    data[pos] = @intFromEnum(segment.rejection_reason);
+    data[pos] = @backingInt(segment.rejection_reason);
     pos += 1;
     data[pos] = @intFromBool(segment.converged);
     pos += 1;
@@ -913,7 +913,7 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
     if (!std.mem.eql(u8, take(data, &pos, 4) catch return error.InvalidGraphMetricSegment, wire_magic)) return error.InvalidGraphMetricSegment;
     const version = readInt(u16, data, &pos) catch return error.InvalidGraphMetricSegment;
     if (version != wire_version) return error.UnsupportedGraphMetricSegmentVersion;
-    const kind = std.enums.fromInt(@import("../../graph/graph.zig").GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
+    const kind = std.enums.fromInt(@import("antfly_local_sources").graph_graph.GraphMetricKind, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;
     const materialization_state = std.enums.fromInt(types.MaterializationState, data[pos]) orelse return error.InvalidGraphMetricSegment;
     pos += 1;

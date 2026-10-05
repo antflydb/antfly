@@ -410,7 +410,7 @@ pub fn artifactKey(input: ArtifactKeyInput) ArtifactKey {
     std.mem.writeInt(u32, &policy, qualification_policy_version, .little);
     hasher.update(&policy);
     hashBytes(&hasher, qualification_policy_identity);
-    hasher.update(&.{@intFromEnum(input.backend)});
+    hasher.update(&.{@backingInt(input.backend)});
     hashBytes(&hasher, input.semantic_identity);
     hashBytes(&hasher, input.runtime_identity);
     hashBytes(&hasher, input.target_identity);
@@ -436,7 +436,7 @@ pub fn compileArtifactKey(input: ArtifactKeyInput) ArtifactKey {
     std.mem.writeInt(u32, &abi, codegen_abi_version, .little);
     hasher.update(&abi);
     hashBytes(&hasher, "compile");
-    hasher.update(&.{@intFromEnum(input.backend)});
+    hasher.update(&.{@backingInt(input.backend)});
     hashBytes(&hasher, input.semantic_identity);
     hashBytes(&hasher, input.runtime_identity);
     hashBytes(&hasher, input.target_identity);
@@ -895,7 +895,7 @@ fn encodeCacheEntry(
     @memset(encoded[0..cache_header_bytes], 0);
     @memcpy(encoded[0..cache_magic.len], cache_magic);
     std.mem.writeInt(u32, encoded[8..12], codegen_abi_version, .little);
-    encoded[12] = @intFromEnum(kind);
+    encoded[12] = @backingInt(kind);
     std.mem.writeInt(u64, encoded[16..24], payload.len, .little);
     @memcpy(encoded[24..56], &key);
     var digest: ArtifactKey = undefined;
@@ -913,7 +913,7 @@ fn validateCacheEntry(
     if (encoded.len < cache_header_bytes) return error.InvalidKernelJitCacheEntry;
     if (!std.mem.eql(u8, encoded[0..cache_magic.len], cache_magic)) return error.InvalidKernelJitCacheEntry;
     if (std.mem.readInt(u32, encoded[8..12], .little) != codegen_abi_version) return error.InvalidKernelJitCacheEntry;
-    if (encoded[12] != @intFromEnum(expected_kind)) return error.InvalidKernelJitCacheEntry;
+    if (encoded[12] != @backingInt(expected_kind)) return error.InvalidKernelJitCacheEntry;
     const payload_len = std.mem.readInt(u64, encoded[16..24], .little);
     if (payload_len == 0 or payload_len > maximum_artifact_bytes) return error.InvalidKernelJitCacheEntry;
     if (payload_len != encoded.len - cache_header_bytes) return error.InvalidKernelJitCacheEntry;
@@ -995,7 +995,7 @@ const LoadedQualificationPackageManifest = struct {
     claims: []QualificationPackageRecordClaim,
     profile_digests: []ArtifactKey,
 
-    fn deinit(self: *LoadedQualificationPackageManifest) void {
+    pub fn deinit(self: *LoadedQualificationPackageManifest) void {
         self.allocator.free(self.profile_digests);
         self.allocator.free(self.claims);
         self.allocator.free(self.keys);
@@ -1009,7 +1009,7 @@ const LoadedQualificationPackage = struct {
     payloads: [][]u8,
     profile_count: usize,
 
-    fn deinit(self: *LoadedQualificationPackage) void {
+    pub fn deinit(self: *LoadedQualificationPackage) void {
         for (self.payloads) |payload| self.allocator.free(payload);
         self.allocator.free(self.payloads);
         self.allocator.free(self.keys);
@@ -2224,7 +2224,7 @@ const TestQualificationPackageProfile = struct {
     json: []u8,
     input: QualificationPackageProfileInput,
 
-    fn deinit(self: *TestQualificationPackageProfile) void {
+    pub fn deinit(self: *TestQualificationPackageProfile) void {
         std.testing.allocator.free(self.json);
         self.* = undefined;
     }

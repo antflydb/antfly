@@ -16,7 +16,7 @@
 //! Owned wire projections. Producers capture every row in one metadata read
 //! transaction (or under the standalone metadata mutex).
 const std = @import("std");
-const domain = @import("domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const metadata = @import("../metadata/table_manager.zig");
 const api = @import("../metadata/api.zig");
 const extensions = @import("../extensions/mod.zig");
@@ -59,7 +59,7 @@ pub const Export = struct {
     /// Immutable programs for active row-policy generations. Draft policy
     /// definitions may already differ, so they cannot reconstruct these
     /// programs during restore. An in-flight publication is not exportable.
-    policy_install_snapshots: []const @import("policies.zig").InstallSnapshot = &.{},
+    policy_install_snapshots: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot = &.{},
     extension_packages: []extensions.PackageManifest = &.{},
     installed_extensions: []extensions.InstalledExtension = &.{},
     extension_members: []extensions.ExtensionMember = &.{},

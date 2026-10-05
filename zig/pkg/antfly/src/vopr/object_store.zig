@@ -55,7 +55,7 @@ const RejectConditionalAppendWal = struct {
         .truncate_prefix = truncatePrefix,
     };
 
-    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 
     fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -552,7 +552,7 @@ test "serverless object store VOPR enrichment conflict preserves pruning progres
     const lease = @import("../serverless/manifest/read_lease.zig");
     const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
     runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
-        fn read(ptr: *const anyopaque) u64 {
+        pub fn read(ptr: *const anyopaque) u64 {
             return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
         }
     }.read };

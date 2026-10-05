@@ -1,22 +1,22 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const casbin = @import("antfly_casbin");
 const storage = @import("usermgr_storage");
-const user_manager = @import("user_manager.zig");
+const user_manager = @import("antfly_local_sources").usermgr_user_manager;
 
 const Allocator = std.mem.Allocator;
 const backend_erased = storage.backend_erased;
@@ -121,7 +121,7 @@ pub const StorageUserStore = struct {
         try txn.commit();
     }
 
-    fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
+    pub fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
         const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginWrite();
         errdefer txn.abort();
@@ -187,7 +187,7 @@ pub const StorageUserStore = struct {
         try txn.commit();
     }
 
-    fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
+    pub fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
         const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginWrite();
         errdefer txn.abort();
@@ -229,7 +229,7 @@ const OwnedPortableSeedEntry = struct {
     key_base64: []u8,
     value_base64: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.namespace);
         alloc.free(self.key_base64);
         alloc.free(self.value_base64);

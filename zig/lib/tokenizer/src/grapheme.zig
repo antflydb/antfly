@@ -31,7 +31,7 @@ fn properties(cp: u21) u8 {
     return 0;
 }
 fn category(flags: u8) Category {
-    return @enumFromInt(flags & 15);
+    return @fromBackingInt(@as(u4, @truncate(flags)));
 }
 fn control(cat: Category) bool {
     return cat == .control or cat == .cr or cat == .lf;

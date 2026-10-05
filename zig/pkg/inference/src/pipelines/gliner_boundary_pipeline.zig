@@ -627,7 +627,7 @@ const Work = struct {
                 .pool_indices = try pool_indices.toOwnedSlice(self.allocator),
             };
         }
-        var scored = try self.scorer.record(self.scratch_allocator, .{ .sample_index = b, .mode = @enumFromInt(@intFromEnum(mode)), .fields = inputs, .anchor_field = structure.anchor }, self.options.task_limits, self.options.control);
+        var scored = try self.scorer.record(self.scratch_allocator, .{ .sample_index = b, .mode = @fromBackingInt(@backingInt(mode)), .fields = inputs, .anchor_field = structure.anchor }, self.options.task_limits, self.options.control);
         defer scored.deinit();
         if (scored.fields.len != structure.fields.len or scored.object_logits.len > self.options.task_limits.max_record_instances or
             scored.instance_seeds.len != scored.object_logits.len) return error.InvalidBoundaryScorerOutput;
@@ -658,7 +658,7 @@ const Work = struct {
         options.temperature = self.config.head.record_temperature;
         options.control = self.options.control;
         options.assignment.control = self.options.control;
-        var decoded = try record_decoder.decode(self.scratch_allocator, .{ .mode = @enumFromInt(@intFromEnum(mode)), .anchor_field = structure.anchor, .object_logits = scored.object_logits, .instance_spans = instance_spans, .fields = fields }, options);
+        var decoded = try record_decoder.decode(self.scratch_allocator, .{ .mode = @fromBackingInt(@backingInt(mode)), .anchor_field = structure.anchor, .object_logits = scored.object_logits, .instance_spans = instance_spans, .fields = fields }, options);
         defer decoded.deinit();
         const anchors = try self.allocator.alloc(?SourceSpan, decoded.records.len);
         for (decoded.records, anchors) |record, *anchor| anchor.* = if (record.anchor) |span| try self.source(b, span, offsets) else null;
@@ -990,7 +990,7 @@ fn cloneOwned(comptime T: type, allocator: Allocator, value: T) Allocator.Error!
         .optional => |optional| if (value) |item| try cloneOwned(optional.child, allocator, item) else null,
         .@"struct" => blk: {
             var result: T = undefined;
-            inline for (std.meta.fields(T)) |field| @field(result, field.name) = try cloneOwned(field.type, allocator, @field(value, field.name));
+            inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |reflected_name, field_type| @field(result, reflected_name) = try cloneOwned(field_type, allocator, @field(value, reflected_name));
             break :blk result;
         },
         else => value,

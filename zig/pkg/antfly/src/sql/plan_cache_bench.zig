@@ -15,7 +15,7 @@
 
 //! Standalone compile/cache microbenchmark; not query/storage throughput.
 const std = @import("std");
-const compiler = @import("compiler.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
 const plans = @import("plan_cache.zig");
 
 pub fn main(init: std.process.Init) !void {

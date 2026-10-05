@@ -406,8 +406,8 @@ pub fn solve(allocator: std.mem.Allocator, program: Program, logits: []const []c
     defer arena.deinit();
     const alloc = arena.allocator();
     const locals = try alloc.alloc([]const Candidate, program.tasks.len);
-    var possible = [_]Selection{0} ** max_tasks;
-    var always = [_]Selection{0} ** max_tasks;
+    var possible = @as([max_tasks]Selection, @splat(0));
+    var always = @as([max_tasks]Selection, @splat(0));
     for (program.tasks, logits, 0..) |task, scores, i| {
         if (scores.len != task.labels.len) return error.InvalidClassificationLogits;
         locals[i] = try enumerate(alloc, program, i, scores, options);
@@ -566,7 +566,7 @@ fn appendCandidate(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(Candi
     if (!std.math.isFinite(score)) return error.InvalidClassificationLogits;
     try list.append(alloc, .{ .selected = selected, .utility = score });
 }
-const State = struct { selected: [max_tasks]Selection = [_]Selection{0} ** max_tasks, lexical: [max_tasks]Selection = [_]Selection{0} ** max_tasks, score: f64 = 0 };
+const State = struct { selected: [max_tasks]Selection = @as([max_tasks]Selection, @splat(0)), lexical: [max_tasks]Selection = @as([max_tasks]Selection, @splat(0)), score: f64 = 0 };
 const Search = struct {
     program: Program,
     locals: []const []const Candidate,
@@ -578,7 +578,7 @@ const Search = struct {
     best: ?State = null,
 
     fn initializeOrder(self: *Search) void {
-        var touching = [_]usize{0} ** max_tasks;
+        var touching = @as([max_tasks]usize, @splat(0));
         for (self.program.roots) |root| {
             const refs = self.program.taskReferences(root);
             for (self.program.tasks, 0..) |_, i| if (refs & taskBit(i) != 0) {

@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const graph_mod = @import("../../graph/graph.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
 const graph_metric_policy = @import("graph_metric_policy.zig");
 
 pub const IndexSpec = struct {
@@ -163,8 +163,8 @@ pub fn parseMetricConfigsAlloc(alloc: Allocator, index: std.json.Value) ![]graph
 
 fn parseKind(value: std.json.Value) !graph_mod.GraphMetricKind {
     if (value != .string) return error.InvalidIndexConfig;
-    inline for (std.meta.fields(graph_mod.GraphMetricKind)) |field| {
-        if (std.mem.eql(u8, value.string, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphMetricKind).@"enum".field_names, @typeInfo(graph_mod.GraphMetricKind).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, value.string, reflected_name)) return @fromBackingInt(field_value);
     }
     return error.InvalidIndexConfig;
 }

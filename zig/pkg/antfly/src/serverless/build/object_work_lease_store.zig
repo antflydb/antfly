@@ -32,7 +32,7 @@ const CurrentLease = struct {
     body_carries_coordination_etag: bool,
     etag: []u8,
 
-    fn deinit(self: *CurrentLease, alloc: Allocator) void {
+    pub fn deinit(self: *CurrentLease, alloc: Allocator) void {
         if (self.owner_id) |owner_id| alloc.free(owner_id);
         alloc.free(self.etag);
         self.* = undefined;
@@ -43,7 +43,7 @@ const CurrentFenceFloor = struct {
     value: u64,
     etag: []u8,
 
-    fn deinit(self: *CurrentFenceFloor, alloc: Allocator) void {
+    pub fn deinit(self: *CurrentFenceFloor, alloc: Allocator) void {
         alloc.free(self.etag);
         self.* = undefined;
     }

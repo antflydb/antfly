@@ -321,5 +321,5 @@ ANTFLY_LITE_REQUIRE_LIBRARY=1 uv run pytest -q
 Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `ANTFLY_LITE_REQUIRE_LIBRARY=1` is set, in which case they fail instead.
 `tests/test_conformance.py` runs every case in
-`zig/pkg/antfly/capi-conformance/cases/*.json` through this public API, the
+`zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.

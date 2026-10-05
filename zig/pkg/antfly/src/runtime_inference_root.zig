@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Compiled owner of the inference runtime entry points.
 
@@ -31,10 +31,6 @@ const runtimeAllocator = process.runtimeAllocator;
 
 const inference_runtime = @import("inference_runtime/runtime.zig");
 
-const standalone_inference_host = @import("antfly_inference_host");
-
-const standalone_inference_bridge = @import("antfly_inference_bridge");
-
 fn runInference(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return inference_runtime.runFromIterator(init, "antfly", args);
 }
@@ -43,148 +39,10 @@ fn inferenceEntry(context: *const bridge.Context) callconv(.c) c_int {
     return runtimeEntry(context, "inference", runInference);
 }
 
-fn standaloneInferenceCreate(context: *const standalone_inference_bridge.CreateContext) callconv(.c) standalone_inference_bridge.Status {
-    if (!standalone_inference_bridge.validContext(
-        standalone_inference_bridge.CreateContext,
-        context.abi_version,
-        context.struct_size,
-    ))
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    context.out_handle.* = standalone_inference_host.linkedInferenceCreate(context) catch |err| {
-        return reportStandaloneInferenceFailure("create", err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceConfigure(context: *const standalone_inference_bridge.ConfigureContext) callconv(.c) standalone_inference_bridge.Status {
-    if (!standalone_inference_bridge.validContext(
-        standalone_inference_bridge.ConfigureContext,
-        context.abi_version,
-        context.struct_size,
-    ))
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    standalone_inference_host.linkedInferenceConfigure(context) catch |err| {
-        return reportStandaloneInferenceFailure("configure", err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge.ProviderInvokeContext) callconv(.c) standalone_inference_bridge.Status {
-    if (!standalone_inference_bridge.validContext(
-        standalone_inference_bridge.ProviderInvokeContext,
-        context.abi_version,
-        context.struct_size,
-    ))
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    standalone_inference_host.linkedInferenceInvokeProvider(context) catch |err| {
-        return @import("antfly_inference_provider_failure").status(
-            context.operation,
-            context.request_json.slice(),
-            context.has_deadline != 0,
-            err,
-        );
-    };
-    return .ok;
-}
-
-fn standaloneInferenceDestroyProviderResponse(handle: *anyopaque) callconv(.c) void {
-    standalone_inference_host.linkedInferenceDestroyProviderResponse(handle);
-}
-
-fn standaloneInferenceRouteManifest(context: *const standalone_inference_bridge.RouteManifestContext) callconv(.c) standalone_inference_bridge.Status {
-    if (!standalone_inference_bridge.validContext(
-        standalone_inference_bridge.RouteManifestContext,
-        context.abi_version,
-        context.struct_size,
-    ))
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    standalone_inference_host.linkedInferenceRouteManifest(context) catch |err| {
-        return reportStandaloneInferenceFailure("route_manifest", err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceHandleHttp(context: *const standalone_inference_bridge.HttpHandleContext) callconv(.c) standalone_inference_bridge.Status {
-    if (!standalone_inference_bridge.validContext(
-        standalone_inference_bridge.HttpHandleContext,
-        context.abi_version,
-        context.struct_size,
-    ))
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    standalone_inference_host.linkedInferenceHandleHttp(context) catch |err| {
-        return reportStandaloneInferenceFailure("handle_http", err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceDestroyHttpResponse(handle: *anyopaque) callconv(.c) void {
-    standalone_inference_host.linkedInferenceDestroyHttpResponse(handle);
-}
-
-fn standaloneInferenceTryAcquireRequest(handle: *anyopaque) callconv(.c) u8 {
-    return @intFromBool(standalone_inference_host.linkedInferenceTryAcquireRequest(handle));
-}
-
-fn standaloneInferenceReleaseRequest(handle: *anyopaque) callconv(.c) void {
-    standalone_inference_host.linkedInferenceReleaseRequest(handle);
-}
-
-fn standaloneInferenceRequestAdmissionStats(
-    handle: *anyopaque,
-    out: *standalone_inference_bridge.RequestAdmissionStats,
-) callconv(.c) void {
-    out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
-}
-
-fn standaloneInferencePullModel(context: *const standalone_inference_bridge.PullModelContext) callconv(.c) standalone_inference_bridge.Status {
-    if (!standalone_inference_bridge.validContext(
-        standalone_inference_bridge.PullModelContext,
-        context.abi_version,
-        context.struct_size,
-    ))
-        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
-    standalone_inference_host.linkedInferencePullModel(context) catch |err| {
-        return standalone_inference_bridge.statusFromError(err);
-    };
-    return .ok;
-}
-
-fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
-    standalone_inference_host.linkedInferenceDestroy(handle);
-}
-
-const standalone_inference_function_table: standalone_inference_bridge.FunctionTable = .{
-    .abi_version = standalone_inference_bridge.abi_version,
-    .struct_size = @sizeOf(standalone_inference_bridge.FunctionTable),
-    .capabilities = standalone_inference_bridge.Capability.provider |
-        standalone_inference_bridge.Capability.route_manifest |
-        standalone_inference_bridge.Capability.resource_budget |
-        standalone_inference_bridge.Capability.request_admission |
-        standalone_inference_bridge.Capability.model_pull,
-    .create = &standaloneInferenceCreate,
-    .configure = &standaloneInferenceConfigure,
-    .invoke_provider = &standaloneInferenceInvokeProvider,
-    .destroy_provider_response = &standaloneInferenceDestroyProviderResponse,
-    .route_manifest = &standaloneInferenceRouteManifest,
-    .handle_http = &standaloneInferenceHandleHttp,
-    .destroy_http_response = &standaloneInferenceDestroyHttpResponse,
-    .try_acquire_request = &standaloneInferenceTryAcquireRequest,
-    .release_request = &standaloneInferenceReleaseRequest,
-    .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
-    .destroy = &standaloneInferenceDestroy,
-    .pull_model = &standaloneInferencePullModel,
-};
-
-fn standaloneInferenceGetFunctionTable() callconv(.c) *const standalone_inference_bridge.FunctionTable {
-    return &standalone_inference_function_table;
-}
-
-fn reportStandaloneInferenceFailure(comptime operation: []const u8, err: anyerror) standalone_inference_bridge.Status {
-    std.log.err("standalone inference bridge failed operation={s} err={}", .{ operation, err });
-    return standalone_inference_bridge.statusFromError(err);
-}
-
 comptime {
-    exportInternal(&standaloneInferenceGetFunctionTable, "antfly_standalone_inference_get_function_table");
+    _ = @import("antfly_inference_native_exports");
     exportInternal(&inferenceEntry, "antfly_runtime_inference");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

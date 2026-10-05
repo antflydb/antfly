@@ -13,14 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+from audit_embedded_source_boundary import (
+    audit,
+    audit_modules,
+    production_imports,
+    check_replication_contract,
+)
 from check_embedded_isolated_build import stage_sources
-
-from audit_embedded_source_boundary import audit, production_imports, audit_modules
 
 
 class EmbeddedBoundaryTest(unittest.TestCase):
@@ -29,7 +33,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             repository = Path(directory) / "repo"
             stage = Path(directory) / "stage"
             files = {
-                "zig/pkg/antfly/src/storage/db/db.zig": "local working change",
+                "zig/pkg/antfly-embedded/src/local/storage/db/db.zig": "local working change",
                 "zig/pkg/antfly/src/storage/server_db_adapter.zig": "server",
                 "zig/pkg/antfly/src/storage/server_transaction_dispatch.zig": "server dispatch",
                 "zig/pkg/antfly/src/storage/server_transaction_recovery.zig": "server recovery",
@@ -46,13 +50,173 @@ class EmbeddedBoundaryTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(content)
             listing = b"\0".join(name.encode() for name in files) + b"\0"
-            with patch("check_embedded_isolated_build.subprocess.check_output", return_value=listing):
+            with patch(
+                "check_embedded_isolated_build.subprocess.check_output",
+                return_value=listing,
+            ):
                 self.assertEqual(stage_sources(repository, stage), 7)
-            self.assertEqual((stage / "zig/pkg/antfly/src/storage/db/db.zig").read_text(), "local working change")
+            self.assertEqual(
+                (
+                    stage / "zig/pkg/antfly-embedded/src/local/storage/db/db.zig"
+                ).read_text(),
+                "local working change",
+            )
             self.assertTrue((stage / "specs/openapi/public.yaml").is_file())
             self.assertTrue((stage / "scripts/codegen.py").is_file())
-            self.assertIn('@compileError("server implementation unavailable', (stage / "zig/pkg/antfly/src/capi/server_owner.zig").read_text())
+            self.assertFalse((stage / "zig/pkg/antfly").exists())
             self.assertFalse((stage / "docs/plan.md").exists())
+
+    def test_local_ports_reject_policy_even_without_server_imports(self):
+        for token in (
+            "sync_policy",
+            "standby_names",
+            "fenced_primary",
+            "raft_applied_entry_marker",
+            "HAMirrorUnavailable",
+            "primary_ha",
+            "getGroupCreatedAtMillis",
+            "ensureGroupCreatedAtMillis",
+        ):
+            for path in (
+                "storage/db/replication_contract.zig",
+                "storage/db/commit_integration.zig",
+                "storage/db/db.zig",
+                "storage/db/index_repair_scheduler.zig",
+                "storage/db/graph_cleanup_owner.zig",
+                "storage/db/native_projection_owner.zig",
+                "storage/db/runtime_restart_owner.zig",
+                "storage/db/cleanup_job_owner.zig",
+                "storage/db/query_visibility.zig",
+                "storage/db/source_pin_cleanup_owner.zig",
+                "storage/db/applied_sequence_coalescer.zig",
+                "storage/db/document_collectors.zig",
+                "storage/db/owned_keys.zig",
+                "storage/db/graph_field_plan.zig",
+                "storage/db/replay_vector_collectors.zig",
+                "storage/db/relational_read_session.zig",
+                "storage/db/read_projection.zig",
+                "storage/db/local_mutation.zig",
+                "storage/db/execution_resources.zig",
+                "storage/db/mutation_preparation.zig",
+                "storage/db/mutation_commit.zig",
+                "storage/db/mutation_materialization.zig",
+                "storage/db/result_collectors.zig",
+                "storage/db/materialized_sources.zig",
+                "storage/db/graph_restore_materialization.zig",
+                "storage/db/status_projection.zig",
+                "storage/db/managed_admission_owner.zig",
+                "storage/db/publication_recovery_owner.zig",
+            ):
+                with (
+                    self.subTest(token=token, path=path),
+                    self.assertRaisesRegex(ValueError, "server replication policy"),
+                ):
+                    check_replication_contract(path, f"pub const {token} = 0;")
+        check_replication_contract(
+            "storage/hot_standby/db_commit.zig", "pub const sync_policy = 0;"
+        )
+        check_replication_contract(
+            "storage/db/replication_contract.zig",
+            'test "fixture" { const sync_policy = 0; }',
+        )
+        check_replication_contract(
+            "storage/db/replication_contract.zig",
+            '// standby_names\nconst note = "sync_policy";',
+        )
+
+    def test_module_graph_checks_policy_in_moved_local_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            contract = (
+                project
+                / "pkg/antfly-embedded/src/local/storage/db/replication_contract.zig"
+            )
+            contract.parent.mkdir(parents=True)
+            contract.write_text("pub const sync_policy = 0;")
+            with self.assertRaisesRegex(ValueError, "server replication policy"):
+                audit_modules(project, {"local": contract}, {}, "local")
+            contract.write_text("pub const CommitRequirements = struct {};")
+            self.assertEqual(
+                1, audit_modules(project, {"local": contract}, {}, "local")
+            )
+
+    def test_visibility_hook_keeps_server_identity_outside_local_storage(self):
+        for field in ("table_name: []const u8", "group_id: u64", "db: *DB"):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ValueError, "server routing in local visibility hook"
+                ),
+            ):
+                check_replication_contract(
+                    "storage/db/db.zig",
+                    f"pub const QueryVisibilityHook = struct {{\n    {field},\n}};",
+                )
+        check_replication_contract(
+            "storage/db/db.zig",
+            "pub const QueryVisibilityHook = struct {\n    ptr: *anyopaque,\n};",
+        )
+
+    def test_extracted_visibility_hook_rejects_server_identity(self):
+        for field in ("table_name: []const u8", "group_id: u64", "db: *DB"):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ValueError, "server routing in local visibility hook"
+                ),
+            ):
+                check_replication_contract(
+                    "storage/db/query_visibility.zig",
+                    f"pub const QueryVisibilityHook = struct {{\n    {field},\n}};",
+                )
+        check_replication_contract(
+            "storage/db/db.zig",
+            'pub const QueryVisibilityHook = @import("query_visibility.zig").QueryVisibilityHook;',
+        )
+
+    def test_real_visibility_hook_cannot_regain_server_fields(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "pkg/antfly-embedded/src/local/storage/db/query_visibility.zig"
+        )
+        source = source_path.read_text()
+        declaration = "pub const QueryVisibilityHook = struct {"
+        self.assertIn(declaration, source)
+        for field in (
+            "group_id: u64 = 0,",
+            'table_name: []const u8 = "",',
+            "owner: ?*DB = null,",
+        ):
+            changed = source.replace(declaration, declaration + "\n    " + field, 1)
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "server routing"),
+            ):
+                check_replication_contract("storage/db/query_visibility.zig", changed)
+
+    def test_local_child_range_planning_rejects_server_destination_policy(self):
+        path = "storage/db/document_child_range_effects.zig"
+        for source in (
+            "const status = range.route_status;",
+            'const status = "remote_committed";',
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(
+                    ValueError, "server child-range destination policy"
+                ),
+            ):
+                check_replication_contract(path, source)
+        check_replication_contract(
+            path, 'test "fixture" { const status = "remote_committed"; }'
+        )
+        check_replication_contract(
+            path, "const destination = selector.select(ptr, range);"
+        )
+        check_replication_contract(
+            "storage/server_document_child_range.zig",
+            'const status = "remote_committed";',
+        )
 
     def test_dynamic_imports_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "literal source owner"):
@@ -104,37 +268,86 @@ fn lazy() void { _ = @import("local.zig"); }
                     audit(root, ["root.zig"])
 
     def test_test_only_owner_and_nonempty_fallback(self):
-        source = '\n'.join([
-            'const fixture = if (builtin.is_test) @import("raft/fixture.zig") else struct {};',
-            'const oracle = if (builtin.is_test) @import("lmdb_engine") else struct { const local = @import("fallback.zig"); };',
-            'const Harness = if (builtin.is_test) struct { const runtime = @import("vopr"); } else struct {};',
-        ])
-        self.assertEqual(production_imports(source, include_named=True), ["fallback.zig"])
+        source = (
+            'const fixture = if (builtin.is_test) @import("raft/fixture.zig") else struct {};\n'
+            'const oracle = if (builtin.is_test) @import("lmdb_engine") else struct { const local = @import("fallback.zig"); };\n'
+            'const Harness = if (builtin.is_test) struct { const runtime = @import("vopr"); } else struct {};'
+        )
+        self.assertEqual(
+            production_imports(source, include_named=True), ["fallback.zig"]
+        )
+
+    def test_test_only_named_import_allows_field_selection(self):
+        source = 'const fixture = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};'
+        self.assertEqual(production_imports(source, include_named=True), [])
+        self.assertEqual(
+            production_imports(
+                source.replace("builtin.is_test", "dynamic"), include_named=True
+            ),
+            ["antfly_server_test_sources"],
+        )
 
     def test_target_alternatives_keep_unknown_options(self):
-        source = ('const remote = if (builtin.os.tag == .freestanding or build_options.minimal) '
-                  '@import("stub.zig") else @import("remote");')
-        self.assertEqual(production_imports(source, include_named=True, target_os="freestanding"), ["stub.zig"])
-        self.assertEqual(production_imports(source, include_named=True, target_os="linux"), ["stub.zig", "remote"])
+        source = (
+            "const remote = if (builtin.os.tag == .freestanding or build_options.minimal) "
+            '@import("stub.zig") else @import("remote");'
+        )
+        self.assertEqual(
+            production_imports(source, include_named=True, target_os="freestanding"),
+            ["stub.zig"],
+        )
+        self.assertEqual(
+            production_imports(source, include_named=True, target_os="linux"),
+            ["stub.zig", "remote"],
+        )
 
     def test_disabled_backend_guard_excludes_only_its_function(self):
-        source = ('fn disabled() void { if (comptime !build_options.enable_pjrt) return error.Unavailable; '
-                  '_ = @import("pjrt"); } fn other() void { _ = @import("local.zig"); }')
-        self.assertEqual(production_imports(source, include_named=True, options={"enable_pjrt": False}), ["local.zig"])
-        self.assertEqual(production_imports(source, include_named=True, options={"enable_pjrt": True}), ["pjrt", "local.zig"])
-        self.assertEqual(production_imports(source, include_named=True, options={}), ["pjrt", "local.zig"])
+        source = (
+            "fn disabled() void { if (comptime !build_options.enable_pjrt) return error.Unavailable; "
+            '_ = @import("pjrt"); } fn other() void { _ = @import("local.zig"); }'
+        )
+        self.assertEqual(
+            production_imports(
+                source, include_named=True, options={"enable_pjrt": False}
+            ),
+            ["local.zig"],
+        )
+        self.assertEqual(
+            production_imports(
+                source, include_named=True, options={"enable_pjrt": True}
+            ),
+            ["pjrt", "local.zig"],
+        )
+        self.assertEqual(
+            production_imports(source, include_named=True, options={}),
+            ["pjrt", "local.zig"],
+        )
 
     def test_runtime_control_flow_cannot_make_a_feature_guard_unconditional(self):
-        for control in ("if (dynamic)", "while (dynamic)", "for (items) |_|", "if (dynamic) {} else"):
+        for control in (
+            "if (dynamic)",
+            "while (dynamic)",
+            "for (items) |_|",
+            "if (dynamic) {} else",
+        ):
             with self.subTest(control=control):
-                source = ('fn execute() void { ' + control +
-                          ' if (!build_options.enable_pjrt) return; '
-                          '_ = @import("storage/server_db_adapter.zig"); }')
-                self.assertEqual(production_imports(source, options={"enable_pjrt": False}),
-                                 ["storage/server_db_adapter.zig"])
-        source = ('fn execute() void { if (dynamic) { if (!build_options.enable_pjrt) return; '
-                  '_ = @import("disabled.zig"); } _ = @import("outside.zig"); }')
-        self.assertEqual(production_imports(source, options={"enable_pjrt": False}), ["outside.zig"])
+                source = (
+                    "fn execute() void { "
+                    + control
+                    + " if (!build_options.enable_pjrt) return; "
+                    '_ = @import("storage/server_db_adapter.zig"); }'
+                )
+                self.assertEqual(
+                    production_imports(source, options={"enable_pjrt": False}),
+                    ["storage/server_db_adapter.zig"],
+                )
+        source = (
+            "fn execute() void { if (dynamic) { if (!build_options.enable_pjrt) return; "
+            '_ = @import("disabled.zig"); } _ = @import("outside.zig"); }'
+        )
+        self.assertEqual(
+            production_imports(source, options={"enable_pjrt": False}), ["outside.zig"]
+        )
 
     def test_external_cache_does_not_exempt_antfly_generated_owners(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -152,29 +365,57 @@ fn lazy() void { _ = @import("local.zig"); }
             server.parent.mkdir(parents=True)
             server.write_text("")
             modules = {"entry": entry, "generated": generated, "server": server}
-            edges = {("entry", "generated"): "generated", ("generated", "server"): "server"}
+            edges = {
+                ("entry", "generated"): "generated",
+                ("generated", "server"): "server",
+            }
             with self.assertRaisesRegex(ValueError, "server coordination"):
                 audit_modules(project, modules, edges, "entry")
             sibling.write_text("")
             self.assertEqual(audit_modules(project, modules, edges, "entry"), 3)
-            self.assertEqual(audit_modules(project, modules, {("entry", "generated"): "generated"},
-                                          "entry", external_modules={"generated"}), 2)
+            self.assertEqual(
+                audit_modules(
+                    project,
+                    modules,
+                    {("entry", "generated"): "generated"},
+                    "entry",
+                    external_modules={"generated"},
+                ),
+                2,
+            )
             # Explicit dependencies cannot hide a declared Antfly import.
             with self.assertRaisesRegex(ValueError, "server coordination"):
-                audit_modules(project, modules, edges, "entry", external_modules={"generated"})
+                audit_modules(
+                    project, modules, edges, "entry", external_modules={"generated"}
+                )
             modules["dependency"] = cache / "dependency.zig"
-            indirect = {("entry", "generated"): "generated",
-                        ("generated", "dependency"): "dependency",
-                        ("dependency", "server"): "server"}
+            indirect = {
+                ("entry", "generated"): "generated",
+                ("generated", "dependency"): "dependency",
+                ("dependency", "server"): "server",
+            }
             with self.assertRaisesRegex(ValueError, "server coordination"):
-                audit_modules(project, modules, indirect, "entry",
-                              external_modules={"generated", "dependency"})
+                audit_modules(
+                    project,
+                    modules,
+                    indirect,
+                    "entry",
+                    external_modules={"generated", "dependency"},
+                )
 
     def test_target_struct_branch_preserves_local_imports(self):
-        source = ('const backend = if (@import("builtin").os.tag == .freestanding) '
-                  'struct { const local = @import("portable.zig"); } else @import("native");')
-        self.assertEqual(production_imports(source, include_named=True, target_os="freestanding"), ["builtin", "portable.zig"])
-        self.assertEqual(production_imports(source, include_named=True, target_os="linux"), ["builtin", "native"])
+        source = (
+            'const backend = if (@import("builtin").os.tag == .freestanding) '
+            'struct { const local = @import("portable.zig"); } else @import("native");'
+        )
+        self.assertEqual(
+            production_imports(source, include_named=True, target_os="freestanding"),
+            ["builtin", "portable.zig"],
+        )
+        self.assertEqual(
+            production_imports(source, include_named=True, target_os="linux"),
+            ["builtin", "native"],
+        )
 
     def test_named_modules_use_their_own_import_tables(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -185,8 +426,15 @@ fn lazy() void { _ = @import("local.zig"); }
             first.write_text('const child = @import("shared");')
             second.write_text('const local = @import("shared");')
             local.write_text("")
-            self.assertEqual(audit_modules(project, {"first": first, "second": second, "local": local},
-                {("first", "shared"): "second", ("second", "shared"): "local"}, "first"), 3)
+            self.assertEqual(
+                audit_modules(
+                    project,
+                    {"first": first, "second": second, "local": local},
+                    {("first", "shared"): "second", ("second", "shared"): "local"},
+                    "first",
+                ),
+                3,
+            )
             with self.assertRaisesRegex(ValueError, "unresolved module"):
                 audit_modules(project, {"first": first}, {}, "first")
 
@@ -201,7 +449,12 @@ fn lazy() void { _ = @import("local.zig"); }
                     owner.parent.mkdir(parents=True, exist_ok=True)
                     owner.write_text("")
                     with self.assertRaisesRegex(ValueError, "server coordination"):
-                        audit_modules(project, {"entry": entry, "server": owner}, {("entry", "contracts"): "server"}, "entry")
+                        audit_modules(
+                            project,
+                            {"entry": entry, "server": owner},
+                            {("entry", "contracts"): "server"},
+                            "entry",
+                        )
 
 
 if __name__ == "__main__":

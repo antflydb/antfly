@@ -23,7 +23,7 @@ const runtime_options = @import("standalone_runtime_options");
 
 const use_direct_implementation = builtin.is_test or !runtime_options.linked_runtime_boundaries;
 const direct_impl = if (use_direct_implementation)
-    @import("../storage/lite/restore_staging.zig")
+    @import("antfly_local_sources").storage_lite_restore_staging
 else
     struct {};
 

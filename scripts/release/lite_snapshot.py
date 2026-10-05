@@ -103,8 +103,9 @@ def build(
                 raise ValueError(f"unexpected npm package: {source}")
         else:
             name, package_version = wheel_identity(source)
-            if name != "antfly-embedded" or package_version != python_version_from_release(
-                version
+            if (
+                name != "antfly-embedded"
+                or package_version != python_version_from_release(version)
             ):
                 raise ValueError(f"unexpected wheel: {source}")
         shutil.copy2(source, out_dir / source.name)

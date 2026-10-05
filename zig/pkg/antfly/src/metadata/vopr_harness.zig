@@ -35,7 +35,7 @@ const api_http_test_runtime = @import("../api/http_test_runtime.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
 const api_distributed_graph = @import("../api/distributed_graph.zig");
-const api_operation = @import("../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("antfly_source_root").antfly_sources.table_reads;
@@ -62,13 +62,13 @@ const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
-const common_config = @import("../common/config.zig");
-const docstore_mod = @import("../storage/docstore.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const db_root_identity = @import("../storage/db/root_identity.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const storage_sim = @import("../storage/sim_runtime.zig");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const db_root_identity = @import("antfly_local_sources").storage_db_root_identity;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const storage_sim = @import("antfly_local_sources").storage_sim_runtime;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const raft_trace_logger = @import("../tracing/raft_trace_logger.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
@@ -1601,19 +1601,19 @@ pub const DistributedDataVoprScenario = struct {
             .id = vopr.id.stable("event", "distributed_data.phase_completed"),
             .name = "distributed_data.phase_completed",
             .kind = if (world.completed) .client_response else .state_change,
-            .payload_digest = @intFromEnum(world.stage),
+            .payload_digest = @backingInt(world.stage),
         });
         return if (world.completed)
-            vopr.outcome.TransitionOutcome.targetReached("distributed_data.split_merge_completed", @intFromEnum(world.stage))
+            vopr.outcome.TransitionOutcome.targetReached("distributed_data.split_merge_completed", @backingInt(world.stage))
         else
             vopr.outcome.TransitionOutcome.applied();
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, alloc: std.mem.Allocator) !void {
-        try builder.addNamed(alloc, "distributed_data.stage", @intFromEnum(world.stage));
+        try builder.addNamed(alloc, "distributed_data.stage", @backingInt(world.stage));
         try builder.addNamed(alloc, "distributed_data.transport_delayed", @intFromBool(world.delayed_transport));
-        try builder.addNamed(alloc, "distributed_data.split_fault", @intFromEnum(world.split_failure));
-        try builder.addNamed(alloc, "distributed_data.merge_fault", @intFromEnum(world.merge_failure));
+        try builder.addNamed(alloc, "distributed_data.split_fault", @backingInt(world.split_failure));
+        try builder.addNamed(alloc, "distributed_data.merge_fault", @backingInt(world.merge_failure));
         try builder.addNamed(alloc, "distributed_data.storage_crash_required", 1);
         try builder.addNamed(alloc, "distributed_data.acknowledged_documents", if (world.completed) 5 else 0);
     }
@@ -2672,7 +2672,7 @@ fn buildHealthyStoreStatusReports(
         var leader_store_id: ?u64 = null;
         var voter_set_known = false;
         var voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint =
-            [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len;
+            @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0));
         for (projected_intents) |intent| {
             if (intent.record.group_id != base_status.group_id) continue;
             if (intent.store_id == 0) continue;
@@ -5755,10 +5755,10 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
     hashPlacementU64(hasher, intent.record.group_id);
     hashPlacementU64(hasher, intent.record.replica_id);
     hashPlacementU64(hasher, intent.record.local_node_id);
-    hashPlacementU64(hasher, @intFromEnum(intent.record.bootstrap_mode));
+    hashPlacementU64(hasher, @backingInt(intent.record.bootstrap_mode));
     hashPlacementU64(hasher, intent.record.metadata_version);
     hashPlacementU64(hasher, intent.store_id);
-    hashPlacementU64(hasher, @intFromEnum(intent.serving_state));
+    hashPlacementU64(hasher, @backingInt(intent.serving_state));
     hashPlacementU64(hasher, intent.relocation_generation);
     hashPlacementU64(hasher, intent.relocation_source_node_id);
     hashPlacementU64(hasher, intent.relocation_source_store_id);
@@ -5776,7 +5776,7 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
         // Preserve the historical hash for pre-versioned records so rolling
         // upgrades do not perturb otherwise unchanged placement intents.
         if (snapshot.format != .unknown) {
-            hashPlacementU64(hasher, @intFromEnum(snapshot.format));
+            hashPlacementU64(hasher, @backingInt(snapshot.format));
         }
         hasher.update(snapshot.snapshot_id);
         hasher.update(snapshot.uri);
@@ -6800,7 +6800,7 @@ const PublicApiStatusSource = struct {
         self.node.freeCatalogRoutingSnapshot(snapshot);
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
+    pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         _ = alloc;
         try applyCreateTableMutation(self.node, table_name, req);
@@ -6815,7 +6815,7 @@ const PublicApiStatusSource = struct {
         try applyReplaceTableDefinitionMutation(self.node, expected, replacement);
     }
 
-    fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+    pub fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         var result = try dropTableExact(ptr, alloc, table_name);
         defer result.deinit(alloc);
     }
@@ -6829,17 +6829,17 @@ const PublicApiStatusSource = struct {
         return try applyDropTableMutation(self.node, alloc, table_name);
     }
 
-    fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try applyUpdateSchemaMutation(self.node, alloc, table_name, schema_json);
     }
 
-    fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+    pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try applyCreateIndexMutation(self.node, alloc, table_name, index_name, index_json);
     }
 
-    fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+    pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try applyDropIndexMutation(self.node, alloc, table_name, index_name);
     }
@@ -6929,6 +6929,7 @@ pub const MetadataAdminVoprSource = struct {
             .fk_initial_create_work,
             .fk_initial_retirement_page,
             .store_root_enroll,
+            .store_root_enrollment_status,
             .fk_initial_retirement_signed_page,
             .fk_initial_retirement_ack,
             .fk_initial_parent_decision,
@@ -7056,7 +7057,7 @@ pub const MetadataAdminVoprSource = struct {
         self.node.freeAdminSnapshot(snapshot);
     }
 
-    fn createTable(
+    pub fn createTable(
         ptr: *anyopaque,
         _: std.mem.Allocator,
         table_name: []const u8,
@@ -7066,7 +7067,7 @@ pub const MetadataAdminVoprSource = struct {
         try applyCreateTableMutation(self.node, table_name, req);
     }
 
-    fn dropTable(
+    pub fn dropTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -7075,7 +7076,7 @@ pub const MetadataAdminVoprSource = struct {
         _ = try applyDropTableMutation(self.node, alloc, table_name);
     }
 
-    fn updateSchema(
+    pub fn updateSchema(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -7085,7 +7086,7 @@ pub const MetadataAdminVoprSource = struct {
         try applyUpdateSchemaMutation(self.node, alloc, table_name, schema_json);
     }
 
-    fn createIndex(
+    pub fn createIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -7096,7 +7097,7 @@ pub const MetadataAdminVoprSource = struct {
         try applyCreateIndexMutation(self.node, alloc, table_name, index_name, index_json);
     }
 
-    fn dropIndex(
+    pub fn dropIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -7331,7 +7332,7 @@ const VoprAuthManager = struct {
         return self;
     }
 
-    fn deinit(self: *VoprAuthManager) void {
+    pub fn deinit(self: *VoprAuthManager) void {
         self.manager.deinit();
         self.policy_store.deinit();
         self.store.deinit();
@@ -7484,7 +7485,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         client: api_http_client.ApiHttpClient = undefined,
         metadata_client: metadata_http_client.MetadataHttpClient = undefined,
 
-        fn initInPlace(
+        pub fn initInPlace(
             self: *@This(),
             alloc: std.mem.Allocator,
             cluster: *MetadataHttpClusterVopr,
@@ -7581,7 +7582,7 @@ fn PublicApiTestRig(comptime N: usize) type {
             return self;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.client_executor.deinit();
             deinitPublicApiStack(N, &self.listeners, &self.servers, &self.write_sources);
             for (self.api_base_uris) |uri| self.alloc.free(uri);
@@ -7636,7 +7637,7 @@ pub const VoprPublicClusterFixture = struct {
     modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
     resource_managers: [node_count]resource_manager_mod.ResourceManager = undefined,
     resource_manager_count: usize = 0,
-    resource_reservations: [node_count]?resource_manager_mod.BatchReservation = .{null} ** node_count,
+    resource_reservations: [node_count]?resource_manager_mod.BatchReservation = @splat(null),
     cluster: MetadataHttpClusterVopr = undefined,
     cluster_live: bool = false,
     cluster_started: bool = false,
@@ -8086,7 +8087,7 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     pub fn bootstrapPhaseOrdinal(self: *const VoprPublicClusterFixture) u8 {
-        return @intFromEnum(self.bootstrap_phase);
+        return @backingInt(self.bootstrap_phase);
     }
 
     pub fn externalCatalogSource(
@@ -9600,8 +9601,8 @@ const MetadataVoprDriver = struct {
             .named("metadata.range_group_id", @intCast(cfg.range_group_id)),
             .named("metadata.split_group_id", @intCast(cfg.split_group_id)),
             .named("metadata.split_transition_id", @intCast(cfg.split_transition_id)),
-            .named("metadata.workload", @intFromEnum(cfg.workload)),
-            .named("metadata.injected_bug", @intFromEnum(cfg.injected_bug)),
+            .named("metadata.workload", @backingInt(cfg.workload)),
+            .named("metadata.injected_bug", @backingInt(cfg.injected_bug)),
         };
         std.mem.sort(vopr.trace.Parameter, &scenario_parameters, {}, struct {
             fn lessThan(_: void, lhs: vopr.trace.Parameter, rhs: vopr.trace.Parameter) bool {
@@ -9636,7 +9637,7 @@ const MetadataVoprDriver = struct {
         return self;
     }
 
-    fn deinit(self: *MetadataVoprDriver) void {
+    pub fn deinit(self: *MetadataVoprDriver) void {
         if (self.artifact) |*artifact| artifact.deinit();
         self.artifact = null;
     }
@@ -9646,7 +9647,7 @@ const MetadataVoprDriver = struct {
     }
 
     fn actionId(action: MetadataVoprAction, discriminator: u64) u64 {
-        return vopr.id.derive("antfly.metadata.action", @as(u64, @intFromEnum(action)) + 1, discriminator);
+        return vopr.id.derive("antfly.metadata.action", @as(u64, @backingInt(action)) + 1, discriminator);
     }
 
     fn appendCandidate(
@@ -10207,7 +10208,7 @@ const MetadataVoprDriver = struct {
         std.mem.sort(FaultChange, changes[0..count], {}, struct {
             fn lessThan(_: void, lhs: FaultChange, rhs: FaultChange) bool {
                 if (lhs.id != rhs.id) return lhs.id < rhs.id;
-                return @intFromEnum(lhs.phase) < @intFromEnum(rhs.phase);
+                return @backingInt(lhs.phase) < @backingInt(rhs.phase);
             }
         }.lessThan);
         for (changes[0..count]) |change| try self.trace().addFault(.{
@@ -10892,7 +10893,7 @@ const MetadataVoprScratch = struct {
         return .{ .alloc = alloc, .io_impl = io_impl, .sub_path = sub_path };
     }
 
-    fn deinit(self: *MetadataVoprScratch) void {
+    pub fn deinit(self: *MetadataVoprScratch) void {
         const path = std.fmt.allocPrint(self.alloc, ".zig-cache/tmp/{s}", .{self.sub_path}) catch null;
         if (path) |owned_path| {
             std.Io.Dir.cwd().deleteTree(self.io_impl.io(), owned_path) catch {};

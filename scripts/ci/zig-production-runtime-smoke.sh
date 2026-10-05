@@ -95,7 +95,7 @@ exercise_post_handler_init_failure() {
 
   # The listener lease is acquired after the API handler runtime is initialized.
   # Reusing the live server's port forces that startup path to unwind and catches
-  # double-destroy regressions under the real ReleaseFast runtime.
+  # double-destroy regressions under the real fast runtime.
   if "$binary" standalone \
     --host 127.0.0.1 \
     --port "$port" \

@@ -210,10 +210,10 @@ pub const IcsInfo = struct {
     previous_window_shape: u1 = 0,
     max_sfb: u8,
     num_window_groups: u8,
-    window_group_length: [8]u8 = [_]u8{0} ** 8,
+    window_group_length: [8]u8 = @as([8]u8, @splat(0)),
     predictor_data_present: ?bool = null,
     predictor_reset_group: u8 = 0,
-    prediction_used: [max_prediction_bands]bool = [_]bool{false} ** max_prediction_bands,
+    prediction_used: [max_prediction_bands]bool = @as([max_prediction_bands]bool, @splat(false)),
 };
 
 pub const ElementPrefix = union(ElementKind) {
@@ -598,7 +598,7 @@ const AacDecodeScratch = struct {
     short_block: []f32 = &.{},
     imdct_work: []fast_imdct.Complex = &.{},
 
-    fn deinit(self: *AacDecodeScratch) void {
+    pub fn deinit(self: *AacDecodeScratch) void {
         self.allocator.free(self.windowed_samples);
         self.allocator.free(self.short_block);
         self.allocator.free(self.imdct_work);
@@ -693,7 +693,7 @@ const AacWindowTables = struct {
         }
     }
 
-    fn deinit(self: *AacWindowTables) void {
+    pub fn deinit(self: *AacWindowTables) void {
         self.freeFirst(16);
     }
 
@@ -722,7 +722,7 @@ const AacImdctPlans = struct {
         };
     }
 
-    fn deinit(self: *AacImdctPlans) void {
+    pub fn deinit(self: *AacImdctPlans) void {
         self.windows.deinit();
         self.long.deinit();
         self.short.deinit();
@@ -936,18 +936,18 @@ pub const TnsFilter = struct {
     direction: bool = false,
     coef_compress: bool = false,
     coef_len: u8 = 0,
-    coefficients: [20]u8 = [_]u8{0} ** 20,
+    coefficients: [20]u8 = @as([20]u8, @splat(0)),
 };
 
 pub const TnsWindow = struct {
     n_filt: u8 = 0,
     coef_res: u1 = 0,
-    filters: [4]TnsFilter = [_]TnsFilter{.{}} ** 4,
+    filters: [4]TnsFilter = @as([4]TnsFilter, @splat(.{})),
 };
 
 pub const TnsData = struct {
     num_windows: u8,
-    windows: [8]TnsWindow = [_]TnsWindow{.{}} ** 8,
+    windows: [8]TnsWindow = @as([8]TnsWindow, @splat(.{})),
 };
 
 pub const GainControlAdjustment = struct {
@@ -957,16 +957,16 @@ pub const GainControlAdjustment = struct {
 
 pub const GainControlWindow = struct {
     adjust_num: u8 = 0,
-    adjustments: [7]GainControlAdjustment = [_]GainControlAdjustment{.{}} ** 7,
+    adjustments: [7]GainControlAdjustment = @as([7]GainControlAdjustment, @splat(.{})),
 };
 
 pub const GainControlBand = struct {
-    windows: [8]GainControlWindow = [_]GainControlWindow{.{}} ** 8,
+    windows: [8]GainControlWindow = @as([8]GainControlWindow, @splat(.{})),
 };
 
 pub const GainControlData = struct {
     max_band: u8 = 0,
-    bands: [8]GainControlBand = [_]GainControlBand{.{}} ** 8,
+    bands: [8]GainControlBand = @as([8]GainControlBand, @splat(.{})),
 };
 
 const ElementHeader = struct {
@@ -1339,7 +1339,7 @@ const AacSpectralLookup = struct {
 
 fn buildAacSpectralLookup(comptime codes: anytype, comptime bits: anytype) [1 << AAC_SPECTRAL_LOOKUP_BITS]AacSpectralLookup {
     @setEvalBranchQuota(100_000);
-    var table = [_]AacSpectralLookup{.{}} ** (1 << AAC_SPECTRAL_LOOKUP_BITS);
+    var table = @as([(1 << AAC_SPECTRAL_LOOKUP_BITS)]AacSpectralLookup, @splat(.{}));
     for (codes, bits, 0..) |code, bit_len, i| {
         if (bit_len == 0 or bit_len > AAC_SPECTRAL_LOOKUP_BITS) continue;
         const fill_bits = AAC_SPECTRAL_LOOKUP_BITS - bit_len;
@@ -1418,7 +1418,7 @@ const AacScalefactorLookup = struct {
 
 fn buildAacScalefactorLookup() [1 << AAC_SCALEFACTOR_LOOKUP_BITS]AacScalefactorLookup {
     @setEvalBranchQuota(100_000);
-    var table = [_]AacScalefactorLookup{.{}} ** (1 << AAC_SCALEFACTOR_LOOKUP_BITS);
+    var table = @as([(1 << AAC_SCALEFACTOR_LOOKUP_BITS)]AacScalefactorLookup, @splat(.{}));
     for (scalefactor_codes, scalefactor_bits, 0..) |code, bit_len, symbol| {
         if (bit_len == 0 or bit_len > AAC_SCALEFACTOR_LOOKUP_BITS) continue;
         const fill_bits = AAC_SCALEFACTOR_LOOKUP_BITS - bit_len;
@@ -2078,7 +2078,7 @@ fn dequantizeFirstChannelSpectralCoefficientsAllocWithShape(
 ) !DequantizedSpectralCoefficients {
     var state = try initFirstChannelSpectralStateAllocWithShape(allocator, sample_rate, bytes, shape);
     defer state.deinit();
-    var predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&predictor_states);
     return try dequantizeFirstChannelSpectralStateAllocWithShape(allocator, sample_rate, &state, &predictor_states, shape);
 }
@@ -2387,7 +2387,7 @@ fn decodeSingleChannelPcmBlockWithExpectedLayoutAlloc(
     bytes: []const u8,
     expected_layout: ?ProgramConfigLayout,
 ) !FirstChannelPcmBlock {
-    var predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&predictor_states);
     return decodeSingleChannelPcmBlockWithExpectedLayoutAndPredictorsAlloc(
         allocator,
@@ -2692,8 +2692,8 @@ fn decodeChannelPairDequantizedCoefficientsWithExpectedLayoutAlloc(
     bytes: []const u8,
     expected_layout: ?ProgramConfigLayout,
 ) !ChannelPairDequantizedCoefficients {
-    var left_predictor_states = [_]PredictorState{.{}} ** max_predictors;
-    var right_predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var left_predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
+    var right_predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&left_predictor_states);
     resetAllPredictors(&right_predictor_states);
     return decodeChannelPairDequantizedCoefficientsWithExpectedLayoutAndPredictorsAlloc(
@@ -2990,8 +2990,8 @@ fn decodeChannelPairPcmBlockWithExpectedLayoutAlloc(
     bytes: []const u8,
     expected_layout: ?ProgramConfigLayout,
 ) !ChannelPairPcmBlock {
-    var left_predictor_states = [_]PredictorState{.{}} ** max_predictors;
-    var right_predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var left_predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
+    var right_predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&left_predictor_states);
     resetAllPredictors(&right_predictor_states);
     return decodeChannelPairPcmBlockWithExpectedLayoutAndPredictorsAlloc(
@@ -3175,8 +3175,8 @@ fn decodeChannelPairPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfos
     defer if (right_tail) |tail| allocator.free(tail);
     var previous_left_window_shape: u1 = 0;
     var previous_right_window_shape: u1 = 0;
-    var left_predictor_states = [_]PredictorState{.{}} ** max_predictors;
-    var right_predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var left_predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
+    var right_predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&left_predictor_states);
     resetAllPredictors(&right_predictor_states);
     var scratch = AacDecodeScratch{ .allocator = allocator };
@@ -3305,7 +3305,7 @@ fn decodeFirstChannelPcmSequenceWithExpectedLayoutAllocAndShapeMaybeTrailingInfo
     var tail: ?[]f32 = null;
     defer if (tail) |owned| allocator.free(owned);
     var previous_window_shape: u1 = 0;
-    var predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&predictor_states);
     var scratch = AacDecodeScratch{ .allocator = allocator };
     defer scratch.deinit();
@@ -4083,7 +4083,7 @@ fn inferRawDataBlockProgramConfigLayoutAlloc(
         if (trailingBitsAreZero(reader.bytes, reader.bit_offset)) return layout;
         if (reader.bytes.len * 8 - reader.bit_offset < 3) return error.UnsupportedAudioFormat;
 
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .sce, .lfe => {
                 if (require_layout_before_channel and layout == null) return error.UnsupportedAudioFormat;
@@ -4126,7 +4126,7 @@ const ChannelAccessUnits = struct {
     owned: std.ArrayList([]u8),
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *ChannelAccessUnits) void {
+    pub fn deinit(self: *ChannelAccessUnits) void {
         for (self.owned.items) |bytes| self.allocator.free(bytes);
         self.owned.deinit(self.allocator);
         self.units.deinit(self.allocator);
@@ -4219,7 +4219,7 @@ fn rawDataBlockHasChannelElement(bytes: []const u8) !bool {
         if (trailingBitsAreZero(reader.bytes, reader.bit_offset)) return false;
         if (reader.bytes.len * 8 - reader.bit_offset < 3) return error.UnsupportedAudioFormat;
 
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .sce, .cpe, .lfe => return true,
             .dse => {
@@ -4258,7 +4258,7 @@ fn supportedRawDataBlockEndBit(
 ) !usize {
     var reader = BitReader.initFromBitOffset(bytes, start_bit);
     while (true) {
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .sce, .lfe => {
                 _ = try reader.readBits(u8, 4);
@@ -4415,7 +4415,7 @@ fn scanAccessUnitTrailingInfoAlloc(
 
     while (reader.bit_offset < reader.bytes.len * 8) {
         if (trailingBitsAreZero(reader.bytes, reader.bit_offset)) return info;
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .sce, .lfe => {
                 _ = try reader.readBits(u8, 4);
@@ -5011,7 +5011,7 @@ fn decodeAacSpectralSymbol(reader: *BitReader, codebook: AacSpectralCodebook) !S
         .values = .{ 0, 0, 0, 0 },
         .dimensions = codebook.dimensions,
     };
-    var negative = [_]bool{false} ** 4;
+    var negative = @as([4]bool, @splat(false));
 
     if (codebook.unsigned_values) {
         for (0..codebook.dimensions) |i| {
@@ -5099,9 +5099,9 @@ fn decodeAacSpectralIndex(reader: *BitReader, codebook: AacSpectralCodebook) !us
 }
 
 fn unpackAacSpectralIndex(index: usize, radix: u8, dimensions: u8) [4]i16 {
-    var out = [_]i16{0} ** 4;
+    var out = @as([4]i16, @splat(0));
     var remaining = index;
-    var digits = [_]u8{0} ** 4;
+    var digits = @as([4]u8, @splat(0));
     var i = dimensions;
     while (i > 0) {
         i -= 1;
@@ -5271,7 +5271,7 @@ fn parseGainControlData(reader: *BitReader, ics_info: IcsInfo) !GainControlData 
         .{ 2, 1, 5 },
     };
 
-    const mode = @intFromEnum(ics_info.window_sequence);
+    const mode = @backingInt(ics_info.window_sequence);
     const max_band_bits: usize = if (ics_info.window_sequence == .eight_short) 3 else 2;
     const max_band = try reader.readBits(u8, max_band_bits);
     if (max_band > 8) return error.UnsupportedAudioFormat;
@@ -5406,7 +5406,7 @@ fn computeTnsLpc(filter: TnsFilter, out: *[20]f32) !usize {
     const map = tnsCoefficientMap(filter);
     if (map.len == 0) return error.UnsupportedAudioFormat;
 
-    var lpc = [_]f32{0} ** 20;
+    var lpc = @as([20]f32, @splat(0));
     for (0..filter.order) |m| {
         // The tables hold -sin(coef/iqfac); the step-up wants the reflection
         // coefficient itself (ISO 14496-3 4.6.9.4.2).
@@ -5928,8 +5928,8 @@ fn parsePulseData(reader: *BitReader, ics_info: IcsInfo) !PulseData {
     var pulse = PulseData{
         .num_pulse = try reader.readBits(u8, 2) + 1,
         .pulse_swb = try reader.readBits(u8, 6),
-        .offsets = [_]u8{0} ** 4,
-        .amplitudes = [_]u8{0} ** 4,
+        .offsets = @as([4]u8, @splat(0)),
+        .amplitudes = @as([4]u8, @splat(0)),
     };
     pulse.offsets[0] = try reader.readBits(u8, 5);
     pulse.amplitudes[0] = try reader.readBits(u8, 4);
@@ -5981,7 +5981,7 @@ fn seekFirstChannelElement(reader: *BitReader) !ElementHeader {
 
 fn seekFirstChannelElementWithTrailingInfo(reader: *BitReader, trailing_info: *TrailingElementInfo) !ElementHeader {
     while (true) {
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .sce, .cpe, .lfe => {
                 const element_instance_tag = try reader.readBits(u8, 4);
@@ -6014,7 +6014,7 @@ fn scanSupportedTrailingElements(reader: *BitReader) !TrailingElementInfo {
         if (trailingBitsAreZero(reader.bytes, reader.bit_offset)) return info;
         if (reader.bytes.len * 8 - reader.bit_offset < 3) return error.UnsupportedAudioFormat;
 
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .dse => {
                 _ = try reader.readBits(u8, 4);
@@ -6068,7 +6068,7 @@ const FirstChannelSpectralState = struct {
     tns_data: ?TnsData,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *FirstChannelSpectralState) void {
+    pub fn deinit(self: *FirstChannelSpectralState) void {
         self.allocator.free(self.sections);
         self.allocator.free(self.bands);
         self.allocator.free(self.plans);
@@ -6108,7 +6108,7 @@ const ChannelDequantized = struct {
         try deinterleaveShortWindowCoefficientsAlloc(self.allocator, self.coefficients, ics_info, raw_swb_offsets, coeff_offsets, shape);
     }
 
-    fn deinit(self: *ChannelDequantized) void {
+    pub fn deinit(self: *ChannelDequantized) void {
         self.allocator.free(self.bands);
         self.allocator.free(self.coefficients);
     }
@@ -6695,13 +6695,13 @@ pub const ProgramConfigLayout = struct {
     back_single_count: u8 = 0,
     back_pair_count: u8 = 0,
     lfe_count: u8 = 0,
-    front_single_tags: [4]u8 = [_]u8{0} ** 4,
-    front_pair_tags: [4]u8 = [_]u8{0} ** 4,
-    side_single_tags: [4]u8 = [_]u8{0} ** 4,
-    side_pair_tags: [4]u8 = [_]u8{0} ** 4,
-    back_single_tags: [4]u8 = [_]u8{0} ** 4,
-    back_pair_tags: [4]u8 = [_]u8{0} ** 4,
-    lfe_tags: [4]u8 = [_]u8{0} ** 4,
+    front_single_tags: [4]u8 = @as([4]u8, @splat(0)),
+    front_pair_tags: [4]u8 = @as([4]u8, @splat(0)),
+    side_single_tags: [4]u8 = @as([4]u8, @splat(0)),
+    side_pair_tags: [4]u8 = @as([4]u8, @splat(0)),
+    back_single_tags: [4]u8 = @as([4]u8, @splat(0)),
+    back_pair_tags: [4]u8 = @as([4]u8, @splat(0)),
+    lfe_tags: [4]u8 = @as([4]u8, @splat(0)),
 
     fn regularSingleCount(self: ProgramConfigLayout) u8 {
         return self.front_single_count + self.side_single_count + self.back_single_count;
@@ -6893,7 +6893,7 @@ fn addProgramConfigChannelElement(
 fn inferLeadingProgramConfigLayout(bytes: []const u8) !?ProgramConfigLayout {
     var reader = BitReader.init(bytes);
     while (true) {
-        const kind = @as(ElementKind, @enumFromInt(try reader.readBits(u3, 3)));
+        const kind = @as(ElementKind, @fromBackingInt(@intCast(try reader.readBits(u3, 3))));
         switch (kind) {
             .pce => return try parseProgramConfigElementWithTag(&reader),
             .fil => try skipFillElement(&reader),
@@ -6928,7 +6928,7 @@ fn decodePredictionData(reader: *BitReader, max_sfb: u8, sample_rate: u32) !stru
     const sample_rate_index = try sampleRateIndexForRate(sample_rate);
     const band_limit = @min(max_sfb, predictor_sfb_max[sample_rate_index]);
     var predictor_reset_group: u8 = 0;
-    var prediction_used = [_]bool{false} ** max_prediction_bands;
+    var prediction_used = @as([max_prediction_bands]bool, @splat(false));
 
     if ((try reader.readBits(u1, 1)) != 0) {
         predictor_reset_group = try reader.readBits(u8, 5);
@@ -6948,26 +6948,26 @@ fn parseIcsInfo(reader: *BitReader, sample_rate: ?u32) !IcsInfo {
     _ = try reader.readBits(u1, 1);
     const window_sequence = try reader.readBits(u2, 2);
     const window_shape = try reader.readBits(u1, 1);
-    if (window_sequence == @intFromEnum(WindowSequence.eight_short)) {
+    if (window_sequence == @backingInt(WindowSequence.eight_short)) {
         const max_sfb = try reader.readBits(u8, 4);
         const grouping = try reader.readBits(u8, 7);
         const group_lengths = shortWindowGroupLengths(grouping);
         return .{
-            .window_sequence = @enumFromInt(window_sequence),
+            .window_sequence = @fromBackingInt(@intCast(window_sequence)),
             .window_shape = window_shape,
             .max_sfb = max_sfb,
             .num_window_groups = group_lengths.num_groups,
             .window_group_length = group_lengths.lengths,
             .predictor_data_present = null,
             .predictor_reset_group = 0,
-            .prediction_used = [_]bool{false} ** max_prediction_bands,
+            .prediction_used = @as([max_prediction_bands]bool, @splat(false)),
         };
     }
 
     const max_sfb = try reader.readBits(u8, 6);
     const predictor_data_present = (try reader.readBits(u1, 1)) != 0;
     var predictor_reset_group: u8 = 0;
-    var prediction_used = [_]bool{false} ** max_prediction_bands;
+    var prediction_used = @as([max_prediction_bands]bool, @splat(false));
     if (predictor_data_present) {
         const known_sample_rate = sample_rate orelse return error.UnsupportedAudioFormat;
         const prediction = try decodePredictionData(reader, max_sfb, known_sample_rate);
@@ -6975,7 +6975,7 @@ fn parseIcsInfo(reader: *BitReader, sample_rate: ?u32) !IcsInfo {
         prediction_used = prediction.prediction_used;
     }
     return .{
-        .window_sequence = @enumFromInt(window_sequence),
+        .window_sequence = @fromBackingInt(@intCast(window_sequence)),
         .window_shape = window_shape,
         .max_sfb = max_sfb,
         .num_window_groups = 1,
@@ -6992,7 +6992,7 @@ const ShortWindowGroups = struct {
 };
 
 fn shortWindowGroupLengths(grouping: u8) ShortWindowGroups {
-    var lengths = [_]u8{0} ** 8;
+    var lengths = @as([8]u8, @splat(0));
     lengths[0] = 1;
     var groups: u8 = 1;
     for (0..7) |i| {
@@ -7332,7 +7332,7 @@ test "scan adts frames skips trailing id3v1 tag" {
     try plain_bytes.appendSlice(std.testing.allocator, &frame);
     try plain_bytes.appendSlice(std.testing.allocator, payload);
 
-    var id3v1 = [_]u8{0} ** 128;
+    var id3v1 = @as([128]u8, @splat(0));
     id3v1[0] = 'T';
     id3v1[1] = 'A';
     id3v1[2] = 'G';
@@ -7396,9 +7396,9 @@ test "decode adts frame with two crc-absent raw data blocks" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     const payload = payload_builder.bytes.items;
     const frame_len: u16 = @intCast(7 + payload.len);
@@ -7433,10 +7433,10 @@ test "decode adts crc-protected frame with two raw data blocks skips block crcs"
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     const payload = payload_builder.bytes.items;
@@ -7523,7 +7523,7 @@ test "aac lc adts fixed channel config skips metadata-only first stereo raw-data
     defer payload_builder.deinit(std.testing.allocator);
     try payload_builder.appendMetadataOnlyDseFilEnd(std.testing.allocator);
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -7547,7 +7547,7 @@ test "aac lc adts fixed channel config skips metadata-only crc-protected first s
     try payload_builder.appendMetadataOnlyDseFilEnd(std.testing.allocator);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     var adts = std.ArrayList(u8).empty;
@@ -7665,7 +7665,7 @@ test "parse synthetic eight-short ics info keeps window grouping lengths" {
     defer builder.deinit(std.testing.allocator);
 
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 9, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1011000, 7); // 2, 3, 1, 1, 1
@@ -7683,7 +7683,7 @@ test "parse synthetic long-window ics info uses single group length" {
     defer builder.deinit(std.testing.allocator);
 
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 42, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -7703,7 +7703,7 @@ test "parse synthetic long-window ics info rejects predictor data" {
     defer builder.deinit(std.testing.allocator);
 
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 42, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 1, 1); // predictor_data_present
@@ -7717,7 +7717,7 @@ test "parse synthetic long-window ics info decodes predictor data when sample ra
     defer builder.deinit(std.testing.allocator);
 
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 1, 1); // predictor_data_present
@@ -7822,11 +7822,11 @@ test "init synthetic eight-short spectral state with supplied offsets" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -7874,11 +7874,11 @@ test "parse synthetic eight-short spectral layout plan with actual swb_offset_12
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -7941,11 +7941,11 @@ test "dequantize synthetic eight-short spectral state with supplied offsets stay
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -7987,11 +7987,11 @@ test "dequantize synthetic eight-short spectral state with actual swb_offset_128
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -8019,11 +8019,11 @@ test "window synthetic eight-short spectral state with supplied offsets stays ze
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -8062,11 +8062,11 @@ test "decode synthetic eight-short pcm block with supplied offsets stays zero" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -8110,11 +8110,11 @@ test "decode synthetic eight-short pcm block adds previous tail" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -8159,11 +8159,11 @@ test "decode first-channel pcm block accepts synthetic eight-short data with act
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -8583,7 +8583,7 @@ test "window first-channel long block for checked-in mono fixture keeps pns tail
 }
 
 test "overlap add long block handles null previous tail" {
-    const windowed = [_]f32{1} ** 2048;
+    const windowed = @as([2048]f32, @splat(1));
     var overlapped = try overlapAddLongBlockAlloc(std.testing.allocator, null, &windowed);
     defer overlapped.deinit();
     try std.testing.expectEqual(@as(usize, 1024), overlapped.pcm.len);
@@ -8593,8 +8593,8 @@ test "overlap add long block handles null previous tail" {
 }
 
 test "overlap add long block sums previous tail" {
-    const prev = [_]f32{0.25} ** 1024;
-    const curr = [_]f32{0.75} ** 2048;
+    const prev = @as([1024]f32, @splat(0.25));
+    const curr = @as([2048]f32, @splat(0.75));
     var overlapped = try overlapAddLongBlockAlloc(std.testing.allocator, &prev, &curr);
     defer overlapped.deinit();
     for (overlapped.pcm) |sample| try std.testing.expectEqual(@as(f32, 1.0), sample);
@@ -8821,13 +8821,13 @@ test "decode synthetic channel-pair dequantized coefficients supports common_win
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.cpe), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.cpe), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 0, 1); // common_window = false
 
     try builder.appendBits(std.testing.allocator, 100, 8); // left global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 1, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -8839,7 +8839,7 @@ test "decode synthetic channel-pair dequantized coefficients supports common_win
 
     try builder.appendBits(std.testing.allocator, 100, 8); // right global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 1, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -8868,7 +8868,7 @@ test "decode synthetic mono block skips leading pce element" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // element_instance_tag
     try builder.appendBits(std.testing.allocator, 1, 2); // profile
     try builder.appendBits(std.testing.allocator, 4, 4); // sampling_frequency_index = 44.1 kHz
@@ -8886,11 +8886,11 @@ test "decode synthetic mono block skips leading pce element" {
     try builder.alignToByte(std.testing.allocator);
     try builder.appendBits(std.testing.allocator, 0, 8); // comment_field_bytes
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 0, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -8915,7 +8915,7 @@ test "decode synthetic mono block skips leading dse element" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.dse), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.dse), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // element_instance_tag
     try builder.appendBits(std.testing.allocator, 1, 1); // byte_align
     try builder.appendBits(std.testing.allocator, 2, 8); // count
@@ -8941,7 +8941,7 @@ test "decode synthetic mono block skips leading fil element" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.fil), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.fil), 3);
     try builder.appendBits(std.testing.allocator, 2, 4); // count
     try builder.appendBits(std.testing.allocator, 0xaa, 8);
     try builder.appendBits(std.testing.allocator, 0xbb, 8);
@@ -8964,7 +8964,7 @@ test "decode synthetic mono block skips leading fil element with zero escape cou
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.fil), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.fil), 3);
     try builder.appendBits(std.testing.allocator, 15, 4); // escaped count
     try builder.appendBits(std.testing.allocator, 0, 8); // count becomes 14
     for (0..14) |_| try builder.appendBits(std.testing.allocator, 0xaa, 8);
@@ -8988,16 +8988,16 @@ test "decode mono pcm sequence skips supported trailing metadata elements" {
     defer builder.deinit(std.testing.allocator);
 
     try builder.appendSilentMonoSce(std.testing.allocator);
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.dse), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.dse), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // element_instance_tag
     try builder.appendBits(std.testing.allocator, 1, 1); // byte_align
     try builder.appendBits(std.testing.allocator, 1, 8); // count
     try builder.alignToByte(std.testing.allocator);
     try builder.appendBits(std.testing.allocator, 0xaa, 8);
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.fil), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.fil), 3);
     try builder.appendBits(std.testing.allocator, 1, 4); // count
     try builder.appendBits(std.testing.allocator, 0xbb, 8);
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var decoded = try decodeFirstChannelPcmSequenceAlloc(std.testing.allocator, 44100, &.{builder.bytes.items});
     defer decoded.deinit();
@@ -9036,11 +9036,11 @@ test "decode synthetic channel-pair rejects truncated gain-control payload" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.cpe), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.cpe), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 1, 1); // common_window
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 21, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -9066,11 +9066,11 @@ test "decode synthetic channel-pair parses tns data before gain-control flag" {
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.cpe), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.cpe), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 1, 1); // common_window
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 0, 6); // max_sfb
     try builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -9104,16 +9104,16 @@ test "decode synthetic channel-pair skips supported trailing metadata elements" 
     defer builder.deinit(std.testing.allocator);
 
     try builder.appendSilentStereoCpe(std.testing.allocator);
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.dse), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.dse), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // element_instance_tag
     try builder.appendBits(std.testing.allocator, 1, 1); // byte_align
     try builder.appendBits(std.testing.allocator, 1, 8); // count
     try builder.alignToByte(std.testing.allocator);
     try builder.appendBits(std.testing.allocator, 0xaa, 8);
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.fil), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.fil), 3);
     try builder.appendBits(std.testing.allocator, 1, 4); // count
     try builder.appendBits(std.testing.allocator, 0xbb, 8);
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var pair = try decodeChannelPairDequantizedCoefficientsAlloc(
         std.testing.allocator,
@@ -9148,13 +9148,13 @@ test "decode synthetic channel-pair pcm block supports common_window false eight
     var builder = TestBitBuilder.init();
     defer builder.deinit(std.testing.allocator);
 
-    try builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.cpe), 3);
+    try builder.appendBits(std.testing.allocator, @backingInt(ElementKind.cpe), 3);
     try builder.appendBits(std.testing.allocator, 0, 4); // tag
     try builder.appendBits(std.testing.allocator, 0, 1); // common_window = false
 
     try builder.appendBits(std.testing.allocator, 100, 8); // left global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -9166,7 +9166,7 @@ test "decode synthetic channel-pair pcm block supports common_window false eight
 
     try builder.appendBits(std.testing.allocator, 100, 8); // right global_gain
     try builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.eight_short), 2);
+    try builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.eight_short), 2);
     try builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try builder.appendBits(std.testing.allocator, 2, 4); // max_sfb
     try builder.appendBits(std.testing.allocator, 0b1111111, 7); // one group of 8 windows
@@ -9199,11 +9199,11 @@ test "aac pcm sequence tail replacement handles allocation failure" {
     var mono_builder = TestBitBuilder.init();
     defer mono_builder.deinit(std.testing.allocator);
 
-    try mono_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try mono_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try mono_builder.appendBits(std.testing.allocator, 0, 4); // tag
     try mono_builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try mono_builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try mono_builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try mono_builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try mono_builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try mono_builder.appendBits(std.testing.allocator, 0, 6); // max_sfb
     try mono_builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -9226,11 +9226,11 @@ test "aac pcm sequence tail replacement handles allocation failure" {
     var stereo_builder = TestBitBuilder.init();
     defer stereo_builder.deinit(std.testing.allocator);
 
-    try stereo_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.cpe), 3);
+    try stereo_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.cpe), 3);
     try stereo_builder.appendBits(std.testing.allocator, 0, 4); // tag
     try stereo_builder.appendBits(std.testing.allocator, 1, 1); // common_window
     try stereo_builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try stereo_builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try stereo_builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try stereo_builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try stereo_builder.appendBits(std.testing.allocator, 0, 6); // max_sfb
     try stereo_builder.appendBits(std.testing.allocator, 0, 1); // predictor_data_present
@@ -9459,15 +9459,15 @@ test "dequantize aac coefficient preserves sign and zero" {
 }
 
 test "imdct long of zero coefficients stays zero" {
-    const coeffs = [_]f32{0} ** 1024;
-    var out = [_]f32{1} ** 2048;
+    const coeffs = @as([1024]f32, @splat(0));
+    var out = @as([2048]f32, @splat(1));
     try imdctLongInto(&out, &coeffs);
     for (out) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
 }
 
 test "imdct short of zero coefficients stays zero" {
-    const coeffs = [_]f32{0} ** 128;
-    var out = [_]f32{1} ** 256;
+    const coeffs = @as([128]f32, @splat(0));
+    var out = @as([256]f32, @splat(1));
     try imdctShortInto(&out, &coeffs);
     for (out) |sample| try std.testing.expectApproxEqAbs(@as(f32, 0), sample, 1e-6);
 }
@@ -9489,7 +9489,7 @@ test "optimized aac imdct stays close to naive transform" {
 }
 
 test "compose eight short window sequence places first short block at aac offset" {
-    var coeffs = [_]f32{0} ** 1024;
+    var coeffs = @as([1024]f32, @splat(0));
     coeffs[0] = 1.0;
 
     var seq = try composeEightShortWindowSequenceAlloc(std.testing.allocator, &coeffs);
@@ -9512,7 +9512,7 @@ test "compose eight short window sequence places first short block at aac offset
 }
 
 test "compose eight short window sequence overlaps adjacent windows by 128 samples" {
-    var coeffs = [_]f32{0} ** 1024;
+    var coeffs = @as([1024]f32, @splat(0));
     coeffs[0] = 1.0;
     coeffs[128] = 1.0;
 
@@ -9572,7 +9572,7 @@ test "overlap add short window sequence adds previous tail into first half" {
 }
 
 test "short window overlap add splits composed sequence into pcm and tail" {
-    var coeffs = [_]f32{0} ** 1024;
+    var coeffs = @as([1024]f32, @splat(0));
     coeffs[0] = 1.0;
     coeffs[7 * 128] = 1.0;
 
@@ -9712,7 +9712,7 @@ const TestBitBuilder = struct {
         };
     }
 
-    fn deinit(self: *TestBitBuilder, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TestBitBuilder, allocator: std.mem.Allocator) void {
         self.bytes.deinit(allocator);
     }
 
@@ -9745,24 +9745,24 @@ const TestBitBuilder = struct {
     }
 
     fn appendMetadataOnlyDseFilEnd(self: *TestBitBuilder, allocator: std.mem.Allocator) !void {
-        try self.appendBits(allocator, @intFromEnum(ElementKind.dse), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.dse), 3);
         try self.appendBits(allocator, 0, 4); // element_instance_tag
         try self.appendBits(allocator, 1, 1); // byte_align
         try self.appendBits(allocator, 1, 8); // count
         try self.alignToByte(allocator);
         try self.appendBits(allocator, 0xaa, 8);
-        try self.appendBits(allocator, @intFromEnum(ElementKind.fil), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.fil), 3);
         try self.appendBits(allocator, 1, 4); // count
         try self.appendBits(allocator, 0xbb, 8);
-        try self.appendBits(allocator, @intFromEnum(ElementKind.end), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.end), 3);
     }
 
     fn appendByteAlignedMetadataOnlyFilEnd(self: *TestBitBuilder, allocator: std.mem.Allocator) !void {
         for (0..3) |_| {
-            try self.appendBits(allocator, @intFromEnum(ElementKind.fil), 3);
+            try self.appendBits(allocator, @backingInt(ElementKind.fil), 3);
             try self.appendBits(allocator, 0, 4); // count
         }
-        try self.appendBits(allocator, @intFromEnum(ElementKind.end), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.end), 3);
     }
 
     fn appendSilentMonoSce(self: *TestBitBuilder, allocator: std.mem.Allocator) !void {
@@ -9770,11 +9770,11 @@ const TestBitBuilder = struct {
     }
 
     fn appendNonZeroMonoSce(self: *TestBitBuilder, allocator: std.mem.Allocator) !void {
-        try self.appendBits(allocator, @intFromEnum(ElementKind.sce), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.sce), 3);
         try self.appendBits(allocator, 0, 4); // tag
         try self.appendBits(allocator, 100, 8); // global_gain
         try self.appendBits(allocator, 0, 1); // reserved
-        try self.appendBits(allocator, @intFromEnum(WindowSequence.only_long), 2);
+        try self.appendBits(allocator, @backingInt(WindowSequence.only_long), 2);
         try self.appendBits(allocator, 0, 1); // window_shape
         try self.appendBits(allocator, 1, 6); // max_sfb
         try self.appendBits(allocator, 0, 1); // predictor_data_present
@@ -9806,11 +9806,11 @@ const TestBitBuilder = struct {
         kind: ElementKind,
         tag: u4,
     ) !void {
-        try self.appendBits(allocator, @intFromEnum(kind), 3);
+        try self.appendBits(allocator, @backingInt(kind), 3);
         try self.appendBits(allocator, tag, 4);
         try self.appendBits(allocator, 100, 8); // global_gain
         try self.appendBits(allocator, 0, 1); // reserved
-        try self.appendBits(allocator, @intFromEnum(WindowSequence.only_long), 2);
+        try self.appendBits(allocator, @backingInt(WindowSequence.only_long), 2);
         try self.appendBits(allocator, 0, 1); // window_shape
         try self.appendBits(allocator, 0, 6); // max_sfb
         try self.appendBits(allocator, 0, 1); // predictor_data_present
@@ -9978,11 +9978,11 @@ const TestBitBuilder = struct {
     }
 
     fn appendSilentStereoCpeWithTag(self: *TestBitBuilder, allocator: std.mem.Allocator, tag: u4) !void {
-        try self.appendBits(allocator, @intFromEnum(ElementKind.cpe), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.cpe), 3);
         try self.appendBits(allocator, tag, 4);
         try self.appendBits(allocator, 1, 1); // common_window
         try self.appendBits(allocator, 0, 1); // reserved
-        try self.appendBits(allocator, @intFromEnum(WindowSequence.only_long), 2);
+        try self.appendBits(allocator, @backingInt(WindowSequence.only_long), 2);
         try self.appendBits(allocator, 0, 1); // window_shape
         try self.appendBits(allocator, 0, 6); // max_sfb
         try self.appendBits(allocator, 0, 1); // predictor_data_present
@@ -9998,11 +9998,11 @@ const TestBitBuilder = struct {
     }
 
     fn appendSilentStereoCpeWithGainControlAndSbrFill(self: *TestBitBuilder, allocator: std.mem.Allocator, tag: u4) !void {
-        try self.appendBits(allocator, @intFromEnum(ElementKind.cpe), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.cpe), 3);
         try self.appendBits(allocator, tag, 4);
         try self.appendBits(allocator, 1, 1); // common_window
         try self.appendBits(allocator, 0, 1); // reserved
-        try self.appendBits(allocator, @intFromEnum(WindowSequence.only_long), 2);
+        try self.appendBits(allocator, @backingInt(WindowSequence.only_long), 2);
         try self.appendBits(allocator, 0, 1); // window_shape
         try self.appendBits(allocator, 0, 6); // max_sfb
         try self.appendBits(allocator, 0, 1); // predictor_data_present
@@ -10021,11 +10021,11 @@ const TestBitBuilder = struct {
     }
 
     fn appendStereoIntensityCpeWithTnsGainAndSbrFill(self: *TestBitBuilder, allocator: std.mem.Allocator, tag: u4) !void {
-        try self.appendBits(allocator, @intFromEnum(ElementKind.cpe), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.cpe), 3);
         try self.appendBits(allocator, tag, 4);
         try self.appendBits(allocator, 1, 1); // common_window
         try self.appendBits(allocator, 0, 1); // reserved
-        try self.appendBits(allocator, @intFromEnum(WindowSequence.only_long), 2);
+        try self.appendBits(allocator, @backingInt(WindowSequence.only_long), 2);
         try self.appendBits(allocator, 0, 1); // window_shape
         try self.appendBits(allocator, 1, 6); // max_sfb
         try self.appendBits(allocator, 0, 1); // predictor_data_present
@@ -10064,7 +10064,7 @@ const TestBitBuilder = struct {
     }
 
     fn appendSyntheticEnhancementFillElement(self: *TestBitBuilder, allocator: std.mem.Allocator, payload: []const u8) !void {
-        try self.appendBits(allocator, @intFromEnum(ElementKind.fil), 3);
+        try self.appendBits(allocator, @backingInt(ElementKind.fil), 3);
         if (payload.len > 15) return error.UnsupportedAudioFormat;
         try self.appendBits(allocator, payload.len, 4);
         for (payload) |byte| try self.appendBits(allocator, byte, 8);
@@ -10345,11 +10345,11 @@ test "aac main mp4 access unit config decodes mono predictor data" {
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.sce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.sce), 3);
     try unit_builder.appendBits(std.testing.allocator, 0, 4); // tag
     try unit_builder.appendBits(std.testing.allocator, 100, 8); // global_gain
     try unit_builder.appendBits(std.testing.allocator, 0, 1); // reserved
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(WindowSequence.only_long), 2);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(WindowSequence.only_long), 2);
     try unit_builder.appendBits(std.testing.allocator, 0, 1); // window_shape
     try unit_builder.appendBits(std.testing.allocator, 1, 6); // max_sfb
     try unit_builder.appendBits(std.testing.allocator, 1, 1); // predictor_data_present
@@ -11053,16 +11053,16 @@ test "aac lc mp4 access unit config skips metadata-only mono access unit" {
 
     var metadata_unit = TestBitBuilder.init();
     defer metadata_unit.deinit(std.testing.allocator);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.dse), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.dse), 3);
     try metadata_unit.appendBits(std.testing.allocator, 0, 4); // element_instance_tag
     try metadata_unit.appendBits(std.testing.allocator, 1, 1); // byte_align
     try metadata_unit.appendBits(std.testing.allocator, 1, 8); // count
     try metadata_unit.alignToByte(std.testing.allocator);
     try metadata_unit.appendBits(std.testing.allocator, 0xaa, 8);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.fil), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.fil), 3);
     try metadata_unit.appendBits(std.testing.allocator, 1, 4); // count
     try metadata_unit.appendBits(std.testing.allocator, 0xbb, 8);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var audio_unit = TestBitBuilder.init();
     defer audio_unit.deinit(std.testing.allocator);
@@ -11095,10 +11095,10 @@ test "aac lc mp4 access unit config rejects metadata-only mono access units" {
 
     var metadata_unit = TestBitBuilder.init();
     defer metadata_unit.deinit(std.testing.allocator);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.fil), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.fil), 3);
     try metadata_unit.appendBits(std.testing.allocator, 1, 4); // count
     try metadata_unit.appendBits(std.testing.allocator, 0xbb, 8);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     try std.testing.expectError(
         error.UnsupportedAudioFormat,
@@ -11115,7 +11115,7 @@ test "aac lc mp4 access unit config rejects metadata-only mono access units" {
 test "aac lc adts explicit pce channel config decodes mono access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoPce(std.testing.allocator);
     try payload_builder.appendSilentMonoSce(std.testing.allocator);
 
@@ -11147,7 +11147,7 @@ test "aac lc adts explicit pce channel config decodes mono access unit" {
 test "aac lc adts explicit pce channel config reuses first-frame mono layout" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
     try first_payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
 
@@ -11172,9 +11172,9 @@ test "aac lc adts explicit pce channel config reuses first-frame mono layout" {
 test "aac lc adts explicit pce channel config skips metadata-only leading mono frame" {
     var metadata_payload_builder = TestBitBuilder.init();
     defer metadata_payload_builder.deinit(std.testing.allocator);
-    try metadata_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try metadata_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try metadata_payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
-    try metadata_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var audio_payload_builder = TestBitBuilder.init();
     defer audio_payload_builder.deinit(std.testing.allocator);
@@ -11201,7 +11201,7 @@ test "aac lc adts explicit pce channel config skips metadata-only pre-layout mon
 
     var audio_payload_builder = TestBitBuilder.init();
     defer audio_payload_builder.deinit(std.testing.allocator);
-    try audio_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try audio_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try audio_payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
     try audio_payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
 
@@ -11222,9 +11222,9 @@ test "aac lc adts explicit pce channel config skips metadata-only pre-layout mon
 test "aac lc adts explicit pce channel config rejects metadata-only mono stream" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11254,7 +11254,7 @@ test "aac lc adts explicit pce channel config rejects missing initial layout" {
 test "aac lc adts explicit pce channel config rejects later mono tag mismatch" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
     try first_payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 3);
 
@@ -11276,7 +11276,7 @@ test "aac lc adts explicit pce channel config rejects later mono tag mismatch" {
 test "aac lc adts explicit pce channel config rejects mixed sample rate frames" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .front, 0);
     try first_payload_builder.appendSilentMonoSce(std.testing.allocator);
 
@@ -11333,7 +11333,7 @@ test "aac lc mp4 explicit pce mono lfe decodes access unit" {
 test "aac lc adts explicit pce channel config decodes mono lfe access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoLfePce(std.testing.allocator);
     try payload_builder.appendSilentLfeWithTag(std.testing.allocator, 0);
 
@@ -11420,9 +11420,9 @@ test "aac lc mp4 explicit pce rejects mismatched metadata-only mono access unit"
 
     var metadata_unit = TestBitBuilder.init();
     defer metadata_unit.deinit(std.testing.allocator);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try metadata_unit.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var audio_unit = TestBitBuilder.init();
     defer audio_unit.deinit(std.testing.allocator);
@@ -11453,7 +11453,7 @@ test "aac lc mp4 explicit pce rejects mismatched in-band mono pce before matchin
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try unit_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
     try unit_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
 
@@ -11482,12 +11482,12 @@ test "aac lc mp4 explicit pce rejects conflicting repeated in-band mono pce" {
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try unit_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
     try unit_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try unit_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     try std.testing.expectError(
         error.UnsupportedAudioFormat,
@@ -11504,7 +11504,7 @@ test "aac lc mp4 explicit pce rejects conflicting repeated in-band mono pce" {
 test "aac lc adts explicit pce channel config decodes mono back sce access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 3);
 
@@ -11578,9 +11578,9 @@ test "aac lc mp4 explicit pce skips metadata-only stereo access unit" {
 
     var metadata_unit = TestBitBuilder.init();
     defer metadata_unit.deinit(std.testing.allocator);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try metadata_unit.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var audio_unit = TestBitBuilder.init();
     defer audio_unit.deinit(std.testing.allocator);
@@ -11614,9 +11614,9 @@ test "aac lc mp4 explicit pce rejects mismatched metadata-only stereo access uni
 
     var metadata_unit = TestBitBuilder.init();
     defer metadata_unit.deinit(std.testing.allocator);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try metadata_unit.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var audio_unit = TestBitBuilder.init();
     defer audio_unit.deinit(std.testing.allocator);
@@ -11647,9 +11647,9 @@ test "aac lc mp4 explicit pce rejects metadata-only stereo access units" {
 
     var metadata_unit = TestBitBuilder.init();
     defer metadata_unit.deinit(std.testing.allocator);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try metadata_unit.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
-    try metadata_unit.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try metadata_unit.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     try std.testing.expectError(
         error.UnsupportedAudioFormat,
@@ -11676,7 +11676,7 @@ test "aac lc mp4 explicit pce rejects mismatched in-band stereo pce before match
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try unit_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try unit_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
 
@@ -11705,12 +11705,12 @@ test "aac lc mp4 explicit pce rejects conflicting repeated in-band stereo pce" {
 
     var unit_builder = TestBitBuilder.init();
     defer unit_builder.deinit(std.testing.allocator);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try unit_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try unit_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try unit_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
-    try unit_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try unit_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     try std.testing.expectError(
         error.UnsupportedAudioFormat,
@@ -11727,7 +11727,7 @@ test "aac lc mp4 explicit pce rejects conflicting repeated in-band stereo pce" {
 test "aac lc adts explicit pce channel config decodes stereo access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPce(std.testing.allocator);
     try payload_builder.appendSilentStereoCpe(std.testing.allocator);
 
@@ -11759,7 +11759,7 @@ test "aac lc adts explicit pce channel config decodes stereo access unit" {
 test "aac lc adts explicit pce channel config reuses first-frame stereo cpe layout" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try first_payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
 
@@ -11784,7 +11784,7 @@ test "aac lc adts explicit pce channel config reuses first-frame stereo cpe layo
 test "aac lc adts explicit pce channel config reuses first-frame stereo sce layout" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendStereoScePairPceWithFrontBackTags(std.testing.allocator, 2, 3);
     try first_payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
     try first_payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 3);
@@ -11811,12 +11811,12 @@ test "aac lc adts explicit pce channel config reuses first-frame stereo sce layo
 test "aac lc adts explicit pce channel config reuses first raw-data-block stereo layout" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11836,11 +11836,11 @@ test "aac lc adts explicit pce channel config reuses first raw-data-block stereo
 test "aac lc adts explicit pce channel config skips metadata-only first raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11861,10 +11861,10 @@ test "aac lc adts explicit pce channel config skips metadata-only pre-layout raw
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
     try payload_builder.appendByteAlignedMetadataOnlyFilEnd(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11884,12 +11884,12 @@ test "aac lc adts explicit pce channel config skips metadata-only pre-layout raw
 test "aac lc adts explicit pce channel config rejects later raw-data-block stereo tag mismatch" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11906,12 +11906,12 @@ test "aac lc adts explicit pce channel config rejects later raw-data-block stere
 test "aac lc adts explicit pce channel config rejects conflicting repeated layout in same raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11926,12 +11926,12 @@ test "aac lc adts explicit pce channel config rejects conflicting repeated layou
 test "aac lc adts explicit pce channel config rejects conflicting repeated mono layout in same raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11946,14 +11946,14 @@ test "aac lc adts explicit pce channel config rejects conflicting repeated mono 
 test "aac lc adts explicit pce channel config rejects conflicting repeated layout in later raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11970,14 +11970,14 @@ test "aac lc adts explicit pce channel config rejects conflicting repeated layou
 test "aac lc adts explicit pce channel config rejects conflicting repeated mono layout in later raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
 
     var adts = std.ArrayList(u8).empty;
     defer adts.deinit(std.testing.allocator);
@@ -11994,15 +11994,15 @@ test "aac lc adts explicit pce channel config rejects conflicting repeated mono 
 test "aac lc adts explicit pce channel config reuses crc-protected raw-data-block stereo layout" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoScePairPceWithFrontBackTags(std.testing.allocator, 2, 3);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 3);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     var adts = std.ArrayList(u8).empty;
@@ -12029,10 +12029,10 @@ test "aac lc adts explicit pce channel config skips crc-protected metadata-only 
     defer payload_builder.deinit(std.testing.allocator);
     try payload_builder.appendByteAlignedMetadataOnlyFilEnd(std.testing.allocator);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     var adts = std.ArrayList(u8).empty;
@@ -12058,12 +12058,12 @@ test "aac lc adts explicit pce channel config rejects crc-protected audio before
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     var adts = std.ArrayList(u8).empty;
@@ -12085,15 +12085,15 @@ test "aac lc adts explicit pce channel config rejects crc-protected audio before
 test "aac lc adts explicit pce channel config rejects conflicting repeated layout in crc-protected raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     var adts = std.ArrayList(u8).empty;
@@ -12115,15 +12115,15 @@ test "aac lc adts explicit pce channel config rejects conflicting repeated layou
 test "aac lc adts explicit pce channel config rejects conflicting repeated mono layout in crc-protected raw-data-block" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .side, 2);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x1234, 16); // first raw_data_block CRC
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendMonoRegularScePceWithTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 2);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.end), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.end), 3);
     try payload_builder.appendBits(std.testing.allocator, 0x5678, 16); // second raw_data_block CRC
 
     var adts = std.ArrayList(u8).empty;
@@ -12145,7 +12145,7 @@ test "aac lc adts explicit pce channel config rejects conflicting repeated mono 
 test "aac lc adts explicit pce channel config rejects later stereo tag mismatch" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try first_payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
 
@@ -12167,13 +12167,13 @@ test "aac lc adts explicit pce channel config rejects later stereo tag mismatch"
 test "aac lc adts explicit pce channel config rejects conflicting repeated stereo layout" {
     var first_payload_builder = TestBitBuilder.init();
     defer first_payload_builder.deinit(std.testing.allocator);
-    try first_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try first_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try first_payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .side, 2);
     try first_payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 2);
 
     var second_payload_builder = TestBitBuilder.init();
     defer second_payload_builder.deinit(std.testing.allocator);
-    try second_payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try second_payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try second_payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try second_payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
 
@@ -12232,7 +12232,7 @@ test "aac lc mp4 explicit pce stereo cpe tag must match access unit" {
 test "aac lc adts explicit pce stereo cpe tag must match access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithTag(std.testing.allocator, 2);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
 
@@ -12307,7 +12307,7 @@ test "aac lc mp4 explicit pce stereo side cpe tag must match access unit" {
 test "aac lc adts explicit pce channel config decodes stereo back cpe access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoPceWithPositionTag(std.testing.allocator, .back, 3);
     try payload_builder.appendSilentStereoCpeWithTag(std.testing.allocator, 3);
 
@@ -12373,7 +12373,7 @@ test "aac lc mp4 explicit pce stereo sce pair decodes access unit" {
 test "aac lc adts explicit pce channel config decodes stereo sce pair access unit" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoScePairPce(std.testing.allocator);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 0);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 1);
@@ -12528,7 +12528,7 @@ test "aac lc mp4 explicit pce rejects sce plus lfe as stereo" {
 test "aac lc adts explicit pce rejects sce plus lfe as stereo" {
     var payload_builder = TestBitBuilder.init();
     defer payload_builder.deinit(std.testing.allocator);
-    try payload_builder.appendBits(std.testing.allocator, @intFromEnum(ElementKind.pce), 3);
+    try payload_builder.appendBits(std.testing.allocator, @backingInt(ElementKind.pce), 3);
     try payload_builder.appendStereoSceLfePce(std.testing.allocator);
     try payload_builder.appendSilentMonoSceWithTag(std.testing.allocator, 0);
     try payload_builder.appendSilentLfeWithTag(std.testing.allocator, 1);
@@ -12637,8 +12637,8 @@ test "aac eight-short gain control parser consumes max-band shape" {
 }
 
 test "aac perceptual noise substitution is deterministic" {
-    var coefficients_a = [_]f32{0} ** 8;
-    var coefficients_b = [_]f32{0} ** 8;
+    var coefficients_a = @as([8]f32, @splat(0));
+    var coefficients_b = @as([8]f32, @splat(0));
     const plans = [_]SpectralBandLayout{.{
         .band_type = NOISE_BT,
         .class = .noise,
@@ -14041,7 +14041,7 @@ test "aac sync-extension ps mono-core stereo output tolerates delayed first ps p
 }
 
 test "aac main prediction carries state and honors reset groups" {
-    var prediction_used = [_]bool{false} ** max_prediction_bands;
+    var prediction_used = @as([max_prediction_bands]bool, @splat(false));
     prediction_used[0] = true;
 
     const base_ics_info: IcsInfo = .{
@@ -14054,7 +14054,7 @@ test "aac main prediction carries state and honors reset groups" {
         .prediction_used = prediction_used,
     };
 
-    var predictor_states = [_]PredictorState{.{}} ** max_predictors;
+    var predictor_states = @as([max_predictors]PredictorState, @splat(.{}));
     resetAllPredictors(&predictor_states);
 
     // The predictor is backward adaptive: its correlation terms stay zero until
@@ -14062,7 +14062,7 @@ test "aac main prediction carries state and honors reset groups" {
     // pass through untouched and only later ones carry a prediction.
     var predicted: f32 = 0;
     for (0..4) |frame_index| {
-        var block = [_]f32{0} ** 1024;
+        var block = @as([1024]f32, @splat(0));
         block[0] = 0.25;
         try applyMainPrediction(&block, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
         predicted = block[0] - 0.25;
@@ -14074,19 +14074,19 @@ test "aac main prediction carries state and honors reset groups" {
     // after that frame has been predicted.
     var reset_ics_info = base_ics_info;
     reset_ics_info.predictor_reset_group = 1;
-    var reset_block = [_]f32{0} ** 1024;
+    var reset_block = @as([1024]f32, @splat(0));
     reset_block[0] = 0.25;
     try applyMainPrediction(&reset_block, reset_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
     try std.testing.expect(@abs(reset_block[0] - 0.25) > 1e-6);
 
-    var after_reset = [_]f32{0} ** 1024;
+    var after_reset = @as([1024]f32, @splat(0));
     after_reset[0] = 0.25;
     try applyMainPrediction(&after_reset, base_ics_info, &.{ 0, 4 }, 44100, &predictor_states);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), after_reset[0], 1e-6);
 }
 
 test "aac tns tool accepts zeroed long-window coefficients" {
-    var coefficients = [_]f32{0} ** 4;
+    var coefficients = @as([4]f32, @splat(0));
     const plans = [_]SpectralBandLayout{.{
         .band_type = 5,
         .class = .pair,
@@ -14131,7 +14131,7 @@ test "aac tns tool accepts zeroed long-window coefficients" {
 }
 
 test "aac tns tool accepts zeroed grouped short-window coefficients" {
-    var coefficients = [_]f32{0} ** 32;
+    var coefficients = @as([32]f32, @splat(0));
     const coeff_offsets = [_]u16{ 0, 16, 32 };
     var tns = TnsData{ .num_windows = 8 };
     tns.windows[0].n_filt = 1;

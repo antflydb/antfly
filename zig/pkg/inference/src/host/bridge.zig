@@ -431,12 +431,12 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
 pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
 
 test "linked inference ABI rejects mismatched context and function-table prefixes" {
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ProcessMemoryLimitProvenance.automatic));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ProcessMemoryLimitProvenance.explicit));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v2));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(ProcessMemoryLimitProvenance.cgroup_v1));
-    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(ProcessMemoryLimitProvenance.host));
-    try std.testing.expectEqual(@as(u8, 5), @intFromEnum(ProcessMemoryLimitProvenance.unavailable));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(ProcessMemoryLimitProvenance.automatic));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(ProcessMemoryLimitProvenance.explicit));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(ProcessMemoryLimitProvenance.cgroup_v2));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(ProcessMemoryLimitProvenance.cgroup_v1));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(ProcessMemoryLimitProvenance.host));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(ProcessMemoryLimitProvenance.unavailable));
     try std.testing.expect(validContext(RouteManifestContext, abi_version, @sizeOf(RouteManifestContext)));
     try std.testing.expect(!validContext(RouteManifestContext, abi_version - 1, @sizeOf(RouteManifestContext)));
     try std.testing.expect(!validContext(RouteManifestContext, abi_version, @sizeOf(RouteManifestContext) - 1));

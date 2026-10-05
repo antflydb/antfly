@@ -49,7 +49,7 @@ pub fn writeVarint(alloc: Allocator, buf: *Buf, value: u64) !void {
 }
 
 pub fn writeTag(alloc: Allocator, buf: *Buf, field: u32, wt: WireType) !void {
-    try writeVarint(alloc, buf, @as(u64, field) << 3 | @intFromEnum(wt));
+    try writeVarint(alloc, buf, @as(u64, field) << 3 | @backingInt(wt));
 }
 
 // ---------------------------------------------------------------------------
@@ -134,12 +134,13 @@ pub fn varintSize(value: u64) usize {
 }
 
 fn writeFixed32Raw(alloc: Allocator, buf: *Buf, value: u32) !void {
-    const bytes: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, value));
+    // Zig 0.17 array bitcasts use logical bits, independent of host byte order.
+    const bytes: [4]u8 = @bitCast(@as(u32, value));
     try buf.appendSlice(alloc, &bytes);
 }
 
 fn writeFixed64Raw(alloc: Allocator, buf: *Buf, value: u64) !void {
-    const bytes: [8]u8 = @bitCast(std.mem.nativeToLittle(u64, value));
+    const bytes: [8]u8 = @bitCast(@as(u64, value));
     try buf.appendSlice(alloc, &bytes);
 }
 
@@ -176,10 +177,10 @@ pub fn readTag(bytes: []const u8, pos: *usize) DecodeError!Tag {
     return .{
         .field = @intCast(v >> 3),
         .wire_type = switch (raw_wire_type) {
-            @intFromEnum(WireType.varint) => .varint,
-            @intFromEnum(WireType.fixed64) => .fixed64,
-            @intFromEnum(WireType.length_delimited) => .length_delimited,
-            @intFromEnum(WireType.fixed32) => .fixed32,
+            @backingInt(WireType.varint) => .varint,
+            @backingInt(WireType.fixed64) => .fixed64,
+            @backingInt(WireType.length_delimited) => .length_delimited,
+            @backingInt(WireType.fixed32) => .fixed32,
             else => return error.InvalidWireType,
         },
     };
@@ -340,6 +341,21 @@ test "fixed32 and fixed64 roundtrip" {
     try std.testing.expectEqual(@as(u32, 2), tag2.field);
     try std.testing.expectEqual(WireType.fixed64, tag2.wire_type);
     try std.testing.expectEqual(@as(u64, 0xCAFEBABE12345678), try readFixed64(buf.items, &pos));
+}
+
+test "fixed wire bytes are little endian at compile time" {
+    // Evaluate the actual encoder when cross-compiling too, including on big endian.
+    const encoded = comptime blk: {
+        var backing: [64]u8 = undefined;
+        var fba: std.heap.FixedBufferAllocator = .init(&backing);
+        var output: Buf = .initBuffer(&backing);
+        writeFixed32(fba.allocator(), &output, 1, 0xDEADBEEF) catch unreachable;
+        writeFixed64(fba.allocator(), &output, 2, 0xCAFEBABE12345678) catch unreachable;
+        if (!std.mem.eql(u8, output.items, &.{ 0x0d, 0xef, 0xbe, 0xad, 0xde, 0x11, 0x78, 0x56, 0x34, 0x12, 0xbe, 0xba, 0xfe, 0xca }))
+            @compileError("fixed protobuf bytes must be little endian on every target");
+        break :blk output.items[0..14].*;
+    };
+    try std.testing.expectEqualSlices(u8, &.{ 0x0d, 0xef, 0xbe, 0xad, 0xde, 0x11, 0x78, 0x56, 0x34, 0x12, 0xbe, 0xba, 0xfe, 0xca }, &encoded);
 }
 
 test "skipField skips all wire types" {

@@ -47,7 +47,7 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) }}
     needs: admission
-    name: Darwin ARM64 ReleaseFast archive
+    name: Darwin ARM64 fast archive
     runs-on: arc-antfly-publish
     timeout-minutes: 180
     steps:
@@ -121,7 +121,7 @@ jobs:
             scripts/packaging/build_zig_release_archive.sh \
             --version 0.0.0-diagnostic \
             --target aarch64-macos \
-            --optimize ReleaseFast \
+            --optimize fast \
             --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
             --out-dir dist/release-archives \
             --metal true \
@@ -150,7 +150,7 @@ jobs:
           # standalone inference runtime by default (see COMPILATION.md's
           # "C API composition" section), which is a deliberate product
           # decision, not a regression. 60MiB leaves headroom over the
-          # measured ~48MiB stripped ReleaseFast size.
+          # measured ~48MiB stripped fast size.
           if [ "$library_size" -ge 62914560 ]; then
             echo "libantfly.dylib exceeded the 60MiB retained-code budget: $library_size bytes" >&2
             exit 1

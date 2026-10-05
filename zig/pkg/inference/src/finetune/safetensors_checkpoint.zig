@@ -110,7 +110,7 @@ pub fn saveControlled(
 
     // 3. Write the file.
     if (std.fs.path.dirname(path)) |dir| {
-        if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir);
     }
     const io = compat.io();
     if (control) |active| try active.check();

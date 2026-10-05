@@ -62,7 +62,7 @@ const PacketHeaderBitWriter = struct {
         return .{ .allocator = allocator };
     }
 
-    fn deinit(self: *PacketHeaderBitWriter) void {
+    pub fn deinit(self: *PacketHeaderBitWriter) void {
         self.bytes.deinit(self.allocator);
     }
 

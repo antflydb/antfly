@@ -14,9 +14,11 @@
 // limitations.
 
 //! Private server storage-provider operations, separate from public C exports.
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
+const server_document_child_range = @import("../storage/server_document_child_range.zig");
 pub const storage_root = @import("antfly_source_root");
 pub const antfly = @import("../capi_root.zig");
-const handles = @import("handles.zig");
+const handles = @import("antfly_local_sources").capi_handles;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -203,6 +205,7 @@ pub const StorageOwnerContext = struct {
 pub const SystemStoreHandle = struct {
     store: *antfly.storage_backend_erased.Store,
     context: *StorageOwnerContext,
+    refs: std.atomic.Value(usize) = .init(1),
 };
 
 pub const SystemReadTxnHandle = struct {
@@ -235,6 +238,7 @@ pub const MetadataApplyStoreHandle = struct {
     alloc: Allocator,
     store: metadata_raft_apply.RaftApplyStore,
     context: ?*StorageOwnerContext,
+    system_store: ?*SystemStoreHandle = null,
     listener_bridges: std.ArrayListUnmanaged(*MetadataListenerBridge) = .empty,
     listener_mutex: std.Io.Mutex = .init,
 };
@@ -485,7 +489,7 @@ pub const StorageOwnerRuntimeHooks = struct {
         }
         const wire = kernel_owner_abi.CoordinatedTtlRequest{
             .table_id = request.table_id,
-            .group_id = request.group_id,
+            .group_id = self.group_id,
             .schema_version = request.schema_version,
             .ttl_duration_ns = request.ttl_duration_ns,
             .ttl_field = .fromSlice(request.ttl_field),
@@ -512,10 +516,21 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     config: kernel_owner_abi.RuntimeHooksConfig,
     group_id: u64,
+    artifact_upload_recovery: @import("../storage/artifact_upload_recovery.zig").Scheduler = .{},
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue = enqueueArtifactPublication };
+        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
+    }
+
+    fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryTick) bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        return self.artifact_upload_recovery.shouldPoll(tick);
+    }
+
+    fn recoverArtifactUploads(ptr: *anyopaque, invocation: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryInvocation) !bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        return self.artifact_upload_recovery.advance(self.artifactPublicationDispatcher().?, invocation);
     }
 
     pub fn enqueueArtifactPublication(ptr: *anyopaque, namespace: [24]u8, command: []const u8) !void {
@@ -883,8 +898,11 @@ pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // The result has grown across ABI versions. Read only the leading version
+    // word, which every revision shares, and reject a caller built against
+    // another layout before writing: it may have reserved a smaller struct.
+    if (out_result.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
     out_result.* = .{
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),
@@ -895,6 +913,14 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
     };
+    const resources = owner_context.resources.resource_manager.snapshot();
+    out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
+    comptime std.debug.assert(@import("antfly_local_sources").storage_resource_manager.slice_count <= kernel_owner_abi.context_resource_slice_capacity);
+    const slice_count = resources.slices.len;
+    out_result.resource_slice_count = @intCast(slice_count);
+    for (resources.slices[0..slice_count], out_result.resource_slices[0..slice_count]) |slice, *out| {
+        out.* = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(slice);
+    }
     return .ok;
 }
 
@@ -957,6 +983,7 @@ pub fn storageContextSystemStoreOpen(
 
 pub fn storageSystemStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     const handle = asSystemStore(store_ptr) orelse return;
+    if (handle.refs.fetchSub(1, .acq_rel) != 1) return;
     const context = handle.context;
     context.alloc.destroy(handle);
     context.release();
@@ -1357,10 +1384,13 @@ pub fn metadataApplyStoreOpen(
         .root_dir = root_dir,
         .no_sync = request.no_sync != 0,
         .read_only = request.read_only != 0,
+        .borrowed_store = if (asSystemStore(request.system_store)) |system| system.store else null,
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer store.deinit();
     const handle = alloc.create(MetadataApplyStoreHandle) catch return .out_of_memory;
-    handle.* = .{ .alloc = alloc, .store = store, .context = context };
+    const system_store = asSystemStore(request.system_store);
+    if (system_store) |system| _ = system.refs.fetchAdd(1, .monotonic);
+    handle.* = .{ .alloc = alloc, .store = store, .context = context, .system_store = system_store };
     context_borrowed = false;
     out_store.* = handle;
     return .ok;
@@ -1371,6 +1401,7 @@ pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     const alloc = handle.alloc;
     const context = handle.context;
     handle.store.deinit();
+    if (handle.system_store) |system| storageSystemStoreClose(system);
     for (handle.listener_bridges.items) |bridge| alloc.destroy(bridge);
     handle.listener_bridges.deinit(alloc);
     handle.* = undefined;
@@ -1538,14 +1569,14 @@ pub fn metadataApplyStoreRemoveListeners(store_ptr: ?*anyopaque, registration_id
     return 0;
 }
 
-pub fn metadataApplyStoreBindHA(
+pub fn metadataApplyStoreBindHotStandby(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataHABindRequest,
 ) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const port: ?antfly.capi_dependencies.storage_metadata_hot_standby_port.Port = if (request.port) |ptr| @as(*const antfly.capi_dependencies.storage_metadata_hot_standby_port.Port, @ptrCast(@alignCast(ptr))).* else null;
-    handle.store.bindHAPort(port) catch |err| return storageOwnerStatusFromError(err);
+    handle.store.bindHotStandbyPort(port) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -1573,13 +1604,13 @@ pub fn metadataApplyStoreProjection(
             break :blk metadataProjectionJson(alloc, out_json, result);
         },
         .flush_ha_outbox => blk: {
-            handle.store.flushHAOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.flushHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .apply_ha_record => blk: {
             if (request.key.len > 2 * 1024 * 1024) break :blk .invalid_argument;
             const record = antfly.capi_dependencies.storage_hot_standby_replication_record.decode(request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
-            handle.store.applyHARecord(record) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.applyHotStandbyRecord(record) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .export_ha_checkpoint, .import_ha_checkpoint => blk: {
@@ -1587,10 +1618,10 @@ pub fn metadataApplyStoreProjection(
             if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) break :blk .invalid_argument;
             const io = handle.store.io_impl.io();
             if (request.kind == .export_ha_checkpoint) {
-                const value = handle.store.exportHACheckpoint(io, path) catch |err| break :blk storageOwnerStatusFromError(err);
+                const value = handle.store.exportHotStandbyCheckpoint(io, path) catch |err| break :blk storageOwnerStatusFromError(err);
                 break :blk metadataProjectionJson(alloc, out_json, value);
             }
-            handle.store.importHACheckpoint(io, path, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.importHotStandbyCheckpoint(io, path, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .migrate_standalone_restore_jobs => blk: {
@@ -2782,9 +2813,9 @@ pub fn localTransitionIdentity(
 pub fn localTransitionSplitResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
     return .{
         .kind = .split,
-        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .phase = @fromBackingInt(@backingInt(status.phase)),
         .has_source_split_phase = @intFromBool(status.source_split_phase != null),
-        .source_split_phase = if (status.source_split_phase) |phase| @intFromEnum(phase) else 0,
+        .source_split_phase = if (status.source_split_phase) |phase| @backingInt(phase) else 0,
         .bootstrapped = @intFromBool(status.bootstrapped),
         .replay_required = @intFromBool(status.replay_required),
         .replay_caught_up = @intFromBool(status.replay_caught_up),
@@ -2798,7 +2829,7 @@ pub fn localTransitionSplitResult(status: anytype) kernel_owner_abi.LocalTransit
 pub fn localTransitionMergeResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
     return .{
         .kind = .merge,
-        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .phase = @fromBackingInt(@backingInt(status.phase)),
         .bootstrapped = @intFromBool(status.bootstrapped),
         .replay_required = @intFromBool(status.replay_required),
         .replay_caught_up = @intFromBool(status.replay_caught_up),
@@ -3051,13 +3082,12 @@ pub fn storageOwnerLocalTransition(
 
 pub fn storageOwnerTargetAdvanced(
     ptr: *anyopaque,
-    table_name: []const u8,
-    group_id: u64,
-    _: ?*db_mod.DB,
     event: db_mod.QueryVisibilityEvent,
 ) void {
     if (event.change != .target_advanced) return;
     const handle: *Handle = @ptrCast(@alignCast(ptr));
+    const table_name = handle.storage_owner_table_name orelse "";
+    const group_id = handle.storage_owner_group_id;
     const observer = handle.storage_owner_target_observer;
     const notify = observer.notify orelse return;
     const identities_json = if (event.target_scope_known)
@@ -3298,11 +3328,9 @@ pub fn storageOwnerOpen(
     handle.db.local_execution.row_policy_authority_secret = owned_policy_secret;
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
-    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort(), request.group_id);
+    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
-        .table_name = owned_table_name,
-        .group_id = request.group_id,
         .on_change = storageOwnerTargetAdvanced,
     });
     // Configuration can start DB-owned workers. Publish their pointers only
@@ -3593,7 +3621,7 @@ pub fn storageOwnerOperationTableName(
     return storageOwnerTableName(handle, request.table_name);
 }
 
-pub fn storageHASeedFailure(
+pub fn storageHotStandbySeedFailure(
     err: anyerror,
     operation: kernel_owner_abi.HASeedOperation,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3602,12 +3630,12 @@ pub fn storageHASeedFailure(
         err,
         .storage_owner,
         kernel_owner_abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }
 
-pub fn validateHASeedRequest(
+pub fn validateHotStandbySeedRequest(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     expected_operation: kernel_owner_abi.HASeedOperation,
 ) ![]const u8 {
@@ -3620,7 +3648,7 @@ pub fn validateHASeedRequest(
     return json;
 }
 
-pub fn storageHASeedActivateJson(
+pub fn storageHotStandbySeedActivateJson(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3628,16 +3656,16 @@ pub fn storageHASeedActivateJson(
     out_response.* = .{};
     out_failure.* = .{};
     const operation = kernel_owner_abi.HASeedOperation.activate;
-    const request_json = validateHASeedRequest(request, operation) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+    const request_json = validateHotStandbySeedRequest(request, operation) catch |err|
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
     var parsed = std.json.parseFromSlice(hot_standby_seed_activation.ActivateRequest, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    }) catch return storageHotStandbySeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
     var result = hot_standby_seed_activation.activate(alloc, parsed.value) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     alloc.free(result.generation_path);
     const response = result.active_receipt_json;
     result = undefined;
@@ -3648,7 +3676,7 @@ pub fn storageHASeedActivateJson(
     return .ok;
 }
 
-pub fn storageHASeedValidateJson(
+pub fn storageHotStandbySeedValidateJson(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     out_result: *kernel_owner_abi.HASeedValidationResult,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3656,20 +3684,20 @@ pub fn storageHASeedValidateJson(
     out_result.* = .{};
     out_failure.* = .{};
     const operation = kernel_owner_abi.HASeedOperation.validate_activated_generation;
-    const request_json = validateHASeedRequest(request, operation) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+    const request_json = validateHotStandbySeedRequest(request, operation) catch |err|
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
     var parsed = std.json.parseFromSlice(hot_standby_seed_activation.StartupExpectation, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    }) catch return storageHotStandbySeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
     out_result.checkpoint_lsn = hot_standby_seed_activation.validateActivatedGeneration(alloc, parsed.value) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     return .ok;
 }
 
-pub fn storageHASeedPruneJson(
+pub fn storageHotStandbySeedPruneJson(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3677,16 +3705,16 @@ pub fn storageHASeedPruneJson(
     out_response.* = .{};
     out_failure.* = .{};
     const operation = kernel_owner_abi.HASeedOperation.prune_activated_generations;
-    const request_json = validateHASeedRequest(request, operation) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+    const request_json = validateHotStandbySeedRequest(request, operation) catch |err|
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
     var parsed = std.json.parseFromSlice(hot_standby_seed_activation.ActivatedGenerationGCRequest, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    }) catch return storageHotStandbySeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
     var result = hot_standby_seed_activation.pruneActivatedGenerations(alloc, parsed.value) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const response = result.result_json;
     result = undefined;
     out_response.* = .{
@@ -3701,7 +3729,7 @@ pub const StorageOwnerDocumentChildRangeDispatch = struct {
     callback_fn: kernel_owner_abi.DocumentChildRangeDispatchFn,
 
     pub fn dispatcher(self: *@This()) db_mod.DocumentArtifactChildRangeDispatcher {
-        return .{ .ptr = self, .apply = apply };
+        return .{ .ptr = self, .select_destination = server_document_child_range.selectPersistedDestination, .apply = apply };
     }
 
     pub fn apply(
@@ -3910,11 +3938,11 @@ pub fn storageOwnerWaitForSync(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     const sync_level: db_mod.types.SyncLevel = switch (request.sync_level) {
-        @intFromEnum(kernel_owner_abi.SyncLevel.propose) => .propose,
-        @intFromEnum(kernel_owner_abi.SyncLevel.write) => .write,
-        @intFromEnum(kernel_owner_abi.SyncLevel.full_text) => .full_text,
-        @intFromEnum(kernel_owner_abi.SyncLevel.enrichments) => .enrichments,
-        @intFromEnum(kernel_owner_abi.SyncLevel.full_index) => .full_index,
+        @backingInt(kernel_owner_abi.SyncLevel.propose) => .propose,
+        @backingInt(kernel_owner_abi.SyncLevel.write) => .write,
+        @backingInt(kernel_owner_abi.SyncLevel.full_text) => .full_text,
+        @backingInt(kernel_owner_abi.SyncLevel.enrichments) => .enrichments,
+        @backingInt(kernel_owner_abi.SyncLevel.full_index) => .full_index,
         else => return .invalid_argument,
     };
     switch (sync_level) {
@@ -3940,8 +3968,8 @@ pub fn storageOwnerApplyHotStandbyReplicationRecord(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     replication_ingress.applyRecord(&handle.db, .{
-        .kind = @enumFromInt(request.record_kind),
-        .payload_codec = @enumFromInt(request.payload_codec),
+        .kind = @fromBackingInt(request.record_kind),
+        .payload_codec = @fromBackingInt(request.payload_codec),
         .flags = request.flags,
         .cluster_id = request.cluster_id,
         .shard_id = request.shard_id,
@@ -4073,8 +4101,8 @@ pub fn storageOwnerBackupJson(
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const format: kernel_owner_abi.BackupFormat = switch (request.format) {
-        @intFromEnum(kernel_owner_abi.BackupFormat.native) => .native,
-        @intFromEnum(kernel_owner_abi.BackupFormat.portable) => .portable,
+        @backingInt(kernel_owner_abi.BackupFormat.native) => .native,
+        @backingInt(kernel_owner_abi.BackupFormat.portable) => .portable,
         else => return .invalid_argument,
     };
     const handle = asHandle(owner) orelse return .invalid_argument;
@@ -4747,7 +4775,7 @@ pub fn replicatedBatchStorageKernelJson(
 pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
     handle: *Handle,
     request_json: capi.Slice,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    raft_entry: db_mod.OrderedApplyReceipt,
     out_buf: *capi.Buffer,
 ) kernel_owner_abi.Status {
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|
@@ -5510,7 +5538,7 @@ pub fn storageOwnerArtifactOperationJson(
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const operation: kernel_owner_abi.ArtifactOperation = switch (request.operation) {
-        0...@intFromEnum(kernel_owner_abi.ArtifactOperation.apply_child_range_batch) => @enumFromInt(request.operation),
+        0...@backingInt(kernel_owner_abi.ArtifactOperation.apply_child_range_batch) => @fromBackingInt(request.operation),
         else => return .invalid_argument,
     };
     const handle = asHandle(owner) orelse return .invalid_argument;
@@ -5647,7 +5675,8 @@ pub fn storageOwnerRuntimeStatusJson(
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
         .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
-        .created_at_millis = (handle.db.getGroupCreatedAtMillis(
+        .created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(
+            &handle.db,
             handle.alloc,
             handle.storage_owner_group_id,
         ) catch null) orelse 0,
@@ -6003,7 +6032,7 @@ pub fn storageOwnerQueryFailure(
         err,
         .storage_owner,
         kernel_owner_abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }
@@ -6026,6 +6055,7 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
     const Capture = struct {
         alloc: Allocator,
         scope: [32]u8,
+        plan_id: [16]u8,
         batch_json: ?[]u8 = null,
         pub fn propose(ptr: *anyopaque, batch: db_mod.types.BatchRequest, context: antfly.capi_dependencies.api_operation.RequestContext) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -6034,10 +6064,11 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
             if (batch.restore_staging_scope) |scope| if (!std.mem.eql(u8, &scope, &self.scope)) return error.RestoreStagingScopeChanged;
             var scoped = batch;
             scoped.restore_staging_scope = self.scope;
+            scoped.restore_staging_plan_id = self.plan_id;
             self.batch_json = try antfly.capi_dependencies.api_batch.encodeBatchRequest(self.alloc, scoped);
         }
     };
-    var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest() };
+    var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest(), .plan_id = input.value.scope.plan_id };
     defer if (capture.batch_json) |bytes| handle.alloc.free(bytes);
     const response = restore.executeResident(handle.alloc, &handle.db, .{
         .io = io,
@@ -6226,3 +6257,7 @@ pub fn releaseServerContext(context_ptr: *anyopaque) void {
     const context: *StorageOwnerContext = @ptrCast(@alignCast(context_ptr));
     context.release();
 }
+
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const transactionRecoveryConfig = StorageOwnerTransactionRecovery.serverConfig;
+} else struct {};

@@ -17,16 +17,16 @@
 //! identity. Begin rechecks the catalog revision and every owner descriptor.
 const std = @import("std");
 const server_mod = @import("http_server.zig");
-const operation = @import("operation.zig");
-const domain = @import("../system_catalog/domain.zig");
-const records = @import("../common/topology_records.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const records = @import("antfly_local_sources").common_topology_records;
 const publication = @import("../metadata/fk_generation_publication.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
 const tables = @import("tables.zig");
 const platform_time = @import("antfly_platform").time;
 const existing = @import("fk_generation_plan_builder.zig");
 
-fn retirementScopeForDeployment(mode: @import("../common/config.zig").DeploymentMode) publication.InitialRetirementScope {
+fn retirementScopeForDeployment(mode: @import("antfly_local_sources").common_config.DeploymentMode) publication.InitialRetirementScope {
     return switch (mode) {
         .standalone, .embedded => .local_owner,
         .distributed, .serverless => .hosted_store,
@@ -171,7 +171,7 @@ pub fn build(
     for (derived) |item| {
         if (std.mem.eql(u8, item.parent_table_name, child.name)) {
             if (!self_target_checked) {
-                try @import("../schema/relational_foreign_key_target.zig").validate(alloc, child.schema_json, child.name, child.schema_json);
+                try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child.schema_json, child.name, child.schema_json);
                 self_target_checked = true;
             }
             try self_transitions.append(alloc, item.transition);

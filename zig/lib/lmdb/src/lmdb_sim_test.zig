@@ -17,7 +17,7 @@ const std = @import("std");
 const zig_lmdb = @import("lmdb_engine");
 const sim_fixture = @import("storage_sim_fixture");
 const lmdb_sim_fixture = @import("lmdb_sim_fixture.zig");
-const c = @cImport(@cInclude("lmdb.h"));
+const c = @import("lmdb_c_bindings");
 var lmdb_sim_tmp_nonce: u64 = 0;
 
 fn nextLmdbSimTmpNonce() u64 {
@@ -67,7 +67,7 @@ pub fn namespace(comptime Api: type) type {
             fn open(path: [*:0]const u8, opts: EnvironmentOptions, backend: DifferentialBackend) Error!DifferentialEnvironment {
                 if (backend == .zig and opts.map_async and !opts.write_map) return Error.Incompatible;
 
-                const path_owned = std.heap.c_allocator.dupeZ(u8, std.mem.span(path)) catch return Error.LmdbUnexpected;
+                const path_owned = std.heap.c_allocator.dupeSentinel(u8, std.mem.span(path), 0) catch return Error.LmdbUnexpected;
                 errdefer std.heap.c_allocator.free(path_owned);
 
                 var c_env: ?*c.MDB_env = null;
@@ -450,7 +450,7 @@ pub fn namespace(comptime Api: type) type {
             docs: []OwnedEntry = &.{},
             dups: []OwnedEntry = &.{},
 
-            fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
+            pub fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
                 freeOwnedEntries(allocator, self.main);
                 freeOwnedEntries(allocator, self.docs);
                 freeOwnedEntries(allocator, self.dups);

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Audit the local engine's authored production imports, before its package move.
+"""Audit the local engine's authored production imports and resolved owners.
 
 The default check follows authored relative imports. Build targets additionally
 pass their actual named module tables, resolving each import in its source owner.
@@ -28,14 +28,14 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
 LITERALS = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|(?m:^[ \t]*\\\\[^\n]*)'
 )
 IMPORT = re.compile(r'@import\s*\(\s*"([^"\n]+)"\s*\)')
-FORBIDDEN = ("raft/", "data/", "standalone/", "cmd/", "storage/hot_standby/")
+FORBIDDEN = ("raft/", "data/", "standalone/", "storage/hot_standby/")
 SERVER_METADATA = {
     "api.zig",
     "server.zig",
@@ -50,7 +50,9 @@ def mask_literals(source: str) -> str:
     )
 
 
-def production_exclusions(source: str, *, target_os: str | None = None, options: dict[str, bool] | None = None) -> tuple[str, list[tuple[int, int]]]:
+def production_exclusions(
+    source: str, *, target_os: str | None = None, options: dict[str, bool] | None = None
+) -> tuple[str, list[tuple[int, int]]]:
     """Skip comments, strings and complete test bodies, preserving lazy imports."""
     masked = mask_literals(source)
     stack: list[int] = []
@@ -68,24 +70,28 @@ def production_exclusions(source: str, *, target_os: str | None = None, options:
     for test in re.finditer(r"\btest\s*\{", masked):
         brace = masked.index("{", test.start(), test.end())
         excluded.append((test.start(), ends[brace]))
-    for container in re.finditer(r'\bif\s*\(\s*builtin\.is_test\s*\)\s*struct\s*\{', masked):
+    for container in re.finditer(
+        r"\bif\s*\(\s*builtin\.is_test\s*\)\s*struct\s*\{", masked
+    ):
         brace = masked.index("{", container.start(), container.end())
         excluded.append((brace, ends[brace]))
     # The false branch must be an empty owner: a production call then fails
     # compilation instead of silently reaching a server fixture.
     test_owner = re.compile(
-        r'\bconst\s+\w+\s*=\s*if\s*\(\s*builtin\.is_test\s*\)'
-        r'\s*@import\(\s*"[^"\n]+"\s*\)\s*else\s*struct\s*\{\s*\}\s*;'
+        r"\bconst\s+\w+\s*=\s*if\s*\(\s*builtin\.is_test\s*\)"
+        r'\s*@import\(\s*"[^"\n]+"\s*\)(?:\.\w+)*\s*else\s*struct\s*\{\s*\}\s*;'
     )
     for owner in test_owner.finditer(source):
-        if masked[owner.start():owner.start() + 5] == "const":
+        if masked[owner.start() : owner.start() + 5] == "const":
             excluded.append((owner.start(), owner.end()))
     for test_import in re.finditer(
-        r'\bif\s*\(\s*builtin\.is_test\s*\)\s*(@import\(\s*"[^"\n]+"\s*\))\s*else\b', source
+        r'\bif\s*\(\s*builtin\.is_test\s*\)\s*(@import\(\s*"[^"\n]+"\s*\))(?:\.\w+)*\s*else\b',
+        source,
     ):
-        if masked[test_import.start():test_import.start() + 2] == "if":
+        if masked[test_import.start() : test_import.start() + 2] == "if":
             excluded.append((test_import.start(1), test_import.end(1)))
     if target_os:
+
         def skip_space(offset: int) -> int:
             while offset < len(masked) and masked[offset].isspace():
                 offset += 1
@@ -98,7 +104,7 @@ def production_exclusions(source: str, *, target_os: str | None = None, options:
                     return ends[brace]
             imported = IMPORT.match(source, offset)
             if imported:
-                suffix = re.match(r"(?:\.\w+)*", source[imported.end():])
+                suffix = re.match(r"(?:\.\w+)*", source[imported.end() :])
                 return imported.end() + len(suffix[0])
             return None
 
@@ -108,11 +114,13 @@ def production_exclusions(source: str, *, target_os: str | None = None, options:
             while closing < len(masked) and depth:
                 depth += (masked[closing] == "(") - (masked[closing] == ")")
                 closing += 1
-            condition = source[opening + 1:closing - 1].replace('@import("builtin")', "builtin")
+            condition = source[opening + 1 : closing - 1].replace(
+                '@import("builtin")', "builtin"
+            )
             terms = []
             for term in re.split(r"\s+or\s+", condition):
                 term = term.strip().removeprefix("comptime ")
-                os_check = re.fullmatch(r'builtin\.os\.tag\s*(==|!=)\s*\.(\w+)', term)
+                os_check = re.fullmatch(r"builtin\.os\.tag\s*(==|!=)\s*\.(\w+)", term)
                 if os_check:
                     terms.append((target_os == os_check[2]) == (os_check[1] == "=="))
                 elif term == "builtin.is_test":
@@ -121,7 +129,13 @@ def production_exclusions(source: str, *, target_os: str | None = None, options:
                     terms.append(options.get(term.removeprefix("build_options.")))
                 else:
                     terms.append(None)
-            value = True if True in terms else False if all(term is False for term in terms) else None
+            value = (
+                True
+                if True in terms
+                else False
+                if all(term is False for term in terms)
+                else None
+            )
             if value is None:
                 continue
             first = skip_space(closing)
@@ -136,17 +150,24 @@ def production_exclusions(source: str, *, target_os: str | None = None, options:
             if second_end is not None:
                 excluded.append((second, second_end) if value else (first, first_end))
     if options is not None:
-        for guard in re.finditer(r'\bif\s*\(\s*(?:comptime\s+)?(!?)build_options\.(\w+)\s*\)\s*return(?:\s+[^;]*)?;', masked):
+        for guard in re.finditer(
+            r"\bif\s*\(\s*(?:comptime\s+)?(!?)build_options\.(\w+)\s*\)\s*return(?:\s+[^;]*)?;",
+            masked,
+        ):
             # Only a standalone statement proves the rest of this block dead.
             # An unbraced runtime if/loop, else arm, or expression can decide
             # whether the guard runs at all. Unknown syntax stays visible.
-            preceding = masked[:guard.start()].rstrip()
+            preceding = masked[: guard.start()].rstrip()
             if not preceding or preceding[-1] not in "{;}":
                 continue
             value = options.get(guard[2])
             if value is None or (not value if guard[1] else value) is not True:
                 continue
-            containers = [(start, end) for start, end in ends.items() if start < guard.start() < end]
+            containers = [
+                (start, end)
+                for start, end in ends.items()
+                if start < guard.start() < end
+            ]
             if containers:
                 _, end = min(containers, key=lambda pair: pair[1] - pair[0])
                 excluded.append((guard.end(), end))
@@ -164,8 +185,16 @@ def production_source(source: str) -> str:
     return "".join(chars)
 
 
-def production_imports(source: str, *, include_named: bool = False, target_os: str | None = None, options: dict[str, bool] | None = None) -> list[str]:
-    masked, excluded = production_exclusions(source, target_os=target_os, options=options)
+def production_imports(
+    source: str,
+    *,
+    include_named: bool = False,
+    target_os: str | None = None,
+    options: dict[str, bool] | None = None,
+) -> list[str]:
+    masked, excluded = production_exclusions(
+        source, target_os=target_os, options=options
+    )
     result = []
     for call in re.finditer(r"@import\b", masked):
         if any(start <= call.start() < end for start, end in excluded):
@@ -189,8 +218,122 @@ def server_source(relative: str) -> bool:
                 or relative.startswith("metadata/storage/")
             )
         )
-        or relative in {"server_db_integration_test_root.zig", "system_catalog/server_call.zig", "storage/server_db_adapter.zig", "storage/metadata_hot_standby_port.zig", "tracing/server_raft_writer.zig", "tracing/raft_trace_logger.zig", "tracing/mod.zig", "capi/server_owner.zig", "capi_root.zig", "capi_dependencies.zig"}
+        or relative
+        in {
+            "server_db_integration_test_root.zig",
+            "system_catalog/server_call.zig",
+            "storage/server_db_adapter.zig",
+            "storage/metadata_hot_standby_port.zig",
+            "tracing/server_raft_writer.zig",
+            "tracing/raft_trace_logger.zig",
+            "tracing/mod.zig",
+            "capi/server_owner.zig",
+            "capi_root.zig",
+            "capi_dependencies.zig",
+        }
     )
+
+
+def check_local_observation_contracts(relative: str, source: str) -> None:
+    """Keep routing identity and destination policy out of local event/planning ports."""
+    production = production_source(source)
+    masked = mask_literals(production)
+    if relative in {"storage/db/db.zig", "storage/db/query_visibility.zig"}:
+        hook = re.search(
+            r"\bpub\s+const\s+QueryVisibilityHook\s*=\s*struct\s*\{(.*?)\n\};",
+            masked,
+            re.DOTALL,
+        )
+        if hook and {"table_name", "group_id", "DB"}.intersection(
+            re.findall(r"\b\w+\b", hook[1])
+        ):
+            raise ValueError(
+                f"{relative} exposes server routing in local visibility hook"
+            )
+    if relative == "storage/db/document_child_range_effects.zig":
+        if re.search(r"\broute_status\b", masked) or any(
+            match[0] == '"remote_committed"' for match in LITERALS.finditer(production)
+        ):
+            raise ValueError(
+                f"{relative} interprets server child-range destination policy"
+            )
+
+
+def check_replication_contract(relative: str, source: str) -> None:
+    """Reject server policy leaking back through the engine's borrowed ports."""
+    check_local_observation_contracts(relative, source)
+    if relative not in {
+        "storage/db/replication_contract.zig",
+        "storage/db/commit_integration.zig",
+        "storage/db/db.zig",
+        "storage/db/document_child_range_effects.zig",
+        "storage/db/document_child_range_outbox.zig",
+        "storage/db/portable_activation_recovery.zig",
+        "storage/db/quarantine_recovery.zig",
+        "storage/db/independent_maintenance.zig",
+        "storage/db/index_repair_scheduler.zig",
+        "storage/db/graph_cleanup_owner.zig",
+        "storage/db/native_projection_owner.zig",
+        "storage/db/runtime_restart_owner.zig",
+        "storage/db/cleanup_job_owner.zig",
+        "storage/db/query_visibility.zig",
+        "storage/db/coalesced_job_admission.zig",
+        "storage/db/dense_publication_admission.zig",
+        "storage/db/local_runtime_owner.zig",
+        "storage/db/embedding_activity_cache.zig",
+        "storage/db/source_pin_cleanup_owner.zig",
+        "storage/db/applied_sequence_coalescer.zig",
+        "storage/db/bulk_ingest_session.zig",
+        "storage/db/document_collectors.zig",
+        "storage/db/owned_keys.zig",
+        "storage/db/graph_field_plan.zig",
+        "storage/db/replay_vector_collectors.zig",
+        "storage/db/relational_read_session.zig",
+        "storage/db/read_projection.zig",
+        "storage/db/local_mutation.zig",
+        "storage/db/execution_resources.zig",
+        "storage/db/mutation_preparation.zig",
+        "storage/db/mutation_commit.zig",
+        "storage/db/mutation_materialization.zig",
+        "storage/db/result_collectors.zig",
+        "storage/db/materialized_sources.zig",
+        "storage/db/graph_restore_materialization.zig",
+        "storage/db/status_projection.zig",
+        "storage/db/managed_admission_owner.zig",
+        "storage/db/publication_recovery_owner.zig",
+        "storage/db/target_advance_tracker.zig",
+        "storage/db/schema_reconcile_owner.zig",
+        "storage/db/dense_catch_up_session_owner.zig",
+        "storage/db/enrichment_runtime_owner.zig",
+    }:
+        return
+    source = mask_literals(production_source(source))
+    forbidden = {
+        "sync_policy",
+        "standby_names",
+        "sync_wait_fn",
+        "sync_wait_ctx",
+        "failure_count",
+        "last_gate_action",
+        "sync_reject_count",
+        "sync_degraded_count",
+        "is_standby",
+        "isStandbyRole",
+        "fenced_primary",
+        "FencedWriteGate",
+        "RaftAppliedEntryIdentity",
+        "raft_applied_entry_marker",
+        "HAMirrorUnavailable",
+        "primary_ha",
+        "getGroupCreatedAtMillis",
+        "ensureGroupCreatedAtMillis",
+        "groupCreatedAtMetadataKeyAlloc",
+    }
+    found = forbidden.intersection(re.findall(r"\b\w+\b", source))
+    if found:
+        raise ValueError(
+            f"{relative} exposes server replication policy: {', '.join(sorted(found))}"
+        )
 
 
 def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
@@ -210,8 +353,10 @@ def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
             raise ValueError(
                 "engine imports server coordination: " + " -> ".join(reversed(chain))
             )
+        source = path.read_text()
+        check_replication_contract(relative, source)
         dependencies = []
-        for imported in production_imports(path.read_text()):
+        for imported in production_imports(source):
             dependency = (path.parent / imported).resolve()
             if not dependency.is_relative_to(root):
                 raise ValueError(
@@ -227,15 +372,26 @@ def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
     return graph
 
 
-def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str, str], str], entry: str, target_os: str | None = None, external_modules: set[str] | None = None) -> int:
+def audit_modules(
+    project: Path,
+    modules: dict[str, Path],
+    edges: dict[tuple[str, str], str],
+    entry: str,
+    target_os: str | None = None,
+    external_modules: set[str] | None = None,
+) -> int:
     """Resolve source imports against the actual target's Build.Module table."""
     project = project.resolve()
     source_root = project / "pkg/antfly/src"
+    local_root = project / "pkg/antfly-embedded/src/local"
     external_modules = external_modules or set()
     unknown = external_modules.difference(modules)
     if unknown:
         raise ValueError(f"unknown external module owners: {sorted(unknown)}")
-    if entry not in modules or any(owner not in modules or target not in modules for (owner, _), target in edges.items()):
+    if entry not in modules or any(
+        owner not in modules or target not in modules
+        for (owner, _), target in edges.items()
+    ):
         raise ValueError("module graph references an unknown source owner")
     pending = collections.deque([(entry, modules[entry].resolve(), [])])
     visited: set[tuple[str, Path]] = set()
@@ -244,8 +400,15 @@ def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str
         if (module, path) in visited:
             continue
         visited.add((module, path))
-        if path.is_relative_to(source_root) and server_source(path.relative_to(source_root).as_posix()):
-            raise ValueError("embedded module imports server coordination: " + " -> ".join(chain + [str(path)]))
+        if path.is_relative_to(source_root):
+            raise ValueError(
+                "embedded module imports server coordination: "
+                + " -> ".join(chain + [str(path)])
+            )
+        if path.is_relative_to(local_root):
+            check_replication_contract(
+                path.relative_to(local_root).as_posix(), path.read_text()
+            )
         # Exempt only dependency-owned modules declared by the build, never
         # Antfly-generated sources merely because their cache is external.
         if module in external_modules and not path.is_relative_to(project):
@@ -254,17 +417,25 @@ def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str
             # including re-entry through another dependency-owned module.
             for (owner, _), target in edges.items():
                 if owner == module:
-                    pending.append((target, modules[target].resolve(), chain + [str(path)]))
+                    pending.append(
+                        (target, modules[target].resolve(), chain + [str(path)])
+                    )
             continue
         if not path.is_file():
             raise ValueError(f"missing module source: {path}")
         options = {}
         option_owner = edges.get((module, "build_options"))
         if option_owner in modules and modules[option_owner].is_file():
-            options = {name: value == "true" for name, value in re.findall(
-                r"pub const (\w+): bool = (true|false);", modules[option_owner].read_text()
-            )}
-        for imported in production_imports(path.read_text(), include_named=True, target_os=target_os, options=options):
+            options = {
+                name: value == "true"
+                for name, value in re.findall(
+                    r"pub const (\w+): bool = (true|false);",
+                    modules[option_owner].read_text(),
+                )
+            }
+        for imported in production_imports(
+            path.read_text(), include_named=True, target_os=target_os, options=options
+        ):
             if imported in {"std", "builtin"}:
                 continue
             next_chain = chain + [str(path)]
@@ -272,22 +443,29 @@ def audit_modules(project: Path, modules: dict[str, Path], edges: dict[tuple[str
                 dependency = (path.parent / imported).resolve()
                 # Generated sibling files belong to their declared module's
                 # source directory. Other external imports need a named owner.
-                if not dependency.is_relative_to(project) and not dependency.is_relative_to(modules[module].resolve().parent):
-                    raise ValueError(f"{path} imports outside Antfly's source owner: {imported}")
+                if not dependency.is_relative_to(
+                    project
+                ) and not dependency.is_relative_to(modules[module].resolve().parent):
+                    raise ValueError(
+                        f"{path} imports outside Antfly's source owner: {imported}"
+                    )
                 pending.append((module, dependency, next_chain))
             else:
                 target = entry if imported == "root" else edges.get((module, imported))
                 if target is None or target not in modules:
-                    raise ValueError(f"unresolved module import {imported!r} in {path} (owner {module})")
+                    raise ValueError(
+                        f"unresolved module import {imported!r} in {path} (owner {module})"
+                    )
                 pending.append((target, modules[target].resolve(), next_chain))
     return len(visited)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "pkg/antfly/src",
+        default=Path(__file__).resolve().parents[1] / "pkg/antfly-embedded/src/local",
     )
     parser.add_argument("--entry", action="append")
     parser.add_argument("--json", type=Path)
@@ -304,9 +482,13 @@ def main() -> None:
                 args.project or Path(__file__).resolve().parents[1],
                 {name: Path(path) for name, path in args.module},
                 {(owner, name): target for owner, name, target in args.module_import},
-                args.entry_module, args.target_os, set(args.external_module),
+                args.entry_module,
+                args.target_os,
+                set(args.external_module),
             )
-            print(f"Embedded module boundary: {count} resolved sources, no server coordination imports.")
+            print(
+                f"Embedded module boundary: {count} resolved sources, no server coordination imports."
+            )
             return
         graph = audit(
             args.root, args.entry or ["embedded_root.zig", "storage/db/db.zig"]

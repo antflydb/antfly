@@ -1905,7 +1905,7 @@ fn cudaProfileForArch(
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
-        .modern_bert => |cfg| if (cfg.laya != null and !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
+        .modern_bert => |cfg| if (cfg.laya != null and cfg.laya.?.format == .laya and !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,
@@ -5252,7 +5252,9 @@ const GpuHostedBudgetPolicy = struct {
     prefer_f32_dense_tensors: bool,
 };
 
-fn a4bGpuHostedBudgetPolicy(config: backend_contracts.A4bInferenceConfig) GpuHostedBudgetPolicy {
+fn a4bGpuHostedBudgetPolicy(
+    config: backend_contracts.A4bInferenceConfig,
+) GpuHostedBudgetPolicy {
     const budget: usize = @intCast(config.memory_budget_bytes);
     const kv: usize = @intCast(config.kv_budget_bytes);
     const scratch: usize = @intCast(config.safety_reserve_bytes);
@@ -5415,6 +5417,7 @@ pub fn widenBudgetLimitsForModelPath(
     defer mf.deinit();
 
     const model_weight_bytes = estimateNativeWeightBytes(allocator, mf) catch 0;
+
     const arch_config = try detectArchitecture(allocator, model_path, mf);
     const policy = gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
 
@@ -5843,7 +5846,7 @@ fn transposeGpt2Conv1dResidentGpuHostedWeights(
         }
 
         const name = std.mem.span(key);
-        const name_z = try allocator.dupeZ(u8, name);
+        const name_z = try allocator.dupeSentinel(u8, name, 0);
         defer allocator.free(name_z);
 
         if (isGpt2Conv1dWeight(name) and
@@ -6819,6 +6822,7 @@ const ArchSession = struct {
         metal_runtime.MetalJitRouteScope.none()
     else {},
     budget_floor: runtime.tier.memory.Limits = .{},
+    generation_workspace: ?runtime.tier.memory.ReservedGenerationWorkspace = null,
     shared_cache_budget_floor: runtime.tier.cache.Budget = .{},
     backend_data: BackendData,
     /// Optional Io for parallel GEMM dispatch via lib/linalg's Io variants.
@@ -6915,7 +6919,7 @@ pub fn beginMetalWorkloadProfile(session: Session, regime: ops.WorkloadRegime) !
     if (arch_session.backend_type != .metal) return false;
     const provider = gpuBackendData(arch_session).shared_metal_native_provider orelse
         return error.MetalWorkloadProfileUnavailable;
-    try provider.workloadProfileBegin(@enumFromInt(@intFromEnum(regime)));
+    try provider.workloadProfileBegin(@fromBackingInt(@intCast(@backingInt(regime))));
     return true;
 }
 
@@ -7453,9 +7457,10 @@ pub fn cudaOpProfileLoggingEnabled() bool {
 pub fn cudaStatsDelta(after: CudaRuntimeStats, before: CudaRuntimeStats) CudaRuntimeStats {
     if (comptime !build_options.enable_cuda) return after;
     var delta = after;
-    inline for (std.meta.fields(CudaRuntimeStats)) |field| {
-        switch (@typeInfo(field.type)) {
-            .int => @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name),
+    const info = @typeInfo(CudaRuntimeStats).@"struct";
+    inline for (info.field_names, info.field_types) |reflected_name, Field| {
+        switch (@typeInfo(Field)) {
+            .int => @field(delta, reflected_name) = @field(after, reflected_name) -| @field(before, reflected_name),
             else => {},
         }
     }
@@ -8357,9 +8362,31 @@ pub fn widenBudgetLimitsForSession(
     session: Session,
     limits: runtime.tier.memory.Limits,
 ) runtime.tier.memory.Limits {
+    if (session.generation_workspace) |workspace| return workspace.widenLimits(limits);
     if (session.vtable != &arch_vtable) return limits;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return widenLimits(limits, self.budget_floor);
+}
+
+/// Publish the load plan's serving policy only after its resident lease is
+/// retained. The model owner keeps the session and reservation alive together.
+pub fn configureReservedGenerationWorkspace(
+    session: *Session,
+    floor: runtime.tier.memory.Limits,
+    resident: runtime.tier.memory.AdmissionAmounts,
+) void {
+    std.debug.assert(session.vtable == &arch_vtable);
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    std.debug.assert(self.backend_type == .cuda);
+    std.debug.assert(self.generation_workspace == null);
+    self.generation_workspace = .{
+        .floor = floor,
+        .capacity = .{
+            .backend_kv_bytes = resident.backend_kv_bytes,
+            .backend_scratch_bytes = resident.backend_scratch_bytes,
+        },
+    };
+    session.generation_workspace = &self.generation_workspace.?;
 }
 
 /// Bind a session's lazy residency cache to the serving owner's hard limits
@@ -9902,6 +9929,7 @@ fn archBackend(ptr: *anyopaque) BackendType {
 
 fn archClose(ptr: *anyopaque) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.generation_workspace) |*workspace| workspace.borrowed.deinit();
     if (self.laya_trunk_cache) |cache| {
         cache.deinit();
         self.allocator.destroy(cache);
@@ -10024,6 +10052,41 @@ test "large multimodal gemma gpu_hosted budget floor widens dense limits" {
     try std.testing.expect(floor.host_limit_bytes >= 2 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.backend_limit_bytes >= 6 * 1024 * 1024 * 1024);
     try std.testing.expect(floor.combined_limit_bytes >= floor.backend_limit_bytes);
+}
+
+test "CUDA A4B serving policy is attached to the returned session" {
+    var owner = ArchSession{
+        .allocator = std.testing.allocator,
+        .arch_config = .{ .gpt = .{ .family = .gemma } },
+        .backend_type = .cuda,
+        .backend_data = undefined,
+    };
+    var session = Session{ .ptr = &owner, .vtable = &arch_vtable };
+    const resident = runtime.tier.memory.AdmissionAmounts{ .backend_weight_bytes = 80, .backend_kv_bytes = 16, .backend_scratch_bytes = 4 };
+    configureReservedGenerationWorkspace(&session, .{ .backend_limit_bytes = 100, .combined_limit_bytes = 100, .kv_limit_bytes = 16, .scratch_limit_bytes = 4 }, resident);
+    defer owner.generation_workspace.?.borrowed.deinit();
+    const limits = widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 20, .backend_limit_bytes = 50, .combined_limit_bytes = 70 });
+    try std.testing.expectEqual(@as(usize, 100), limits.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 120), limits.combined_limit_bytes);
+    var amounts = runtime.tier.memory.AdmissionAmounts{ .backend_kv_bytes = 16, .backend_scratch_bytes = 4 };
+    var lease = try session.generation_workspace.?.acquire(&amounts);
+    defer lease.release();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, amounts);
+    // Value copies of Session borrow from the same bounded owner.
+    const copy = session;
+    var another = runtime.tier.memory.AdmissionAmounts{ .backend_scratch_bytes = 1 };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, copy.generation_workspace.?.acquire(&another));
+}
+
+test "CUDA A4B hosted policy keeps construction budget independent of staging" {
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        null,
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const floor = a4bGpuHostedBudgetPolicy(config).budget_floor;
+    const backend_budget = @as(usize, @intCast(config.memory_budget_bytes));
+    try std.testing.expectEqual(backend_budget, floor.backend_limit_bytes);
+    try std.testing.expectEqual(backend_budget, floor.combined_limit_bytes);
 }
 
 test "Qwen3-VL reranker BF16 budget covers mapped and backend weight domains" {
@@ -10477,11 +10540,11 @@ test "deepseek v4 required tensors use canonical hf names" {
         names.deinit(allocator);
     }
 
-    var attention_schedule = [_]gpt_mod.DeepseekV4AttentionKind{.sliding_attention} ** gpt_mod.deepseek_v4_max_layers;
+    var attention_schedule = @as([gpt_mod.deepseek_v4_max_layers]gpt_mod.DeepseekV4AttentionKind, @splat(.sliding_attention));
     attention_schedule[1] = .compressed_sparse_attention;
     attention_schedule[2] = .heavily_compressed_attention;
 
-    var mlp_schedule = [_]gpt_mod.DeepseekV4MlpKind{.moe} ** gpt_mod.deepseek_v4_max_layers;
+    var mlp_schedule = @as([gpt_mod.deepseek_v4_max_layers]gpt_mod.DeepseekV4MlpKind, @splat(.moe));
     mlp_schedule[0] = .hash_moe;
 
     var missing = std.ArrayListUnmanaged([]const u8).empty;

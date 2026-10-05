@@ -14,5 +14,5 @@
 // limitations.
 
 test {
-    _ = @import("db/derived/derived_log.zig");
+    _ = @import("antfly_local_sources").storage_db_derived_derived_log;
 }

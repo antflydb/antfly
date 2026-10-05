@@ -16,7 +16,7 @@
 //! One physical owner for a native standalone metadata catalog. This is not
 //! a Raft placement and must never be inferred from a public table listing.
 const std = @import("std");
-const incarnation = @import("incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 
 pub const Binding = struct {
     metadata_incarnation: incarnation.MetadataClusterIncarnation,

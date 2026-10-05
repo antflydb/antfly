@@ -49,6 +49,7 @@ pub fn create(ctx: Context) Suite {
     });
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     ctx.graph.identities.addImports(tests.root_module);
+    runtime_build.applyCBindings(tests.root_module, ctx.graph.c_bindings);
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);
     tests.root_module.addImport("antfly-json", ctx.graph.json_mod);
     tests.root_module.addImport("httpx", ctx.graph.httpx_mod);

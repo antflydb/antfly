@@ -108,7 +108,7 @@ pub const MetadataServer = struct {
     owned_kernel_owner_source: ?*MetadataKernelOwnerSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
-    http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null,
+    http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null,
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     owned_admin_listener: ?*MetadataAdminHttpRuntime = null,
     restore_supervisor_owner_id: u64 = 0,
@@ -134,7 +134,7 @@ pub const MetadataServer = struct {
         };
         var http_config = cfg.http;
         if (online_capabilities != null) {
-            http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("../storage/db/online_merge_io_contract.zig").max_response_bytes);
+            http_config.http.executor.max_response_bytes = @max(http_config.http.executor.max_response_bytes, @import("antfly_local_sources").storage_db_online_merge_io_contract.max_response_bytes);
         }
         svc.* = try service.MetadataHttpService.init(alloc, http_config, deps.http, service_cfg);
         errdefer svc.deinit();
@@ -216,7 +216,7 @@ pub const MetadataServer = struct {
         };
         var owned_admin_mux: ?*MetadataAdminMux = null;
         errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
-        var http_observer_lease: ?@import("../storage/background_runtime.zig").BackendRuntime.WorkerLease = null;
+        var http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null;
         errdefer if (http_observer_lease) |*lease| lease.release();
         var owned_http_runtime: ?*httpx.HttpRuntime = null;
         errdefer if (owned_http_runtime) |http_runtime| {
@@ -301,6 +301,7 @@ pub const MetadataServer = struct {
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            public_read_source.decision_registry = if (cfg.api_server_cfg.node_config) |node_config| &node_config.registry else null;
             _ = public_read_source.withBackendRuntime(backend_runtime);
             _ = public_read_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
@@ -318,6 +319,7 @@ pub const MetadataServer = struct {
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;
+            api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
             api_server_cfg.configureRemoteCatalogPublicationAuthority();
             // Restore-owner and durable-session RPCs share the same owned
             // data-bearing routes and transport as ordinary hosted reads and
@@ -521,6 +523,7 @@ pub const MetadataServer = struct {
         const io = (try self.svc.ensureBackendRuntime()).io() orelse return error.AsyncRestoreUnavailable;
         var last_unexpected_error: ?anyerror = null;
         while (!self.restore_supervisor_stop.load(.acquire)) {
+            const observed_progress = self.svc.restore_owner_progress_generation.load(.acquire);
             if (self.owned_admin_mux) |mux| {
                 if (mux.ensureRestoreLeadershipIfLocalLeader()) |local_leader| {
                     if (local_leader) {
@@ -544,7 +547,15 @@ pub const MetadataServer = struct {
                     }
                 }
             }
-            io.sleep(std.Io.Duration.fromMilliseconds(250), .awake) catch return;
+            // Register before checking the generation, so a receipt racing
+            // reset cannot be lost. Periodic reconciliation covers restarts
+            // and notifications that never reached this metadata replica.
+            self.svc.restore_owner_progress_event.reset();
+            if (self.svc.restore_owner_progress_generation.load(.acquire) != observed_progress) continue;
+            self.svc.restore_owner_progress_event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return,
+            };
         }
     }
 
@@ -698,11 +709,11 @@ const MetadataAdminHttpRuntime = struct {
     handler: public_api_kernel.HttpxHandler,
     server: httpx.Server,
     listener_task: httpx.ListenerTask,
-    api_lane_lease: @import("../storage/background_runtime.zig").BackendRuntime.ApiLaneLease,
+    api_lane_lease: @import("antfly_local_sources").storage_background_runtime.BackendRuntime.ApiLaneLease,
 
     fn init(
         alloc: std.mem.Allocator,
-        backend_runtime: *@import("../storage/background_runtime.zig").BackendRuntime,
+        backend_runtime: *@import("antfly_local_sources").storage_background_runtime.BackendRuntime,
         http_runtime: *httpx.HttpRuntime,
         cfg: raft_transport.StdHttpListenerConfig,
         mux: *MetadataAdminMux,
@@ -751,7 +762,7 @@ const MetadataAdminHttpRuntime = struct {
         };
     }
 
-    fn deinit(self: *MetadataAdminHttpRuntime) void {
+    pub fn deinit(self: *MetadataAdminHttpRuntime) void {
         self.deinitWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
     }
 
@@ -1228,7 +1239,7 @@ const MetadataRoutingSnapshot = struct {
     stores: []metadata_mod.StoreRecord,
     placements: []raft_reconciler.PlacementIntent,
 
-    fn deinit(self: *MetadataRoutingSnapshot, svc: *service.MetadataHttpService, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *MetadataRoutingSnapshot, svc: *service.MetadataHttpService, alloc: std.mem.Allocator) void {
         svc.freeProjectedPlacementIntents(alloc, self.placements);
         svc.freeProjectedStores(alloc, self.stores);
         self.* = undefined;
@@ -1594,7 +1605,7 @@ test "metadata server online merge defaults on only for authenticated native dep
     cfg.api_server_cfg.deployment_mode = .serverless;
     try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
     cfg.api_server_cfg.deployment_mode = .distributed;
-    var node = try @import("../common/config.zig").Config.parseFromSlice(std.testing.allocator, "{}");
+    var node = try @import("antfly_local_sources").common_config.Config.parseFromSlice(std.testing.allocator, "{}");
     defer node.deinit();
     node.deployment_mode = .serverless;
     cfg.api_server_cfg.node_config = &node;
@@ -1605,7 +1616,7 @@ test "metadata server online merge defaults on only for authenticated native dep
     if (control_only_storage_sources) {
         try (try onlineMergeCapabilities(cfg)).?.require();
     } else try std.testing.expect((try onlineMergeCapabilities(cfg)) == null);
-    try std.testing.expect(@import("../storage/db/online_merge_io_contract.zig").max_response_bytes >= 32 * 1024 * 1024);
+    try std.testing.expect(@import("antfly_local_sources").storage_db_online_merge_io_contract.max_response_bytes >= 32 * 1024 * 1024);
 }
 
 test "metadata server can expose admin listener endpoints" {
@@ -1802,8 +1813,9 @@ test "metadata server can expose admin listener endpoints" {
         .content_type = "application/json",
     });
     defer authenticated_policy_status.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 409), authenticated_policy_status.status);
-    try std.testing.expectEqualStrings("RowPolicyCatalogChanged", authenticated_policy_status.body);
+    // Authenticated status reads distinguish an absent policy from errors.
+    try std.testing.expectEqual(@as(u16, 200), authenticated_policy_status.status);
+    try std.testing.expectEqualStrings("null", authenticated_policy_status.body);
 
     // A forged service header must not reach the decoder-activation probe.
     // This exercises the real host authentication middleware, not just the

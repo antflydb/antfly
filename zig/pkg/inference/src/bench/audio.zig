@@ -155,8 +155,8 @@ fn parseArgs(init: std.process.Init) !BenchConfig {
 }
 
 fn parseBenchKind(arg: []const u8) !BenchKind {
-    inline for (std.meta.fields(BenchKind)) |field| {
-        if (std.mem.eql(u8, arg, field.name)) return @field(BenchKind, field.name);
+    inline for (@typeInfo(BenchKind).@"enum".field_names) |reflected_name| {
+        if (std.mem.eql(u8, arg, reflected_name)) return @field(BenchKind, reflected_name);
     }
     return error.InvalidBenchKind;
 }

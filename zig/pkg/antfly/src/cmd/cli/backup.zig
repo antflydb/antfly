@@ -17,7 +17,7 @@ const std = @import("std");
 const antfly = @import("../../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
-const platform_time = @import("backup_wait.zig").platform_time;
+const platform_time = antfly.platform_time;
 
 const lite_restore_staging = @import("../../standalone/restore_staging_bridge.zig");
 const portable_backup = antfly.portable_backup;
@@ -26,17 +26,43 @@ const backups_api = antfly.public_api.backups;
 const fs_paths = antfly.common.fs_paths;
 
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
-const restore_poll_interval_ms = @import("backup_wait.zig").restore_poll_interval_ms;
-
-const restore_poll_ambiguous_grace_polls = @import("backup_wait.zig").restore_poll_ambiguous_grace_polls;
-
+const restore_poll_interval_ms: u64 = 1000;
+const restore_poll_ambiguous_grace_polls: u8 = 5;
 const max_restore_tables: usize = 256;
 const default_backup_list_limit: usize = 100;
 const max_backup_list_limit: usize = 1000;
 
-const RestorePollDisposition = @import("backup_wait.zig").RestorePollDisposition;
+const RestorePollDisposition = enum { use_data, retry, invalid };
 
-const RestorePollState = @import("backup_wait.zig").RestorePollState;
+const RestorePollState = struct {
+    consecutive_ambiguous_polls: u8 = 0,
+
+    fn observe(self: *RestorePollState, status_code: u16, has_data: bool) RestorePollDisposition {
+        if (has_data) {
+            self.consecutive_ambiguous_polls = 0;
+            return .use_data;
+        }
+
+        return switch (status_code) {
+            // Explicitly transient responses reset the bounded ambiguity
+            // streak. The overall restore timeout still bounds retries.
+            408, 429, 502, 503, 504 => blk: {
+                self.consecutive_ambiguous_polls = 0;
+                break :blk .retry;
+            },
+            // A follower can briefly lack a newly committed job, and an
+            // upstream can emit a short 500 burst. Bound only consecutive
+            // ambiguous observations so a late blip does not terminate an
+            // otherwise healthy long-running restore.
+            404, 500 => blk: {
+                if (self.consecutive_ambiguous_polls >= restore_poll_ambiguous_grace_polls) break :blk .invalid;
+                self.consecutive_ambiguous_polls += 1;
+                break :blk .retry;
+            },
+            else => .invalid,
+        };
+    }
+};
 
 const BackupArgs = struct {
     help: bool = false,
@@ -358,11 +384,11 @@ fn writeRestoreResponse(
     return restorePhaseResult(job.phase);
 }
 
-pub const waitForRestoreJob = @import("backup_wait.zig").waitForRestoreJob;
+pub const waitForRestoreJob = @import("antfly_local_sources").cmd_cli_backup_wait.waitForRestoreJob;
 
-pub const isTerminalRestorePhase = @import("backup_wait.zig").isTerminalRestorePhase;
+pub const isTerminalRestorePhase = @import("antfly_local_sources").cmd_cli_backup_wait.isTerminalRestorePhase;
 
-pub const restorePhaseResult = @import("backup_wait.zig").restorePhaseResult;
+pub const restorePhaseResult = @import("antfly_local_sources").cmd_cli_backup_wait.restorePhaseResult;
 
 pub fn prepareInputRestorePlan(
     allocator: std.mem.Allocator,

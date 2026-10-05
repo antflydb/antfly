@@ -397,7 +397,7 @@ fn encodeRecord(alloc: std.mem.Allocator, buffer: *std.ArrayList(u8), record: re
     try appendInt(alloc, buffer, u64, @intCast(record.raft.max_inflight_bytes));
     try appendInt(alloc, buffer, u64, @intCast(record.raft.max_uncommitted_entries_size));
     try buffer.append(alloc, packFlags(record.raft));
-    try buffer.append(alloc, @intFromEnum(record.raft.read_only_option));
+    try buffer.append(alloc, @backingInt(record.raft.read_only_option));
 
     switch (record.bootstrap) {
         .empty => try buffer.append(alloc, bootstrap_empty),
@@ -559,8 +559,8 @@ fn packFlags(cfg: replica.ReplicaRaftConfig) u8 {
 
 fn decodeReadOnlyOption(raw: u8) !core.types.ReadOnlyOption {
     return switch (raw) {
-        @intFromEnum(core.types.ReadOnlyOption.safe) => .safe,
-        @intFromEnum(core.types.ReadOnlyOption.lease_based) => .lease_based,
+        @backingInt(core.types.ReadOnlyOption.safe) => .safe,
+        @backingInt(core.types.ReadOnlyOption.lease_based) => .lease_based,
         else => error.InvalidReplicaCatalogReadOnlyOption,
     };
 }
@@ -634,7 +634,7 @@ test "file replica catalog decoder accepts v2 while predecessor writer stays fai
     encoded_record.items[bootstrap_offset] = bootstrap_fetch_snapshot_versioned;
     try encoded_record.append(
         std.testing.allocator,
-        @intFromEnum(snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2),
+        @backingInt(snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2),
     );
 
     var catalog_bytes: std.ArrayList(u8) = .empty;

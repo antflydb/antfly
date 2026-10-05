@@ -17,9 +17,9 @@
 //! primary bytes (including intents and retained effects) are authoritative.
 //! Local sidecar pins and derived projections are deliberately not included.
 const std = @import("std");
-const core = @import("../../storage/db/core.zig");
+const core = @import("antfly_local_sources").storage_db_core;
 const fs = @import("antfly_runtime_fs").fs_paths;
-const Cancellation = @import("../../storage/db/types.zig").CancellationToken;
+const Cancellation = @import("antfly_local_sources").storage_db_types.CancellationToken;
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const max_files = 1_000_000;
 pub const header_size = 80;
@@ -32,7 +32,7 @@ pub const Identity = struct {
     native_term: u64,
     native_index: u64,
 
-    fn validate(self: Identity) !void {
+    pub fn validate(self: Identity) !void {
         if (self.group_id == 0 or self.native_index > self.through_index or
             (self.native_index == 0) != (self.native_term == 0)) return error.InvalidSnapshot;
     }
@@ -222,7 +222,7 @@ pub fn extract(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, root: []co
 }
 
 test "relational index system native Raft snapshot preserves exact typed primary and later writes are excluded" {
-    const db_mod = @import("../../storage/db/mod.zig");
+    const db_mod = @import("antfly_local_sources").storage_db_mod;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -237,13 +237,13 @@ test "relational index system native Raft snapshot preserves exact typed primary
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
     );
     const owner_identity = try source.relationalTopologyIdentity();
-    const scope: @import("../../storage/db/online_source_contract.zig").Scope = .{
+    const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .admission_epoch = owner_identity.next_epoch, .transition_id = 55, .attempt = 1, .peer_group_id = 23, .owner_group_id = 22, .role = .merge_source, .namespace = owner_identity.namespace, .catalog_digest = owner_identity.catalog_digest },
         .receiver_namespace = .{ .table_id = 21, .shard_id = 23, .range_id = 23 },
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 2, .sequence = 1 },
     };
-    const pin_mod = @import("../../storage/db/source_pin.zig");
+    const pin_mod = @import("antfly_local_sources").storage_db_source_pin;
     pin_mod.test_failure = .after_prepare;
     defer pin_mod.test_failure = .none;
     try std.testing.expectError(error.InjectedSourcePinFailure, @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 2, .index = 1 }));
@@ -254,9 +254,9 @@ test "relational index system native Raft snapshot preserves exact typed primary
     const certificate = try source.prepareOnlineSourcePublication(scope, .none);
     try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 2, .index = 2 });
     try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .timestamp_ns = 987654321, .writes = &.{.{ .key = "a", .value = "{\"n\":9007199254740993}" }} }, .{ .term = 2, .index = 5 });
-    const txn_id = [_]u8{7} ** 16;
-    _ = try source.beginReplicatedTransactionAtRaftEntry(txn_id, 987654322, 987654322, &.{"participant"}, false, false, .{ .term = 2, .index = 6 });
-    try source.writeReplicatedTransactionAtRaftEntry(txn_id, .{ .writes = &.{.{ .key = "prepared", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 7 });
+    const txn_id = @as([16]u8, @splat(7));
+    _ = try source.beginReplicatedTransactionAtOrderedReceipt(txn_id, 987654322, 987654322, &.{"participant"}, false, false, .{ .term = 2, .index = 6 });
+    try source.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{ .writes = &.{.{ .key = "prepared", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 7 });
     try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } } }, .{ .term = 2, .index = 8 });
     try std.testing.expectError(error.InvalidSnapshot, @import("../../storage/server_db_adapter.zig").captureSnapshot(&source, 22, 4));
     // Requested through-index includes protocol-only entries without a native

@@ -101,7 +101,7 @@ const Triplet = struct {
     relation: []const u8,
     score: f32,
 
-    fn deinit(self: *const Triplet, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *const Triplet, allocator: std.mem.Allocator) void {
         allocator.free(self.subject);
         allocator.free(self.object);
         allocator.free(self.relation);

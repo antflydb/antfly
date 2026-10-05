@@ -16,9 +16,9 @@
 //! System catalog response shapes. Authentication and scoped authorization are
 //! performed by the public handler before these operations are invoked.
 const std = @import("std");
-const domain = @import("../system_catalog/domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const routes = @import("../system_catalog/routes.zig");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const metadata_authority = @import("../metadata/authority.zig");
 pub const Response = struct {
     status: u16,

@@ -130,7 +130,12 @@ If you want the same check locally before pushing, install the repository hooks 
 make install-git-hooks
 ```
 
-That enables `.githooks/pre-push`, which runs `make tidy-check` when pushed changes include Go sources or Go module files.
+That enables two hooks:
+
+- `.githooks/pre-commit` formats staged Zig, Go, Python, Rust, and TypeScript workspace files with the tools used by `make fmt`. Only formatting changes are added to the index; unrelated unstaged edits stay unstaged. If formatting overlaps an unstaged edit, the hook stops without applying any changes. Run `make fmt`, then review and stage the desired hunks before retrying.
+- `.githooks/pre-push` runs `make tidy-check` when pushed changes include Go sources or Go module files.
+
+Install the development tools and TypeScript dependencies before using the hooks. Missing tools or formatter failures stop the commit with an error. Use `git commit --no-verify` to bypass hooks when needed; CI continues to check formatting independently.
 
 ## Testing
 

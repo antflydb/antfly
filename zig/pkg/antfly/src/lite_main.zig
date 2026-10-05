@@ -1,24 +1,21 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const structlog = @import("structlog");
-const dispatch = @import("runtime_dispatch.zig");
-
-extern fn antfly_runtime_lite(context: *const dispatch.Context) callconv(.c) c_int;
-extern fn antfly_runtime_inference(context: *const dispatch.Context) callconv(.c) c_int;
+const cli_main = @import("main.zig");
 const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
 
 pub const std_options: std.Options = .{
@@ -47,10 +44,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, subcommand, "lite")) {
-        return try dispatch.run(antfly_runtime_lite, subcommand, init, &args);
+        return try cli_main.runRuntimeUnit(.standalone, subcommand, init, &args);
     }
 
-    // Embedded hosts can re-execute this binary as their inference worker.
+    // lite serve re-executes this binary as its supervised inference worker.
     if (std.mem.eql(u8, subcommand, "inference")) {
         const worker_command = args.next() orelse return error.InvalidArguments;
         if (!std.mem.eql(u8, worker_command, "_worker")) return error.InvalidArguments;
@@ -61,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
         defer worker_args.deinit();
         _ = worker_args.next();
         _ = worker_args.next();
-        return try dispatch.run(antfly_runtime_inference, subcommand, init, &worker_args);
+        return try cli_main.runRuntimeUnit(.inference, subcommand, init, &worker_args);
     }
 
     std.debug.print("unknown subcommand: {s}\n", .{subcommand});
@@ -89,3 +86,6 @@ fn printVersion() void {
 test "lite main compiles" {
     _ = main;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

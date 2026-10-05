@@ -238,7 +238,7 @@ const SequenceTaskHead = struct {
     out_proj_weight: []f32,
     out_proj_bias: []f32,
 
-    fn deinit(self: *SequenceTaskHead, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SequenceTaskHead, allocator: std.mem.Allocator) void {
         for (self.label_vocab) |item| allocator.free(item);
         allocator.free(self.label_vocab);
         allocator.free(self.dense_weight);
@@ -256,7 +256,7 @@ const TokenTaskHead = struct {
     classifier_weight: []f32,
     classifier_bias: []f32,
 
-    fn deinit(self: *TokenTaskHead, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TokenTaskHead, allocator: std.mem.Allocator) void {
         for (self.label_vocab) |item| allocator.free(item);
         allocator.free(self.label_vocab);
         allocator.free(self.classifier_weight);
@@ -327,6 +327,7 @@ pub fn trainLoRABundleOneStep(
 
 pub fn trainEvalSequenceLoRABundle(
     allocator: std.mem.Allocator,
+    io: std.Io,
     bundle: *LoadedLoRABundle,
     train_examples: []const document_data.SequenceExample,
     val_examples: []const document_data.SequenceExample,
@@ -398,7 +399,7 @@ pub fn trainEvalSequenceLoRABundle(
     head = try cloneSequenceTaskHead(allocator, &best_head);
     if (options.save_output_on_completion and options.ddp_rank == 0) {
         try saveLoRABundle(bundle, out_dir);
-        try saveSequenceTaskHead(allocator, &head, out_dir);
+        try saveSequenceTaskHead(allocator, io, &head, out_dir);
         std.log.info("layoutlmv3 sequence checkpoint: best_epoch={d} acc={d:.3} saved={s}", .{ best_epoch, best_accuracy, out_dir });
     }
     const after_train = try evaluateSequenceExamples(allocator, bundle, &head, train_examples, options.max_train_examples, options.layer_name);
@@ -430,6 +431,7 @@ pub fn trainEvalSequenceLoRABundle(
 
 pub fn trainEvalTokenLoRABundle(
     allocator: std.mem.Allocator,
+    io: std.Io,
     bundle: *LoadedLoRABundle,
     train_examples: []const document_data.TokenTaskExample,
     val_examples: []const document_data.TokenTaskExample,
@@ -523,7 +525,7 @@ pub fn trainEvalTokenLoRABundle(
     head = try cloneTokenTaskHead(allocator, &best_head);
     if (options.save_output_on_completion and options.ddp_rank == 0) {
         try saveLoRABundle(bundle, out_dir);
-        try saveTokenTaskHead(allocator, &head, out_dir);
+        try saveTokenTaskHead(allocator, io, &head, out_dir);
         std.log.info("layoutlmv3 token checkpoint: best_epoch={d} exact_match={d:.3} saved={s}", .{ best_epoch, best_exact_match, out_dir });
     }
     const after_train = try evaluateTokenExamples(allocator, bundle, &head, train_examples, options.max_train_examples, options.layer_name);
@@ -744,7 +746,7 @@ const LoRAAdamState = struct {
         return .{ .allocator = allocator, .m = m, .v = v, .step = 0 };
     }
 
-    fn deinit(self: *LoRAAdamState) void {
+    pub fn deinit(self: *LoRAAdamState) void {
         self.allocator.free(self.m);
         self.allocator.free(self.v);
         self.* = undefined;
@@ -766,7 +768,7 @@ const LoRAScheduleFreeState = struct {
         return .{ .allocator = allocator, .z = z, .v = v, .step = 0 };
     }
 
-    fn deinit(self: *LoRAScheduleFreeState) void {
+    pub fn deinit(self: *LoRAScheduleFreeState) void {
         self.allocator.free(self.z);
         self.allocator.free(self.v);
         self.* = undefined;
@@ -1049,8 +1051,8 @@ fn trainTokenHeadGraphOneStep(
     return summary;
 }
 
-fn saveSequenceTaskHead(allocator: std.mem.Allocator, head: *const SequenceTaskHead, out_dir: []const u8) !void {
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+fn saveSequenceTaskHead(allocator: std.mem.Allocator, io: std.Io, head: *const SequenceTaskHead, out_dir: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, sequence_head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, sequence_head_config_file_name });
@@ -1072,8 +1074,8 @@ fn saveSequenceTaskHead(allocator: std.mem.Allocator, head: *const SequenceTaskH
     try writeTaskHeadConfigJson(allocator, config_path, "sequence_classification", head.hidden_size, head.label_vocab);
 }
 
-fn saveTokenTaskHead(allocator: std.mem.Allocator, head: *const TokenTaskHead, out_dir: []const u8) !void {
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+fn saveTokenTaskHead(allocator: std.mem.Allocator, io: std.Io, head: *const TokenTaskHead, out_dir: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, token_head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     const config_path = try std.fs.path.join(allocator, &.{ out_dir, token_head_config_file_name });
@@ -1098,7 +1100,7 @@ fn loadTokenTaskHeadIfPresent(
 ) !?TokenTaskHead {
     const input = model_input orelse return null;
     const model_dir = blk: {
-        const stat = compat.cwd().statFile(compat.io(), input, .{}) catch break :blk input;
+        const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), input, .{}) catch break :blk input;
         if (stat.kind == .directory) break :blk input;
         break :blk (std.fs.path.dirname(input) orelse ".");
     };
@@ -1108,7 +1110,7 @@ fn loadTokenTaskHeadIfPresent(
     defer if (config_path) |path| allocator.free(path);
     if (checkpoint_path == null or config_path == null) return null;
 
-    const raw_cfg = try compat.cwd().readFileAlloc(compat.io(), config_path.?, allocator, .limited(8 * 1024 * 1024));
+    const raw_cfg = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), config_path.?, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(raw_cfg);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_cfg, .{});
     defer parsed.deinit();
@@ -1166,7 +1168,7 @@ fn writeTaskHeadConfigJson(
         .num_labels = label_vocab.len,
         .labels = label_vocab,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn computeTokenFeatures(out: *[6]f32, tok: document_data.TokenBox, token_idx: usize, token_count: usize) void {
@@ -1969,7 +1971,7 @@ fn writeSyntheticLayoutLMv3BaseModel(
     dir_path: []const u8,
     hidden_size: usize,
 ) !void {
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, config_file_name });
     defer allocator.free(config_path);
     const config = try std.json.Stringify.valueAlloc(allocator, .{
@@ -1981,7 +1983,7 @@ fn writeSyntheticLayoutLMv3BaseModel(
         .num_hidden_layers = 12,
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(config);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = config });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = config });
 
     const query = try allocator.alloc(f32, hidden_size * hidden_size);
     defer allocator.free(query);
@@ -2026,8 +2028,8 @@ fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ "/tmp", root, name });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 
@@ -2063,7 +2065,7 @@ test "bootstrap save and materialize layoutlmv3 lora bundle" {
     const allocator = std.testing.allocator;
     const root_dir = try testScratchDir(allocator, "layoutlmv3-materialize");
     defer allocator.free(root_dir);
-    defer compat.cwd().deleteTree(compat.io(), root_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root_dir) catch {};
 
     const base_dir = try std.fs.path.join(allocator, &.{ root_dir, "base" });
     defer allocator.free(base_dir);
@@ -2072,8 +2074,8 @@ test "bootstrap save and materialize layoutlmv3 lora bundle" {
     const out_dir = try std.fs.path.join(allocator, &.{ root_dir, "out" });
     defer allocator.free(out_dir);
 
-    try compat.cwd().createDirPath(compat.io(), base_dir);
-    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), base_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), adapter_dir);
 
     const base_config =
         \\{
@@ -2087,7 +2089,7 @@ test "bootstrap save and materialize layoutlmv3 lora bundle" {
     ;
     const base_config_path = try std.fs.path.join(allocator, &.{ base_dir, "config.json" });
     defer allocator.free(base_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = base_config_path, .data = base_config });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = base_config_path, .data = base_config });
 
     const base_tensors = [_]WriteTensorF32{
         .{
@@ -2172,7 +2174,7 @@ test "bootstrap save and materialize layoutlmv3 lora bundle" {
     ;
     const head_cfg_path = try std.fs.path.join(allocator, &.{ adapter_dir, "sequence_head_config.json" });
     defer allocator.free(head_cfg_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_cfg_path, .data = head_cfg });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = head_cfg_path, .data = head_cfg });
 
     var summary = try materializeMergedModel(allocator, base_dir, adapter_dir, "sequence", out_dir);
     defer freeMaterializeSummary(allocator, &summary);
@@ -2210,7 +2212,7 @@ test "train eval layoutlmv3 sequence lora bundle saves sequence head" {
     const allocator = std.testing.allocator;
     const root_dir = try testScratchDir(allocator, "layoutlmv3-sequence-train");
     defer allocator.free(root_dir);
-    defer compat.cwd().deleteTree(compat.io(), root_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root_dir) catch {};
 
     const base_dir = try std.fs.path.join(allocator, &.{ root_dir, "base_seq" });
     defer allocator.free(base_dir);
@@ -2219,8 +2221,8 @@ test "train eval layoutlmv3 sequence lora bundle saves sequence head" {
     const out_dir = try std.fs.path.join(allocator, &.{ root_dir, "out_seq" });
     defer allocator.free(out_dir);
 
-    try compat.cwd().createDirPath(compat.io(), base_dir);
-    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), base_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), adapter_dir);
     try bootstrapSyntheticLoRABundle(allocator, base_dir, adapter_dir, 8);
 
     var bundle = try loadLoRABundle(allocator, base_dir, adapter_dir);
@@ -2267,6 +2269,7 @@ test "train eval layoutlmv3 sequence lora bundle saves sequence head" {
 
     var summary = try trainEvalSequenceLoRABundle(
         allocator,
+        std.testing.io,
         &bundle,
         train_examples[0..],
         val_examples[0..],
@@ -2285,15 +2288,15 @@ test "train eval layoutlmv3 sequence lora bundle saves sequence head" {
     defer allocator.free(seq_head_path);
     const seq_head_cfg_path = try std.fs.path.join(allocator, &.{ out_dir, sequence_head_config_file_name });
     defer allocator.free(seq_head_cfg_path);
-    try compat.cwd().access(compat.io(), seq_head_path, .{});
-    try compat.cwd().access(compat.io(), seq_head_cfg_path, .{});
+    try std.Io.Dir.cwd().access(compat.testingIo(), seq_head_path, .{});
+    try std.Io.Dir.cwd().access(compat.testingIo(), seq_head_cfg_path, .{});
 }
 
 test "train eval layoutlmv3 token lora bundle saves and reloads token head" {
     const allocator = std.testing.allocator;
     const root_dir = try testScratchDir(allocator, "layoutlmv3-token-train");
     defer allocator.free(root_dir);
-    defer compat.cwd().deleteTree(compat.io(), root_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root_dir) catch {};
 
     const base_dir = try std.fs.path.join(allocator, &.{ root_dir, "base_tok" });
     defer allocator.free(base_dir);
@@ -2302,8 +2305,8 @@ test "train eval layoutlmv3 token lora bundle saves and reloads token head" {
     const out_dir = try std.fs.path.join(allocator, &.{ root_dir, "out_tok" });
     defer allocator.free(out_dir);
 
-    try compat.cwd().createDirPath(compat.io(), base_dir);
-    try compat.cwd().createDirPath(compat.io(), adapter_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), base_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), adapter_dir);
     try bootstrapSyntheticLoRABundle(allocator, base_dir, adapter_dir, 8);
 
     var bundle = try loadLoRABundle(allocator, base_dir, adapter_dir);
@@ -2345,6 +2348,7 @@ test "train eval layoutlmv3 token lora bundle saves and reloads token head" {
 
     var summary = try trainEvalTokenLoRABundle(
         allocator,
+        std.testing.io,
         &bundle,
         train_examples[0..],
         val_examples[0..],

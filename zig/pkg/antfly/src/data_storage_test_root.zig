@@ -19,7 +19,7 @@ pub const storage = @import("data/storage/mod.zig");
 pub const db_split_handoff = @import("data/storage/db_split_handoff.zig");
 
 const data_store = @import("data/storage/raft_apply_store.zig");
-const doc_identity = @import("storage/db/doc_identity.zig");
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
 const range_transition = @import("data/storage/range_transition.zig");
 const raft_state_machine = @import("raft/state_machine/mod.zig");
 const raft_storage = @import("raft/storage/mod.zig");
@@ -129,3 +129,6 @@ test "db merge coordinator reapplies target namespace for persisted reassignment
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

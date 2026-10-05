@@ -1,0 +1,120 @@
+{
+  "date": "2026-10-04",
+  "command": "zig build sql-native-pipeline-bench -Doptimize=ReleaseSafe -j2 --summary all",
+  "source_base": "23f410cff",
+  "source_digest_sha256": "39f70478ebb4f357d3b34a7c2d9229f8238aa2077229c6c9788bc0f4589721b6",
+  "measurement_notes": [
+    "Equal-output checks; three local samples per shape; no timing assertions.",
+    "Separate expression programs use the same typed kernels as the fused DAG; this measures shared work, not a comparison with the pre-PR executor.",
+    "Indexed delivery uses disk_rows.Rows and the same ownership copy as the previous blocking cursor; block delivery uses result_cursor.Cursor.",
+    "Other local native builds were active. These are microbenchmarks, not end-to-end query speed guarantees.",
+    "Short-expression timings overlap; repeated longer expression chains show a clearer benefit. Fused DAG delivery may retain more result workspace."
+  ],
+  "samples": [
+    {
+      "case": "shared_expression_dag",
+      "shape": "short",
+      "rows": 131072,
+      "sample": 0,
+      "separate_ns": 11034333,
+      "fused_ns": 10421333,
+      "separate_peak_bytes": 172614,
+      "fused_peak_bytes": 174078
+    },
+    {
+      "case": "blocking_result_delivery",
+      "rows": 4096,
+      "sample": 0,
+      "indexed_ns": 117496000,
+      "block_ns": 58971708,
+      "indexed_peak_bytes": 32696,
+      "block_peak_bytes": 27006,
+      "indexed_written_bytes": 417792,
+      "block_written_bytes": 197824,
+      "indexed_reads": 104,
+      "block_reads": 49,
+      "indexed_writes": 104,
+      "block_writes": 49
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "short",
+      "rows": 131072,
+      "sample": 1,
+      "separate_ns": 11420042,
+      "fused_ns": 11622541,
+      "separate_peak_bytes": 172614,
+      "fused_peak_bytes": 174078
+    },
+    {
+      "case": "blocking_result_delivery",
+      "rows": 4096,
+      "sample": 1,
+      "indexed_ns": 115132875,
+      "block_ns": 59262542,
+      "indexed_peak_bytes": 32696,
+      "block_peak_bytes": 27006,
+      "indexed_written_bytes": 417792,
+      "block_written_bytes": 197824,
+      "indexed_reads": 104,
+      "block_reads": 49,
+      "indexed_writes": 104,
+      "block_writes": 49
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "short",
+      "rows": 131072,
+      "sample": 2,
+      "separate_ns": 10771333,
+      "fused_ns": 10674333,
+      "separate_peak_bytes": 172614,
+      "fused_peak_bytes": 174078
+    },
+    {
+      "case": "blocking_result_delivery",
+      "rows": 4096,
+      "sample": 2,
+      "indexed_ns": 113764000,
+      "block_ns": 58176250,
+      "indexed_peak_bytes": 32696,
+      "block_peak_bytes": 27006,
+      "indexed_written_bytes": 417792,
+      "block_written_bytes": 197824,
+      "indexed_reads": 104,
+      "block_reads": 49,
+      "indexed_writes": 104,
+      "block_writes": 49
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "shared_chain",
+      "rows": 131072,
+      "sample": 0,
+      "separate_ns": 17979125,
+      "fused_ns": 12663584,
+      "separate_peak_bytes": 154182,
+      "fused_peak_bytes": 174078
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "shared_chain",
+      "rows": 131072,
+      "sample": 1,
+      "separate_ns": 18529458,
+      "fused_ns": 13625208,
+      "separate_peak_bytes": 154182,
+      "fused_peak_bytes": 174078
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "shared_chain",
+      "rows": 131072,
+      "sample": 2,
+      "separate_ns": 18862292,
+      "fused_ns": 14026792,
+      "separate_peak_bytes": 154182,
+      "fused_peak_bytes": 174078
+    }
+  ]
+}

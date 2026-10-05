@@ -415,7 +415,7 @@ const FallbackNativeBackend = struct {
     compute: *NativeCompute,
     backend: ComputeBackend,
 
-    fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
         self.backend.deinit();
         native_mod.deinitPrefetchQueue(self.weight_store);
         self.weight_store.resident_weights.deinit(allocator);
@@ -654,8 +654,8 @@ fn dumpPartitionReport(
     var host_assisted_target_nodes: usize = 0;
     var first_fallback_op: ?[]const u8 = null;
     var first_host_assisted_op: ?[]const u8 = null;
-    var fallback_counts = [_]OpCount{.{}} ** 64;
-    var host_assisted_counts = [_]OpCount{.{}} ** 64;
+    var fallback_counts = @as([64]OpCount, @splat(.{}));
+    var host_assisted_counts = @as([64]OpCount, @splat(.{}));
     var fallback_used: usize = 0;
     var host_assisted_used: usize = 0;
     const include_parts = graphPartitionReportPartsRequested();

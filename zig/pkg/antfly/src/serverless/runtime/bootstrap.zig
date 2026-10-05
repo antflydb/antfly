@@ -16,15 +16,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
-const common_secrets = @import("../../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const artifacts_object_store = @import("../artifacts/object_store.zig");
 const manifest_object_store = @import("../manifest/object_store.zig");
 const wal_object_store = @import("../wal/object_store.zig");
 const catalog_object_store = @import("../catalog/object_store.zig");
 const progress_object_store = @import("../catalog/object_progress_store.zig");
 const configured_object_store_support = @import("../configured_object_store_support.zig");
-const external_binding = @import("../external_source/catalog_binding.zig");
-const remote_uri = @import("../remote_uri.zig");
+const external_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
@@ -35,13 +35,13 @@ const api_mod = @import("../api/mod.zig");
 const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
-const managed_embedder = @import("../../inference/managed_embedder.zig");
-const bedrock = @import("antfly_inference_bedrock");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const aws = @import("antfly_credentials").aws;
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
-const object_store_support = @import("../object_store_support.zig");
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-const common_config = @import("../../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
@@ -77,7 +77,7 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
-    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
     /// the shared std.Io backend, so deployments can align this with their
@@ -123,7 +123,7 @@ const ConfiguredExternalSourceObjectStoreResolver = struct {
 };
 
 const S3ClientPool = struct {
-    const AwsCredentialContext = @import("../aws_credential_context.zig").AwsCredentialContext;
+    const AwsCredentialContext = @import("antfly_local_sources").serverless_aws_credential_context.AwsCredentialContext;
 
     const Entry = struct {
         options: object_store_support.S3Options,
@@ -146,7 +146,7 @@ const S3ClientPool = struct {
         return .{ .alloc = alloc, .io_impl = io_impl };
     }
 
-    fn deinit(self: *S3ClientPool) void {
+    pub fn deinit(self: *S3ClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
             if (entry.credential_context) |context| {
@@ -219,7 +219,7 @@ const GcsClientPool = struct {
         return .{ .alloc = alloc, .io = io };
     }
 
-    fn deinit(self: *GcsClientPool) void {
+    pub fn deinit(self: *GcsClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
             self.alloc.destroy(entry.impl);
@@ -282,7 +282,7 @@ fn gcsOptionsEql(a: object_store_support.GcsOptions, b: object_store_support.Gcs
         optionalStringEql(a.scope, b.scope);
 }
 
-fn credentialSourceEql(a: bedrock.CredentialSource, b: bedrock.CredentialSource) bool {
+fn credentialSourceEql(a: aws.CredentialSource, b: aws.CredentialSource) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .default => true,
@@ -324,7 +324,7 @@ const OwnedS3Target = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;
@@ -335,7 +335,7 @@ const OwnedGcsTarget = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;

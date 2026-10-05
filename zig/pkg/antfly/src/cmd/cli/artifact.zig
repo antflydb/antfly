@@ -112,7 +112,7 @@ fn getArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
     try cli.printResponse(allocator, io, &resp);
 }
 
-fn putArtifactEnrichment(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn putArtifactEnrichment(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     var artifact_name: ?[]const u8 = null;
     var file_path: ?[]const u8 = null;
@@ -184,7 +184,7 @@ fn normalizeEnrichmentJson(allocator: std.mem.Allocator, artifact: []const u8, o
     return try out.toOwnedSlice();
 }
 
-fn deleteArtifactEnrichment(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn deleteArtifactEnrichment(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     var artifact_name: ?[]const u8 = null;
 

@@ -75,7 +75,7 @@ const Prepared = struct {
         return .{ .schemas = schemas, .batch = try processor.prepare(a, tokenizer, requests, .{}) };
     }
 
-    fn deinit(self: *Prepared, a: Allocator) void {
+    pub fn deinit(self: *Prepared, a: Allocator) void {
         self.batch.deinit();
         for (self.schemas) |*schema| schema.deinit();
         a.free(self.schemas);
@@ -167,7 +167,7 @@ const Reference = struct {
         return .{ .root = root, .source = source, .pin = pin, .tensors = .{ .allocator = a, .reader = try safetensors.MMapReader.openFileAbsolute(a, tensor_path) } };
     }
 
-    fn deinit(self: *Reference) void {
+    pub fn deinit(self: *Reference) void {
         self.tensors.deinit();
         self.pin.deinit();
         self.source.deinit();

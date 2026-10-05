@@ -13,29 +13,29 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const provider_registry = @import("provider_registry.zig");
+pub const provider_registry = @import("antfly_local_sources").common_provider_registry;
 pub const listener_security = @import("listener_security.zig");
-pub const config = @import("config.zig");
-pub const vector_migration = @import("vector_migration.zig");
-pub const table_storage = @import("table_storage.zig");
+pub const config = @import("antfly_local_sources").common_config;
+pub const vector_migration = @import("antfly_local_sources").common_vector_migration;
+pub const table_storage = @import("antfly_local_sources").common_table_storage;
 pub const http = @import("http/mod.zig");
 pub const audio_runtime = @import("audio_runtime.zig");
-pub const secrets = @import("secrets.zig");
-pub const secret_contract = @import("secret_contract.zig");
-pub const secret_record = @import("secret_record.zig");
-pub const credential_source_identity = @import("credential_source_identity.zig");
+pub const secrets = @import("antfly_local_sources").common_secrets;
+pub const secret_contract = @import("antfly_local_sources").common_secret_contract;
+pub const secret_record = @import("antfly_local_sources").common_secret_record;
+pub const credential_source_identity = @import("antfly_local_sources").common_credential_source_identity;
 pub const remote_content_runtime = @import("remote_content_runtime.zig");
 pub const health_server = @import("health_server.zig");
 pub const runtime_lifecycle = @import("runtime_lifecycle.zig");
-pub const prometheus = @import("prometheus.zig");
-pub const request_admission = @import("request_admission.zig");
-pub const group_ids = @import("group_ids.zig");
+pub const prometheus = @import("antfly_local_sources").common_prometheus;
+pub const request_admission = @import("antfly_local_sources").common_request_admission;
+pub const group_ids = @import("antfly_local_sources").common_group_ids;
 pub const data_format = @import("data_format.zig");
 pub const fs_paths = @import("antfly_runtime_fs").fs_paths;
-pub const byte_copy = @import("byte_copy.zig");
+pub const byte_copy = @import("antfly_local_sources").common_byte_copy;
 pub const cache_budget = @import("antfly_cache_budget");
 pub const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-pub const threaded_connect_io = @import("threaded_connect_io.zig");
+pub const threaded_connect_io = @import("antfly_local_sources").common_threaded_connect_io;
 
 test {
     _ = provider_registry;

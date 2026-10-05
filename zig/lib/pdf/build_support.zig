@@ -19,7 +19,7 @@ const addMacosSdkPaths = @import("../platform/build_support.zig").addMacosSdkPat
 pub const AddTestsOptions = struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     image_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
     pdf_standard_fonts_mod: *std.Build.Module,
@@ -62,7 +62,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 pub fn addBenchmark(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     pdf_mod: *std.Build.Module,
 }) *std.Build.Step.Compile {
     const module = b.createModule(.{
@@ -85,7 +85,7 @@ pub fn addSafetyTests(b: *std.Build, pdf_mod: *std.Build.Module) *std.Build.Step
     });
 }
 
-pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, image: *std.Build.Module, hash: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module) *std.Build.Module {
+pub fn createModule(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, image: *std.Build.Module, hash: *std.Build.Module, font: *std.Build.Module, standard_fonts: *std.Build.Module) *std.Build.Module {
     const module = b.createModule(.{
         .root_source_file = root.path(b, "src/mod.zig"),
         .target = target,

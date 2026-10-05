@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const store_report_baseline = @import("store_report_baseline.zig");
@@ -20,8 +21,8 @@ const store_report_update = @import("store_report_update.zig");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const common_group_ids = @import("../common/group_ids.zig");
-const common_secrets = @import("../common/secrets.zig");
+const common_group_ids = @import("antfly_local_sources").common_group_ids;
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const metadata_mod = @import("domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -56,18 +57,18 @@ const raft_transition_service = @import("../raft/transition_service.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
-const api_operation = @import("../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("antfly_source_root").antfly_sources.table_writes;
-const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const db_mod = if (control_only_storage_sources)
-    @import("../storage/db/control_root.zig")
+    @import("antfly_local_sources").storage_db_control_root
 else
     @import("antfly_source_root").antfly_sources.selected_db;
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
-const backfill_state_mod = @import("../storage/db/backfill_state.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
+const backfill_state_mod = @import("antfly_local_sources").storage_db_backfill_state;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const foreign_mod = @import("../foreign/mod.zig");
 
 const cdc_replication_round_interval_ms: u64 = 1_000;
@@ -157,7 +158,7 @@ const EmbeddingActivityCache = struct {
         owner_fences: std.AutoHashMapUnmanaged(u64, OwnerFence) = .empty,
         entries: EntryMap = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             var entries = self.entries.iterator();
             while (entries.next()) |entry| {
                 alloc.free(@constCast(entry.key_ptr.index_name));
@@ -169,9 +170,9 @@ const EmbeddingActivityCache = struct {
         }
     };
 
-    shards: [shard_count]Shard = [_]Shard{.{}} ** shard_count,
+    shards: [shard_count]Shard = @as([shard_count]Shard, @splat(.{})),
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (&self.shards) |*shard| shard.deinit(alloc);
         self.* = .{};
     }
@@ -298,7 +299,7 @@ const EmbeddingActivityCache = struct {
         return self.updateWithSequence(alloc, projected, reports, now_ns, false);
     }
     fn updateWithSequence(self: *@This(), alloc: std.mem.Allocator, projected: []const metadata_table_manager.StoreRecord, reports: []const metadata_table_manager.StoreStatusReport, now_ns: u64, allow_same_sequence: bool) !void {
-        var expired_shards = [_]bool{false} ** shard_count;
+        var expired_shards = @as([shard_count]bool, @splat(false));
         for (reports) |report| {
             if (report.embedding_activity_protocol_version != embedding_activity_protocol_version) continue;
             if (report.reporter_incarnation == 0 or report.embedding_activity_sequence == 0) continue;
@@ -566,7 +567,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             return .{};
         }
 
-        fn getTable(
+        pub fn getTable(
             self: *@This(),
             alloc: std.mem.Allocator,
             _: u64,
@@ -584,15 +585,15 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
         wait_error: ?anyerror = null,
         wait_calls: usize = 0,
 
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
 
-        fn metadataIncarnation(_: *@This()) !?metadata_api.MetadataClusterIncarnation {
+        pub fn metadataIncarnation(_: *@This()) !?metadata_api.MetadataClusterIncarnation {
             return "0123456789abcdef0123456789abcdef".*;
         }
 
-        fn proposeTransitionCommandWithReceipt(
+        pub fn proposeTransitionCommandWithReceipt(
             self: *@This(),
             _: metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
@@ -600,7 +601,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             return .{ .term = 7, .index = 19 };
         }
 
-        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
             try std.testing.expectEqual(@as(u64, 7), receipt.term);
             try std.testing.expectEqual(@as(u64, 19), receipt.index);
             self.wait_calls += 1;
@@ -1082,7 +1083,7 @@ test "metadata service node lifecycle proposal distinguishes rejection from ambi
         wait_error: ?anyerror = null,
         wait_calls: usize = 0,
 
-        fn proposeTransitionCommandWithReceipt(
+        pub fn proposeTransitionCommandWithReceipt(
             self: *@This(),
             _: metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
@@ -1090,7 +1091,7 @@ test "metadata service node lifecycle proposal distinguishes rejection from ambi
             return .{ .term = 7, .index = 19 };
         }
 
-        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
             try std.testing.expectEqual(@as(u64, 7), receipt.term);
             try std.testing.expectEqual(@as(u64, 19), receipt.index);
             self.wait_calls += 1;
@@ -1136,7 +1137,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             return .{};
         }
 
-        fn getTable(
+        pub fn getTable(
             _: *@This(),
             _: std.mem.Allocator,
             _: u64,
@@ -1156,16 +1157,16 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
         locked: bool = false,
         recursive_lock: bool = false,
 
-        fn lockCatalogMutation(self: *@This()) void {
+        pub fn lockCatalogMutation(self: *@This()) void {
             if (self.locked) self.recursive_lock = true;
             self.locked = true;
         }
 
-        fn unlockCatalogMutation(self: *@This()) void {
+        pub fn unlockCatalogMutation(self: *@This()) void {
             self.locked = false;
         }
 
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
 
@@ -1243,10 +1244,10 @@ test "metadata reconciliation never appends an ordinary placement after hidden B
         fn getTableTransitionFence(_: *@This(), _: u64, _: u64) !metadata_storage.raft_apply_store.TableTransitionFence {
             return .{};
         }
-        fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
+        pub fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
             return null;
         }
-        fn initialGroupReservation(self: *@This(), _: u64, _: u64) !?fk_generation_publication.InitialGroupReservation {
+        pub fn initialGroupReservation(self: *@This(), _: u64, _: u64) !?fk_generation_publication.InitialGroupReservation {
             if (!self.hosted) return null;
             return .{
                 .plan_id = @splat(1),
@@ -1266,24 +1267,24 @@ test "metadata reconciliation never appends an ordinary placement after hidden B
         stale_projection: bool = false,
         read_cuts: usize = 0,
         last_tag: ?std.meta.Tag(metadata_storage.TransitionCommand) = null,
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
-        fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: api_operation.RequestContext, required: u16) !TableTopologyProtocolReadiness {
             return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{1});
         }
-        fn cachedCoordinatedDecoderReadiness(_: *@This(), required: u16) !TableTopologyProtocolReadiness {
+        pub fn cachedCoordinatedDecoderReadiness(_: *@This(), required: u16) !TableTopologyProtocolReadiness {
             return tableTopologyProtocolReadiness(3, required, "0123456789abcdef0123456789abcdef".*, &.{1});
         }
-        fn ensureLinearizableReadWithContext(self: *@This(), _: api_operation.RequestContext) !void {
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: api_operation.RequestContext) !void {
             self.read_cuts += 1;
             if (self.stale_projection) self.store.hosted = true;
         }
-        fn lockCatalogMutation(self: *@This()) void {
+        pub fn lockCatalogMutation(self: *@This()) void {
             self.locked = true;
             if (self.begin_on_lock) self.store.hosted = true; // BEGIN committed after first point read.
         }
-        fn unlockCatalogMutation(self: *@This()) void {
+        pub fn unlockCatalogMutation(self: *@This()) void {
             self.locked = false;
         }
         fn proposeTransitionCommandsWithReceipt(self: *@This(), commands: []const metadata_storage.TransitionCommand) !MetadataProposalReceipt {
@@ -1330,14 +1331,14 @@ test "metadata reconciliation plan hides retryable errors after admission" {
         fn getTableTransitionFence(_: *@This(), _: u64, _: u64) !metadata_storage.raft_apply_store.TableTransitionFence {
             return .{};
         }
-        fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
+        pub fn getTable(_: *@This(), _: std.mem.Allocator, _: u64, _: u64) !?metadata_table_manager.TableRecord {
             return null;
         }
     };
     const FakeService = struct {
         metadata_group_id: u64 = 1,
         store: FakeStore = .{},
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
         fn proposeTransitionCommandsWithReceipt(_: *@This(), _: []const metadata_storage.TransitionCommand) !MetadataProposalReceipt {
@@ -1775,7 +1776,7 @@ const MetadataProposalProgressDriver = struct {
     const Lease = struct {
         driver: *MetadataProposalProgressDriver,
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             self.driver.lane.unlock();
             self.driver.notifyWaiters();
             self.* = undefined;
@@ -1877,7 +1878,7 @@ const TableTopologyProtocolProbeCoordinator = struct {
             self.publishes_completion = true;
         }
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             if (self.publishes_completion) {
                 _ = self.coordinator.wake_epoch.fetchAdd(1, .release);
             }
@@ -1970,7 +1971,7 @@ test "table topology protocol probes share matching success and bounded failure"
         .required_version = 3,
         .metadata_incarnation = null,
         .protected_member_count = 2,
-        .protected_membership_fingerprint = [_]u8{7} ** std.crypto.hash.sha2.Sha256.digest_length,
+        .protected_membership_fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(7)),
     };
     const first_completion_epoch = first.completionEpoch();
     coordinator.cached = .{
@@ -2121,7 +2122,7 @@ const LifecycleSignal = struct {
         return false;
     }
 
-    fn deinit(self: *LifecycleSignal) void {
+    pub fn deinit(self: *LifecycleSignal) void {
         var it = self.table_epochs.iterator();
         while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.table_epochs.deinit(self.alloc);
@@ -2343,7 +2344,7 @@ test "metadata transition driver online routes capture one projection without ad
             std.debug.assert(self.locked);
             self.locked = false;
         }
-        fn projectedCoreSnapshotLocked(self: *@This()) !*const ProjectedCoreSnapshot {
+        pub fn projectedCoreSnapshotLocked(self: *@This()) !*const ProjectedCoreSnapshot {
             std.debug.assert(self.locked);
             self.captures += 1;
             return &self.core;
@@ -2455,14 +2456,14 @@ pub fn compareAndSetOnlineMerge(service: anytype, previous: @import("online_merg
 /// Called after the service has its final address and shared HTTP executor.
 /// The default capability set is false; installing an incomplete bundle fails
 /// closed and ordinary merges continue through their existing driver.
-pub fn installOnlineMergeDriver(service: anytype, executor: @import("../common/http/http_common.zig").RequestExecutor, capabilities: @import("online_merge.zig").Capabilities) !void {
+pub fn installOnlineMergeDriver(service: anytype, executor: @import("antfly_local_sources").common_http_http_common.RequestExecutor, capabilities: @import("online_merge.zig").Capabilities) !void {
     return installOnlineMergeDriverWithAdmission(service, executor, capabilities, true);
 }
 
 /// Disabling new online work must not abandon durable in-flight transitions or
 /// their source fences. Recovery retains the same complete driver; only the
 /// optional ordinary-to-online admission callback is removed.
-pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import("../common/http/http_common.zig").RequestExecutor, capabilities: @import("online_merge.zig").Capabilities, allow_new_admissions: bool) !void {
+pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import("antfly_local_sources").common_http_http_common.RequestExecutor, capabilities: @import("online_merge.zig").Capabilities, allow_new_admissions: bool) !void {
     var runtime = try @import("online_merge_driver.zig").create(service, executor, capabilities);
     errdefer runtime.deinit();
     if (!allow_new_admissions) runtime.driver.admit = null;
@@ -2477,7 +2478,7 @@ pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import
 }
 
 test "metadata transition driver online installs before registration and reattaches replacement" {
-    const http = @import("../common/http/http_common.zig");
+    const http = @import("antfly_local_sources").common_http_http_common;
     const shard = @import("../raft/shard_ops.zig");
     const Stub = struct {
         fn build(_: *anyopaque, _: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
@@ -2489,13 +2490,13 @@ test "metadata transition driver online installs before registration and reattac
         }
         const operations: shard.ShardOperationAdapter.VTable = blk: {
             var value: shard.ShardOperationAdapter.VTable = undefined;
-            for (std.meta.fields(@TypeOf(value))) |field| {
-                if (@typeInfo(field.type) == .optional) {
-                    @field(value, field.name) = null;
+            for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+                if (@typeInfo(field_type) == .optional) {
+                    @field(value, reflected_name) = null;
                     continue;
                 }
-                @field(value, field.name) = struct {
-                    fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) @typeInfo(@typeInfo(field.type).pointer.child).@"fn".return_type.? {
+                @field(value, reflected_name) = struct {
+                    fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field_type).pointer.child).@"fn".param_types[2].?) @typeInfo(@typeInfo(field_type).pointer.child).@"fn".return_type.? {
                         return error.UnexpectedTransitionEffect;
                     }
                 }.call;
@@ -2515,7 +2516,7 @@ test "metadata transition driver online installs before registration and reattac
     defer svc.deinit();
     svc.raft.disableTransitionOps();
     var capabilities: @import("online_merge.zig").Capabilities = .{};
-    inline for (std.meta.fields(@TypeOf(capabilities))) |field| @field(capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(@TypeOf(capabilities))) |reflected_name| @field(capabilities, reflected_name) = true;
     try installOnlineMergeDriver(&svc, .{ .ptr = &token, .vtable = &.{ .execute = Stub.request } }, capabilities);
     try std.testing.expect(svc.raft.transition_svc == null);
     const driver_ptr = svc.online_merge_runtime.?.driver.ptr;
@@ -3255,7 +3256,7 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
             break :blk false;
         },
         .register_store, .upsert_store => |record| {
-            if (!std.mem.eql(u8, &record.replica_root_public_key, &([_]u8{0} ** 32)))
+            if (!std.mem.eql(u8, &record.replica_root_public_key, &(@as([32]u8, @splat(0)))))
                 return metadata_topology_protocol.store_root_signing_decoder_version;
             if (record.replica_root_incarnation != 0) return metadata_topology_protocol.store_root_uuid_decoder_version;
             return if (record.relational_topology_protocol_version != 0) metadata_topology_protocol.coordinated_lifecycle_version else 0;
@@ -3404,7 +3405,7 @@ fn runtimeStatusProtocolSafeCommand(
 const EncodedTransitionBatch = struct {
     entries: [][]const u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.entries) |entry| alloc.free(entry);
         alloc.free(self.entries);
         self.* = undefined;
@@ -3567,7 +3568,7 @@ test "metadata service synchronizes restore progress as one bounded proposal bat
             return .{ .term = 2, .index = 8 };
         }
 
-        fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(self: *@This(), receipt: MetadataProposalReceipt) !void {
             try std.testing.expectEqual(@as(u64, 2), receipt.term);
             try std.testing.expectEqual(@as(u64, 8), receipt.index);
             self.waited = true;
@@ -3598,7 +3599,7 @@ test "metadata service rejects conflicting restore progress batch identities" {
             return error.UnexpectedProposal;
         }
 
-        fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
             return error.UnexpectedProposal;
         }
     };
@@ -3638,7 +3639,7 @@ test "metadata restore progress batch never reports non-admission after receipt"
             return .{ .term = 2, .index = 8 };
         }
 
-        fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
+        pub fn waitForTransitionApplied(_: *@This(), _: MetadataProposalReceipt) !void {
             return error.NotLeader;
         }
     };
@@ -3667,7 +3668,7 @@ test "metadata service catalog reconciliation batch admits compact plans beyond 
     const FakeService = struct {
         alloc: std.mem.Allocator,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return true;
         }
     };
@@ -3693,7 +3694,7 @@ fn transitionCarriesNativeRestoreIdentity(command: metadata_storage.TransitionCo
     };
 }
 
-fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
+pub fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
     const Service = @TypeOf(service.*);
     if (comptime @hasDecl(Service, "nativeRestoreIdentityProtocolReady"))
         return service.nativeRestoreIdentityProtocolReady();
@@ -3744,7 +3745,7 @@ const LinearizableMetadataReadTracker = struct {
     requests: std.AutoHashMapUnmanaged(u64, bool) = .empty,
     downstream: ?raft_state_machine.ReadStateObserver = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.requests.deinit(self.alloc);
         self.* = undefined;
     }
@@ -4209,7 +4210,7 @@ fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
             self.pending = &.{};
             alloc.free(incoming);
         }
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.leaves.root) |root| root.release(alloc);
             alloc.free(self.pending);
             alloc.free(self.items);
@@ -4226,7 +4227,7 @@ fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
 }
 const StoreCapabilities = struct {
     const Kind = enum { repair, vector_projection, native_storage, artifact_source, reporter_fence, inference, native_restore, relational_topology };
-    flags: std.EnumSet(Kind) = .initEmpty(),
+    flags: std.EnumSet(Kind) = .empty,
     fn fromStores(stores: []const metadata_table_manager.StoreRecord) StoreCapabilities {
         var out: StoreCapabilities = .{};
         if (storesHaveRuntimeRepairStatus(stores)) out.flags.insert(.repair);
@@ -4256,7 +4257,7 @@ test "catalog projection capability counts cover every enum tag and last-owner r
         snapshot.adjustCapabilities(facts, false);
         try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
     }
-    snapshot.adjustCapabilities(.{ .flags = .initFull() }, true);
+    snapshot.adjustCapabilities(.{ .flags = .full }, true);
     try std.testing.expectEqual(std.enums.values(StoreCapabilities.Kind).len, snapshot.capabilities().flags.count());
     snapshot.deinitStores(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), snapshot.capabilities().flags.count());
@@ -4399,7 +4400,7 @@ const ProjectedCoreSnapshot = struct {
         self.capability_counts = .initFill(0);
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.deinitStores(alloc);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
         if (self.placement_intents.len > 0) alloc.free(self.placement_intents);
@@ -4498,7 +4499,7 @@ const CoreProjectionChanges = struct {
     };
     const Pending = struct {
         all: bool = true,
-        kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .initEmpty(),
+        kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .empty,
         stores: [256]StoreChange = undefined,
         store_count: usize = 0,
         all_stores: bool = false,
@@ -4564,14 +4565,14 @@ const CoreProjectionChanges = struct {
         self.pending.store_count += 1;
     }
     fn take(self: *@This()) Pending {
-        return self.takeKinds(.initFull());
+        return self.takeKinds(.full);
     }
     fn takeKinds(self: *@This(), kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind)) Pending {
         self.mutex.lockUncancelable(std.Options.debug_io);
         defer self.mutex.unlock(std.Options.debug_io);
         const all = self.pending.all;
         if (self.pending.all) {
-            self.pending.kinds = .initFull();
+            self.pending.kinds = .full;
             self.pending.all_stores = true;
             self.pending.all = false;
         }
@@ -4599,7 +4600,7 @@ const ProjectedCoreSnapshotCache = struct {
     transition_epoch: u64 = 0,
     snapshot: ?ProjectedCoreSnapshot = null,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         self.* = .{};
     }
@@ -4610,7 +4611,7 @@ const TransitionReadinessCache = struct {
     epoch: u64 = 0,
     ready_by_group: std.AutoHashMapUnmanaged(u64, transition_state.StablePlacementReadiness) = .empty,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.ready_by_group.deinit(alloc);
         self.* = .{};
     }
@@ -4626,7 +4627,7 @@ const TransitionReadinessInputs = struct {
     stores: []const metadata_table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.store_view.deinit(alloc);
         for (self.placement_intents) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_intents);
@@ -4786,7 +4787,7 @@ const StoreReadView = struct {
         for (self.leases, self.stores) |lease, *record| record.* = try lease.materializedRecord(alloc);
     }
 
-    fn deinit(self: *StoreReadView, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *StoreReadView, alloc: std.mem.Allocator) void {
         if (self.owned_records) for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
         for (self.leases) |lease| lease.release(alloc);
         alloc.free(self.leases);
@@ -5105,7 +5106,7 @@ fn isExpectedCdcRoundError(err: anyerror) bool {
 }
 
 test "metadata durable cutover acknowledgement is attempt scoped" {
-    const fingerprint = [_]u8{0x5a} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const fingerprint = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x5a));
     const expected = metadata_table_manager.ReplicationSourceStatusRecord{
         .table_id = 41,
         .source_ordinal = 2,
@@ -5118,7 +5119,7 @@ test "metadata durable cutover acknowledgement is attempt scoped" {
         .cutover_intent_id = 99,
         .cutover_authority_id = 1001,
         .cutover_config_fingerprint = fingerprint,
-        .cutover_provider_identity = [_]u8{0x6b} ** std.crypto.hash.sha2.Sha256.digest_length,
+        .cutover_provider_identity = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x6b)),
     };
     try std.testing.expect(replicationCutoverIntentApplied(expected, expected));
 
@@ -6240,7 +6241,7 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    fn runtimeStatusProtocolReady(self: *MetadataService, required_version: u16) bool {
+    pub fn runtimeStatusProtocolReady(self: *MetadataService, required_version: u16) bool {
         if (!metadata_runtime_status_protocol.profileSatisfies(
             metadata_runtime_status_protocol.current_record_version,
             required_version,
@@ -6263,7 +6264,7 @@ pub const MetadataService = struct {
         return local_member;
     }
 
-    fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
+    pub fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
         // The in-process service supports only a local metadata membership;
         // Version-specific readiness proves the complete V15 restore contract.
         return self.runtimeStatusProtocolReady(
@@ -7841,7 +7842,7 @@ pub const MetadataService = struct {
         return projected;
     }
 
-    fn statusProjectedReconcileLease(self: *MetadataService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
+    pub fn statusProjectedReconcileLease(self: *MetadataService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
         return try self.getCachedProjectedReconcileLease(now_ms, self.isLocalMetadataLeader());
     }
 
@@ -7938,6 +7939,8 @@ pub const MetadataHttpService = struct {
     local_data_owner: bool,
     reallocation_protocol_peers: []const ReallocationProtocolPeer,
     store_status_ticks: usize,
+    restore_owner_progress_generation: std.atomic.Value(u64) = .init(1),
+    restore_owner_progress_event: std.Io.Event = .unset,
     projection_epoch: std.atomic.Value(u64) = .init(1),
     catalog_epoch: std.atomic.Value(u64) = .init(1),
     projected_core_epoch: std.atomic.Value(u64) = .init(1),
@@ -8014,7 +8017,7 @@ pub const MetadataHttpService = struct {
     probe_ready: std.atomic.Value(bool) = .init(false),
     runtime_status_protocol_cache_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_ready_fingerprint: RuntimeStatusMembershipFingerprint =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     runtime_status_protocol_ready_version: u16 = 0,
     runtime_status_protocol_probe_mutex: std.Io.Mutex = .init,
     runtime_status_protocol_activated_version: std.atomic.Value(u16) = .init(0),
@@ -8297,6 +8300,10 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.core_projection_changes.mark(signal);
+        if ((signal.kind == .store and signal.store_reports_changed) or signal.kind == .restore_job or signal.kind == .schema_progress or signal.kind == .restore_progress) {
+            _ = self.restore_owner_progress_generation.fetchAdd(1, .release);
+            self.restore_owner_progress_event.set(self.raft.host.http_host.host.deps.io);
+        }
         if (projectionSignalChangesCatalog(signal.kind)) {
             _ = self.catalog_epoch.fetchAdd(1, .release);
         }
@@ -8690,7 +8697,7 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
-    fn runtimeStatusProtocolReady(self: *MetadataHttpService, required_version: u16) bool {
+    pub fn runtimeStatusProtocolReady(self: *MetadataHttpService, required_version: u16) bool {
         if (metadata_runtime_status_protocol.profileSatisfies(
             self.runtimeStatusProtocolActivationVersion(),
             required_version,
@@ -8767,7 +8774,7 @@ pub const MetadataHttpService = struct {
         return store.getDenseNativeStorageProtocolActivationVersion(self.metadata_group_id) catch 0;
     }
 
-    fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
+    pub fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
         if (metadata_runtime_status_protocol.profileSatisfies(
             self.runtimeStatusProtocolActivationVersion(),
             metadata_runtime_status_protocol.native_restore_identity_record_version,
@@ -8854,7 +8861,7 @@ pub const MetadataHttpService = struct {
                 if (common_version != null) ctx.service.lifecycle_signal.notify(null);
             }
 
-            fn deinit(ptr: *anyopaque) void {
+            pub fn deinit(ptr: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 // A job rejected or cancelled before run must release the
                 // single-flight gate as well.
@@ -9724,9 +9731,16 @@ pub const MetadataHttpService = struct {
     // Proposal-time admission must not instantiate the network/activation path:
     // activation itself proposes a command, and callers may hold mutation locks.
     fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, required_version: u16, comptime cached_only: bool) !TableTopologyProtocolReadiness {
-        try request.ensureActive();
+        var zig017_return_error: ?anyerror = null;
+        (request.ensureActive() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (required_version == 0 or required_version > metadata_topology_protocol.current_version)
-            return error.TableTopologyProtocolUpgradeRequired;
+            return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         // Status.conf_state borrows the Raft group's membership arrays. Copy
         // the required IDs while the runtime lock protects those arrays, then
@@ -9735,29 +9749,47 @@ pub const MetadataHttpService = struct {
             self.lockRuntime();
             defer self.unlockRuntime();
             const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
                 raft_status.soft.leader_id.? != local_node_id)
-                return error.NotLeader;
+                return zig017_failure: {
+                    zig017_return_error = error.NotLeader;
+                    break :zig017_failure error.NotLeader;
+                };
             break :locked .{
                 .term = raft_status.hard.current_term,
-                .required_node_ids = try collectReallocationBarrierNodeIds(
+                .required_node_ids = (collectReallocationBarrierNodeIds(
                     self.alloc,
                     raft_status.conf_state,
                     self.reallocation_protocol_peers,
-                ),
+                ) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                }),
             };
         };
         const required_node_ids = observation.required_node_ids;
         defer self.alloc.free(required_node_ids);
-        const incarnation = (try self.metadataIncarnation()) orelse
-            return error.TableTopologyProtocolUpgradeRequired;
-        const expected_readiness = try tableTopologyProtocolReadiness(
+        const incarnation = ((self.metadataIncarnation() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        })) orelse
+            return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
+        const expected_readiness = (tableTopologyProtocolReadiness(
             observation.term,
             required_version,
             incarnation,
             required_node_ids,
-        );
+        ) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (cached_only and required_node_ids.len == 1 and required_node_ids[0] == local_node_id) return expected_readiness;
 
         const required_activation: metadata_topology_protocol.Activation = .{
@@ -9767,7 +9799,10 @@ pub const MetadataHttpService = struct {
             .membership_fingerprint = expected_readiness.protected_membership_fingerprint,
         };
         if (self.projectedStore()) |store| {
-            if (try store.topologyActivation(self.metadata_group_id)) |activation| {
+            if ((store.topologyActivation(self.metadata_group_id) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            })) |activation| {
                 if (activation.satisfies(required_activation)) return expected_readiness;
             }
         }
@@ -9777,10 +9812,16 @@ pub const MetadataHttpService = struct {
         // probe can share its outcome even after scheduler delays.
         var joined_completion_epoch: ?u32 = null;
         var probe_lease = while (true) {
-            try request.ensureActive();
+            (request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
             if (self.table_topology_protocol_probe.tryAcquire()) |lease| break lease;
-            if (cached_only) return error.TableTopologyProtocolUpgradeRequired;
+            if (cached_only) return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
             if (joined_completion_epoch == null) joined_completion_epoch = observed_epoch +% 1;
             self.table_topology_protocol_probe.waitForHandoff(
                 observed_epoch,
@@ -9794,9 +9835,15 @@ pub const MetadataHttpService = struct {
             joined_completion_epoch,
         )) |outcome| switch (outcome) {
             .ready => return expected_readiness,
-            .upgrade_required => return error.TableTopologyProtocolUpgradeRequired,
+            .upgrade_required => return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            },
         };
-        if (cached_only) return error.TableTopologyProtocolUpgradeRequired;
+        if (cached_only) return zig017_failure: {
+            zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+            break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+        };
         // Every path below performs a real network observation (including a
         // failed one), so its lease publishes exactly one new cohort epoch.
         probe_lease.publishCompletion();
@@ -9804,7 +9851,7 @@ pub const MetadataHttpService = struct {
         // consumed by concurrent waiters as success.
         self.table_topology_protocol_probe.cached = null;
         const completion_epoch = probe_lease.completionEpoch();
-        errdefer |err| if (err == error.TableTopologyProtocolUpgradeRequired) {
+        errdefer if (zig017_return_error) |err| if (err == error.TableTopologyProtocolUpgradeRequired) {
             const failed_at_ns = platform_time.monotonicNs();
             self.table_topology_protocol_probe.cached = .{
                 .completion_epoch = completion_epoch,
@@ -9845,11 +9892,17 @@ pub const MetadataHttpService = struct {
                 };
             }
         };
-        const slots = try self.alloc.alloc(ProbeSlot, required_node_ids.len);
+        const slots = (self.alloc.alloc(ProbeSlot, required_node_ids.len) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer self.alloc.free(slots);
         for (slots) |*slot| slot.* = .{};
         for (required_node_ids, slots) |node_id, *slot| {
-            try request.ensureActive();
+            (request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             slot.node_id = node_id;
             if (node_id == local_node_id) {
                 slot.status = .{
@@ -9862,11 +9915,20 @@ pub const MetadataHttpService = struct {
             }
             const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
                 std.log.warn("table topology protocol blocked: metadata member {d} is not configured", .{node_id});
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             };
             const orchestration_url = peer.orchestration_url orelse
-                return error.TableTopologyProtocolUpgradeRequired;
-            if (orchestration_url.len == 0) return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
+            if (orchestration_url.len == 0) return zig017_failure: {
+                zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+            };
             slot.base_uri = orchestration_url;
         }
         // Validate the complete route set before scheduling any fibers so an
@@ -9874,7 +9936,10 @@ pub const MetadataHttpService = struct {
         const probe_io = self.raft.host.http_host.outboundIo();
         var batch_start: usize = 0;
         while (batch_start < slots.len) : (batch_start += table_topology_protocol_probe_concurrency) {
-            try request.ensureActive();
+            (request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             const batch_end = @min(batch_start + table_topology_protocol_probe_concurrency, slots.len);
             var probe_group: std.Io.Group = .init;
             for (slots[batch_start..batch_end]) |*slot| {
@@ -9889,14 +9954,23 @@ pub const MetadataHttpService = struct {
             }
             probe_group.await(probe_io) catch |err| {
                 std.log.warn("table topology protocol fanout failed err={s}", .{@errorName(err)});
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             };
         }
-        try request.ensureActive();
+        (request.ensureActive() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         for (slots) |slot| {
             if (slot.err) |err| {
                 std.log.warn("table topology protocol probe failed member={d} err={s}", .{ slot.node_id, @errorName(err) });
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             }
             if (!tableTopologyProtocolCompatible(
                 slot.status,
@@ -9909,7 +9983,10 @@ pub const MetadataHttpService = struct {
                     "table topology protocol blocked member={d} reports node={d} group={d} protocol={d}",
                     .{ slot.node_id, slot.status.metadata_raft_local_node_id, slot.status.metadata_group_id, slot.status.table_topology_protocol_version },
                 );
-                return error.TableTopologyProtocolUpgradeRequired;
+                return zig017_failure: {
+                    zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
+                    break :zig017_failure error.TableTopologyProtocolUpgradeRequired;
+                };
             }
         }
         // Record only after every protected member has demonstrated support.
@@ -9918,16 +9995,31 @@ pub const MetadataHttpService = struct {
         activation.version = metadata_topology_protocol.current_version;
         for (slots) |slot| activation.version = @min(activation.version, slot.status.table_topology_protocol_version);
         if (activation.version >= metadata_topology_protocol.durable_activation_version) {
-            const bytes = try std.json.Stringify.valueAlloc(self.alloc, activation, .{});
+            const bytes = (std.json.Stringify.valueAlloc(self.alloc, activation, .{}) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer self.alloc.free(bytes);
             const receipt = blk: {
                 self.lockCatalogMutation();
                 defer self.unlockCatalogMutation();
-                try self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness);
-                break :blk try self.proposeTransitionCommandWithReceiptInTerm(.{ .activate_topology_protocol = bytes }, observation.term);
+                (self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+                break :blk (self.proposeTransitionCommandWithReceiptInTerm(.{ .activate_topology_protocol = bytes }, observation.term) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
             };
-            try self.waitForTransitionAppliedWithContext(receipt, request);
-            try self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness);
+            (self.waitForTransitionAppliedWithContext(receipt, request) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (self.validateTableTopologyProtocolReadinessWithContext(request, expected_readiness) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
         self.table_topology_protocol_probe.cached = .{
             .completion_epoch = completion_epoch,
@@ -11885,7 +11977,7 @@ pub const MetadataHttpService = struct {
         self.component_projection_mutex.unlock(std.Options.debug_io);
     }
     fn componentKinds() std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) {
-        var kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .initFull();
+        var kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .full;
         kinds.remove(.store);
         return kinds;
     }
@@ -12476,7 +12568,7 @@ pub const MetadataHttpService = struct {
         return projected;
     }
 
-    fn statusProjectedReconcileLease(self: *MetadataHttpService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
+    pub fn statusProjectedReconcileLease(self: *MetadataHttpService, now_ms: u64) !?metadata_reconcile_lease.ReconcileLeaseRecord {
         return try self.getCachedProjectedReconcileLease(now_ms, self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id));
     }
 
@@ -12913,7 +13005,7 @@ test "metadata runtime status capability cache is scoped to incarnation and memb
     try std.testing.expect(!std.mem.eql(
         u8,
         &fingerprint,
-        &([_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length),
+        &(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0))),
     ));
 
     var changed_conf_state = conf_state;
@@ -12985,7 +13077,7 @@ test "metadata service transition commands negotiate runtime status payload vers
         alloc: std.mem.Allocator,
         ready_version: u16,
 
-        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
             return self.ready_version >= required_version;
         }
     };
@@ -13132,7 +13224,7 @@ test "metadata service transition commands negotiate runtime status payload vers
 test "runtime status native authority cannot downgrade to inference-only V16" {
     const FakeService = struct {
         alloc: std.mem.Allocator = std.testing.allocator,
-        fn runtimeStatusProtocolReady(_: *@This(), required: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required: u16) bool {
             return metadata_runtime_status_protocol.profileSatisfies(16, required);
         }
     };
@@ -13161,7 +13253,7 @@ test "metadata service projects optional activity without freezing older status"
         proposed_activity: bool = false,
         proposed_native_restore_version: u16 = 0,
 
-        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
             return self.ready_version >= required_version;
         }
 
@@ -13443,16 +13535,16 @@ test "metadata service gates mandatory native restore identity until protocol ac
         alloc: std.mem.Allocator,
         ready: bool,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return true;
         }
 
-        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
             _ = required_version;
             return true;
         }
 
-        fn nativeRestoreIdentityProtocolReady(self: *@This()) bool {
+        pub fn nativeRestoreIdentityProtocolReady(self: *@This()) bool {
             return self.ready;
         }
     };
@@ -13482,11 +13574,11 @@ test "metadata service never downgrades vector projection readiness debt" {
         alloc: std.mem.Allocator,
         ready: bool,
 
-        fn runtimeStatusRepairProtocolReady(self: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(self: *@This()) bool {
             return self.ready;
         }
 
-        fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required_version: u16) bool {
             _ = required_version;
             return self.ready;
         }
@@ -13552,7 +13644,7 @@ test "metadata service defers reporter fence transitions while activation is unk
         upserts: usize = 0,
         last_reporter_incarnation: u64 = 0,
 
-        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
             _ = required_version;
             return false;
         }
@@ -13617,7 +13709,7 @@ test "relational integrity metadata topology heartbeat selects framed profile an
         groups: usize = 0,
         topology: u16 = 0,
 
-        fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
+        pub fn runtimeStatusProtocolReady(self: *@This(), required: u16) bool {
             if (required == metadata_runtime_status_protocol.framed_index_record_version) {
                 self.framed_profile_probes += 1;
                 return self.ready;
@@ -13668,7 +13760,7 @@ test "metadata service defers vector projection readiness transitions while acti
         alloc: std.mem.Allocator,
         upserts: usize = 0,
 
-        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+        pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return false;
         }
 
@@ -13716,7 +13808,7 @@ test "metadata service status reporting never proposes deletion of committed rep
         upserts: usize = 0,
         proposed_repair_status: bool = false,
 
-        fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), required_version: u16) bool {
             _ = required_version;
             return false;
         }
@@ -14169,7 +14261,7 @@ fn scheduleReplicationBackfillJob(service: anytype) !void {
             };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
             ctx.service.cdc_job_in_flight.store(false, .release);
             const alloc = ctx.alloc;
@@ -15203,7 +15295,7 @@ fn collectLocalGroupStatusReport(
     defer db_mod.types.freeDBStats(alloc, stats);
 
     const now_realtime_ms = platform_clock.Clock.real().nowRealtimeMs();
-    const created_at_millis = (try db.getGroupCreatedAtMillis(alloc, group_id)) orelse now_realtime_ms;
+    const created_at_millis = (try server_group_metadata.getGroupCreatedAtMillis(db, alloc, group_id)) orelse now_realtime_ms;
     const readiness = if (replica_root_dir) |root_dir|
         try transition_state.readinessForLocalGroup(
             alloc,
@@ -15543,7 +15635,7 @@ const ServiceGroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = [_]u8{0} ** metadata_table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: metadata_table_manager.VoterSetFingerprint = @as([metadata_table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     raft_term: u64 = 0,
     raft_membership_index: u64 = 0,
@@ -15651,7 +15743,7 @@ pub const StoreStatusBackfillMarker = struct {
         corrupt,
         valid: []const u8,
 
-        fn deinit(self: State, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: State, alloc: std.mem.Allocator) void {
             switch (self) {
                 .valid => |resume_key| alloc.free(resume_key),
                 else => {},
@@ -17071,7 +17163,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hasher.update(std.mem.asBytes(&intent.record.group_id));
         hasher.update(std.mem.asBytes(&intent.record.replica_id));
         hasher.update(std.mem.asBytes(&intent.record.local_node_id));
-        hasher.update(std.mem.asBytes(&@intFromEnum(intent.record.bootstrap_mode)));
+        hasher.update(std.mem.asBytes(&@backingInt(intent.record.bootstrap_mode)));
         hasher.update(std.mem.asBytes(&intent.record.metadata_version));
         hasher.update(std.mem.asBytes(&intent.store_id));
         hasher.update(std.mem.asBytes(&@as(u64, intent.peer_node_ids.len)));
@@ -17083,7 +17175,7 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
             // Keep the legacy fingerprint stable while making an explicitly
             // versioned locator a distinct provisioning input.
             if (snapshot.format != .unknown) {
-                hasher.update(std.mem.asBytes(&@intFromEnum(snapshot.format)));
+                hasher.update(std.mem.asBytes(&@backingInt(snapshot.format)));
             }
             hashProjectedProvisioningBytes(&hasher, snapshot.snapshot_id);
             hashProjectedProvisioningBytes(&hasher, snapshot.uri);
@@ -19651,7 +19743,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
     const ProviderCapture = struct {
         calls: usize = 0,
 
-        fn collect(
+        pub fn collect(
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             _: []const u8,
@@ -20840,7 +20932,7 @@ test "metadata service clears restore intent once all placement replicas report 
         placement_reads: usize = 0,
         progress_reads: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.upserted_table) |record| metadata_table_manager.freeTable(self.alloc, record);
             if (self.completed_restore) |identity| metadata_table_manager.freeRestoreIntentIdentity(self.alloc, identity);
         }
@@ -20894,14 +20986,14 @@ test "metadata service clears restore intent once all placement replicas report 
             alloc.free(records);
         }
 
-        fn listProjectedRestoreProgress(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RestoreProgressRecord {
+        pub fn listProjectedRestoreProgress(self: *@This(), alloc: std.mem.Allocator) ![]metadata_table_manager.RestoreProgressRecord {
             self.progress_reads += 1;
             const out = try alloc.alloc(metadata_table_manager.RestoreProgressRecord, self.progress.len);
             for (self.progress, 0..) |record, i| out[i] = try metadata_table_manager.cloneRestoreProgress(alloc, record);
             return out;
         }
 
-        fn freeProjectedRestoreProgress(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RestoreProgressRecord) void {
+        pub fn freeProjectedRestoreProgress(_: *@This(), alloc: std.mem.Allocator, records: []metadata_table_manager.RestoreProgressRecord) void {
             for (records) |record| metadata_table_manager.freeRestoreProgress(alloc, record);
             alloc.free(records);
         }
@@ -21678,7 +21770,7 @@ test "metadata http projected clone helpers clean up on allocation failure" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "metadata service local replica root reconcile permit hook defers reconcile work" {
@@ -21926,7 +22018,7 @@ test "metadata service store report workload benchmark selected admission end to
     const Fake = struct {
         alloc: std.mem.Allocator,
         upserts: usize = 0,
-        fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
             return true;
         }
         fn upsertStore(self: *@This(), _: metadata_table_manager.StoreRecord) !void {
@@ -21980,7 +22072,7 @@ test "metadata service repeated store reports fence sequential candidates and pr
         upserts: usize = 0,
         generation: u64 = 0,
         capacity: u64 = 0,
-        fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
+        pub fn runtimeStatusProtocolReady(_: *@This(), _: u16) bool {
             return true;
         }
         fn upsertStore(self: *@This(), record: metadata_table_manager.StoreRecord) !void {
@@ -22090,7 +22182,7 @@ test "metadata service sparse leases preserve pinned groups through allocation f
             try std.testing.expect(!removed.capabilities.flags.contains(.repair));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "metadata service projection journal keeps group bursts sparse and isolates overflow" {

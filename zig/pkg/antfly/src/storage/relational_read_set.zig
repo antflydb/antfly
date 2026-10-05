@@ -17,9 +17,9 @@
 //! Coordination happens before construction; this module never acquires a
 //! mutation fence or reopens an owner between pages.
 const std = @import("std");
-const View = @import("relational_read_view.zig").View;
-const typed_json = @import("typed_json.zig");
-const types = @import("db/types.zig");
+const View = @import("antfly_local_sources").storage_relational_read_view.View;
+const typed_json = @import("antfly_local_sources").storage_typed_json;
+const types = @import("antfly_local_sources").storage_db_types;
 
 pub const Set = struct {
     alloc: std.mem.Allocator,

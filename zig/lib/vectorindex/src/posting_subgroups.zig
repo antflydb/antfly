@@ -451,7 +451,7 @@ fn certifiedAllocationExercise(alloc: Allocator) !void {
     var plan = try Plan.build(alloc, &vectors, 2, 2, null);
     defer plan.deinit();
     try std.testing.expect(plan.view.lowerBound(0, &.{ 1, 0 }) == null);
-    const errors = [_]Plan.SourceError{.{ .norm_error = 0.001, .decoded_norm_lower_bound = 0.98 }} ** 4;
+    const errors = @as([4]Plan.SourceError, @splat(.{ .norm_error = 0.001, .decoded_norm_lower_bound = 0.98 }));
     try plan.certify(&vectors, &errors);
     const encoded = try plan.view.encode(alloc);
     defer alloc.free(encoded);
@@ -481,7 +481,7 @@ fn certifiedAllocationExercise(alloc: Allocator) !void {
             }
         }
     }
-    const invalid = [_]Plan.SourceError{.{ .norm_error = 1, .decoded_norm_lower_bound = 0 }} ** 4;
+    const invalid = @as([4]Plan.SourceError, @splat(.{ .norm_error = 1, .decoded_norm_lower_bound = 0 }));
     try std.testing.expectError(error.UncertifiableSubgroup, plan.certify(&vectors, &invalid));
     // Failed replacement does not discard a previously valid certificate.
     try std.testing.expectEqualSlices(f32, borrowed.radii, plan.view.radii);
@@ -508,7 +508,7 @@ test "certified subgroup spherical bounds cover SIMD tails high dimensions and s
         }
         var plan = try Plan.build(alloc, vectors, dims, 4, null);
         defer plan.deinit();
-        const errors = [_]Plan.SourceError{.{ .norm_error = 0.001, .decoded_norm_lower_bound = 0.99 }} ** 8;
+        const errors = @as([8]Plan.SourceError, @splat(.{ .norm_error = 0.001, .decoded_norm_lower_bound = 0.99 }));
         try plan.certify(vectors, &errors);
         const query = try alloc.alloc(f32, dims);
         defer alloc.free(query);
@@ -536,7 +536,7 @@ test "certified subgroup spherical bounds cover SIMD tails high dimensions and s
 test "subgroup plans are balanced deterministic and allocation safe" {
     try allocationExercise(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
-    const vectors = [_]f32{ 1, 0 } ** 17;
+    const vectors = z17RepeatArray([_]f32{ 1, 0 }, 17);
     var plan = try Plan.build(std.testing.allocator, &vectors, 2, 16, null);
     defer plan.deinit();
     try plan.view.validate();
@@ -572,4 +572,10 @@ test "subgroup training honours cancellation without allocations" {
             }
         }.check,
     }));
+}
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
 }

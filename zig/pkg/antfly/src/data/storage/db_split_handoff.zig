@@ -19,13 +19,13 @@ const data_raft_batch = @import("../raft_batch.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const shard_state_store = @import("shard_state_store.zig");
-const internal_keys = @import("../../storage/internal_keys.zig");
-const shard_mod = @import("../../storage/shard.zig");
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const shard_mod = @import("antfly_local_sources").storage_shard;
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const doc_identity = @import("../../storage/db/doc_identity.zig");
-const db_types = @import("../../storage/db/types.zig");
-const range_state = @import("../../storage/db/range_state.zig");
-const merge_state = @import("../../storage/db/merge_state.zig");
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const range_state = @import("antfly_local_sources").storage_db_range_state;
+const merge_state = @import("antfly_local_sources").storage_db_merge_state;
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const range_transition = @import("range_transition.zig");
 
@@ -2193,7 +2193,7 @@ test "db merge coordinator copies committed outcomes without replaying transform
             try std.testing.expectEqual(count, parsed.value.object.get("count").?.integer);
             try std.testing.expect((try receiver.get(std.testing.allocator, "doc:u")) == null);
             const edges = try receiver.getEdges(std.testing.allocator, "gr_v1", "doc:t", "links", .out);
-            defer @import("../../graph/graph.zig").GraphIndex.freeEdges(std.testing.allocator, edges);
+            defer @import("antfly_local_sources").graph_graph.GraphIndex.freeEdges(std.testing.allocator, edges);
             try std.testing.expectEqual(@as(usize, 1), edges.len);
             try std.testing.expectEqualStrings("doc:y", edges[0].target);
         }
@@ -2376,7 +2376,7 @@ test "db merge receiver cleanup retires orphan graph ttl artifacts" {
     try receiver.deleteDocsInRange(alloc, .{ .start = "doc:m", .end = "doc:z" });
     try std.testing.expectError(error.NotFound, receiver.db.core.store.get(alloc, artifact_key));
     const due = try receiver.db.core.store.scanPrefix(alloc, &internal_keys.graph_edge_expiration_index_prefix);
-    defer @import("../../storage/docstore.zig").DocStore.freeResults(alloc, due);
+    defer @import("antfly_local_sources").storage_docstore.DocStore.freeResults(alloc, due);
     try std.testing.expectEqual(@as(usize, 0), due.len);
 }
 

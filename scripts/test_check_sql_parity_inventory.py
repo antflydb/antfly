@@ -109,6 +109,9 @@ class ParityInventoryTest(unittest.TestCase):
         partial = next(
             entry for entry in ledger["entries"] if entry["id"] == "sql-0008"
         )
+        # Build a controlled negative fixture: later valid evidence additions
+        # must not satisfy the requirement these three unrelated tests probe.
+        partial["evidence"] = partial["evidence"][:3]
         partial["evidence"][0]["test"] = (
             "SQL joined mutation equality work scales with inputs not Cartesian candidates"
         )

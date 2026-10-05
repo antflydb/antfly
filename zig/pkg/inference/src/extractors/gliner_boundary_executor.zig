@@ -858,7 +858,7 @@ const QualificationGeometryTest = struct {
             try std.testing.expectEqual(expected_body[i], value.window_words.min);
             try std.testing.expect(value.padded_sequence_tokens.min > value.window_words.min);
             try std.testing.expect(value.padded_sequence_tokens.min < options.processor.max_sequence_tokens);
-            inline for (@typeInfo(policy.LengthContract).@"struct".fields) |field| try std.testing.expectEqual(@field(value, field.name).min, @field(value, field.name).max);
+            inline for (comptime std.meta.fieldNames(policy.LengthContract)) |reflected_name| try std.testing.expectEqual(@field(value, reflected_name).min, @field(value, reflected_name).max);
         }
         try std.testing.expectEqual(@as(usize, 9), receiver.prefix_words[1]);
         try std.testing.expectEqual(@as(usize, 9), receiver.prefix_words[2]);
@@ -888,5 +888,5 @@ test "boundary qualification later item and window rejection cancels quietly and
 }
 
 test "boundary qualification quiet geometry releases every failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
 }

@@ -43,7 +43,7 @@ const Fixture = struct {
         return .{ .allocator = a, .store = store, .backend = backend };
     }
 
-    fn deinit(self: *Fixture) void {
+    pub fn deinit(self: *Fixture) void {
         self.backend.deinit();
         self.allocator.destroy(self.backend);
         metal.deinitSharedNativeProvider(self.store);

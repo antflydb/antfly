@@ -2512,7 +2512,7 @@ test "reading cancellation interrupts encoded decode and borrowed raster preproc
     pipeline.allocator = std.testing.allocator;
     pipeline.config = .{ .image_size = 16 };
     pipeline.execution_control = .{ .ptr = &probe, .check_fn = Probe.check };
-    const rgba = [_]u8{127} ** (32 * 32 * 4);
+    const rgba = @as([(32 * 32 * 4)]u8, @splat(127));
     const png = try antfly_image.png.encodeRgba(std.testing.allocator, 32, 32, &rgba);
     defer std.testing.allocator.free(png);
     // Backend fields intentionally remain undefined: cancellation must stop

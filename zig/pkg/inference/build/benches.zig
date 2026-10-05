@@ -33,6 +33,7 @@ fn createCpuComputeModule(ctx: Context, source: []const u8) *std.Build.Module {
     });
     module.addOptions("build_options", runtime_build.addBuildOptions(ctx.b, .{
         .enable_system_blas = ctx.backend.enable_system_blas,
+        .enable_runtime_openblas = ctx.backend.enable_runtime_openblas,
         .enable_native_quant_dispatch_stats = ctx.backend.enable_native_quant_dispatch_stats,
     }));
     if (ctx.backend.enable_system_blas)
@@ -48,9 +49,7 @@ pub fn addPagedAttention(ctx: Context) void {
     });
 
     const run_bench = ctx.addRunArtifact(bench_exe);
-    if (ctx.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     const bench_step = ctx.step("bench-paged-attention", "Run the native paged-attention benchmark");
     bench_step.dependOn(&run_bench.step);
 }
@@ -70,16 +69,12 @@ pub fn addTrainingAndLinalg(ctx: Context) void {
         }),
     });
     const run_training_bench = ctx.addRunArtifact(training_bench_exe);
-    if (ctx.args) |args| {
-        run_training_bench.addArgs(args);
-    }
+    run_training_bench.addPassthruArgs();
     const training_bench_step = ctx.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
     linalg_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     const run_linalg_bench = ctx.addRunArtifact(linalg_bench_exe);
-    if (ctx.args) |args| {
-        run_linalg_bench.addArgs(args);
-    }
+    run_linalg_bench.addPassthruArgs();
     const linalg_bench_step = ctx.step("bench-linalg", "Run the shared linalg benchmark");
     linalg_bench_step.dependOn(&run_linalg_bench.step);
 }
@@ -113,9 +108,7 @@ pub fn addGliner(ctx: Context) void {
     gliner2_bench_exe.root_module.link_libc = true;
     runtime_build.configureOnnxRuntime(b, gliner2_bench_exe.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
     const run_gliner2_bench = ctx.addRunArtifact(gliner2_bench_exe);
-    if (ctx.args) |args| {
-        run_gliner2_bench.addArgs(args);
-    }
+    run_gliner2_bench.addPassthruArgs();
     const gliner2_bench_step = ctx.step("bench-gliner2-native", "Run an end-to-end GLiNER2 bench against the native backend with random weights");
     gliner2_bench_step.dependOn(&run_gliner2_bench.step);
 }
@@ -133,9 +126,7 @@ pub fn addAudio(ctx: Context) void {
     audio_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     audio_bench_exe.root_module.link_libc = true;
     const run_audio_bench = ctx.addRunArtifact(audio_bench_exe);
-    if (ctx.args) |args| {
-        run_audio_bench.addArgs(args);
-    }
+    run_audio_bench.addPassthruArgs();
     const audio_bench_step = ctx.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
     audio_bench_step.dependOn(&run_audio_bench.step);
 }
@@ -148,7 +139,7 @@ pub const CreateBgeResult = struct {
 pub fn createBge(ctx: Context) CreateBgeResult {
     const b = ctx.b;
     const module_options: std.Build.Module.CreateOptions = .{
-        .root_source_file = ctx.path("src/bench/bge_m3_e2e.zig"),
+        .root_source_file = ctx.path("src/bench/bge_m3_bench.zig"),
         .target = ctx.target,
         .optimize = ctx.optimize,
     };
@@ -163,6 +154,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .optimize = ctx.optimize,
     });
     runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
+        .c_bindings = ctx.graph.c_bindings,
         .build_info_mod = ctx.graph.build_info_mod,
         .identities = ctx.graph.identities,
         .build_options_mod = ctx.graph.build_options_mod,
@@ -228,6 +220,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
         }),
     });
     decide_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    decide_bench.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     decide_bench.root_module.link_libc = true;
     ctx.step("bench-gliner25-decide-build", "Build the loaded-model GLiNER2.5-Decide request benchmark").dependOn(&b.addInstallArtifact(decide_bench, .{}).step);
     // Use the shared optimize value for the entire dependency graph. The
@@ -243,6 +236,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     });
     gliner25_cpu_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner25_cpu_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_cpu_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     // The imported native runtime owns backend and BLAS linkage.
     gliner25_cpu_bench_exe.root_module.link_libc = true;
     const install_gliner25_cpu_bench = b.addInstallArtifact(gliner25_cpu_bench_exe, .{});
@@ -259,6 +253,7 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     });
     gliner25_cuda_bench_exe.root_module.addImport("build_options", ctx.graph.build_options_mod);
     gliner25_cuda_bench_exe.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    gliner25_cuda_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     gliner25_cuda_bench_exe.root_module.link_libc = true;
     const install_gliner25_cuda_bench = b.addInstallArtifact(gliner25_cuda_bench_exe, .{});
     ctx.step("bench-gliner25-cuda-build", "Build the GLiNER2.5 CUDA direct-core worker (requires CUDA and ReleaseFast)").dependOn(&install_gliner25_cuda_bench.step);

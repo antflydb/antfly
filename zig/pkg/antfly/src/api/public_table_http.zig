@@ -18,20 +18,20 @@ const ant_json = @import("antfly-json");
 const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
-const batch_api = @import("batch.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_query_mod = @import("../graph/query.zig");
-const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
+const batch_api = @import("antfly_local_sources").api_batch;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
+const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
+const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
-const common_secrets = @import("../common/secrets.zig");
-const common_config = @import("../common/config.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const common_config = @import("antfly_local_sources").common_config;
 const http_route_helpers = @import("http_route_helpers.zig");
-const query_contract = @import("query_contract.zig");
-const operation = @import("operation.zig");
+const query_contract = @import("antfly_local_sources").api_query_contract;
+const operation = @import("antfly_local_sources").api_operation;
 const reranking_contract = @import("antfly_reranking");
 
 threadlocal var last_batch_failure_name: ?[]const u8 = null;
@@ -115,6 +115,7 @@ pub const TableApi = struct {
         Conflict,
         IntegrityTopologyBusy,
         UniqueConstraintViolation,
+        RelationalCheckViolation,
         ForeignKeyParentMissing,
         ForeignKeyReferenced,
         MethodNotAllowed,
@@ -122,6 +123,7 @@ pub const TableApi = struct {
         DenseRepairBackpressure,
         Unavailable,
         WriteUnavailable,
+        ConstraintActivationUnavailable,
         WriteDefinitelyAbortedUnavailable,
         HAWriteDurabilityPending,
         OutcomeUnknown,
@@ -130,6 +132,7 @@ pub const TableApi = struct {
         CommittedGraphMetricMaterializationRejected,
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
+        ExternalLakeReadOnly,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
         HAFencedPrimary,
@@ -509,7 +512,7 @@ pub const TableApi = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            action: @import("../storage/db/relational_index_maintenance_contract.zig").Action,
+            action: @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Action,
             body: []const u8,
             request: operation.RequestContext,
         ) ExecuteIndexMaintenanceError![]u8 = null,
@@ -811,6 +814,7 @@ pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
 /// Stable, machine-readable reasons for a retryable query 503. Keep this set in
 /// sync with QueryTemporarilyUnavailableError in the public OpenAPI contract.
 pub const QueryTemporarilyUnavailableReason = enum {
+    decision_provider_unavailable,
     doc_identity_unavailable,
     read_requires_primary,
     standby_read_unavailable,
@@ -826,6 +830,7 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
     reason: QueryTemporarilyUnavailableReason,
 ) !OwnedResponse {
     const message: []const u8 = switch (reason) {
+        .decision_provider_unavailable => "decision provider unavailable",
         .doc_identity_unavailable => "doc identity unavailable",
         .read_requires_primary => "read requires primary",
         .standby_read_unavailable => "standby read unavailable",
@@ -1721,7 +1726,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
             .json = true,
             .retry_after_seconds = 1,
         },
-        error.UniqueConstraintViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
+        error.UniqueConstraintViolation, error.RelationalCheckViolation, error.ForeignKeyParentMissing, error.ForeignKeyReferenced => return .{
             .status = 409,
             .json = true,
             .body = try std.json.Stringify.valueAlloc(alloc, .{ .@"error" = @errorName(err) }, .{}),
@@ -1741,6 +1746,12 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
+        error.ConstraintActivationUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.WriteDefinitelyAbortedUnavailable => return .{
             .status = 503,
             .body = try alloc.dupe(u8, "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}"),
@@ -1794,6 +1805,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         // commit result instead of blindly replaying non-idempotent transforms.
         error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.ExternalLakeReadOnly => return .{ .status = 400, .body = try alloc.dupe(u8, "external lake tables are read-only") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
@@ -2462,7 +2474,7 @@ pub fn handleTableDeleteIndex(
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
 }
 
-pub fn handleTableIndexMaintenance(alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action, body: []const u8, api: TableApi) !OwnedResponse {
+pub fn handleTableIndexMaintenance(alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Action, body: []const u8, api: TableApi) !OwnedResponse {
     try api.ensureActive();
     const callback = api.vtable.execute_table_index_maintenance orelse return .{ .status = 405, .body = try alloc.dupe(u8, "index maintenance is not supported") };
     const response = callback(api.ptr, alloc, table_name, index_name, action, body, api.request) catch |err| switch (err) {
@@ -3745,6 +3757,7 @@ test "public table batch handler maps write unavailable errors" {
         retry_after_seconds: ?u32 = null,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
+        .{ .err = error.ConstraintActivationUnavailable, .status = 503, .body = "{\"code\":\"constraint_activation_pending\",\"message\":\"constraint activation is not ready; no mutation was admitted\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.WriteDefinitelyAbortedUnavailable, .status = 503, .body = "{\"code\":\"transaction_precommit_aborted\",\"message\":\"the transaction was durably aborted before commit; retrying the batch is safe\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{ .err = error.IntegrityTopologyBusy, .status = 409, .body = "{\"code\":\"integrity_topology_busy\",\"message\":\"table integrity topology is changing; retry this batch after publication\",\"retryable\":true,\"retry_after_ms\":1000}", .json = true, .retry_after_seconds = 1 },
         .{
@@ -4273,7 +4286,7 @@ test "public table query handler preserves structured filter and hierarchy diagn
 test "public table query handler preserves retryable failure status" {
     // Corrupt persistent storage is intentionally logged at error severity;
     // the strict CI runner requires tests to declare those exercised paths.
-    @import("../test_error_logs.zig").expectErrorLogs(2);
+    @import("antfly_test_error_logs").expectErrorLogs(2);
 
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
@@ -6572,7 +6585,7 @@ test "public table graph metric action handler returns status response" {
             };
         }
 
-        fn executeGraphMetricAction(
+        pub fn executeGraphMetricAction(
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,

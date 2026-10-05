@@ -55,3 +55,6 @@ pub fn usage(comptime resource: Resource) []const u8 {
     if (resource == .artifact) text = text ++ "  --kind <kind>           Filter artifact repair kind\n\nRepair starts a job and advances one pass. --once exposes a bounded pass.\n";
     return text;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

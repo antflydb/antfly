@@ -396,7 +396,7 @@ pub const Module = struct {
         for ([_]Buffer{ output, logits, targets, seeds }) |b| if (b.ptr == 0 or b.len < bytes) return error.InvalidCudaState;
         var ptrs = [_]driver.CUdeviceptr{ output.ptr, logits.ptr, targets.ptr, seeds.ptr };
         var n: u32 = @intCast(count);
-        var kind: u32 = @intFromEnum(settings.kind);
+        var kind: u32 = @backingInt(settings.kind);
         var scalars = [_]f32{ settings.gamma_positive, settings.gamma_negative, settings.clip, settings.negative_weight, settings.positive_backward_power, settings.negative_backward_power };
         var params: [12]?*anyopaque = undefined;
         for (&ptrs, 0..) |*ptr, i| params[i] = @ptrCast(ptr);

@@ -43,7 +43,7 @@ test "boundary training fixture metadata rejects missing ambiguous and unbounded
     try std.testing.expectError(error.InvalidTrainingFixtureMetadata, resolve([]const u8, null, null, &table));
     try std.testing.expectError(error.InvalidTrainingFixtureMetadata, resolve([]const u8, a, 0, &table));
     try std.testing.expectError(error.InvalidTrainingFixtureMetadata, resolve([]const u8, null, 2, &table));
-    try std.testing.expectError(error.InvalidTrainingFixtureMetadata, resolve(u8, null, 0, &([_]u8{0} ** (max_entries + 1))));
+    try std.testing.expectError(error.InvalidTrainingFixtureMetadata, resolve(u8, null, 0, &(@as([(max_entries + 1)]u8, @splat(0)))));
     try validate(1, &.{max_entries});
     try std.testing.expectError(error.InvalidTrainingFixtureMetadata, validate(2, &.{0}));
     try std.testing.expectError(error.InvalidTrainingFixtureMetadata, validate(1, &.{max_entries + 1}));

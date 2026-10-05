@@ -14,10 +14,10 @@
 // limitations.
 
 const std = @import("std");
-const db_types = @import("../storage/db/types.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
 const read_gate = @import("read_gate.zig");
 
-pub const FeatureReads = @import("../storage/read_consistency.zig").FeatureReads;
+pub const FeatureReads = @import("antfly_local_sources").storage_read_consistency.FeatureReads;
 
 test "feature reads facade forwards typed requests with explicit consistency" {
     const Recorder = struct {

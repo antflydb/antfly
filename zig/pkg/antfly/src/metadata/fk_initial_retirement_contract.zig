@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Exact, immutable proof for retiring one hosted hidden initial-FK replica.
 //! A ticket is metadata-owned discovery, not permission to unlink. The data
@@ -20,7 +20,7 @@
 //! may attest completion. Metadata accepts that attestation only from the
 //! currently registered physical store root.
 const std = @import("std");
-const incarnation = @import("incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 const retirement = @import("fk_initial_retirement.zig");
 
 pub const ticket_encoded_len = 256;
@@ -95,7 +95,7 @@ pub const Intent = struct {
         var bytes: [intent_encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "IFRI");
         bytes[4] = 1;
-        bytes[5] = @intFromEnum(self.phase);
+        bytes[5] = @backingInt(self.phase);
         const ticket_bytes = try self.ticket.encode();
         @memcpy(bytes[8..264], &ticket_bytes);
         std.crypto.hash.Blake3.hash(bytes[0..264], bytes[264..296], .{});

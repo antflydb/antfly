@@ -149,9 +149,9 @@ test "compact subgroup hints handle zero tails overflow and allocation failure" 
     try allocationExercise(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
     var codes: [17]i8 = undefined;
-    const zero = [_]f32{0} ** 17;
+    const zero = @as([17]f32, @splat(0));
     try std.testing.expectEqual(@as(f32, 0), try quantize(&zero, &codes));
-    const values = [_]f32{1} ** 17;
+    const values = @as([17]f32, @splat(1));
     var owned = try Owned.init(std.testing.allocator, &values, 17);
     defer owned.deinit(std.testing.allocator);
     const scale = try quantize(&values, &codes);

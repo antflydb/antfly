@@ -303,7 +303,7 @@ fn buildIndexCreateConfig(
     });
 }
 
-fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient, table_name: []const u8, args: *std.process.Args.Iterator) !void {
+pub fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient, table_name: []const u8, args: *std.process.Args.Iterator) !void {
     var idx_name: ?[]const u8 = null;
     var idx_type: ?[]const u8 = null;
     var field: ?[]const u8 = null;
@@ -420,7 +420,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     std.debug.print("Create index command successful.\n", .{});
 }
 
-fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
+pub fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
     var idx_name = pre_index;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "drop")) continue;
@@ -441,7 +441,7 @@ fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_in
 
 const ListOutput = enum { summary, json };
 
-fn listIndexes(
+pub fn listIndexes(
     allocator: std.mem.Allocator,
     io: std.Io,
     client: *antfly_client.AntflyClient,
@@ -482,7 +482,7 @@ fn listIndexesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     }
 }
 
-fn getIndex(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
+pub fn getIndex(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
     var idx_name = pre_index;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "get")) continue;

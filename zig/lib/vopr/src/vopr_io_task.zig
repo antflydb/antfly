@@ -31,6 +31,16 @@ comptime {
 const stack_alignment = builtin.target.stackAlignment();
 const storage_alignment = 16;
 
+/// Written at the lowest (bottom-most, since this stack grows down) address
+/// of every fiber's heap-allocated stack. This allocation has no guard page,
+/// so an overflow silently corrupts whatever heap allocation sits below it
+/// instead of faulting at the overflow site; checking this pattern on every
+/// resume turns that into a loud, attributable panic close to the overflow
+/// instead of a baffling crash somewhere else later (observed in practice as
+/// another task's fields reading back as small integers after a neighbor's
+/// stack ran past its bound under Debug codegen).
+const stack_guard_pattern: [16]u8 = .{ 0xc0, 0xff, 0xee, 0xba, 0xdf, 0x00, 0xd0, 0x0d, 0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce };
+
 pub const Config = struct {
     stack_size: usize = 1024 * 1024,
     max_tasks: usize = 4096,
@@ -228,6 +238,16 @@ const Entry = struct {
         task.kernel.finishCurrent(task);
     }
 };
+
+/// Panics loudly, as close to the overflow as the scheduler can get, instead
+/// of letting a corrupted neighbor fail mysteriously later (or never, if the
+/// corrupted bytes happen not to matter for that neighbor's own next use).
+fn checkStackGuard(task: *Task) void {
+    if (!std.mem.eql(u8, task.stack[0..stack_guard_pattern.len], &stack_guard_pattern)) std.debug.panic(
+        "VoprIo task fiber stack overflowed its {d}-byte allocation (task=0x{x} id={x}): widen Config.stack_size for this VoprIo.init call",
+        .{ task.stack.len, @intFromPtr(task), task.id },
+    );
+}
 
 fn taskIdentityAnchor(_: *const anyopaque, _: *anyopaque) void {}
 
@@ -853,6 +873,8 @@ pub const Kernel = struct {
             return error.OutOfMemory;
         const stack: []align(stack_alignment) u8 = @alignCast(stack_ptr[0..self.config.stack_size]);
         errdefer self.allocator.rawFree(stack, .fromByteUnits(stack_alignment), @returnAddress());
+        std.debug.assert(stack.len >= stack_guard_pattern.len);
+        @memcpy(stack[0..stack_guard_pattern.len], &stack_guard_pattern);
         const storage = try self.allocator.alignedAlloc(u8, .fromByteUnits(storage_alignment), storage_len);
         errdefer self.allocator.free(storage);
         @memcpy(storage[0..context_bytes.len], context_bytes);
@@ -972,6 +994,12 @@ pub const Kernel = struct {
         self.execution_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
         const message: std.Io.fiber.Switch = .{ .old = &self.main_context, .new = &task.context };
         _ = std.Io.fiber.contextSwitch(&message);
+        // Check before touching anything else: every resume cycle returns
+        // here, so this is the earliest point to catch an overflow this
+        // task's own fiber just caused, before the corrupted neighbor (or
+        // this very kernel, if it is the one sitting below this task's
+        // stack) gets used.
+        checkStackGuard(task);
         self.setCurrent(null);
         self.execution_thread_id.store(0, .seq_cst);
     }
@@ -1006,6 +1034,13 @@ pub const Kernel = struct {
     }
 
     fn destroyTaskMemory(self: *Kernel, task: *Task) void {
+        // Defense in depth: every ordinary resume already checks this in
+        // switchToTask, but check again immediately before the stack is
+        // freed, in case this task is reaped on a path that skipped a
+        // resume (for example, teardown destroying every task regardless
+        // of status) so this allocation is never reused while silently
+        // corrupted.
+        checkStackGuard(task);
         self.allocator.free(task.storage);
         self.allocator.rawFree(task.stack, .fromByteUnits(stack_alignment), @returnAddress());
         self.allocator.destroy(task);
@@ -1372,7 +1407,7 @@ test "task kernel parks future await and exposes each resume" {
     };
     const Shared = struct {
         kernel: *Kernel,
-        order: [4]u8 = [_]u8{0} ** 4,
+        order: [4]u8 = @as([4]u8, @splat(0)),
         len: usize = 0,
 
         fn push(self: *@This(), value: u8) void {

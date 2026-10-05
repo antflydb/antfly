@@ -16,14 +16,14 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const memory_budget = @import("../storage/memory_budget.zig");
-const hbc_mod = @import("../storage/hbc_adapter.zig");
-const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
-const background_runtime_mod = @import("../storage/background_runtime.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const hbc_mod = @import("antfly_local_sources").storage_hbc_adapter;
+const runtime_callbacks = @import("antfly_local_sources").storage_db_runtime_callbacks;
+const background_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 const raft_mod = @import("../raft/mod.zig");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const filesystem_capacity = @import("../storage/filesystem_capacity.zig");
-const runtime_status = @import("runtime_status.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
 const scraping = @import("antfly_scraping");
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
@@ -508,7 +508,7 @@ fn implementationTests() type {
                 .{ .budgets = large, .total = 64 * 1024 * MiB },
             }) |fixture| {
                 const budgets = fixture.budgets;
-                const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+                const configured = budgets.options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
                 try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
                 try std.testing.expectEqual(configured.hard_limit_bytes * 7 / 8, configured.soft_limit_bytes);
                 try std.testing.expectEqual(
@@ -523,9 +523,9 @@ fn implementationTests() type {
             const medium = smartResourceBudgetsForTotal(12 * GiB);
             const large = smartResourceBudgetsForTotal(64 * GiB);
 
-            const small_hbc = small.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-            const medium_hbc = medium.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-            const large_hbc = large.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const small_hbc = small.options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const medium_hbc = medium.options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const large_hbc = large.options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
 
             try std.testing.expectEqual(@as(u64, 2 * GiB / 3), small_hbc.hard_limit_bytes);
             try std.testing.expectEqual(@as(u64, 4 * GiB), medium_hbc.hard_limit_bytes);

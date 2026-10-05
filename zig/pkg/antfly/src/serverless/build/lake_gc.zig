@@ -20,8 +20,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const artifact_ref = @import("../manifest/artifact_ref.zig");
-const base_source = @import("../manifest/base_source.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const Snapshot = struct {
     snapshot_id: []const u8,

@@ -24,7 +24,7 @@ Runs the Gemma4 CUDA production-readiness gate against local models.
 
 Environment:
   ROOT_DIR=/path/to/antfly
-  ZIG=.tools/zig-x86_64-linux-0.16.0/zig
+  ZIG=.tools/zig-x86_64-linux-0.17.0/zig
   BIN=zig/pkg/inference/zig-out/bin/antfly-inference
   OUT_DIR=/tmp/gemma4-cuda-production-gate-<timestamp>
 
@@ -65,7 +65,7 @@ if [[ $# -ne 0 ]]; then
 fi
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-ZIG="${ZIG:-$ROOT_DIR/.tools/zig-x86_64-linux-0.16.0/zig}"
+ZIG="${ZIG:-$ROOT_DIR/.tools/zig-x86_64-linux-0.17.0/zig}"
 BIN="${BIN:-$ROOT_DIR/zig/pkg/inference/zig-out/bin/antfly-inference}"
 OUT_DIR="${OUT_DIR:-/tmp/gemma4-cuda-production-gate-$(date +%Y%m%d-%H%M%S)}"
 

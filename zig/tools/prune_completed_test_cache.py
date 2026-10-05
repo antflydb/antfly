@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Release disposable Zig test link inputs between sequential CI build phases.
 
 Call only when no build or test using this job-local cache is running. Keep
@@ -62,7 +75,7 @@ def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
 def release_completed_phase(cache: Path) -> None:
     """Release a quiescent CI phase's complete, private compiler cache.
 
-    Self-hosted Debug emits only executables, so object-only pruning cannot
+    Self-hosted debug emits only executables, so object-only pruning cannot
     bound disk use across phases. Remove manifests with outputs: retaining a
     manifest after removing its executable produces a false Zig cache hit.
     Global dependency caches and installed zig-out artifacts are outside this

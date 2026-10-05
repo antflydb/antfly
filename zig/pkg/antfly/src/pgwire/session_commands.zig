@@ -474,7 +474,7 @@ const Parser = struct {
         }
         return error.InvalidSqlSyntax;
     }
-    fn name(self: *Parser) ![]const u8 {
+    pub fn name(self: *Parser) ![]const u8 {
         try self.space();
         if (self.pos < self.input.len and self.input[self.pos] == '"') {
             const result = try self.quoted('"');

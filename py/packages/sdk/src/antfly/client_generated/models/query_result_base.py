@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.query_profile import QueryProfile
     from ..models.query_result_base_aggregations import QueryResultBaseAggregations
     from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+    from ..models.query_result_base_evaluation import QueryResultBaseEvaluation
     from ..models.query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 
 
@@ -26,6 +27,8 @@ class QueryResultBase:
     Attributes:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
+        evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
+            aggregations.
         hits (QueryHits | Unset): A list of query hits.
         aggregations (QueryResultBaseAggregations | Unset): Aggregation results keyed by the user-defined aggregation
             names from the request.
@@ -40,6 +43,7 @@ class QueryResultBase:
 
     took: int
     status: int
+    evaluation: QueryResultBaseEvaluation | Unset = UNSET
     hits: QueryHits | Unset = UNSET
     aggregations: QueryResultBaseAggregations | Unset = UNSET
     analyses: QueryResultBaseAnalyses | Unset = UNSET
@@ -53,6 +57,10 @@ class QueryResultBase:
         took = self.took
 
         status = self.status
+
+        evaluation: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.evaluation, Unset):
+            evaluation = self.evaluation.to_dict()
 
         hits: dict[str, Any] | Unset = UNSET
         if not isinstance(self.hits, Unset):
@@ -86,6 +94,8 @@ class QueryResultBase:
                 "status": status,
             }
         )
+        if evaluation is not UNSET:
+            field_dict["evaluation"] = evaluation
         if hits is not UNSET:
             field_dict["hits"] = hits
         if aggregations is not UNSET:
@@ -109,12 +119,20 @@ class QueryResultBase:
         from ..models.query_profile import QueryProfile
         from ..models.query_result_base_aggregations import QueryResultBaseAggregations
         from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+        from ..models.query_result_base_evaluation import QueryResultBaseEvaluation
         from ..models.query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 
         d = dict(src_dict)
         took = d.pop("took")
 
         status = d.pop("status")
+
+        _evaluation = d.pop("evaluation", UNSET)
+        evaluation: QueryResultBaseEvaluation | Unset
+        if isinstance(_evaluation, Unset):
+            evaluation = UNSET
+        else:
+            evaluation = QueryResultBaseEvaluation.from_dict(_evaluation)
 
         _hits = d.pop("hits", UNSET)
         hits: QueryHits | Unset
@@ -158,6 +176,7 @@ class QueryResultBase:
         query_result_base = cls(
             took=took,
             status=status,
+            evaluation=evaluation,
             hits=hits,
             aggregations=aggregations,
             analyses=analyses,

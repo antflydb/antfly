@@ -23,7 +23,7 @@ const RecordedFrame = struct {
     media_type: []u8,
     bytes: []u8,
 
-    fn deinit(self: *RecordedFrame, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *RecordedFrame, alloc: std.mem.Allocator) void {
         alloc.free(self.address);
         alloc.free(self.media_type);
         alloc.free(self.bytes);
@@ -36,7 +36,7 @@ const RecordingFrameDriver = struct {
     failures_remaining: usize = 0,
     sent: std.ArrayListUnmanaged(RecordedFrame) = .empty,
 
-    fn deinit(self: *RecordingFrameDriver) void {
+    pub fn deinit(self: *RecordingFrameDriver) void {
         for (self.sent.items) |*frame| frame.deinit(self.alloc);
         self.sent.deinit(self.alloc);
         self.* = undefined;

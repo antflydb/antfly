@@ -943,7 +943,7 @@ test "RaBitQuantizer range scans preserve scores bounds gaps and empty plans" {
                 try quantizer.estimateDistancesWithScratch(&set, q, &distances, &bounds, &scratch);
                 var actual: [count]f32 = undefined;
                 var errors: [count]f32 = undefined;
-                var seen = [_]bool{false} ** count;
+                var seen = @as([count]bool, @splat(false));
                 const output = Output{ .distances = &actual, .errors = &errors, .seen = &seen };
                 const ranges = [_]ScoreRange{ .{ .start = 2, .end = 7 }, .{ .start = 11, .end = 13 }, .{ .start = 13, .end = count } };
                 try quantizer.estimateDistancesInRangesTo(&set, q, &scratch, null, &ranges, output);
@@ -979,7 +979,7 @@ test "RaBitQuantizer range scans observe cancellation after sparse gaps" {
     };
     var quantizer = try RaBitQuantizer.init(std.testing.allocator, 2, 42, .l2_squared);
     defer quantizer.deinit();
-    var set = try quantizer.quantize(&.{ 0, 0 }, &([_]f32{ 1, 1 } ** 137), 137);
+    var set = try quantizer.quantize(&.{ 0, 0 }, &(z17RepeatArray([_]f32{ 1, 1 }, 137)), 137);
     defer set.deinit(std.testing.allocator);
     var scratch = try RaBitQuantizer.EstimateScratch.init(std.testing.allocator, 2);
     defer scratch.deinit(std.testing.allocator);
@@ -1138,7 +1138,7 @@ test "RaBitQuantizer checks cancellation inside distance scans" {
     // Reach a second periodic scan poll. A one-row centroid-equality fixture
     // has only entry + row-zero polls and cannot trigger a third check.
     const count = 129;
-    var quantized = try quantizer.quantize(&.{ 0, 0 }, &([_]f32{ 1, 1 } ** count), count);
+    var quantized = try quantizer.quantize(&.{ 0, 0 }, &(z17RepeatArray([_]f32{ 1, 1 }, count)), count);
     defer quantized.deinit(std.testing.allocator);
     var distances: [count]f32 = undefined;
     var error_bounds: [count]f32 = undefined;
@@ -1286,4 +1286,10 @@ test "SIMD packing exhausts every eight-lane bit mask" {
             try std.testing.expectEqual(expected, packedQueryByte(values, bit, .mask));
         }
     }
+}
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
 }

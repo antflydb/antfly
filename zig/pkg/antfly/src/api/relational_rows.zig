@@ -17,8 +17,8 @@
 //! coordinator as public batches, with exact version and schema preconditions.
 const std = @import("std");
 const wire = @import("antfly_metadata_openapi").types;
-const batch = @import("batch.zig");
-const types = @import("../storage/db/types.zig");
+const batch = @import("antfly_local_sources").api_batch;
+const types = @import("antfly_local_sources").storage_db_types;
 
 pub fn parseMutation(alloc: std.mem.Allocator, body: []const u8) !batch.OwnedBatchRequest {
     var parsed = std.json.parseFromSlice(wire.RelationalRowMutationRequest, alloc, body, .{ .parse_numbers = false }) catch |err| switch (err) {

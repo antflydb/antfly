@@ -30,7 +30,7 @@ const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const rejoin = @import("rejoin.zig");
 const replication_api = @import("replication_api.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 const status = @import("status.zig");
@@ -342,12 +342,12 @@ fn parseSlot(cursor: *Cursor) !Command {
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--slot") or std.mem.eql(u8, arg, "--name")) {
             _ = cursor.next();
-            slot_name = try validateHASlotName(try cursor.value(arg));
+            slot_name = try validateHotStandbySlotName(try cursor.value(arg));
         } else if (std.mem.eql(u8, arg, "--initial-lsn")) {
             _ = cursor.next();
             initial_lsn = try parseU64(try cursor.value("--initial-lsn"));
         } else if (slot_name == null and !isFlag(arg)) {
-            slot_name = try validateHASlotName(cursor.next().?);
+            slot_name = try validateHotStandbySlotName(cursor.next().?);
         } else {
             break;
         }
@@ -372,7 +372,7 @@ fn parseSeed(cursor: *Cursor) !SeedCommand {
         while (cursor.peek()) |arg| {
             if (std.mem.eql(u8, arg, "--slot")) {
                 _ = cursor.next();
-                slot_name = try validateHASlotName(try cursor.value("--slot"));
+                slot_name = try validateHotStandbySlotName(try cursor.value("--slot"));
             } else if (std.mem.eql(u8, arg, "--manifest-id")) {
                 _ = cursor.next();
                 manifest_id = try cursor.value("--manifest-id");
@@ -394,10 +394,10 @@ fn parseSeed(cursor: *Cursor) !SeedCommand {
         while (cursor.peek()) |arg| {
             if (std.mem.eql(u8, arg, "--manifest")) {
                 _ = cursor.next();
-                manifest_path = try validateHAPath(try cursor.value("--manifest"), .manifest);
+                manifest_path = try validateHotStandbyPath(try cursor.value("--manifest"), .manifest);
             } else if (std.mem.eql(u8, arg, "--content-root")) {
                 _ = cursor.next();
-                content_root = try validateHAPath(try cursor.value("--content-root"), .content_root);
+                content_root = try validateHotStandbyPath(try cursor.value("--content-root"), .content_root);
             } else {
                 break;
             }
@@ -414,7 +414,7 @@ fn parseManifestPath(cursor: *Cursor) ![]const u8 {
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--manifest")) {
             _ = cursor.next();
-            return try validateHAPath(try cursor.value("--manifest"), .manifest);
+            return try validateHotStandbyPath(try cursor.value("--manifest"), .manifest);
         }
         break;
     }
@@ -441,9 +441,9 @@ fn parseStreamOnce(cursor: *Cursor) !StreamOnceCommand {
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--slot")) {
             _ = cursor.next();
-            slot_name = try validateHASlotName(try cursor.value("--slot"));
+            slot_name = try validateHotStandbySlotName(try cursor.value("--slot"));
         } else if (slot_name == null and !isFlag(arg)) {
-            slot_name = try validateHASlotName(cursor.next().?);
+            slot_name = try validateHotStandbySlotName(cursor.next().?);
         } else {
             break;
         }
@@ -461,7 +461,7 @@ fn parseStreamStart(cursor: *Cursor) !replication_api.StartReplicationRequest {
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--slot")) {
             _ = cursor.next();
-            slot_name = try validateHASlotName(try cursor.value("--slot"));
+            slot_name = try validateHotStandbySlotName(try cursor.value("--slot"));
         } else if (std.mem.eql(u8, arg, "--from-lsn")) {
             _ = cursor.next();
             from_lsn = try parseU64(try cursor.value("--from-lsn"));
@@ -513,10 +513,10 @@ fn parseStandbyUpstream(cursor: *Cursor) !StandbyUpstreamCommand {
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--upstream-url")) {
             _ = cursor.next();
-            upstream_url = try validateHAAdminURL(try cursor.value("--upstream-url"));
+            upstream_url = try validateHotStandbyAdminURL(try cursor.value("--upstream-url"));
         } else if (std.mem.eql(u8, arg, "--slot")) {
             _ = cursor.next();
-            slot_name = try validateHASlotName(try cursor.value("--slot"));
+            slot_name = try validateHotStandbySlotName(try cursor.value("--slot"));
         } else if (std.mem.eql(u8, arg, "--cluster-id")) {
             _ = cursor.next();
             identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
@@ -562,7 +562,7 @@ fn parseStandbyStatusUpdate(cursor: *Cursor) !replication_api.StandbyStatusUpdat
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--slot")) {
             _ = cursor.next();
-            slot_name = try validateHASlotName(try cursor.value("--slot"));
+            slot_name = try validateHotStandbySlotName(try cursor.value("--slot"));
         } else if (std.mem.eql(u8, arg, "--timeline-id")) {
             _ = cursor.next();
             timeline_id = try parseU64(try cursor.value("--timeline-id"));
@@ -852,14 +852,14 @@ fn parseOperator(
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--primary-admin-url")) {
             _ = cursor.next();
-            command.spec.primary_admin_url = try validateHAAdminURL(try cursor.value("--primary-admin-url"));
+            command.spec.primary_admin_url = try validateHotStandbyAdminURL(try cursor.value("--primary-admin-url"));
         } else if (std.mem.eql(u8, arg, "--standby")) {
             _ = cursor.next();
-            try standbys.append(alloc, .{ .name = try validateHANodeID(try cursor.value("--standby")) });
+            try standbys.append(alloc, .{ .name = try validateHotStandbyNodeID(try cursor.value("--standby")) });
         } else if (std.mem.eql(u8, arg, "--standby-admin-url")) {
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
-            standbys.items[standbys.items.len - 1].admin_url = try validateHAAdminURL(try cursor.value("--standby-admin-url"));
+            standbys.items[standbys.items.len - 1].admin_url = try validateHotStandbyAdminURL(try cursor.value("--standby-admin-url"));
         } else if (std.mem.eql(u8, arg, "--standby-route-selector")) {
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
@@ -871,15 +871,15 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--standby-seed-manifest")) {
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
-            standbys.items[standbys.items.len - 1].seed_manifest_path = try validateHAPath(try cursor.value("--standby-seed-manifest"), .manifest);
+            standbys.items[standbys.items.len - 1].seed_manifest_path = try validateHotStandbyPath(try cursor.value("--standby-seed-manifest"), .manifest);
         } else if (std.mem.eql(u8, arg, "--standby-seed-content-root")) {
             _ = cursor.next();
             if (standbys.items.len == 0) return error.StandbyNameMissing;
-            standbys.items[standbys.items.len - 1].seed_content_root = try validateHAPath(try cursor.value("--standby-seed-content-root"), .content_root);
+            standbys.items[standbys.items.len - 1].seed_content_root = try validateHotStandbyPath(try cursor.value("--standby-seed-content-root"), .content_root);
         } else if (std.mem.eql(u8, arg, "--standby-disabled")) {
             _ = cursor.next();
             try standbys.append(alloc, .{
-                .name = try validateHANodeID(try cursor.value("--standby-disabled")),
+                .name = try validateHotStandbyNodeID(try cursor.value("--standby-disabled")),
                 .desired = false,
             });
         } else if (std.mem.eql(u8, arg, "--standby-drop-slot")) {
@@ -910,7 +910,7 @@ fn parseOperator(
             command.spec.auto_failover.require_remote_apply = false;
         } else if (std.mem.eql(u8, arg, "--current-primary-id")) {
             _ = cursor.next();
-            command.current_primary_id = try validateHANodeID(try cursor.value("--current-primary-id"));
+            command.current_primary_id = try validateHotStandbyNodeID(try cursor.value("--current-primary-id"));
         } else if (std.mem.eql(u8, arg, "--primary-admin-unavailable")) {
             _ = cursor.next();
             command.primary_admin_unavailable = true;
@@ -922,7 +922,7 @@ fn parseOperator(
             command.fencing.ready = true;
         } else if (std.mem.eql(u8, arg, "--fence-holder")) {
             _ = cursor.next();
-            command.fencing.holder = try validateHANodeID(try cursor.value("--fence-holder"));
+            command.fencing.holder = try validateHotStandbyNodeID(try cursor.value("--fence-holder"));
         } else if (std.mem.eql(u8, arg, "--fence-generation")) {
             _ = cursor.next();
             command.fencing.generation = try parseU64(try cursor.value("--fence-generation"));
@@ -932,7 +932,7 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--former-primary-id") or std.mem.eql(u8, arg, "--former-node-id")) {
             _ = cursor.next();
             has_former_primary = true;
-            former_node_id = try validateHANodeID(try cursor.value(arg));
+            former_node_id = try validateHotStandbyNodeID(try cursor.value(arg));
         } else if (std.mem.eql(u8, arg, "--former-cluster-id")) {
             _ = cursor.next();
             has_former_primary = true;
@@ -966,11 +966,11 @@ fn parseOperator(
         } else if (std.mem.eql(u8, arg, "--receipt-old-primary-id")) {
             _ = cursor.next();
             has_fence = true;
-            fence_old_primary_id = try validateHANodeID(try cursor.value("--receipt-old-primary-id"));
+            fence_old_primary_id = try validateHotStandbyNodeID(try cursor.value("--receipt-old-primary-id"));
         } else if (std.mem.eql(u8, arg, "--receipt-promoted-node-id")) {
             _ = cursor.next();
             has_fence = true;
-            fence_promoted_node_id = try validateHANodeID(try cursor.value("--receipt-promoted-node-id"));
+            fence_promoted_node_id = try validateHotStandbyNodeID(try cursor.value("--receipt-promoted-node-id"));
         } else if (std.mem.eql(u8, arg, "--receipt-parent-timeline-id")) {
             _ = cursor.next();
             has_fence = true;
@@ -1124,10 +1124,10 @@ fn parseFenceRequest(cursor: *Cursor) !fencing.FenceRequest {
             identity.epoch = try parseU64(try cursor.value("--epoch"));
         } else if (std.mem.eql(u8, arg, "--old-primary-id")) {
             _ = cursor.next();
-            old_primary_id = try validateHANodeID(try cursor.value("--old-primary-id"));
+            old_primary_id = try validateHotStandbyNodeID(try cursor.value("--old-primary-id"));
         } else if (std.mem.eql(u8, arg, "--promoted-node-id")) {
             _ = cursor.next();
-            promoted_node_id = try validateHANodeID(try cursor.value("--promoted-node-id"));
+            promoted_node_id = try validateHotStandbyNodeID(try cursor.value("--promoted-node-id"));
         } else if (std.mem.eql(u8, arg, "--new-timeline-id")) {
             _ = cursor.next();
             new_timeline_id = try parseU64(try cursor.value("--new-timeline-id"));
@@ -1213,7 +1213,7 @@ fn parseRejoin(cursor: *Cursor) !Command {
     while (cursor.peek()) |arg| {
         if (std.mem.eql(u8, arg, "--node-id")) {
             _ = cursor.next();
-            node_id = try validateHANodeID(try cursor.value("--node-id"));
+            node_id = try validateHotStandbyNodeID(try cursor.value("--node-id"));
         } else if (std.mem.eql(u8, arg, "--cluster-id")) {
             _ = cursor.next();
             identity.cluster_id = try parseU64(try cursor.value("--cluster-id"));
@@ -1241,11 +1241,11 @@ fn parseRejoin(cursor: *Cursor) !Command {
         } else if (std.mem.eql(u8, arg, "--fence-old-primary-id")) {
             _ = cursor.next();
             has_fence = true;
-            fence_old_primary_id = try validateHANodeID(try cursor.value("--fence-old-primary-id"));
+            fence_old_primary_id = try validateHotStandbyNodeID(try cursor.value("--fence-old-primary-id"));
         } else if (std.mem.eql(u8, arg, "--fence-promoted-node-id")) {
             _ = cursor.next();
             has_fence = true;
-            fence_promoted_node_id = try validateHANodeID(try cursor.value("--fence-promoted-node-id"));
+            fence_promoted_node_id = try validateHotStandbyNodeID(try cursor.value("--fence-promoted-node-id"));
         } else if (std.mem.eql(u8, arg, "--fence-parent-timeline-id")) {
             _ = cursor.next();
             has_fence = true;
@@ -1342,7 +1342,7 @@ const SyncPolicyBuilder = struct {
     failure_policy: primary_mod.FailurePolicy = .block,
     standby_names: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *SyncPolicyBuilder, alloc: Allocator) void {
+    pub fn deinit(self: *SyncPolicyBuilder, alloc: Allocator) void {
         self.standby_names.deinit(alloc);
         self.* = undefined;
     }
@@ -1366,7 +1366,7 @@ const SyncPolicyBuilder = struct {
         }
         if (std.mem.eql(u8, arg, "--sync-standby")) {
             _ = cursor.next();
-            try self.standby_names.append(alloc, try validateHANodeID(try cursor.value("--sync-standby")));
+            try self.standby_names.append(alloc, try validateHotStandbyNodeID(try cursor.value("--sync-standby")));
             return true;
         }
         if (std.mem.eql(u8, arg, "--sync-failure")) {
@@ -1430,13 +1430,13 @@ const Cursor = struct {
     }
 };
 
-const HAPathField = enum {
+const HotStandbyPathField = enum {
     manifest,
     content_root,
 };
 
-fn validateHASlotName(raw: []const u8) ![]const u8 {
-    switch (validation.classifyHAString(raw)) {
+fn validateHotStandbySlotName(raw: []const u8) ![]const u8 {
+    switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing => return error.SlotNameMissing,
         .padded => return error.InvalidSlotName,
@@ -1445,8 +1445,8 @@ fn validateHASlotName(raw: []const u8) ![]const u8 {
     return raw;
 }
 
-fn validateHANodeID(raw: []const u8) ![]const u8 {
-    switch (validation.classifyHAString(raw)) {
+fn validateHotStandbyNodeID(raw: []const u8) ![]const u8 {
+    switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing, .padded => return error.InvalidNodeId,
     }
@@ -1454,28 +1454,28 @@ fn validateHANodeID(raw: []const u8) ![]const u8 {
     return raw;
 }
 
-fn validateHAPath(raw: []const u8, field: HAPathField) ![]const u8 {
-    switch (validation.classifyHAString(raw)) {
+fn validateHotStandbyPath(raw: []const u8, field: HotStandbyPathField) ![]const u8 {
+    switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing => return switch (field) {
             .manifest => error.ManifestPathMissing,
             .content_root => error.ContentRootMissing,
         },
-        .padded => return haPathInvalidError(field),
+        .padded => return hotStandbyPathInvalidError(field),
     }
-    if (!validation.isAbsoluteNormalizedPath(raw)) return haPathInvalidError(field);
+    if (!validation.isAbsoluteNormalizedPath(raw)) return hotStandbyPathInvalidError(field);
     return raw;
 }
 
-fn haPathInvalidError(field: HAPathField) anyerror {
+fn hotStandbyPathInvalidError(field: HotStandbyPathField) anyerror {
     return switch (field) {
         .manifest => error.ManifestPathInvalid,
         .content_root => error.ContentRootInvalid,
     };
 }
 
-fn validateHAAdminURL(raw: []const u8) ![]const u8 {
-    switch (validation.classifyHAString(raw)) {
+fn validateHotStandbyAdminURL(raw: []const u8) ![]const u8 {
+    switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing, .padded => return error.InvalidHAAdminURL,
     }

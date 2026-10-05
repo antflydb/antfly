@@ -46,7 +46,7 @@ const Options = struct {
     native_model_dir: []const u8,
     reference_model_dir: []const u8,
     prompt: []const u8,
-    image_paths: [8][]const u8 = .{""} ** 8,
+    image_paths: [8][]const u8 = @splat(""),
     image_count: usize = 0,
     backend: BackendChoice = .auto,
     native_backend: ?BackendChoice = null,
@@ -130,7 +130,7 @@ const PreparedMessages = struct {
         return self.messages_buf[0..];
     }
 
-    fn deinit(self: *PreparedMessages) void {
+    pub fn deinit(self: *PreparedMessages) void {
         if (self.content_part_slice) |slice| self.allocator.free(slice);
         if (self.message_image_slice) |slice| self.allocator.free(slice);
         for (self.loaded_images.items) |image_bytes| self.allocator.free(image_bytes);
@@ -146,7 +146,7 @@ const FirstTokenResult = struct {
     token_text: []u8,
     finish_reason: []const u8,
 
-    fn deinit(self: *FirstTokenResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *FirstTokenResult, allocator: std.mem.Allocator) void {
         allocator.free(self.rendered_prompt);
         allocator.free(self.token_text);
     }
@@ -157,7 +157,7 @@ const ExpandedPromptInfo = struct {
     token_ids: []i64,
     image_offsets: []usize,
 
-    fn deinit(self: *ExpandedPromptInfo) void {
+    pub fn deinit(self: *ExpandedPromptInfo) void {
         self.allocator.free(self.token_ids);
         self.allocator.free(self.image_offsets);
     }
@@ -189,7 +189,7 @@ const NativeAnalysis = struct {
     top_logits: []TopLogit,
     elapsed_ms: u64 = 0,
 
-    fn deinit(self: *NativeAnalysis, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *NativeAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         allocator.free(self.prompt_token_ids);
         allocator.free(self.last_logits);
@@ -215,7 +215,7 @@ const RuntimeParityCapture = struct {
     logits: []f32,
     top_logits: []TopLogit,
 
-    fn deinit(self: *RuntimeParityCapture) void {
+    pub fn deinit(self: *RuntimeParityCapture) void {
         self.allocator.free(self.token_text);
         self.allocator.free(self.final_hidden);
         self.allocator.free(self.pre_norm_hidden);
@@ -250,10 +250,10 @@ const WeightBindingSlotStat = struct {
     rms: f64 = 0,
     mean_abs: f64 = 0,
     max_abs: f32 = 0,
-    first: [weight_binding_sample_count]f32 = [_]f32{0} ** weight_binding_sample_count,
+    first: [weight_binding_sample_count]f32 = @as([weight_binding_sample_count]f32, @splat(0)),
     first_count: usize = 0,
 
-    fn deinit(self: *WeightBindingSlotStat, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *WeightBindingSlotStat, allocator: std.mem.Allocator) void {
         allocator.free(self.label);
         if (self.used_name_owned) allocator.free(self.used_name);
         if (self.shape_owned) allocator.free(self.shape);
@@ -268,7 +268,7 @@ const WeightBindingAnalysis = struct {
     weight_prefix: []u8,
     stats: []WeightBindingSlotStat,
 
-    fn deinit(self: *WeightBindingAnalysis, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *WeightBindingAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.model_dir);
         allocator.free(self.weight_prefix);
         for (self.stats) |*stat| stat.deinit(allocator);
@@ -286,7 +286,7 @@ const ActivationTracePoint = struct {
     all_rows: bool,
     values: []f32,
 
-    fn deinit(self: *ActivationTracePoint, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ActivationTracePoint, allocator: std.mem.Allocator) void {
         allocator.free(self.label);
         allocator.free(self.values);
         self.* = undefined;
@@ -302,7 +302,7 @@ const ActivationTraceAnalysis = struct {
     top1: i32,
     points: []ActivationTracePoint,
 
-    fn deinit(self: *ActivationTraceAnalysis, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ActivationTraceAnalysis, allocator: std.mem.Allocator) void {
         allocator.free(self.model_dir);
         allocator.free(self.prompt);
         allocator.free(self.prompt_token_ids);
@@ -330,7 +330,7 @@ const ActivationTraceCollector = struct {
         };
     }
 
-    fn deinit(self: *ActivationTraceCollector) void {
+    pub fn deinit(self: *ActivationTraceCollector) void {
         for (self.points.items) |*point| point.deinit(self.allocator);
         self.points.deinit(self.allocator);
         self.* = undefined;
@@ -901,7 +901,7 @@ const QualityEvalItem = struct {
     native_empty_or_special: bool,
     reference_empty_or_special: bool,
 
-    fn deinit(self: *QualityEvalItem, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *QualityEvalItem, allocator: std.mem.Allocator) void {
         allocator.free(self.prompt);
         allocator.free(self.native_text);
         allocator.free(self.reference_text);
@@ -1196,7 +1196,7 @@ fn writeQualityEvalJson(
         try out.appendSlice(allocator, row);
     }
     try out.appendSlice(allocator, "\n]}\n");
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
 }
 
 fn runActivationTraceCompare(allocator: std.mem.Allocator, opts: Options) !void {
@@ -2446,7 +2446,7 @@ const RuntimeParityDecodeState = struct {
     kv_storage: *runtime.kv.storage_runtime.KvStorageRuntime,
     decode_state: generation.NativeDecodeState,
 
-    fn deinit(self: *RuntimeParityDecodeState) void {
+    pub fn deinit(self: *RuntimeParityDecodeState) void {
         self.decode_state.deinit();
         self.kv_storage.deinit();
         self.allocator.destroy(self.kv_storage);

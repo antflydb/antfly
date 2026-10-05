@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const graph_mod = @import("../../graph/graph.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
 
 pub const Score = struct {
     node_id: []u8,

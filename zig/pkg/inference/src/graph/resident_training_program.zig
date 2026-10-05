@@ -17,9 +17,12 @@
 //! Compilation owns the lowered program, checked descriptors and liveness.
 //! All live parameters require explicit resident bindings; there is no named
 //! weight lookup, interpreter fallback or activation readback in this module.
-//! Initial dispatches finish individually, allowing bounded reclamation and
-//! cancellation. Command batching is a separate qualification step.
+//! On Metal, dispatches record into a resident command batch flushed in
+//! bounded segments (`Batch`), so reclamation and cancellation stay bounded by
+//! a segment rather than by one dispatch. `ANTFLY_RESIDENT_PROGRAM_UNBATCHED`
+//! restores per-dispatch completion.
 const std = @import("std");
+const platform = @import("antfly_platform");
 const ml = @import("ml").graph;
 const ops = @import("../ops/ops.zig");
 const instructions = @import("../ops/resident_program_ops.zig");
@@ -38,6 +41,11 @@ pub const Limits = struct {
     max_constant_bytes: usize = 64 * 1024 * 1024,
     max_binding_bytes: usize = 8 * 1024 * 1024 * 1024,
     max_working_bytes: usize = 512 * 1024 * 1024,
+    /// Dispatches recorded into one resident command batch before it is
+    /// submitted and awaited; 0 completes every dispatch individually. A
+    /// segment also ends once its fresh output, scratch and capture bytes
+    /// exceed `max_working_bytes`.
+    max_batch_dispatches: usize = 256,
     max_capture_bytes: usize = 1024 * 1024 * 1024,
     max_device_bytes: usize = 10 * 1024 * 1024 * 1024,
     max_host_metadata_bytes: usize = 256 * 1024 * 1024,
@@ -129,7 +137,7 @@ pub const Program = struct {
             return error.ResourceLimitExceeded;
         for (targets) |target| if (target >= source_count) return error.InvalidResidentProgramTarget;
         var view = source.*;
-        view.outputs = .{ .items = @constCast(targets), .capacity = targets.len };
+        view.outputs = .{ .items = @constCast(targets), .capacity = targets.len, .pointer_stability = .{} };
         var lowered = try ml.lower.lower(a, &view);
         errdefer lowered.deinit();
         const graph = &lowered.graph;
@@ -245,6 +253,11 @@ pub const Program = struct {
         defer a.free(outputs);
         @memset(outputs, null);
         errdefer for (outputs) |value| if (value) |tensor| cb.free(tensor);
+        // Registered after the buffer defers, so a failed batch is cancelled
+        // before any of its recorded inputs or outputs are released.
+        var batch = Batch{ .cb = &cb, .limits = self.limits, .enabled = self.limits.max_batch_dispatches > 0 and !platform.env.getenvBoolDefault("ANTFLY_RESIDENT_PROGRAM_UNBATCHED", false) };
+        try batch.begin();
+        errdefer batch.abort();
         // Validate every explicit binding before constant uploads or numeric
         // execution. The strict reshape returns an owned immutable alias and
         // verifies exact owner, physical dtype, storage and logical shape.
@@ -269,10 +282,18 @@ pub const Program = struct {
                     .i32 => try cb.residentTrainingPrimitive(&.{ .upload_i32 = .{ .values = std.mem.bytesAsSlice(i32, @as([]align(4) const u8, @alignCast(raw))), .shape = dimensions[0..shape.rank_] } }, self.limits.instruction.primitive),
                     else => return error.UnsupportedResidentProgramDType,
                 };
+                try batch.recorded(try nodeBytes(shape, self.limits));
             } else if (self.descriptors[id]) |instruction| {
                 var inputs: [4]ops.CT = undefined;
                 for (node.getInputs(), 0..) |input, ordinal| inputs[ordinal] = values[input] orelse return error.MissingResidentProgramValue;
+                // DeBERTa training attention owns its command buffer and
+                // reads back a control scalar, so it runs between segments.
+                const standalone = instruction.op == .fused_deberta_training_attention_v1 or instruction.op == .fused_deberta_training_attention_backward_v1;
+                if (standalone) try batch.end();
                 values[id] = try cb.residentTrainingInstruction(&instruction, inputs[0..node.num_inputs], self.limits.instruction);
+                if (standalone) try batch.begin();
+                const geometry = try instruction.validate(self.limits.instruction);
+                try batch.recorded(try checkedAdd(geometry.output_elements * 4, geometry.scratch_bytes));
             }
             const value = values[id] orelse return error.MissingResidentProgramBinding;
             var capture = self.first_capture[id];
@@ -280,6 +301,7 @@ pub const Program = struct {
                 var dimensions: [8]i32 = undefined;
                 for (node.output_shape.dims[0..node.output_shape.rank_], 0..) |dim, axis| dimensions[axis] = @intCast(dim);
                 outputs[capture] = try cb.snapshotTensorShape(value, dimensions[0..node.output_shape.rank_]);
+                try batch.recorded(try nodeBytes(node.output_shape, self.limits));
             }
             for (node.getInputs()) |input| if (self.last_use[input] == id) {
                 if (values[input]) |owned| cb.free(owned);
@@ -290,10 +312,56 @@ pub const Program = struct {
                 values[id] = null;
             }
         }
+        try batch.end();
         try active.check();
         const completed = try a.alloc(ops.CT, outputs.len);
         for (outputs, completed) |output, *value| value.* = output orelse unreachable;
         return .{ .allocator = a, .outputs = completed, .admission = self.admission };
+    }
+};
+
+/// A resident command batch over one program execution: dispatches record
+/// into the backend's batch and complete together at each segment boundary.
+/// Backends without resident batches (`residentTrainingBeginBatch` returns
+/// false) complete every dispatch individually, as before.
+const Batch = struct {
+    cb: *const ops.ComputeBackend,
+    limits: Limits,
+    enabled: bool,
+    open: bool = false,
+    dispatches: usize = 0,
+    bytes: usize = 0,
+
+    fn begin(self: *Batch) !void {
+        if (!self.enabled or self.open) return;
+        self.open = try self.cb.residentTrainingBeginBatch();
+        self.dispatches = 0;
+        self.bytes = 0;
+    }
+
+    /// Submits and awaits the recorded segment.
+    fn end(self: *Batch) !void {
+        if (!self.open) return;
+        self.open = false;
+        try self.cb.residentTrainingEndBatch(true);
+    }
+
+    fn abort(self: *Batch) void {
+        if (!self.open) return;
+        self.open = false;
+        self.cb.residentTrainingEndBatch(false) catch {};
+    }
+
+    /// Counts one recorded dispatch and the fresh device bytes it holds until
+    /// the segment completes; ends the segment at either bound.
+    fn recorded(self: *Batch, bytes: usize) !void {
+        if (!self.open) return;
+        self.dispatches += 1;
+        self.bytes +|= bytes;
+        if (self.dispatches >= self.limits.max_batch_dispatches or self.bytes >= self.limits.max_working_bytes) {
+            try self.end();
+            try self.begin();
+        }
     }
 };
 
@@ -437,6 +505,9 @@ test "resident program preserves backend and request controls without GPU dispat
     var vtable: ops.ComputeBackend.VTable = undefined;
     vtable.backendKind = Fake.kind;
     vtable.residentTrainingInstruction = Fake.instruction;
+    // No resident command batch: every dispatch completes individually.
+    vtable.residentTrainingBeginBatch = null;
+    vtable.residentTrainingEndBatch = null;
     var cb = ops.ComputeBackend{ .ptr = &fake, .vtable = &vtable, .execution_control = base };
     const bindings = [_]Binding{.{ .node_id = input, .value = @ptrCast(&fake) }};
     original.failure = error.OriginalControlStopped;

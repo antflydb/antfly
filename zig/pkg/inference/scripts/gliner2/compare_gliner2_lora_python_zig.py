@@ -3667,9 +3667,9 @@ def main() -> int:
     )
     p.add_argument(
         "--zig-optimize",
-        choices=["Debug", "ReleaseSafe", "ReleaseFast", "ReleaseSmall"],
-        default="ReleaseFast",
-        help="Zig optimization mode for the training binary (default: ReleaseFast; pass Debug for instrumentation-heavy debugging)",
+        choices=["debug", "safe", "fast", "small"],
+        default="fast",
+        help="Zig optimization mode for the training binary (default: fast; pass debug for instrumentation-heavy debugging)",
     )
     p.add_argument(
         "--dump-parity",

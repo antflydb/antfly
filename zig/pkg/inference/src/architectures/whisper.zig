@@ -585,7 +585,7 @@ const StepProfile = struct {
     in_place_kv: u32 = 0,
     device_choice: bool = false,
     planned_scope: bool = false,
-    totals: [std.enums.values(Bucket).len]u64 = [_]u64{0} ** std.enums.values(Bucket).len,
+    totals: [std.enums.values(Bucket).len]u64 = @as([std.enums.values(Bucket).len]u64, @splat(0)),
 
     fn start(self: *StepProfile) void {
         if (self.enabled) self.last_ns = platform.time.monotonicNs();
@@ -595,7 +595,7 @@ const StepProfile = struct {
         if (!self.enabled) return;
         if (self.frame_active.*) cb.decoderRuntimeFlushActiveFrame() catch {};
         const now = platform.time.monotonicNs();
-        self.totals[@intFromEnum(bucket)] += now -| self.last_ns;
+        self.totals[@backingInt(bucket)] += now -| self.last_ns;
         self.last_ns = now;
     }
 
@@ -1060,7 +1060,7 @@ const ResidualStream = struct {
         return pair.normed;
     }
 
-    fn deinit(self: *ResidualStream, cb: *const ComputeBackend) void {
+    pub fn deinit(self: *ResidualStream, cb: *const ComputeBackend) void {
         if (self.pending) |p| cb.free(p);
         cb.free(self.sum);
         self.* = undefined;

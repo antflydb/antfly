@@ -21,8 +21,8 @@ const std = @import("std");
 const vopr = @import("vopr");
 const replication = @import("../metadata/replication_backfill.zig");
 const foreign = @import("../foreign/source.zig");
-const table_writes = @import("../api/table_write_source.zig");
-const db_types = @import("../storage/db/types.zig");
+const table_writes = @import("antfly_local_sources").api_table_write_source;
+const db_types = @import("antfly_local_sources").storage_db_types;
 const table_manager = @import("../metadata/table_manager.zig");
 const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
@@ -647,7 +647,7 @@ pub const Scenario = struct {
             const intent = params.exact_cutover_intent orelse
                 return error.InvalidReplicationCutoverIntent;
             self.exact_cutover_prepares +|= 1;
-            try intent.persist([_]u8{0x7a} ** std.crypto.hash.sha2.Sha256.digest_length);
+            try intent.persist(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x7a)));
             try intent.check();
             if (params.retired_slot_name != null or
                 params.retired_publication_name != null)

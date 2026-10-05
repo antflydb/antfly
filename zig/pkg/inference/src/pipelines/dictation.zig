@@ -33,8 +33,8 @@ pub const Style = enum {
     verbatim,
 
     pub fn parse(text: []const u8) ?Style {
-        inline for (@typeInfo(Style).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @field(Style, field.name);
+        inline for (@typeInfo(Style).@"enum".field_names) |reflected_name| {
+            if (std.mem.eql(u8, text, reflected_name)) return @field(Style, reflected_name);
         }
         return null;
     }

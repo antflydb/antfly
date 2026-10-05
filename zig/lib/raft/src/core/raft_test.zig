@@ -160,7 +160,7 @@ const CaptureLogger = struct {
         };
     }
 
-    fn deinit(self: *CaptureLogger) void {
+    pub fn deinit(self: *CaptureLogger) void {
         for (self.records.items) |record| self.alloc.free(record.message);
         self.records.deinit(self.alloc);
     }
@@ -189,7 +189,7 @@ const CaptureTraceLogger = struct {
         };
     }
 
-    fn deinit(self: *CaptureTraceLogger, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CaptureTraceLogger, alloc: std.mem.Allocator) void {
         self.events.deinit(alloc);
     }
 

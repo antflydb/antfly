@@ -40,7 +40,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     cli.fatal("unknown namespace subcommand: {s}", .{subcommand});
 }
 
-fn listNamespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn listNamespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const parsed = parseNamespaceArgs(args, .{ .require_name = false });
     var resp = try client.inner.listNamespaces(parsed.database_name);
     defer resp.deinit();
@@ -50,7 +50,7 @@ fn listNamespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     }
 }
 
-fn createNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn createNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const parsed = parseNamespaceArgs(args, .{ .require_name = true });
     var resp = try client.inner.createNamespace(parsed.database_name, parsed.namespace_name.?);
     defer resp.deinit();
@@ -60,7 +60,7 @@ fn createNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     }
 }
 
-fn dropNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn dropNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const parsed = parseNamespaceArgs(args, .{ .require_name = true });
     var resp = try client.inner.dropNamespace(parsed.database_name, parsed.namespace_name.?);
     defer resp.deinit();
@@ -70,7 +70,7 @@ fn dropNamespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     }
 }
 
-fn setNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn setNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const parsed = parseNamespaceTablespaceArgs(args);
     var resp = try client.inner.setNamespaceTablespace(parsed.database_name, parsed.namespace_name, .{ .tablespace_name = parsed.tablespace_name });
     defer resp.deinit();
@@ -80,7 +80,7 @@ fn setNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client: *ant
     }
 }
 
-fn clearNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn clearNamespaceTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const parsed = parseNamespaceArgs(args, .{ .require_name = true });
     var resp = try client.inner.clearNamespaceTablespace(parsed.database_name, parsed.namespace_name.?);
     defer resp.deinit();

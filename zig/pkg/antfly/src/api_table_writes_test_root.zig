@@ -13,11 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const batch = @import("api/batch.zig");
+const batch = @import("antfly_local_sources").api_batch;
 const http_client = @import("api/http_client.zig");
 const internal_transition_wire = @import("api/internal_transition_wire.zig");
 const provisioned_storage = @import("api/provisioned_storage.zig");
-const table_write_source = @import("api/table_write_source.zig");
+const table_write_source = @import("antfly_local_sources").api_table_write_source;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 
 test {
@@ -39,3 +39,6 @@ pub const antfly_sources = @import("source_owner_control.zig");
 pub const consumer_tests_only = true;
 
 pub const linked_owner_fixture = @import("api/linked_owner_test_fixture.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

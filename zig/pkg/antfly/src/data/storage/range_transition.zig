@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const shard_mod = @import("../../storage/shard.zig");
+const shard_mod = @import("antfly_local_sources").storage_shard;
 
 pub const TransitionKind = enum {
     split,

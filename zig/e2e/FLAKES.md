@@ -1,5 +1,265 @@
 # Zig E2E flakes
 
+## 2026-10-02: restore proofs and follower artifact admission
+
+[Run 36961250636](https://github.com/antflydb/antfly/actions/runs/36961250636)
+failed restore, FK merge recovery, standby restart and scoped-secret scenarios.
+These had separate causes:
+
+- Private restore provisioning reconstructed an incomplete bootstrap and lost
+  the source-generation proof. It now retains the canonical bootstrap, with
+  borrowed strings rebound to the immutable provisioning projection. The
+  three-by-three harness refreshes physical table IDs after restore publication.
+- FK merge admission waited for a follower's managed full-text initial build,
+  while ordinary repair scheduling waited for serving admission. Committed
+  artifact reconciliation now advances one bounded initial-build quantum under
+  its exact durable intent. Repair kind, configuration, root and group fences
+  remain checked; unrelated repairs cannot use this path.
+- A truncated HTTP response escaped as `UnexpectedEof`, which the standby error
+  boundary treated as an unknown fatal failure. The shared transport and runtime
+  ABI normalize it to `InvalidResponse` without certifying mutation delivery or
+  replaying a mutation. Standby recovery retains its durable retry position.
+- Provider-only secret grants correctly deny row-policy signing keys. Opening
+  an ordinary data owner now leaves that optional authority unavailable on
+  `Unauthorized`; other failures still propagate and policy admission remains
+  fail-closed.
+
+Readiness and secret fixtures now accept the current compatible readiness
+payload and explicitly recognized committed/pending write responses, and still
+wait for their serving or provider assertions. Missing backup repositories are
+checked at admission rather than expecting a job for a rejected request.
+
+Use the repository regression loop with a frozen Debug server:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN="$PWD/zig/zig-out/bin/antfly" \
+ANTFLY_E2E_REGRESSION_REPEATS=20 \
+scripts/ci/zig-e2e-regression-loop.sh \
+  'e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-child_owner]'
+```
+
+The FK failure reproduced three times before the fix, then passed 20/20
+isolated repetitions with the final Debug server. Restore, standby restart
+and scoped-secret cases passed 35/35 tests across five repetitions of each
+selector (including both portable and native mixed restore). Readiness and
+harness checks passed 105/105; exact FK schema admission and missing-backup
+rejection also passed against the final server.
+Local macOS runs do not establish Linux storage latency or qualify the complete
+E2E suite.
+
+## 2026-09-29: receipt-driven recovery and native graph read budgets (#918)
+
+Rewrite source preparation, owner replay, validation and final owner publication
+use windows of at most four independent owners. A window never crosses a cohort
+phase barrier. Authoritative owner receipts survive a lost scheduling checkpoint;
+successful publication prefixes are saved before returning a later owner's
+failure. Metadata progress notifications wake cooperative continuations, with
+periodic reconciliation retained for lost notifications and restart. Durable
+failure backoff remains separate from these in-memory wakeups.
+
+Fresh ordinary integrity writes first perform generation-fenced claim reads to
+reject definite statement-wide conflicts without creating transaction state.
+Successful writes still perform transactional prepare and retain row versions,
+content digests and generation predicates. Explicit retained transaction IDs
+keep their existing recovery path. Preparation batches up to eight primary
+observations or claims per owner under one ReadIndex gate and immutable owner
+snapshot; proofs are not retained across RPCs. Dirty topology reports reuse a
+fresh immutable baseline, while registration, expired baselines and periodic
+reconciliation still obtain a current metadata snapshot.
+
+Run 36648393361 also failed the quickstart progressive first-result gate. Its
+last observation had six completed provider calls and a seventh still executing;
+the logs do not identify that call's blocking stage. The unchanged frozen server
+passed 20 isolated repetitions and 20 shared-process sequences including the
+preceding managed-index tests. The provider fixture now owns its kernel-assigned
+port and reports accepted, decoded, completed and active requests on failure.
+The 30-second first-result deadline and serving assertions are unchanged.
+These reproductions do not establish that the CI stall is fixed.
+
+Merging the newer graph and SQL changes exposed a separate native graph-boundary
+defect: local graph requests used an unbounded edge reader and omitted physical
+scan counts, which the response encoder now requires. They now use the bounded
+reader with edge-type filters, TTL, identity fences, admission and physical scan
+accounting. A native regression covers successful response encoding and edge,
+byte and scan limits. The graph suite also exposed split/merge imports casting
+expanded mutation records to smaller storage records; both paths now explicitly
+project key/value fields. The complete graph suite passed 73/73 after these fixes.
+
+Live rewrite recovery seals the source accepted-generation summary and installs
+only fresh surviving FK mappings on hidden targets. Initial provisioning and cold
+RPC recovery share one descriptor builder; receipt reads accept validated live
+handoffs under the same strict ReadIndex gate as empty-generation handoffs.
+Public restore-job listings independently own response strings before releasing
+their parsed records. The final Debug smoke passed all three #919 selectors.
+
+The v20 soak reproduced a post-publication 404 while the rewrite job was already
+succeeded. Strict lookup fallback previously returned null after exhausting
+replicas with unproved HTTP misses or server failures. Exhaustion now returns
+availability unless a native strict-barrier read or authenticated receipt proves
+absence. The existing request budget bounds re-resolution; successful-absence
+reads still return immediately. Regression coverage exhausts a bounded peer list
+with unmarked 404 and 500 responses, and preserves certified absence. The E2E
+failure now captures exact frontend, key, job result and metadata snapshots for
+HTTP failures as well as transport failures. This concrete false-absence defect
+is fixed; the retained cluster does not establish which endpoint returned the
+unproved miss, so final qualification must include the publication path.
+
+Earlier frozen 600/600 recovery runs do not qualify these subsequent
+architectural changes; the final v25 qualification is recorded below.
+
+The v22 mixed soak passed Autograph and FK recovery 200/200 each, but schema
+publication passed 198/200: two successful jobs were followed by a frontend
+404 for a retained row. Reopening copies of all three target replicas found
+the expected durable row. That does not establish the live read's failing
+stage. Two additional false-absence paths are now guarded: a missing route
+under ReadIndex returns availability, and descriptor disappearance after an
+authenticated route cannot certify a row miss. Focused regressions preserve
+stale semantics and native certified absence. The v23 frozen-binary mixed
+soak completed; its results do not qualify later source changes.
+The v23 run also reproduced two schema HTTP 500 failures: a parent point read
+after publication and a child read after cascading delete. Both report a
+system-catalog `ReadFailed` collapsed into `RuntimeBoundaryFailure`. Its
+quickstart soak completed with 196/200 progressive passes and four other cases
+200/200 each. All four progressive failures were completion stalls after both
+indexes became queryable, with repeated `EnrichmentLeaseFenceLost` warnings.
+They were not first-result failures. These runs do not qualify later changes.
+
+The HTTP executor now retrieves std.http's underlying header/body read error
+before crossing archive boundaries. Truncated response bodies become
+`InvalidResponse`, which the existing read-only catalog retry loop handles
+inside its original deadline. It also checks that the HTTP framing reached its
+terminal state: a premature Content-Length EOF can otherwise expose a valid
+JSON prefix as success. The fault matrix covers both transfer encodings and
+buffered/streamed GET/POST, with one send per request and no success flush for
+partial streams. The executor never retries a delivered mutation or treats
+partial bytes as a successful response. Catalog invalidation retains
+one immutable endpoint-hint generation for admitted cache-only write forwarding;
+it remains unavailable to authoritative reads and planning, and the receiving
+owner still checks group leadership and the unchanged write-route fence.
+
+Enrichment renews the exact admitted lease epoch throughout a replay pass,
+including text provider waits and draining concurrent lanes. Writer contention
+retries promptly within the lease slack. Independently scheduled renewals cannot
+shorten durable expiry, and renewal updates the cached scheduling deadline and
+statistics only for the matching held tenure. Durable write fences still reject
+expired or superseded epochs.
+
+Final v25 native macOS arm64 qualification completed on 2026-10-01 against
+the frozen Debug server from `a70f7dd221`, SHA-256
+`1e703bb3542313233ad67be092a06b20e1e55e9fb85e18ce76482c4b4505d1fb`.
+The repository regression loop passed Autograph, snapshot-owner FK recovery,
+and publication-reply-loss schema recovery **200/200 each**, with exit code 0.
+The shared-process quickstart loop passed progressive indexing and all four
+preceding managed-index cases **200/200 each**, also with exit code 0. These
+results are not pooled with earlier executable revisions. Linux CI remains a
+separate gate: run `36819027473` lost the x86_64 runner and its E2E build failed
+before running tests because shared fixture modules received duplicate
+`antfly_build_info_version` link objects. Final executable link inputs now attach
+once per root module, independently of the number of filtered test executables.
+
+Hosted initial, self and truncate FK recovery selections now execute in the
+normal native Zig unit inventory, serially after ordinary unit work. The focused
+`antfly-api-hosted-recovery-test` target reuses those compiler artifacts without
+running the whole inventory. They inherit the selected build mode (Debug by
+default), require zero skips and retain a 15-minute execution deadline per suite
+through the shared test runner. E2E jobs package only the server; there are no
+separate FK runner lanes or fixture optimization overrides. Approved PR runs
+use the reusable workflow on main, so this workflow layout takes effect only
+after merge; the old workflow still expects the removed fixture packaging.
+
+The native migration check exposed single-voter self-FK DDL returning HTTP 500
+with `StorageReadTemporarilyUnavailable` before proposal admission. Those
+fixtures waited for public catalog readiness, while only the three-voter case
+proved the metadata frontend's routed ReadIndex identity and integrity-catalog
+readiness. All self-FK publication cases now establish that same read-only
+prerequisite before submitting DDL once. The barrier retries only transient
+readiness errors; it does not retry a possibly delivered mutation or weaken
+restart/lost-reply proofs.
+
+Final native Debug migration verification passed initial FK **8/8**, self-FK
+**4/4** and external-parent/graph truncate **7/7**, with zero skips, failures or
+leaks and all 34 build steps successful. External-parent/graph fixtures accept
+asynchronous CREATE admission while preserving the subsequent table barriers
+and all recovery assertions. Shared-runner regressions passed 11/11, shard
+tests passed 9/9, and workflow lint, shell syntax and Zig formatting passed.
+
+Owner admission now preserves the request's deadline, executor clock and
+cancellation through ordinary lookup and lease acquisition. Descriptor reads
+translate the remaining budget into the catalog clock once, share that absolute
+deadline across eventual and authoritative captures, and check cancellation
+between captures and before owner admission. Budgeted misses cannot fall back
+to an unbounded administrative snapshot. Deterministic regressions use distinct
+clock epochs and consume time or cancel during the first capture, proving that
+confirmation neither renews the budget nor runs after expiry/cancellation.
+
+The post-main smoke also exposed a shared metadata availability defect: initial
+FK creation wrote its physical table before publishing the logical binding,
+leaving a bound table in the legacy-only listing. Listing then failed with
+`InvalidDerivedCatalogIndex`, so merge and rewrite recovery could not reach the
+injected owner fault. Every binding writer now uses one transaction helper that
+removes newly bound tables from that derived listing. This performs point updates
+per changed binding, without a catalog sweep. The initial-FK regression checks
+the public listing and absence of legacy aliases; 20 admission/placement tests
+and 146 catalog persistence tests passed. The FK fixture also resolves its table
+from the immutable ID retained at creation, rather than diagnostic display-name
+annotations that are allowed to be absent.
+
+The restore corpus benchmark uses a checked allocator without per-allocation
+stack traces, while ordinary correctness fixtures keep the testing allocator.
+Debug safety, leak checks and the original 30-second deadline remain enabled.
+All 10 staged restore regressions passed; native and portable 768-row benchmark
+work completed in 1.3–1.4 seconds locally. This removes allocator instrumentation
+overhead from the fixture; it is not a measured production latency improvement.
+
+## 2026-09-29: Autograph and metadata recovery signatures (#919)
+
+[Run 36609343247](https://github.com/antflydb/antfly/actions/runs/36609343247)
+reported a live provisional event beside its canonical event, a snapshot-owner
+merge recovery failure, and an incomplete publication-reply-loss dependency
+cohort. Metadata WAL commits reached 12,339 ms for 41 bytes. The local baseline
+at the run's main revision passed four repetitions of each selector; it did not
+reproduce that physical sync delay. See `../FLAKES.md` for the durability and
+promotion-intent regressions and the limits of the root-cause evidence.
+
+Use the existing bounded supervisor with a frozen CPU executable named `antfly`:
+
+```sh
+SKIP_BUILD=1 ANTFLY_BIN=/absolute/path/to/bin/antfly \
+ANTFLY_E2E_REGRESSION_WORKERS=4 ANTFLY_E2E_REGRESSION_REPEATS=50 \
+ANTFLY_E2E_REGRESSION_REPORT_DIR=/tmp/issue919-soak \
+scripts/ci/zig-e2e-regression-loop.sh \
+  e2e/antfly/test_autoschema.py::test_label_routed_autograph_promotes_events_and_entities \
+  'e2e/antfly/test_online_merge_recovery.py::test_online_fk_merge_preserves_shadow_claims_and_retained_references[snapshot-owner]' \
+  'e2e/antfly/test_relational_integrity_recovery.py::test_schema_rewrite_recovers_dependency_cohort[publication-reply_loss]'
+```
+
+This runs 200 invocations per selector and retains one XML report per invocation
+plus bounded failure roots. Sandbox attempts that cannot bind fixture ports
+are infrastructure errors and must not be counted as completed invocations.
+
+The recovery scenarios emit JSON `E2E phase` milestones when
+`ANTFLY_E2E_PHASE_TIMINGS=1` (enabled by the regression loop). `seconds` measures
+wall time since the previous milestone, including requests and polling sleeps;
+`elapsed_seconds` measures time since the test body started. Pytest's
+`--durations=10` separately reports fixture setup and teardown. `E2E observation`
+records publication-job or merge-phase changes without resetting the phase
+clock. These diagnostics do not change deadlines, retry policy, or assertions.
+
+For a short profile, use the same command with one worker, three repeats, and a
+new report directory. Compare topology/constraint readiness, corpus seeding,
+fault recovery, publication completion, and final reads/claim/cascade checks.
+Runs overlapping another soak measure contention as well as scenario latency;
+repeat without competing workers before attributing a delay to production.
+
+A three-repeat profile of each recovery selector against the frozen Debug
+binary, alongside the four-worker soak, passed all six invocations. Schema
+rewrite spent 16.3–20.4 seconds waiting for cohort publication after reply loss
+and 6.4–10.6 seconds checking the two tables' replicated topology. FK merge spent
+5.4–8.2 seconds waiting for the donor successor, 9.5–11.4 seconds completing the
+merge after restart, and 9.1–13.7 seconds independently probing all 47 UNIQUE
+claims with three workers. These identify phases to investigate, not the exact
+server-side cause of the delay or unloaded latency.
+
 ## 2026-09-27: PR #885 recovery-2 write and restore stalls
 
 [PR #885 run 36345949010](https://github.com/antflydb/antfly/actions/runs/36345949010)
@@ -1772,8 +2032,8 @@ in `.worktrees/fix-metadata-backup-create-flake`:
 Build and correctness commands, from `zig/`:
 
 ```sh
-python3 tools/run_bounded_zig_build.py --zig zig -- build antfly -Doptimize=Debug -fincremental
-python3 tools/run_bounded_zig_build.py --zig zig -- build lib-metadata-test -Doptimize=Debug -- metadata.service.
+python3 tools/run_bounded_zig_build.py --zig zig -- build antfly -Doptimize=debug -fincremental
+python3 tools/run_bounded_zig_build.py --zig zig -- build lib-metadata-test -Doptimize=debug -- metadata.service.
 ```
 
 Final original-cadence soak, from the worktree root (the initial 30-run batch

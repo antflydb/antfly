@@ -142,7 +142,7 @@ const ExclusiveDecisions = struct {
     allocator: std.mem.Allocator,
     fields: []FieldDecision,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.fields) |field| {
             self.allocator.free(field.chosen);
             self.allocator.free(field.owners);
@@ -258,7 +258,7 @@ const RecordScratch = struct {
         return .{ .allocator = allocator, .values = values, .fields = fields, .probabilities = probabilities, .key_spans = key_spans };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.allocator.free(self.key_spans);
         self.allocator.free(self.probabilities);
         self.allocator.free(self.fields);

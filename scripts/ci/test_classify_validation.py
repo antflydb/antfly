@@ -43,7 +43,7 @@ class ClassifyValidationTests(unittest.TestCase):
             "py/packages/embedded/src/antfly_embedded/_database.py",
             "rs/crates/embedded/src/lib.rs",
             "rs/crates/embedded-sys/src/lib.rs",
-            "zig/pkg/antfly/capi-conformance/cases/open_modes.json",
+            "zig/pkg/antfly-embedded/capi-conformance/cases/open_modes.json",
         ):
             with self.subTest(path=path):
                 self.assertTrue(classify([path])["sdk"])

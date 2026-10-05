@@ -19,9 +19,9 @@
 //! but does not cancel an execution that already loaded the resource.
 const std = @import("std");
 const transactions = @import("transactions.zig");
-const catalog = @import("../sql/catalog.zig");
-const ast = @import("../sql/ast.zig");
-const Budget = @import("../sql/memory_budget.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
+const Budget = @import("antfly_local_sources").sql_memory_budget;
 const connection_record = @import("sql_connection_record.zig");
 
 const key = "\x00sql-prepared-v1";
@@ -308,7 +308,7 @@ pub fn discardConnectionTxn(txn: anytype, alloc: std.mem.Allocator, connection_i
 
 test "SQL prepared durable directory preserves ownership expiry admission and loaded execution" {
     const alloc = std.testing.allocator;
-    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var native = try backend.runtimeStore(alloc, .{ .name = "prepared-test" });
     defer native.deinit();
@@ -369,7 +369,7 @@ test "SQL prepared manifest rejects rebinding and preserves logical aliases" {
 
 test "SQL prepared resource survives native store restart and transaction cleanup" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("sql-prepared-restart");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-prepared-restart");
     defer directory.cleanup();
     var resource: Resource = .{ .id = @splat('a'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 1000, .database = "app", .namespace = "public", .statement = "SELECT 1", .setting_epoch = 9, .parameter_types = &.{}, .bindings = &.{} };
     {

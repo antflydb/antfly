@@ -17,19 +17,19 @@
 
 const std = @import("std");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const batch_api = @import("batch.zig");
+const batch_api = @import("antfly_local_sources").api_batch;
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const internal_keys = @import("../storage/internal_keys.zig");
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const raft_mod = @import("../raft/mod.zig");
-const table_reads = @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
-const query_api = @import("query.zig");
-const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
+const query_api = @import("antfly_local_sources").api_query;
+const runtime_preflight = @import("antfly_local_sources").storage_db_runtime_preflight;
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -126,15 +126,15 @@ fn validatePrivateMergeSourceRollback(group_id: u64, input: db_mod.types.BatchRe
         control.receiver_group_id == 0 or control.receiver_group_id == group_id)
         return error.InvalidArgument;
     const empty: db_mod.types.BatchRequest = .{};
-    inline for (std.meta.fields(db_mod.types.BatchRequest)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "merge_source_transition") and
-            !std.mem.eql(u8, field.name, "timestamp_ns") and
-            !std.mem.eql(u8, field.name, "sync_level"))
+    inline for (@typeInfo(db_mod.types.BatchRequest).@"struct".field_names, @typeInfo(db_mod.types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "merge_source_transition") and
+            !std.mem.eql(u8, reflected_name, "timestamp_ns") and
+            !std.mem.eql(u8, reflected_name, "sync_level"))
         {
-            const value = @field(input, field.name);
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+            const value = @field(input, reflected_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (value.len != 0) return error.InvalidArgument;
-            } else if (!std.meta.eql(value, @field(empty, field.name))) return error.InvalidArgument;
+            } else if (!std.meta.eql(value, @field(empty, reflected_name))) return error.InvalidArgument;
         }
     }
 }
@@ -156,7 +156,7 @@ pub const RoutedRaftBatchWriter = struct {
             operation.RequestContext,
         ) anyerror!?void,
     };
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
     pub fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, request: operation.RequestContext) !?void {
         // The data runtime supplies this callback to the separately compiled
@@ -169,7 +169,7 @@ pub const BatchValidator = struct {
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.BatchWrite) anyerror!void,
 
-    fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+    pub fn validate(self: BatchValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
         return self.validate_fn(self.ptr, request, table_name, writes);
     }
 };
@@ -178,7 +178,7 @@ pub const TxnValidator = struct {
     ptr: *anyopaque,
     validate_fn: *const fn (*anyopaque, operation.RequestContext, []const u8, []const db_mod.types.TransactionWrite) anyerror!void,
 
-    fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
+    pub fn validate(self: TxnValidator, request: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.TransactionWrite) !void {
         return self.validate_fn(self.ptr, request, table_name, writes);
     }
 };
@@ -551,7 +551,7 @@ pub const Operations = struct {
             try validatePrivateMergeSourceRollback(group_id, input);
             break :rollback .relational_topology;
         } else if (input.online_source) |control| source: {
-            @import("../storage/db/online_source_contract.zig").validateRequest(input) catch return error.InvalidArgument;
+            @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(input) catch return error.InvalidArgument;
             if (control.scope().fence.owner_group_id != group_id) return error.InvalidArgument;
             // Source retention uses the same private exact-owner authority as
             // topology lifecycle commands; it never grants public row writes.
@@ -1060,7 +1060,7 @@ pub const Operations = struct {
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
             if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "online_source_status")) {
-                const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("../storage/db/online_source_contract.zig").Scope };
+                const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope };
                 var scoped = std.json.parseFromSlice(StatusRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 scoped.value.scope.validate() catch return error.InvalidArgument;
@@ -1436,7 +1436,7 @@ const DocumentArtifactChildKeyPrefixes = struct {
     unit: []u8,
     chunk: []u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.unit);
         alloc.free(self.chunk);
         self.* = undefined;
@@ -1505,7 +1505,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.failure;
                 }
-                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                pub fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
             };
             var source = Source{ .failure = error.UnexpectedTestCall };
             const operations = Operations{
@@ -1515,12 +1515,12 @@ fn consumerTests() type {
                 .txn_validator = .{ .ptr = &source, .validate_fn = Source.validate },
             };
             const errors = @import("relational_integrity_errors.zig");
-            inline for (@typeInfo(errors.Error).error_set.?) |field| {
-                source.failure = @field(errors.Error, field.name);
+            inline for (@typeInfo(errors.Error).error_set.error_names.?) |field| {
+                source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-                source.failure = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+                source.failure = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
         }
@@ -1677,7 +1677,7 @@ fn consumerTests() type {
             };
 
             const Validator = struct {
-                fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+                pub fn validate(_: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
             };
 
             const operations = Operations{
@@ -1686,7 +1686,7 @@ fn consumerTests() type {
                 .writes = Source.iface(),
                 .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
             };
-            const txn_id = [_]u8{0x42} ** 16;
+            const txn_id = @as([16]u8, @splat(0x42));
             try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
                 std.testing.allocator,
                 .{},
@@ -1703,7 +1703,7 @@ fn consumerTests() type {
             ));
 
             const AdmissionValidator = struct {
-                fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
+                pub fn validate(ptr: *anyopaque, _: operation.RequestContext, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {
                     const failure: *const anyerror = @ptrCast(@alignCast(ptr));
                     return failure.*;
                 }
@@ -1815,7 +1815,7 @@ fn consumerTests() type {
                 saw_unfenced_transaction: bool = false,
                 saw_unfenced_source: bool = false,
 
-                fn validate(ptr: *anyopaque, _: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
+                pub fn validate(ptr: *anyopaque, _: operation.RequestContext, table_name: []const u8, writes: []const db_mod.types.BatchWrite) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.validation_error) |err| return err;
                     try std.testing.expectEqualStrings("documents", table_name);
@@ -1956,7 +1956,7 @@ fn consumerTests() type {
             ));
             try std.testing.expectEqual(@as(usize, 4), state.calls);
 
-            const txn_id = [_]u8{7} ** 16;
+            const txn_id = @as([16]u8, @splat(7));
             const transaction_participants = [_][]const u8{"table:documents:group:17"};
             _ = try operations.routedBatch(
                 std.testing.allocator,
@@ -2332,7 +2332,7 @@ fn consumerTests() type {
                     return null;
                 }
 
-                fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?@import("query.zig").QueryResponse {
+                fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_query.QueryResponse {
                     return null;
                 }
 

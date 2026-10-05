@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const sparse_types = @import("types.zig");
-const bounded_decode = @import("../bounded_decode.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 
 pub const DecodeLimits = bounded_decode.Limits;
 
@@ -150,7 +150,7 @@ fn encodedSizes(segment: sparse_types.Segment) !EncodedSizes {
 }
 
 test "lake sparse segment codec rejects forged counts before allocation" {
-    var payload = [_]u8{0} ** header_len;
+    var payload = @as([header_len]u8, @splat(0));
     std.mem.writeInt(u32, payload[0..4], std.math.maxInt(u32), .little);
     try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(std.testing.allocator, &payload));
 }

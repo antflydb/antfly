@@ -213,7 +213,7 @@ const RepairLookup = struct {
         }
         return out;
     }
-    fn deinit(self: *RepairLookup, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *RepairLookup, alloc: std.mem.Allocator) void {
         self.groups.deinit(alloc);
         self.exact.deinit(alloc);
         self.names.deinit(alloc);
@@ -630,15 +630,15 @@ fn runtimeEnrichmentStatusEqual(
     lhs: table_manager.RuntimeEnrichmentStatusReport,
     rhs: table_manager.RuntimeEnrichmentStatusReport,
 ) bool {
-    inline for (std.meta.fields(table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status") or
-            std.mem.eql(u8, field.name, "stall_reason") or
-            std.mem.eql(u8, field.name, "active_phase") or
-            std.mem.eql(u8, field.name, "active_model") or
-            std.mem.eql(u8, field.name, "active_backend"))
+    inline for (comptime std.meta.fieldNames(table_manager.RuntimeEnrichmentStatusReport)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "projection_checkpoint_status") or
+            std.mem.eql(u8, reflected_name, "stall_reason") or
+            std.mem.eql(u8, reflected_name, "active_phase") or
+            std.mem.eql(u8, reflected_name, "active_model") or
+            std.mem.eql(u8, reflected_name, "active_backend"))
         {
-            if (!std.mem.eql(u8, @field(lhs, field.name), @field(rhs, field.name))) return false;
-        } else if (@field(lhs, field.name) != @field(rhs, field.name)) {
+            if (!std.mem.eql(u8, @field(lhs, reflected_name), @field(rhs, reflected_name))) return false;
+        } else if (@field(lhs, reflected_name) != @field(rhs, reflected_name)) {
             return false;
         }
     }

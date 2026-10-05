@@ -14,13 +14,13 @@
 // limitations.
 
 //! Hot standby integration for local restore_staging mutations.
-const engine = @import("../db/restore_staging.zig");
+const engine = @import("antfly_local_sources").storage_db_restore_staging;
 const OwnerBootstrap = engine.OwnerBootstrap;
 const Phase = engine.Phase;
 const Scope = engine.Scope;
 const digest = engine.digest;
 const key = engine.key;
-const replication_ingress = @import("../db/replication_ingress.zig");
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const std = @import("std");
 
 const hot_standby_publisher_adapter = @import("db_commit.zig");
@@ -28,8 +28,8 @@ const hot_standby_publisher_adapter = @import("db_commit.zig");
 test "relational integrity restore staging Raft controls retain HA append obligations and replay original import timestamps" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const primary_mod = @import("primary.zig");
-    const effects = @import("../db/replication_effects.zig");
-    const types = @import("../db/types.zig");
+    const effects = @import("antfly_local_sources").storage_db_replication_effects;
+    const types = @import("antfly_local_sources").storage_db_types;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -73,7 +73,7 @@ test "relational integrity restore staging Raft controls retain HA append obliga
         defer replica.close();
         try target.setSchemaJson(alloc, "{}");
         try replica.setSchemaJson(alloc, "{}");
-        const schema = try @import("../schema.zig").serializeSchema(owned, target.core.schema orelse .{});
+        const schema = try @import("antfly_local_sources").storage_schema.serializeSchema(owned, target.core.schema orelse .{});
         const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = source_options.identity_namespace.?, .target_namespace = target_options.identity_namespace.?, .target_schema_digest = digest(schema) };
         try target.reserveRestoreStagingScoped(alloc, scope);
         try replica.reserveRestoreStagingScoped(alloc, scope);
@@ -88,12 +88,11 @@ test "relational integrity restore staging Raft controls retain HA append obliga
             defer stored_bootstrap.deinit();
             try std.testing.expectEqualStrings("docs", stored_bootstrap.value.table_name);
         }
-        target.local_execution.replication_async_batch_mirror = .{
-            .publisher = hot_standby_publisher_adapter.bind(&primary),
+        target.local_execution.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
             .sync_policy = .{ .mode = if (synchronous) .remote_write else .async, .standby_names = &.{"standby"}, .failure_policy = .block },
             .sync_wait_ctx = &ack,
             .sync_wait_fn = Ack.wait,
-        };
+        });
         const begin: types.BatchRequest = .{ .restore_staging = .{ .begin = scope } };
         if (synchronous) {
             try std.testing.expectError(error.InjectedRestoreMirrorWaitFailure, @import("../server_db_adapter.zig").applyOrdered(&target, begin, .{ .term = 1, .index = 1 }));

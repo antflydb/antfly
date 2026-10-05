@@ -125,7 +125,7 @@ fn runWithFlags(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     return listTablesMode(allocator, io, client, if (output != null) .json else .summary);
 }
 
-fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     var shards: ?i64 = null;
     var file_path: ?[]const u8 = null;
@@ -210,7 +210,7 @@ fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
     std.debug.print("Create table command successful.\n", .{});
 }
 
-fn dropTable(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn dropTable(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -225,7 +225,7 @@ fn dropTable(client: *antfly_client.AntflyClient, args: *std.process.Args.Iterat
     std.debug.print("Drop table command successful.\n", .{});
 }
 
-fn listTables(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+pub fn listTables(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
     return listTablesMode(allocator, io, client, .summary);
 }
 
@@ -277,7 +277,7 @@ fn listTablesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     }
 }
 
-fn getTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn getTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {

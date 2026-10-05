@@ -320,21 +320,21 @@ const AdminOperation = struct {
 
 fn adminOperationForAction(alloc: Allocator, action: Action) !AdminOperation {
     return switch (action.kind) {
-        .create_slot => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_replication_slots) },
+        .create_slot => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_replication_slots) },
         .resume_slot => try slotAdminOperation(alloc, action, "PUT", "resume"),
         .pause_slot => try slotAdminOperation(alloc, action, "PUT", "pause"),
         .drop_slot => try slotAdminOperation(alloc, action, "DELETE", null),
         .seed_standby,
         .mark_reseed,
-        => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_base_backups) },
-        .finish_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_base_backups_finish) },
-        .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_standby_bootstrap) },
-        .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_fence) },
-        .assess_promotion => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_promotion_assess) },
-        .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_promotion_current_fence) },
-        .demote_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_assess) },
-        .rewind_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_rewind) },
-        .reseed_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.ha_rejoin_reseed) },
+        => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_base_backups) },
+        .finish_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_base_backups_finish) },
+        .bootstrap_standby_seed => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_standby_bootstrap) },
+        .acquire_fence => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_fence) },
+        .assess_promotion => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_promotion_assess) },
+        .promote_standby => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_promotion_current_fence) },
+        .demote_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_rejoin_assess) },
+        .rewind_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_rejoin_rewind) },
+        .reseed_former_primary => .{ .method = "POST", .path = try alloc.dupe(u8, admin_api.routes.hot_standby_rejoin_reseed) },
         .update_primary_endpoint => .{},
     };
 }
@@ -1174,9 +1174,9 @@ test "storage.hot_standby operator plans slots and standby bootstrap" {
     try std.testing.expectEqual(@as(?ActionKind, null), plan.actions[0].depends_on);
     try std.testing.expectEqual(@as(?ActionKind, .create_slot), plan.actions[1].depends_on);
     try std.testing.expectEqualStrings("POST", plan.actions[0].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_replication_slots, plan.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_replication_slots, plan.actions[0].admin_path.?);
     try std.testing.expectEqualStrings("POST", plan.actions[1].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_base_backups, plan.actions[1].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_base_backups, plan.actions[1].admin_path.?);
     try std.testing.expectEqualStrings("SlotMissing", plan.actions[0].reason);
     try std.testing.expectEqualStrings("StandbyNeedsBaseBackup", plan.actions[1].reason);
     try std.testing.expectEqual(@as(usize, 1), plan.desired_standby_count);
@@ -1238,9 +1238,9 @@ test "storage.hot_standby operator plans seed finish and bootstrap with manifest
     try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", plan.actions[2].admin_url.?);
     try std.testing.expectEqualStrings("http://standby-a-ha.default.svc:8081", plan.actions[3].admin_url.?);
     try std.testing.expectEqualStrings("POST", plan.actions[2].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_base_backups_finish, plan.actions[2].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_base_backups_finish, plan.actions[2].admin_path.?);
     try std.testing.expectEqualStrings("POST", plan.actions[3].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_standby_bootstrap, plan.actions[3].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_standby_bootstrap, plan.actions[3].admin_path.?);
 
     var finish = (try adminCommandForAction(alloc, plan.actions[2], primary.identity, .{})) orelse return error.TestExpectedEqual;
     defer finish.deinit(alloc);
@@ -2004,15 +2004,15 @@ test "storage.hot_standby operator gates automatic promotion on fencing and caug
     try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[3].admin_url);
     try std.testing.expectEqualStrings("http://primary-ha.default.svc:8081", safe.actions[4].admin_url.?);
     try std.testing.expectEqualStrings("POST", safe.actions[0].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_fence, safe.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_fence, safe.actions[0].admin_path.?);
     try std.testing.expectEqualStrings("POST", safe.actions[1].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_promotion_assess, safe.actions[1].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_promotion_assess, safe.actions[1].admin_path.?);
     try std.testing.expectEqualStrings("POST", safe.actions[2].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_promotion_current_fence, safe.actions[2].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_promotion_current_fence, safe.actions[2].admin_path.?);
     try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[3].admin_method);
     try std.testing.expectEqual(@as(?[]const u8, null), safe.actions[3].admin_path);
     try std.testing.expectEqualStrings("POST", safe.actions[4].admin_method.?);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_rejoin_assess, safe.actions[4].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_rejoin_assess, safe.actions[4].admin_path.?);
     for (safe.actions) |action| {
         const precondition = action.fencing_precondition orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(FencingAuthority.kubernetes_lease, precondition.authority);
@@ -2114,13 +2114,13 @@ test "storage.hot_standby operator renders versioned json plan for controllers" 
     try expectContains(rendered, "\"executor\":\"admin_api\"");
     try expectContains(rendered, "\"admin_url\":\"http://standby-a-ha.default.svc:8081\"");
     try expectContains(rendered, "\"admin_method\":\"POST\"");
-    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.ha_fence ++ "\"");
+    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.hot_standby_fence ++ "\"");
     try expectContains(rendered, "\"kind\":\"assess_promotion\"");
-    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.ha_promotion_assess ++ "\"");
-    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.ha_promotion_current_fence ++ "\"");
+    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.hot_standby_promotion_assess ++ "\"");
+    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.hot_standby_promotion_current_fence ++ "\"");
     try expectContains(rendered, "\"executor\":\"controller_action\"");
     try expectContains(rendered, "\"admin_url\":\"http://primary-ha.default.svc:8081\"");
-    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.ha_rejoin_assess ++ "\"");
+    try expectContains(rendered, "\"admin_path\":\"" ++ admin_api.routes.hot_standby_rejoin_assess ++ "\"");
     try expectContains(rendered, "\"route_from\":\"primary-a\"");
     try expectContains(rendered, "\"route_to\":\"standby-a\"");
     try expectContains(rendered, "\"fencing_precondition\"");
@@ -2419,7 +2419,7 @@ test "storage.hot_standby operator plans former primary rewind or reseed from fe
     try std.testing.expectEqual(rejoin.Action.rewind, rewind.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.rewind_former_primary, rewind.actions[0].kind);
     try std.testing.expectEqual(ActionPhase.rejoin, rewind.actions[0].phase);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_rejoin_rewind, rewind.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_rejoin_rewind, rewind.actions[0].admin_path.?);
     try std.testing.expectEqual(@as(?u64, 10), rewind.actions[0].target_lsn);
     const rewind_fence = rewind.actions[0].fencing_precondition orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(FencingAuthority.kubernetes_lease, rewind_fence.authority);
@@ -2472,7 +2472,7 @@ test "storage.hot_standby operator plans former primary rewind or reseed from fe
     defer reseed.deinit(alloc);
     try std.testing.expectEqual(rejoin.Action.reseed, reseed.former_primary_assessment.?.action);
     try std.testing.expectEqual(ActionKind.reseed_former_primary, reseed.actions[0].kind);
-    try std.testing.expectEqualStrings(admin_api.routes.ha_rejoin_reseed, reseed.actions[0].admin_path.?);
+    try std.testing.expectEqualStrings(admin_api.routes.hot_standby_rejoin_reseed, reseed.actions[0].admin_path.?);
     try std.testing.expectEqualStrings("FormerPrimaryRequiresReseed", reseed.actions[0].reason);
     const reseed_fence = reseed.actions[0].fencing_precondition orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(FencingAuthority.kubernetes_lease, reseed_fence.authority);

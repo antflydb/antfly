@@ -80,13 +80,13 @@ fn users(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antfly
     cli.fatal("unknown auth users subcommand: {s}", .{sub});
 }
 
-fn listUsers(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+pub fn listUsers(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
     var resp = try client.inner.listUsers();
     defer resp.deinit();
     try printResponse(allocator, io, &resp);
 }
 
-fn createUser(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn createUser(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const username = args.next() orelse cli.fatal("username is required", .{});
     var password: ?[]const u8 = null;
     var file: ?[]const u8 = null;

@@ -110,7 +110,7 @@ const Weights = struct {
     cb: *const ops.ComputeBackend,
     inputs: []interpreter.RuntimeInput,
     wrt: []ml.NodeId,
-    fn deinit(self: *Weights) void {
+    pub fn deinit(self: *Weights) void {
         for (self.inputs) |input| self.cb.free(input.value);
         self.allocator.free(self.inputs);
         self.allocator.free(self.wrt);
@@ -287,7 +287,7 @@ const Teacher = struct {
         }
         return result;
     }
-    fn deinit(self: *Teacher, a: Allocator) void {
+    pub fn deinit(self: *Teacher, a: Allocator) void {
         for (self.values) |values| a.free(values);
     }
     fn context(self: *const Teacher, microbatch: u64) step.StepContext {

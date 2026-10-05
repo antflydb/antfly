@@ -3161,7 +3161,7 @@ const CachedSelfTensor = struct {
     tensor: CT,
     owned_view: bool = false,
 
-    fn deinit(self: CachedSelfTensor, cb: *const ComputeBackend) void {
+    pub fn deinit(self: CachedSelfTensor, cb: *const ComputeBackend) void {
         if (self.owned_view) cb.free(self.tensor);
     }
 };

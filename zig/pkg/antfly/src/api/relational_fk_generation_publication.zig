@@ -1,26 +1,26 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Private parent-owner FK generation publication boundary. The request is
 //! only an identity/probe; the receiving owner must fetch its own exact,
 //! linearizable metadata decision before proposing a replicated transition.
 const std = @import("std");
-const operation = @import("operation.zig");
-const callback_abi = @import("../runtime_callback_abi.zig");
-const integrity = @import("../storage/db/relational_integrity_contract.zig");
-const identity = @import("../storage/db/doc_identity_namespace.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
+const integrity = @import("antfly_local_sources").storage_db_relational_integrity_contract;
+const identity = @import("antfly_local_sources").storage_db_doc_identity_namespace;
 
 pub const Action = enum { stage, activate, acknowledge, cancel };
 
@@ -371,7 +371,7 @@ test "initial FK child receipt binds hidden owner and empty state" {
 }
 
 test "FK generation schema Raft command keeps canonical JSON bytes on wire" {
-    const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
     const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
     const command: topology.Command = .{
         .action = .install_child_schema,

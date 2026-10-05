@@ -103,7 +103,7 @@ pub const CleanupResult = struct {
 const Cluster = struct {
     indices: std.ArrayListUnmanaged(usize) = .empty,
 
-    fn deinit(self: *Cluster, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Cluster, allocator: std.mem.Allocator) void {
         self.indices.deinit(allocator);
     }
 };

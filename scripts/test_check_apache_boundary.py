@@ -32,11 +32,16 @@ class ApacheBoundaryTests(unittest.TestCase):
         self.assertIn("storage/metadata_hot_standby_port.zig", owners)
         for owner in owners:
             with self.subTest(owner=owner):
-                self.assertEqual("elv2", boundary.group_for(boundary.SOURCE_ROOT + owner, "all"))
+                self.assertEqual(
+                    "elv2",
+                    boundary.group_for(boundary.SERVER_SOURCE_ROOT + owner, "all"),
+                )
 
     def test_production_closure_excludes_explicit_server_test_owners(self):
-        _, errors = self.check_fixture('test "server integration" { _ = @import("main.zig"); }\n'
-            'const fixture = if (builtin.is_test) @import("main.zig") else struct {};')
+        _, errors = self.check_fixture(
+            'test "server integration" { _ = @import("main.zig"); }\n'
+            'const fixture = if (builtin.is_test) @import("main.zig") else struct {};'
+        )
         self.assertEqual(errors, [])
         _, errors = self.check_fixture('fn lazy() void { _ = @import("main.zig"); }')
         self.assertTrue(any("non-Apache dependency" in error for error in errors))
@@ -46,10 +51,15 @@ class ApacheBoundaryTests(unittest.TestCase):
             root = Path(directory)
             path = root / boundary.SOURCE_ROOT / "lite_main.zig"
             path.parent.mkdir(parents=True)
+            source = source.replace('"main.zig"', '"../../../antfly/src/main.zig"')
+            source = source.replace("../antfarm/", "../../../antfly/antfarm/")
+            source = source.replace("../../../lib/", "../../../../lib/")
             path.write_text(source)
-            (path.parent / "main.zig").write_text("")
+            server = root / boundary.SERVER_SOURCE_ROOT / "main.zig"
+            server.parent.mkdir(parents=True, exist_ok=True)
+            server.write_text("")
             wrapper = root / "zig/pkg/antfly-embedded/src/root.zig"
-            wrapper.parent.mkdir(parents=True)
+            wrapper.parent.mkdir(parents=True, exist_ok=True)
             wrapper.write_text("")
             for name, content in (files or {}).items():
                 dependency = root / name
@@ -214,7 +224,12 @@ class ApacheBoundaryTests(unittest.TestCase):
         self.assertTrue(any("unreviewed module" in error for error in errors))
 
     def test_rejects_server_only_generated_api(self):
-        for module in ("antfly_admin_openapi", "antfly_metadata_server_openapi", "antfly_usermgr_server_openapi", "antfly_public_server_openapi"):
+        for module in (
+            "antfly_admin_openapi",
+            "antfly_metadata_server_openapi",
+            "antfly_usermgr_server_openapi",
+            "antfly_public_server_openapi",
+        ):
             with self.subTest(module=module):
                 _, errors = self.check_fixture(
                     f'const server = @import("{module}");',
@@ -223,7 +238,10 @@ class ApacheBoundaryTests(unittest.TestCase):
                     },
                 )
                 self.assertTrue(
-                    any("embedded product imports server-only API" in error for error in errors)
+                    any(
+                        "embedded product imports server-only API" in error
+                        for error in errors
+                    )
                 )
 
     def test_rejects_server_import_inside_shared_module(self):
@@ -302,18 +320,15 @@ class ApacheBoundaryTests(unittest.TestCase):
                 any("source outside product tree" in error for error in errors)
             )
 
-    def test_focused_inference_entrypoint_is_checked(self):
-        self.assertIn("runtime_inference_main.zig", boundary.ENTRYPOINTS)
+    def test_independent_inference_entrypoint_is_checked(self):
+        self.assertIn("zig/pkg/inference/src/main.zig", boundary.PACKAGE_ENTRYPOINTS)
         self.assertEqual(
-            "apache",
-            boundary.group_for(
-                boundary.SOURCE_ROOT + "runtime_inference_main.zig", "all"
-            ),
+            "apache", boundary.group_for("zig/pkg/inference/src/main.zig", "all")
         )
         self.assertEqual(
             "elv2",
             boundary.group_for(
-                boundary.SOURCE_ROOT + "runtime_artifact_main.zig", "all"
+                boundary.SERVER_SOURCE_ROOT + "runtime_artifact_main.zig", "all"
             ),
         )
 

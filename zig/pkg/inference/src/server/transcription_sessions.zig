@@ -449,7 +449,7 @@ test "registry caps audio buffered across sessions" {
     var b = try registry.create(allocator, .{ .id = testId(2), .model = "m", .now_wall_s = 0, .now_mono_ns = 0, .io = std.testing.io });
     defer b.deinit(allocator);
 
-    const silence = [_]f32{0} ** 16_000;
+    const silence = @as([16_000]f32, @splat(0));
     const entry_a = try registry.acquire(&a.id, 1, std.testing.io);
     try std.testing.expect(registry.canBuffer(entry_a, 1000));
     try std.testing.expect(!registry.canBuffer(entry_a, 1001));

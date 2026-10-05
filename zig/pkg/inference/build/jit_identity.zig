@@ -35,7 +35,7 @@ pub fn create(b: *std.Build, root: std.Build.LazyPath, metal: bool, cuda: bool) 
         .root_module = b.createModule(.{
             .root_source_file = root.path(b, "tools/jit_identity.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     return .{
@@ -47,10 +47,10 @@ pub fn create(b: *std.Build, root: std.Build.LazyPath, metal: bool, cuda: bool) 
 fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, backend: enum { metal, cuda }) *std.Build.Module {
     const run = b.addRunArtifact(tool);
     run.addArg("baseline");
-    run.addFileArg(root.path(b, switch (backend) {
+    run.addFileArg2(root.path(b, switch (backend) {
         .metal => "src/backends/metal_kernels.m",
         .cuda => "src/ops/cuda/artifacts/inference_cuda_kernels.cu",
-    }));
+    }), .{ .make_absolute = true });
     run.addArg("qualification");
     const qualification: []const []const u8 = switch (backend) {
         .metal => &.{
@@ -72,7 +72,7 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
         },
     };
     run.addArg(b.fmt("{d}", .{qualification.len}));
-    for (qualification) |path| run.addFileArg(root.path(b, path));
+    for (qualification) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     if (backend == .cuda) {
         run.addArgs(&.{ "dispatch", "4" });
         for ([_][]const u8{
@@ -80,8 +80,8 @@ fn add(b: *std.Build, tool: *std.Build.Step.Compile, root: std.Build.LazyPath, b
             "src/graph/quant_kernel_compiler.zig",
             "src/graph/quant_matmul.zig",
             "src/gguf/tensor_types.zig",
-        }) |path| run.addFileArg(root.path(b, path));
+        }) |path| run.addFileArg2(root.path(b, path), .{ .make_absolute = true });
     }
     run.addArg("--output");
-    return b.createModule(.{ .root_source_file = run.addOutputFileArg(b.fmt("{s}_identity.zig", .{@tagName(backend)})) });
+    return b.createModule(.{ .root_source_file = run.addOutputFileArg2(b.fmt("{s}_identity.zig", .{@tagName(backend)}), .{ .make_absolute = true }) });
 }

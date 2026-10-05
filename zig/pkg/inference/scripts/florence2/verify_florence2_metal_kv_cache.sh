@@ -33,7 +33,7 @@ Environment overrides:
   ANTFLY_FLORENCE2_MAX_TOKENS        maximum generated tokens (default: 64)
   ANTFLY_FLORENCE2_WARMUP_ITERS      warmup reads per case (default: 1)
   ANTFLY_FLORENCE2_MEASURE_ITERS     measured reads per case (default: 3)
-  ANTFLY_FLORENCE2_OPTIMIZE          Zig optimization mode (default: ReleaseSafe)
+  ANTFLY_FLORENCE2_OPTIMIZE          Zig optimization mode (default: safe)
   ANTFLY_FLORENCE2_OUT_DIR           artifact directory (default: private temporary directory)
   ANTFLY_FLORENCE2_STRICT_RESIDENT   require resident Metal ops (default: 1)
   ANTFLY_FLORENCE2_MIN_KV_SPEEDUP    minimum full/cache p50 ratio (default: 1.05)
@@ -75,7 +75,7 @@ prompt="${ANTFLY_FLORENCE2_PROMPT:-<MORE_DETAILED_CAPTION>}"
 max_tokens="${ANTFLY_FLORENCE2_MAX_TOKENS:-64}"
 warmup_iters="${ANTFLY_FLORENCE2_WARMUP_ITERS:-1}"
 measure_iters="${ANTFLY_FLORENCE2_MEASURE_ITERS:-3}"
-optimize="${ANTFLY_FLORENCE2_OPTIMIZE:-ReleaseSafe}"
+optimize="${ANTFLY_FLORENCE2_OPTIMIZE:-safe}"
 strict_resident="${ANTFLY_FLORENCE2_STRICT_RESIDENT:-1}"
 min_kv_speedup="${ANTFLY_FLORENCE2_MIN_KV_SPEEDUP:-1.05}"
 out_dir="${ANTFLY_FLORENCE2_OUT_DIR:-}"

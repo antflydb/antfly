@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Report potential, analyzed, and emitted reachability in Antfly's Zig graph.
 
 The source graph follows literal relative ``@import("*.zig")`` edges. It makes
@@ -18,9 +33,9 @@ import json
 import re
 import struct
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
 
 SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parents[2]
@@ -399,7 +414,7 @@ def load_time_report(name: str, path: Path, repo_root: Path = REPO_ROOT) -> Time
     with path.open(encoding="utf-8") as source:
         raw = json.load(source)
     if not isinstance(raw, dict):
-        raise ValueError(f"time report is not a JSON object: {path}")
+        raise TypeError(f"time report is not a JSON object: {path}")
 
     file_values = raw.get("all_files")
     has_file_list = isinstance(file_values, list)
@@ -582,6 +597,11 @@ def source_group(path: Path, repo_root: Path = REPO_ROOT) -> str:
     parts = path.relative_to(repo_root).parts
     if parts[:4] == ("zig", "pkg", "antfly", "src") and len(parts) > 4:
         return f"zig/pkg/antfly/src/{parts[4]}"
+    if (
+        parts[:5] == ("zig", "pkg", "antfly-embedded", "src", "local")
+        and len(parts) > 5
+    ):
+        return f"zig/pkg/antfly-embedded/src/local/{parts[5]}"
     if parts[:2] == ("zig", "lib") and len(parts) > 2:
         return f"zig/lib/{parts[2]}"
     if parts[:2] == ("zig", "pkg") and len(parts) > 2:
@@ -1084,7 +1104,10 @@ def check_runtime_boundary(graph: ImportGraph) -> bool:
 def check_codegen_boundary(graph: ImportGraph) -> bool:
     clean = True
     for source_name, target_name in CODEGEN_BOUNDARIES:
-        if not (graph.source_root / source_name).is_file() or not (graph.source_root / target_name).is_file():
+        if (
+            not (graph.source_root / source_name).is_file()
+            or not (graph.source_root / target_name).is_file()
+        ):
             continue
         source = graph.resolve_source(source_name)
         target = graph.resolve_source(target_name)
@@ -1098,7 +1121,10 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
         print(f"codegen boundary violation: {rendered}", file=sys.stderr)
 
     for source_name, token in INFERENCE_ABI_FORBIDDEN_TOKENS:
-        if source_name == "standalone/inference_bridge.zig" and not (graph.source_root / source_name).is_file():
+        if (
+            source_name == "standalone/inference_bridge.zig"
+            and not (graph.source_root / source_name).is_file()
+        ):
             source = REPO_ROOT / "zig/pkg/inference/src/host/bridge.zig"
         elif not (graph.source_root / source_name).is_file():
             continue
@@ -1270,7 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             return 1
         return 0
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

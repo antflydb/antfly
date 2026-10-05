@@ -15,12 +15,12 @@
 
 //! Server transaction command validation, participant selection and acknowledgement policy.
 const std = @import("std");
-const db_mod = @import("db/mod.zig");
-const transactions_mod = @import("transactions.zig");
-const local_transaction_contract = @import("../api/local_transaction_contract.zig");
-const local_write = @import("local_write.zig");
+const db_mod = @import("antfly_local_sources").storage_db_mod;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const local_transaction_contract = @import("antfly_local_sources").api_local_transaction_contract;
+const local_write = @import("antfly_local_sources").storage_local_write;
 const validateTableBatchAgainstLocalSchema = local_write.validateTableBatchAgainstLocalSchema;
-const runTestBeforeBatchExecutionHook = @import("../api/local_write_test_hooks.zig").runTestBeforeBatchExecutionHook;
+const runTestBeforeBatchExecutionHook = @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook;
 const batchWritesAsTransactionWrites = local_write.batchWritesAsTransactionWrites;
 
 pub fn applyStorageKernelReplicatedBatch(
@@ -54,7 +54,7 @@ pub fn applyReplicatedTransactionMutationAtRaftEntry(
     table_name: []const u8,
     group_id: u64,
     req: db_mod.types.BatchRequest,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    raft_entry: db_mod.OrderedApplyReceipt,
 ) !void {
     try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
 }
@@ -66,10 +66,10 @@ pub fn applyReplicatedTransactionMutationInternal(
     group_id: u64,
     req: db_mod.types.BatchRequest,
     visibility_cancellation: db_mod.types.CancellationToken,
-    raft_entry: ?db_mod.RaftAppliedEntryIdentity,
+    raft_entry: ?db_mod.OrderedApplyReceipt,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
-    try @import("range_protection.zig").validateRequest(req);
+    try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
     if (req.relational_index_maintenance) |command| if (command.owner_group_id != group_id) return error.PreparedGenerationChanged;
     switch (mutation) {
         .begin => |begin| {
@@ -134,7 +134,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                 .relational_repair = req.relational_repair,
             };
             if (raft_entry) |entry|
-                try db.writeReplicatedTransactionAtRaftEntry(prepare.txn_id, intents, entry)
+                try db.writeReplicatedTransactionAtOrderedReceipt(prepare.txn_id, intents, entry)
             else
                 try db.writeTransaction(prepare.txn_id, intents);
         },
@@ -150,7 +150,7 @@ pub fn applyReplicatedTransactionMutationInternal(
                     transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
-                try db.resolveReplicatedTransactionAtRaftEntry(
+                try db.resolveReplicatedTransactionAtOrderedReceipt(
                     resolve.txn_id,
                     resolve.status,
                     resolve.commit_version,
@@ -180,7 +180,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             }
         },
         .acknowledge => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantResolvedAtRaftEntry(ack.txn_id, ack.participant, entry)
+            db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(ack.txn_id, ack.participant, entry)
         else
             db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
@@ -190,7 +190,7 @@ pub fn applyReplicatedTransactionMutationInternal(
             else => return err,
         },
         .acknowledge_many => |ack| (if (raft_entry) |entry|
-            db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(ack.txn_id, ack.participants, entry)
+            db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(ack.txn_id, ack.participants, entry)
         else
             db.markTransactionParticipantsResolved(ack.txn_id, ack.participants)) catch |err| switch (err) {
             transactions_mod.TxnError.TxnNotFound => {},
@@ -198,7 +198,7 @@ pub fn applyReplicatedTransactionMutationInternal(
         },
         .cleanup => |cleanup| {
             if (raft_entry) |entry|
-                _ = try db.cleanupReplicatedTransactionAtRaftEntry(
+                _ = try db.cleanupReplicatedTransactionAtOrderedReceipt(
                     cleanup.txn_id,
                     cleanup.cutoff_timestamp,
                     cleanup.retained_cutoff_timestamp,

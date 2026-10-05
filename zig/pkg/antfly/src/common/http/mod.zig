@@ -13,11 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const http_common = @import("http_common.zig");
+pub const http_common = @import("antfly_local_sources").common_http_http_common;
 pub const io_http_executor = @import("io_http_executor.zig");
-pub const peer_disconnect_observer = @import("peer_disconnect_observer.zig");
+pub const peer_disconnect_observer = @import("antfly_local_sources").common_http_peer_disconnect_observer;
 pub const std_http_executor = @import("std_http_executor.zig");
-pub const std_http_listener = @import("std_http_listener.zig");
+pub const std_http_listener = @import("antfly_local_sources").common_http_std_http_listener;
 
 pub const Header = http_common.Header;
 pub const HttpRequest = http_common.HttpRequest;

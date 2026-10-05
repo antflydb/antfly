@@ -220,7 +220,7 @@ const PackageCtx = struct {
         return self.cycles.fieldLeadsBack(sym.fqn, self.current_message_fqn);
     }
 
-    fn deinit(self: *PackageCtx) void {
+    pub fn deinit(self: *PackageCtx) void {
         self.imports.deinit(self.allocator);
     }
 };
@@ -240,7 +240,7 @@ const Cycles = struct {
     /// FQN → set of message FQNs reachable from it.
     reach: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)),
 
-    fn deinit(self: *Cycles) void {
+    pub fn deinit(self: *Cycles) void {
         var it = self.reach.valueIterator();
         while (it.next()) |set| set.deinit(self.allocator);
         self.reach.deinit(self.allocator);
@@ -758,10 +758,10 @@ fn zigStringLiteral(allocator: Allocator, value: []const u8) ![]u8 {
 }
 
 /// Prefer the enum variant whose numeric value is 0. If none exists, fall
-/// back to `@enumFromInt(0)`.
+/// back to `@fromBackingInt(0)`.
 fn enumDefault(ctx: *PackageCtx, type_name: []const u8) ![]u8 {
     const sym = ctx.table.lookup(type_name) orelse
-        return std.fmt.allocPrint(ctx.allocator, "@enumFromInt(0)", .{});
+        return std.fmt.allocPrint(ctx.allocator, "@fromBackingInt(0)", .{});
     // Walk the original descriptor to find value 0. The symbol table doesn't
     // carry the values, so we have to re-scan. For the small number of enums
     // we touch this is fine; we could cache if needed.
@@ -769,12 +769,12 @@ fn enumDefault(ctx: *PackageCtx, type_name: []const u8) ![]u8 {
         if (!std.mem.eql(u8, other.fqn, sym.fqn)) continue;
         if (other.kind != .@"enum") break;
         // Need the original EnumDescriptorProto — we don't carry it, so just
-        // default to @enumFromInt(0). Keeping it simple: generated code reads
+        // default to @fromBackingInt(0). Keeping it simple: generated code reads
         // fine either way and the runtime compares against integer 0 for
         // skip-on-default.
         break;
     }
-    return std.fmt.allocPrint(ctx.allocator, "@enumFromInt(0)", .{});
+    return std.fmt.allocPrint(ctx.allocator, "@fromBackingInt(0)", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +854,7 @@ const Writer = struct {
     buffer: std.ArrayListUnmanaged(u8) = .empty,
     indent_level: u32 = 0,
 
-    fn deinit(self: *Writer) void {
+    pub fn deinit(self: *Writer) void {
         self.buffer.deinit(self.allocator);
     }
 

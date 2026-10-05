@@ -134,7 +134,7 @@ fn matmulRegisterTile(
         inline for (0..MR) |r| {
             const av: Vec = @splat(alpha * a[r * lda + l]);
             inline for (0..NR_VECS) |c_idx| {
-                acc[r][c_idx] = @mulAdd(Vec, av, bv[c_idx], acc[r][c_idx]);
+                acc[r][c_idx] = primitives.mulAdd(Vec, av, bv[c_idx], acc[r][c_idx]);
             }
         }
     }
@@ -300,7 +300,7 @@ fn sgemmTransBAddSliceGeneric(
                 }
                 inline for (0..MR) |r| {
                     inline for (0..NR) |c| {
-                        acc[r][c] = @mulAdd(Vec, av[r], bv[c], acc[r][c]);
+                        acc[r][c] = primitives.mulAdd(Vec, av[r], bv[c], acc[r][c]);
                     }
                 }
             }
@@ -333,7 +333,7 @@ fn sgemmTransBAddSliceGeneric(
                 while (l + V <= k) : (l += V) {
                     const av: Vec = a_row[l..][0..V].*;
                     const bv = loadBVecAsF32(BT, V, b, b_off + l);
-                    acc = @mulAdd(Vec, av, bv, acc);
+                    acc = primitives.mulAdd(Vec, av, bv, acc);
                 }
                 var sum: f32 = @reduce(.Add, acc);
                 while (l < k) : (l += 1) sum += a_row[l] * loadBScalarAsF32(BT, b, b_off + l);
@@ -352,7 +352,7 @@ fn sgemmTransBAddSliceGeneric(
             while (l + V <= k) : (l += V) {
                 const av: Vec = a_row[l..][0..V].*;
                 const bv = loadBVecAsF32(BT, V, b, b_off + l);
-                acc = @mulAdd(Vec, av, bv, acc);
+                acc = primitives.mulAdd(Vec, av, bv, acc);
             }
             var sum: f32 = @reduce(.Add, acc);
             while (l < k) : (l += 1) sum += a_row[l] * loadBScalarAsF32(BT, b, b_off + l);

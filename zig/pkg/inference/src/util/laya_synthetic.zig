@@ -66,7 +66,7 @@ pub const WordTokenizer = struct {
     fn vocabSize(_: *anyopaque) usize {
         return vocab_size;
     }
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
     const vtable = tokenizer_mod.Tokenizer.VTable{
         .encode = encode,
         .encodeInto = encodeInto,

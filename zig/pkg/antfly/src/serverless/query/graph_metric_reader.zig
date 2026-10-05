@@ -20,12 +20,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const metric_segment = @import("../graph_metric_segment/mod.zig");
-const graph_mod = @import("../../graph/graph.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
 const graph_metric_config = @import("../build/graph_metric_config.zig");
 const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const graph_metric_policy = @import("../build/graph_metric_policy.zig");
 const runtime_mod = @import("runtime.zig");
-const operation = @import("../../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const routing_cache = @import("graph_metric_routing_cache.zig");
@@ -81,7 +81,7 @@ pub const Score = struct {
     }
 };
 
-pub const PublicScore = @import("../../storage/db/types.zig").GraphMetricScore;
+pub const PublicScore = @import("antfly_local_sources").storage_db_types.GraphMetricScore;
 
 pub const Result = struct {
     scores: []Score,
@@ -231,7 +231,7 @@ const OwnedMetricRange = struct {
     bytes: []u8,
     memory: runtime_mod.GraphMetricReadBudget.Reservation = .{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.bytes);
         self.memory.deinit();
         self.* = undefined;
@@ -462,7 +462,7 @@ fn scoreColumnsWithScopeAlloc(
         logical_refs[i] = ref;
         const existing = for (physical_refs[0..physical_count], physical_configs[0..physical_count], 0..) |prior, prior_config, p| {
             if (lake_graph_metric.sameComputation(config, prior_config) and
-                (std.mem.eql(u8, ref.name, prior.name) or @import("../manifest/artifact_ref.zig").areGraphArtifactAliases(ref, prior))) break p;
+                (std.mem.eql(u8, ref.name, prior.name) or @import("antfly_local_sources").serverless_manifest_artifact_ref.areGraphArtifactAliases(ref, prior))) break p;
         } else null;
         mapping[i] = existing orelse physical_count;
         if (existing == null) {
@@ -645,7 +645,7 @@ const CandidateOrder = struct {
     rows: []u32,
     memory: runtime_mod.GraphMetricReadBudget.Reservation,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.rows);
         self.memory.deinit();
     }
@@ -769,7 +769,7 @@ const PointScorePlan = struct {
     touched_blocks: []TouchedBlock = &.{},
     ranges: []ScoreFetchRange = &.{},
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.point_routing) |*routing| routing.deinit();
         self.alloc.free(self.touched_blocks);
         self.range_alloc.free(self.ranges);
@@ -1333,7 +1333,7 @@ const OwnedRoutingLease = struct {
         return .{ .lease = lease, .entry = lease.entry, .memory = memory };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.lease.deinit();
         self.memory.deinit();
     }
@@ -1376,7 +1376,7 @@ const PointRouting = struct {
         self.routing.entries = expanded;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.lease) |*lease| lease.deinit() else self.routing.deinit(self.alloc);
         for (self.payloads.items) |payload| self.payload_alloc.free(payload);
         self.payloads.deinit(self.alloc);
@@ -1960,7 +1960,7 @@ const FetchedMetricRanges = struct {
     payloads: [][]u8,
     memory: runtime_mod.GraphMetricReadBudget.Reservation = .{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.payloads) |payload| if (payload.len > 0) std.heap.smp_allocator.free(payload);
         alloc.free(self.payloads);
         self.memory.deinit();
@@ -2446,7 +2446,7 @@ test "serverless graph metric transport admission bounds cache copies and adapts
     const alloc = std.testing.allocator;
     var session = runtime_mod.QuerySession{ .alloc = alloc, .artifacts = undefined, .manifest = undefined };
     const range = ScoreFetchRange{ .first_block = 0, .last_block = 0, .offset = 0, .len = 4096 };
-    const ranges = [_]ScoreFetchRange{range} ** 8;
+    const ranges = @as([8]ScoreFetchRange, @splat(range));
     const peak = try transportMemoryBytes(range.len, 1);
     session.graph_metric_read_budget.limits.max_retained_bytes = peak;
     try std.testing.expectEqual(@as(usize, 1), try admittedMetricRangeBatchEnd(&session, &ranges, 0));
@@ -2894,11 +2894,11 @@ test "serverless graph metric point reads authenticate before fetching ranges" {
         verify_calls: usize = 0,
         range_calls: usize = 0,
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedPut;
         }
-        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+        pub fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
             return error.UnexpectedFullRead;
         }
         fn getRangeAlloc(ptr: *anyopaque, alloc_: Allocator, _: []const u8, _: u64, len: usize) ![]u8 {
@@ -2977,7 +2977,7 @@ test "serverless graph metric point and top-1025 reads authenticate bounded rang
 }
 
 test "serverless graph metric point routing reads only selected pages of a large index" {
-    try testAuthenticatedMetricReadsWithPrefix(2 * metric_segment.codec.routing_page_entries * metric_segment.score_block_entries + 1, "x" ** 256);
+    try testAuthenticatedMetricReadsWithPrefix(2 * metric_segment.codec.routing_page_entries * metric_segment.score_block_entries + 1, z17RepeatString("x", 256));
 }
 
 test "serverless graph metric small byte indexes keep a single routing read across pages" {
@@ -3040,11 +3040,11 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         corrupt_routing_page: bool = false,
         corrupt_routing_root: bool = false,
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedPut;
         }
-        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+        pub fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
             return error.UnexpectedFullRead;
         }
         fn getRangeAlloc(ptr: *anyopaque, result_alloc: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
@@ -3617,4 +3617,15 @@ test "serverless graph metric ranked blocks reject cross-boundary inversions and
     duplicate.scores[0] = .{ .node_suffix = "b", .value = 9 };
     duplicate.len = 1;
     try std.testing.expectError(error.InvalidGraphMetricSegment, duplicate_validator.observeBlock(duplicate));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

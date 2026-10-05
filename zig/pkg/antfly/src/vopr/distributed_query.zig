@@ -25,8 +25,8 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_catalog = @import("../api/table_catalog.zig");
-const db_types = @import("../storage/db/types.zig");
-const graph_query = @import("../graph/query.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
+const graph_query = @import("antfly_local_sources").graph_query;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
@@ -67,7 +67,7 @@ pub const Scenario = struct {
     };
 
     const mode_ids = ids: {
-        var values: [@typeInfo(Mode).@"enum".fields.len]vopr.id.StableId = undefined;
+        var values: [@typeInfo(Mode).@"enum".field_names.len]vopr.id.StableId = undefined;
         for (std.meta.tags(Mode), 0..) |mode, index|
             values[index] = vopr.id.stable(name, @tagName(mode));
         break :ids values;
@@ -171,7 +171,7 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             self.service_rate_model.deinit();
             self.vopr_io.deinit();
             const owner_allocator = self.owner_allocator;

@@ -128,9 +128,9 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
         try std.testing.expectError(expected, adapter.execute(action));
         try std.testing.expectError(expected, retained.execute(action));
         try std.testing.expectError(expected, retained.topologyRead(std.testing.allocator, 17, "rows", request, .none));
-        inline for (std.meta.fields(@import("metadata/transition_actions.zig").TransitionAction)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "none")) {
-                const op = @unionInit(@import("metadata/transition_actions.zig").TransitionAction, field.name, std.mem.zeroes(field.type));
+        inline for (@typeInfo(@import("metadata/transition_actions.zig").TransitionAction).@"union".field_names, @typeInfo(@import("metadata/transition_actions.zig").TransitionAction).@"union".field_types) |reflected_name, field_type| {
+            if (comptime !std.mem.eql(u8, reflected_name, "none")) {
+                const op = @unionInit(@import("metadata/transition_actions.zig").TransitionAction, reflected_name, std.mem.zeroes(field_type));
                 try std.testing.expectError(expected, adapter.execute(op));
             }
         }
@@ -158,9 +158,9 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     failure = .ok;
     try adapter.execute(action);
     try retained.execute(action);
-    inline for (std.meta.fields(@import("metadata/transition_actions.zig").TransitionAction)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "none")) {
-            const op = @unionInit(@import("metadata/transition_actions.zig").TransitionAction, field.name, std.mem.zeroes(field.type));
+    inline for (@typeInfo(@import("metadata/transition_actions.zig").TransitionAction).@"union".field_names, @typeInfo(@import("metadata/transition_actions.zig").TransitionAction).@"union".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "none")) {
+            const op = @unionInit(@import("metadata/transition_actions.zig").TransitionAction, reflected_name, std.mem.zeroes(field_type));
             try adapter.execute(op);
         }
     }
@@ -173,3 +173,6 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     var canceled: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, adapter.topologyRead(std.testing.allocator, 17, "rows", request, .fromAtomic(&canceled)));
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

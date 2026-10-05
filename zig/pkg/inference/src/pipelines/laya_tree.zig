@@ -501,7 +501,7 @@ fn emit(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, state: []const 
     var segment: usize = 1;
     for (branches, 0..) |branch, qi| {
         const t = branch.tokens;
-        const kind: i64 = @intFromEnum(branch.kind);
+        const kind: i64 = @backingInt(branch.kind);
         const question_segment = segment;
         parents[question_segment] = 0;
         segment += 1;

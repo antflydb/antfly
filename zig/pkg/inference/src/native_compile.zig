@@ -77,7 +77,7 @@ const Options = struct {
     node_index: ?u32 = null,
     node_range_start: ?u32 = null,
     node_range_end: ?u32 = null,
-    debug_output_nodes: [max_debug_output_nodes]u32 = [_]u32{0} ** max_debug_output_nodes,
+    debug_output_nodes: [max_debug_output_nodes]u32 = @as([max_debug_output_nodes]u32, @splat(0)),
     debug_output_node_count: usize = 0,
     node_neighborhood: usize = 0,
     node_closure: bool = false,
@@ -115,7 +115,7 @@ const RefreshedPackageManifest = struct {
     prefill_count: usize,
     decode_count: usize,
 
-    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
         allocator.free(self.package_path);
     }
 };

@@ -18,7 +18,7 @@
 //! must not run alongside an older binary that does not acquire that lock.
 const std = @import("std");
 const antfly = struct {
-    const vector_migration = @import("../common/vector_migration.zig");
+    const vector_migration = @import("antfly_local_sources").common_vector_migration;
     const migration_files = @import("../common/migration_files.zig");
     const metadata = @import("../metadata/mod.zig");
     const vector_migration_offline = @import("../storage/vector_migration_offline.zig");

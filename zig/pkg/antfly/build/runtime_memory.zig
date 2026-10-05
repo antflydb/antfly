@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 
@@ -34,7 +34,7 @@ pub const RuntimeLibraryUnit = enum {
 pub const CompileMemoryProfile = struct {
     host: std.Target,
     target: std.Target,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     cpu_inference: bool,
     sanitize_thread: bool = false,
@@ -46,13 +46,27 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
-        profile.optimize == .ReleaseFast and profile.strip and profile.cpu_inference and !profile.sanitize_thread)
+        (profile.optimize == .fast or profile.optimize == .safe) and
+        profile.strip and profile.cpu_inference and !profile.sanitize_thread)
     {
         // Cold Zig 0.16 x86_64 Linux CPU ReleaseFast, stripped, with empty
         // local/global caches. See COMPILATION.md for measurements and the
         // matched 22 GiB scheduler experiment. Preserve headroom above peaks;
         // storage and inference must be able to overlap on a normal runner.
-        const gib: usize = switch (unit) {
+        // Run 36903575966 also measured this exact ReleaseSafe profile.
+        // Its archives compiled successfully but conservative admission
+        // serialized the build until the E2E job's 90-minute deadline.
+        // Retain margins above rounded Zig MaxRSS and allow the two largest
+        // units to overlap within the existing 22 GiB aggregate budget.
+        const gib: usize = if (profile.optimize == .safe) switch (unit) {
+            .api_kernel => 7,
+            .distributed => 8,
+            .storage_kernel => 12,
+            .enrichment_compute => 3,
+            .serverless => 5,
+            .inference => 8,
+            .cli => 3,
+        } else switch (unit) {
             .api_kernel => 5,
             .distributed => 5,
             .storage_kernel => 8,
@@ -74,14 +88,15 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // platform frameworks. Linux ARM64 reached 4.99 GB in the
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-        // build. Reserve 10 GiB so the scheduler serializes competing
-        // roots instead of discarding a successful production build.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
-        // Physical storage now compiles separately from distributed
-        // coordination. Retain the split kernel's conservative 20 GiB
-        // reservation; the former monolithic 24/22 GiB measurements
-        // do not describe either of these independent artifacts.
-        .storage_kernel => 20 * 1024 * 1024 * 1024,
+        // build. Linux retains 10 GiB. The macOS claim now includes a
+        // provisional margin over the subsequently exceeded 11 GiB claim.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 14 else 10) * 1024 * 1024 * 1024,
+        // September's macOS 20 GiB claim is below the reported 22–23 GB
+        // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
+        // Keep the measured Linux profiles separate. The other macOS bumps
+        // below are provisional 25% margins over claims reported as exceeded;
+        // replace them with cold-build evidence before lowering them.
+        .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else 20) * 1024 * 1024 * 1024,
         // The aarch64-macOS ReleaseSafe distributed unit reached 12.14 GB
         // after the September 2026 runtime changes. Keep a measured margin
         // without reducing Linux runner concurrency.
@@ -92,27 +107,39 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // the 10 GiB reservation keeps it serialized with the macOS
         // storage kernel until both release runners confirm that.
         .serverless => 10 * 1024 * 1024 * 1024,
-        // The broad aarch64-macOS ReleaseFast inference root now
-        // reaches roughly 13.6 GB after storage/runtime integration.
-        // Reserve enough headroom for mode-dependent IR; the build
+        // The broad aarch64-macOS ReleaseFast inference root
+        // previously reached roughly 13.6 GB after storage integration;
+        // the 16 GiB claim has since been reported as exceeded on macOS.
+        // Add provisional headroom for mode-dependent IR; the build
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
-        .inference => 16 * 1024 * 1024 * 1024,
-        // Clean aarch64-macOS ReleaseFast codegen currently peaks
-        // around 2.23 GB, just above the former 2 GiB reservation.
-        .cli => 3 * 1024 * 1024 * 1024,
+        .inference => @as(usize, if (target.os.tag == .macos) 20 else 16) * 1024 * 1024 * 1024,
+        // macOS CLI exceeded the newer 3 GiB claim too; provision 4 GiB
+        // pending a fresh cold-build trace. Keep the Linux claim unchanged.
+        .cli => @as(usize, if (target.os.tag == .macos) 4 else 3) * 1024 * 1024 * 1024,
     };
+}
+
+test "macOS reservations cover reported storage peak and prevent unsafe overlap" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = false, .cpu_inference = true };
+    const reported_storage_bytes: usize = 23_000_000_000;
+    const storage = runtimeCompileMaxRss(.storage_kernel, profile);
+    try std.testing.expect(storage >= reported_storage_bytes + reported_storage_bytes / 4);
+    // A 48 GiB developer host with 8 GiB reserved for other work cannot
+    // admit storage and inference simultaneously under the revised claims.
+    try std.testing.expect(storage + runtimeCompileMaxRss(.inference, profile) > 40 * 1024 * 1024 * 1024);
 }
 
 test "measured release reservations admit storage with inference and preserve unmeasured profiles" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
-    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .ReleaseFast, .strip = true, .cpu_inference = true };
+    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
     const budget = 22 * 1024 * 1024 * 1024;
     try std.testing.expectEqual(@as(usize, 13) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.distributed, .{
         .host = macos,
         .target = macos,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .strip = false,
         .cpu_inference = true,
     }));
@@ -125,13 +152,13 @@ test "measured release reservations admit storage with inference and preserve un
         var profile = measured;
         profile.host = macos;
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
-        inline for (.{ .Debug, .ReleaseSafe, .ReleaseSmall }) |mode| {
+        inline for (.{ .debug, .small }) |mode| {
             profile = measured;
             profile.optimize = mode;
             try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
         }
         profile = measured;
-        profile.target.cpu.features.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
+        profile.target.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx2));
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
         profile = measured;
         profile.strip = false;
@@ -151,4 +178,26 @@ test "measured release reservations admit storage with inference and preserve un
             try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, profile));
         }
     }
+}
+
+test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
+    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = true, .cpu_inference = true };
+    const gib = 1024 * 1024 * 1024;
+    // Zig's summary rounds MaxRSS. Add a whole GiB to each reported peak
+    // before requiring headroom, rather than treating 8G as an exact sample.
+    const peak_upper_bounds = [_]usize{ 5, 6, 9, 2, 4, 6, 2 };
+    for (std.meta.tags(RuntimeLibraryUnit), peak_upper_bounds) |unit, upper| {
+        try std.testing.expect(runtimeCompileMaxRss(unit, measured) > upper * gib);
+        var fallback = measured;
+        fallback.cpu_inference = false;
+        try std.testing.expect(runtimeCompileMaxRss(unit, measured) <= runtimeCompileMaxRss(unit, fallback));
+        var unstripped = measured;
+        unstripped.strip = false;
+        try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, unstripped));
+        var sanitized = measured;
+        sanitized.sanitize_thread = true;
+        try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, sanitized));
+    }
+    try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= 22 * gib);
 }

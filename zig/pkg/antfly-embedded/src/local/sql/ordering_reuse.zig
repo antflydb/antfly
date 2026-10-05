@@ -1,0 +1,87 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Prefix-compatible window orders can share a permutation only when the
+//! consumer is peer-invariant. ROWS/navigation retain their stable tie order.
+const std = @import("std");
+const binding = @import("window_binding.zig");
+fn prefix(weak: binding.Sort, strong: binding.Sort) bool {
+    if (!std.mem.eql(usize, weak.partition, strong.partition) or weak.order.len > strong.order.len or !std.mem.eql(usize, weak.order, strong.order[0..weak.order.len])) return false;
+    for (weak.directions, strong.directions[0..weak.directions.len]) |a, b| {
+        if (a.descending != b.descending or (a.nulls_first orelse a.descending) != (b.nulls_first orelse b.descending)) return false;
+    }
+    return true;
+}
+fn peerInvariant(bound: anytype, index: usize) bool {
+    for (bound.specs) |spec| if (spec.sort == index) {
+        switch (spec.kind) {
+            .rank, .dense_rank, .percent_rank, .cume_dist => {},
+            .count, .sum, .min, .max, .bool_and, .bool_or => {
+                if (spec.frame) |frame| {
+                    if (frame.mode == .rows or frame.exclusion == .current or frame.exclusion == .ties) return false;
+                }
+                if ((spec.kind == .sum or spec.kind == .min or spec.kind == .max) and (spec.type == .number or spec.type == .json)) return false;
+            },
+            else => return false,
+        }
+    };
+    return true;
+}
+pub fn plan(a: std.mem.Allocator, bound: anytype) ![]usize {
+    const roots = try a.alloc(usize, bound.sorts.len);
+    for (bound.sorts, roots, 0..) |weak, *root, index| {
+        root.* = index;
+        for (bound.sorts, 0..) |strong, candidate| {
+            if (!prefix(weak, strong)) continue;
+            if (strong.order.len != weak.order.len and !peerInvariant(bound, index)) continue;
+            if (strong.order.len > bound.sorts[root.*].order.len or (strong.order.len == bound.sorts[root.*].order.len and candidate < root.*)) root.* = candidate;
+        }
+    }
+    return roots;
+}
+/// A final ORDER BY can consume a window's physical order directly. Require
+/// the full key, including partition keys, so original-ordinal tie ordering
+/// remains identical to a fresh sort. Expressions/decision keys stay opaque.
+pub fn finalOrder(sort: binding.Sort, programs: []const @import("scalar.zig").Program, orders: []const @import("ast.zig").Order) bool {
+    if (programs.len == 0 or programs.len != sort.partition.len + sort.order.len or programs.len != orders.len) return false;
+    for (programs, orders, 0..) |program, order, index| {
+        if (program.instructions.len != 1 or program.instructions[0].operation != .column) return false;
+        const column = if (index < sort.partition.len) sort.partition[index] else sort.order[index - sort.partition.len];
+        const direction: @import("operators.zig").Order = if (index < sort.partition.len) .{} else sort.directions[index - sort.partition.len];
+        if (program.instructions[0].operation.column != column or order.descending != direction.descending or (order.nulls_first orelse order.descending) != (direction.nulls_first orelse direction.descending)) return false;
+    }
+    return true;
+}
+
+test "SQL window ordering reuse retains navigation and ROWS tie semantics" {
+    const a = std.testing.allocator;
+    const sorts = [_]binding.Sort{
+        .{ .partition = &.{0}, .order = &.{1}, .directions = &.{.{}} },
+        .{ .partition = &.{0}, .order = &.{ 1, 2 }, .directions = &.{ .{}, .{} } },
+        .{ .partition = &.{0}, .order = &.{1}, .directions = &.{.{ .descending = true }} },
+    };
+    const specs = [_]binding.Spec{.{ .kind = .rank, .arguments = &.{}, .filter = null, .sort = 0, .frame = null, .type = .integer, .star = false }};
+    const bound: binding.Bound = .{ .input = undefined, .statement = undefined, .sorts = &sorts, .specs = &specs, .outputs = &.{}, .orders = &.{}, .names = &.{} };
+    const roots = try plan(a, bound);
+    defer a.free(roots);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 2 }, roots);
+    var changed = bound;
+    var navigation = specs;
+    navigation[0].kind = .lag;
+    changed.specs = &navigation;
+    const independent = try plan(a, changed);
+    defer a.free(independent);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 2 }, independent);
+}

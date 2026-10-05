@@ -22,13 +22,25 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const link_libc = b.option(bool, "link_libc", "Link the platform module against libc") orelse true;
 
-    _ = platform_build.addModule(b, "antfly_platform", .{
+    const platform_mod = platform_build.addModule(b, "antfly_platform", .{
         .root_source_file = b.path("src/root.zig"),
         .filesystem_capacity_source_file = b.path("src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
     });
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/io_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_mod.addImport("antfly_platform", platform_mod);
+    const bench = b.addExecutable(.{ .name = "io-backend-bench", .root_module = bench_mod });
+    const install_bench = b.addInstallArtifact(bench, .{});
+    b.step("io-backend-bench", "Build Threaded versus Evented positional I/O comparison")
+        .dependOn(&install_bench.step);
 
     const tests = platform_build.addTests(b, .{
         .root = b.path("."),

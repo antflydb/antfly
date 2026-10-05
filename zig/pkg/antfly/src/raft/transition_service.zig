@@ -221,7 +221,7 @@ pub const TransitionService = struct {
                     {
                         effective_record.rollback_reason = previous.rollback_reason;
                     }
-                    if (@intFromEnum(effective_record.phase) < @intFromEnum(previous.phase)) {
+                    if (@backingInt(effective_record.phase) < @backingInt(previous.phase)) {
                         // Controller snapshots can lag the executor phase
                         // while carrying a newly committed rollback request.
                         // Preserve local progress while adopting that intent.
@@ -287,7 +287,7 @@ pub const TransitionService = struct {
                     {
                         effective_record.rollback_reason = previous.rollback_reason;
                     }
-                    if (@intFromEnum(effective_record.phase) < @intFromEnum(previous.phase)) {
+                    if (@backingInt(effective_record.phase) < @backingInt(previous.phase)) {
                         if (!rollback_requested) return;
                         effective_record.phase = previous.phase;
                     }
@@ -1132,8 +1132,8 @@ test "transition retry jitter is bounded and desynchronizes services" {
 fn transitionRecordEqual(left: anytype, right: @TypeOf(left)) bool {
     return switch (@typeInfo(@TypeOf(left))) {
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field|
-                if (!transitionRecordEqual(@field(left, field.name), @field(right, field.name))) break :blk false;
+            inline for (info.field_names) |reflected_name|
+                if (!transitionRecordEqual(@field(left, reflected_name), @field(right, reflected_name))) break :blk false;
             break :blk true;
         },
         .optional => if (left) |value| if (right) |other| transitionRecordEqual(value, other) else false else right == null,
@@ -1261,7 +1261,7 @@ test "metadata transition driver online service never invokes ordinary merge fal
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (state.phase != .publish) return error.UnexpectedOnlineStep;
             if (self.recovery_published) {
-                const certificate: @import("../storage/source_snapshot.zig").Certificate = .{ .cut = .{ .namespace = state.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
+                const certificate: @import("antfly_local_sources").storage_source_snapshot.Certificate = .{ .cut = .{ .namespace = state.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
                 return .{ .scope = state.scope, .certificate = certificate, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .published, .snapshot_certificate = try certificate.digest() } };
             }
             return .{ .scope = state.scope, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .pinned } };
@@ -1285,13 +1285,13 @@ test "metadata transition driver online service never invokes ordinary merge fal
         }
         const vtable: shard_ops.ShardOperationAdapter.VTable = blk: {
             var value: shard_ops.ShardOperationAdapter.VTable = undefined;
-            for (std.meta.fields(@TypeOf(value))) |field| {
-                if (@typeInfo(field.type) == .optional) {
-                    @field(value, field.name) = null;
+            for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+                if (@typeInfo(field_type) == .optional) {
+                    @field(value, reflected_name) = null;
                     continue;
                 }
-                @field(value, field.name) = struct {
-                    fn call(ptr: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) @typeInfo(@typeInfo(field.type).pointer.child).@"fn".return_type.? {
+                @field(value, reflected_name) = struct {
+                    fn call(ptr: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field_type).pointer.child).@"fn".param_types[2].?) @typeInfo(@typeInfo(field_type).pointer.child).@"fn".return_type.? {
                         const self: *Parent = @ptrCast(@alignCast(ptr));
                         self.ordinary_calls += 1;
                         return error.UnexpectedOrdinaryMergeFallback;
@@ -1326,7 +1326,7 @@ test "metadata transition driver online service never invokes ordinary merge fal
     try service.submitMerge(ordinary);
     stub.initial = record.online.?;
     var capabilities: @import("../metadata/online_merge.zig").Capabilities = .{};
-    inline for (std.meta.fields(@TypeOf(capabilities))) |field| @field(capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(@TypeOf(capabilities))) |reflected_name| @field(capabilities, reflected_name) = true;
     service.online_driver = .{ .ptr = &stub, .capabilities = capabilities, .observe = Stub.observe, .execute = Stub.execute, .compare_and_set = Stub.cas, .admit = Stub.admit };
     _ = try service.stepPending();
     try std.testing.expectEqual(@as(usize, 1), stub.admission_calls);
@@ -1411,16 +1411,16 @@ test "transition service owns records and fences reentrant observations" {
 
         const vtable: shard_ops.ShardOperationAdapter.VTable = blk: {
             var value: shard_ops.ShardOperationAdapter.VTable = undefined;
-            for (std.meta.fields(@TypeOf(value))) |field| {
-                if (std.mem.eql(u8, field.name, "observe_split")) {
-                    @field(value, field.name) = observeSplit;
-                } else if (std.mem.eql(u8, field.name, "observe_merge")) {
-                    @field(value, field.name) = observeMerge;
-                } else if (@typeInfo(field.type) == .optional) {
-                    @field(value, field.name) = null;
+            for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+                if (std.mem.eql(u8, reflected_name, "observe_split")) {
+                    @field(value, reflected_name) = observeSplit;
+                } else if (std.mem.eql(u8, reflected_name, "observe_merge")) {
+                    @field(value, reflected_name) = observeMerge;
+                } else if (@typeInfo(field_type) == .optional) {
+                    @field(value, reflected_name) = null;
                 } else {
-                    @field(value, field.name) = struct {
-                        fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field.type).pointer.child).@"fn".params[2].type.?) !void {
+                    @field(value, reflected_name) = struct {
+                        fn call(_: *anyopaque, _: u64, _: @typeInfo(@typeInfo(field_type).pointer.child).@"fn".param_types[2].?) !void {
                             return error.UnexpectedStaleTransitionAction;
                         }
                     }.call;
@@ -2265,7 +2265,7 @@ test "transition service clones queued transition record strings" {
         last_split_key: ?[]u8 = null,
         last_source_range_end: ?[]u8 = null,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             if (self.last_split_key) |split_key| alloc.free(split_key);
             if (self.last_source_range_end) |end| alloc.free(end);
             self.* = undefined;

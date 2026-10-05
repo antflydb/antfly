@@ -114,9 +114,16 @@ The long-term rule for dense replay sizing is:
 
 Live managed indexes derive the estimate from their configured dimensions. The
 384-f32 default remains only for callers that do not carry dense index metadata.
-It can be overridden with `ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES`.
-The byte window can be overridden with `ANTFLY_DENSE_REPLAY_MAX_WINDOW_BYTES`. These
-are escape hatches; production sizing should come from resource-manager budgets.
+Lite's fallback posting path applies a working-set factor to the vector estimate.
+Replay keeps an independent ceiling in original work units, including keys and
+document descriptors, so that factor does not enlarge delete-only or mixed work
+windows. Resource-manager slice headroom still caps estimated memory. Adaptive
+window state remains in work units when the storage estimate changes.
+
+The estimate can be overridden with `ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES`.
+An explicit estimate replaces the storage-derived estimate and uses its original
+unscaled window ceiling. The byte window can be overridden with
+`ANTFLY_DENSE_REPLAY_MAX_WINDOW_BYTES`. These are escape hatches; production sizing should come from resource-manager budgets.
 
 This keeps the two goals separate:
 

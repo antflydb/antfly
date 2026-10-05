@@ -17,8 +17,9 @@
 //! Distributed sources retain routing, admission, consistency, aggregation,
 //! and lifecycle; this source owns only coarse physical operations.
 
+const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const std = @import("std");
-const request_operation = @import("operation.zig");
+const request_operation = @import("antfly_local_sources").api_operation;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
@@ -26,33 +27,33 @@ const kernel_error_identity = @import("kernel_error_identity");
 const client = @import("../storage/kernel_owner_client.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
-const backend_types = @import("../storage/backend_types.zig");
-const db_types = @import("../storage/db/types.zig");
-const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
-const replication_contract = @import("../storage/db/replication_contract.zig");
-const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
-const text_memory = @import("../storage/db/text_memory_stats.zig");
-const replication_effects = @import("../storage/db/replication_effects.zig");
-const ha_replication_record = @import("../storage/db/replication_record.zig");
-const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const runtime_callbacks = @import("antfly_local_sources").storage_db_runtime_callbacks;
+const replication_contract = @import("antfly_local_sources").storage_db_replication_contract;
+const document_artifact_child_range = @import("antfly_local_sources").storage_db_document_artifact_child_range;
+const text_memory = @import("antfly_local_sources").storage_db_text_memory_stats;
+const replication_effects = @import("antfly_local_sources").storage_db_replication_effects;
+const hot_standby_replication_record = @import("antfly_local_sources").storage_db_replication_record;
+const runtime_preflight = @import("antfly_local_sources").storage_db_runtime_preflight;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_domain = @import("../metadata/domain.zig");
-const backup_contract = @import("backup_contract.zig");
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 const distributed_graph = @import("distributed_graph.zig");
-const query_response = @import("query_response.zig");
-const runtime_status = @import("runtime_status.zig");
+const query_response = @import("antfly_local_sources").api_query_response;
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const feature_reads = @import("../raft/feature_reads.zig");
 const table_catalog = @import("table_catalog.zig");
-const table_read_source = @import("table_read_source.zig");
-const table_reads = @import("local_query_contract.zig");
+const table_read_source = @import("antfly_local_sources").api_table_read_source;
+const table_reads = @import("antfly_local_sources").api_local_query_contract;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
-const table_write_source = @import("table_write_source.zig");
+const table_write_source = @import("antfly_local_sources").api_table_write_source;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const scraping = @import("antfly_scraping");
 
 /// Native owner controls use the platform monotonic clock. In particular on
@@ -176,13 +177,96 @@ test "source owner routed admission preserves the fence clock" {
     try std.testing.expectEqual(@as(usize, 2), catalog.calls);
 }
 
+test "source owner lookup and descriptor admission preserve one cancellable catalog budget" {
+    const Fixture = struct {
+        request_now: u64 = 10,
+        catalog_now: u64 = 1000 * std.time.ns_per_s,
+        canceled: std.atomic.Value(bool) = .init(false),
+        mode: enum { confirm, cancel, expire } = .confirm,
+        captures: usize = 0,
+        confirmations: usize = 0,
+        fn now(ptr: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const value: *const u64 = @ptrCast(@alignCast(ptr.?));
+            return .{ .nanoseconds = value.* };
+        }
+        fn capture(ptr: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(?u64, 1001 * std.time.ns_per_s), deadline);
+            self.captures += 1;
+            const elapsed: u64 = if (self.mode == .expire) std.time.ns_per_s else 250 * std.time.ns_per_ms;
+            self.request_now += elapsed;
+            self.catalog_now += elapsed;
+            if (self.mode == .cancel) self.canceled.store(true, .release);
+            return .{ .metadata_group_id = 1, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
+        }
+        fn confirm(ptr: *anyopaque, _: []const u8, deadline: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // The eventual miss used 250 ms. Confirmation keeps the original
+            // absolute deadline, rather than receiving a fresh second.
+            try std.testing.expectEqual(@as(?u64, 1001 * std.time.ns_per_s), deadline);
+            self.confirmations += 1;
+            return error.DescriptorProbeComplete;
+        }
+        fn freeRouting(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnbudgetedDescriptorFallback;
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Fixture.now;
+    for ([_]@FieldType(Fixture, "mode"){ .confirm, .cancel, .expire }) |mode| {
+        for ([_]bool{ false, true }) |lookup| {
+            var fixture: Fixture = .{ .mode = mode };
+            const request_io: std.Io = .{ .userdata = &fixture.request_now, .vtable = &vtable };
+            const catalog_io: std.Io = .{ .userdata = &fixture.catalog_now, .vtable = &vtable };
+            var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog_io), .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .table_routing_snapshot = Fixture.capture, .linearizable_table_routing_snapshot = Fixture.confirm, .free_routing_snapshot = Fixture.freeRouting } }, read_gate.alreadyReadSafeBarrier());
+            const opts: db_types.LookupOptions = .{ .execution_deadline_ns = fixture.request_now + std.time.ns_per_s, .execution_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&request_io), .cancellation = .fromAtomic(&fixture.canceled) };
+            const expected: anyerror = switch (mode) {
+                .confirm => error.DescriptorProbeComplete,
+                .cancel => error.Canceled,
+                .expire => error.CatalogRoutingSnapshotTimeout,
+            };
+            if (lookup) {
+                try std.testing.expectError(expected, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", opts, .stale));
+            } else {
+                try std.testing.expectError(expected, source.acquireWithControls(7, "rows", .from(opts)));
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+            try std.testing.expectEqual(@as(usize, if (mode == .confirm) 1 else 0), fixture.confirmations);
+        }
+    }
+}
+
+test "source owner fenced descriptor disappearance is availability not absence" {
+    const Fixture = struct {
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+            const groups = try alloc.alloc(table_catalog.CatalogGroupRoute, 1);
+            groups[0] = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } };
+            return .{ .found = .{ .metadata_group_id = 1, .metadata_incarnation = null, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .groups = groups } };
+        }
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &.{}, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var fixture: u8 = 0;
+    var source = ProvisionedKernelOwnerSource.init(std.testing.allocator, "unused", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.resolve } }, read_gate.alreadyReadSafeBarrier());
+    const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 1, .topology_epoch = 1, .route = .{ .group_id = 7, .range_id = 7, .identity_namespace = .{ .table_id = 1, .shard_id = 7, .range_id = 7 } } };
+    // The authenticated public route exists. A later descriptor projection
+    // cannot certify that its row is absent without admitting an owner.
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ProvisionedKernelOwnerSource.lookupGroupLocalRouted(&source, std.testing.allocator, fence, 7, "rows", "a", .{}, .read_index));
+    // An unfenced physical lookup still identifies a genuinely missing table.
+    try std.testing.expectError(error.TableNotFound, ProvisionedKernelOwnerSource.lookupGroupLocal(&source, std.testing.allocator, 7, "rows", "a", .{}, .read_index));
+}
+
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     read_safety_barrier: read_gate.ReadSafetyBarrier,
     /// Selected once by the hosting runtime before any owner is opened.
-    online_source_authority: @import("../storage/db/online_source_contract.zig").Authority = .raft,
+    online_source_authority: @import("antfly_local_sources").storage_db_online_source_contract.Authority = .raft,
     row_policy_authority_secret: ?[]const u8 = null,
     row_policy_authority_issuer: ?[]const u8 = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
@@ -190,14 +274,14 @@ pub const ProvisionedKernelOwnerSource = struct {
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
-    coordinated_ttl: ?@import("../storage/coordinated_ttl.zig").Port = null,
+    coordinated_ttl: ?server_coordinated_ttl.Port = null,
     artifact_publications: ?@import("../storage/artifact_publication_dispatch.zig").Port = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
     promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
     replication_write_gate: ?replication_contract.WriteGate = null,
-    ha_async_mirror: ?replication_contract.AsyncEffectMirror = null,
+    hot_standby_async_mirror: ?replication_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     remote_content_configured: bool = false,
     secret_store: ?*anyopaque = null,
@@ -287,7 +371,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return pending;
         }
 
-        fn deinit(self: *ApplyOpen, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ApplyOpen, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.path);
             alloc.free(self.descriptor.schema_json);
@@ -316,7 +400,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []u8,
         schema_json: []u8,
         indexes_json: []u8,
-        table_storage: ?@import("../common/table_storage.zig").Settings = null,
+        table_storage: ?@import("antfly_local_sources").common_table_storage.Settings = null,
         generation: u64,
         initial_range: ?db_types.ByteRange = null,
         identity: descriptor_contract.Identity,
@@ -361,7 +445,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         initial_range: ?db_types.ByteRange = null,
         restore_cancel_recovery: bool = false,
         restore_ha_replay: bool = false,
-        table_storage: ?@import("../common/table_storage.zig").Settings = null,
+        table_storage: ?@import("antfly_local_sources").common_table_storage.Settings = null,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
         /// A Raft entry's pinned descriptor did not authorize current-catalog
@@ -442,7 +526,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.entry.transient_retirement_pending = false;
         }
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             if (!self.active) return;
             self.source.release(self.entry, self.exclusive, self.apply_only);
             self.active = false;
@@ -490,13 +574,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         }
     }
 
-    fn stopApplyControl(self: *ProvisionedKernelOwnerSource) void {
+    /// Publish the control worker's stop without joining it. A deployment
+    /// sharing one cooperative scheduler must wake all owners before driving
+    /// their tasks to completion and reclaiming the sources.
+    pub fn beginApplyControlShutdown(self: *ProvisionedKernelOwnerSource) void {
         lock(&self.mutex);
         self.apply_control_stopping = true;
         self.apply_control_started.store(false, .release);
         const io = self.apply_control_io;
         if (io) |control_io| self.apply_control_wake.set(control_io);
         self.mutex.unlock();
+    }
+
+    fn stopApplyControl(self: *ProvisionedKernelOwnerSource) void {
+        self.beginApplyControlShutdown();
+        const io = self.apply_control_io;
         if (self.apply_control_future) |*future| future.await(io.?);
         self.apply_control_future = null;
         // Keep the borrowed Io value stable until source destruction: an
@@ -652,7 +744,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         mirror: ?replication_contract.AsyncEffectMirror,
     ) *ProvisionedKernelOwnerSource {
         self.replication_write_gate = gate;
-        self.ha_async_mirror = mirror;
+        self.hot_standby_async_mirror = mirror;
         return self;
     }
 
@@ -987,11 +1079,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             return rows;
         }
 
-        fn relationalRead(self: *TransitionLease, comptime T: type, alloc: std.mem.Allocator, request: @import("../storage/db/relational_transition_contract.zig").Request) !T {
+        fn relationalRead(self: *TransitionLease, comptime T: type, alloc: std.mem.Allocator, request: @import("antfly_local_sources").storage_db_relational_transition_contract.Request) !T {
             var encoded: std.Io.Writer.Allocating = .init(alloc);
             defer encoded.deinit();
             var json: std.json.Stringify = .{ .writer = &encoded.writer };
-            try @import("../storage/db/relational_integrity_json.zig").write(request, &json);
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(request, &json);
             var response: abi.OwnedBytes = .{};
             try kernel_error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(self.lease.owner().handle, &.{
                 .table_name = .fromSlice(self.lease.entry.table_name),
@@ -1020,18 +1112,18 @@ pub const ProvisionedKernelOwnerSource = struct {
             return alloc.dupe(u8, response.bytes());
         }
 
-        pub fn relationalTopologyStatus(self: *TransitionLease) !@import("../storage/db/relational_integrity_topology_contract.zig").Status {
+        pub fn relationalTopologyStatus(self: *TransitionLease) !@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Status {
             var arena = std.heap.ArenaAllocator.init(self.lease.source.alloc);
             defer arena.deinit();
-            return self.relationalRead(@import("../storage/db/relational_integrity_topology_contract.zig").Status, arena.allocator(), .{ .status = {} });
+            return self.relationalRead(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Status, arena.allocator(), .{ .status = {} });
         }
 
-        pub fn relationalHandoffManifest(self: *TransitionLease, alloc: std.mem.Allocator, source: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, destination: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) !@import("../storage/db/relational_integrity_handoff_contract.zig").Manifest {
-            return self.relationalRead(@import("../storage/db/relational_integrity_handoff_contract.zig").Manifest, alloc, .{ .manifest = .{ .source = source, .destination = destination, .lower = lower, .upper = upper, .primary_sequence = primary_sequence } });
+        pub fn relationalHandoffManifest(self: *TransitionLease, alloc: std.mem.Allocator, source: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, destination: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) !@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Manifest {
+            return self.relationalRead(@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Manifest, alloc, .{ .manifest = .{ .source = source, .destination = destination, .lower = lower, .upper = upper, .primary_sequence = primary_sequence } });
         }
 
-        pub fn relationalHandoffPage(self: *TransitionLease, alloc: std.mem.Allocator, manifest: @import("../storage/db/relational_integrity_handoff_contract.zig").Manifest, progress: @import("../storage/db/relational_integrity_handoff_contract.zig").Progress) !@import("../storage/db/relational_integrity_handoff_contract.zig").Page {
-            return self.relationalRead(@import("../storage/db/relational_integrity_handoff_contract.zig").Page, alloc, .{ .page = .{ .manifest = manifest, .progress = progress } });
+        pub fn relationalHandoffPage(self: *TransitionLease, alloc: std.mem.Allocator, manifest: @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Manifest, progress: @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Progress) !@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Page {
+            return self.relationalRead(@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Page, alloc, .{ .page = .{ .manifest = manifest, .progress = progress } });
         }
     };
 
@@ -1406,7 +1498,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.request.cancellation_fn = cancelled;
         }
 
-        fn deinit(self: *EncodedRestoreRequest) void {
+        pub fn deinit(self: *EncodedRestoreRequest) void {
             self.alloc.free(self.manifest_json);
             self.* = undefined;
         }
@@ -1626,13 +1718,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        record: ha_replication_record.RecordView,
+        record: hot_standby_replication_record.RecordView,
     ) !void {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1649,7 +1741,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Read the persisted private bootstrap without asking the public catalog
     /// to invent a route for an unpublished owner. Warm reads pin the exact
     /// current generation; cold reads stay inside the compiled storage owner.
-    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap) {
         try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
@@ -1670,7 +1762,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         if (output.len == 0) return null;
-        return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
+        return try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
     }
 
     pub fn readHiddenInitialChildRecord(
@@ -1678,7 +1770,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_id: u64,
-    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    ) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
@@ -1699,7 +1791,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (output.len == 0) return null;
         if (generation != self.visibleRootGeneration(group_id)) return error.InitialChildPublicationChanged;
-        var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_initial_child_publication.zig").Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
         defer parsed.deinit();
         try parsed.value.validate();
         return parsed.value;
@@ -1712,11 +1804,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_id: u64,
-    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    ) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         return self.readHiddenInitialChildRecord(alloc, group_id, 0);
     }
 
-    pub fn cancelColdInitialChildRetirementAtPath(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+    pub fn cancelColdInitialChildRetirementAtPath(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, cancel_revision: u64) !void {
         try self.ensureContextConfigured();
         const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
         defer alloc.free(path);
@@ -1734,7 +1826,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_path: []const u8,
-    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    ) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         try self.ensureContextConfigured();
         const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
         defer alloc.free(path);
@@ -1747,7 +1839,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }, &output));
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (output.len == 0) return null;
-        var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_initial_child_publication.zig").Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
         defer parsed.deinit();
         try parsed.value.validate();
         return parsed.value;
@@ -1785,7 +1877,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
     }
 
-    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: hot_standby_replication_record.RecordView) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -1793,8 +1885,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
         defer lease.deinit();
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1808,14 +1900,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         });
     }
 
-    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: hot_standby_replication_record.RecordView) !void {
         var lease = try self.acquirePreparedOwner(group_id, table_name);
         defer lease.deinit();
         if (lease.entry.initial_child_bootstrap_json.len == 0 or lease.entry.identity.table_id != record.table_id or
             lease.entry.identity.shard_id != record.shard_id) return error.InitialChildPublicationChanged;
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1867,7 +1959,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_name = .fromSlice(table_name),
             .backup_root = .fromSlice(plan.backup_root),
             .backup_id = .fromSlice(plan.backup_id),
-            .format = @intFromEnum(switch (plan.format) {
+            .format = @backingInt(switch (plan.format) {
                 .native => abi.BackupFormat.native,
                 .portable => abi.BackupFormat.portable,
             }),
@@ -1940,7 +2032,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return shards;
     }
 
-    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: @import("antfly_local_sources").storage_db_native_backup_seal_contract.Request, control: backup_contract.BackupOperationControl) !?[]u8 {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try control.ensureActive();
         const json = try std.json.Stringify.valueAlloc(alloc, input, .{});
@@ -1969,7 +2061,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Private lifecycle bridge: materialize from the admitted durable pin,
     /// then return its certificate for a separate replicated publication CAS.
-    pub fn prepareOnlineSourcePublication(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: @import("../storage/db/online_source_contract.zig").Scope, context: @import("operation.zig").RequestContext) !@import("../storage/source_snapshot.zig").Certificate {
+    pub fn prepareOnlineSourcePublication(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_source_snapshot.Certificate {
         try context.ensureActive();
         try scope.validate();
         if (scope.fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
@@ -1982,7 +2074,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         var response = try lease.owner().prepareSourcePinPublicationJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         defer response.deinit();
-        var parsed = try std.json.parseFromSlice(@import("../storage/source_snapshot.zig").Certificate, alloc, response.bytes(), .{});
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, response.bytes(), .{});
         defer parsed.deinit();
         _ = try parsed.value.encode();
         if (!parsed.value.cut.namespace.eql(scope.fence.namespace)) return error.SourceSnapshotCutMismatch;
@@ -1990,7 +2082,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    pub fn onlineSourceArtifact(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/source_artifact_transfer.zig").Request, context: @import("operation.zig").RequestContext) ![]u8 {
+    pub fn onlineSourceArtifact(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_source_artifact_transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.scope().validate();
         if (request.scope().fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
@@ -2008,7 +2100,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return alloc.dupe(u8, response.bytes());
     }
 
-    pub fn onlineMergeIo(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request, context: @import("operation.zig").RequestContext) ![]u8 {
+    pub fn onlineMergeIo(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();
         if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
@@ -2822,7 +2914,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     ) !LoadedDescriptor {
         try expected.validate();
         var lease = try self.acquirePreparedOwner(group_id, table_name);
@@ -2864,12 +2956,22 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         deadline_ns: ?u64,
     ) !LoadedDescriptor {
-        var projection = (try table_catalog.tableGroupDescriptorProjection(
+        return self.loadDescriptorWithBudget(alloc, group_id, table_name, self.catalog.budget(deadline_ns));
+    }
+
+    fn loadDescriptorWithBudget(
+        self: *ProvisionedKernelOwnerSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        budget: table_catalog.RoutingBudget,
+    ) !LoadedDescriptor {
+        var projection = (try table_catalog.tableGroupDescriptorProjectionControlled(
             alloc,
             self.catalog,
             table_name,
             group_id,
-            deadline_ns,
+            budget,
         )) orelse return error.TableNotFound;
         errdefer projection.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -2898,6 +3000,12 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn from(req: anytype) ReadControls {
             return .{ .execution_deadline_ns = req.execution_deadline_ns, .execution_io = if (@hasField(@TypeOf(req), "execution_io")) req.execution_io else null, .cancellation = req.cancellation };
+        }
+
+        fn catalogBudget(self: ReadControls, catalog: table_catalog.CatalogSource) table_catalog.RoutingBudget {
+            var budget = catalog.budget(catalog.deadlineFrom(.{ .deadline_ns = self.execution_deadline_ns, .io = self.execution_io }));
+            budget.cancellation = self.cancellation orelse .none;
+            return budget;
         }
 
         fn check(self: ReadControls) !void {
@@ -2929,8 +3037,9 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         try controls.check();
-        var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
+        var descriptor = try self.loadDescriptorWithBudget(self.alloc, group_id, table_name, controls.catalogBudget(self.catalog));
         defer descriptor.deinit(self.alloc);
+        try controls.check();
         return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, controls);
     }
 
@@ -3106,7 +3215,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
-    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: @import("../storage/coordinated_ttl.zig").Port) *ProvisionedKernelOwnerSource {
+    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: server_coordinated_ttl.Port) *ProvisionedKernelOwnerSource {
         std.debug.assert(self.entries.items.len == 0);
         self.coordinated_ttl = port;
         return self;
@@ -3131,7 +3240,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const port = self.coordinated_ttl orelse return 1;
         if (request.candidate_count > abi.coordinated_ttl_page_capacity or
             (request.candidate_count != 0 and request.candidates == null)) return 1;
-        var candidates: [abi.coordinated_ttl_page_capacity]@import("../storage/coordinated_ttl.zig").Candidate = undefined;
+        var candidates: [abi.coordinated_ttl_page_capacity]server_coordinated_ttl.Candidate = undefined;
         for (candidates[0..request.candidate_count], 0..) |*dest, index| {
             const source = request.candidates.?[index];
             if (source.key.len != 0 and source.key.ptr == null) return 1;
@@ -3273,12 +3382,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub const RestoreDescriptorUse = enum { read, mutate, resolve };
     pub const RestoreDescriptorRecovery = struct {
         const VTable = struct { recover: @FieldType(RestoreDescriptorRecovery, "recover_fn") };
-        const Boundary = @import("../runtime_callback_abi.zig").Boundary(VTable);
+        const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
         ptr: *anyopaque,
-        recover_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, @import("operation.zig").RequestContext) anyerror!OwnedRestoreDescriptor,
+        recover_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, @import("antfly_local_sources").api_operation.RequestContext) anyerror!OwnedRestoreDescriptor,
         boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
 
-        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: @import("operation.zig").RequestContext) !OwnedRestoreDescriptor {
+        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
             return Boundary.call("recover", self.boundary_dispatch, self.recover_fn, .{ self.ptr, alloc, group_id, table_name, scope, plan_id, use, context });
         }
     };
@@ -3291,7 +3400,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Cold hidden-owner recovery is bounded by its explicit plan identity.
     /// Only the host's authoritative restore-plan callback can supply a missing
     /// descriptor; ordinary named-table discovery is never an alternative.
-    pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("operation.zig").RequestContext) !OwnedRestoreDescriptor {
+    pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
         try context.ensureActive();
         var descriptor = if (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) |cached| cached else blk: {
             const plan = plan_id orelse return error.RestoreStagingScopeChanged;
@@ -3300,7 +3409,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             break :blk try recovery.recover(alloc, group_id, table_name, scope, plan, use, context);
         };
         errdefer descriptor.deinit(alloc);
-        var parsed = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
         defer parsed.deinit();
         try parsed.value.validate();
         const namespace = parsed.value.scope.target_namespace;
@@ -3331,7 +3440,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer pinned.deinit();
         const entry = pinned.entry;
         {
-            var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, entry.restore_bootstrap_json, .{});
+            var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, entry.restore_bootstrap_json, .{});
             defer bootstrap.deinit();
             if (!std.mem.eql(u8, &scope, &bootstrap.value.scope.digest())) return error.RestoreStagingScopeChanged;
             const schema_json = try alloc.dupe(u8, entry.schema_json);
@@ -3383,7 +3492,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     ) !bool {
         try expected.validate();
         lock(&self.mutex);
@@ -3415,7 +3524,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
         opts: db_types.LookupOptions,
     ) !?table_read_source.LookupResponse {
         try expected.validate();
@@ -3468,7 +3577,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
         req: db_types.BatchRequest,
         operation_index: u64,
     ) !void {
@@ -3498,26 +3607,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         input: @import("restore_owner.zig").Request,
         proposer: ?@import("restore_owner.zig").Proposer,
         options: RestoreOwnerOptions,
-        request: @import("operation.zig").RequestContext,
+        request: @import("antfly_local_sources").api_operation.RequestContext,
     ) !@import("restore_owner.zig").Response {
         try request.ensureActive();
         try input.validate(group_id);
         if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
         if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
-        var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
+        var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
         defer bootstrap.deinit();
         if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;
         if (input.action == .install_generation_admissions) {
             const expected = bootstrap.value.generation_admission orelse return error.RestoreSourceProofMissing;
             const command = input.generation_admissions.?;
             if (!std.mem.eql(u8, &expected.source_summary_digest, &command.source_summary_digest) or
-                !std.mem.eql(u8, &expected.expected_receipt_digest, &try @import("../storage/db/restore_staging_contract.zig").admissionReceiptDigest(command)))
+                !std.mem.eql(u8, &expected.expected_receipt_digest, &try @import("antfly_local_sources").storage_db_restore_staging_contract.admissionReceiptDigest(command)))
                 return error.RestoreStagingScopeChanged;
         }
         var prepared = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, input, options, request);
         defer prepared.deinit();
         const encoded = prepared.value.batch_json orelse return prepared.value.response;
-        var batch = try @import("batch.zig").parseInternalBatchRequest(alloc, encoded);
+        var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, encoded);
         defer batch.deinit(alloc);
         const scope = batch.req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
         if (!std.mem.eql(u8, &scope, &input.scope.digest()) or batch.req.restore_staging == null) return error.RestoreStagingScopeChanged;
@@ -3544,7 +3653,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         input: @import("restore_owner.zig").Request,
         options: RestoreOwnerOptions,
-        request: @import("operation.zig").RequestContext,
+        request: @import("antfly_local_sources").api_operation.RequestContext,
     ) !std.json.Parsed(@import("restore_owner.zig").Prepared) {
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
@@ -3965,7 +4074,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .initial_child_bootstrap_json = .fromSlice(descriptor.initial_child_bootstrap_json),
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
-            .online_source_authority = @intFromEnum(self.online_source_authority),
+            .online_source_authority = @backingInt(self.online_source_authority),
             .row_policy_authority_secret = .fromSlice(self.row_policy_authority_secret orelse ""),
             .row_policy_authority_issuer = .fromSlice(self.row_policy_authority_issuer orelse ""),
             .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
@@ -4107,13 +4216,13 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
-        const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
+        const request_json = try @import("antfly_local_sources").api_local_query_contract.encodeStorageKernelQueryRequestForExecution(alloc, req, raw_search_result);
         defer alloc.free(request_json);
         var lease = try self.acquireWithControls(group_id, table_name, .from(req));
         defer lease.deinit();
         try table_reads.checkQueryDeadline(req);
         var cancellation = req.cancellation;
-        var execution = @import("../storage/local_query_controls.zig").executionOptions(req);
+        var execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(req);
         execution.raw_search_result = @intFromBool(raw_search_result);
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,
@@ -4221,7 +4330,12 @@ pub const ProvisionedKernelOwnerSource = struct {
             defer response.deinit();
             return .{ .json = try alloc.dupe(u8, response.bytes()), .version = response.version(), .expected_content_digest = response.expectedContentDigest() };
         }
-        return try lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency);
+        // The route was authenticated above. A missing descriptor during
+        // owner admission is a topology/availability race, never a row miss.
+        return lookupGroupLocal(ptr, alloc, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
+            error.TableNotFound => error.StorageReadTemporarilyUnavailable,
+            else => err,
+        };
     }
 
     fn publishedHandoffReceiptReadCertified(key: []const u8, opts: db_types.LookupOptions, consistency: read_gate.ReadConsistency) bool {
@@ -4243,7 +4357,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.normalize(alloc, writes);
         }
-        fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+        fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.rangeProofs(alloc);
         }
@@ -4266,7 +4380,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
 
-        fn validate(ptr: *anyopaque) !void {
+        pub fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validateLocal(self);
             if (self.frozen_proof) |proof| {
@@ -4299,7 +4413,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
 
-        fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+        fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const frozen_proof = self.frozen_proof orelse return error.SqlStatementSnapshotRequired;
             try validate(self);
@@ -4327,7 +4441,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         source: *ProvisionedKernelOwnerSource,
         owner: Lease,
-        native: @import("../storage/statement_read_fence.zig").Snapshot,
+        native: @import("antfly_local_sources").storage_statement_read_fence.Snapshot,
         route: metadata_api.CatalogRouteFence,
         group: u64,
         table: []u8,
@@ -4370,7 +4484,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             const proofs = try view.rangeProofs(alloc);
             errdefer alloc.free(proofs);
             if (proofs.len == 0) return error.SqlRangeTrackingRequired;
-            const owners = try alloc.alloc(@import("range_read_guards.zig").OwnerRangeProof, 1);
+            const owners = try alloc.alloc(@import("antfly_local_sources").api_range_read_guards.OwnerRangeProof, 1);
             owners[0] = .{ .fence = self.route, .proofs = proofs };
             return .{ .view = view, .owner_proofs = owners };
         }
@@ -4656,14 +4770,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         try self.prepareLookupRead(group_id, key, opts, consistency);
         const request_json = try table_reads.encodeStorageKernelLookupRequest(alloc, key, opts);
         defer alloc.free(request_json);
+        var controls = ReadControls.from(opts);
+        controls.allow_deferred_catalog = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"identity\"}") or
+            std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_publication\"}") or
+            fkGenerationSourceDeferredLookupAllowed(key, opts, consistency);
+        try controls.check();
         var lease = if (std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_preflight\"}") or
             std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"initial_child_publication\"}"))
             try self.acquirePreparedOwner(group_id, table_name)
         else
-            try self.acquireWithControls(group_id, table_name, .{ .allow_deferred_catalog = std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"identity\"}") or
-                std.mem.eql(u8, opts.relational_topology_json, "{\"mode\":\"generation_publication\"}") or
-                fkGenerationSourceDeferredLookupAllowed(key, opts, consistency) });
+            try self.acquireWithControls(group_id, table_name, controls);
         defer lease.deinit();
+        try controls.check();
         var response = lease.owner().lookupJson(table_name, request_json) catch |err| switch (err) {
             error.NotFound => return null,
             else => return err,
@@ -4688,10 +4806,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, if (handoff_receipt) .resolve else .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });
         defer descriptor.deinit(alloc);
         if (handoff_receipt) {
-            var parsed = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
+            var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
             defer parsed.deinit();
             try parsed.value.validate();
-            if (!parsed.value.scope.empty_generation or parsed.value.empty_generation_handoff == null)
+            if (parsed.value.empty_generation_handoff == null)
                 return error.RestoreStagingScopeChanged;
         }
         const identity = descriptor.view().identity;
@@ -4877,7 +4995,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         metadata_prepared: bool,
-        entry: ?db_types.RaftAppliedEntryIdentity,
+        entry: ?db_types.OrderedApplyReceipt,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var lease = if (metadata_prepared)
@@ -4920,7 +5038,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: ?descriptor_contract.Descriptor,
     ) !?void {
         if (self.replication_write_gate) |gate| try gate.check();
-        var replication_mutation = if (self.ha_async_mirror) |mirror|
+        var replication_mutation = if (self.hot_standby_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
         else
             null;
@@ -4975,7 +5093,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn preflightHotStandbyMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         try mirror.publisher.preflightRecordingDecision(mirror);
     }
 
@@ -5006,7 +5124,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
         identity: Identity,
     ) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         const transition_mutex = mirror.transition_mutex;
         if (transition_mutex) |mutex| lock(mutex);
         var transition_locked = transition_mutex != null;
@@ -5014,7 +5132,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         const payload = replication_effects.encodeBatchMutationRequestAlloc(self.alloc, req) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
         defer self.alloc.free(payload);
@@ -5023,10 +5141,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_id = identity.table_id,
         }) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
 
         if (transition_mutex) |mutex| {
             mutex.unlock();
@@ -5045,7 +5163,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         replay_payload: []const u8,
         identity: Identity,
     ) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         const transition_mutex = mirror.transition_mutex;
         if (transition_mutex) |mutex| lock(mutex);
         var transition_locked = transition_mutex != null;
@@ -5056,10 +5174,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_id = identity.table_id,
         }) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
 
         if (transition_mutex) |mutex| {
             mutex.unlock();
@@ -5078,7 +5196,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn noteReplicationMirrorFailure(mirror: replication_contract.AsyncEffectMirror, err: anyerror) void {
-        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        mirror.noteFailure();
         std.log.warn("failed to mirror compiled-owner commit into HA stream: {s}", .{@errorName(err)});
     }
 
@@ -5439,7 +5557,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         return null;
     }
 
-    fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+    pub fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+        if (req.restore_staging) |control| switch (control) {
+            .finish => return .resolve,
+            else => {},
+        };
         // Empty-generation admission is installed after old-owner cutover,
         // while the target is still private. This is a bounded Plan-bound
         // recovery control, not a new import mutation; the storage apply
@@ -5504,7 +5626,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         topology_epoch: u64,
         retain_terminal: bool,
         participants: []const []const u8,
-        context: @import("distributed_txn_contract.zig").PreDecisionContext,
+        context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
@@ -5609,7 +5731,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: @import("distributed_txn_contract.zig").TxnStatusRequest,
+        req: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest,
         context: request_operation.RequestContext,
     ) !?db_types.TxnStatus {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
@@ -6128,7 +6250,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 };
 
 test "compiled owner coordinated ttl admission preserves exact observations and pressure" {
-    const ttl = @import("../storage/coordinated_ttl.zig");
+    const ttl = @import("../storage/server_coordinated_ttl.zig");
     const Fake = struct {
         calls: usize = 0,
         pressure: bool = false,
@@ -6143,7 +6265,7 @@ test "compiled owner coordinated ttl admission preserves exact observations and 
             try std.testing.expectEqualStrings("\x00\xffkey", request.candidates[0].key);
             try std.testing.expectEqual(@as(u64, 99), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 44), request.candidates[0].ttl_timestamp_ns);
-            try std.testing.expectEqual([_]u8{0xa7} ** 32, request.candidates[0].expected_content_digest);
+            try std.testing.expectEqual(@as([32]u8, @splat(0xa7)), request.candidates[0].expected_content_digest);
             self.calls += 1;
             return 0;
         }
@@ -6167,7 +6289,7 @@ test "compiled owner coordinated ttl admission preserves exact observations and 
 
 test "storage owner quiesce drains leases and promotion callbacks before context destruction" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-quiesce");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-quiesce");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
     var source = ProvisionedKernelOwnerSource.init(alloc, path, table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
@@ -6362,6 +6484,21 @@ test "committed owner apply never opens or closes storage under the raft apply l
             platform_sync.lockYielding(&self.raft_mutex);
             self.raft_mutex.unlock();
         }
+
+        fn applyCommitted(self: *@This(), owner_source: *Source, descriptor: descriptor_contract.Descriptor, batch: db_types.BatchRequest, index: u64) !void {
+            const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(std.testing.allocator, 1, "docs", descriptor, batch, 1, index) catch |err| switch (err) {
+                    error.RaftApplyWriterUnavailable => {
+                        if (platform_time.monotonicNs() >= deadline) return error.TestOwnerDidNotAdmit;
+                        try self.io.sleep(.fromMilliseconds(1), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+        }
     };
     var gate = Gate{ .io = io };
     defer {
@@ -6385,28 +6522,39 @@ test "committed owner apply never opens or closes storage under the raft apply l
         .key = "doc:a",
         .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
     }} };
-    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
-    try gate.cold_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // A bounded admission rejection need not enqueue an open: the registry
+    // itself may be busy. Force that history, then retry the same committed
+    // entry just as the progress driver does until the control worker enters.
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+        try std.testing.expectEqual(@as(usize, 0), source.apply_control_pending.items.len);
+    }
+    const cold_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.cold_entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+        if (platform_time.monotonicNs() >= cold_deadline) return error.TestColdOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     // The worker is held before physical open; a repeated committed apply
     // remains a bounded retry and cannot itself open the owner.
     try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
     gate.cold_release.set(io);
-    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
-                if (platform_time.monotonicNs() >= deadline) return error.TestColdOwnerDidNotOpen;
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
+    try gate.applyCommitted(&source, first, first_batch, 1);
     // A different group's cold open can hold the owner registry while a
     // recovery callback awaits Raft progress. The already-admitted apply
     // lease must be releasable even in that exact lock order.
-    var warm_lease = try source.acquireApplyOnly(1, "docs", first);
+    const lease_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var warm_lease = while (true) {
+        const lease = source.acquireApplyOnly(1, "docs", first) catch |err| {
+            try std.testing.expect(err == error.RaftApplyWriterUnavailable);
+            if (platform_time.monotonicNs() >= lease_deadline) return error.TestWarmOwnerDidNotAdmit;
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        break lease;
+    };
     const Release = struct {
         lease: *Source.Lease,
         io: std.Io,
@@ -6455,22 +6603,22 @@ test "committed owner apply never opens or closes storage under the raft apply l
     }
     try apply.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
     try std.testing.expectEqual(@as(?anyerror, error.RaftApplyWriterUnavailable), apply.failure);
-    try gate.close_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // Retirement admission is also a retry, not proof that this attempt
+    // queued the descriptor. Keep Raft's mutex held while advancing the exact
+    // entry; physical close still belongs to the independent control worker.
+    const close_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.close_entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2));
+        if (platform_time.monotonicNs() >= close_deadline) return error.TestRetiredOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     gate.raft_mutex.unlock();
     raft_mutex_held = false;
     gate.close_release.set(io);
-    while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
-                if (platform_time.monotonicNs() >= deadline +| 5 * std.time.ns_per_s) return error.TestRetiredOwnerDidNotReopen;
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2);
+    try gate.applyCommitted(&source, second, second_batch, 2);
+    // Idempotency uses the same admission contract: the successful apply wakes
+    // release reconciliation, which can briefly contend with this retry.
+    try gate.applyCommitted(&source, second, second_batch, 2);
     var lease = try source.acquireDescriptorOnce(1, "docs", path, second, .shared, .resident, .{ .historical_raft_apply = true });
     defer lease.deinit();
     var value = try lease.owner().lookupJson("docs", "{\"key\":\"doc:a\",\"include_all_fields\":true}");
@@ -6699,15 +6847,15 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     defer alloc.free(root);
     var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.deinit();
-    const Bootstrap = @import("../storage/db/relational_initial_child_publication.zig").Bootstrap;
+    const Bootstrap = @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap;
     const expected: Bootstrap = .{
-        .plan_id = .{1} ** 16,
-        .plan_digest = .{2} ** 32,
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
         .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
         .schema_version = 1,
-        .schema_digest = .{3} ** 32,
-        .public_schema_json_digest = .{4} ** 32,
-        .catalog_digest = .{5} ** 32,
+        .schema_digest = @splat(3),
+        .public_schema_json_digest = @splat(4),
+        .catalog_digest = @splat(5),
     };
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
     defer alloc.free(bootstrap_json);
@@ -6723,7 +6871,7 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     try std.testing.expectEqualStrings(bootstrap_json, loaded.view().initial_child_bootstrap_json);
     try std.testing.expect(loaded.view().identity.eql(.{ .table_id = 7, .shard_id = 8, .range_id = 9 }));
     var wrong = expected;
-    wrong.plan_id = .{6} ** 16;
+    wrong.plan_id = @splat(6);
     try std.testing.expectError(error.InitialChildPublicationChanged, source.loadInitialChildDescriptor(alloc, 1, "hidden", wrong));
 }
 
@@ -7414,15 +7562,15 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
         fn owns(_: *anyopaque, _: []const u8) bool {
             return true;
         }
-        fn resolve(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: @import("../storage/db/types.zig").TxnStatus, _: u64) !void {}
-        fn single(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: []const u8) !void {
+        fn resolve(_: *anyopaque, _: @import("antfly_local_sources").storage_db_types.TxnId, _: []const u8, _: @import("antfly_local_sources").storage_db_types.TxnStatus, _: u64) !void {}
+        fn single(_: *anyopaque, _: @import("antfly_local_sources").storage_db_types.TxnId, _: []const u8, _: []const u8) !void {
             return error.TestUnexpectedSingle;
         }
-        fn cleanup(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: u64, _: u64) !void {}
-        fn many(ptr: *anyopaque, txn: @import("../storage/db/types.zig").TxnId, owner: []const u8, participants: []const []const u8) !void {
+        fn cleanup(_: *anyopaque, _: @import("antfly_local_sources").storage_db_types.TxnId, _: []const u8, _: u64, _: u64) !void {}
+        fn many(ptr: *anyopaque, txn: @import("antfly_local_sources").storage_db_types.TxnId, owner: []const u8, participants: []const []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqual([_]u8{4} ** 16, txn);
+            try std.testing.expectEqual(@as([16]u8, @splat(4)), txn);
             try std.testing.expectEqualStrings("owner", owner);
             try std.testing.expectEqual(@as(usize, 2), participants.len);
             try std.testing.expectEqualStrings("first", participants[0]);

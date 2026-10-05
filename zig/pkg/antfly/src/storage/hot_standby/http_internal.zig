@@ -21,12 +21,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const http_operation = @import("http_operation.zig");
 const internal_api = @import("../../internal/mod.zig");
 const primary_mod = @import("primary.zig");
 const replication_api = @import("replication_api.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;
@@ -252,7 +252,7 @@ const StartReplicationDocument = struct {
     encoded_bytes: usize,
     records: []ReplicationFrameDocument,
 
-    fn deinit(self: *StartReplicationDocument, alloc: Allocator) void {
+    pub fn deinit(self: *StartReplicationDocument, alloc: Allocator) void {
         for (self.records) |*record| record.deinit(alloc);
         alloc.free(self.records);
         self.* = undefined;
@@ -265,7 +265,7 @@ const ReplicationFrameDocument = struct {
     payload_codec: []const u8,
     encoded: []const u8,
 
-    fn deinit(self: *ReplicationFrameDocument, alloc: Allocator) void {
+    pub fn deinit(self: *ReplicationFrameDocument, alloc: Allocator) void {
         alloc.free(self.encoded);
         self.* = undefined;
     }
@@ -418,7 +418,7 @@ const TestPaths = struct {
     primary_log: [:0]u8,
     primary_slots: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
     }
@@ -437,8 +437,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
     };
 }
 

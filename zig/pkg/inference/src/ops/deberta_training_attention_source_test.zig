@@ -173,10 +173,10 @@ fn checkCase(a: Allocator, reference: *const parity.TensorFixture, case: Case, i
     try std.testing.expectEqual(@as(usize, 5), case.gradient_leaf_order.len);
     for ([_][]const u8{ "q", "k", "v", "qr", "kr" }, case.gradient_leaf_order) |expected, actual|
         try std.testing.expectEqualStrings(expected, actual);
-    inline for (std.meta.fields(Names)) |field| {
-        const expected = try std.fmt.allocPrint(a, "{s}.{s}", .{ case.id, field.name });
+    inline for (comptime std.meta.fieldNames(Names)) |reflected_name| {
+        const expected = try std.fmt.allocPrint(a, "{s}.{s}", .{ case.id, reflected_name });
         defer a.free(expected);
-        try std.testing.expectEqualStrings(expected, @field(case.tensors, field.name));
+        try std.testing.expectEqualStrings(expected, @field(case.tensors, reflected_name));
     }
     const bs: i64 = @as(i64, case.batch) * sequence;
     const h: i64 = case.hidden_size;

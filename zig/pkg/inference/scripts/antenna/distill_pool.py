@@ -30,7 +30,12 @@ mix of the pinned permissive sources in ``SOURCES`` (and ``wikipedia`` with
 utterances, questions and web sentences for the text rows, and their intent,
 emotion, topic and free-form entity-type names for the marker rows. None is an
 evaluation dataset. NuNER sentences mostly get entity schemas built from
-their own annotated types plus random negatives. Rows are native
+their own annotated types plus random negatives. ``openjev`` adds typed
+decision states, each question a classification task over its options.
+
+``--label-sets label_sets.json`` makes every other classification row draw
+its labels from one real label set (the source's own, else a hand-written
+set) instead of mixing label and entity-type names. Rows are native
 boundary training rows (``boundary_dataset.zig`` version 1) with no
 annotations, split into train and validation, deduplicated by text, and
 limited to texts upstream's word splitter keeps whole.
@@ -108,8 +113,40 @@ SOURCES = {
         f"{HF}/fancyzhx/dbpedia_14/resolve/9abd46cf7fc8b4c64290f26993c540b92aa145ac/dbpedia_14/train-00000-of-00001.parquet",
         "0640e4664a99cc94c47db1d7b2e01c14455d5bbecb8183ad1f93bde59f3f28ee",
     ),
+    # CC0; Open-Jev rule-labelled typed decisions (release-v2-redistributable
+    # train split). Each record's question becomes a classification task over
+    # its options; customer-control-v1 is excluded (Open-Jev notes its
+    # question descriptions have no verified source license).
+    "openjev": (
+        f"{HF}/ZefanCai/Open-Jev/resolve/c67699e13d0ae25e35b77165a4b6b079bedc8aba/raw/release-v2-redistributable/train.jsonl.gz",
+        "e67c8aa8b31f341981d78c4da5fc07a195a6d1357ee37ca9d7fc5b2135d3fde5",
+    ),
 }
 NUNER_MIN_TYPE_COUNT = 20
+OPENJEV_EXCLUDED = ("customer-control-v1",)
+# Synthetic game and pixel generators; the workflow and reasoning sources are
+# closer to the decisions Antenna serves, so only a quarter of these are kept.
+OPENJEV_GAMES = (
+    "painting-geometry-v1",
+    "snake-v1",
+    "vizdoom-basic-v1",
+    "tic_tac_toe-v1",
+    "tile_platformer-v1",
+    "trex_runner-v1",
+)
+OPENJEV_QUESTION_WORDS = 24
+OPENJEV_OPTION_WORDS = 8
+# Task names for sources whose texts carry their own label set.
+SOURCE_TASKS = {
+    "banking77": "intent",
+    "ag_news": "topic",
+    "massive": "intent",
+    "go_emotions": "emotion",
+    "dbpedia": "topic",
+    "huffpost": "topic",
+}
+# Sources loaded through antenna_training_sets.py (pinned there).
+TRAINING_SET_SOURCES = ("huffpost",)
 
 
 def wikipedia_passages(path: Path, limit: int) -> list[str]:
@@ -174,8 +211,40 @@ def _parquet_names(data: bytes, column: str) -> list[str]:
     return list(features.get("names") or features["feature"]["names"])
 
 
+def _schema_name(value: str, words: int) -> str:
+    """A schema name the native compiler accepts: no brackets or parentheses
+    (reserved markers and label syntax), single spaces, at most ``words``."""
+    cleaned = "".join(" " if c in "()[]" else c for c in value)
+    return " ".join(cleaned.split()[:words])
+
+
+def _openjev_task(record: dict[str, Any]) -> tuple[str, list[str], str, str] | None:
+    """(question, option labels, kind, source), or None when the options do
+    not make at least two distinct labels."""
+    import ast
+
+    options = record["options"]
+    if isinstance(options, str):
+        options = ast.literal_eval(options)
+    kind = record["kind"]
+    if kind == "noul":
+        labels = ["no", "yes"]
+    elif kind == "choice" and all(": " in o for o in options):
+        labels = [o.split(": ", 1)[0] for o in options]
+    else:
+        labels = list(options)
+    labels = [_schema_name(label, OPENJEV_OPTION_WORDS) for label in labels]
+    labels = [label for label in dict.fromkeys(labels) if label]
+    question = _schema_name(record["question"], OPENJEV_QUESTION_WORDS)
+    if len(labels) < 2 or not question:
+        return None
+    return question, labels, kind, record["source"]
+
+
 def load_source(name: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
-    """([(text, own entity types)], label names) for a pool source."""
+    """([(text, own entity types)], label names) for a pool source.
+
+    Open-Jev items carry a third element, their ``_openjev_task``."""
     import ast
     import csv
     import gzip
@@ -183,6 +252,13 @@ def load_source(name: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
 
     import pyarrow.parquet as pq
 
+    if name in TRAINING_SET_SOURCES:
+        import antenna_training_sets
+
+        records = antenna_training_sets.load_classification(name)
+        return [(record["text"], []) for record in records], (
+            antenna_training_sets.label_names(name)
+        )
     data = _fetch(name)
     if name == "nuner":
         csv.field_size_limit(1 << 24)
@@ -198,6 +274,20 @@ def load_source(name: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
                 if " <> " in part
             ]
             items.append((row["input"], list(dict.fromkeys(t for t in types if t))))
+        return items, []
+    if name == "openjev":
+        items = []
+        for line in gzip.decompress(data).decode("utf-8").splitlines():
+            record = json.loads(line)
+            if record["source"] in OPENJEV_EXCLUDED:
+                continue
+            task = _openjev_task(record)
+            state = record["state"]
+            # Rendered as scripts/laya/prepare_laya_openjev.py renders it.
+            if not isinstance(state, str):
+                state = json.dumps(state, ensure_ascii=False)
+            if task is not None and state.strip():
+                items.append((state, [], task))
         return items, []
     if name == "massive":
         rows = [
@@ -240,6 +330,29 @@ def _interleave(rng: random.Random, groups: list[list[Any]]) -> list[Any]:
     return mixed
 
 
+def _coherent_task(
+    rng: random.Random,
+    label_sets: list[tuple[str, list[str]]],
+    native: list[str],
+    source: str,
+) -> dict[str, Any]:
+    """One classification task drawn from a single real label set: the
+    source's own when it has one, otherwise a random set. A quarter of tasks
+    get one or two distractor labels from another set."""
+    if native:
+        task, pool = SOURCE_TASKS.get(source, "category"), native
+    else:
+        task, pool = rng.choice(label_sets)
+    count = min(len(pool), rng.randint(4, 16))
+    labels = rng.sample(pool, count)
+    if rng.random() < 0.25:
+        _, other = rng.choice(label_sets)
+        spare = [label for label in other if label not in labels]
+        labels += rng.sample(spare, min(len(spare), rng.randint(1, 2)))
+    rng.shuffle(labels)
+    return {"name": task, "labels": labels}
+
+
 def build_mix(args: argparse.Namespace) -> dict[str, Any]:
     from collections import Counter
 
@@ -255,6 +368,14 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
     types = {
         kind for dataset in TYPE_SETS for kind in datasets.entity_types(dataset)
     } | set(GENERIC_TYPES)
+    label_sets = (
+        [
+            (item["task"], item["labels"])
+            for item in json.loads(args.label_sets.read_text(encoding="utf-8"))["sets"]
+        ]
+        if args.label_sets
+        else []
+    )
     groups, counts, own_labels = [], {}, {}
     for name, rows in requested.items():
         if name in TEXT_SETS:
@@ -289,21 +410,50 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
             items = [(text, [t for t in own if t in common]) for text, own in items]
         labels |= set(names)
         own_labels[name] = names
+        if names and args.label_sets:
+            label_sets.append((SOURCE_TASKS.get(name, "category"), names))
+        if name == "openjev":
+            # Yes/no questions are 62% of Open-Jev; keep a third of them so
+            # option lists dominate the decision rows, and a quarter of the
+            # synthetic game rows.
+            def keep(task: tuple[str, list[str], str, str]) -> bool:
+                share = (1 / 3 if task[2] == "noul" else 1.0) * (
+                    0.25 if task[3] in OPENJEV_GAMES else 1.0
+                )
+                return rng.random() < share
+
+            items = [item for item in items if keep(item[2])]
         rng.shuffle(items)
         items = [
-            (name, text, own)
-            for text, own in items
-            if len(list(splitter(text, lower=False))) <= args.max_words
+            (name, item[0], item[1], item[2] if len(item) > 2 else None)
+            for item in items
+            if len(list(splitter(item[0], lower=False))) <= args.max_words
         ][: int(rows)]
         counts[name] = len(items)
         groups.append(items)
     labels, types = sorted(labels), sorted(types)
     seen: set[str] = set()
     rows = []
-    for name, text, own in _interleave(rng, groups):
-        if text in seen:
+    for name, text, own, task in _interleave(rng, groups):
+        if task is not None:
+            # A decision's state repeats across its questions; keep each question.
+            key = f"{text}\u0000{task[0]}"
+        else:
+            key = text
+        if key in seen:
             continue
-        seen.add(text)
+        seen.add(key)
+        if task is not None:
+            schema = {"classifications": [{"name": task[0], "labels": task[1]}]}
+            rows.append(
+                {
+                    "version": 1,
+                    "id": f"pool-{len(rows)}",
+                    "text": text,
+                    "schema": schema,
+                }
+            )
+            continue
         entity = rng.random() < (0.8 if own else args.entity_share)
         if entity:
             count = rng.randint(2, 10)
@@ -313,6 +463,12 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
             )
             rng.shuffle(chosen)
             schema = {"entities": chosen}
+        elif label_sets:
+            schema = {
+                "classifications": [
+                    _coherent_task(rng, label_sets, own_labels[name], name)
+                ]
+            }
         else:
             count = rng.randint(4, 16)
             native = own_labels[name]
@@ -343,6 +499,12 @@ def build_mix(args: argparse.Namespace) -> dict[str, Any]:
                 for name in requested
             },
             "label_names": len(labels),
+            "label_sets": {
+                "count": len(label_sets),
+                "sha256": oracle.sha256_file(args.label_sets),
+            }
+            if args.label_sets
+            else None,
             "entity_types": len(types),
             "wikipedia": {
                 "sha256": WIKIPEDIA_SHA256,
@@ -447,7 +609,13 @@ def write(
     import antenna_datasets as datasets
 
     validation_count = max(1, int(len(rows) * args.validation_fraction))
-    splits = {"validation": rows[:validation_count], "train": rows[validation_count:]}
+    # Rows sharing a text (an Open-Jev state's questions) stay in one split:
+    # the trainer rejects a text present in both.
+    held = {row["text"] for row in rows[:validation_count]}
+    splits = {
+        "validation": [row for row in rows if row["text"] in held],
+        "train": [row for row in rows if row["text"] not in held],
+    }
     with oracle.atomic_output_directory(args.output) as directory:
         files = {}
         for split, items in splits.items():
@@ -509,7 +677,12 @@ def main() -> int:
         action="append",
         default=[],
         metavar="NAME=ROWS",
-        help=f"sampled source mix instead of the default texts: {', '.join(TEXT_SETS + ('wikipedia',) + tuple(SOURCES))}",
+        help=f"sampled source mix instead of the default texts: {', '.join(TEXT_SETS + ('wikipedia',) + tuple(SOURCES) + TRAINING_SET_SOURCES)}",
+    )
+    parser.add_argument(
+        "--label-sets",
+        type=Path,
+        help="coherent classification label sets (label_sets.json); --source mixes only",
     )
     print(json.dumps(build(parser.parse_args()), sort_keys=True))
     return 0

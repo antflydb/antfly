@@ -18,8 +18,8 @@
 //! and its periodic expiry task must outlive every RPC task using this owner.
 const std = @import("std");
 const registry_mod = @import("../storage/retained_read_registry.zig");
-const reads = @import("table_read_source.zig");
-const types = @import("../storage/db/types.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const types = @import("antfly_local_sources").storage_db_types;
 const metadata = @import("../metadata/api.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const time = @import("antfly_platform").time;
@@ -74,7 +74,7 @@ pub const Owner = struct {
     const Snapshot = struct {
         alloc: std.mem.Allocator,
         cancelled: std.atomic.Value(bool) = .init(false),
-        snapshot: @import("../storage/statement_read_fence.zig").Snapshot,
+        snapshot: @import("antfly_local_sources").storage_statement_read_fence.Snapshot,
 
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -227,7 +227,7 @@ pub const Owner = struct {
         return page;
     }
 
-    pub fn rangeProofs(self: Owner, alloc: std.mem.Allocator, scope: registry_mod.Scope, token: registry_mod.Token) ![]@import("../storage/range_protection.zig").Proof {
+    pub fn rangeProofs(self: Owner, alloc: std.mem.Allocator, scope: registry_mod.Scope, token: registry_mod.Token) ![]@import("antfly_local_sources").storage_range_protection.Proof {
         var borrow = try self.registry.borrow(token, scope, .cursor, time.monotonicNs());
         defer borrow.deinit();
         const cursor: *Cursor = @ptrCast(@alignCast(borrow.resource.ptr));
@@ -280,7 +280,7 @@ fn consumerTests() type {
                     try std.testing.expectEqual(self.capture_token.ptr, route.admission_cancellation.ptr);
                     return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .capture_snapshot = captureSnapshot, .release = release } };
                 }
-                fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+                fn captureSnapshot(ptr: *anyopaque, _: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try self.capture_token.check();
                     return .{ .ptr = self, .vtable = &.{ .open = open, .release = releaseSnapshot } };
@@ -289,7 +289,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.snapshots_closed += 1;
                 }
-                fn validate(ptr: *anyopaque) !void {
+                pub fn validate(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try self.capture_token.check();
                 }

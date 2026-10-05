@@ -77,17 +77,17 @@ pub const ReplicaRuntimePolicy = struct {
         self: ReplicaRuntimePolicy,
         desired: ReplicaRuntimePolicy,
     ) ?ReplicaRuntimePolicyField {
-        inline for (std.meta.fields(ReplicaRuntimePolicy)) |field| {
-            if (!std.meta.eql(@field(self, field.name), @field(desired, field.name)))
-                return @field(ReplicaRuntimePolicyField, field.name);
+        inline for (comptime std.meta.fieldNames(ReplicaRuntimePolicy)) |reflected_name| {
+            if (!std.meta.eql(@field(self, reflected_name), @field(desired, reflected_name)))
+                return @field(ReplicaRuntimePolicyField, reflected_name);
         }
         return null;
     }
 
     pub fn fingerprint(self: ReplicaRuntimePolicy) u64 {
         var hasher = std.hash.Wyhash.init(0x726166745f706f6c);
-        inline for (std.meta.fields(ReplicaRuntimePolicy)) |field| {
-            std.hash.autoHash(&hasher, @field(self, field.name));
+        inline for (comptime std.meta.fieldNames(ReplicaRuntimePolicy)) |reflected_name| {
+            std.hash.autoHash(&hasher, @field(self, reflected_name));
         }
         return hasher.final();
     }

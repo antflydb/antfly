@@ -280,7 +280,7 @@ fn appendFrame(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), record: Recor
     std.mem.writeInt(u16, frame[6..8], frame_header_len, .big);
     std.mem.writeInt(u32, frame[8..12], @intCast(total_len), .big);
     @memset(frame[12..16], 0);
-    frame[16] = @intFromEnum(record.kind);
+    frame[16] = @backingInt(record.kind);
     @memset(frame[17..24], 0);
     std.mem.writeInt(u64, frame[24..32], record.batch_id, .big);
     std.mem.writeInt(u64, frame[32..40], record.source_sequence, .big);
@@ -306,11 +306,11 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
     if (std.mem.readInt(u32, frame[12..16], .big) != Crc32.hash(frame[16..])) return error.VectorWalChecksumMismatch;
     for (frame[17..24]) |reserved| if (reserved != 0) return error.UnsupportedVectorWalFlags;
     const kind: Kind = switch (frame[16]) {
-        @intFromEnum(Kind.upsert) => .upsert,
-        @intFromEnum(Kind.reference) => .reference,
-        @intFromEnum(Kind.tombstone) => .tombstone,
-        @intFromEnum(Kind.coverage) => .coverage,
-        @intFromEnum(Kind.commit) => .commit,
+        @backingInt(Kind.upsert) => .upsert,
+        @backingInt(Kind.reference) => .reference,
+        @backingInt(Kind.tombstone) => .tombstone,
+        @backingInt(Kind.coverage) => .coverage,
+        @backingInt(Kind.commit) => .commit,
         else => return error.InvalidVectorWalRecord,
     };
     const key_len: usize = @intCast(std.mem.readInt(u32, frame[56..60], .big));

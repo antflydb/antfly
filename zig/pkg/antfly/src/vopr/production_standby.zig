@@ -20,15 +20,15 @@ const std = @import("std");
 const runtime = @import("../data/runtime.zig");
 const admin_api = @import("../admin/mod.zig");
 const hot_standby = @import("../storage/hot_standby/mod.zig");
-const storage_io = @import("../storage/lsm_backend/storage_io.zig");
-const wal = @import("../storage/wal.zig");
-const http = @import("../common/http/http_common.zig");
+const storage_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+const wal = @import("antfly_local_sources").storage_wal;
+const http = @import("antfly_local_sources").common_http_http_common;
 const catalog = @import("../api/table_catalog.zig");
 const api = @import("../api/http_server.zig");
 const metadata_api = @import("../metadata/api.zig");
 const table_manager = @import("../metadata/table_manager.zig");
 const api_client = @import("../api/http_client.zig");
-const background = @import("../storage/background_runtime.zig");
+const background = @import("antfly_local_sources").storage_background_runtime;
 
 pub const Owners = struct {
     pub const token = "vopr-standby-scaling-admin";
@@ -95,7 +95,7 @@ pub const Owners = struct {
         self.io.sleep(.fromNanoseconds(@intCast(ns)), .awake) catch unreachable;
     }
 
-    pub fn primaryConfig(self: *Owners) runtime.DataServerHAConfig {
+    pub fn primaryConfig(self: *Owners) runtime.DataServerHotStandbyConfig {
         const primary = &self.primary.?;
         return .{
             .admin_context = .{ .primary = primary, .primary_node_id = "primary", .fence_store = &self.fences.? },
@@ -131,7 +131,7 @@ pub const Owners = struct {
             .replica_root_dir = self.primary_root,
             .backend_runtime = backend,
             .api_server_cfg = .{ .admin_bearer_token = token },
-            .ha = self.primaryConfig(),
+            .hot_standby = self.primaryConfig(),
         }, self.catalogSource(), self.statusSource());
         try self.primary_server.?.startPublicHttp();
         self.primary_uri = try self.primary_server.?.baseUri(self.alloc);
@@ -160,7 +160,7 @@ pub const Owners = struct {
             .replica_root_dir = self.replica_root,
             .api_server_cfg = .{},
             .backend_runtime = backend,
-            .ha = .{
+            .hot_standby = .{
                 .admin_context = .{ .standby = &self.standby.?, .standby_node_id = "standby", .fence_store = &self.fences.? },
                 .standby_owner = &self.standby,
                 .admin_bearer_token = token,
@@ -172,7 +172,7 @@ pub const Owners = struct {
     }
 
     pub fn catchUp(self: *Owners, executor: http.RequestExecutor, upstream: []const u8) !void {
-        _ = try self.server.?.replicateHAStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
+        _ = try self.server.?.replicateHotStandbyStandbyUntilCaughtUp(executor, upstream, "standby", .{ .max_records = 8 });
         if (self.primary.?.lastLsn() == 0) return error.ProductionStandbyEmptyReplicationStream;
         const progress = self.standby.?.currentProgress();
         self.observed_progress = progress;
@@ -229,9 +229,9 @@ pub const Owners = struct {
         self.fences = null;
         self.fences = try hot_standby.fencing.Store.open(self.alloc, fence_path, .{ .wal_options = self.options });
         try self.standbyAdmin(executor, 200);
-        if (self.standby != null or self.server.?.ha_promoted_primary == null)
+        if (self.standby != null or self.server.?.hot_standby_promoted_primary == null)
             return error.ProductionStandbyPromotionNotAdopted;
-        const promoted = &self.server.?.ha_promoted_primary.?;
+        const promoted = &self.server.?.hot_standby_promoted_primary.?;
         self.promoted_lsn = promoted.lastLsn();
         self.promoted_sound = promoted.identity.timeline_id == 2 and
             promoted.identity.epoch == 2 and promoted.lastLsn() > self.boundary;
@@ -288,7 +288,11 @@ fn testProductionOwners(cancel_after_promotion: bool) !void {
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standby", .{tmp.sub_path});
     defer alloc.free(root);
-    var vopr_io = try vopr.vopr_io.VoprIo.init(.{ .tasks = .{ .stack_size = 8 * 1024 * 1024 } });
+    // Match the 32 MiB headroom used by the other production-shaped
+    // DataServer VOPR campaigns (data/runtime.zig, vopr/data_server.zig):
+    // 8 MiB overflowed under Debug codegen on the equivalent single-server
+    // Raft-merge campaign.
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{ .tasks = .{ .stack_size = 32 * 1024 * 1024 } });
     defer vopr_io.deinit();
     var backend = try background.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = vopr_io.io() }, .filesystem_io = vopr_io.io() });
     var backend_live = true;

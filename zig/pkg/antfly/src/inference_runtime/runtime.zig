@@ -1,24 +1,24 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const preload_model_spec = @import("../common/preload_model_spec.zig");
-const process_memory_budget = @import("../common/process_memory_budget.zig");
+const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
 const httpx = @import("httpx");
@@ -97,8 +97,8 @@ const BudgetOverridesMb = struct {
     scratch_budget_mb: usize = 0,
 };
 
-pub const parseBackendType = runtime_paths.parseBackendType;
-pub const parseOptionalBackendType = runtime_paths.parseOptionalBackendType;
+pub const parseBackendType = inference.backends.BackendType.parse;
+pub const parseOptionalBackendType = inference.backends.BackendType.parseOptional;
 
 fn parseKernelJitMode(value: []const u8) !inference.graph.kernel_jit.Mode {
     return std.meta.stringToEnum(inference.graph.kernel_jit.Mode, value) orelse error.InvalidArguments;
@@ -221,8 +221,9 @@ fn resolveRunKeepAliveMs(config: ?*const common_config.Config) !u64 {
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(inference.server.WarmModelKind).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, value, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -803,7 +804,7 @@ pub fn spawnServerProcess(
     };
 }
 
-fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const configured_models_dir = try parseListModelsDir(args);
     const models_dir: []const u8 = configured_models_dir orelse defaultModelsDir(alloc);
 

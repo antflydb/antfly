@@ -227,7 +227,7 @@ const WeightCache = struct {
         return value;
     }
 
-    fn deinit(self: *WeightCache, a: Allocator, cb: *const ops.ComputeBackend) void {
+    pub fn deinit(self: *WeightCache, a: Allocator, cb: *const ops.ComputeBackend) void {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             cb.free(entry.value_ptr.*);

@@ -17,8 +17,8 @@
 //! Raft state is the job journal: a lost response is reconciled from a fresh
 //! leader read-index snapshot, never from a coordinator-local cursor.
 const std = @import("std");
-const policies = @import("../system_catalog/policies.zig");
-const Receipt = @import("../storage/db/row_policy_bundle.zig").Receipt;
+const policies = @import("antfly_local_sources").system_catalog_policies;
+const Receipt = @import("antfly_local_sources").storage_db_row_policy_bundle.Receipt;
 
 pub const Port = struct {
     ptr: *anyopaque,

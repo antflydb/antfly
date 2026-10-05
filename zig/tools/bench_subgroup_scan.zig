@@ -1,3 +1,18 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Offline combined-cost screen on an authenticated immutable AFPS directory.
 //! Borrowed leaf bytes remain owned for the whole run. This is not a live
 //! generation-lease/recovery test and does not measure exact completion/recall.
@@ -71,7 +86,7 @@ pub fn main(init: std.process.Init) !void {
     var directory = try vi.quantized_directory.VerifiedReader.init(alloc, directory_bytes);
     defer directory.deinit();
     const dims = directory.reader.dims;
-    if (dims != metadata.dims or directory.reader.metric != metadata.metric or directory.reader.metric != @intFromEnum(vector.vector.DistanceMetric.cosine) or dims > 4096) return error.UnsupportedDirectory;
+    if (dims != metadata.dims or directory.reader.metric != metadata.metric or directory.reader.metric != @backingInt(vector.vector.DistanceMetric.cosine) or dims > 4096) return error.UnsupportedDirectory;
     var leaves: std.ArrayList(Leaf) = .empty;
     var groups: std.ArrayList(Group) = .empty;
     var total_rows: u64 = 0;
@@ -96,7 +111,7 @@ pub fn main(init: std.process.Init) !void {
     const fixture_groups: usize = word(fixture, 4);
     const encoded_query_count: usize = word(fixture, 12);
     if (fixture_groups > 8192 or encoded_query_count == 0 or encoded_query_count > 256 or fixture.len != 16 + (fixture_groups + encoded_query_count) * dims * 4) return error.InvalidFixture;
-    const debug = @import("builtin").mode == .Debug;
+    const debug = @import("builtin").mode == .debug;
     const query_count = if (debug) @min(encoded_query_count, 4) else encoded_query_count;
     const queries = try alloc.alloc(f32, query_count * dims);
     const approx_queries = try alloc.alloc(f32, queries.len);

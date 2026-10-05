@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Internal-only, bounded transport contract for hosted initial-FK retirement.
 //! These messages do not authorize deletion by themselves. The endpoint must
@@ -232,7 +232,7 @@ test "hosted initial FK retirement wire bounds exact store cursor and ACK" {
     bad_cursor[cursor.len - 1] = 'G';
     try std.testing.expectError(error.InvalidInitialFkRetirementPage, validateCursor(1, 13, bad_cursor[0..cursor.len]));
 
-    const identity = @import("../storage/db/root_signing_identity.zig");
+    const identity = @import("antfly_local_sources").storage_db_root_signing_identity;
     const seed: [32]u8 = @splat(7);
     const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: identity.State = .{

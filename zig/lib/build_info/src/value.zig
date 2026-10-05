@@ -15,7 +15,7 @@
 
 const metadata = @import("metadata");
 
-fn version(length: *usize) callconv(.c) [*]const u8 {
+pub fn version(length: *usize) callconv(.c) [*]const u8 {
     length.* = metadata.version.len;
     return metadata.version.ptr;
 }

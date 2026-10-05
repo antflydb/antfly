@@ -19,9 +19,9 @@ const std = @import("std");
 const wire = @import("antfly_indexes_openapi").types;
 const metadata = @import("../metadata/table_manager.zig");
 const tables = @import("tables.zig");
-const reads = @import("table_read_source.zig");
-const operation = @import("operation.zig");
-const native = @import("../storage/db/relational_index_status_contract.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const operation = @import("antfly_local_sources").api_operation;
+const native = @import("antfly_local_sources").storage_db_relational_index_status_contract;
 
 /// Initial FK publication accepts a parent-owner stage (or self-parent child
 /// release) only after the exact schema-bound witness index is ready in that
@@ -71,7 +71,7 @@ test "relational index status initial FK owner readiness rejects building and st
     try std.testing.expectError(error.GenerationAdmissionPending, requireInitialFkSupportReady(status, 51, 3, "a", "zz", comparison));
 }
 
-pub fn expectedComparison(alloc: std.mem.Allocator, parsed: @import("../schema/mod.zig").ParsedTableSchema, name: []const u8) ![32]u8 {
+pub fn expectedComparison(alloc: std.mem.Allocator, parsed: @import("antfly_local_sources").schema_mod.ParsedTableSchema, name: []const u8) ![32]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const temporary = arena.allocator();
@@ -79,18 +79,18 @@ pub fn expectedComparison(alloc: std.mem.Allocator, parsed: @import("../schema/m
     const definition = for (declarations) |definition| {
         if (std.mem.eql(u8, definition.name, name)) break definition;
     } else return error.IndexNotFound;
-    const runtime_schema = try @import("../schema/mod.zig").deriveRelationalCheckLayout(temporary, parsed);
-    var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(temporary, runtime_schema);
+    const runtime_schema = try @import("antfly_local_sources").schema_mod.deriveRelationalCheckLayout(temporary, parsed);
+    var layout = try @import("antfly_local_sources").storage_db_algebraic_relational_row_codec.PhysicalLayout.init(temporary, runtime_schema);
     defer layout.deinit();
-    var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(temporary, runtime_schema, &layout, definition.keys);
+    var tuple = try @import("antfly_local_sources").storage_db_relational_index_keys.TuplePlan.init(temporary, runtime_schema, &layout, definition.keys);
     defer tuple.deinit();
     try bindCoverFingerprint(temporary, runtime_schema, &layout, definition, &tuple.fingerprint);
     return tuple.fingerprint;
 }
 
-fn bindCoverFingerprint(alloc: std.mem.Allocator, runtime_schema: @import("../storage/schema.zig").TableSchema, layout: *const @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout, definition: @import("../storage/relational_index.zig").RelationalIndexDefinition, fingerprint: *[32]u8) !void {
+fn bindCoverFingerprint(alloc: std.mem.Allocator, runtime_schema: @import("antfly_local_sources").storage_schema.TableSchema, layout: *const @import("antfly_local_sources").storage_db_algebraic_relational_row_codec.PhysicalLayout, definition: @import("antfly_local_sources").storage_relational_index.RelationalIndexDefinition, fingerprint: *[32]u8) !void {
     if (definition.include_columns.len != 0) {
-        var cover = try @import("../storage/db/relational_index_cover.zig").Plan.init(alloc, runtime_schema, layout, definition.keys, definition.include_columns);
+        var cover = try @import("antfly_local_sources").storage_db_relational_index_cover.Plan.init(alloc, runtime_schema, layout, definition.keys, definition.include_columns);
         defer cover.deinit();
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update(fingerprint);
@@ -98,7 +98,7 @@ fn bindCoverFingerprint(alloc: std.mem.Allocator, runtime_schema: @import("../st
         hash.final(fingerprint);
     }
     if (definition.where.len != 0) {
-        var condition = try @import("../storage/db/relational_index_predicate.zig").Plan.init(alloc, runtime_schema, layout, definition.where);
+        var condition = try @import("antfly_local_sources").storage_db_relational_index_predicate.Plan.init(alloc, runtime_schema, layout, definition.where);
         defer condition.deinit();
         condition.bindFingerprint(fingerprint);
     }
@@ -124,20 +124,20 @@ pub fn collectAll(alloc: std.mem.Allocator, source: anytype, reader: reads.Table
 
 /// Shared /indexes already parsed the exact expected schema for its configs.
 /// Reuse that immutable request-owned value instead of parsing it a second time.
-pub fn collectAllWithParsedSchema(alloc: std.mem.Allocator, source: anytype, reader: reads.TableReadSource, name: []const u8, expected_schema: []const u8, parsed: @import("../schema/mod.zig").ParsedTableSchema, request: operation.RequestContext) !Collection {
+pub fn collectAllWithParsedSchema(alloc: std.mem.Allocator, source: anytype, reader: reads.TableReadSource, name: []const u8, expected_schema: []const u8, parsed: @import("antfly_local_sources").schema_mod.ParsedTableSchema, request: operation.RequestContext) !Collection {
     return collectSelected(alloc, source, reader, name, null, expected_schema, request, parsed);
 }
 
-fn collectSelected(alloc: std.mem.Allocator, source: anytype, reader: reads.TableReadSource, name: []const u8, index_name: ?[]const u8, expected_schema: []const u8, request: operation.RequestContext, borrowed_schema: ?@import("../schema/mod.zig").ParsedTableSchema) !Collection {
+fn collectSelected(alloc: std.mem.Allocator, source: anytype, reader: reads.TableReadSource, name: []const u8, index_name: ?[]const u8, expected_schema: []const u8, request: operation.RequestContext, borrowed_schema: ?@import("antfly_local_sources").schema_mod.ParsedTableSchema) !Collection {
     try request.ensureActive();
     var snapshot = (try source.adminSnapshot()) orelse return error.Unavailable;
     defer source.freeAdminSnapshot(&snapshot);
     const table = tables.findTableByName(&snapshot, name) orelse return error.TableNotFound;
     if (!std.mem.eql(u8, table.schema_json, expected_schema)) return error.PreparedGenerationChanged;
-    var owned_schema: ?@import("../schema/mod.zig").ParsedTableSchema = null;
+    var owned_schema: ?@import("antfly_local_sources").schema_mod.ParsedTableSchema = null;
     defer if (owned_schema) |*value| value.deinit(alloc);
     const parsed = borrowed_schema orelse blk: {
-        owned_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, table.schema_json);
+        owned_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
         break :blk owned_schema.?;
     };
     if (parsed.storage_mode != .relational) return error.RelationalTableRequired;
@@ -145,15 +145,15 @@ fn collectSelected(alloc: std.mem.Allocator, source: anytype, reader: reads.Tabl
     errdefer arena.deinit();
     const temporary = arena.allocator();
     const definitions = (try parsed.relationalIndexDefinitions(temporary)) orelse return error.IndexNotFound;
-    const runtime_schema = try @import("../schema/mod.zig").deriveRelationalCheckLayout(temporary, parsed);
-    var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(temporary, runtime_schema);
+    const runtime_schema = try @import("antfly_local_sources").schema_mod.deriveRelationalCheckLayout(temporary, parsed);
+    var layout = try @import("antfly_local_sources").storage_db_algebraic_relational_row_codec.PhysicalLayout.init(temporary, runtime_schema);
     defer layout.deinit();
     var names: std.StringHashMapUnmanaged(usize) = .empty;
     var comparisons: std.ArrayList([32]u8) = .empty;
     for (definitions) |definition| {
         if (index_name) |selected| if (!std.mem.eql(u8, selected, definition.name)) continue;
         try request.ensureActive();
-        var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(temporary, runtime_schema, &layout, definition.keys);
+        var tuple = try @import("antfly_local_sources").storage_db_relational_index_keys.TuplePlan.init(temporary, runtime_schema, &layout, definition.keys);
         defer tuple.deinit();
         try bindCoverFingerprint(temporary, runtime_schema, &layout, definition, &tuple.fingerprint);
         try names.put(temporary, definition.name, comparisons.items.len);
@@ -345,7 +345,7 @@ test "relational index status requires complete current owner coverage and stand
             };
         }
         pub fn freeAdminSnapshot(_: *@This(), _: *@import("../metadata/api.zig").AdminSnapshot) void {}
-        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: @import("../storage/db/types.zig").LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: @import("antfly_local_sources").storage_db_types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(.read_index, consistency);
@@ -354,7 +354,7 @@ test "relational index status requires complete current owner coverage and stand
             try std.testing.expectEqualStrings("by_id", request.value.name.?);
             try std.testing.expectEqual(@as(u32, 2), request.value.schema_version);
             if (self.missing and key.len != 0) return null;
-            var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(allocator, schema_json);
+            var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(allocator, schema_json);
             defer schema.deinit(allocator);
             return .{ .version = 0, .json = try std.json.Stringify.valueAlloc(allocator, native.Status{
                 .table_id = 7,
@@ -428,7 +428,7 @@ test "relational index status batches many indexes once per owner with complete 
     }
     try schema_out.writer.writeAll("],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}");
     const schema_json = schema_out.written();
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(temporary, schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(temporary, schema_json);
     defer parsed.deinit(temporary);
     const comparison = try expectedComparison(temporary, parsed, "index_0");
     const Fixture = struct {
@@ -444,7 +444,7 @@ test "relational index status batches many indexes once per owner with complete 
             return .{ .status = .{ .metadata_group_id = 1, .metrics = .{} }, .tables = &self.table, .ranges = &self.ranges, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
         }
         pub fn freeAdminSnapshot(_: *@This(), _: *@import("../metadata/api.zig").AdminSnapshot) void {}
-        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: @import("../storage/db/types.zig").LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: @import("antfly_local_sources").storage_db_types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual(.read_index, consistency);

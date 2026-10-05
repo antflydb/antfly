@@ -14,16 +14,16 @@
 // limitations.
 
 const std = @import("std");
-const document_mapper = @import("../storage/db/document_mapper.zig");
+const document_mapper = @import("antfly_local_sources").storage_db_document_mapper;
 
 pub const cluster = @import("cluster.zig");
-pub const operation = @import("operation.zig");
+pub const operation = @import("antfly_local_sources").api_operation;
 const sql_execution = @import("sql_execution.zig");
 const sql_pgwire = @import("sql_pgwire.zig");
 const sql_session = @import("sql_session.zig");
 pub const probe_operations = @import("probe_operations.zig");
 pub const storage_maintenance_operations = @import("storage_maintenance_operations.zig");
-pub const batch = @import("batch.zig");
+pub const batch = @import("antfly_local_sources").api_batch;
 pub const backups = @import("backups.zig");
 pub const restore_owner = @import("restore_owner.zig");
 pub const restore_parent_activation = @import("restore_parent_activation.zig");
@@ -32,9 +32,9 @@ pub const row_policy_install = @import("row_policy_install.zig");
 pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
 pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
 pub const linear_merge = @import("linear_merge.zig");
-pub const query = @import("query.zig");
-pub const query_contract = @import("query_contract.zig");
-pub const runtime_status = @import("runtime_status.zig");
+pub const query = @import("antfly_local_sources").api_query;
+pub const query_contract = @import("antfly_local_sources").api_query_contract;
+pub const runtime_status = @import("antfly_local_sources").api_runtime_status;
 pub const cluster_api_http = @import("cluster_api_http.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
 pub const research_agent = @import("research_agent.zig");
@@ -42,16 +42,16 @@ pub const research_jobs = @import("research_jobs.zig");
 pub const web_fetch = @import("web_fetch.zig");
 pub const document_renderer = @import("document_renderer.zig");
 pub const public_table_http = @import("public_table_http.zig");
-pub const public_embedding_query = @import("public_embedding_query.zig");
+pub const public_embedding_query = @import("antfly_local_sources").api_public_embedding_query;
 pub const public_graph_query = @import("public_graph_query.zig");
-pub const public_search_request = @import("public_search_request.zig");
-pub const public_query_string = @import("public_query_string.zig");
-pub const public_text_query = @import("public_text_query.zig");
+pub const public_search_request = @import("antfly_local_sources").api_public_search_request;
+pub const public_query_string = @import("antfly_local_sources").api_public_query_string;
+pub const public_text_query = @import("antfly_local_sources").api_public_text_query;
 pub const query_builder_agent = @import("query_builder_agent.zig");
 pub const distributed_txn = @import("distributed_txn.zig");
 pub const transactions = @import("transactions.zig");
-const e2e = @import("e2e.zig");
-const multi_node_e2e = @import("multi_node_e2e.zig");
+const integration_tests = @import("integration_test.zig");
+const multi_node_integration_test = @import("multi_node_integration_test.zig");
 pub const table_catalog = @import("table_catalog.zig");
 pub const table_router = @import("table_router.zig");
 pub const tables = @import("tables.zig");
@@ -103,7 +103,7 @@ pub const MemoryLimitSource = provisioned_storage.MemoryLimitSource;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
-pub const HAReadGate = table_reads.HAReadGate;
+pub const HotStandbyReadGate = table_reads.HotStandbyReadGate;
 pub const backend_current_root_generation = table_reads.backend_current_root_generation;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
 pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;
@@ -242,6 +242,7 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("online_merge_io.zig");
     _ = @import("sql_truncate.zig");
     _ = @import("sql_policy_ddl.zig");
     _ = sql_execution;
@@ -273,8 +274,8 @@ test "api module compiles" {
     _ = internal_join_operations;
     _ = internal_repair_operations;
     _ = transactions;
-    _ = e2e;
-    _ = multi_node_e2e;
+    _ = integration_tests;
+    _ = multi_node_integration_test;
     _ = table_catalog;
     _ = table_router;
     _ = tables;

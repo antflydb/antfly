@@ -12879,6 +12879,7 @@ components:
             - index_rebuilding
             - query_embedding_temporarily_unavailable
             - reranker_temporarily_unavailable
+            - decision_provider_unavailable
           description: Stable machine-readable retry classification.
         message:
           type: string
@@ -12891,7 +12892,7 @@ components:
     QueryDependencyError:
       type: object
       additionalProperties: false
-      description: A stable failure envelope for query embedding and reranking dependencies.
+      description: A stable failure envelope for query embedding, reranking, and decision dependencies.
       required:
         - code
         - error
@@ -12908,6 +12909,11 @@ components:
             - query_embedding_upstream_failure
             - reranker_rate_limited
             - reranker_upstream_failure
+            - decision_limit_exceeded
+            - invalid_decision_evaluation
+            - decision_provider_unavailable
+            - decision_rate_limited
+            - decision_upstream_failure
             - query_timeout
         error:
           type: string
@@ -21175,6 +21181,138 @@ components:
       required:
         - table
       additionalProperties: false
+    QueryEvaluation:
+      type: object
+      additionalProperties: false
+      required:
+        - scope
+        - compute
+      description: >
+        Evaluate expressions after global retrieval merging, before final
+
+        offset/limit. Candidates require candidate_count; matches require
+
+        max_rows and fail if the full qualifying population exceeds that budget.
+
+        Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+
+        be combined with evaluation. NULL inputs skip inference; errors fail.
+      properties:
+        graph_query:
+          type: string
+          description: Evaluate completed bindings of this named graph MATCH instead of retrieval hits.
+            Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined
+            with this stage.
+        scope:
+          type: string
+          enum:
+            - candidates
+            - matches
+        candidate_count:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        max_rows:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        compute:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: '#/components/schemas/QueryExpression'
+        where:
+          type: object
+          description: Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression),
+            not (predicate), and, or (predicate arrays). Comparisons propagate NULL.
+          additionalProperties: true
+        order_by:
+          type: array
+          maxItems: 16
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - expression
+            properties:
+              expression:
+                $ref: '#/components/schemas/QueryExpression'
+              descending:
+                type: boolean
+        aggregations:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required:
+              - type
+              - expression
+            properties:
+              type:
+                type: string
+                enum:
+                  - terms
+                  - avg
+                  - sum
+                  - count
+              expression:
+                $ref: '#/components/schemas/QueryExpression'
+    QueryExpression:
+      x-zig-type: std.json.Value
+      x-go-type-skip-optional-pointer: false
+      type: object
+      additionalProperties: false
+      description: >
+        Exactly one of literal, field, ref, or call. A call requires input and
+
+        decider. ai_decide requires questions; ai_probability requires statement;
+
+        ai_choice and ai_score require instructions and criteria. Named refs may
+
+        select nested JSON members with dotted paths. Binding cycles are invalid.
+      properties:
+        literal:
+          x-go-type: json.RawMessage
+        field:
+          type: string
+          minLength: 1
+        ref:
+          type: string
+          minLength: 1
+        call:
+          type: string
+          enum:
+            - ai_decide
+            - ai_choice
+            - ai_score
+            - ai_probability
+        input:
+          $ref: '#/components/schemas/QueryExpression'
+          x-go-type-skip-optional-pointer: false
+        decider:
+          type: string
+          minLength: 1
+        questions:
+          type: object
+          additionalProperties: true
+        statement:
+          type: string
+          minLength: 1
+        instructions:
+          type: string
+          minLength: 1
+        criteria:
+          description: Choice ID map or ordered score level array.
+          oneOf:
+            - type: object
+              additionalProperties:
+                type: string
+            - type: array
+              minItems: 2
+              maxItems: 64
+              items:
+                type: string
     QueryRequest:
       type: object
       not:
@@ -21336,10 +21474,14 @@ components:
                   - required:
                       - pruner
                   - required:
+                      - evaluate
+                  - required:
                       - join
                   - required:
                       - foreign_sources
       properties:
+        evaluate:
+          $ref: '#/components/schemas/QueryEvaluation'
         table_target:
           $ref: '#/components/schemas/CatalogTableTarget'
         table:
@@ -23089,6 +23231,10 @@ components:
         - _id
         - _score
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
+          description: Named query-time computed values, separate from stored source.
         _id:
           type: string
           description: ID of the record.
@@ -23317,6 +23463,10 @@ components:
         - took
         - status
       properties:
+        evaluation:
+          type: object
+          additionalProperties: true
+          description: Function evaluation scope, population, usage, and scoped aggregations.
         hits:
           $ref: '#/components/schemas/QueryHits'
         aggregations:
@@ -23557,6 +23707,16 @@ components:
         - type
         - weight
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped
+            to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical
+            source. The document is the authority for replay and deletion.
         source:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -23827,6 +23987,16 @@ components:
       x-go-type-skip-optional-pointer: true
       type: object
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped
+            to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical
+            source. The document is the authority for replay and deletion.
         source:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -25058,7 +25228,10 @@ components:
           type: integer
           minimum: 0
           maximum: 4096
-          description: Maximum number of chunks to generate per document.
+          description: 'Maximum number of chunks to generate per document. Zero (the default when omitted)
+            means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap
+            output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count
+            equals `max_chunks` as potentially truncated.'
         threshold:
           type: number
           format: float
@@ -25112,7 +25285,6 @@ components:
         provider: antfly
         api_url: http://localhost:8080
         model: fixed
-        max_chunks: 50
         text:
           target_tokens: 500
           overlap_tokens: 50
@@ -25168,7 +25340,9 @@ components:
               type: integer
               minimum: 0
               maximum: 4096
-              description: Maximum number of chunks to generate per document. Zero uses the chunker default.
+              description: Maximum number of chunks to generate per document. Zero (or omitted, the default)
+                means unlimited — the document is chunked in full with no cap. Set an explicit value up
+                to 4096 to bound chunk count for very large inputs.
             threshold:
               type: number
               format: float
@@ -25421,6 +25595,10 @@ components:
           additionalProperties: true
           writeOnly: true
           description: Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+            Decision producers use type=decision and config={version, decider, questions}, where decider
+            is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification
+            hash, version, and source fingerprint. Change version or specification to rebuild through
+            the enrichment lifecycle.
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -25433,11 +25611,11 @@ components:
         neighbor_context:
           $ref: '#/components/schemas/EnrichmentNeighborContextConfig'
           description: Optional bounded sample of the document's graph neighbors appended to the producer
-            input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator
-            or extractor); producers that treat the source as a media locator (copy, reader, transcriber,
-            document_extraction) reject it. Only same-shard graph state is sampled; a graph index without
-            local state for a document yields empty neighbors at runtime while the graph index reference
-            itself is validated at admission.
+            input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator,
+            extractor, or decision); producers that treat the source as a media locator (copy, reader,
+            transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph
+            index without local state for a document yields empty neighbors at runtime while the graph
+            index reference itself is validated at admission.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
@@ -25886,13 +26064,21 @@ components:
             - document
             - external
           default: document
+        source:
+          $ref: '#/components/schemas/GraphTemplateValue'
+          description: Logical source endpoint. When set, edge.edge_id is required; the artifact document
+            remains the durable owner.
         target:
           $ref: '#/components/schemas/GraphTemplateValue'
     GraphArtifactEdgeMappingConfig:
       type: object
       additionalProperties: false
-      description: Maps each artifact item to an edge type, weight, and public metadata.
+      description: Maps each artifact item to a relationship identity, type, weight, and public metadata.
       properties:
+        edge_id:
+          $ref: '#/components/schemas/GraphTemplateValue'
+          description: Stable application relationship ID. Required with nodes.source. Replays update
+            the same identity; distinct IDs preserve parallel relationships.
         type:
           $ref: '#/components/schemas/GraphTemplateValue'
         weight:
@@ -27029,6 +27215,78 @@ components:
         Existing JSON document write and read APIs remain available. This
 
         setting alone does not declare primary keys or unique constraints.
+    ExternalLakeCredentialRef:
+      type: object
+      additionalProperties: false
+      required:
+        - ref
+      properties:
+        ref:
+          type: string
+          minLength: 1
+          description: Name of a configured external_io connection with lake_read capability.
+        scope:
+          type: string
+          description: Allowed object prefix relative to the configured bucket or filesystem root.
+    ExternalLakeSnapshotSelector:
+      type: object
+      additionalProperties: false
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - current
+            - snapshot_id
+            - object_version_digest
+        id:
+          type: string
+          minLength: 1
+          description: Required for snapshot_id; selects an Iceberg snapshot.
+        digest:
+          type: string
+          minLength: 1
+          description: Required for object_version_digest; pins a Parquet object inventory.
+    ExternalLakeTableSource:
+      type: object
+      additionalProperties: false
+      description: Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory
+        and object versions before returning rows.
+      required:
+        - kind
+        - table_id
+        - format
+        - uri
+      properties:
+        kind:
+          type: string
+          enum:
+            - external
+        table_id:
+          type: string
+          minLength: 1
+        format:
+          type: string
+          enum:
+            - parquet
+            - iceberg
+        uri:
+          type: string
+          minLength: 1
+        schema_fingerprint:
+          type: string
+          default: auto
+          minLength: 1
+        write_policy:
+          type: string
+          enum:
+            - read_only
+          default: read_only
+        credentials:
+          $ref: '#/components/schemas/ExternalLakeCredentialRef'
+        snapshot:
+          $ref: '#/components/schemas/ExternalLakeSnapshotSelector'
     RelationalColumnExpression:
       type: object
       additionalProperties: false
@@ -27550,6 +27808,10 @@ components:
             update requests.
         storage_mode:
           $ref: '#/components/schemas/TableStorageMode'
+        base_source:
+          $ref: '#/components/schemas/ExternalLakeTableSource'
+          description: External tables require relational storage mode and are read-only. Omit for native
+            tables.
         column_defaults:
           type: array
           maxItems: 256
@@ -32847,6 +33109,59 @@ components:
             execution rejects document filters on aliases qualified with a different table because its
             published snapshot contains only the queried table. Explicitly qualifying an alias with the
             queried table is equivalent to omitting `table`.
+    GraphRelationshipPropertyPredicate:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+        - op
+      properties:
+        field:
+          type: string
+          description: JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type,
+            /weight, /created_at, /updated_at.
+        op:
+          type: string
+          enum:
+            - eq
+            - ne
+            - lt
+            - lte
+            - gt
+            - gte
+            - is_null
+            - is_not_null
+        value:
+          description: Non-null scalar comparison value. Omit for is_null and is_not_null.
+        value_type:
+          type: string
+          enum:
+            - scalar
+            - datetime
+          default: scalar
+          description: Datetime compares RFC3339 instants rather than string ordering.
+    GraphRelationshipFilter:
+      type: object
+      additionalProperties: false
+      description: AND predicates applied to every relationship before neighbor admission, path ranking,
+        and match counting. Missing or null properties fail comparisons, including ne; use explicit null
+        operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have
+        inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at
+        requires a created_at value. Invalid timestamp properties never match.
+      properties:
+        properties:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/GraphRelationshipPropertyPredicate'
+        valid_at:
+          type: string
+          format: date-time
+          description: Require metadata.valid_at <= instant < metadata.invalid_at.
+        known_at:
+          type: string
+          format: date-time
+          description: Require metadata.created_at <= instant < metadata.expired_at.
     GraphEdgeWeightRange:
       type: object
       additionalProperties: false
@@ -32881,6 +33196,8 @@ components:
         intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop
         edges with a table-qualified alias at each table boundary.'
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from:
           $ref: '#/components/schemas/GraphIdentifier'
         to:
@@ -33278,6 +33595,8 @@ components:
         identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without
         storing a reciprocal edge.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         start:
           $ref: '#/components/schemas/GraphNodeSelector'
         direction:
@@ -33373,6 +33692,8 @@ components:
         - to
       description: Find the best path from `from` to `to` in the requested stored-edge direction.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
         to:
@@ -33432,9 +33753,11 @@ components:
         - to
         - k
       description: Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
-        Results are unique by ordered table-qualified node identities plus stored-edge direction and type,
-        and are ordered best-first by the selected objective.
+        Results are unique by ordered table-qualified node identities plus stored-edge direction, type,
+        edge ID and fact owner, and are ordered best-first by the selected objective.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
         to:
@@ -33663,6 +33986,8 @@ components:
       deprecated: true
       description: Deprecated graph_searches traversal and path parameters.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         edge_types:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -33719,6 +34044,8 @@ components:
       deprecated: true
       description: Deprecated linear graph_searches pattern edge.
       properties:
+        edge_filter:
+          $ref: '#/components/schemas/GraphRelationshipFilter'
         types:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -33932,6 +34259,12 @@ components:
       description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query.
         Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
+        computed:
+          type: array
+          description: Evaluated values parallel to returned rows, when decision evaluation was requested.
+          items:
+            type: object
+            additionalProperties: true
         kind:
           type: string
           enum:
@@ -34022,6 +34355,16 @@ components:
         not unqualified physical edge keys, so identity remains unambiguous across tables and for equal
         keys in different tables.
       properties:
+        edge_id:
+          type: string
+          minLength: 1
+          description: Application relationship ID. Absent on legacy tuple relationships. IDs are scoped
+            to this graph index, owning document, and endpoint/type tuple.
+        owner_document:
+          type: string
+          minLength: 1
+          description: Owning fact document key in the graph index table when it differs from the logical
+            source. The document is the authority for replay and deletion.
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
         to:
@@ -34309,6 +34652,9 @@ components:
       deprecated: true
       description: Deprecated graph_searches pattern response row.
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
         bindings:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -39180,7 +39526,6 @@ components:
         - probabilities
         - confidence
         - confidence_method
-        - act_probability
       properties:
         name:
           type: string
@@ -39226,7 +39571,9 @@ components:
           format: float
           minimum: 0
           maximum: 1
-          description: Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+          description: Auxiliary model estimate for acting, from models with an action head (Laya). Does
+            not authorize or execute a tool call.
+          x-go-type-skip-optional-pointer: false
     ExtractionAttributeLabel:
       type: object
       required:
@@ -39568,7 +39915,10 @@ components:
           type: integer
           minimum: 0
           maximum: 4096
-          description: Maximum number of chunks to generate per document.
+          description: 'Maximum number of chunks to generate per document. Zero (the default when omitted)
+            means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap
+            output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count
+            equals `max_chunks` as potentially truncated.'
         threshold:
           type: number
           format: float

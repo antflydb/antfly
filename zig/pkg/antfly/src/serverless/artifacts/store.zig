@@ -18,13 +18,13 @@ const std = @import("std");
 test "serverless scoped artifact identities validate every routing component" {
     const a = std.testing.allocator;
     const scope: UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
-    const checksum = "a" ** 64;
+    const checksum = z17RepeatString("a", 64);
     const id = try scope.artifactId(checksum);
     try std.testing.expectEqualStrings(checksum, try sha256ChecksumFromArtifactId(&id));
     try std.testing.expectEqual(scope, (try uploadScopeFromArtifactId(&id)).?);
     const suffix = try storageSuffixAlloc(a, &id);
     defer a.free(suffix);
-    try std.testing.expectEqualStrings("graph/" ++ "01" ** 32 ++ "/" ++ "02" ** 16 ++ "/" ++ checksum, suffix);
+    try std.testing.expectEqualStrings("graph/" ++ z17RepeatString("01", 32) ++ "/" ++ z17RepeatString("02", 16) ++ "/" ++ checksum, suffix);
     for ([_]usize{ 0, 7, 71, 78, 142, 143, 174 }) |offset| {
         var corrupt = id;
         corrupt[offset] = '/';
@@ -614,13 +614,13 @@ test "serverless verified empty artifacts avoid invalid cloud ranges" {
     const State = struct {
         range_calls: usize = 0,
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
 
         fn put(_: *anyopaque, _: Allocator, _: []const u8) anyerror!ArtifactMetadata {
             return error.UnexpectedCall;
         }
 
-        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]u8 {
+        pub fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]u8 {
             return error.UnexpectedCall;
         }
 
@@ -706,4 +706,15 @@ test "serverless verified empty artifacts avoid invalid cloud ranges" {
             .none,
         ),
     );
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

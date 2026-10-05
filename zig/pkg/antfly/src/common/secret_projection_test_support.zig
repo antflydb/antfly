@@ -1,21 +1,21 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const secrets = @import("secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 
 pub const Projection = struct {
     tmp: std.testing.TmpDir,
@@ -38,7 +38,7 @@ pub const Projection = struct {
             try tmp.dir.createDir(io, dir, .default_dir);
             const content = try std.fmt.allocPrint(alloc,
                 \\{{"generation":"{s}","secrets":[{{"key":"{s}","value":"{s}","created_at_ns":1,"updated_at_ns":1}},{{"key":"projected.precedence","value":"{s}","created_at_ns":1,"updated_at_ns":1}}]}}
-            , .{ generation ** 64, key, value, key });
+            , .{ z17RepeatString(generation, 64), key, value, key });
             defer alloc.free(content);
             try tmp.dir.writeFile(io, .{ .sub_path = dir ++ "/secrets.json", .data = content });
         }
@@ -80,7 +80,7 @@ pub fn expectHealthyRotation(store: *secrets.FileStore, initial_generation: u64)
     try std.testing.expect(!health.stale_snapshot);
     try std.testing.expectEqual(@as(u64, 0), health.reload_failures);
     try std.testing.expect(health.supports_source_generation);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xbb} ** 32), &health.source_generation.?);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xbb))), &health.source_generation.?);
 }
 
 // Call the runtime initializer so a regression cannot hide behind FileStore's
@@ -170,4 +170,15 @@ pub fn expectRuntimeWrites(comptime init_store: anytype) !void {
         try std.testing.expectEqualStrings(path, store.path);
         try std.testing.expect(!store.healthSnapshot().last_reload_failed);
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

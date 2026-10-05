@@ -1,28 +1,28 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Checked native retained-read capability across the hidden storage archive.
 //! Every archive is linked by one compiler invocation; calls still validate
 //! signature/layout contracts and translate error identities at the boundary.
 const std = @import("std");
 const native = @import("antfly_runtime_abi").native_abi;
-const callbacks = @import("../runtime_callback_abi.zig");
+const callbacks = @import("antfly_local_sources").runtime_callback_abi;
 const errors = @import("antfly_runtime_abi").error_abi;
-const types = @import("db/types.zig");
-pub const View = @import("relational_read_view.zig").View;
-pub const Fence = @import("statement_read_fence.zig").Fence;
+const types = @import("antfly_local_sources").storage_db_types;
+pub const View = @import("antfly_local_sources").storage_relational_read_view.View;
+pub const Fence = @import("antfly_local_sources").storage_statement_read_fence.Fence;
 
 pub const Provider = struct {
     ptr: *anyopaque,

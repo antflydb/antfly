@@ -33,7 +33,7 @@ const TrieNode = struct {
         return node;
     }
 
-    fn deinit(self: *TrieNode) void {
+    pub fn deinit(self: *TrieNode) void {
         var it = self.children.valueIterator();
         while (it.next()) |child| {
             child.*.deinit();

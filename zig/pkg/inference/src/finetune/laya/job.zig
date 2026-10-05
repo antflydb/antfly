@@ -103,6 +103,9 @@ pub const Config = struct {
     two_stage_mass_cutoff: ?f32 = null,
     /// Keep the token embeddings and the lowest N encoder layers at their
     /// source values. Backward work and optimizer state cover only the rest.
+    /// `num_hidden_layers + 1` also keeps the final norm, freezing the whole
+    /// encoder: only the decision head trains, so a trunk shared with other
+    /// heads keeps its exact output.
     freeze_layers: u32 = 0,
     /// Low-rank adaptation (models/laya/LAYA.md, "LoRA for Laya training").
     /// Null trains every unfrozen parameter directly, as before.
@@ -223,7 +226,7 @@ const Cache = struct {
         self.program.?.frozen = self.frozen;
         return &self.program.?;
     }
-    fn deinit(self: *Cache) void {
+    pub fn deinit(self: *Cache) void {
         if (self.program) |*p| p.deinit();
     }
 };
@@ -262,7 +265,7 @@ fn metrics(preds: []const Prediction, temperatures: [3]f32) !Metrics {
         var gold: usize = 0;
         for (p.logits, p.target, 0..) |z, t, k| {
             if (!std.math.isFinite(z)) return error.NonFiniteLayaLogits;
-            max = @max(max, z / temperatures[@intFromEnum(p.kind)]);
+            max = @max(max, z / temperatures[@backingInt(p.kind)]);
             if (z > p.logits[winner]) winner = k;
             if (t > p.target[gold]) gold = k;
         }
@@ -270,13 +273,13 @@ fn metrics(preds: []const Prediction, temperatures: [3]f32) !Metrics {
         var sum: f64 = 0;
         var probs: [model.max_packed_options]f64 = undefined;
         for (p.logits, 0..) |z, k| {
-            probs[k] = @exp(z / temperatures[@intFromEnum(p.kind)] - max);
+            probs[k] = @exp(z / temperatures[@backingInt(p.kind)] - max);
             sum += probs[k];
         }
         var expected: f64 = 0;
         var target_expected: f64 = 0;
         for (p.logits, p.target, 0..) |z, t, k| {
-            ce -= t * (z / temperatures[@intFromEnum(p.kind)] - max - @log(sum));
+            ce -= t * (z / temperatures[@backingInt(p.kind)] - max - @log(sum));
             expected += @as(f64, @floatFromInt(k)) * probs[k] / sum;
             target_expected += @as(f64, @floatFromInt(k)) * t;
         }
@@ -293,7 +296,7 @@ fn metricsByKind(a: std.mem.Allocator, preds: []const Prediction, temperatures: 
     for (0..3) |kind| {
         var subset: std.ArrayListUnmanaged(Prediction) = .empty;
         defer subset.deinit(a);
-        for (preds) |p| if (@intFromEnum(p.kind) == kind) try subset.append(a, p);
+        for (preds) |p| if (@backingInt(p.kind) == kind) try subset.append(a, p);
         if (subset.items.len > 0) result[kind] = try metrics(subset.items, temperatures);
     }
     return result;
@@ -303,7 +306,7 @@ fn calibrate(a: std.mem.Allocator, preds: []const Prediction) ![3]f32 {
     for (0..3) |kind| {
         var subset: std.ArrayListUnmanaged(Prediction) = .empty;
         defer subset.deinit(a);
-        for (preds) |p| if (@intFromEnum(p.kind) == kind) try subset.append(a, p);
+        for (preds) |p| if (@backingInt(p.kind) == kind) try subset.append(a, p);
         if (subset.items.len < 10) continue;
         var best = (try metrics(subset.items, temperatures)).soft_ce;
         // Bounded deterministic log-temperature search. Unit temperature is
@@ -547,7 +550,7 @@ const Cursor = struct {
     epochs: u64,
     accumulation: u64,
     stop: ?u64 = null,
-    fn validate(raw: ?*const anyopaque, identity: training.controller.Identity, accumulated: u32) !void {
+    pub fn validate(raw: ?*const anyopaque, identity: training.controller.Identity, accumulated: u32) !void {
         const self: *const Cursor = @ptrCast(@alignCast(raw.?));
         const completed = identity.microbatch_step;
         if (completed > self.batches * self.epochs) return error.InvalidLayaResumePosition;
@@ -624,7 +627,8 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     encoder.laya.?.packing = try packing(c, source_laya);
     if (c.decision_head) |head| encoder.laya.?.decision_head = head;
     const laya = encoder.laya.?;
-    if (c.freeze_layers > encoder.num_hidden_layers) return error.InvalidLayaJob;
+    if (c.freeze_layers > encoder.num_hidden_layers + 1) return error.InvalidLayaJob;
+    const freeze = if (c.freeze_layers > encoder.num_hidden_layers) training.whole_encoder else c.freeze_layers;
     for ([_][]const u8{ "attention_bias", "mlp_bias", "norm_bias" }) |key| if (config_json.value.object.get(key)) |v| {
         if (v != .bool or v.bool) return error.UnsupportedLayaEncoderBias;
     };
@@ -666,7 +670,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     if (calib_layout) |cl| try architecture.validate(encoder, cl, c.head_dropout, lora, use_fused_attention);
     for ([_][]const training.Example{ train.examples, eval.examples }) |examples| for (examples) |e| for (e.ids) |id| if (id < 0 or id >= encoder.vocab_size) return error.InvalidLayaTrainingToken;
     if (calibration) |calib| for (calib.examples) |e| for (e.ids) |id| if (id < 0 or id >= encoder.vocab_size) return error.InvalidLayaTrainingToken;
-    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = c.freeze_layers, .lora = lora, .use_fused_attention = use_fused_attention };
+    var cache = Cache{ .allocator = a, .config = encoder, .dropout = c.head_dropout, .freeze_layers = freeze, .lora = lora, .use_fused_attention = use_fused_attention };
     defer cache.deinit();
     // Release the raw source snapshot before optimizer initialization/restore.
     // Only owned trainable values, frozen values, and export metadata survive.
@@ -682,7 +686,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         try @import("../../models/laya.zig").validateReader(&source, source_check, encoder);
         if (source.header.tensors.get("temperature")) |meta| if (!std.mem.eql(i64, meta.shape, &.{3})) return error.InvalidLayaWeights;
         const initial = try cache.get(train.examples[0..@min(train.examples.len, c.batch_size)]);
-        const selected = try training.parameters(permanent, &initial.graph, &source, c.freeze_layers, lora, c.seed);
+        const selected = try training.parameters(permanent, &initial.graph, &source, freeze, lora, c.seed);
         const export_tensors = try exportInputs(permanent, &source, selected);
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("antfly-laya-training/v1");
@@ -708,7 +712,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
     // which are uploaded once but never enter the optimizer.
     var frozen_elements: usize = 0;
     for (admitted.export_tensors) |t| {
-        if (training.frozen(t.name, c.freeze_layers, lora)) frozen_elements = try addBytes(frozen_elements, t.data.len);
+        if (training.frozen(t.name, freeze, lora)) frozen_elements = try addBytes(frozen_elements, t.data.len);
     }
     var layouts: [3]architecture.Layout = undefined;
     var layout_count: usize = 2;
@@ -719,7 +723,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         layout_count = 3;
     }
     const backend_estimate: usize = if (c.backend == .metal)
-        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], c.freeze_layers, use_fused_attention)
+        try estimateBackendBytes(encoder, selected, frozen_elements, layouts[0..layout_count], freeze, use_fused_attention)
     else
         0;
     if (c.backend == .metal and backend_estimate > c.max_backend_bytes) {
@@ -762,7 +766,7 @@ pub fn execute(gpa: std.mem.Allocator, io: std.Io, c: Config, admission: *memory
         for (frozen.items) |f| owner.cb.free(f.value);
         frozen.deinit(a);
     }
-    for (admitted.export_tensors) |t| if (training.frozen(t.name, c.freeze_layers, lora)) {
+    for (admitted.export_tensors) |t| if (training.frozen(t.name, freeze, lora)) {
         var dims: [8]i32 = undefined;
         if (t.shape.len > dims.len or t.data.len == 0) return error.InvalidLayaWeights;
         for (t.shape, dims[0..t.shape.len]) |dim, *dst| dst.* = std.math.cast(i32, dim) orelse return error.InvalidLayaWeights;
@@ -924,7 +928,7 @@ test "laya resume cursor accounts for partial windows and epoch flushes" {
 
 test "laya admission checks late long sequences and token vocabulary before training" {
     const cfg = modern.Config{ .laya = .{ .max_len = 2048 }, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
-    const ids = [_]i64{0} ** 2048;
+    const ids = @as([2048]i64, @splat(0));
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;
@@ -980,7 +984,7 @@ test "laya backend estimate covers weights, activations, and the fixed overhead 
 
 test "laya admission drops the quadratic bound when fused segment attention is selected" {
     const cfg = modern.Config{ .laya = .{ .max_len = 2048 }, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
-    const ids = [_]i64{0} ** 2048;
+    const ids = @as([2048]i64, @splat(0));
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;

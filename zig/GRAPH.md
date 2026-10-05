@@ -26,6 +26,292 @@ recovery: primary-store durability, replay journal, enrichment state hashes,
 managed-index applied sequence, and reverse-index rebuild from owned outgoing
 edges.
 
+## Relationship deletion durability
+
+Primary graph relationship artifacts are the durable authority for graph replay,
+reconstruction, and portable snapshots. Deleting a document retires its owned
+artifacts and source-owned inline relationships that target it. This includes
+legacy relationships, parallel explicit IDs, and self loops. Fact relationships
+owned by an independent document retain that document's lifecycle and may refer
+to absent endpoints; deleting their owner retires them.
+
+A local target directory maps inline relationships to their complete primary
+artifact keys. Every primary transaction and batch maintains it atomically with
+artifact writes and deletes. New stores mark the directory ready on their first
+user-record write. Older stores backfill at most 256 keys or 256 KiB of temporary
+key data per transaction (one oversized key may form its own page). A durable
+cursor resumes migration after interruption; readers use the directory only
+when the final ready marker commits. Ordinary document upserts do not advance
+migration: a constant-time retirement summary remains conservative while the
+directory is incomplete, and changed owner documents check their authoritative retirement
+prefixes. Bulk relationship ingestion similarly checks only the candidate
+retirement keys in its writer transaction. Maintenance makes directory progress
+one page at a time; idle ready owners avoid acquiring the apply lock. Endpoint
+deletion records a durable cleanup job instead of enumerating all incoming
+relationships in the foreground. Each cleanup command advances at most one migration page, then processes at most 256
+relationship retirements and completed endpoint jobs in total, or 256 KiB of
+directory and job-key data (one oversized record may form its own page). Empty
+endpoint jobs share a page instead of requiring separate replicated commands.
+Each committed retirement removes its directory entry, so
+restarting at the target prefix resumes without retaining the full adjacency.
+
+In data-Raft deployments the owner leader proposes cleanup through the ordinary
+replicated writer, one page per control round. Commands carry the leader-selected
+relationship identities; followers never replan from local directory progress.
+Planned commands are private and isolated: their only effects are inline
+relationship deletions and cleanup-job removals. They cannot delete documents or
+change constraint metadata, so completion also works on tables with unique or
+foreign-key constraints. Strictly validated private cleanup commands also use
+maintenance admission during row-policy preparation and activation; user
+mutations retain principal authentication.
+
+Standalone DB writes and recovery execute the same commands locally. Resident
+standalone owners also register with the shared maintenance scheduler, processing
+one bounded page per turn independently of foreground writes, including after
+TTL expiry. Idle maintenance also backfills the incoming directory in bounded
+pages before future deletions. `DB.openOwned` installs a stable owner
+automatically; callers using
+the movable `DB.open` form must call `startResidentBackgroundWorkersIfNeeded`
+after installing the DB at its final address to enable resident maintenance.
+Explicit worker suppression leaves cleanup to writes, recovery, and maintenance
+calls. Local batch completion is shared by ordinary writes, profiled writes,
+transaction writes/resolution, and storage callback entry points. Completion
+runs at most one bounded cleanup page for weak sync levels after the primary
+apply lock is released. Remaining durable jobs continue through resident
+maintenance. Recovery, explicit maintenance, and `full_index` drain endpoint
+jobs completely; `full_index` also waits for the resulting cleanup replay cut,
+including cleanup completed concurrently by a resident worker. Foreground drains
+check cancellation between atomic pages, leaving remaining jobs for maintenance
+without undoing the primary commit. Foreground cleanup retains the callback
+dispatcher and committed-effects observer. Replicated apply executes only its
+ordered command and leaves subsequent cleanup to the owner leader. Raft ownership is
+checked before local planning, including before the first applied-entry marker
+exists. Pending jobs survive restart and leader changes. Standalone HA mirrors the exact
+selected relationship identities and job removals, encoded under the apply fence
+and reused by its durable outbox and stream; standbys never replan cleanup from
+their own directory rebuild progress. Startup and local maintenance check the
+live HA write gate as well as Raft ownership. Standby, transitioning, fenced,
+and stale-generation owners retain queued jobs without planning local effects
+or advancing directory rebuilds; exact replicated pages remain applicable. A
+newly authorized primary resumes local cleanup through the same authority check.
+
+A transactionally maintained admission count fences graph reads for endpoint
+jobs with incident inline edges. Empty endpoint jobs do not interrupt unrelated
+traversals. Owner revival jobs fence reads until their input replay is complete.
+Older queues or invalidated directories without a complete admission summary
+remain conservatively fenced until their jobs drain. Graph reads return
+`StorageBusy` while an incident-edge job remains pending. New inline
+relationships targeting a pending endpoint receive the deterministic rejection
+`IntegrityTopologyBusy`, allowing Raft to advance to subsequent cleanup entries.
+Independent fact documents keep their own lifecycle. Portable export returns
+`StorageBusy` and range-source admission returns `IntegrityTopologyBusy` rather
+than capture a cut that would omit pending cleanup. Native whole-store recovery
+retains the durable jobs.
+
+Deleting an endpoint also records retirement of each affected relationship whose
+owner survives. Retirement records belong to that owner and retain the complete
+relationship identity. Primary projection writes honor them even when retained
+source artifacts are replayed, so rebuilding source precedence during restore
+cannot recreate a retired relationship. Explicit relationship writes clear that
+identity's retirement. A meaningful owner-document update clears its retirements
+and replays its durable graph inputs; semantic no-ops preserve retirement.
+Explicit relationship deletion records the same durable retirement, including
+independently owned identities. Index deletion removes its retirement records
+through the existing bounded cleanup fence before same-name recreation.
+
+Retirements transfer with their owning document range and are included in
+portable relationship blocks, including imports that omit derived indexes.
+Ordinary batch deletion and TTL expiry share the same retirement planner. Bundles containing them require AFB reader version
+8; ordinary relationship bundles require version 6. The target
+directory and its migration checkpoint are local derived metadata and are
+rebuilt through primary writes on import. Directory keys are fixed-size hashes,
+while values retain complete artifact keys. A local reference directory maintains
+an exact retirement count, including repeated writes, deletion, and rollback.
+The bounded, resumable v3 migration indexes existing retirements and only locally
+owned incident relationships before publishing the count as authoritative. A
+managed table persists its namespace binding with graph artifact writes. Explicit
+source or target tags in another namespace cannot enter the local endpoint
+cleanup directory, even when document keys coincide. Anonymous native stores
+consider explicit table tags foreign. Upgrading a v2 directory clears and rebuilds
+its local entries in bounded pages; changing the namespace binding does the same.
+Primary document replay deletes producing-document ownership only; incoming
+relationship removal uses exact identities selected from this authoritative directory.
+Stores with no retirements cache that state per transaction. Bulk ingestion checks
+all candidate identities with sorted reads before adding append entries, then
+ingests surviving edges directly even while other retirements remain. Batches
+that write retirement records themselves use ordinary transactional writes. A
+sorted bulk preflight also detects foreign rewrites with old local incoming
+membership; those rewrites remove it transactionally, while fresh foreign rows
+retain the append path without per-edge buffer drains.
+
+Merge artifact pages include primary retirement records. Receiver replay applies
+exact relationship deletions to existing projections as well as suppressing
+future materialization. Commands that can generate retirements during apply
+require data-Raft protocol version 22, including ordinary document writes and deletion,
+legacy relationship deletion, cleanup, transforms, document transaction
+prepares, committed transaction decisions, and merge pages. Classification occurs before proposal even when retirement records
+are absent from the input. Ordinary artifact-only batches retain their existing
+protocol requirements.
+
+HA batch mutation envelope V21 independently protects that complete graph apply
+contract, including document-derived effects, on both unordered and ordinary-Raft
+replay. Its `apply_schema_version` retains the original control schema and exact
+receipts; older standbys reject V21 before applying rows. New decoders can still
+read historical envelopes. Duplicate ordinary replay projects only the completion
+proof and envelope versions, without copying document or artifact payloads.
+
+Endpoint routing reads only unique root `source_table` and `target_table` JSON
+strings. Nested evidence fields cannot redirect traversal. Whitespace and JSON
+escapes are supported in names and keys; malformed or ambiguous tags have no
+routing authority. Plain names borrow metadata, while decoded names use scoped,
+budgeted scratch shared by traversal, paths, patterns, and distributed expansion.
+Traversal verifies the departing qualified endpoint and requested direction
+before admitting its adjacent endpoint. Equal
+document keys in different tables are distinct nodes: reverse traversal reads
+the source tag, and bidirectional traversal compares qualified endpoint
+identities. A genuine self-loop remains unoriented for bidirectional traversal.
+
+Native shortest-path and Yen searches preserve qualified node identity in every
+returned node, spur seed, root exclusion, and joined candidate. Native callers can specify
+`source_table` and `target_table` to distinguish equal document keys; an omitted
+target table retains the legacy key-only target selection. Returned-path memory
+leases include the table array and every owned table string, as well as node and
+relationship data.
+
+Meaningful producing-document updates revive older relationship deletions through
+a durable owner job. Foreground admission performs a job lookup and at most one
+retirement-prefix seek, then atomically publishes a new lifecycle generation.
+Older retirement stamps immediately cease suppressing the new document
+projection. Maintenance clears older stamps and replays retained assets, chunks,
+and resolutions through separate type prefixes, skipping projected edges and embeddings,
+in pages of at most 255 inspected records plus one checkpoint,
+or 256 KiB, admitting one oversized record. Owner jobs can progress independently
+of incoming-directory migration. A checkpoint digest fences stale or
+repeated pages. Replay checks the current input bytes under the apply lock;
+newer input updates and newer deletion stamps survive older prepared pages.
+Endpoint pages likewise recheck current table routing before deleting a selected
+relationship. Semantic no-op owner writes preserve retirements and pending jobs.
+
+Graph reads and portable exports wait while owner jobs are pending. `full_index`
+completion drains the jobs and waits for their derived replay cut. Weak sync
+returns after the bounded foreground write; durable maintenance resumes after
+restart and follows the existing Raft and HA write-authority rules. Portable
+retirement stamps require AFB reader version 8; historical unstamped markers
+remain readable, and imported stamps advance the local lifecycle counter.
+
+Artifact metadata writers use the same structural root-field rules in primary
+and background indexing. Custom templates can override a resolved table with
+one valid explicit root tag; duplicate or invalid explicit tags reject the
+projection. Default item metadata replaces root routing tags with the resolved
+endpoint table. Nested evidence is retained and never suppresses a root tag.
+Unrelated JSON member spans, including exact number literals, are copied intact.
+
+Physical splits rebuild the incoming directory and retirement accounting on both
+the child and retained parent before graph work resumes. Clearing and rebuilding
+use bounded, durable pages; incomplete directories conservatively check primary
+retirement records rather than inferring their absence from missing metadata.
+
+Explicit mutation range validation uses the producing document (or the logical
+source for an implicitly owned edge). Endpoints may belong to other ranges.
+Graph document cleanup scans adjacency and fact-owner keys in pages of at most
+256 records or 256 KiB of identity keys, admitting one oversized identity when
+necessary. It does not hydrate relationship metadata. Independent incident facts
+survive endpoint cleanup; their owner directory drives fact-document deletion.
+Each page uses the normal graph mutation path, and interrupted replay resumes by
+scanning remaining records before advancing its durable coverage checkpoint.
+
+Endpoint cleanup jobs carry a durable generation assigned in the same primary
+commit as the deletion. Planned pages include that generation for every affected
+endpoint. Apply checks each job under the primary mutation fence and skips the
+effects of missing or replaced jobs, while still advancing the ordered command
+receipt. Replaying an old page therefore cannot delete a recreated relationship
+or finish a newer deletion. Legacy jobs with raw endpoint values use generation
+zero; newly enqueued jobs always have a positive generation. Guard identities
+count toward the page byte budget. HA cleanup payloads require schema version 18,
+or version 19 when carrying an ordinary Raft receipt; older envelopes are rejected.
+
+Preparing a transaction with inline relationships retains shared dependencies
+on each distinct target document after checking that its cleanup job is absent.
+Active cleanup rejects prepare before the transaction votes ready. Ordinary target
+writes and deletes, TTL expiry, and another transaction's target deletion respect
+the durable read guards until commit or abort; restart retains those guards.
+Fact-owned projections retain their independent lifecycle and do not reserve
+endpoint documents. Target dependencies are deduplicated across the prepare.
+Configured field-derived edges use the same guards, including relational rows.
+Graph catalog additions, replacements, and deletion return `SchemaInUse` until
+durable prepares resolve, so commit uses the same relationship mapping admitted
+at prepare. A rejected index deletion restores its stopped derived worker from
+the durable replay checkpoint and notifies it of the current replay target. Successful catalog
+deletion never recreates that worker.
+
+Native unordered bulk writers maintain a namespace/key index over their append
+arena. Scalar and sorted-batch point reads use that index, including missing-job
+admission probes, instead of repeatedly scanning earlier appends. The latest
+write wins within the overlay; a mutable-write fallback clears the index after
+draining, and commit or abort releases it. Duplicate detection reuses the index.
+This keeps endpoint admission linear in batch size while preserving direct
+sorted ingestion and the same transactional cleanup fence.
+Cleanup-job admission uses transactional prefix-existence probes. Native writers
+lazily build a key-only ordered overlay, update it as writes and tombstones arrive,
+and seek pinned committed generations without copying the growing write buffer
+or base memtable for every endpoint. Matching pending deletions suppress committed
+rows; pending insertions count immediately. Other backends use their ordinary
+transactional cursor. These probes do not change durable directory formats or
+force unordered bulk appends through the mutable-write fallback.
+
+The distributed cleanup worker retains one immutable indexed routing generation
+per sweep and visits each range once, checking current local leadership before
+proposal. It probes at most eight ranges and submits at most one cleanup page per
+round. Table lookup uses the routing generation's index. A following sweep adopts
+current topology, and shutdown releases the retained generation. This avoids
+repeated catalog captures and quadratic range searches as the shard count grows.
+
+This preserves the local-store ownership scope of primary artifacts; it does not
+introduce a global cross-shard endpoint-deletion protocol.
+
+## Projection values and page budgets
+
+JSON number literals remain intact in source artifacts, document context, and
+metadata templates through live materialization, repair, and restore. Only
+numeric fields used by the graph engine, such as edge weights and entity array
+indices, are converted to their declared numeric types. Relationship predicates
+compare these preserved decimal literals exactly, including arbitrary precision
+coefficients and exponents. Stored floating-point weights compare using their
+shortest round-trip decimal representation, so `/weight = 0.1` matches a stored
+`f64` weight of `0.1` without exposing binary rounding through a wider float.
+A distinct literal such as `1.5000000000000001` still differs from `1.5`.
+Comparison borrows digit views and never allocates big integers or expands
+exponent zeros; its work is linear in the input number lengths. Canonical and
+legacy graph responses preserve these numeric tokens in metadata and evidence.
+
+Algebraic provenance labels are opaque strings. Binary relationship identities are exposed
+as `antfly:graph-provenance:v1:` followed by unpadded base64url of the executor's
+label bytes; safe legacy tuple labels retain their existing representation. The
+prefix is reserved, so legacy labels beginning with it are encoded too. Internal
+path reconstruction keeps compact framed bytes and never decodes public text.
+Distributed relationship deduplication hashes length-prefixed identity components,
+including the ID and owner, so differing component splits do not cause systematic
+hash collisions.
+
+Relationship filters prepare constants, numeric views, and decoded JSON pointers
+once, then reuse immutable prepared state across expansions and Yen spur searches.
+Intrinsic-only filters do not inspect metadata and allocate no per-edge state.
+Metadata predicates scan and skip unrelated containers instead of building a JSON
+tree. Presence/null-only predicates validate and skip scalar content without
+decoding strings. When a comparison or temporal predicate shares that pointer,
+the prepared projection decodes its value once. Scalar values and escaped keys
+are bounded by the metadata input length rather than an implicit decoder size
+limit; decoded strings and scanner nesting consume the graph retained-memory
+budget, and denial produces the normal graph budget diagnostic. JSON pointers
+have at most 256 components; array indices use canonical unsigned decimal spelling.
+Duplicate selected object keys fail the predicate as ambiguous.
+
+Artifact materialization and restore pages retain at most 2048 relation items
+or 4 MiB of materialized writes. Byte accounting includes the mutation struct,
+index name, both endpoints, type, relationship ID, owner, and metadata. One
+oversized relationship may occupy a page by itself to guarantee cursor progress;
+subsequent relationships resume from the durable item ordinal.
+
 ## Goals
 
 - Let a graph index declare an enrichment dependency for the artifact it needs.
@@ -713,8 +999,38 @@ The rejected visit and the next page's repeated visit both count as physical
 scan work, including repeated contributor selection. Retained native cursors charge
 the adjacency entry once and charge any repeated contributor visits. If no edge
 can fit, a bounded read returns the byte-budget error rather than repeating an
-empty page. Bounded local reads and graph neighbor enrichment enforce a total scan ceiling. Distributed pattern edge
-RPCs carry a shard scan ceiling and report physical rows scanned, including
+empty page. Bounded local reads and graph neighbor enrichment enforce a total
+scan ceiling.
+
+Neighbor-context sampling resolves root endpoint table tags with the same rules
+as traversal, including incoming relationships whose raw source and target keys
+are equal across tables. Direct and generated graph changes notify dependent
+producers for both added and removed endpoints, including arbitrary endpoints
+of fact documents and endpoints whose table routing changes. Generated graph
+publication and its endpoint work share a journal record. The asset dependency
+DAG includes neighbor sampling dependencies on graph artifact sources; catalog
+admission rejects direct or indirect feedback through the sampled graph.
+Neighbor-dependent producers and their transitive consumers run after primary
+commit even for synchronous writes, which wait for generated coverage. Runtime
+publishes nonleaf asset producers before consuming them; independent leaf
+producers retain provider batching.
+
+Before sampling, committed graph effects catch up in at most four 64-record
+replay pages per turn, with an additional limit of four mutation/cleanup pages
+and 1,024 scanned journal keys. Mutation pages contain at most 256 keys or
+256 KiB of primary key/value bytes (one oversized artifact may make progress). Owner cleanup and
+private contribution history retirement resume in separate bounded pages. A
+10 ms work interval yields at the next page boundary. Binary journal refresh
+retains only byte offsets and borrows key bytes, avoiding whole-record copies
+and repeated scans of already processed keys. Legacy JSON records are decoded
+for compatibility. The source frontier advances independently of consumer
+coverage and includes skipped journal records. An unfinished turn releases its
+publication/index leases and remains dependency work without spending the
+provider retry budget. Reopen, rebuild, and ordinary graph mutation invalidate
+both the volatile frontier and partial cursor, so neither can certify recovery
+or retain the replay journal.
+
+Distributed pattern edge RPCs carry a shard scan ceiling and report physical rows scanned, including
 expired rows. The coordinator charges those rows to the request-owned graph
 budget across shard reads and named pattern operations. It reads shards
 sequentially while that physical budget is active because a failed fair-share
@@ -733,6 +1049,16 @@ implemented as a separate lake graph feature: lake sidecars are built from
 row-source JSON and receive neither this index TTL policy nor the authoritative
 edge creation timestamp. Stateful TTL-enabled graph indexes do not publish
 through that sidecar path.
+
+Canonical serverless traversal, shortest paths,
+k-shortest paths, and MATCH apply relationship predicates on `/source`,
+`/target`, `/type`, and `/weight` before admission and path ranking. Published
+lake sidecars do not store fact IDs, owners, fact metadata, or creation/update times;
+filters on these fields, `valid_at`, and `known_at` are rejected with HTTP 422
+(`edge_filter`, `request_control_not_supported`), including in OPTIONAL and
+NOT EXISTS clauses. Temporal/fact predicates require the stateful graph index
+until lake publication has an explicit format supporting those fields.
+
 The DB materializer and enrichment runtime both consult source tombstones
 during replay, clear them on source retirement, and admit a changed source
 revision with a new lifetime. A guarded cleanup transaction now
@@ -784,6 +1110,22 @@ Direct writes on indexes with asset sources enforce the same configured edge
 budget against the reconciled durable count. Admission checks the final batch
 state, so a deletion and replacement at the limit can commit together, and
 rejected additions publish neither contender state nor replay work.
+
+Generated graph preparation uses private, disposable stage rows. A replay pass
+owns the enrichment lease and drains all its execution lanes before returning.
+The next owner reclaims abandoned stage rows in pages of at most 256 keys before
+starting new work, including after restart when replay is already caught up.
+Both stage writes and cleanup validate the exact enrichment lease in the write
+transaction; a superseded owner cannot recreate reclaimed rows or delete its
+successor's preparations. Cleanup is restartable and honors foreground deadlines.
+It never promotes an abandoned stage, advances replay coverage, or retries a
+provider. Original durable inputs remain the authority for regeneration.
+
+Generated replacement and withdrawal use allocator-accounted hash indexes for
+write/delete membership, affected identities, and replay artifact deduplication.
+Journal construction retains first-occurrence ordering with indexed admission.
+These operations take expected linear work in the number of keys rather than
+repeatedly scanning a growing replacement batch while holding publication.
 
 Document and relational TTL deletion take the same publication lease and retire
 all selected direct/source deadline rows in the primary deletion transaction.

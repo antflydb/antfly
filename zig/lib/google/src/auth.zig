@@ -99,7 +99,7 @@ const HttpxTransport = struct {
         };
     }
 
-    fn deinit(self: *HttpxTransport) void {
+    pub fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
         if (self.io_impl) |io_impl| {
             io_impl.deinit();
@@ -204,7 +204,7 @@ pub const AuthorizedUser = struct {
     token_uri: []u8,
     quota_project_id: ?[]u8 = null,
 
-    fn deinit(self: *AuthorizedUser, alloc: Allocator) void {
+    pub fn deinit(self: *AuthorizedUser, alloc: Allocator) void {
         alloc.free(self.client_id);
         alloc.free(self.client_secret);
         alloc.free(self.refresh_token);
@@ -225,7 +225,7 @@ pub const ExternalAccount = struct {
     service_account_impersonation_url: ?[]u8 = null,
     quota_project_id: ?[]u8 = null,
 
-    fn deinit(self: *ExternalAccount, alloc: Allocator) void {
+    pub fn deinit(self: *ExternalAccount, alloc: Allocator) void {
         alloc.free(self.audience);
         alloc.free(self.subject_token_type);
         alloc.free(self.token_url);
@@ -247,7 +247,7 @@ pub const MetadataCredentials = struct {
     token_url: []u8,
     project_id_url: []u8,
 
-    fn deinit(self: *MetadataCredentials, alloc: Allocator) void {
+    pub fn deinit(self: *MetadataCredentials, alloc: Allocator) void {
         alloc.free(self.token_url);
         alloc.free(self.project_id_url);
         self.* = undefined;
@@ -260,7 +260,7 @@ pub const Credentials = union(enum) {
     external_account: ExternalAccount,
     metadata: MetadataCredentials,
 
-    fn deinit(self: *Credentials, alloc: Allocator) void {
+    pub fn deinit(self: *Credentials, alloc: Allocator) void {
         switch (self.*) {
             inline else => |*value| value.deinit(alloc),
         }
@@ -718,7 +718,7 @@ const AccessToken = struct {
     value: []u8,
     expires_at_s: u64,
 
-    fn deinit(self: *AccessToken, alloc: Allocator) void {
+    pub fn deinit(self: *AccessToken, alloc: Allocator) void {
         alloc.free(self.value);
         self.* = undefined;
     }

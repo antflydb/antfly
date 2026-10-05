@@ -186,7 +186,179 @@ Wikipedia: 274,109 rows, median 19 words, 60% entity schemas. All sources
 are MIT, Apache 2.0 or CC BY(-SA); none is an evaluation set. Types with
 brackets or parentheses are dropped: the native schema compiler reserves them.
 
+### Distillation on the mixed pool
+
+One epoch of the mixed pool (34,264 optimizer steps, 68,528 microbatches,
+run17) from the identity-neck student, with run15's settings otherwise:
+
+| Mean (in-domain / held-out) | Optimizer steps | Classification | NER F1 |
+| --- | --- | --- | --- |
+| Wikipedia pool, run15 | 14,850 | 0.624 / 0.359 | 0.435 / 0.379 |
+| mixed pool, run17 | 12,000 | 0.583 / 0.345 | 0.443 / 0.469 |
+| mixed pool, run17 | 24,000 | 0.632 / 0.363 | 0.502 / 0.507 |
+| mixed pool, run17 | 34,264 | 0.637 / 0.372 | 0.516 / 0.524 |
+| PyTorch stage 2 | 14,000 | 0.662 / 0.378 | 0.449 / 0.364 |
+
+NER passes PyTorch stage 2 on both groups (MIT movie 0.24 to 0.46, CrossNER
+science 0.40 to 0.57); classification dipped early (Banking77 0.44 at 12,000
+steps) and recovered to just above run15, still short of stage 2 on typed
+decisions (0.29 against 0.38). The probe on the final student, own schemas,
+run15 against run17:
+
+| Source | Words | Markers |
+| --- | --- | --- |
+| CLINC150 | 0.513 -> 0.368 | 0.679 -> 0.429 |
+| SST-5 | 0.424 -> 0.335 | 0.858 -> 0.700 |
+| Banking77 | 0.396 -> 0.334 | 0.561 -> 0.556 |
+| AG News | 0.219 -> 0.220 | 0.667 -> 0.593 |
+| CrossNER (5 domains) | 0.33-0.36 -> 0.26-0.29 | 0.23-0.32 -> 0.18-0.24 |
+| MIT restaurant | 0.470 -> 0.330 | 0.268 -> 0.191 |
+| MIT movie | 0.456 -> 0.337 | 0.401 -> 0.206 |
+
+Short text and unseen type names closed most of their gap; classification
+markers (0.43-0.70) remain the largest error. Marker errors depend on which
+label names a draw samples: a second draw of the same probe put CLINC150's
+at 0.59, so compare them loosely. The probe is now
+`scripts/antenna/gap_probe.py`.
+
+The run stopped at microbatch 57,505 on the trainer's fixed 64 MiB
+`progress.jsonl` cap (about 1.2 KB per report) and resumed from the
+microbatch-48,000 checkpoint with identical state; the cap now sizes itself
+to the run (#915). Resuming needed host 8.5 GiB and backend 11 GiB to pass
+the Studio's live-memory admission. The epoch took about 23 hours.
+
+### Stage 3 from the mixed-pool student
+
+The same stage-3 job as before (pilot rows, hard labels, 2 epochs, resident
+Metal), run18:
+
+| Mean (in-domain / held-out) | Classification | NER F1 |
+| --- | --- | --- |
+| from PyTorch stage 2 | 0.743 / 0.345 | 0.684 / 0.511 |
+| from the Wikipedia-pool student (run16) | 0.740 / 0.316 | 0.696 / 0.497 |
+| from the mixed-pool student (run18) | 0.734 / 0.368 | 0.719 / 0.629 |
+| gliner2.5-base + the same recipe (upstream trainer) | 0.808 / 0.467 | 0.723 / 0.624 |
+
+Trained entirely natively, the ModernBERT student now matches its teacher
+fine-tuned the same way on NER, in-domain and held out (CrossNER science
+0.69, politics 0.71, MIT movie 0.49). Classification trails by 0.07
+in-domain and 0.10 held out: typed decisions 0.25, CLINC150 0.47, SST-5
+0.38.
+
+### Second pool: real label sets and typed decisions
+
+`distill_pool.py --label-sets` now draws each classification row's labels
+from one real set: the source's own (MASSIVE intents, GoEmotions emotions,
+DBpedia and AG News topics, Banking77 intents) or one of 65 hand-written sets
+in `scripts/antenna/label_sets.json` (sentiment and rating scales, stance,
+urgency, departments, document and question types, and so on; none
+reproduces an evaluation label list). `--source openjev` adds Open-Jev's
+CC0 typed decisions (release-v2-redistributable train, without
+customer-control-v1), each question a task over its options, rendered as
+Laya's converter renders them; a third of the yes/no questions and a quarter
+of the synthetic game rows are kept, and 9,665 decision rows fit the 128-word
+limit. Rows sharing a text stay in one split. The pool has 252,352 training
+rows, 43% classification with 795 task names and 1,138 labels; run19 distills
+on it with run17's settings.
+
+### A Laya decision head on the Antenna trunk
+
+`scripts/antenna/init_decision_head.py` builds a Laya-format checkpoint from
+the run17 student: its `encoder.*` tensors copy across unchanged (the names
+already match Laya's), the GLiNER heads and neck are dropped, and a fresh
+decision head (`type_emb`, `scorer`, `act_head`, two `head.layers`) is
+initialized at width 768 as upstream Laya's modules initialize it, with the
+released checkpoint's decision settings. Laya's loader, trainer and
+evaluator take it unchanged. `freeze_layers = num_hidden_layers + 1` now
+freezes the whole encoder, final norm included (without a new job field, so
+existing Laya run identities hold), so only the head trains and the trunk
+stays exact for the GLiNER heads; the exported encoder tensors are
+bit-identical to the source's.
+
+Accuracy on Laya's step-0 eval split (760 typed decisions), RLCD, head
+learning rate 1e-4, batch 1, resident Metal:
+
+| | Overall | Choice | Score | Yes/no |
+| --- | --- | --- | --- | --- |
+| untrained head | 0.286 | | | |
+| released Laya (ModernBERT-large, not fine-tuned) | 0.387 | 0.34 | 0.35 | 0.48 |
+| step-0 split, 2,000 decisions, 3 epochs (15 min) | 0.434 | 0.39 | 0.34 | 0.61 |
+| plus Open-Jev (64,450 decisions), 1 epoch (4 h) | 0.404 | 0.41 | 0.25 | 0.61 |
+| that head, then the step-0 split for 3 epochs | 0.476 | 0.49 | 0.39 | 0.59 |
+
+A head on the frozen base-size trunk beats released Laya-large, but trails
+Laya's full step-0 fine-tune (about 0.62, encoder trained). Mixed in for one
+epoch, Open-Jev hurts score questions, as it left Laya's own eval unchanged
+(LAYA.md, "Scaling packed training on Open-Jev"); as a first stage followed
+by three epochs on the step-0 split it helps (0.476 against 0.434, soft
+cross-entropy 1.094 against 1.135), mostly on choice and score questions.
+
+### A clean recipe: only permissively licensed training data
+
+Checking each source's own terms before publishing weights:
+- **AG News:** the AG corpus page restricts it to research and "any other non-commercial activity".
+- **MIT restaurant (and MIT movie):** MIT SLS publishes no license.
+- **CrossNER:** MIT-licensed. Usable.
+
+`scripts/antenna/antenna_training_sets.py` pins permissive training-only sets:
+HuffPost News Category (CC BY 4.0), DBpedia (CC BY-SA 3.0), MASSIVE intents
+and slots (Apache 2.0 / CC BY 4.0), Few-NERD (CC BY-SA 4.0) and MultiCoNER v2
+(CC BY 4.0). `teacher_targets.py --recipe clean` builds stage 3 rows from
+Banking77, HuffPost, DBpedia and MASSIVE intents (classification) and CrossNER
+AI/literature/music, Few-NERD, MASSIVE slots and MultiCoNER v2 (NER).
+
+Large type sets are sampled per row like large label sets: every gold type
+plus negatives, up to 24 queries. With all 66 Few-NERD types, the job stopped
+on `BoundaryQueryLimitExceeded`.
+
+The clean pool is run19's mix with HuffPost (20,000) in place of AG News.
+AG News and MIT restaurant remain evaluation sets only.
+
+Distilling on it (run21) gives 0.655 / 0.372 classification and 0.503 / 0.520
+NER, within noise of run19. A decision head on its trunk (dec7, same
+curriculum) reaches 0.511 on the step-0 typed-decision eval, the best so far
+(0.476 on run17's trunk, 0.443 on run19's).
+
+Stage 3 (run22), grouped by what each run trained on:
+
+| | run20 (AG News, MIT) | run22 (clean) |
+| --- | --- | --- |
+| Banking77 (both trained) | 0.586 | 0.626 |
+| CrossNER AI, literature, music NER (both trained) | 0.696 | 0.698 |
+| CLINC150, SST-5, typed decisions (neither) | 0.388 | 0.372 |
+| CrossNER politics, science, MIT movie NER (neither) | 0.632 | 0.619 |
+| AG News (run20 only) | 0.852 | 0.728 |
+| MIT restaurant (run20 only) | 0.778 | 0.436 |
+
+The clean model matches on everything both runs saw or both held out. It
+loses restaurant-style slot NER, which MASSIVE's assistant-command slots
+don't replace. The private Hugging Face repo antflydb/antenna-0 now holds the
+clean `student/` (run21), `gliner/` (run22) and `decision/` (dec7). Its git
+history still has the earlier version.
+
+Adding SNIPS BookRestaurant (CC0 1.0, 1,973 booking requests, 14 slot types)
+to the clean stage 3 rows (run23):
+- **MIT restaurant:** rises from 0.436 to 0.485.
+- **Held-out sets:** classification goes from 0.372 to 0.385 and NER from 0.619 to 0.625.
+- **Banking77:** goes from 0.626 to 0.596, within its noise.
+
+MIT restaurant's own types (amenity, hours, price, rating) appear in no
+permissive set, which bounds what substitutes can recover. antenna-0's
+`gliner/` is now run23.
+
+On the throughput binary, bigger microbatches pay little. Batch 8 gives 960
+examples a minute against 714 at batch 4, and its longest microbatches still
+exceed the Studio's device limits. Batch 16 and 32 don't fit with the
+materialized attention profile on 36 GB. Larger batches need the fused,
+linear-memory attention profile.
+
+Run21 finished on the throughput branch (#959). Resumed from its own pause
+checkpoint, it ran at 209 microbatches per minute against 49, with
+bit-identical losses.
+
 ## Next
 
-- Distill on the mixed pool (one epoch, 34,264 optimizer steps, run17),
-  rerun the probe, then stage 3.
+- Restaurant-style types beyond SNIPS (amenity, hours, price, rating) from a
+  permissive source, or teacher-labelled restaurant queries.
+- Embedding layout and classification targets continue in
+  2026-10-03-embedding-layout.md.

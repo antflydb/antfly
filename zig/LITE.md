@@ -1130,13 +1130,23 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native v3 now has two explicit signatures: `AFLITE\x03N` for the original
-unpacked encoding and `AFLITE\x03P` for packed records. New files use the packed
-encoding. Existing unpacked v3 files remain readable and writable without
-conversion; explicit vacuum writes a packed replacement. Revision 2 remains
-unsupported. Older binaries reject the packed signature before checkpoint
-selection, preventing an older reader from silently selecting a pre-packing
-fallback checkpoint. A packed file requires a binary supporting this encoding.
+Native owners create revision-4 files (`AFLITE\x04P`) with packed records and
+durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
+unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
+owners migrate revision 3 through an atomic compact-generation replacement;
+read-only opens preserve the existing encoding. The Zig `page_reuse = false`
+option preserves revision-3 creation/open behavior. Raw native primitives also
+retain their revision-3 default for compatibility. Revision 2 remains unsupported,
+and older binaries reject the revision-4 signature before checkpoint selection.
+
+Revision 4 removes historical record chains. Ordered indexes identify live
+records; journaled ownership counters and a hierarchical bitmap replenish free
+pages through incremental retirement. Shared values and packed slots retire
+independently, behind recovery, durability, and reader fences. Page reuse remains
+enabled when optional physical shrinking is disabled. Shrinking rewrites a
+compact generation independently of routine reuse. See the
+[reclamation design](../docs/design/lite-reclamation.md) for policy options,
+storage admission, format encoding, memory costs, and qualification.
 
 Small records in multi-key transactions share immutable record pages. A tagged
 reference identifies a physical page and a validated record offset; large
@@ -1240,7 +1250,7 @@ Compaction releases the namespace registry lock after its initial sync barrier.
 Secret metadata enumeration also uses a scope-bounded catalog cursor. It does
 not materialize unrelated private metadata or encrypted values from other scopes.
 
-Run `zig build lite-native-benchmark -Doptimize=ReleaseSafe` for the reproducible
+Run `zig build lite-native-benchmark -Doptimize=safe` for the reproducible
 transaction-assembly, commit, and sorted-read workloads. Timings are observations;
 structural tests enforce page-read, write-call, memory, and correctness bounds.
 

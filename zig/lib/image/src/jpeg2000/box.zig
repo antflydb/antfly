@@ -473,7 +473,7 @@ fn writeJp2HeaderBox(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         for (entries) |e| {
             std.mem.writeInt(u16, &buf2, e.channel, .big);
             try out.appendSlice(allocator, &buf2);
-            std.mem.writeInt(u16, &buf2, @intFromEnum(e.kind), .big);
+            std.mem.writeInt(u16, &buf2, @backingInt(e.kind), .big);
             try out.appendSlice(allocator, &buf2);
             std.mem.writeInt(u16, &buf2, e.association, .big);
             try out.appendSlice(allocator, &buf2);
@@ -488,7 +488,7 @@ fn writeJp2HeaderBox(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(
 }
 
 fn appendColorSpec(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), cs: ColorSpec) !void {
-    try out.append(allocator, @intFromEnum(cs.method));
+    try out.append(allocator, @backingInt(cs.method));
     try out.append(allocator, cs.precedence);
     try out.append(allocator, cs.approximation);
     switch (cs.method) {

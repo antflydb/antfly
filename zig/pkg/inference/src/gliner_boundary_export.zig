@@ -91,9 +91,9 @@ pub fn publishDirectory(allocator: Allocator, io: std.Io, source: []const u8, de
         const Darwin = struct {
             extern "c" fn renamex_np([*:0]const u8, [*:0]const u8, c_uint) c_int;
         };
-        const source_z = try allocator.dupeZ(u8, source);
+        const source_z = try allocator.dupeSentinel(u8, source, 0);
         defer allocator.free(source_z);
-        const destination_z = try allocator.dupeZ(u8, destination);
+        const destination_z = try allocator.dupeSentinel(u8, destination, 0);
         defer allocator.free(destination_z);
         while (true) switch (std.posix.errno(Darwin.renamex_np(source_z.ptr, destination_z.ptr, 0x00000004))) {
             .SUCCESS => return,
@@ -141,7 +141,7 @@ const Sink = struct {
     }
     fn padTo(self: *@This(), target: u64) !void {
         if (target < self.bytes) return error.InvalidTensorOffset;
-        const zeros = [_]u8{0} ** 256;
+        const zeros = @as([256]u8, @splat(0));
         while (self.bytes < target) try self.write(zeros[0..@intCast(@min(target - self.bytes, zeros.len))]);
     }
 };

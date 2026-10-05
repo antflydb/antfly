@@ -27,18 +27,14 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
 
     const run_exe = ctx.addRunArtifact(exe);
     run_exe.step.dependOn(&install_exe.step);
-    if (ctx.args) |args| {
-        run_exe.addArgs(args);
-    }
+    run_exe.addPassthruArgs();
     const run_step = ctx.step("run", "Run the Antfly inference server");
     run_step.dependOn(&run_exe.step);
 
     const run_finetune = ctx.addRunArtifact(exe);
     run_finetune.step.dependOn(&install_exe.step);
     run_finetune.addArg("finetune");
-    if (ctx.args) |args| {
-        run_finetune.addArgs(args);
-    }
+    run_finetune.addPassthruArgs();
     const finetune_step = ctx.step("finetune", "Run Antfly inference finetune");
     finetune_step.dependOn(&run_finetune.step);
 

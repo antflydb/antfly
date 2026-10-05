@@ -50,7 +50,7 @@ const CachedProjectedMedia = struct {
 const ProjectedMediaCache = struct {
     items: std.StringHashMapUnmanaged(CachedProjectedMedia) = .empty,
 
-    fn deinit(self: *ProjectedMediaCache, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ProjectedMediaCache, allocator: std.mem.Allocator) void {
         var it = self.items.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);

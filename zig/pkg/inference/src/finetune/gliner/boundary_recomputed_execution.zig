@@ -140,7 +140,7 @@ const Prepared = struct {
     storage: []Route,
     routes: []Route,
     estimate: Admission,
-    fn deinit(self: *Prepared) void {
+    pub fn deinit(self: *Prepared) void {
         self.allocator.free(self.storage);
     }
     fn find(self: *Prepared, original: Id) ?*Route {
@@ -376,7 +376,7 @@ const Tiny = struct {
         const built = try graph.build(a, source, .{ .embedding_output = embedded, .normalized_relative = relative, .layers = &layers, .output = hidden }, &.{ absent, encoder_only, shared, explicit_zero }, &.{}, .{ .outputs = &.{output} }, .{});
         return .{ .allocator = a, .source = source, .built = built, .shared = shared, .encoder_only = encoder_only, .explicit_zero = explicit_zero, .absent = absent, .unselected = unselected };
     }
-    fn deinit(self: *Tiny) void {
+    pub fn deinit(self: *Tiny) void {
         self.built.deinit();
         self.source.deinit();
         self.allocator.destroy(self.source);

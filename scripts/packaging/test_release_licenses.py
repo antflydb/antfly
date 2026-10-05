@@ -38,6 +38,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/lite-release-README.md",
                 "scripts/packaging/inference-release-README.md",
                 "scripts/apache_engine_files.txt",
+                "scripts/source_license_roots.json",
                 "scripts/embedded_asset_licenses.json",
                 "LICENSE",
                 "LICENSES/Apache-2.0.txt",
@@ -104,7 +105,9 @@ class ReleaseLicenseTests(unittest.TestCase):
                         capture_output=True,
                         text=True,
                     )
-                    build_dir = root / ("zig/pkg/inference" if product == "inference" else "zig")
+                    build_dir = root / (
+                        "zig/pkg/inference" if product == "inference" else "zig"
+                    )
                     args = json.loads((build_dir / "build-args.json").read_text())
                     self.assertEqual(
                         steps,
@@ -126,7 +129,9 @@ class ReleaseLicenseTests(unittest.TestCase):
                             "./lib/libantfly.dylib",
                             "./include/antfly.h",
                         ):
-                            self.assertEqual(product != "inference", name in archive.getnames())
+                            self.assertEqual(
+                                product != "inference", name in archive.getnames()
+                            )
                         self.assertEqual(
                             product == "server",
                             "./LICENSES/Elastic-2.0.txt" in archive.getnames(),
@@ -160,7 +165,9 @@ class ReleaseLicenseTests(unittest.TestCase):
                         if product != "inference":
                             self.assertEqual(
                                 (ROOT / "scripts/apache_engine_files.txt").read_bytes(),
-                                archive.extractfile("./scripts/apache_engine_files.txt").read(),
+                                archive.extractfile(
+                                    "./scripts/apache_engine_files.txt"
+                                ).read(),
                             )
                         if product == "server":
                             self.assertEqual(
@@ -203,7 +210,12 @@ class ReleaseLicenseTests(unittest.TestCase):
                                 name
                                 for name in archive.getnames()
                                 if name
-                                in {"./antfly", "./antfly-lite", "./antfly-inference", "./antfly-inference-worker"}
+                                in {
+                                    "./antfly",
+                                    "./antfly-lite",
+                                    "./antfly-inference",
+                                    "./antfly-inference-worker",
+                                }
                             },
                         )
 

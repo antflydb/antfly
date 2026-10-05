@@ -27,7 +27,7 @@ const ExpertBatchBuffer = struct {
     touch_count: u64 = 0,
     last_touched_step: u64 = 0,
 
-    fn deinit(self: *ExpertBatchBuffer, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ExpertBatchBuffer, allocator: std.mem.Allocator) void {
         self.rows.deinit(allocator);
         self.route_weights.deinit(allocator);
     }
@@ -47,7 +47,7 @@ const LayerState = struct {
     predicted_scores: std.ArrayListUnmanaged(u32) = .empty,
     coactivation: []u32 = &.{},
 
-    fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
         for (self.expert_batches) |*batch| batch.deinit(allocator);
         allocator.free(self.expert_batches);
         allocator.free(self.active_flags);

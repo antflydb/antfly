@@ -134,6 +134,17 @@ def same_identity(left: object, right: dict[str, str]) -> bool:
     )
 
 
+def require_not_aborted(state: dict[str, Any], tag: str) -> None:
+    aborted = state.get("aborted", [])
+    if not isinstance(aborted, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("tag"), str)
+        for item in aborted
+    ):
+        raise SystemExit("release channel has malformed aborted identities")
+    if any(item["tag"] == tag for item in aborted):
+        raise SystemExit(f"release channel promotion for {tag} was aborted")
+
+
 @dataclass
 class StoredState:
     document: dict[str, Any]
@@ -242,6 +253,7 @@ def begin_promotion(
     channel: str = "stable",
 ) -> None:
     stored = store.load()
+    require_not_aborted(stored.document, identity["tag"])
     current = validate_promotion_state(
         stored.document, identity, bootstrap_current, channel
     )
@@ -263,7 +275,7 @@ def begin_promotion(
             and pending.get("container_digest") is None
         ):
             next_state = {
-                "schema_version": 1,
+                **stored.document,
                 "channel": channel,
                 "current": current,
                 "pending": identity,
@@ -275,7 +287,7 @@ def begin_promotion(
             return
         raise AssertionError("validated pending promotion was not resumable")
     next_state = {
-        "schema_version": 1,
+        **stored.document,
         "channel": channel,
         "current": current,
         "pending": identity,
@@ -295,6 +307,7 @@ def validate_promotion_state(
     # The candidate was validated when its identity was created. Journal and
     # registry state may contain legacy spellings and are observation-only.
     validate_observed_channel_tag(identity["tag"], channel, policy)
+    require_not_aborted(state, identity["tag"])
     stored_channel = state.get("channel")
     if stored_channel not in {None, channel}:
         raise SystemExit(
@@ -378,6 +391,7 @@ def finish_promotion(
 ) -> None:
     stored = store.load()
     state = stored.document
+    require_not_aborted(state, identity["tag"])
     if state.get("channel") not in {None, channel}:
         raise SystemExit(f"release channel journal does not belong to {channel}")
     if state.get("pending") is None and same_identity(state.get("current"), identity):
@@ -400,7 +414,7 @@ def finish_promotion(
     committed_at = utc_timestamp(now)
     committed_identity = {**identity, "committed_at": committed_at}
     next_state = {
-        "schema_version": 1,
+        **state,
         "channel": channel,
         "current": committed_identity,
         "pending": None,
@@ -410,11 +424,36 @@ def finish_promotion(
     print(f"committed release channel promotion for {identity['tag']}")
 
 
+def abort_promotion(
+    store: S3ChannelStore,
+    identity: dict[str, str],
+    cancelled_run: int,
+    channel: str = "stable",
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Clear an unpublished reservation after independent checks in the caller."""
+    stored = store.load()
+    state = stored.document
+    if state.get("channel") != channel or state.get("pending") != identity:
+        raise SystemExit("release channel has no exact pending identity to abort")
+    if not isinstance(cancelled_run, int) or cancelled_run <= 0:
+        raise SystemExit("invalid cancelled promotion run")
+    require_not_aborted(state, identity["tag"])
+    aborted = [
+        *state.get("aborted", []),
+        {**identity, "cancelled_run": cancelled_run, "aborted_at": utc_timestamp(now)},
+    ]
+    store.compare_and_swap(stored, {**state, "pending": None, "aborted": aborted})
+    print(f"aborted unpublished release channel promotion for {identity['tag']}")
+
+
 def journaled_container_digest(
     store: S3ChannelStore, identity: dict[str, str], channel: str = "stable"
 ) -> str | None:
     """Return a reusable digest already bound to this exact release identity."""
     state = store.load().document
+    require_not_aborted(state, identity["tag"])
     if state.get("channel") not in {None, channel}:
         raise SystemExit(f"release channel journal does not belong to {channel}")
     pending = state.get("pending")

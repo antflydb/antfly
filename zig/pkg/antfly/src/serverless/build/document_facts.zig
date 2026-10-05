@@ -21,7 +21,7 @@ const Allocator = std.mem.Allocator;
 const tree = @import("../graph_segment/page_tree.zig");
 const page_store = @import("../graph_segment/page_store.zig");
 const artifacts = @import("../artifacts/store.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const max_document_id_bytes = 256 * 1024;
 pub const max_pending_key_bytes = max_document_id_bytes + 8;
@@ -55,7 +55,7 @@ pub const Fact = struct {
 
     pub const encoded_bytes = 80;
     pub fn encode(self: Fact) [encoded_bytes]u8 {
-        var bytes = [_]u8{0} ** encoded_bytes;
+        var bytes = @as([encoded_bytes]u8, @splat(0));
         @memcpy(bytes[0..32], &self.body.digest);
         @memcpy(bytes[32..48], &self.body.attempt);
         std.mem.writeInt(u64, bytes[48..56], self.body.bytes, .little);
@@ -99,7 +99,7 @@ pub const Root = struct {
         return std.mem.eql(u8, &a.encode(), &b.encode());
     }
     pub fn encode(self: Root) [encoded_bytes]u8 {
-        var out = [_]u8{0} ** encoded_bytes;
+        var out = @as([encoded_bytes]u8, @splat(0));
         @memcpy(out[0..8], "AFDFACT3");
         @memcpy(out[16..48], &self.domain);
         @memcpy(out[48..80], &self.policy_fingerprint);

@@ -32,9 +32,9 @@ pub const agents = @import("agents.zig");
 pub const internal = @import("internal.zig");
 pub const auth = @import("auth.zig");
 
-pub const OutputFormat = @import("io.zig").OutputFormat;
+pub const OutputFormat = @import("antfly_local_sources").cmd_cli_io.OutputFormat;
 
-pub const GlobalConfig = @import("io.zig").GlobalConfig;
+pub const GlobalConfig = @import("antfly_local_sources").cmd_cli_io.GlobalConfig;
 
 pub const CatalogFlags = struct {
     database: ?[]const u8 = null,
@@ -95,6 +95,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\  --pruner <json>                   Result pruner configuration
     \\  --limit <n>                       Result limit
     \\  --offset <n>                      Result offset
+    \\  --wait-ready-ms <n>               Wait for this query to serve within n milliseconds
     \\
     ;
     if (std.mem.eql(u8, command, "load")) return
@@ -224,11 +225,11 @@ test "client commands expose help without a server" {
 /// Supported env vars:
 ///   ANTFLY_URL    — server base URL (default http://127.0.0.1:8080)
 ///   ANTFLY_TOKEN  — bearer token for authentication
-pub const parseGlobalFlags = @import("io.zig").parseGlobalFlags;
+pub const parseGlobalFlags = @import("antfly_local_sources").cmd_cli_io.parseGlobalFlags;
 
-pub const initClient = @import("io.zig").initClient;
+pub const initClient = @import("antfly_local_sources").cmd_cli_io.initClient;
 
-pub const writeJson = @import("io.zig").writeJson;
+pub const writeJson = @import("antfly_local_sources").cmd_cli_io.writeJson;
 
 pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !void {
     if (resp.data) |parsed| {
@@ -239,11 +240,11 @@ pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !v
     try writeJson(allocator, io, .{ .status = resp.status_code });
 }
 
-pub const expectHttpSuccess = @import("io.zig").expectHttpSuccess;
+pub const expectHttpSuccess = @import("antfly_local_sources").cmd_cli_io.expectHttpSuccess;
 
-pub const writeStdout = @import("io.zig").writeStdout;
+pub const writeStdout = @import("antfly_local_sources").cmd_cli_io.writeStdout;
 
-pub const readFileAlloc = @import("io.zig").readFileAlloc;
+pub const readFileAlloc = @import("antfly_local_sources").cmd_cli_io.readFileAlloc;
 
 pub fn splitCommaListAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -259,7 +260,7 @@ pub fn splitCommaListAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]con
     return try list.toOwnedSlice(allocator);
 }
 
-pub const fatal = @import("io.zig").fatal;
+pub const fatal = @import("antfly_local_sources").cmd_cli_io.fatal;
 
 test "cli mod compiles" {
     _ = table;

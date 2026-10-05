@@ -14,7 +14,7 @@
 // limitations.
 
 //! Compatibility facade for the local inference provider adapter.
-const local = @import("../storage/inference_provider.zig");
+const local = @import("antfly_local_sources").storage_inference_provider;
 pub const inference_bridge = local.inference_bridge;
 pub const runtime_http_abi = local.runtime_http_abi;
 pub const LocalInferenceConnectionContext = local.LocalInferenceConnectionContext;
@@ -55,6 +55,7 @@ pub const inferenceProviderGenerateText = local.inferenceProviderGenerateText;
 pub const inferenceProviderGenerateTextWithContext = local.inferenceProviderGenerateTextWithContext;
 pub const inferenceProviderGenerateMessages = local.inferenceProviderGenerateMessages;
 pub const inferenceProviderGenerateJson = local.inferenceProviderGenerateJson;
+pub const inferenceProviderDecideJson = local.inferenceProviderDecideJson;
 pub const inferenceProviderGenerateMessagesWithContext = local.inferenceProviderGenerateMessagesWithContext;
 pub const inferenceProviderGenerateMessagesWithAttachments = local.inferenceProviderGenerateMessagesWithAttachments;
 pub const inferenceProviderGenerateMessagesWithAttachmentsWithContext = local.inferenceProviderGenerateMessagesWithAttachmentsWithContext;

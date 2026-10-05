@@ -1,23 +1,23 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const httpx = @import("httpx");
-const common = @import("http_common.zig");
-const std_http_listener = @import("std_http_listener.zig");
-const threaded_connect_io = @import("../threaded_connect_io.zig");
+const common = @import("antfly_local_sources").common_http_http_common;
+const std_http_listener = @import("antfly_local_sources").common_http_std_http_listener;
+const threaded_connect_io = @import("antfly_local_sources").common_threaded_connect_io;
 
 const cancellation_poll_interval_ms: i64 = 25;
 
@@ -368,7 +368,11 @@ pub const StdHttpExecutor = struct {
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         try sendDirectRequest(&request, req.body);
 
-        var response = try request.receiveHead(&.{});
+        var response = request.receiveHead(&.{}) catch |err| {
+            if (err == error.ReadFailed) return request.connection.?.getReadError() orelse error.InvalidResponse;
+            if (err == error.HttpRequestTruncated) return error.InvalidResponse;
+            return err;
+        };
         const response_limit = if (req.max_response_bytes != null) req.responseLimit(self.cfg.max_response_bytes) else std.math.maxInt(usize);
         if (response.head.content_length) |length| if (length > response_limit) return error.ResponseTooLarge;
         var header_count: usize = 0;
@@ -384,7 +388,7 @@ pub const StdHttpExecutor = struct {
         while (header_it.next()) |header| : (header_index += 1)
             headers[header_index] = .{ .name = header.name, .value = header.value };
         try downstream.start(alloc, .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .content_type = response.head.content_type,
             .headers = headers,
         });
@@ -394,12 +398,14 @@ pub const StdHttpExecutor = struct {
         const body_reader = response.reader(&transfer_buffer);
         var consumed: usize = 0;
         while (true) {
-            const read = try body_reader.readSliceShort(&read_buffer);
+            const read = body_reader.readSliceShort(&read_buffer) catch |err|
+                return responseBodyReadError(err, response.bodyErr());
             if (read == 0) break;
             if (read > response_limit - consumed) return error.ResponseTooLarge;
             consumed += read;
             try downstream.writeAll(read_buffer[0..read]);
         }
+        try ensureDirectResponseComplete(&request);
         try downstream.flush();
         const connection_closing = if (request.connection) |connection| connection.closing else true;
         self.recordCompletedRequest(request_keep_alive, connection_closing);
@@ -743,7 +749,11 @@ pub const StdHttpExecutor = struct {
         if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         try sendDirectRequest(&request, req.body);
 
-        var response = try request.receiveHead(&.{});
+        var response = request.receiveHead(&.{}) catch |err| {
+            if (err == error.ReadFailed) return request.connection.?.getReadError() orelse error.InvalidResponse;
+            if (err == error.HttpRequestTruncated) return error.InvalidResponse;
+            return err;
+        };
         const response_limit = req.responseLimit(self.cfg.max_response_bytes);
         if (response.head.content_length) |length| if (length > response_limit) return error.ResponseTooLarge;
         const content_type = if (response.head.content_type) |value|
@@ -781,13 +791,15 @@ pub const StdHttpExecutor = struct {
         var transfer_buffer: [512]u8 = undefined;
         const body = response.reader(&transfer_buffer).allocRemaining(alloc, .limited(response_limit)) catch |err| switch (err) {
             error.StreamTooLong => return error.ResponseTooLarge,
-            else => return err,
+            else => return responseBodyReadError(err, response.bodyErr()),
         };
+        errdefer alloc.free(body);
+        try ensureDirectResponseComplete(&request);
 
         const connection_closing = if (request.connection) |connection| connection.closing else true;
         self.recordCompletedRequest(request_keep_alive, connection_closing);
         return .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .content_type = content_type,
             .headers = headers,
             .body = body,
@@ -872,6 +884,40 @@ pub const StdHttpExecutor = struct {
     }
 };
 
+fn ensureDirectResponseComplete(request: *std.http.Client.Request) !void {
+    // Content-Length readers can expose ordinary EOF without ReadFailed.
+    // Receiving a syntactically valid JSON prefix still does not complete the
+    // HTTP message. Chunked bodies must also reach their terminal frame.
+    switch (request.reader.state) {
+        .body_remaining_content_length, .body_remaining_chunk_len => {
+            if (request.connection) |connection| connection.closing = true;
+            return error.InvalidResponse;
+        },
+        else => {},
+    }
+}
+
+/// std.http's body reader deliberately erases the framing failure into
+/// ReadFailed. Recover it before crossing a runtime archive boundary. A
+/// truncated body is an incomplete response, never a successful empty read
+/// or proof that a mutation was not delivered.
+fn responseBodyReadError(err: anyerror, body_error: ?std.http.Reader.BodyError) anyerror {
+    if (err != error.ReadFailed) return err;
+    return switch (body_error orelse return error.InvalidResponse) {
+        error.HttpChunkTruncated => error.InvalidResponse,
+        else => |cause| cause,
+    };
+}
+
+test "std http body failures retain framing cause without mutation delivery proof" {
+    try std.testing.expectEqual(error.InvalidResponse, responseBodyReadError(error.ReadFailed, error.HttpChunkTruncated));
+    try std.testing.expectEqual(error.HttpChunkInvalid, responseBodyReadError(error.ReadFailed, error.HttpChunkInvalid));
+    try std.testing.expectEqual(error.HttpHeadersOversize, responseBodyReadError(error.ReadFailed, error.HttpHeadersOversize));
+    try std.testing.expectEqual(error.InvalidResponse, responseBodyReadError(error.ReadFailed, null));
+    try std.testing.expectEqual(error.Canceled, responseBodyReadError(error.Canceled, error.HttpChunkTruncated));
+    try std.testing.expectEqual(error.OutOfMemory, responseBodyReadError(error.OutOfMemory, null));
+}
+
 fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []const u8) bool {
     // The new client request owns framing, routing, connection lifecycle, and
     // the two canonical headers represented separately on HttpRequest.
@@ -911,9 +957,13 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
 test "std http executor retains socket write failures and uncertain delivery" {
     const Inject = struct {
         var writes: std.atomic.Value(usize) = .init(0);
-        fn netWrite(_: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []const u8, _: []const []const u8, _: usize) std.Io.net.Stream.Writer.Error!usize {
-            _ = writes.fetchAdd(1, .monotonic);
-            return error.ConnectionResetByPeer;
+        var upstream: @FieldType(std.Io.VTable, "operate") = undefined;
+        fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            if (operation == .net_write) {
+                _ = writes.fetchAdd(1, .monotonic);
+                return .{ .net_write = error.ConnectionResetByPeer };
+            }
+            return upstream(context, operation);
         }
     };
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -924,7 +974,8 @@ test "std http executor retains socket write failures and uncertain delivery" {
     for ([_]common.Method{ .GET, .POST }) |method| {
         var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
         defer executor.deinit();
-        executor.io_vtable.netWrite = Inject.netWrite;
+        Inject.upstream = executor.io_vtable.operate;
+        executor.io_vtable.operate = Inject.operate;
         Inject.writes.store(0, .monotonic);
         var delivery: common.RequestDeliveryTracker = .{};
         try std.testing.expectError(error.ConnectionResetByPeer, executor.executor().execute(std.testing.allocator, .{
@@ -937,6 +988,76 @@ test "std http executor retains socket write failures and uncertain delivery" {
         try std.testing.expectEqual(@as(usize, 0), executor.client.connection_pool.free_len);
         try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, delivery.load());
     }
+}
+
+test "std http executor rejects truncated response without replaying a delivered mutation" {
+    const Inject = struct {
+        var reads: std.atomic.Value(usize) = .init(0);
+        var writes: std.atomic.Value(usize) = .init(0);
+        var upstream: @FieldType(std.Io.VTable, "operate") = undefined;
+        var response: []const u8 = undefined;
+        fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            switch (operation) {
+                .net_write => {
+                    _ = writes.fetchAdd(1, .monotonic);
+                },
+                .net_read => |request| {
+                    if (reads.fetchAdd(1, .monotonic) != 0) return .{ .net_read = .{ .data_len = 0 } };
+                    @memcpy(request.data[0][0..response.len], response);
+                    return .{ .net_read = .{ .data_len = response.len } };
+                },
+                else => {},
+            }
+            return upstream(context, operation);
+        }
+    };
+    const Sink = struct {
+        flushed: bool = false,
+        fn start(_: *anyopaque, _: std.mem.Allocator, _: common.StreamingResponse) anyerror!void {}
+        fn write(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn flush(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.flushed = true;
+        }
+    };
+    var server = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
+    defer std.testing.allocator.free(uri);
+    for ([_][]const u8{
+        "HTTP/1.1 200 OK\r\nContent-L",
+        "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nnull",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nnull",
+    }) |response| for ([_]common.Method{ .GET, .POST }) |method| for ([_]bool{ false, true }) |streaming| {
+        var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
+        defer executor.deinit();
+        Inject.upstream = executor.io_vtable.operate;
+        executor.io_vtable.operate = Inject.operate;
+        Inject.response = response;
+        Inject.reads.store(0, .monotonic);
+        Inject.writes.store(0, .monotonic);
+        var delivery: common.RequestDeliveryTracker = .{};
+        const request: common.HttpRequest = .{
+            .method = method,
+            .uri = uri,
+            .body = if (method == .POST) "body" else "",
+            .delivery_tracker = &delivery,
+        };
+        if (streaming) {
+            var sink: Sink = .{};
+            try std.testing.expectError(error.InvalidResponse, executor.executor().executeStream(std.testing.allocator, request, .{
+                .ptr = &sink,
+                .vtable = &.{ .start = Sink.start, .write_all = Sink.write, .flush = Sink.flush },
+            }));
+            try std.testing.expect(!sink.flushed);
+        } else {
+            try std.testing.expectError(error.InvalidResponse, executor.executor().execute(std.testing.allocator, request));
+        }
+        try std.testing.expect(Inject.reads.load(.monotonic) >= 2);
+        try std.testing.expectEqual(@as(usize, 1), Inject.writes.load(.monotonic));
+        try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, delivery.load());
+        try std.testing.expectEqual(@as(usize, 0), executor.client.connection_pool.free_len);
+    };
 }
 
 test "std http executor module compiles" {
@@ -1231,7 +1352,7 @@ test "std http executor streams response metadata and body past buffered limit" 
         wrote_before_start: bool = false,
         body: std.ArrayListUnmanaged(u8) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.body.deinit(self.alloc);
         }
 

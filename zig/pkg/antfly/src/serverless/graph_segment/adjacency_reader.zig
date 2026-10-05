@@ -22,7 +22,7 @@ const wire = @import("packed.zig");
 const types = @import("types.zig");
 const topology = @import("topology_reader.zig");
 const artifacts = @import("../artifacts/store.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const paged = @import("page_reader.zig");
 const page_graph = @import("page_graph.zig");
@@ -533,7 +533,7 @@ const TestStore = struct {
     payload: []const u8,
     calls: usize = 0,
     bytes: usize = 0,
-    fn deinit(_: Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: Allocator, _: *anyopaque) void {}
     fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts.ArtifactMetadata {
         return error.Unsupported;
     }
@@ -848,7 +848,7 @@ test "serverless graph paged dictionary fences handle long shared prefixes and p
     const a = fixture.allocator();
     const count = 1025;
     const ids = try a.alloc([]const u8, count);
-    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(a, "{s}/{d:0>8}", .{ &([_]u8{'x'} ** 100), i });
+    for (ids, 0..) |*id, i| id.* = try std.fmt.allocPrint(a, "{s}/{d:0>8}", .{ &(@as([100]u8, @splat('x'))), i });
     var builder = @import("builder.zig").Builder{ .alloc = a };
     defer builder.deinit();
     for (ids, 0..) |id, i| try builder.addEdge(id, ids[(i + 1) % count], "link", 1, null);
@@ -871,7 +871,7 @@ test "serverless graph paged dictionary fences handle long shared prefixes and p
     }
     try std.testing.expect(!try reader.containsNode(""));
     try std.testing.expect(!try reader.containsNode("z"));
-    const missing = try std.fmt.allocPrint(a, "{s}/00001025", .{&([_]u8{'x'} ** 100)});
+    const missing = try std.fmt.allocPrint(a, "{s}/00001025", .{&(@as([100]u8, @splat('x')))});
     try std.testing.expect(!try reader.containsNode(missing));
     const calls = memory.calls;
     for ([_]usize{ 0, 255, 256, 511, 512, 1023, 1024 }) |i| try std.testing.expect(try reader.containsNode(ids[i]));

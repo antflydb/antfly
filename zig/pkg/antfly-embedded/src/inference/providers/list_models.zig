@@ -74,7 +74,7 @@ pub const ListedModel = struct {
     kind: ModelKind = .other,
     dimensions: ?u32 = null,
 
-    fn deinit(self: *ListedModel, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ListedModel, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         if (self.display_name) |value| alloc.free(value);
         self.* = undefined;
@@ -278,7 +278,7 @@ const ResultBuilder = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *ResultBuilder) void {
+    pub fn deinit(self: *ResultBuilder) void {
         for (self.models.items) |*model| model.deinit(self.alloc);
         self.models.deinit(self.alloc);
     }
@@ -509,7 +509,12 @@ pub fn parseAntflyModels(alloc: std.mem.Allocator, body: []const u8) !ListResult
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    for (0..haystack.len - needle.len + 1) |i| {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
 }
 
 // --- Tests ---

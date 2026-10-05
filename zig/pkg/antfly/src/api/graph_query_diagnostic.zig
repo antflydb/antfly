@@ -14,7 +14,7 @@
 // limitations.
 
 const std = @import("std");
-const graph_query = @import("../graph/query.zig");
+const graph_query = @import("antfly_local_sources").graph_query;
 
 pub const Reason = enum {
     legacy_graph_searches_not_supported,

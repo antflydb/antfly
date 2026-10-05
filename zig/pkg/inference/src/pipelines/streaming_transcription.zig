@@ -253,7 +253,7 @@ pub const Session = struct {
         }
     }
 
-    fn finalize(
+    pub fn finalize(
         self: *Session,
         transcriber: anytype,
         events: *std.ArrayListUnmanaged(Event),
@@ -415,7 +415,7 @@ const FakeTranscriber = struct {
     /// Text returned per call, cycled. Empty list returns a length-derived text.
     scripted: []const []const u8 = &.{},
 
-    prefix_lens: [16]usize = [_]usize{0} ** 16,
+    prefix_lens: [16]usize = @as([16]usize, @splat(0)),
 
     pub fn encodePromptText(_: *FakeTranscriber, allocator: std.mem.Allocator, text: []const u8) ![]i32 {
         var count: usize = 0;

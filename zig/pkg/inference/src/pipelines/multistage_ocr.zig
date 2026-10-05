@@ -236,7 +236,7 @@ fn recognitionInputWidth(config: PreprocessConfig, source_width: u32, source_hei
 
 test "dynamic recognition preserves square glyphs beyond the width hint" {
     const config = PreprocessConfig{ .width = 20, .height = 5, .keep_aspect_ratio = true, .dynamic_width = true };
-    var pixels = [_]u8{255} ** (80 * 10 * 3);
+    var pixels = @as([(80 * 10 * 3)]u8, @splat(255));
     for (0..10) |row| @memset(pixels[row * 80 * 3 ..][0 .. 10 * 3], 0);
     const img = image.Image{ .data = &pixels, .width = 80, .height = 10, .channels = 3 };
     const width = try recognitionInputWidth(config, img.width, img.height);
@@ -1032,7 +1032,7 @@ test "recognition backend failure cannot become successful partial OCR" {
             .preprocess = .{ .width = 2, .height = 2 },
         } },
     };
-    var pixels = [_]u8{255} ** (5 * 3 * 3);
+    var pixels = @as([(5 * 3 * 3)]u8, @splat(255));
     const img = image.Image{ .data = &pixels, .width = 5, .height = 3, .channels = 3 };
     if (pipeline.runDecoded(img)) |result_value| {
         var result = result_value;

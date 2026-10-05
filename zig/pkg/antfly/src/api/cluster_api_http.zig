@@ -15,9 +15,9 @@
 
 const std = @import("std");
 const backups_api = @import("backups.zig");
-const operation = @import("operation.zig");
-const common_secrets = @import("../common/secrets.zig");
-const common_config = @import("../common/config.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const common_config = @import("antfly_local_sources").common_config;
 
 pub const ClusterApi = struct {
     ptr: *anyopaque,

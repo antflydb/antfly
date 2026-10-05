@@ -20,8 +20,8 @@ const tavily = @import("tavily_api").types;
 const api = @import("antfly_websearch_openapi");
 const generating_api = @import("antfly_generating_api_openapi");
 const metadata = @import("antfly_metadata_openapi");
-const common = @import("../common/config.zig");
-const secrets = @import("../common/secrets.zig");
+const common = @import("antfly_local_sources").common_config;
+const secrets = @import("antfly_local_sources").common_secrets;
 const time = @import("antfly_platform").time;
 
 pub const default_endpoint = "https://api.exa.ai/search";

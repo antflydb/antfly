@@ -32,3 +32,5 @@ test "embedded package surfaces are reachable" {
     _ = storage_backend;
     _ = db_types;
 }
+
+pub const lake = support.lake;

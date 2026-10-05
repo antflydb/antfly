@@ -1,25 +1,25 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//     https://www.antfly.io/licensing/ELv2-license
 //
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Bounded public shape validation, independent of a table's typed compiler.
 //! Storage binds types and dependencies; this boundary rejects ambiguous or
 //! unsupported JSON before admission and preserves the same closed GET shape.
 const std = @import("std");
 const wire = @import("antfly_schema_openapi");
-const impl = @import("../schema/table_schema_impl.zig");
-const ColumnKind = @import("../storage/schema.zig").RelationalColumnType;
+const impl = @import("antfly_local_sources").schema_table_schema_impl;
+const ColumnKind = @import("antfly_local_sources").storage_schema.RelationalColumnType;
 
 /// Request-local cached binding for column/op predicates. Parsed API handlers
 /// reuse their immutable schema; raw/wire paths parse only referenced fields.
@@ -37,7 +37,7 @@ pub const ColumnTypes = struct {
         const result = switch (self.source) {
             .parsed => |schema| found: {
                 for (schema.document_schemas) |document| for (document.properties) |property| {
-                    if (std.mem.eql(u8, property.name, name)) break :found @import("../schema/mod.zig").runtimeRelationalColumnType(property);
+                    if (std.mem.eql(u8, property.name, name)) break :found @import("antfly_local_sources").schema_mod.runtimeRelationalColumnType(property);
                 };
                 break :found null;
             },
@@ -155,11 +155,11 @@ fn canonicalLiteral(alloc: std.mem.Allocator, kind: wire.RelationalExpressionTyp
         .integer => {
             // Invalid values remain untouched for normal typed admission to
             // reject, never rounded or silently coerced by normalization.
-            const integer = @import("../schema/table_schema_impl.zig").documentIntegerToI64(value) orelse return value;
+            const integer = @import("antfly_local_sources").schema_table_schema_impl.documentIntegerToI64(value) orelse return value;
             if (integer > safe or integer < -safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{integer}) };
         },
         .datetime => {
-            const timestamp = @import("../schema/table_schema_impl.zig").documentDateTimeToNs(value) orelse return value;
+            const timestamp = @import("antfly_local_sources").schema_table_schema_impl.documentDateTimeToNs(value) orelse return value;
             if (timestamp > safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{timestamp}) };
         },
         else => {},

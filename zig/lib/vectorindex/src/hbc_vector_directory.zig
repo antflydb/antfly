@@ -768,8 +768,8 @@ fn markVerified(words: []@import("antfly_platform").atomic.Value(u64), block_ind
 
 fn encodeDescriptor(value: Descriptor) [descriptor_size]u8 {
     var out: [descriptor_size]u8 = @splat(0);
-    out[0] = @intFromEnum(value.encoding);
-    out[1] = @intFromEnum(value.metadata_end_encoding);
+    out[0] = @backingInt(value.encoding);
+    out[1] = @backingInt(value.metadata_end_encoding);
     writeU32(&out, 4, @intCast(value.count));
     writeU64(&out, 8, value.first_id);
     writeU64(&out, 16, value.last_id);
@@ -786,13 +786,13 @@ fn encodeDescriptor(value: Descriptor) [descriptor_size]u8 {
 fn decodeDescriptor(bytes: []const u8) !Descriptor {
     if (bytes.len != descriptor_size or readU16(bytes, 2) != 0) return error.CorruptedVectorDirectory;
     const encoding: IdEncoding = switch (bytes[0]) {
-        @intFromEnum(IdEncoding.raw) => .raw,
-        @intFromEnum(IdEncoding.restart_varint) => .restart_varint,
+        @backingInt(IdEncoding.raw) => .raw,
+        @backingInt(IdEncoding.restart_varint) => .restart_varint,
         else => return error.CorruptedVectorDirectory,
     };
     const metadata_end_encoding: MetadataEndEncoding = switch (bytes[1]) {
-        @intFromEnum(MetadataEndEncoding.u16) => .u16,
-        @intFromEnum(MetadataEndEncoding.u32) => .u32,
+        @backingInt(MetadataEndEncoding.u16) => .u16,
+        @backingInt(MetadataEndEncoding.u32) => .u32,
         else => return error.CorruptedVectorDirectory,
     };
     return .{

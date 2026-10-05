@@ -105,15 +105,15 @@ fn evidenceAllocationError(terminal: EvidenceAllocationFailure, err: anyerror) a
 fn hashOptions(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
     const T = @TypeOf(value);
     switch (@typeInfo(T)) {
-        .@"struct" => |info| inline for (info.fields) |field| {
+        .@"struct" => |info| inline for (info.field_names) |reflected_name| {
             // These carry ownership/cancellation/validator execution, not
             // semantics. Compiled validator expressions live in schema IDs.
-            if (comptime !std.mem.eql(u8, field.name, "control") and !std.mem.eql(u8, field.name, "check_context") and !std.mem.eql(u8, field.name, "check_fn") and
-                !std.mem.eql(u8, field.name, "regex_context") and !std.mem.eql(u8, field.name, "validate_value_fn"))
+            if (comptime !std.mem.eql(u8, reflected_name, "control") and !std.mem.eql(u8, reflected_name, "check_context") and !std.mem.eql(u8, reflected_name, "check_fn") and
+                !std.mem.eql(u8, reflected_name, "regex_context") and !std.mem.eql(u8, reflected_name, "validate_value_fn"))
             {
-                hash.update(field.name);
+                hash.update(reflected_name);
                 hash.update("\x00");
-                hashOptions(hash, @field(value, field.name));
+                hashOptions(hash, @field(value, reflected_name));
             }
         },
         .optional => {
@@ -131,7 +131,7 @@ fn hashOptions(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
             hash.update(&bytes);
         },
         .float => |info| {
-            const Bits = std.meta.Int(.unsigned, info.bits);
+            const Bits = @Int(.unsigned, info.bits);
             var bytes: [info.bits / 8]u8 = undefined;
             std.mem.writeInt(Bits, &bytes, @bitCast(value), .little);
             hash.update(&bytes);
@@ -813,7 +813,7 @@ test "gliner boundary long executor word splitter binds inference and window ide
     defer request.deinit();
     const config = model.Config{ .version = 3, .architecture_version = 1, .max_len = 4096, .backbone = .small, .head = .{}, .encoder = std.mem.zeroes(model.EncoderConfig) };
     const digest = artifact.Digest.of("identity fixture");
-    const identity = artifact.Identity{ .backbone = .small, .precision = .fp32, .weight = digest, .sidecars = [_]artifact.Digest{digest} ** 4 };
+    const identity = artifact.Identity{ .backbone = .small, .precision = .fp32, .weight = digest, .sidecars = @as([4]artifact.Digest, @splat(digest)) };
     var fingerprints: [3][32]u8 = undefined;
     var plan_fingerprints: [3][32]u8 = undefined;
     for (request.items, 0..) |*item, index| {
@@ -918,7 +918,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
     var request_live = true;
     defer if (request_live) request.deinit();
     const item = &request.items[0];
-    var document = try document_mod.plan(a, item.text, item.compiled.fingerprint, .{ .mode = .windowed, .max_window_body_words = 5, .overlap_words = 3, .inference_fingerprint = [_]u8{7} ** 32 });
+    var document = try document_mod.plan(a, item.text, item.compiled.fingerprint, .{ .mode = .windowed, .max_window_body_words = 5, .overlap_words = 3, .inference_fingerprint = @as([32]u8, @splat(7)) });
     var document_live = true;
     defer if (document_live) document.deinit();
     const left_text = try document.windowText(0);

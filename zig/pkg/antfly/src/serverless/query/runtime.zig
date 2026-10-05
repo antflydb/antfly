@@ -22,10 +22,10 @@ const manifest_mod = @import("../manifest/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const graph_metric_config = @import("../build/graph_metric_config.zig");
 const cache_mod = @import("cache.zig");
-const bounded_decode = @import("../bounded_decode.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
-const operation = @import("../../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const CancellationToken = operation.CancellationToken;
 const read_lease = @import("../manifest/read_lease.zig");
 
@@ -1308,13 +1308,13 @@ test "serverless query session propagates cancellation through full and cached r
         full_calls: usize = 0,
         range_calls: usize = 0,
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
 
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedPut;
         }
 
-        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+        pub fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
             return error.NonCancellableFullReadUsed;
         }
 

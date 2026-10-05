@@ -143,7 +143,7 @@ const Work = struct {
         if (self.options.control) |control| try control.check();
     }
 };
-fn validate(schema: schema_mod.JointSchema, options: Options) !void {
+pub fn validate(schema: schema_mod.JointSchema, options: Options) !void {
     if (!probability(options.candidate_threshold) or !probability(options.relation_role_threshold) or
         (options.entity_threshold != null and !probability(options.entity_threshold.?)) or
         !std.math.isFinite(options.entity_weight) or options.entity_weight < 0 or
@@ -531,7 +531,7 @@ pub fn buildScored(allocator: Allocator, config: *const model.Config, input: Sco
 const test_text = "a a a a a a a a a a a a a a a a";
 fn testSample(words: []processor.Word) processor.Sample {
     for (words, 0..) |*word, i| word.* = .{ .text = "a", .source = .{ .start = 2 * i, .end = 2 * i + 1 }, .input_start = i, .input_end = i + 1 };
-    return .{ .original_text = test_text, .schema_fingerprint = .{0} ** 32, .input_ids = &.{}, .words = words, .groups = &.{}, .queries = &.{}, .classification_labels = &.{}, .enum_choices = &.{}, .prefix_word_count = 0, .body_word_count = words.len, .terminal_period_added = false, .is_joint_ie = true };
+    return .{ .original_text = test_text, .schema_fingerprint = @splat(0), .input_ids = &.{}, .words = words, .groups = &.{}, .queries = &.{}, .classification_labels = &.{}, .enum_choices = &.{}, .prefix_word_count = 0, .body_word_count = words.len, .terminal_period_added = false, .is_joint_ie = true };
 }
 fn testMention(entity: usize, start: usize, logit: f64) MentionScore {
     return .{ .key = .{ .entity_type = entity, .span = .{ .start = start, .end = start + 1 } }, .logit = logit };

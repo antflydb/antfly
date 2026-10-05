@@ -20,15 +20,20 @@ test {
     _ = @import("storage/hot_standby/db_integration_test.zig");
     _ = @import("vopr/index_maintenance.zig");
     _ = @import("antfly_source_root").antfly_sources.physical_db;
-    _ = @import("graph/query.zig");
-    _ = @import("storage/db/graph_runtime.zig");
+    _ = @import("antfly_local_sources").graph_query;
+    _ = @import("antfly_local_sources").storage_db_graph_runtime;
+    _ = @import("antfly_local_sources").storage_db_primary_effect;
     _ = @import("storage/db_split_vopr.zig");
-    _ = @import("storage/db/promotion_runtime.zig");
-    _ = @import("storage/db/resolution_runtime.zig");
-    _ = @import("storage/db/relational_index_catalog.zig");
-    _ = @import("storage/db/relational_index_gc.zig");
+    _ = @import("antfly_local_sources").storage_db_promotion_runtime;
+    _ = @import("antfly_local_sources").storage_db_resolution_runtime;
+    _ = @import("antfly_local_sources").storage_db_relational_index_catalog;
+    _ = @import("antfly_local_sources").storage_db_relational_index_gc;
 }
 
 pub const antfly_sources = struct {
-    pub const physical_db = @import("storage/db/db.zig");
+    pub const physical_db = @import("antfly_local_sources").storage_db_db;
+    pub const selected_db = @import("antfly_local_sources").storage_db_mod;
 };
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

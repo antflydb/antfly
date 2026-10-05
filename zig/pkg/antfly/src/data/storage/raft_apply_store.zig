@@ -19,17 +19,17 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-const background_runtime = @import("../../storage/background_runtime.zig");
-const docstore = @import("../../storage/docstore.zig");
-const generation_lifecycle = @import("../../storage/db/generation_lifecycle.zig");
-const range_state = @import("../../storage/db/range_state.zig");
-const db_types = @import("../../storage/db/types.zig");
-const merge_state = @import("../../storage/db/merge_state.zig");
-const lsm_backend = @import("../../storage/lsm_backend.zig");
-const resource_manager_mod = @import("../../storage/resource_manager.zig");
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const docstore = @import("antfly_local_sources").storage_docstore;
+const generation_lifecycle = @import("antfly_local_sources").storage_db_generation_lifecycle;
+const range_state = @import("antfly_local_sources").storage_db_range_state;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const merge_state = @import("antfly_local_sources").storage_db_merge_state;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
-const shard_mod = @import("../../storage/shard.zig");
+const shard_mod = @import("antfly_local_sources").storage_shard;
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const shard_state_store = @import("shard_state_store.zig");
 const data_raft_batch = @import("../raft_batch.zig");
@@ -111,7 +111,7 @@ pub const RaftApplyStore = struct {
     backend: lsm_backend.BackendHandle,
     shutting_down: std.atomic.Value(bool) = .init(false),
     placement_transition_mutex: std.atomic.Mutex = .unlocked,
-    batch_shards: [batch_shard_count]BatchShard = [_]BatchShard{.{}} ** batch_shard_count,
+    batch_shards: [batch_shard_count]BatchShard = @as([batch_shard_count]BatchShard, @splat(.{})),
 
     const OwnedBatch = AppliedDataBatch;
     const BatchShard = struct {
@@ -312,9 +312,9 @@ pub const RaftApplyStore = struct {
         platform.sync.lockYielding(&self.placement_transition_mutex);
         errdefer self.placement_transition_mutex.unlock();
 
-        var next_exact = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var next_exact = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&next_exact) |*groups| groups.deinit(self.alloc);
-        var admitted_union = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var admitted_union = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&admitted_union) |*groups| groups.deinit(self.alloc);
         for (group_ids) |group_id| {
             const shard_index: usize = @intCast(group_id % batch_shard_count);
@@ -335,7 +335,7 @@ pub const RaftApplyStore = struct {
             shard.mutex.unlock(io);
         }
 
-        var previous = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var previous = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&previous) |*groups| groups.deinit(self.alloc);
         for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
@@ -350,7 +350,7 @@ pub const RaftApplyStore = struct {
         // union can enter a shard. Build a deduplicated retirement set while
         // holding only that shard's mutex. An allocation failure leaves the
         // safe union admitted, exactly like an aborted host reconciliation.
-        var retire_candidates = [_]std.AutoHashMapUnmanaged(u64, void){.empty} ** batch_shard_count;
+        var retire_candidates = @as([batch_shard_count]std.AutoHashMapUnmanaged(u64, void), @splat(.empty));
         errdefer for (&retire_candidates) |*groups| groups.deinit(self.alloc);
         for (&self.batch_shards, 0..) |*shard, shard_index| {
             shard.mutex.lockUncancelable(io);
@@ -1825,7 +1825,7 @@ pub const RaftApplyStore = struct {
             const owned_value = try self.alloc.alloc(u8, @sizeOf(u64) + 1 + entry.data.len);
             errdefer self.alloc.free(owned_value);
             std.mem.writeInt(u64, owned_value[0..8], entry.term, .little);
-            owned_value[8] = @intFromEnum(entry.entry_type);
+            owned_value[8] = @backingInt(entry.entry_type);
             @memcpy(owned_value[9..], entry.data);
             try writes.append(self.alloc, .{ .key = owned_key, .value = owned_value });
         }
@@ -1929,7 +1929,7 @@ pub const RaftApplyStore = struct {
         const header_len = @sizeOf(u64) + 1;
         if (identity.len < header_len or
             std.mem.readInt(u64, identity[0..8], .little) != replay.term or
-            identity[8] != @intFromEnum(replay.entry_type))
+            identity[8] != @backingInt(replay.entry_type))
         {
             return false;
         }
@@ -2432,7 +2432,7 @@ pub const RaftApplyStore = struct {
         // projection-only adapter cannot acknowledge them as empty batches.
         if (decoded.batch.req.online_source != null) {
             if (!native_source_delegate) return error.StorageKernelOwnerUnavailable;
-            try @import("../../storage/db/online_source_contract.zig").validateRequest(decoded.batch.req);
+            try @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(decoded.batch.req);
             try operations.append(alloc, .require_source_pin_protocol);
             try operations.append(alloc, .{ .topology_guard = .{ .index = raft_index, .action = .{ .source = decoded.batch.req.online_source.? } } });
             try operations.append(alloc, .{ .flush_split_delta = raft_index });
@@ -2453,7 +2453,7 @@ pub const RaftApplyStore = struct {
         };
         const fenced_copy = decoded.batch.req.merge_replication != null and decoded.batch.req.merge_checkpoint == null;
         if (decoded.batch.req.merge_page != null) {
-            try @import("../../storage/db/merge_page_contract.zig").validateRequest(decoded.batch.req);
+            try @import("antfly_local_sources").storage_db_merge_page_contract.validateRequest(decoded.batch.req);
             const payload = try std.json.Stringify.valueAlloc(alloc, decoded.batch.req, .{});
             errdefer alloc.free(payload);
             try operations.append(alloc, .{ .merge_page_fence = payload });
@@ -2574,7 +2574,7 @@ pub const RaftApplyStore = struct {
 
 test "data raft integrity transfer refuses projection only owners and retains native protocol barrier" {
     const alloc = std.testing.allocator;
-    const pages = @import("../../storage/db/merge_page_contract.zig");
+    const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
     const source: pages.Source = .{
         .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 },
         .pin_digest = @splat(1),
@@ -2632,7 +2632,7 @@ test "data raft online topology arbitration persists exact rejection and scopes 
     defer alloc.free(barrier);
     try std.testing.expect(try store.seedGroupSnapshotIfAbsent(alloc, group, 1, .{ .start = "", .end = "m" }, &.{}));
     try Apply.bytes(&store, 1, barrier);
-    const scope: @import("../../storage/db/online_source_contract.zig").Scope = .{
+    const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .transition_id = 91, .attempt = 1, .admission_epoch = 1, .owner_group_id = group, .peer_group_id = 602, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = group, .range_id = 700 }, .catalog_digest = @splat(8) },
         .receiver_namespace = .{ .table_id = 7, .shard_id = 602, .range_id = 701 },
         .consumer_epoch = 4,
@@ -3124,7 +3124,7 @@ test "data raft apply store accepts restart replay split below the durable water
         defer std.testing.allocator.free(identity);
         try std.testing.expectEqual(@as(usize, @sizeOf(u64) + 1), identity.len);
         try std.testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, identity[0..8], .little));
-        try std.testing.expectEqual(@intFromEnum(raft_engine.core.types.EntryType.normal), identity[8]);
+        try std.testing.expectEqual(@backingInt(raft_engine.core.types.EntryType.normal), identity[8]);
         var normal_key_buf: [160]u8 = undefined;
         const normal_key = try RaftApplyStore.normalEntryKeyForGroup(&normal_key_buf, 33, 1);
         const normal_data = try group_store.store.get(std.testing.allocator, normal_key);
@@ -3134,7 +3134,7 @@ test "data raft apply store accepts restart replay split below the durable water
         const legacy_payload = "put:b=2";
         var legacy_identity: [@sizeOf(u64) + 1 + legacy_payload.len]u8 = undefined;
         std.mem.writeInt(u64, legacy_identity[0..8], 1, .little);
-        legacy_identity[8] = @intFromEnum(raft_engine.core.types.EntryType.normal);
+        legacy_identity[8] = @backingInt(raft_engine.core.types.EntryType.normal);
         @memcpy(legacy_identity[9..], legacy_payload);
         const legacy_identity_key = try RaftApplyStore.entryIdentityKeyForGroup(&identity_key_buf, 33, 2);
         try group_store.store.put(legacy_identity_key, &legacy_identity);

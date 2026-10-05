@@ -1671,8 +1671,8 @@ implementation strategy:
 
 The first backend-neutral code pieces are in:
 
-- [pkg/antfly/src/storage/backend_types.zig](pkg/antfly/src/storage/backend_types.zig)
-- [pkg/antfly/src/storage/backend_adapter.zig](pkg/antfly/src/storage/backend_adapter.zig)
+- [pkg/antfly-embedded/src/local/storage/backend_types.zig](pkg/antfly-embedded/src/local/storage/backend_types.zig)
+- [pkg/antfly-embedded/src/local/storage/backend_adapter.zig](pkg/antfly-embedded/src/local/storage/backend_adapter.zig)
 
 Those model:
 
@@ -1722,7 +1722,7 @@ Principles:
 
 A binary dense request/response codec lives in the Zig C API, exposed as a
 dense wire entrypoint from
-[pkg/antfly/src/capi/db.zig](pkg/antfly/src/capi/db.zig)
+[pkg/antfly-embedded/src/local/capi/db.zig](pkg/antfly-embedded/src/local/capi/db.zig)
 (`antfly_db_search_dense_wire`), with a matching Go-side codec in the zigdb
 bridge. The narrowed dense path routes through the binary wire first, with the
 JSON path kept as fallback. Local dense search no longer marshals JSON on the

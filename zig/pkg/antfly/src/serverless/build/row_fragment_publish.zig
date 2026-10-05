@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 const artifact_store = @import("../artifacts/store.zig");
 const row_fragment_manifest = @import("row_fragment_manifest.zig");
 const row_fragments = @import("row_fragments.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const PublishOptions = struct {
     schema_fingerprint: []const u8,
@@ -107,7 +107,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -143,7 +143,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         const value = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, value);
     }

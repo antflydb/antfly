@@ -594,7 +594,7 @@ pub const CompiledTrainSession = struct {
         partitioned: bool,
         unsupported_ops: usize = 0,
 
-        fn deinit(self: *CachedMetalGraphExecutorPlan) void {
+        pub fn deinit(self: *CachedMetalGraphExecutorPlan) void {
             self.buffer_plan.deinit();
             self.base_plan.deinit();
             self.base_plan.allocator.free(self.assignments);
@@ -607,7 +607,7 @@ pub const CompiledTrainSession = struct {
         buffer_plan: buffer_plan_mod.BufferPlan,
         assignments: []device_mesh.DeviceId,
 
-        fn deinit(self: *CachedCudaGraphExecutorPlan) void {
+        pub fn deinit(self: *CachedCudaGraphExecutorPlan) void {
             self.buffer_plan.deinit();
             self.base_plan.deinit();
             self.base_plan.allocator.free(self.assignments);
@@ -2053,7 +2053,7 @@ fn dumpGraphOutputValuesJsonl(
         }
         try appendGraphOutputDump("],\"abs_sum\":{d}}}\n", .{abs_sum});
     }
-    try io_compat.cwd().writeFile(io_compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(io_compat.testingIo(), .{
         .sub_path = path,
         .data = graph_output_dump_buffer.items,
     });
@@ -2215,7 +2215,7 @@ const FallbackNativeBackend = struct {
         };
     }
 
-    fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
         self.backend.deinit();
         native_compute.deinitPrefetchQueue(self.weight_store);
         self.weight_store.resident_weights.deinit(allocator);

@@ -17,7 +17,7 @@
  * Coverage beyond the shared conformance cases for the storage_kind /
  * cross-storage-restore surface added in the capi/naming-cleanup ABI
  * cleanup: restoring a .aflite backup into directory storage, and reopening
- * that directory afterwards (see zig/pkg/antfly/capi-conformance/cases/
+ * that directory afterwards (see zig/pkg/antfly-embedded/capi-conformance/cases/
  * directory_storage.json and backup_across_storage.json for the shared
  * cases this complements).
  */

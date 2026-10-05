@@ -23,8 +23,8 @@
       "size_bytes": 6183
     },
     "benchmark_cpu.py": {
-      "sha256": "277fd7f16371ff055be07142a9d32e10f54c4e4fa90aff6011c21995044b4b9d",
-      "size_bytes": 27929
+      "sha256": "aae145f3dbcbe80e40c7cd9d59fb3d47a6d85b7820b08024521de4c91a383fd7",
+      "size_bytes": 33210
     },
     "capture_inventory.py": {
       "sha256": "5751ed3538dcb3547bab3c84a7725e4613daf5cff73a08aaff11690fcea893e0",

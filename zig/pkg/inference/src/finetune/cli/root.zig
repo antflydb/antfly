@@ -332,18 +332,18 @@ const CommandArguments = struct {
         errdefer for (owned[0..initialized]) |argument| allocator.free(argument);
         const vector = try allocator.alloc([*:0]const u8, count);
         errdefer allocator.free(vector);
-        owned[0] = try allocator.dupeZ(u8, argv0);
+        owned[0] = try allocator.dupeSentinel(u8, argv0, 0);
         initialized += 1;
         vector[0] = owned[0].ptr;
         for (args, 1..) |argument, index| {
-            owned[index] = try allocator.dupeZ(u8, argument);
+            owned[index] = try allocator.dupeSentinel(u8, argument, 0);
             initialized += 1;
             vector[index] = owned[index].ptr;
         }
         return .{ .allocator = allocator, .owned = owned, .vector = vector };
     }
 
-    fn deinit(self: *CommandArguments) void {
+    pub fn deinit(self: *CommandArguments) void {
         for (self.owned) |argument| self.allocator.free(argument);
         self.allocator.free(self.owned);
         self.allocator.free(self.vector);

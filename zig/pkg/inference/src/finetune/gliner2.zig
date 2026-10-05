@@ -92,23 +92,23 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_inspect_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), encoder_dir);
     const config_path = try std.fs.path.join(allocator, &.{ root, "config.json" });
     defer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ root, "encoder_config", "config.json" });
     defer allocator.free(encoder_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_name":"urchade/gliner2","model_type":"gliner2","counting_layer":"count_embed","token_pooling":"first","max_width":12,"count_embed_dim":128,"count_embed_layers":2,"count_embed_heads":4,"count_embed_ffn":256,"max_count_embed":20}
         ,
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = encoder_config_path,
         .data =
         \\{"vocab_size":30522,"hidden_size":128,"num_hidden_layers":2,"num_attention_heads":4,"intermediate_size":256,"max_position_embeddings":512,"type_vocab_size":2,"position_buckets":32,"relative_attention":true,"hidden_dropout_prob":0.1,"attention_probs_dropout_prob":0.1,"layer_norm_eps":1e-7}
@@ -117,17 +117,17 @@ test "gliner2 checkpoint inspection reads config and tensor summary" {
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.1.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 32, 128 }, .data = &[_]f32{0} ** (32 * 128) },
-        .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 8, 128 }, .data = &[_]f32{0} ** (8 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.1.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "span_rep.span_rep_layer.project_start.0.weight", .shape = &.{ 32, 128 }, .data = &@as([(32 * 128)]f32, @splat(0)) },
+        .{ .name = "count_embed.pos_embedding.weight", .shape = &.{ 8, 128 }, .data = &@as([(8 * 128)]f32, @splat(0)) },
     });
 
     var summary = try inspectCheckpoint(allocator, root, null);
@@ -196,21 +196,21 @@ test "gliner2 bootstrap and inspect lora bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_bootstrap_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), encoder_dir);
     const config_path = try std.fs.path.join(allocator, &.{ root, "config.json" });
     defer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ root, "encoder_config", "config.json" });
     defer allocator.free(encoder_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_name\":\"urchade/gliner2\",\"model_type\":\"gliner2\",\"counting_layer\":\"count_embed\",\"token_pooling\":\"first\",\"max_width\":12}",
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = encoder_config_path,
         .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
     });
@@ -222,17 +222,17 @@ test "gliner2 bootstrap and inspect lora bundle" {
     }) |file_name| {
         const tokenizer_artifact_path = try std.fs.path.join(allocator, &.{ root, file_name });
         defer allocator.free(tokenizer_artifact_path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_artifact_path, .data = "{}" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_artifact_path, .data = "{}" });
     }
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "lora" });
@@ -252,7 +252,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try saveLoRABundle(&bundle, out_dir);
     const task_head_path = try std.fs.path.join(allocator, &.{ out_dir, task_head_checkpoint_file_name });
     defer allocator.free(task_head_path);
-    const classifier_weight = [_]f32{0.25} ** (3 * 128);
+    const classifier_weight = @as([(3 * 128)]f32, @splat(0.25));
     const classifier_bias = [_]f32{ 0.5, -0.25, 0.75 };
     try writeHeaderAndTensorsF32(allocator, task_head_path, &.{
         .{ .name = "classifier.weight", .shape = &.{ 3, 128 }, .data = &classifier_weight },
@@ -283,7 +283,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
 
     const completion_path = try std.fs.path.join(allocator, &.{ materialized_dir, materialization_manifest_file_name });
     defer allocator.free(completion_path);
-    const completion_bytes = try compat.cwd().readFileAlloc(compat.io(), completion_path, allocator, .limited(64 * 1024));
+    const completion_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), completion_path, allocator, .limited(64 * 1024));
     defer allocator.free(completion_bytes);
     var completion = try std.json.parseFromSlice(std.json.Value, allocator, completion_bytes, .{});
     defer completion.deinit();
@@ -355,7 +355,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     try std.testing.expectEqualSlices(f32, adapter_head.weight, materialized_head.weight);
     try std.testing.expectEqualSlices(f32, adapter_head.bias, materialized_head.bias);
 
-    const hidden_rows = [_]f32{0.5} ** (2 * 128);
+    const hidden_rows = @as([(2 * 128)]f32, @splat(0.5));
     const adapter_logits = try adapter_head.scoreRowsAlloc(allocator, &hidden_rows);
     defer allocator.free(adapter_logits);
     const materialized_logits = try materialized_head.scoreRowsAlloc(allocator, &hidden_rows);
@@ -369,7 +369,7 @@ test "gliner2 bootstrap and inspect lora bundle" {
     // nor the same-process staging directory behind.
     const added_tokens_path = try std.fs.path.join(allocator, &.{ root, added_tokens_file_name });
     defer allocator.free(added_tokens_path);
-    try compat.cwd().deleteFile(compat.io(), added_tokens_path);
+    try std.Io.Dir.cwd().deleteFile(compat.testingIo(), added_tokens_path);
     const failed_materialized_dir = try std.fs.path.join(allocator, &.{ root, "materialized-missing-inventory" });
     defer allocator.free(failed_materialized_dir);
     const failed_staging_dir = try materializationStagingPath(allocator, failed_materialized_dir);
@@ -386,39 +386,39 @@ test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_autodiff_export_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
     const encoder_dir = try std.fs.path.join(allocator, &.{ root, "encoder_config" });
     defer allocator.free(encoder_dir);
-    try compat.cwd().createDirPath(compat.io(), encoder_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), encoder_dir);
     const config_path = try std.fs.path.join(allocator, &.{ root, config_file_name });
     defer allocator.free(config_path);
     const encoder_config_path = try std.fs.path.join(allocator, &.{ root, encoder_config_file_name });
     defer allocator.free(encoder_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_name\":\"urchade/gliner2\",\"model_type\":\"gliner2\",\"counting_layer\":\"count_embed\",\"token_pooling\":\"first\",\"max_width\":12}",
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = encoder_config_path,
         .data = "{\"hidden_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}",
     });
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
     try writeHeaderAndTensorsF32(allocator, checkpoint_path, &.{
-        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &[_]f32{0} ** (4 * 128) },
-        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &[_]f32{0} ** (32 * 32) },
-        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &[_]f32{0} ** 128 },
-        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
-        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &[_]f32{0} ** (128 * 128) },
+        .{ .name = "encoder.embeddings.word_embeddings.weight", .shape = &.{ 4, 128 }, .data = &@as([(4 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.rel_embeddings.weight", .shape = &.{ 32, 32 }, .data = &@as([(32 * 32)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.LayerNorm.weight", .shape = &.{128}, .data = &@as([128]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
+        .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 128, 128 }, .data = &@as([(128 * 128)]f32, @splat(0)) },
     });
 
     const out_dir = try std.fs.path.join(allocator, &.{ root, "autodiff_lora" });
     defer allocator.free(out_dir);
-    const a_data = [_]f32{0.01} ** (2 * 128);
-    const b_data = [_]f32{0.02} ** (128 * 2);
+    const a_data = @as([(2 * 128)]f32, @splat(0.01));
+    const b_data = @as([(128 * 2)]f32, @splat(0.02));
     const params = [_]AutodiffAdapterParam{
         .{
             .name = "encoder.layer.0.attention.self.query_proj.weight.lora_A",
@@ -444,7 +444,7 @@ test "gliner2 exports autodiff adapter params as inspectable PEFT bundle" {
     defer freeAutodiffAdapterExportSummary(allocator, &exported);
     try std.testing.expectEqual(@as(usize, 2), exported.exported_tensor_count);
 
-    const config_bytes = try compat.cwd().readFileAlloc(compat.io(), exported.adapter_config_path, allocator, .limited(64 * 1024));
+    const config_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), exported.adapter_config_path, allocator, .limited(64 * 1024));
     defer allocator.free(config_bytes);
     var config = try std.json.parseFromSlice(std.json.Value, allocator, config_bytes, .{});
     defer config.deinit();
@@ -464,9 +464,9 @@ test "gliner2 classifier task head reloads and scores golden hidden rows" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gliner2_task_head_score_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, task_head_checkpoint_file_name });
     defer allocator.free(checkpoint_path);

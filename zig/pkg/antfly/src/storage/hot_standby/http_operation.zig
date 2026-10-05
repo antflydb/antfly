@@ -52,7 +52,7 @@ pub const Executor = struct {
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
-    const BoundaryAbi = @import("../../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, request: Request) anyerror!OwnedResponse,
     };

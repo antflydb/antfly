@@ -18,11 +18,11 @@
 const std = @import("std");
 const http = @import("http_server.zig");
 const sessions = @import("transactions.zig");
-const sql = @import("../sql/session.zig");
-const integrity = @import("relational_integrity_commit.zig");
-const native = @import("../storage/relational_index.zig");
-const domain = @import("../system_catalog/domain.zig");
-const operation = @import("operation.zig");
+const sql = @import("antfly_local_sources").sql_session;
+const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+const native = @import("antfly_local_sources").storage_relational_index;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const operation = @import("antfly_local_sources").api_operation;
 
 pub fn set(server: *http.ApiHttpServer, alloc: std.mem.Allocator, identity: ?http.AuthenticatedIdentity, context: operation.RequestContext, scope: sql.Scope, lookup_namespace: []const u8, id: sql.Id, names: []const []const u8, deferred: bool) !void {
     try context.ensureActive();

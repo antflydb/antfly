@@ -103,7 +103,7 @@ const Gradients = struct {
         return self;
     }
 
-    fn deinit(self: *Gradients) void {
+    pub fn deinit(self: *Gradients) void {
         for (self.owned.items) |tensor| self.backend.free(tensor);
         self.owned.deinit(self.allocator);
         self.incoming.deinit(self.allocator);

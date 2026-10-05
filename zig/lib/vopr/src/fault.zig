@@ -416,7 +416,7 @@ fn orderLess(lhs: Spec, rhs: Spec) bool {
 
 fn emitLifecycle(sink: *event.Sink, allocator: std.mem.Allocator, kind: event.Kind, spec: Spec) !void {
     try sink.emit(allocator, .{
-        .id = ids.derive("event.fault-lifecycle", spec.id, @intFromEnum(kind)),
+        .id = ids.derive("event.fault-lifecycle", spec.id, @backingInt(kind)),
         .name = spec.name,
         .kind = kind,
         .actor_id = spec.actor_id,

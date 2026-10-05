@@ -45,7 +45,7 @@ fn int(value: usize) !i32 {
     return std.math.cast(i32, value) orelse error.ResourceLimitExceeded;
 }
 
-fn validate(math: *math_mod.Context, config: *const model.Config, control: ?Control) !void {
+pub fn validate(math: *math_mod.Context, config: *const model.Config, control: ?Control) !void {
     try math.check();
     if (control) |active| try active.check();
     if ((math.cb.kind() != .metal and math.cb.kind() != .cuda) or math.cb.vtable.glinerBoundaryDevice == null) return error.UnsupportedGlinerBoundaryDevice;

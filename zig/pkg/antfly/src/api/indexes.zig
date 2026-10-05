@@ -19,23 +19,23 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const tables_api = @import("tables.zig");
-const runtime_status = @import("runtime_status.zig");
-const coverage_policy_mod = @import("coverage_policy.zig");
-const json_helpers = @import("json_helpers.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const document_content_hash = @import("../storage/db/document_content_hash.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
+const coverage_policy_mod = @import("antfly_local_sources").api_coverage_policy;
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const document_content_hash = @import("antfly_local_sources").storage_db_document_content_hash;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const chunking_openapi = @import("antfly_chunking_openapi");
 const chunking_api_openapi = @import("antfly_chunking_api_openapi");
-const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
-const query_contract = @import("query_contract.zig");
+const enrichment_config_validation = @import("antfly_local_sources").storage_db_enrichment_config_validation;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const public_index_contract = @import("public_index_contract.zig");
-const index_repair_status = @import("../common/index_repair_status.zig");
-const credential_safety = @import("../common/credential_safety.zig");
-const table_index_config = @import("table_index_config.zig");
+const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
+const credential_safety = @import("antfly_local_sources").common_credential_safety;
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 
 pub fn encodeGraphMetricStatusResponse(
     alloc: std.mem.Allocator,
@@ -334,7 +334,7 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
     return try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, .{});
 }
 
-pub const collectArtifactEnrichmentsFromTableIndexesJsonWithOptions = @import("local_indexes.zig").collectArtifactEnrichmentsFromTableIndexesJsonWithOptions;
+pub const collectArtifactEnrichmentsFromTableIndexesJsonWithOptions = @import("antfly_local_sources").api_local_indexes.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions;
 
 pub fn encodeArtifactEnrichmentList(
     alloc: std.mem.Allocator,
@@ -427,9 +427,9 @@ pub fn validateArtifactEnrichmentsForIndexRequestJson(
     try validateArtifactEnrichmentConfigDefinitions(alloc, enrichments);
 }
 
-pub const validateArtifactEnrichmentConfigs = @import("local_indexes.zig").validateArtifactEnrichmentConfigs;
+pub const validateArtifactEnrichmentConfigs = @import("antfly_local_sources").api_local_indexes.validateArtifactEnrichmentConfigs;
 
-const validateArtifactEnrichmentConfigDefinitions = @import("local_indexes.zig").validateArtifactEnrichmentConfigDefinitions;
+const validateArtifactEnrichmentConfigDefinitions = @import("antfly_local_sources").api_local_indexes.validateArtifactEnrichmentConfigDefinitions;
 
 fn validateArtifactIndexReferences(
     alloc: std.mem.Allocator,
@@ -650,7 +650,7 @@ fn artifactConfigExistsForKinds(
     return false;
 }
 
-pub const sortArtifactEnrichmentsByDependency = @import("local_indexes.zig").sortArtifactEnrichmentsByDependency;
+pub const sortArtifactEnrichmentsByDependency = @import("antfly_local_sources").api_local_indexes.sortArtifactEnrichmentsByDependency;
 
 pub fn collectArtifactEnrichmentsFromValue(
     alloc: std.mem.Allocator,
@@ -660,17 +660,17 @@ pub fn collectArtifactEnrichmentsFromValue(
     return try collectArtifactEnrichmentsFromValueWithOptions(alloc, value, .{}, out);
 }
 
-pub const collectArtifactEnrichmentsFromValueWithOptions = @import("local_indexes.zig").collectArtifactEnrichmentsFromValueWithOptions;
+pub const collectArtifactEnrichmentsFromValueWithOptions = @import("antfly_local_sources").api_local_indexes.collectArtifactEnrichmentsFromValueWithOptions;
 
-const findArtifactEnrichmentConfig = @import("local_indexes.zig").findArtifactEnrichmentConfig;
+const findArtifactEnrichmentConfig = @import("antfly_local_sources").api_local_indexes.findArtifactEnrichmentConfig;
 
-const artifactEnrichmentConfigsEqual = @import("local_indexes.zig").artifactEnrichmentConfigsEqual;
+const artifactEnrichmentConfigsEqual = @import("antfly_local_sources").api_local_indexes.artifactEnrichmentConfigsEqual;
 
-const neighborContextConfigsEqual = @import("local_indexes.zig").neighborContextConfigsEqual;
+const neighborContextConfigsEqual = @import("antfly_local_sources").api_local_indexes.neighborContextConfigsEqual;
 
-const artifactEnrichmentLessThan = @import("local_indexes.zig").artifactEnrichmentLessThan;
+const artifactEnrichmentLessThan = @import("antfly_local_sources").api_local_indexes.artifactEnrichmentLessThan;
 
-const artifactEnrichmentKindRank = @import("local_indexes.zig").artifactEnrichmentKindRank;
+const artifactEnrichmentKindRank = @import("antfly_local_sources").api_local_indexes.artifactEnrichmentKindRank;
 
 pub fn encodeIndexList(
     alloc: std.mem.Allocator,
@@ -942,9 +942,9 @@ pub fn equivalentIndexConfigJson(
 
 const ApiIndexType = public_index_contract.Kind;
 
-const indexesJsonSource = @import("local_indexes.zig").indexesJsonSource;
+const indexesJsonSource = @import("antfly_local_sources").api_local_indexes.indexesJsonSource;
 
-pub const isReservedIndexMetadataEntry = @import("local_indexes.zig").isReservedIndexMetadataEntry;
+pub const isReservedIndexMetadataEntry = @import("antfly_local_sources").api_local_indexes.isReservedIndexMetadataEntry;
 
 pub fn expectedTableGroupIds(
     alloc: std.mem.Allocator,
@@ -998,7 +998,7 @@ const RuntimeStatusLookup = struct {
         return lookup;
     }
 
-    fn deinit(self: *RuntimeStatusLookup) void {
+    pub fn deinit(self: *RuntimeStatusLookup) void {
         for (self.runtime_indexes) |*map| map.deinit(self.alloc);
         if (self.runtime_indexes.len > 0) self.alloc.free(self.runtime_indexes);
         self.expected_group_indexes.deinit(self.alloc);
@@ -1981,7 +1981,7 @@ const AggregatedIndexStatus = struct {
     coverage_config_mismatch_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
-    source_replay: [64]db_mod.types.IndexSourceReplayStatus = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64,
+    source_replay: [64]db_mod.types.IndexSourceReplayStatus = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" })),
     source_replay_count: usize = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
@@ -2036,7 +2036,7 @@ const AggregatedIndexStatus = struct {
 };
 
 fn canonicalizeConfiguredSourceReplay(aggregate: *AggregatedIndexStatus, configured_sources: []const []const u8) void {
-    var ordered = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64;
+    var ordered = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" }));
     var ordered_count: usize = 0;
     for (configured_sources) |artifact_name| {
         if (ordered_count == ordered.len) break;
@@ -2173,7 +2173,7 @@ const IndexReadinessEvaluation = struct {
     complete: bool,
     state: IndexReadinessState,
 
-    fn evaluate(input: struct {
+    pub fn evaluate(input: struct {
         completion_fences: IndexCompletionFences,
         failed: bool,
         serving_failed: bool,
@@ -2559,9 +2559,9 @@ fn aggregateIndexStatusIndexed(
         aggregate.dense_native_storage_phase = if (materialization_count == 1)
             item.dense_native_storage_phase
         else
-            @enumFromInt(@min(
-                @intFromEnum(aggregate.dense_native_storage_phase),
-                @intFromEnum(item.dense_native_storage_phase),
+            @fromBackingInt(@min(
+                @backingInt(aggregate.dense_native_storage_phase),
+                @backingInt(item.dense_native_storage_phase),
             ));
         const public_item = publicShardIndexRuntimeView(item, runtime.stats.async_indexing);
         if (public_item.dense_vector_projection_pending) aggregate.dense_vector_projection_pending = true;
@@ -2596,7 +2596,7 @@ fn aggregateIndexStatusIndexed(
         aggregate.catch_up_applied_sequence += public_item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += public_item.catch_up_target_sequence;
         if (public_item.catch_up_active) aggregate.catch_up_active = true;
-        if (@intFromEnum(public_item.catch_up_phase) > @intFromEnum(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
+        if (@backingInt(public_item.catch_up_phase) > @backingInt(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
         aggregateTextMergeStats(&aggregate.text_merge, item.text_merge);
         aggregateHbcCacheStats(&aggregate.hbc_cache, item.hbc_cache);
         aggregateHbcPostingStats(&aggregate.hbc_posting, item.hbc_posting);
@@ -2971,6 +2971,7 @@ fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.
     dst.quarantined_merges += src.quarantined_merges;
     dst.quarantined_segments += src.quarantined_segments;
     dst.deferred_for_pressure += src.deferred_for_pressure;
+    dst.forced_drains += src.forced_drains;
     if (dst.last_merge_error.len == 0 and src.last_merge_error.len > 0) dst.last_merge_error = src.last_merge_error;
     if (src.retry_after_ns > 0 and (dst.retry_after_ns == 0 or src.retry_after_ns < dst.retry_after_ns)) dst.retry_after_ns = src.retry_after_ns;
 }
@@ -3264,7 +3265,7 @@ fn appendCoverageIncompleteReasons(
         expected_config_hash,
     );
     const observation_current = authority.coverage_authoritative;
-    var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
+    var reasons = std.EnumSet(CoverageIncompleteReason).empty;
 
     if (!runtime_present) reasons.insert(.runtime_unavailable);
     if (runtime_present and !authority.convergence_authoritative)
@@ -4996,8 +4997,8 @@ fn expectCreatedObjectAllowlistCovers(
     comptime T: type,
     shape: public_index_contract.CreatedObjectShape,
 ) !void {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field.name));
+    inline for (comptime std.meta.fieldNames(T)) |reflected_name| {
+        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, reflected_name));
     }
 }
 
@@ -7618,11 +7619,11 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
-            inline for (@typeInfo(indexes_openapi.GraphArtifactProducerConfig).@"struct".fields) |field| {
-                try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field.name));
+            inline for (comptime std.meta.fieldNames(indexes_openapi.GraphArtifactProducerConfig)) |reflected_name| {
+                try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(reflected_name));
             }
-            inline for (@typeInfo(indexes_openapi.EnrichmentConfig).@"struct".fields) |field| {
-                try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field.name));
+            inline for (comptime std.meta.fieldNames(indexes_openapi.EnrichmentConfig)) |reflected_name| {
+                try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(reflected_name));
             }
 
             inline for (.{

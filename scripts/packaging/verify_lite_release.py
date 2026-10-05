@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "release"))
 from release_channels import normalize_release_version, python_version_from_release  # noqa: E402
 
 from package_cli_release import PACKAGE_PLATFORMS, lite_library_name  # noqa: E402
-from package_lite_release import archive_name  # noqa: E402
+from package_lite_release import SOURCE_LICENSE_FILES, archive_name  # noqa: E402
 
 
 def require(condition: bool, message: str) -> None:
@@ -63,6 +63,9 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
             library = source_bytes(f"./lib/{lib_name}")
             source_bytes("./antfly-lite")
             worker = source_bytes("./antfly-inference-worker")
+            source_maps = {
+                name: source_bytes(f"./scripts/{name}") for name in SOURCE_LICENSE_FILES
+            }
             require(
                 source_bytes("./LICENSE") == apache,
                 f"wrong archive license: {archive_path}",
@@ -94,7 +97,8 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"embedded wheel exposes CLI commands: {wheel_path}",
             )
             require(
-                wheel.read(f"antfly_embedded-{python_version}.dist-info/LICENSE") == apache,
+                wheel.read(f"antfly_embedded-{python_version}.dist-info/LICENSE")
+                == apache,
                 f"wrong wheel license: {wheel_path}",
             )
             require(
@@ -105,6 +109,11 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"wrong wheel license bundle: {wheel_path}",
             )
             require(
+                b"Metadata-Version: 2.4"
+                in wheel.read(f"antfly_embedded-{python_version}.dist-info/METADATA"),
+                f"wrong wheel metadata version: {wheel_path}",
+            )
+            require(
                 b"License-Expression: Apache-2.0"
                 in wheel.read(f"antfly_embedded-{python_version}.dist-info/METADATA"),
                 f"wrong wheel metadata: {wheel_path}",
@@ -113,6 +122,15 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 not any(name.startswith("antfly_cli/") for name in wheel.namelist()),
                 f"server package in {wheel_path}",
             )
+
+            for name, content in source_maps.items():
+                require(
+                    wheel.read(
+                        f"antfly_embedded-{python_version}.dist-info/LICENSES/source-map/{name}"
+                    )
+                    == content,
+                    f"source license map mismatch: {wheel_path}: {name}",
+                )
 
         package_name = platform.npm_package_dir.replace("cli-", "embedded-")
         npm_path = npm_dir / f"antfly-{package_name}-{version}.tgz"
@@ -140,7 +158,8 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
             )
             require(
                 not any(
-                    member.name.startswith("package/bin/") for member in npm.getmembers()
+                    member.name.startswith("package/bin/")
+                    for member in npm.getmembers()
                 )
                 and "bin" not in manifest,
                 f"embedded npm package exposes CLI commands: {npm_path}",
@@ -153,13 +172,20 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
                 f"wrong npm license bundle: {npm_path}",
             )
 
+            for name, content in source_maps.items():
+                require(
+                    npm_bytes(f"LICENSES/source-map/{name}") == content,
+                    f"source license map mismatch: {npm_path}: {name}",
+                )
+
     selector = npm_dir / f"antfly-embedded-{version}.tgz"
     with tarfile.open(selector, "r:gz") as npm:
         member = npm.extractfile("package/package.json")
         require(member is not None, f"missing package.json in {selector}")
         manifest = json.load(member)
         require(
-            manifest["name"] == "@antfly/embedded" and manifest["license"] == "Apache-2.0",
+            manifest["name"] == "@antfly/embedded"
+            and manifest["license"] == "Apache-2.0",
             f"wrong Lite selector: {selector}",
         )
         expected = {

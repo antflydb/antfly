@@ -839,12 +839,25 @@ def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     return data[-limit:]
 
 
-def _write_remote_content_e2e_config(root: Path) -> Path:
+def _write_remote_content_e2e_config(
+    root: Path, *, pgwire_port: int | None = None
+) -> Path:
     config_path = root / "antfly-e2e.json"
     config_path.write_text(
         json.dumps(
             {
                 "remote_content": {"security": {"block_private_ips": False}},
+                **(
+                    {
+                        "pgwire": {
+                            "enabled": True,
+                            "bind_host": "127.0.0.1",
+                            "bind_port": pgwire_port,
+                        }
+                    }
+                    if pgwire_port is not None
+                    else {}
+                ),
                 "connections": {
                     E2E_BACKUP_CONNECTION: {
                         "kind": "external_io",
@@ -1066,13 +1079,13 @@ def _legacy_stateful_command(
 
 
 def _standalone_stateful_command(
-    binary: str, *, host: str, port: int, root: Path
+    binary: str, *, host: str, port: int, root: Path, pgwire_port: int | None = None
 ) -> list[str]:
     return [
         binary,
         "standalone",
         "--config",
-        str(_write_remote_content_e2e_config(root)),
+        str(_write_remote_content_e2e_config(root, pgwire_port=pgwire_port)),
         "--host",
         host,
         "--port",
@@ -1368,7 +1381,7 @@ def require_standalone_storage_headroom(root: Path) -> None:
 
 
 class StandaloneAntflyServer:
-    def __init__(self, binary: str, host: str, port: int):
+    def __init__(self, binary: str, host: str, port: int, *, pgwire: bool = False):
         self.binary = binary
         self.host = host
         with ExitStack() as setup:
@@ -1376,6 +1389,7 @@ class StandaloneAntflyServer:
             setup.callback(self.port_reservations.close)
             port = self.port_reservations.reserve_requested(port)
             self.port = port
+            self.pgwire_port = self.port_reservations.reserve() if pgwire else None
             self.url = f"http://{host}:{port}"
             self.api_url = antfly_public_api_url(self.url, binary=binary)
             self.tempdir = tempfile.TemporaryDirectory(
@@ -1401,12 +1415,26 @@ class StandaloneAntflyServer:
             self.log_file = self.log_path.open("w")
         log_start = self.log_path.stat().st_size
         command = _standalone_stateful_command(
-            self.binary, host=self.host, port=self.port, root=self.root
+            self.binary,
+            host=self.host,
+            port=self.port,
+            root=self.root,
+            pgwire_port=self.pgwire_port,
         )
+        if self.pgwire_port is not None:
+            command.extend(["--auth", "true"])
         self.proc = self.port_reservations.handoff_to(
-            (self.port,),
+            (self.port,) if self.pgwire_port is None else (self.port, self.pgwire_port),
             lambda: subprocess.Popen(
                 command,
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.pgwire_port is not None
+                    else None
+                ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,
                 cwd=self.root,
@@ -1414,6 +1442,7 @@ class StandaloneAntflyServer:
         )
         if not wait_for_server(
             self.api_url,
+            allow_unauthorized=self.pgwire_port is not None,
             processes=[("server", self.proc)],
             listener_ready=lambda: _log_contains_since(
                 self.log_path,
@@ -1421,8 +1450,8 @@ class StandaloneAntflyServer:
                 f"standalone public api listening on {self.url}",
             ),
         ):
-            self.stop()
             out = _read_log_tail(self.log_path)
+            self.stop()
             raise RuntimeError(
                 f"Standalone API server failed to start at {self.api_url}\n{out}"
             )
@@ -1466,6 +1495,8 @@ class StandaloneAntflyServer:
     def pause(self) -> None:
         self._stop_process()
         self.port_reservations.ensure_reserved(self.port)
+        if self.pgwire_port is not None:
+            self.port_reservations.ensure_reserved(self.pgwire_port)
 
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
@@ -1840,19 +1871,32 @@ class OpenAiEmbeddingServer:
         response_delay_s: float = 0.0,
         rate_limit_after_requests: int | None = None,
     ):
-        port = find_free_port()
-        self.url = f"http://{host}:{port}"
         self.response_delay_s = response_delay_s
         self.rate_limit_after_requests = rate_limit_after_requests
         self.rate_limit_input_substring: str | None = None
         self._request_count = 0
         self._request_lock = threading.Lock()
+        self._accepted_requests = 0
+        self._completed_requests = 0
+        self._active_requests: dict[int, float] = {}
         self._allow_rate_limited_requests = threading.Event()
 
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
+                with outer._request_lock:
+                    outer._accepted_requests += 1
+                    request_id = outer._accepted_requests
+                    outer._active_requests[request_id] = time.monotonic()
+                try:
+                    self._embedding_response()
+                finally:
+                    with outer._request_lock:
+                        outer._active_requests.pop(request_id, None)
+                        outer._completed_requests += 1
+
+            def _embedding_response(self) -> None:
                 if self.path != "/v1/embeddings":
                     self.send_error(404)
                     return
@@ -1933,7 +1977,8 @@ class OpenAiEmbeddingServer:
                 _ = format
                 _ = args
 
-        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server = ThreadingHTTPServer((host, 0), Handler)
+        self.url = f"http://{host}:{self._server.server_port}"
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"OpenAI embedding server failed to start at {self.url}")
@@ -1964,6 +2009,20 @@ class OpenAiEmbeddingServer:
 
     def allow_rate_limited_requests(self) -> None:
         self._allow_rate_limited_requests.set()
+
+    def stats(self) -> dict[str, object]:
+        with self._request_lock:
+            now = time.monotonic()
+            return {
+                "accepted_requests": self._accepted_requests,
+                "decoded_requests": self._request_count,
+                "completed_requests": self._completed_requests,
+                "active_request_ages_s": [
+                    round(now - started, 3)
+                    for started in self._active_requests.values()
+                ],
+                "rate_limit_after_requests": self.rate_limit_after_requests,
+            }
 
     def stop(self) -> None:
         self.allow_rate_limited_requests()

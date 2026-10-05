@@ -92,7 +92,7 @@ pub const Scenario = struct {
             return try std.heap.c_allocator.dupe(u8, out.ptr.?[0..out.len]);
         }
 
-        fn backup(handle: *anyopaque) !CApi.Buffer {
+        pub fn backup(handle: *anyopaque) !CApi.Buffer {
             var out: CApi.Buffer = .{};
             if (capi_db.antfly_db_backup(handle, &out) != .ok) return error.CapiBackupFailed;
             return out;

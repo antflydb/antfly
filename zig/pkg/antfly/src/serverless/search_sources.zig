@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const document_projection = @import("document_projection.zig");
-const full_text_indexes = @import("../api/full_text_indexes.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
 const shared_vector = @import("antfly_vector").vector;
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;

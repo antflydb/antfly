@@ -14,8 +14,8 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const json_helpers = @import("json_helpers.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 
 pub const Allocator = std.mem.Allocator;
 pub const join_broadcast_threshold_bytes: u64 = 10 * 1024 * 1024;

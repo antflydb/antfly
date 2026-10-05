@@ -65,7 +65,7 @@ const Fixture = struct {
         return .{ .allocator = a, .attrs = attrs, .qkv = qkv, .relative = r, .control = control, .dout = dout, .dropout = dropout };
     }
 
-    fn deinit(self: *Fixture) void {
+    pub fn deinit(self: *Fixture) void {
         self.allocator.free(self.qkv);
         self.allocator.free(self.relative);
         self.allocator.free(self.control);
@@ -80,7 +80,7 @@ const Reference = struct {
     output: []f32,
     gradient: []f32,
 
-    fn deinit(self: *Reference) void {
+    pub fn deinit(self: *Reference) void {
         self.allocator.free(self.output);
         self.allocator.free(self.gradient);
         self.* = undefined;

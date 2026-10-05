@@ -82,6 +82,7 @@ const QueryOptions = struct {
     aggregations_json: ?[]const u8 = null,
     reranker_json: ?[]const u8 = null,
     pruner_json: ?[]const u8 = null,
+    wait_ready_ms: ?u64 = null,
 };
 
 const QueryParseIssue = union(enum) {
@@ -125,6 +126,13 @@ fn parseQueryOptions(iterator: std.process.Args.Iterator) QueryParseResult {
             if (value <= 0) return .{ .issue = .{ .non_positive = .{ .flag = arg, .value = raw } } };
             if (value > std.math.maxInt(u32)) return .{ .issue = .{ .too_large = .{ .flag = arg, .value = raw } } };
             options.limit = value;
+        } else if (std.mem.eql(u8, arg, "--wait-ready-ms")) {
+            if (options.wait_ready_ms != null) return .{ .issue = .{ .duplicate = arg } };
+            const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+            const value = std.fmt.parseInt(i64, raw, 10) catch return .{ .issue = .{ .invalid_integer = .{ .flag = arg, .value = raw } } };
+            if (value <= 0) return .{ .issue = .{ .non_positive = .{ .flag = arg, .value = raw } } };
+            if (value > std.math.maxInt(u32)) return .{ .issue = .{ .too_large = .{ .flag = arg, .value = raw } } };
+            options.wait_ready_ms = @intCast(value);
         } else if (std.mem.eql(u8, arg, "--offset")) {
             if (options.offset != null) return .{ .issue = .{ .duplicate = arg } };
             const raw = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
@@ -160,7 +168,7 @@ fn parseQueryOptions(iterator: std.process.Args.Iterator) QueryParseResult {
     if (options.semantic_search != null and (options.offset orelse 0) != 0) {
         return .{ .issue = .{ .semantic_offset = {} } };
     }
-    if (options.semantic_search != null and options.table_name == null) {
+    if ((options.semantic_search != null or options.wait_ready_ms != null) and options.table_name == null) {
         return .{ .issue = .{ .missing_table = {} } };
     }
     return .{ .value = options };
@@ -253,6 +261,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     };
 
     if (table_name) |tbl| {
+        if (options.wait_ready_ms) |timeout_ms| {
+            var response = try @import("query_wait.zig").wait(io, client, tbl, body, timeout_ms);
+            defer response.deinit();
+            try cli.writeJson(allocator, io, response.data.?.value);
+            return;
+        }
         // Readiness is diagnostic, so overlap it with the data-plane request
         // and cancel it as soon as a successful query returns. On query
         // failure, allow the bounded advisory to finish so users retain useful
@@ -611,4 +625,20 @@ fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8
     }) catch |err| {
         cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
     };
+}
+
+test "query wake parser requires a table and a bounded positive deadline" {
+    const valid_argv = [_][*:0]const u8{ "--table", "wiki", "--wait-ready-ms", "20000" };
+    const valid = parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = &valid_argv }));
+    try std.testing.expectEqual(@as(?u64, 20000), valid.value.wait_ready_ms);
+    const tableless_argv = [_][*:0]const u8{ "--wait-ready-ms", "20000" };
+    try std.testing.expect(parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = &tableless_argv })).issue == .missing_table);
+    const missing_argv = [_][*:0]const u8{"--wait-ready-ms"};
+    try std.testing.expect(parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = &missing_argv })).issue == .missing_value);
+    const zero_argv = [_][*:0]const u8{ "--wait-ready-ms", "0" };
+    try std.testing.expect(parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = &zero_argv })).issue == .non_positive);
+    const large_argv = [_][*:0]const u8{ "--wait-ready-ms", "4294967296" };
+    try std.testing.expect(parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = &large_argv })).issue == .too_large);
+    const duplicate_argv = [_][*:0]const u8{ "--wait-ready-ms", "1", "--wait-ready-ms", "2" };
+    try std.testing.expect(parseQueryOptions(std.process.Args.Iterator.init(.{ .vector = &duplicate_argv })).issue == .duplicate);
 }

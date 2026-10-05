@@ -468,7 +468,7 @@ fn validGraphMode(problem: Problem, state: State, work: *Work, companions: bool)
 }
 
 fn acyclic(problem: Problem, selected: GraphSet, relation: usize, work: *Work) !bool {
-    var indegree = [_]usize{0} ** max_nodes;
+    var indegree = @as([max_nodes]usize, @splat(0));
     var used: NodeSet = 0;
     var remaining = selected;
     while (remaining != 0) {

@@ -242,7 +242,7 @@ fn checkSolver(a: Allocator, program: constraints.Program, checks: *Checks) !voi
             continue;
         }
         try std.testing.expect(std.math.isFinite(result.utility));
-        const possible = [_]constraints.Selection{0} ** 8;
+        const possible = @as([8]constraints.Selection, @splat(0));
         try std.testing.expectEqual(constraints.Truth.yes, try program.evaluate(.{ .selected = result.selections, .possible = possible[0..program.tasks.len] }));
         for (program.tasks, result.selections) |task, selected| {
             const mask = (@as(constraints.Selection, 1) << @as(u7, @intCast(task.labels.len))) - 1;
@@ -268,7 +268,7 @@ fn checkPlan(a: Allocator, item: wire.Item, mode: long.Mode, checks: *Checks) !u
             .max_windows = 16,
             .max_window_scan_bytes = 16384,
             .max_memory_bytes = 256 * 1024,
-            .inference_fingerprint = .{1} ** 32,
+            .inference_fingerprint = @splat(1),
             .other_record_identity = item.options.long_document.record_identity,
             .control = checks.control(),
         });
@@ -394,8 +394,8 @@ fn allocationProbe(a: Allocator) !void {
 }
 test "GLiNER25 fuzz typed rejection cancellation allocation failure and recovery" {
     const a = std.testing.allocator;
-    try std.testing.expectEqual(error.ExtractionRequestLimitExceeded, (try exercise(a, &([_]u8{'x'} ** (max_input_bytes + 1)), 0, max_checks)).rejection.?);
-    try std.testing.expectEqual(error.ExtractionRequestLimitExceeded, (try exercise(a, &([_]u8{'['} ** 17 ++ [_]u8{']'} ** 17), 0, max_checks)).rejection.?);
+    try std.testing.expectEqual(error.ExtractionRequestLimitExceeded, (try exercise(a, &(@as([(max_input_bytes + 1)]u8, @splat('x'))), 0, max_checks)).rejection.?);
+    try std.testing.expectEqual(error.ExtractionRequestLimitExceeded, (try exercise(a, &(@as([17]u8, @splat('[')) ++ @as([17]u8, @splat(']'))), 0, max_checks)).rejection.?);
     try std.testing.expectEqual(error.OutOfMemory, (try exercise(a, corpus.mixed, 64, max_checks)).rejection.?);
     try std.testing.expectEqual(error.Cancelled, (try exercise(a, corpus.mixed, max_heap_bytes, 0)).rejection.?);
     try std.testing.expectEqual(error.ExtractionRegexLimitExceeded, (try exercise(a, corpus.regex_casefold_limit, max_heap_bytes, max_checks)).rejection.?);

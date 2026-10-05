@@ -20,7 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const wire = @import("packed.zig");
 const artifacts = @import("../artifacts/store.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const page_graph = @import("page_graph.zig");
 const page_store = @import("page_store.zig");
@@ -58,7 +58,7 @@ const Reader = struct {
         return bytes;
     }
 
-    fn read(self: @This(), offset: u64, len: u64) ![]u8 {
+    pub fn read(self: @This(), offset: u64, len: u64) ![]u8 {
         try self.cancellation.check();
         if (offset > self.source.byte_len or len > self.source.byte_len - offset) return error.InvalidGraphSegment;
         return self.store.getVerifiedRangeAllocWithBudget(self.alloc, self.source.artifact_id, self.source.byte_len, self.source.checksum, offset, std.math.cast(usize, len) orelse return error.GraphMetricBuildBudgetExceeded, self.cancellation, self.remaining) catch |err| switch (err) {
@@ -283,12 +283,12 @@ pub const Context = struct {
         const begin = std.mem.readInt(u64, positions[0..8], .little);
         const end = std.mem.readInt(u64, positions[8..16], .little);
         const minimum = layout.type_offsets + (@as(u64, layout.types) + 1) * 8;
-        if (begin < minimum or end < begin or end > self.trailer.directory_len or end - begin > 52 + @import("../../graph/edge_type.zig").max_bytes) return error.InvalidGraphSegment;
+        if (begin < minimum or end < begin or end > self.trailer.directory_len or end - begin > 52 + @import("antfly_local_sources").graph_edge_type.max_bytes) return error.InvalidGraphSegment;
         const raw = try self.directoryReadAlloc(@intCast(begin), @intCast(end - begin));
         defer self.reader.alloc.free(raw);
         var it = wire.TypeIterator{ .bytes = raw };
         const entry = try it.next() orelse return error.InvalidGraphSegment;
-        if (try it.next() != null or !@import("../../graph/edge_type.zig").isValid(entry.kind)) return error.InvalidGraphSegment;
+        if (try it.next() != null or !@import("antfly_local_sources").graph_edge_type.isValid(entry.kind)) return error.InvalidGraphSegment;
         return self.reader.alloc.dupe(u8, entry.kind);
     }
 

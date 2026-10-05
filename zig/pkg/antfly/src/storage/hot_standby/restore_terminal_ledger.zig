@@ -16,12 +16,12 @@
 //! Indexed cancellation authority. Durable applied-prefix admission floors
 //! permit bounded reclamation only after exact native owner cleanup completes.
 const std = @import("std");
-const lsm = @import("../lsm_backend.zig");
+const lsm = @import("antfly_local_sources").storage_lsm_backend;
 const fs = @import("antfly_runtime_fs").fs_paths;
-const record_mod = @import("../db/replication_record.zig");
+const record_mod = @import("antfly_local_sources").storage_db_replication_record;
 pub const replay_floor = @import("replay_floor.zig");
-const ns: @import("../backend_types.zig").Namespace = .{ .name = "restore-terminal" };
-const meta_ns: @import("../backend_types.zig").Namespace = .{ .name = "restore-terminal-meta" };
+const ns: @import("antfly_local_sources").storage_backend_types.Namespace = .{ .name = "restore-terminal" };
+const meta_ns: @import("antfly_local_sources").storage_backend_types.Namespace = .{ .name = "restore-terminal-meta" };
 pub const directory = "restore-terminal-ledger";
 pub const artifact_name = @import("restore_owner_contract.zig").terminal_artifact_name;
 const magic = "AFHTERM2";

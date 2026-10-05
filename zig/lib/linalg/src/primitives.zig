@@ -31,6 +31,18 @@ pub const vec_len = blk: {
 };
 const F32xN = @Vector(vec_len, f32);
 
+/// Explicit FMA on baseline Linux x86 lowers to a scalar software call per
+/// lane. Only that target uses separate multiply/add; other targets retain
+/// their established arithmetic and accelerated x86 objects retain FMA.
+pub inline fn mulAdd(comptime T: type, a: T, b: T, c: T) T {
+    if (comptime builtin.os.tag == .linux and builtin.cpu.arch == .x86_64 and
+        !std.Target.x86.featureSetHas(builtin.cpu.features, .fma))
+    {
+        return a * b + c;
+    }
+    return @mulAdd(T, a, b, c);
+}
+
 pub fn dot(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
     return dotPtrs(a.ptr, b.ptr, a.len);
@@ -107,12 +119,12 @@ pub inline fn expVec(x_in: F32xN) F32xN {
     const c5: F32xN = @splat(0.008333334);
     const c6: F32xN = @splat(0.0013888889);
     var p: F32xN = c6;
-    p = @mulAdd(F32xN, p, r, c5);
-    p = @mulAdd(F32xN, p, r, c4);
-    p = @mulAdd(F32xN, p, r, c3);
-    p = @mulAdd(F32xN, p, r, c2);
-    p = @mulAdd(F32xN, p, r, c1);
-    p = @mulAdd(F32xN, p, r, c1);
+    p = mulAdd(F32xN, p, r, c5);
+    p = mulAdd(F32xN, p, r, c4);
+    p = mulAdd(F32xN, p, r, c3);
+    p = mulAdd(F32xN, p, r, c2);
+    p = mulAdd(F32xN, p, r, c1);
+    p = mulAdd(F32xN, p, r, c1);
 
     const bias: I32xN = @splat(127);
     const pow2_bits: I32xN = (ki + bias) << @splat(23);

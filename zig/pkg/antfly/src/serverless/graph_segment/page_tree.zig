@@ -164,7 +164,7 @@ const Page = struct {
     entries: []Entry,
     ref: Ref,
 
-    fn deinit(self: *Page, alloc: Allocator) void {
+    pub fn deinit(self: *Page, alloc: Allocator) void {
         alloc.free(self.entries);
         alloc.free(self.bytes);
         self.* = undefined;
@@ -175,7 +175,7 @@ const Child = struct {
     first: []u8,
     ref: Ref,
 
-    fn deinit(self: Child, alloc: Allocator) void {
+    pub fn deinit(self: Child, alloc: Allocator) void {
         alloc.free(self.first);
     }
 };
@@ -549,7 +549,7 @@ const SortedBuilder = struct {
         }
     };
 
-    fn deinit(self: *SortedBuilder) void {
+    pub fn deinit(self: *SortedBuilder) void {
         if (self.previous) |previous| self.alloc.free(previous);
         for (&self.levels) |*level| {
             level.clear(self.alloc);
@@ -807,7 +807,7 @@ test "serverless graph page tree rank cursors resume without reading earlier lea
     defer a.free(names);
     const changes = try a.alloc(Mutation, count);
     defer a.free(changes);
-    const value = [_]u8{42} ** 128;
+    const value = @as([128]u8, @splat(42));
     for (names, changes, 0..) |*name, *change, i| {
         std.mem.writeInt(u64, name, i, .big);
         change.* = .{ .key = name, .value = &value };
@@ -834,7 +834,7 @@ test "serverless graph page tree ordered batches preserve snapshots and bound on
     defer alloc.free(keys);
     const changes = try alloc.alloc(Mutation, count);
     defer alloc.free(changes);
-    const value = [_]u8{42} ** 64;
+    const value = @as([64]u8, @splat(42));
     for (keys, changes, 0..) |*key, *change, i| {
         std.mem.writeInt(u64, key, i, .big);
         change.* = .{ .key = key, .value = &value };
@@ -1007,7 +1007,7 @@ fn allocationExercise(alloc: Allocator) !void {
     // failed operation, exactly as an object store does after a lost HEAD CAS.
     var backing: TestStore = .{ .alloc = std.testing.allocator };
     defer backing.deinit();
-    const value = [_]u8{7} ** 8000;
+    const value = @as([8000]u8, @splat(7));
     const root = (try apply(alloc, backing.store(), null, &.{
         .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
         .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value },
@@ -1035,7 +1035,7 @@ test "serverless graph page tree interrupted uploads never change the published 
     const alloc = std.testing.allocator;
     var backing: TestStore = .{ .alloc = alloc };
     defer backing.deinit();
-    const value = [_]u8{17} ** 16000;
+    const value = @as([16000]u8, @splat(17));
     const changes = [_]Mutation{
         .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
         .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value },
@@ -1063,7 +1063,7 @@ test "serverless graph page tree interrupted postorder reclamation preserves sha
     const alloc = std.testing.allocator;
     var backing: TestStore = .{ .alloc = alloc };
     defer backing.deinit();
-    const value = [_]u8{17} ** 16000;
+    const value = @as([16000]u8, @splat(17));
     const changes = [_]Mutation{
         .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
         .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value },
@@ -1118,8 +1118,8 @@ test "serverless graph page tree batch churn matches eager ordered oracle" {
     var random = std.Random.DefaultPrng.init(0x172329);
     const count = 320;
     var keys: [count][8]u8 = undefined;
-    var present = [_]bool{false} ** count;
-    const value = [_]u8{9} ** 1024;
+    var present = @as([count]bool, @splat(false));
+    const value = @as([1024]u8, @splat(9));
     var root: ?Ref = null;
     for (&keys, 0..) |*key, i| std.mem.writeInt(u64, key, i, .big);
     for (0..80) |_| {
@@ -1154,7 +1154,7 @@ test "serverless graph page cache reuses authenticated pages within its byte cap
     const alloc = std.testing.allocator;
     var backing: TestStore = .{ .alloc = alloc };
     defer backing.deinit();
-    const value = [_]u8{3} ** 16000;
+    const value = @as([16000]u8, @splat(3));
     const root = (try apply(alloc, backing.store(), null, &.{
         .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
         .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value },

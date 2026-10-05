@@ -253,7 +253,7 @@ for expression in (
         breakpoint.silent = True
         breakpoint.commands = "silent\npython boundary()\ncontinue\n"
 
-# The transport boundary survives ReleaseSafe inlining of ingress handlers.
+# The transport boundary survives safe inlining of ingress handlers.
 # Resolve symbols from the retained executable, never source line numbers from
 # the diagnostic checkout (which can belong to a different revision).
 http_boundaries = gdb.rbreak("routeErrorResponseStatus")

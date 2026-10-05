@@ -29,9 +29,9 @@
 //! RESOLUTION.md (the entity write is independent of the source-shard edges).
 
 const std = @import("std");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const table_reads = @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
 const distributed_txn = @import("distributed_txn.zig");
 
 const EntitySink = db_mod.EntitySink;
@@ -127,7 +127,7 @@ const PromotionMove = struct {
 pub const DistributedEntitySink = struct {
     writes: table_writes.TableWriteSource,
     reads: ?table_reads.TableReadSource = null,
-    catalog_binding: ?@import("../system_catalog/domain.zig").BindingSource = null,
+    catalog_binding: ?@import("antfly_local_sources").system_catalog_domain.BindingSource = null,
     /// Sync level for entity upserts. `write` (durable, not full-index) keeps
     /// promotion latency low; the entity shard indexes asynchronously.
     sync_level: db_mod.types.SyncLevel = .write,
@@ -415,7 +415,7 @@ const FakeTableWriteSource = struct {
     commit_calls: usize = 0,
     commit_batch_calls: usize = 0,
 
-    fn deinit(self: *FakeTableWriteSource) void {
+    pub fn deinit(self: *FakeTableWriteSource) void {
         for (self.table_names.items) |name| self.alloc.free(name);
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.deletes.items) |key| self.alloc.free(key);
@@ -448,7 +448,7 @@ const FakeTableWriteSource = struct {
         .commit_batch = commitBatch,
     };
 
-    fn commitTransaction(
+    pub fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
@@ -575,7 +575,7 @@ test "DistributedEntitySink live replay preserves curator redirects and alias un
         \\{"entity_type":"person","canonical_name":"Ada","aliases":["Ada","Countess"]}
     );
     const transform: db_mod.types.DocumentTransform = .{ .key = "person/ada", .operations = operations, .upsert = true };
-    const resolve = @import("../storage/db/transform.zig").resolveDocumentTransform;
+    const resolve = @import("antfly_local_sources").storage_db_transform.resolveDocumentTransform;
     const curated =
         \\{"entity_type":"person","canonical_name":"Curated Ada","aliases":["Ada"],"merged_into":"person/curated","merged_into_table":"curated_people","curator_note":true}
     ;
@@ -781,7 +781,7 @@ test "DistributedEntitySink deletes an old pinned copy while moving a key" {
             return error.UnexpectedPromotionScan;
         }
 
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) anyerror!?@import("antfly_local_sources").api_query_response.QueryResponse {
             return error.UnexpectedPromotionQuery;
         }
 

@@ -58,43 +58,32 @@ pub const TreeSearchConfig = struct {
 };
 
 pub const Query = blk: {
-    const fields = std.meta.fields(api.QueryRequest) ++ std.meta.fields(struct { tree_search: ?TreeSearchConfig = null });
-    break :blk planStruct(fields);
+    const base = @typeInfo(api.QueryRequest).@"struct";
+    const extra = @typeInfo(struct { tree_search: ?TreeSearchConfig = null }).@"struct";
+    break :blk @Struct(.auto, null, base.field_names ++ extra.field_names, base.field_types ++ extra.field_types, base.field_attrs ++ extra.field_attrs);
 };
 
 pub const Request = blk: {
-    const original = std.meta.fields(api.RetrievalAgentRequest);
-    var fields: [original.len]std.builtin.Type.StructField = undefined;
-    @memcpy(&fields, original);
-    for (&fields) |*field| {
-        if (std.mem.eql(u8, field.name, "queries")) field.type = []const Query;
+    const original = @typeInfo(api.RetrievalAgentRequest).@"struct";
+    var types: [original.field_types.len]type = undefined;
+    @memcpy(&types, original.field_types);
+    for (original.field_names, 0..) |name, index| {
+        if (std.mem.eql(u8, name, "queries")) types[index] = []const Query;
     }
-    break :blk planStruct(&fields);
+    break :blk @Struct(.auto, null, original.field_names, &types, original.field_attrs);
 };
 
 pub fn fromPublic(alloc: std.mem.Allocator, input: api.RetrievalAgentRequest) !Request {
     var result: Request = undefined;
-    inline for (std.meta.fields(api.RetrievalAgentRequest)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "queries")) {
+    inline for (comptime std.meta.fieldNames(api.RetrievalAgentRequest)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "queries")) {
             const queries = try alloc.alloc(Query, input.queries.len);
             for (input.queries, queries) |source, *dest| {
                 dest.* = .{};
-                inline for (std.meta.fields(api.QueryRequest)) |qfield| @field(dest, qfield.name) = @field(source, qfield.name);
+                inline for (comptime std.meta.fieldNames(api.QueryRequest)) |qfield_name| @field(dest, qfield_name) = @field(source, qfield_name);
             }
             result.queries = queries;
-        } else @field(result, field.name) = @field(input, field.name);
+        } else @field(result, reflected_name) = @field(input, reflected_name);
     }
     return result;
-}
-
-fn planStruct(comptime fields: []const std.builtin.Type.StructField) type {
-    var names: [fields.len][:0]const u8 = undefined;
-    var types: [fields.len]type = undefined;
-    var attrs: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
-    for (fields, 0..) |field, index| {
-        names[index] = field.name;
-        types[index] = field.type;
-        attrs[index] = .{ .default_value_ptr = field.default_value_ptr };
-    }
-    return @Struct(.auto, null, &names, &types, &attrs);
 }

@@ -947,7 +947,7 @@ fn s3AuthorityMatchesEndpoint(
 fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig) !void {
     const cfg = security orelse return;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = (parsed.getHost(&host_buffer) catch return error.InvalidHost).bytes;
+    const host = ((parsed.host orelse return error.InvalidHost).toRaw(&host_buffer) catch return error.InvalidHost);
 
     if (cfg.allowed_hosts) |allowed_hosts| {
         var allowed = false;

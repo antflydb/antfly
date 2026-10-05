@@ -23,7 +23,7 @@
 
 const std = @import("std");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;
@@ -147,7 +147,7 @@ const TestPaths = struct {
     slots: [:0]u8,
     progress: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.log);
         alloc.free(self.slots);
         alloc.free(self.progress);
@@ -170,9 +170,9 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), progress_raw) catch {};
 
     return .{
-        .log = try alloc.dupeZ(u8, log_raw),
-        .slots = try alloc.dupeZ(u8, slots_raw),
-        .progress = try alloc.dupeZ(u8, progress_raw),
+        .log = try alloc.dupeSentinel(u8, log_raw, 0),
+        .slots = try alloc.dupeSentinel(u8, slots_raw, 0),
+        .progress = try alloc.dupeSentinel(u8, progress_raw, 0),
     };
 }
 

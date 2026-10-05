@@ -23,11 +23,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const db_types = @import("../storage/db/types.zig");
-const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
+const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const text_merge_runtime = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Fixture = struct {
@@ -56,7 +56,10 @@ pub const Fixture = struct {
             // allocator's stack-capture path. Give those fibers the same
             // headroom as the production-shaped DataServer campaign instead
             // of relying on VoprIo's deliberately small generic default.
-            .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+            // 8 MiB overflowed under Debug codegen on the equivalent
+            // single-DataServer Raft-merge campaign; use 32 MiB like the
+            // other production-shaped VOPR configs.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         });
         errdefer sim.deinit();
         var backend = try background_runtime.BackendRuntimeHandle.init(allocator, .{
@@ -729,7 +732,9 @@ const ManagedReadinessFixture = struct {
         sim.* = try vopr.vopr_io.VoprIo.init(.{
             .seed = 0x4d41_4e41_4745_4452,
             .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
-            .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+            // Same production-shaped DataServer headroom as the other
+            // VoprIo configs in this file; see the comment above.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         });
         errdefer sim.deinit();
         var backend = try background_runtime.BackendRuntimeHandle.init(allocator, .{
@@ -769,7 +774,7 @@ const ManagedReadinessFixture = struct {
         self.db = try self.openDb();
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.db.close();
         self.allocator.destroy(self.embedder);
         self.repair_storage.deinit();
@@ -1050,7 +1055,7 @@ pub const ManagedReadinessScenario = struct {
             self.stage = .finalize;
         }
 
-        fn finalize(self: *@This()) !void {
+        pub fn finalize(self: *@This()) !void {
             var repaired = false;
             for (0..64) |_| {
                 const result = try self.fixture.db.advanceIndexRepairIntent(
@@ -1170,7 +1175,7 @@ pub const ManagedReadinessScenario = struct {
                 if (selected.id == id) {
                     state.mode = mode;
                     state.stage = .seed;
-                    try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(mode));
+                    try events.emitNamed(allocator, .domain, selected.name, @backingInt(mode));
                     return .applied();
                 }
             }
@@ -1185,7 +1190,7 @@ pub const ManagedReadinessScenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".stage", @intFromEnum(state.stage));
+        try builder.addNamed(allocator, name ++ ".stage", @backingInt(state.stage));
         try builder.addNamed(allocator, name ++ ".progress", @intCast(state.progress));
         try builder.addNamed(allocator, name ++ ".initial-fail-closed", @intFromBool(state.initial_fail_closed));
         try builder.addNamed(allocator, name ++ ".partial-queryable", @intFromBool(state.progressive_partial_queryable));

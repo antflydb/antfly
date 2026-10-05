@@ -180,7 +180,7 @@ const AdmissionBinding = struct {
         actual.* = next;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.lock();
         std.debug.assert(self.host_bytes == 0);
         std.debug.assert(self.backend_bytes == 0);

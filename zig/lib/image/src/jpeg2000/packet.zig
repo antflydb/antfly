@@ -2069,7 +2069,7 @@ const PacketChoiceSearchResult = struct {
     zero_length_included_entries: usize,
     weighted_body_score: usize,
 
-    fn deinit(self: *PacketChoiceSearchResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PacketChoiceSearchResult, allocator: std.mem.Allocator) void {
         allocator.free(self.prefer_extra_bits);
         self.* = undefined;
     }
@@ -3468,7 +3468,7 @@ const Tier1ExecutionPlan = struct {
         return segments;
     }
 
-    fn deinit(self: *Tier1ExecutionPlan) void {
+    pub fn deinit(self: *Tier1ExecutionPlan) void {
         if (self.segments.len > 0) freeTier1Segments(self.allocator, self.segments);
         self.allocator.free(self.rects);
         self.allocator.free(self.subbands);

@@ -27,9 +27,9 @@ const runtimeEntry = process.runtimeEntry;
 
 const exportInternal = process.exportInternal;
 
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
 
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 
 const standby_runtime = @import("cmd/standby.zig");
 
@@ -77,3 +77,6 @@ comptime {
     exportInternal(&metadataEntry, "antfly_runtime_metadata");
     exportInternal(&standaloneEntry, "antfly_runtime_standalone");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

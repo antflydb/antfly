@@ -19,15 +19,15 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const shared_vector = @import("antfly_vector").vector;
-const artifact_ref = @import("../manifest/artifact_ref.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const artifact_store = @import("../artifacts/store.zig");
 const document_projection = @import("../document_projection.zig");
-const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
-const source_binding = @import("../segment/source_binding.zig");
+const sidecar_manifest = @import("antfly_local_sources").serverless_segment_sidecar_manifest;
+const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
 const vector_index = @import("vector_index.zig");
 const vector_segment = @import("../vector_segment/mod.zig");
-const external_rowsource = @import("../../storage/rowsource/external.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const external_rowsource = @import("antfly_local_sources").storage_rowsource_external;
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const VectorSidecarBuildOptions = struct {
@@ -362,7 +362,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         if (self.bytes) |bytes| self.alloc.free(bytes);
         self.* = undefined;
     }
@@ -385,7 +385,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         if (!std.mem.eql(u8, artifact_id, "mem:vector-sidecar")) return error.ArtifactNotFound;
         const bytes = self.bytes orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, bytes);

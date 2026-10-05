@@ -94,6 +94,7 @@ pub fn addRuntimeControls(
     run: *std.Build.Step.Run,
     args: []const []const u8,
 ) void {
+    run.addPassthruArgs();
     // Build arguments are shared by every configured run artifact. Preserve a
     // foreign executable's complete vector without letting it affect compile-
     // time test reachability. If this test step is actually selected, the
