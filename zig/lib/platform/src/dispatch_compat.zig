@@ -1599,6 +1599,9 @@ fn groupAwait(
     // worker, so the original thread-local state must not be reused.
     const fiber = Thread.current().currentFiber();
     ev.yield(.{ .group_await = .{ .ptr = type_erased } });
+    // The group is finished and cannot be reused until this call returns.
+    // Clear its old awaiter before either success or cancellation is returned.
+    type_erased.state = 0;
     if (fiber.cancel_protection.check() == .unblocked and
         @atomicLoad(Fiber.CancelStatus, &fiber.cancel_status, .monotonic).requested)
     {
@@ -1611,6 +1614,7 @@ fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *an
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
     ev.yield(.{ .group_cancel = .{ .ptr = type_erased } });
+    type_erased.state = 0;
 }
 
 fn recancel(userdata: ?*anyopaque) void {

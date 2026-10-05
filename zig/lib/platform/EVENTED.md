@@ -15,6 +15,8 @@ values in optimized builds. New fibers retain the upstream entry-message
 convention. Allocator protection uses an OS mutex and short group critical
 sections use a thread spin lock, since Dispatch callbacks cannot suspend a fiber.
 Group awaiting acknowledges parent cancellation after all children finish.
+Both compatibility backends clear the completed group's awaiter state on normal
+await, canceled await, and explicit cancel, allowing the same group to be reused.
 Group child completion leaves the fiber stack before freeing it and waking its
 awaiter. Backend teardown also drains completion callbacks when a group token
 was already empty at join time. Contended Dispatch mutexes wake the next owner
@@ -22,6 +24,7 @@ and release reservations held by canceled waiters.
 
 The strict `zig build evented-enrichment-test` gate covers backend identity,
 group bookkeeping, parent cancellation while awaiting `std.Io.Group` children,
+reuse of a group after normal await, canceled await, and explicit cancel,
 sleeping tasks, immediate and delayed cancellation, repeated
 concurrent completion, positional file read/write, and file synchronization.
 The macOS gate additionally exercises contended stderr locks with canceled

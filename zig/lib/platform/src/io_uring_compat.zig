@@ -1908,6 +1908,9 @@ fn groupAwait(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
     ev.yield(null, .{ .group_await = .{ .ptr = type_erased } });
+    // The group is finished and cannot be reused until this call returns.
+    // Clear its old awaiter before either success or cancellation is returned.
+    type_erased.state = 0;
     try checkCancel(userdata);
 }
 
@@ -1915,6 +1918,7 @@ fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *an
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
     ev.yield(null, .{ .group_cancel = .{ .ptr = type_erased } });
+    type_erased.state = 0;
 }
 
 fn recancel(userdata: ?*anyopaque) void {

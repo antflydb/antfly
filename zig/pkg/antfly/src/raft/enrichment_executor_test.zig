@@ -104,3 +104,45 @@ test "Dispatch teardown drains group child cleanup after join" {
         try std.testing.expectEqual(@as(usize, 0), allocator.outstanding.load(.acquire));
     }
 }
+
+test "Evented groups can be reused after await and cancellation" {
+    if ((builtin.os.tag != .macos and builtin.os.tag != .linux) or !std.Io.fiber.supported)
+        return error.SkipZigTest;
+    var ev: Evented = undefined;
+    try ev.init(std.testing.allocator, .{});
+    defer ev.deinit();
+    const io = ev.io();
+    const Work = struct {
+        fn complete(task_io: std.Io) std.Io.Cancelable!void {
+            try task_io.sleep(.fromMilliseconds(10), .awake);
+        }
+        fn wait(task_io: std.Io) std.Io.Cancelable!void {
+            try task_io.sleep(.fromSeconds(3600), .awake);
+        }
+        fn canceledAwait(task_io: std.Io, group: *std.Io.Group, ready: *std.Io.Event) std.Io.Cancelable!void {
+            group.async(task_io, wait, .{task_io});
+            ready.set(task_io);
+            try group.await(task_io);
+        }
+    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..4) |_| {
+        group.async(io, Work.complete, .{io});
+        try group.await(io);
+        // A completed group remains idempotent and can accept another batch.
+        try group.await(io);
+        group.async(io, Work.wait, .{io});
+        group.cancel(io);
+        group.cancel(io);
+    }
+    // An await which returns error.Canceled must reset the group too.
+    var ready: std.Io.Event = .unset;
+    var parent = try io.concurrent(Work.canceledAwait, .{ io, &group, &ready });
+    defer parent.cancel(io) catch {};
+    ready.waitUncancelable(io);
+    try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectError(error.Canceled, parent.cancel(io));
+    group.async(io, Work.complete, .{io});
+    try group.await(io);
+}
