@@ -443,3 +443,24 @@ Allocation-failure regressions cover the real public extraction path, complete
 graph identities, pending and stored chunk sources, bulk proof scratch, graph
 page/cache ownership and status clones. Source and module boundary checks cover
 the extracted owners before their later physical package move.
+
+## Shared local mutation implementation and result ownership
+
+Local mutation execution now resides in `storage/db/local_mutation.zig` rather
+than aliasing implementations back into DB. A compile-time binding supplies
+borrowed local resource and codec types. The bounded recovery receiver owns
+invocation scratch, while the owning DB supplies resident scheduling and caller
+acknowledgement. Receipt/primary effects remain atomic, journal/outbox order and
+transition fencing are unchanged, and recovery retains its `.propose` sync policy.
+Prepared-row workers borrow pinned plans and release their regions under the
+same lifetime rules as foreground execution.
+
+Replay vector collectors own cloned identities and sparse numeric results in
+`replay_vector_collectors.zig`, with explicit borrowed payload lifetimes and
+original array lengths retained through tombstone compaction. Graph-field
+planning shares one transactional builder in `graph_field_plan.zig`; no partially
+published result survives an allocation error. Owned key insertion reserves
+capacity before cloning. Relational reader/session cleanup and artifact
+projection have local owners that receive admitted readers or a borrowed core,
+not a DB wrapper. These moves preserve source licenses and the public C ABI;
+physical placement under `antfly-embedded` remains a separate step.

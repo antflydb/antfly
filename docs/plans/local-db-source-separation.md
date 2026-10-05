@@ -162,6 +162,46 @@ the normal unit aggregate. Their white-box hooks are available only in test
 builds. Local maintenance regressions remain owned by the storage engine shard;
 `antfly-local-transaction-recovery-test` provides a focused run.
 
+## Local mutation, collection, and read owners
+
+`storage/db/local_mutation.zig` owns the shared local preparation and execution
+algorithms used by foreground DB writes and synchronous recovery. Its compile-time
+resource binding supplies the existing local state, codec, result and runtime
+types; it neither imports the owning DB wrapper nor selects a server runtime.
+The borrowed `Context` captures stable resource pointers, and each invocation
+constructs an `Execution` with private scratch. Prepared-row workers also live
+in this owner, including their pinned catalog inputs and shared-region lifetime.
+The DB forwards existing entry points and retains ownership, resident scheduling,
+caller acknowledgement, and the ordered read/commit admission boundaries.
+There is no runtime dispatch or extra allocation from the compile-time binding.
+
+`storage/db/replay_vector_collectors.zig` owns dense/sparse replay collectors,
+artifact identity decoding, sparse field reads, and result destruction. Numeric
+payloads and artifact keys retain their original borrowed lifetimes; cloned
+identities remain owned. Tombstone compaction preserves the allocation length
+needed to free the original array and does not turn deleted inputs into upserts.
+
+`storage/db/graph_field_plan.zig` uses one builder for live and pinned-snapshot
+field-derived graph writes. It allocates both merged output arrays before
+changing either extracted result. Errors leave the original contributions
+intact; successful publication transfers element ownership once. The shared
+`storage/db/owned_keys.zig` reserves list capacity before cloning a key, so list
+growth cannot leak a clone. Allocation sweeps cover both planners, existing
+contributions, empty field targets, deduplication, and public extraction with an
+actual configured graph index.
+
+`storage/db/relational_read_session.zig` owns retained relational readers,
+policy leases, proofs, cancellation/deadline checks and filter destruction.
+`storage/db/read_projection.zig` owns artifact projection and transaction/column
+materialization from a borrowed local core and pinned read transaction. DB still
+acquires the admitted snapshot, validates generations and holds statement/read
+fences; projection contexts retain no DB pointer. Document sessions retain their
+existing owner in `document_rows.zig`.
+
+The authored and resolved native/WASM boundary checks cover these owners. Their
+existing ELv2 headers are preserved until the licensing PR applies the Apache
+classification to the full embedded source closure.
+
 ## Remaining separation
 
 The physical DB and its complete local source closure must still move into
