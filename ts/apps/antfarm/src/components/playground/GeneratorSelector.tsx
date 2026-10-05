@@ -118,8 +118,10 @@ export function GeneratorSelector({
   const accounts = chatgpt.accounts.filter((account) => account.connected && account.plan_enabled);
   const connectionId = value?.provider === "chatgpt" ? value.connection_id : undefined;
   useEffect(() => {
-    if (connectionId) void chatgpt.loadModels(connectionId);
-  }, [connectionId, chatgpt.loadModels]);
+    // Account discovery marks the current API/auth scope ready. Waiting for it
+    // also retries a persisted selection when the provider replaces that scope.
+    if (chatgpt.supported && connectionId) void chatgpt.loadModels(connectionId);
+  }, [connectionId, chatgpt.loadModels, chatgpt.supported]);
   const availableProviders = providers.filter(
     (provider) =>
       provider !== "chatgpt" ||

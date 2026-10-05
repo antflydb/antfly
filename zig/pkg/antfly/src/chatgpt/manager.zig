@@ -360,6 +360,10 @@ pub const Manager = struct {
         const query = try protocol.form(local, pairs.items);
         const url = try std.fmt.allocPrint(a, protocol.issuer ++ "/api/accounts/authorize?{s}", .{query});
         errdefer a.free(url);
+        // Finish all fallible return-value allocation before tasks retain the
+        // attempt. Error cleanup below may destroy it only before they start.
+        const attempt_id = try a.dupe(u8, attempt.id);
+        errdefer a.free(attempt_id);
         try self.attempts.append(self.alloc, attempt);
         errdefer _ = self.attempts.pop();
         try attempt.group.concurrent(self.io, Attempt.serve, .{attempt});
@@ -368,7 +372,7 @@ pub const Manager = struct {
             attempt.group.cancel(self.io);
             return err;
         };
-        return .{ .attempt_id = try a.dupe(u8, attempt.id), .authorization_url = url, .expires_at = attempt.expires_at };
+        return .{ .attempt_id = attempt_id, .authorization_url = url, .expires_at = attempt.expires_at };
     }
     pub fn outcome(self: *Manager, a: std.mem.Allocator, owner: []const u8, id: []const u8) !Outcome {
         self.mutex.lockUncancelable(self.io);
@@ -573,6 +577,23 @@ fn scrubRecord(rec: Record) void {
 }
 fn scrub(state: State) void {
     for (state.accounts) |rec| scrubRecord(rec);
+}
+
+test "chatgpt authorization return allocation failure leaves no running attempt" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var instance = try Manager.init(a, io, root);
+    defer instance.deinit();
+    // The URL allocation succeeds; copying the attempt ID fails.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, instance.begin(failing.allocator(), "alice", null));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), instance.attempts.items.len);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
 test "chatgpt mock OAuth rotates refresh and rejects changed subject" {

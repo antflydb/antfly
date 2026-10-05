@@ -417,5 +417,8 @@ new commands. VM import/export was intentionally deferred.
 Review regressions cover delayed callbacks after logout, stale authorization
 pins, owner isolation, explicit reconnect, unrelated account catalog fetches,
 replacement request ownership, catalog refresh after reauthorization and owner
-changes during sign-in refresh. The
-217 runtime/generation tests and 164 Antfarm tests pass; Antfarm builds successfully.
+changes during sign-in refresh. Saved model selections wait for account discovery
+and reload after API scope changes. Authorization startup allocates its response
+before launching tasks; allocation-failure coverage checks that no attempt remains
+registered and all response memory is released. The
+218 runtime/generation tests and 165 Antfarm tests pass; Antfarm builds successfully.

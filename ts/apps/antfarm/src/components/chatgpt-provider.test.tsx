@@ -1,6 +1,7 @@
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChatGPTProvider, useChatGPT } from "./chatgpt-provider";
+import { GENERATOR_DEFAULT_CONFIG, GeneratorSelector } from "./playground/GeneratorSelector";
 
 const mock = vi.hoisted(() => ({
   owner: "alice",
@@ -15,7 +16,12 @@ vi.mock("@/hooks/use-api-config", () => ({ useApiConfig: () => ({ apiUrl: mock.u
 vi.mock("@/hooks/use-auth", () => ({
   useAuth: () => ({ user: mock.owner, isAuthenticated: true, isLoading: false }),
 }));
+vi.mock("@/hooks/use-connections", () => ({
+  useConnectedModels: () => ({ providers: [] }),
+  liveModelSuggestions: () => ({}),
+}));
 vi.mock("@antfly/sdk", () => ({
+  generatorProviders: ["openai", "chatgpt"],
   AntflyClient: class {
     chatgpt = {
       accounts: mock.accounts,
@@ -37,7 +43,51 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
   mock.owner = "alice";
+  mock.url = "http://localhost:8080";
 });
+function SelectedAccount() {
+  return (
+    <GeneratorSelector
+      allowPersonalConnections
+      value={{ provider: "chatgpt", connection_id: "one", model: "model" }}
+      onChange={() => {}}
+      defaultConfig={GENERATOR_DEFAULT_CONFIG}
+    />
+  );
+}
+
+it("loads a persisted selection on mount and after the API scope changes", async () => {
+  mock.accounts.mockResolvedValue({
+    accounts: [
+      { connection_id: "one", email: "alice@example.com", connected: true, plan_enabled: true },
+    ],
+  });
+  mock.models.mockResolvedValue({
+    models: [{ slug: "model", display_name: "Model", visibility: "list" }],
+  });
+  const content = (
+    <ChatGPTProvider>
+      <Consumer />
+      <SelectedAccount />
+    </ChatGPTProvider>
+  );
+  const view = render(content);
+  await waitFor(() => expect(context.models.one?.[0].slug).toBe("model"));
+  expect(mock.models).toHaveBeenCalledTimes(1);
+  const firstSignal = mock.models.mock.calls[0][1] as AbortSignal;
+  mock.url = "http://127.0.0.1:8080";
+  view.rerender(
+    <ChatGPTProvider>
+      <Consumer />
+      <SelectedAccount />
+    </ChatGPTProvider>
+  );
+  await waitFor(() => expect(mock.models).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(context.models.one?.[0].slug).toBe("model"));
+  expect(firstSignal.aborted).toBe(true);
+  expect(mock.models.mock.calls[1][1]).not.toBe(firstSignal);
+});
+
 describe("personal ChatGPT scope", () => {
   it("aborts and clears the previous owner's account when application identity changes", async () => {
     let previousSignal: AbortSignal | undefined;
