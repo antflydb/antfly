@@ -378,6 +378,8 @@ local deadline, response-size and conversation/tool budgets. It requires a valid
 terminal `response.completed` frame before returning a successful result, and
 reports quota failures arriving after upstream deltas. Safe upstream status,
 code, parameter, request ID and numeric retry hints remain request-scoped.
+Completed refusal content is displayed as the assistant's explanation, while
+the original Responses output remains intact for conversation replay.
 Credential queueing, refresh, and inference share the request's absolute deadline
 and cancellation signal. Refresh keeps its 15-second ceiling within the remaining
 budget; inference recalculates that budget after credential acquisition. A timeout
@@ -425,6 +427,8 @@ changes during sign-in refresh. Saved model selections wait for account discover
 and reload after API scope changes. Authorization startup allocates its response
 before launching tasks; allocation-failure coverage checks that no attempt remains
 registered and all response memory is released. The
-219 runtime/generation tests and 165 Antfarm tests pass; Antfarm builds successfully.
+220 runtime/generation tests and 165 Antfarm tests pass; Antfarm builds successfully.
 Delayed-refresh regressions cover deadline expiry, cancellation, preserved
 credentials, and bounded waits for request pins and credential leases.
+Refusal regressions cover refusal-only completions, ordered text and refusal
+parts, and preservation of refusal content and message phase in follow-up input.

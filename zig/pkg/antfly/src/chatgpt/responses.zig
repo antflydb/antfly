@@ -320,7 +320,7 @@ pub const Decoder = struct {
         if (self.failure) |err| return err;
         const raw = self.completed orelse return error.ChatGPTInterrupted;
         if (self.line.items.len != 0 or self.event.items.len != 0) return error.ChatGPTInvalidStream;
-        const Item = struct { type: []const u8, call_id: ?[]const u8 = null, name: ?[]const u8 = null, namespace: ?[]const u8 = null, arguments: ?[]const u8 = null, content: ?[]const struct { type: []const u8, text: ?[]const u8 = null } = null };
+        const Item = struct { type: []const u8, call_id: ?[]const u8 = null, name: ?[]const u8 = null, namespace: ?[]const u8 = null, arguments: ?[]const u8 = null, content: ?[]const struct { type: []const u8, text: ?[]const u8 = null, refusal: ?[]const u8 = null } = null };
         const Response = struct { status: []const u8, output: []const Item, usage: ?struct { input_tokens: u64 = 0, output_tokens: u64 = 0 } = null };
         var parsed = try std.json.parseFromSlice(Response, self.alloc, raw, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -336,6 +336,10 @@ pub const Decoder = struct {
             if (std.mem.eql(u8, item.type, "message")) {
                 for (item.content orelse &.{}) |part| if (std.mem.eql(u8, part.type, "output_text")) {
                     try content.writer.writeAll(part.text orelse "");
+                } else if (std.mem.eql(u8, part.type, "refusal")) {
+                    // Refusals are completed assistant output, not transport
+                    // failures. Display their explanation and keep raw replay.
+                    try content.writer.writeAll(part.refusal orelse return error.ChatGPTInvalidStream);
                 };
             } else if (std.mem.eql(u8, item.type, "function_call")) {
                 if (item.namespace) |ns| if (!std.mem.eql(u8, ns, "antfly")) return error.ChatGPTUnsupportedCapability;
@@ -373,6 +377,44 @@ fn responseFailure(value: ?std.json.Value) anyerror {
     if (err != .object) return error.ChatGPTRequestFailed;
     const code = err.object.get("code") orelse return error.ChatGPTRequestFailed;
     return failureCode(if (code == .string) code.string else null);
+}
+
+test "chatgpt completed refusals remain visible and preserve replay output" {
+    const a = std.testing.allocator;
+    const explanation = "I cannot help with that request.";
+    for ([_][]const u8{ "", "Preface. " }) |prefix| {
+        var decoder: Decoder = .{ .alloc = a, .status = 200 };
+        defer decoder.deinit();
+        try decoder.writeAll("data: {\"type\":\"response.refusal.delta\",\"delta\":\"I cannot\"}\n\ndata: {\"type\":\"response.refusal.done\",\"refusal\":\"I cannot help with that request.\"}\n\n");
+        const preface = if (prefix.len == 0) "" else "{\"type\":\"output_text\",\"text\":\"Preface. \",\"annotations\":[]},";
+        const terminal = try std.fmt.allocPrint(
+            a,
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[{{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"phase\":\"final_answer\",\"content\":[{s}{{\"type\":\"refusal\",\"refusal\":\"{s}\"}}]}}]}}}}\n\n",
+            .{ preface, explanation },
+        );
+        defer a.free(terminal);
+        try decoder.writeAll(terminal);
+        var result = try decoder.result();
+        defer result.deinit();
+        const expected = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, explanation });
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, result.content);
+        try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+        const body = try request(a, "model", &.{
+            .{ .role = .assistant, .content = .{ .text = result.content }, .responses_output_json = result.responses_output_json },
+            .{ .role = .user, .content = .{ .text = "Please explain." } },
+        }, null, null, null);
+        defer a.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer parsed.deinit();
+        const input = parsed.value.object.get("input").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), input.len);
+        try std.testing.expectEqualStrings("final_answer", input[0].object.get("phase").?.string);
+        const parts = input[0].object.get("content").?.array.items;
+        const refusal = parts[if (prefix.len == 0) @as(usize, 0) else 1];
+        try std.testing.expectEqualStrings("refusal", refusal.object.get("type").?.string);
+        try std.testing.expectEqualStrings(explanation, refusal.object.get("refusal").?.string);
+    }
 }
 
 test "chatgpt responses rejects truncated and failed streams after deltas" {
