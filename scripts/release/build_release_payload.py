@@ -152,10 +152,15 @@ def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
     channel = document.get("channel")
     if not isinstance(build_controller_commit, str) or not isinstance(channel, str):
         raise SystemExit("release spec does not match the release identity")
+    build_contract_schema = document.get("build_contract_schema")
     schema_version = document.get("schema_version")
     if schema_version == 4:
         expected = build_release_spec(
-            tag, channel, commit, build_controller_commit
+            tag,
+            channel,
+            commit,
+            build_controller_commit,
+            build_contract_schema=build_contract_schema,
         ).document()
     elif schema_version == 5:
         release_line = document.get("release_line")
@@ -174,12 +179,36 @@ def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
             release_line=release_line,
             source_ref=source_ref,
             source_ref_head=source_ref_head,
+            build_contract_schema=build_contract_schema,
         ).document()
     else:
         raise SystemExit("release spec uses an unsupported schema")
     if document != expected:
         raise SystemExit("release spec does not match the release identity")
     return document
+
+
+def collect_runtime_archives(archive_dir: Path, schema: int) -> list[Path]:
+    from validate_source_contract import runtime_products
+
+    products = runtime_products(schema)
+    server_archives = sorted(archive_dir.glob("antfly_*.tar.gz"))
+    if not server_archives:
+        raise SystemExit(f"no antfly release archives found in {archive_dir}")
+    archives = list(server_archives)
+    for product in products[1:]:
+        prefix = f"antfly-{product}"
+        matching = [
+            archive_dir / f"{prefix}_{archive.name.removeprefix('antfly_')}"
+            for archive in server_archives
+        ]
+        missing = [archive.name for archive in matching if not archive.is_file()]
+        if missing:
+            raise SystemExit(
+                f"missing matching {prefix} release archives: {', '.join(missing)}"
+            )
+        archives.extend(matching)
+    return sorted(archives)
 
 
 def main() -> int:
@@ -232,22 +261,9 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
-    server_archives = sorted(args.archive_dir.glob("antfly_*.tar.gz"))
-    if not server_archives:
-        raise SystemExit(f"no antfly release archives found in {args.archive_dir}")
-    product_archives: list[Path] = []
-    for product in ("antfly-lite", "antfly-inference"):
-        matching = [
-            args.archive_dir / f"{product}_{archive.name.removeprefix('antfly_')}"
-            for archive in server_archives
-        ]
-        missing = [archive.name for archive in matching if not archive.is_file()]
-        if missing:
-            raise SystemExit(
-                f"missing matching {product} release archives: {', '.join(missing)}"
-            )
-        product_archives.extend(matching)
-    archives = sorted([*server_archives, *product_archives])
+    archives = collect_runtime_archives(
+        args.archive_dir, release_spec["build_contract_schema"]
+    )
 
     for archive in archives:
         copied.append(copy_payload_file(archive, out_dir))

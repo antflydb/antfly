@@ -37,7 +37,8 @@ distribution benefit; the current combined bindings cover both use cases.
 Installing an embedded binding does not register `antfly-lite` or
 `antfly-inference` as a command. Platform packages keep
 `antfly-inference-worker` only as a private executable next to `libantfly`,
-where the runtime can find it for isolated worker calls. Direct C API inference
-runs in-process. The Apache Lite archive distributes the `antfly-lite` CLI;
+where the runtime can find it when a backend requires process isolation.
+Bindings call the C API; inference runs in-process or in that private worker
+according to the backend and runtime configuration. The Apache Lite archive distributes the `antfly-lite` CLI;
 the separate Apache inference archive distributes the real `antfly-inference`
 CLI. The two CLI archives do not create separate language binding packages.

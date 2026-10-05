@@ -1,20 +1,40 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "runtime_products": [
+    "server",
+    "lite",
+    "inference"
+  ],
   "required_source_paths": [
-    "zig/build.zig",
+    "LICENSES/Apache-2.0.txt",
+    "openapi.yaml",
+    "py/packages/cli/pyproject.toml",
+    "py/packages/embedded/pyproject.toml",
+    "scripts/apache_engine_files.txt",
+    "scripts/embedded_asset_licenses.json",
     "scripts/install.sh",
     "scripts/packaging/build_zig_release_archive.sh",
     "scripts/packaging/package_cli_release.py",
+    "scripts/packaging/package_lite_release.py",
     "scripts/packaging/test_cabi_packaging.py",
+    "scripts/packaging/test_lite_packaging.py",
+    "scripts/packaging/test_release_licenses.py",
     "scripts/packaging/test_reproducible_tar.py",
+    "scripts/packaging/verify_lite_release.py",
     "scripts/release/build_cli_snapshot.py",
+    "scripts/release/lite_snapshot.py",
+    "scripts/release/platforms.json",
     "scripts/release/release_channels.py",
     "scripts/release/release_platforms.py",
     "scripts/release/verify_cli_snapshot.py",
-    "scripts/release/platforms.json",
+    "scripts/source_license_roots.json",
     "ts/package.json",
     "ts/packages/cli/package.json",
-    "py/packages/cli/pyproject.toml",
-    "openapi.yaml"
+    "ts/packages/embedded/package.json",
+    "zig/build.zig",
+    "zig/embedded.build.zig",
+    "zig/pkg/antfly-embedded/LICENSE",
+    "zig/pkg/inference/LICENSE",
+    "zig/pkg/inference/build.zig"
   ]
 }

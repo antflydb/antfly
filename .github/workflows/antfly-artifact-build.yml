@@ -44,6 +44,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.platforms.outputs.matrix }}
+      build_contract_schema: ${{ steps.source-contract.outputs.build_contract_schema }}
+      runtime_products: ${{ steps.source-contract.outputs.runtime_products }}
       channel: ${{ steps.channel.outputs.channel }}
       build_controller_commit: ${{ steps.controller.outputs.commit }}
       python_build: ${{ steps.toolchain.outputs.python_build }}
@@ -73,6 +75,7 @@ jobs:
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
       - name: Require compatible immutable release-line source
+        id: source-contract
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
           RELEASE_CHANNEL: ${{ inputs.channel }}
@@ -98,7 +101,8 @@ jobs:
           current_source_head="$(git rev-parse FETCH_HEAD)"
           git merge-base --is-ancestor "$SOURCE_REF_HEAD" "$current_source_head"
           git merge-base --is-ancestor "$SOURCE_COMMIT" "$SOURCE_REF_HEAD"
-          python scripts/release/validate_source_contract.py --commit "$SOURCE_COMMIT"
+          python scripts/release/validate_source_contract.py --commit "$SOURCE_COMMIT" \
+            --github-output "$GITHUB_OUTPUT"
       - name: Validate release channel
         id: channel
         env:
@@ -177,47 +181,34 @@ jobs:
       - name: Test reproducible archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
 
-      - name: Build archive
+      - name: Build source-declared runtime archives
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}
+          RUNTIME_PRODUCTS: ${{ needs.release-plan.outputs.runtime_products }}
         run: |
+          set -euo pipefail
           version="${RELEASE_TAG#v}"
-          archive="antfly_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
-          jobs_arg=()
-          if [ -n "${{ matrix.zig_jobs }}" ]; then
-            jobs_arg=(--jobs "${{ matrix.zig_jobs }}")
-          fi
-          scripts/packaging/build_zig_release_archive.sh \
-            --version "$version" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "$archive" \
-            --out-dir dist/release-archives \
-            --metal "${{ matrix.metal }}" \
-            --system-blas "${{ matrix.system_blas }}"
-          lite_archive="antfly-lite_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
-          scripts/packaging/build_zig_release_archive.sh \
-            --product lite \
-            --version "$version" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "$lite_archive" \
-            --out-dir dist/release-archives \
-            --metal "${{ matrix.metal }}" \
-            --system-blas "${{ matrix.system_blas }}"
-          inference_archive="antfly-inference_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
-          scripts/packaging/build_zig_release_archive.sh \
-            --product inference \
-            --version "$version" \
-            --target "${{ matrix.zig_target }}" \
-            --optimize "${{ matrix.zig_optimize }}" \
-            "${jobs_arg[@]}" \
-            --archive-name "$inference_archive" \
-            --out-dir dist/release-archives \
-            --metal "${{ matrix.metal }}" \
-            --system-blas "${{ matrix.system_blas }}"
+          while IFS= read -r product; do
+            build_args=(
+              --version "$version"
+              --target "${{ matrix.zig_target }}"
+              --optimize "${{ matrix.zig_optimize }}"
+              --out-dir dist/release-archives
+              --metal "${{ matrix.metal }}"
+              --system-blas "${{ matrix.system_blas }}"
+            )
+            if [ -n "${{ matrix.zig_jobs }}" ]; then
+              build_args+=(--jobs "${{ matrix.zig_jobs }}")
+            fi
+            prefix=antfly
+            if [ "$product" != server ]; then
+              prefix="antfly-$product"
+              build_args+=(--product "$product")
+            fi
+            archive="${prefix}_${version}_${{ matrix.archive_os }}_${{ matrix.archive_arch }}${{ matrix.archive_suffix }}.tar.gz"
+            build_args+=(--archive-name "$archive")
+            scripts/packaging/build_zig_release_archive.sh "${build_args[@]}"
+          done < <(jq -r '.[]' <<< "$RUNTIME_PRODUCTS")
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -265,6 +256,7 @@ jobs:
       zig_x86_64_linux_sha256: ${{ needs.release-plan.outputs.zig_x86_64_linux_sha256 }}
 
   package-lite-artifacts:
+    if: ${{ contains(fromJSON(needs.release-plan.outputs.runtime_products), 'lite') }}
     name: Build Apache Lite and Inference packages
     needs:
       - release-plan
@@ -297,6 +289,7 @@ jobs:
           if-no-files-found: error
 
   release-request:
+    if: ${{ !cancelled() && !failure() }}
     name: Record immutable release identity
     needs:
       - release-plan
@@ -319,6 +312,7 @@ jobs:
           SOURCE_REF_HEAD: ${{ inputs.source_ref_head }}
           BUILD_CONTROLLER_COMMIT: ${{ needs.release-plan.outputs.build_controller_commit }}
           RELEASE_CHANNEL: ${{ needs.release-plan.outputs.channel }}
+          BUILD_CONTRACT_SCHEMA: ${{ needs.release-plan.outputs.build_contract_schema }}
         run: |
           mkdir -p dist/release-request
           python scripts/release/release_channels.py spec \
@@ -329,6 +323,7 @@ jobs:
             --source-ref "$SOURCE_REF" \
             --source-ref-head "$SOURCE_REF_HEAD" \
             --build-controller-commit "$BUILD_CONTROLLER_COMMIT" \
+            --build-contract-schema "$BUILD_CONTRACT_SCHEMA" \
             > dist/release-request/release-request.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

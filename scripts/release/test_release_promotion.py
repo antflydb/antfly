@@ -22,6 +22,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import shutil
+import subprocess
+import textwrap
 import sys
 import tempfile
 import unittest
@@ -71,7 +75,7 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         document = {
             "schema_version": 1,
-            "required_source_paths": sorted(contract.REQUIRED_PATHS),
+            "required_source_paths": sorted(contract.LEGACY_REQUIRED_PATHS),
         }
 
         def read_object(_root: Path, _commit: str, path: str) -> bytes:
@@ -88,6 +92,154 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertRaisesRegex(SystemExit, "unsupported release build contract"),
         ):
             contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_apache_source_contract_requires_products_and_package_inputs(self) -> None:
+        contract = load_module(
+            "validate_apache_source_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 2,
+            "runtime_products": ["server", "lite", "inference"],
+            "required_source_paths": sorted(contract.REQUIRED_PATHS),
+        }
+
+        def read_object(_root: Path, _commit: str, path: str) -> bytes:
+            return (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            )
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 2)
+            document["runtime_products"] = ["server", "lite"]
+            with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
+                contract.validate(RELEASE_DIR, COMMIT)
+            document["runtime_products"] = ["server", "lite", "inference"]
+            document["required_source_paths"].remove(
+                "scripts/packaging/package_lite_release.py"
+            )
+            with self.assertRaisesRegex(SystemExit, "required builder inputs"):
+                contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_runtime_archives_follow_source_contract_and_fail_closed(self) -> None:
+        payload = load_module(
+            "build_contract_runtime_archives_test", "build_release_payload.py"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            archive_dir = Path(directory)
+            server = archive_dir / "antfly_0.3.0_Linux_x86_64_gnu.tar.gz"
+            server.write_bytes(b"server")
+            self.assertEqual(payload.collect_runtime_archives(archive_dir, 1), [server])
+            with self.assertRaisesRegex(SystemExit, "missing matching antfly-lite"):
+                payload.collect_runtime_archives(archive_dir, 2)
+            lite = archive_dir / "antfly-lite_0.3.0_Linux_x86_64_gnu.tar.gz"
+            lite.write_bytes(b"lite")
+            with self.assertRaisesRegex(
+                SystemExit, "missing matching antfly-inference"
+            ):
+                payload.collect_runtime_archives(archive_dir, 2)
+            inference = archive_dir / "antfly-inference_0.3.0_Linux_x86_64_gnu.tar.gz"
+            inference.write_bytes(b"inference")
+            self.assertEqual(
+                payload.collect_runtime_archives(archive_dir, 2),
+                sorted([server, lite, inference]),
+            )
+            with self.assertRaisesRegex(
+                SystemExit, "unsupported release build contract"
+            ):
+                payload.collect_runtime_archives(archive_dir, 999)
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required by the release workflow")
+    def test_archive_workflow_dispatches_legacy_and_apache_products(self) -> None:
+        workflow = (
+            RELEASE_DIR.parents[1] / ".github/workflows/antfly-artifact-build.yml"
+        ).read_text()
+        step = workflow.split(
+            "      - name: Build source-declared runtime archives\n", 1
+        )[1].split("      - uses:", 1)[0]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        for key, value in {
+            "archive_os": "Linux",
+            "archive_arch": "x86_64",
+            "archive_suffix": "_gnu",
+            "zig_target": "x86_64-linux-gnu",
+            "zig_optimize": "fast",
+            "metal": "false",
+            "system_blas": "false",
+        }.items():
+            script = script.replace("${{ matrix." + key + " }}", value)
+        contract = load_module(
+            "workflow_dispatch_source_contract_test", "validate_source_contract.py"
+        )
+        for schema, jobs in ((1, ""), (1, "2"), (2, ""), (2, "2")):
+            with (
+                self.subTest(schema=schema, jobs=jobs),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                packaging = root / "scripts/packaging"
+                packaging.mkdir(parents=True)
+                command = packaging / "build_zig_release_archive.sh"
+                # Record actual workflow invocations instead of compiling native artifacts.
+                command.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls.txt\n")
+                command.chmod(0o755)
+                subprocess.run(
+                    ["bash", "-c", script.replace("${{ matrix.zig_jobs }}", jobs)],
+                    cwd=root,
+                    check=True,
+                    env={
+                        **os.environ,
+                        "RELEASE_TAG": "v0.3.0",
+                        "RUNTIME_PRODUCTS": json.dumps(
+                            contract.runtime_products(schema)
+                        ),
+                    },
+                )
+                calls = (root / "calls.txt").read_text().splitlines()
+                self.assertEqual(len(calls), len(contract.runtime_products(schema)))
+                self.assertEqual("--jobs 2" in calls[0], bool(jobs))
+                self.assertNotIn("--product", calls[0])
+                self.assertIn(
+                    "--archive-name antfly_0.3.0_Linux_x86_64_gnu.tar.gz", calls[0]
+                )
+                for product, call in zip(
+                    contract.runtime_products(schema)[1:], calls[1:]
+                ):
+                    self.assertIn(f"--product {product}", call)
+                    self.assertIn(
+                        f"--archive-name antfly-{product}_0.3.0_Linux_x86_64_gnu.tar.gz",
+                        call,
+                    )
+
+    def test_release_spec_records_the_validated_source_contract(self) -> None:
+        channels = load_module("apache_release_spec_test", "release_channels.py")
+        payload = load_module(
+            "apache_release_spec_payload_test", "build_release_payload.py"
+        )
+        for schema in (1, 2):
+            with (
+                self.subTest(schema=schema),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                document = channels.build_release_spec(
+                    "v0.3.0",
+                    "stable",
+                    COMMIT,
+                    "f" * 40,
+                    release_line="0.3",
+                    source_ref="refs/heads/main",
+                    source_ref_head=SOURCE_HEAD,
+                    build_contract_schema=schema,
+                ).document()
+                path = Path(directory) / "release-request.json"
+                path.write_text(json.dumps(document))
+                self.assertEqual(
+                    payload.verify_release_spec(path, "v0.3.0", COMMIT)[
+                        "build_contract_schema"
+                    ],
+                    schema,
+                )
 
     def test_release_source_snapshot_is_extracted_from_the_exact_commit(self) -> None:
         stage = load_module("stage_release_source_test", "stage_release_source.py")
@@ -1519,7 +1671,7 @@ class ReleasePromotionTests(unittest.TestCase):
                         "source_ref": "refs/heads/main",
                         "source_ref_head": SOURCE_HEAD,
                         "build_controller_commit": "f" * 40,
-                        "build_contract_schema": 1,
+                        "build_contract_schema": 2,
                         "registry_versions": {
                             "npm": "0.2.1",
                             "python": "0.2.1",

@@ -53,11 +53,24 @@ packages the real Apache `antfly-inference` CLI with commands such as `run`,
 `embed`, `generate`, and `pull`. The default server archive retains ELv2 and
 includes the Apache license for the shared engine and native library.
 
-The release build creates separate Apache Lite and inference archives for each
+Release source contract schema 2 declares `server`, `lite`, and `inference`
+products and requires the Apache package and licensing inputs. The trusted
+controller validates the contract at the exact source commit, builds its declared
+products, and records the contract version in the immutable release request.
+Schema 1 remains supported for historical and maintenance sources: it builds
+server archives and CLI packages, skips embedded package assembly, and promotes
+the server-only runtime scope. Schema 2 promotion requires matching Lite and
+inference archives for every server platform; missing Apache artifacts fail the
+release rather than falling back to a server-only payload.
+
+The schema 2 release build creates separate Apache Lite and inference archives for each
 platform. `package_lite_release.py` assembles
 platform wheels for `antfly-embedded` and native npm packages for
 `@antfly/embedded`;
 the bindings discover these artifacts without using the ELv2 server packages.
+Both Rust embedded crates include the canonical Apache license in their Cargo
+package; Go and Rust consumers obtain the native library from these archives or
+a local build.
 `verify_lite_release.py` compares each wheel and npm package with its Lite
 archive and rejects server executables and ELv2 license files. Both package
 formats carry the package roots, additional-file map, and asset manifest in
