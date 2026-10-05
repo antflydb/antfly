@@ -201,16 +201,28 @@ def teacher_prompt_ids(tok, record: dict) -> list[int]:
 
 
 def snapshot_cache(cache):
-    """Each layer's cache class, state and meta state. Newer mlx-lm states
-    are not bare (keys, values) pairs, and some cache classes need meta state."""
-    return [(type(c), c.state, c.meta_state) for c in cache]
+    """Each layer's keys and values, trimmed to the filled length. mlx-lm 0.32
+    states are the full-capacity buffers plus an offset, and extending a
+    cache writes into its buffers in place; trimmed copies make every fork
+    allocate its own buffer on its first token, so the snapshot stays intact."""
+    saved = []
+    for c in cache:
+        state = c.state
+        keys, values = state[0], state[1]
+        filled = state[2] if len(state) > 2 else keys.shape[2]
+        saved.append((keys[..., :filled, :], values[..., :filled, :]))
+    return saved
 
 
 def fork_cache(cache_mod, saved_state):
-    """A fresh KV cache holding `saved_state` (from `snapshot_cache`);
-    extending it leaves the saved arrays untouched, so one prefix can branch
-    many continuations."""
-    return [cls.from_state(state, meta) for cls, state, meta in saved_state]
+    """A fresh KV cache per layer holding a snapshot from `snapshot_cache`, so
+    one prefix can branch many continuations."""
+    fresh = []
+    for keys, values in saved_state:
+        c = cache_mod.KVCache()
+        c.keys, c.values, c.offset = keys, values, keys.shape[2]
+        fresh.append(c)
+    return fresh
 
 
 def score_labels(

@@ -73,13 +73,28 @@ def ids_for(tok, r):
 
 
 def snapshot(cache):
-    """Each layer's cache class and state; newer mlx-lm states are not bare
-    (keys, values) pairs, and some cache classes carry meta state."""
-    return [(type(x), x.state, x.meta_state) for x in cache]
+    """Each layer's keys and values, trimmed to the filled length. mlx-lm 0.32
+    states are the full-capacity buffers plus an offset, and extending a
+    cache writes into its buffers in place; trimmed copies make every fork
+    allocate its own buffer on its first token, so the snapshot stays intact."""
+    saved = []
+    for c in cache:
+        state = c.state
+        keys, values = state[0], state[1]
+        filled = state[2] if len(state) > 2 else keys.shape[2]
+        saved.append((keys[..., :filled, :], values[..., :filled, :]))
+    return saved
 
 
 def fork(saved):
-    return [cls.from_state(state, meta) for cls, state, meta in saved]
+    """A fresh KV cache per layer holding a snapshot from `snapshot`, so
+    one prefix can branch many continuations."""
+    fresh = []
+    for keys, values in saved:
+        c = cache_mod.KVCache()
+        c.keys, c.values, c.offset = keys, values, keys.shape[2]
+        fresh.append(c)
+    return fresh
 
 
 def labels_from(model, tok, saved, last, r):
