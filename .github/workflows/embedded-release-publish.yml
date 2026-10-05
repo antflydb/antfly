@@ -1,4 +1,4 @@
-name: Publish Apache Lite and Inference
+name: Publish Apache Embedded Packages
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       build_run_id:
-        description: "Successful Release build run containing the Lite snapshot"
+        description: "Successful release-controller run containing the embedded package snapshot"
         required: true
         type: string
 
@@ -20,7 +20,7 @@ env:
 
 jobs:
   prepare:
-    name: Verify immutable Lite release inputs
+    name: Verify immutable embedded release inputs
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -41,32 +41,39 @@ jobs:
         with:
           python-version: ${{ steps.toolchain.outputs.python_build }}
 
-      - name: Require a successful trusted release build and tagged source
-        id: identity
+      - name: Authenticate the release artifact producer
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ inputs.tag_name }}
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main
           [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?([+-][0-9A-Za-z.-]+)?$ ]]
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > "$RUNNER_TEMP/lite-build-run.json"
-          test "$(jq -r .name "$RUNNER_TEMP/lite-build-run.json")" = 'Release build'
-          test "$(jq -r .conclusion "$RUNNER_TEMP/lite-build-run.json")" = success
-          git fetch --no-tags origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
-          commit="$(git rev-parse "$TAG_NAME^{commit}")"
-          version="${TAG_NAME#v}"
-          python_version="$(python -c 'import sys; sys.path.insert(0, "scripts/release"); from release_channels import python_version_from_release; print(python_version_from_release(sys.argv[1]))' "$version")"
-          npm_tag=latest
-          if [[ "$version" == *-* ]]; then npm_tag=next; fi
-          {
-            echo "commit=$commit"
-            echo "version=$version"
-            echo "python_version=$python_version"
-            echo "npm_tag=$npm_tag"
-          } >> "$GITHUB_OUTPUT"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > "$RUNNER_TEMP/embedded-build-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/antfly-release-build-controller.yml" > "$RUNNER_TEMP/embedded-build-workflow.json"
+          python scripts/release/verify_embedded_publish_inputs.py producer \
+            --run-json "$RUNNER_TEMP/embedded-build-run.json" \
+            --workflow-json "$RUNNER_TEMP/embedded-build-workflow.json" \
+            --repository "$GITHUB_REPOSITORY" --default-branch main
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: antfly-release-request
+          path: dist/release-request
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify immutable controller and release-source identity
+        id: identity
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+        run: |
+          python scripts/release/verify_embedded_publish_inputs.py identity \
+            --run-json "$RUNNER_TEMP/embedded-build-run.json" \
+            --workflow-json "$RUNNER_TEMP/embedded-build-workflow.json" \
+            --repository "$GITHUB_REPOSITORY" --default-branch main \
+            --request dist/release-request/release-request.json \
+            --tag "$TAG_NAME" --github-output "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

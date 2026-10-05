@@ -172,7 +172,9 @@ SELECT antfly_status('http://localhost:8080/db/v1/');
 ## Architecture
 
 `antfly-postgres` depends on `antfly-sdk`, a sibling crate in the `rs/` workspace that
-generates a typed Rust SDK from root `openapi.yaml` via [Progenitor](https://github.com/oxidecomputer/progenitor).
+generates a typed Rust SDK from its bundled public OpenAPI spec via
+[Progenitor](https://github.com/oxidecomputer/progenitor). The bundled spec is
+synchronized from root `openapi.yaml` during repository generation.
 `antfly-postgres` uses the shared types (e.g. `QueryResponses`, `QueryHit`) for
 deserialization but keeps its own blocking HTTP client (Postgres extensions
 cannot run an async runtime).

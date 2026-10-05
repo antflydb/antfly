@@ -70,15 +70,20 @@ platform wheels for `antfly-embedded` and native npm packages for
 the bindings discover these artifacts without using the ELv2 server packages.
 Both Rust embedded crates include the canonical Apache license in their Cargo
 package; Go and Rust consumers obtain the native library from these archives or
-a local build.
+a local build. The Rust SDK bundles its OpenAPI build input inside its crate;
+`make generate` refreshes it from the joined public spec and SDK CI verifies both
+synchronization and the build of the published archive. Publish `antfly-sdk`
+before `antfly-postgres`, whose registry dependency requires SDK version `0.1.0`.
 `verify_lite_release.py` compares each wheel and npm package with its Lite
 archive and rejects server executables and ELv2 license files. Both package
 formats carry the package roots, additional-file map, and asset manifest in
 `LICENSES/source-map`; verification compares those files with the archive. The immutable
 package snapshot is produced by `.github/workflows/lite-package.yml` as part
 of the release build. After a successful tagged release build, dispatch
-`.github/workflows/lite-release-publish.yml` on `main` with that tag and build
-run ID. It verifies the immutable tag, package hashes, and archive equivalence
+`.github/workflows/embedded-release-publish.yml` on `main` with that tag and build
+run ID. It authenticates the successful release-controller workflow on `main`,
+then checks its commit-bound release request against the immutable tag and the
+protected release-source history. It verifies package hashes and archive equivalence
 before publishing `antfly-embedded` wheels to PyPI and the
 `@antfly/embedded` platform and selector packages to npm. The PyPI project and
 each npm package must have trusted publishing configured for this workflow in
@@ -86,7 +91,7 @@ their registry settings.
 
 Before the first release, the PyPI account owner must configure a pending
 trusted publisher for project `antfly-embedded`, repository
-`antflydb/antfly`, workflow `lite-release-publish.yml`, and GitHub environment
+`antflydb/antfly`, workflow `embedded-release-publish.yml`, and GitHub environment
 `pypi`. A pending publisher does not reserve the name: the first successful
 upload creates the project.
 
@@ -104,7 +109,7 @@ See [registry claims](../../registry-claims/README.md) for verification commands
 The four npm packages (`@antfly/embedded` and its Darwin ARM64, Linux ARM64,
 and Linux x64 platform packages) were established with nonfunctional `0.0.0`
 setup versions on 2026-10-05. All four trusted publishers are configured for
-`antflydb/antfly`, `lite-release-publish.yml`, environment `npm`.
+`antflydb/antfly`, `embedded-release-publish.yml`, environment `npm`.
 Registry ownership and trusted-publisher settings are external account state;
 verify them in the registries before promoting a release.
 

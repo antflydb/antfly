@@ -130,8 +130,11 @@ check_sdk() {
   check_memoryaf
 
   section "Checking the Rust SDK"
+  "$policy_python" -m unittest discover -s "$repo_root/scripts" -p test_sync_rust_sdk_spec.py
+  "$policy_python" "$repo_root/scripts/sync_rust_sdk_spec.py" --check
   cargo fmt --manifest-path "$repo_root/rs/Cargo.toml" --all --check
   cargo test --locked --manifest-path "$repo_root/rs/Cargo.toml" --package antfly-sdk
+  cargo package --locked --manifest-path "$repo_root/rs/Cargo.toml" --package antfly-sdk
 
   check_lite_bindings
 }

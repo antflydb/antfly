@@ -58,6 +58,8 @@ SDK_FILES = {
     "ts/pnpm-workspace.yaml",
     "ts/tsconfig.base.json",
     "ts/turbo.json",
+    "scripts/sync_rust_sdk_spec.py",
+    "scripts/test_sync_rust_sdk_spec.py",
     "scripts/join_public_openapi.py",
     "scripts/join_openapi.py",
     "scripts/openapi_joiner.py",

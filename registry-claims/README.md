@@ -34,7 +34,7 @@ this repository does not itself grant registry access.
 ## npm
 
 The following packages have `0.0.0` setup versions and trusted publishers for
-repository `antflydb/antfly`, workflow `lite-release-publish.yml`, environment
+repository `antflydb/antfly`, workflow `embedded-release-publish.yml`, environment
 `npm`:
 
 - `@antfly/embedded`
@@ -53,7 +53,7 @@ npm trust list @antfly/embedded
 If missing, an authorized npm account with 2FA can configure it:
 
 ```sh
-npm trust github @antfly/embedded --file lite-release-publish.yml \
+npm trust github @antfly/embedded --file embedded-release-publish.yml \
   --repo antflydb/antfly --env npm --allow-publish --yes
 ```
 

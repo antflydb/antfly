@@ -29,7 +29,7 @@ pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
 
 [dependencies]
-antfly-sdk = { path = "../sdk" }
+antfly-sdk = { path = "../sdk", version = "0.1.0" }
 pgrx = { version = "0.17.0", default-features = false }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1.0", features = ["derive"] }

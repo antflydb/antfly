@@ -92,6 +92,7 @@ build: build-antfarm
 
 build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
+	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
 
 release-scripting-test:
 	scripts/release/test.sh
