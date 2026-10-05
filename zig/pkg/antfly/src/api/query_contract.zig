@@ -8638,19 +8638,24 @@ const ParsedFuzziness = struct {
 
 fn parseBleveFuzziness(value: ?query_openapi.Fuzziness, default_edits: u8) !ParsedFuzziness {
     if (value == null) return .{ .max_edits = default_edits, .auto_fuzzy = false };
-    const int_value = switch (value.?) {
-        .integer => |number| number,
-        // Public admission preserves JSON numbers as text for exact values.
-        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch
-            return error.InvalidQueryRequest,
+    return switch (value.?) {
+        .integer => |int_value| {
+            if (int_value < 0 or int_value > 2) return error.InvalidQueryRequest;
+            return .{ .max_edits = @intCast(int_value), .auto_fuzzy = false };
+        },
+        .number_string => |token| {
+            // Public admission preserves number tokens for lossless IDs. The
+            // schema's untyped fuzziness union retains that representation too.
+            const edits = std.fmt.parseInt(u8, token, 10) catch return error.InvalidQueryRequest;
+            if (edits > 2) return error.InvalidQueryRequest;
+            return .{ .max_edits = edits, .auto_fuzzy = false };
+        },
         .string => |str_value| {
             if (!std.mem.eql(u8, str_value, "auto")) return error.UnsupportedQueryRequest;
             return .{ .max_edits = default_edits, .auto_fuzzy = true };
         },
         else => return error.UnsupportedQueryRequest,
     };
-    if (int_value < 0 or int_value > 2) return error.InvalidQueryRequest;
-    return .{ .max_edits = @intCast(int_value), .auto_fuzzy = false };
 }
 
 fn parseBlevePrefixLength(value: ?i32) !u8 {
@@ -14347,6 +14352,8 @@ fn consumerTests() type {
             const filters = [_][]const u8{
                 "{\"term\":\"active\",\"path\":\"/status\"}",
                 "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":1}",
+                "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":0}",
+                "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":2}",
                 "{\"prefix\":\"doc:\",\"path\":\"/id\"}",
                 "{\"regexp\":\"go.*\",\"path\":\"/tier\"}",
                 "{\"wildcard\":\"go*\",\"path\":\"/tier\"}",
@@ -14382,10 +14389,10 @@ fn consumerTests() type {
                 try std.testing.expect(normalized.len > 0);
             }
 
-            for ([_][]const u8{ "-1", "3", "1.5", "9223372036854775808" }) |fuzziness| {
+            for ([_][]const u8{ "-1", "3", "1.5", "256", "9223372036854775808" }) |token| {
                 const request = try std.mem.concat(alloc, u8, &.{
                     "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"filter\":{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":",
-                    fuzziness,
+                    token,
                     "}}}}}",
                 });
                 defer alloc.free(request);

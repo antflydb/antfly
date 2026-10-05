@@ -1136,6 +1136,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 null;
             defer if (apply_schema_view) |*view| view.release();
+            if (apply_schema_view) |view| if (view.tableSchema().external_base_source != null and
+                (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0)) return error.ExternalLakeReadOnly;
             if (relationalColumns(self) == null) for (effective_req.writes) |write| if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
             if (!use_preprepared_rows and relationalColumns(self) != null and apply_schema_view == null)
                 return error.InvalidSchemaUpdateRequest;
@@ -2038,13 +2040,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_delete_keys,
             );
             defer self.alloc.free(deleted_artifact_keys);
-            // Merge-page artifact deletes can retire a graph fact without a
-            // primary document mutation to allocate the cleanup generation above.
-            if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |key| {
-                if (internal_keys.graphInlineTargetComponent(key) != null) {
-                    graph_lifecycle_generation = try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
-                    break;
-                }
+            // Native transfer pages can delete relationship artifacts without a
+            // document or tuple delete. Classify their prepared effects too, so
+            // every retirement receives this commit's nonzero lifecycle stamp.
+            if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |artifact| {
+                if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                break;
             };
             try appendGraphEndpointRetirements(self.alloc, self.core.store, graph_lifecycle_generation, effective_req.deletes, self.core.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);

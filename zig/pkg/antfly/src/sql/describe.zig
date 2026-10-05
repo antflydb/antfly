@@ -769,19 +769,22 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 
 /// Shared literal/parameter coercion. Exact integer columns never pass through
 /// f64. Native number columns intentionally have IEEE-754 semantics.
-/// Native relational storage encodes timestamps as unsigned epoch nanos.
-/// Convert at the SQL boundary so projection, ordering and scalar evaluation
+/// Native storage uses unsigned epoch nanos; external lake timestamps can be
+/// signed. Convert both exactly at the SQL boundary so projection, ordering and scalar evaluation
 /// share the same canonical datetime representation.
 pub fn coerceAlloc(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !Json {
     if (kind == .datetime and raw != .null) {
         const datetime = @import("../datetime.zig");
-        const ns: u64 = switch (raw) {
-            .integer => |value| std.math.cast(u64, value) orelse return error.InvalidSqlDateTime,
-            .number_string => |text| std.fmt.parseInt(u64, text, 10) catch return error.InvalidSqlDateTime,
-            .string => |text| datetime.parseDateTimeToNs(text) orelse return error.InvalidSqlDateTime,
+        const ns: i128 = switch (raw) {
+            .integer => |value| value,
+            .number_string => |text| std.fmt.parseInt(i128, text, 10) catch return error.InvalidSqlDateTime,
+            .string => |text| datetime.parseDateTimeToSignedNs(text) orelse return error.InvalidSqlDateTime,
             else => return error.SqlTypeMismatch,
         };
-        return .{ .string = try datetime.formatDateTimeNsAlloc(alloc, ns) };
+        return .{ .string = datetime.formatDateTimeSignedNsAlloc(alloc, ns) catch |err| switch (err) {
+            error.InvalidDateTime => return error.InvalidSqlDateTime,
+            else => return err,
+        } };
     }
     return coerce(raw, kind);
 }
@@ -1156,7 +1159,7 @@ test "SQL binding rejects generated column writes even when a predicate is prova
     try std.testing.expectEqualStrings("derived", result.binding.columns[result.binding.columns.len - 1].name);
 }
 
-test "SQL native timestamp coercion preserves epoch precision and canonical offsets" {
+test "SQL timestamp coercion preserves signed epoch precision and canonical offsets" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1166,7 +1169,10 @@ test "SQL native timestamp coercion preserves epoch precision and canonical offs
         try std.testing.expectEqualStrings(expected, (try coerceAlloc(a, raw, .datetime)).string);
     }
     try std.testing.expect((try coerceAlloc(a, .null, .datetime)) == .null);
-    try std.testing.expectError(error.InvalidSqlDateTime, coerceAlloc(a, .{ .integer = -1 }, .datetime));
+    for ([_]Json{ .{ .integer = -1 }, .{ .number_string = "-1" }, .{ .string = "1969-12-31T23:59:59.999999999Z" } }) |raw| {
+        try std.testing.expectEqualStrings("1969-12-31T23:59:59.999999999Z", (try coerceAlloc(a, raw, .datetime)).string);
+    }
+    try std.testing.expectError(error.InvalidSqlDateTime, coerceAlloc(a, .{ .number_string = "170141183460469231731687303715884105727" }, .datetime));
 }
 
 fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {

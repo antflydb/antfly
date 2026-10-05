@@ -5160,9 +5160,10 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     // Every task intentionally holds a lease or waits in descriptor admission.
     // Give the threaded test executor one slot per task so the harness itself
     // cannot become the bottleneck before the >64 contention point is reached.
+    // Keep the platform's default stack size: the linked test graph's static
+    // TLS can exceed a hand-picked 512 KiB stack on glibc (pthread EINVAL).
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .limited(worker_count),
-        .stack_size = 512 * 1024,
     });
     defer io_impl.deinit();
     const io = io_impl.io();

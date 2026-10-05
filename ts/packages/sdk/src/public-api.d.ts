@@ -13709,6 +13709,38 @@ export interface components {
          * @enum {string}
          */
         TableStorageMode: "document" | "relational";
+        ExternalLakeCredentialRef: {
+            /** @description Name of a configured external_io connection with lake_read capability. */
+            ref: string;
+            /** @description Allowed object prefix relative to the configured bucket or filesystem root. */
+            scope?: string;
+        };
+        ExternalLakeSnapshotSelector: {
+            /** @enum {string} */
+            mode: "current" | "snapshot_id" | "object_version_digest";
+            /** @description Required for snapshot_id; selects an Iceberg snapshot. */
+            id?: string;
+            /** @description Required for object_version_digest; pins a Parquet object inventory. */
+            digest?: string;
+        };
+        /** @description Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. */
+        ExternalLakeTableSource: {
+            /** @enum {string} */
+            kind: "external";
+            table_id: string;
+            /** @enum {string} */
+            format: "parquet" | "iceberg";
+            uri: string;
+            /** @default auto */
+            schema_fingerprint?: string;
+            /**
+             * @default read_only
+             * @enum {string}
+             */
+            write_policy?: "read_only";
+            credentials?: components["schemas"]["ExternalLakeCredentialRef"];
+            snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
+        };
         RelationalColumnExpression: {
             column: string;
             expression: components["schemas"]["RelationalScalarExpression"];
@@ -14003,6 +14035,8 @@ export interface components {
              */
             readonly version?: number;
             storage_mode?: components["schemas"]["TableStorageMode"];
+            /** @description External tables require relational storage mode and are read-only. Omit for native tables. */
+            base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
              * @description Immutable typed expressions applied only to absent columns on new
              *     writes, never explicit null. Defaults cannot reference columns.

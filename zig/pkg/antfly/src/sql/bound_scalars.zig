@@ -36,7 +36,20 @@ pub const Bound = struct {
         @memset(out, .{});
         for (self.required) |ordinal| {
             const cell = try row.cell(self.columns[ordinal].name);
-            out[ordinal] = .{ .value = try @import("describe.zig").coerceAlloc(alloc, cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null };
+            out[ordinal] = .{ .value = try @import("describe.zig").coerceAlloc(alloc, cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+        }
+        return out;
+    }
+
+    /// Bind borrowed typed vectors directly to scalar ordinals. Primitive
+    /// values need no JSON object, serialization or per-cell heap allocation.
+    pub fn columnCells(self: Bound, alloc: Allocator, page: catalog.ColumnPage, index: usize) ![]const scalar.Datum {
+        if (self.required.len == 0) return &.{};
+        const out = try alloc.alloc(scalar.Datum, self.columns.len);
+        @memset(out, .{});
+        for (self.required) |ordinal| {
+            const cell = try page.cell(alloc, index, self.columns[ordinal].name);
+            out[ordinal] = .{ .value = try @import("describe.zig").coerceAlloc(alloc, cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null, .patterns = cell.patterns };
         }
         return out;
     }

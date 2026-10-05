@@ -8047,6 +8047,10 @@ pub const DB = struct {
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         try types.validateGraphEndpointCleanupCommand(req);
+        var lake_schema_view = self.core.acquireSchemaView();
+        defer if (lake_schema_view) |*view| view.release();
+        if (lake_schema_view) |view| if (view.tableSchema().external_base_source != null and
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0)) return error.ExternalLakeReadOnly;
         if (self.local_execution.initial_child_hidden.load(.acquire) and
             (req.relational_topology == null or
                 (req.relational_topology.?.action != .provision_initial_child and
@@ -21935,11 +21939,15 @@ pub const DB = struct {
     fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !?u64 {
         if (self.core.schema) |current_schema| {
             if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+            // Attaching/detaching an external base must never hide or resurrect
+            // native rows under the same identity. Create a new table instead.
+            if ((current_schema.external_base_source == null) != (next_schema.external_base_source == null)) return error.InvalidSchemaUpdateRequest;
             return null;
         }
 
         const catalog = self.core.table_catalog;
         if (catalog.reconciled) {
+            if (next_schema.external_base_source != null and catalog.row_count != 0) return error.InvalidSchemaUpdateRequest;
             if (catalog.row_count != 0 and catalog.mode_initialized and
                 catalog.storage_mode != next_schema.storage_mode)
                 return error.InvalidSchemaUpdateRequest;
@@ -21951,6 +21959,7 @@ pub const DB = struct {
         // is known and never copy keys or values into an aggregate result.
         const State = struct {
             desired: schema_mod.StorageMode,
+            external: bool,
             incompatible: bool = false,
             row_count: u64 = 0,
 
@@ -21964,14 +21973,14 @@ pub const DB = struct {
                 else
                     return .@"continue";
                 state.row_count +|= 1;
-                if (mode == state.desired) return .@"continue";
+                if (!state.external and mode == state.desired) return .@"continue";
                 state.incompatible = true;
                 return .stop;
             }
         };
         const lower = [_]u8{internal_keys.user_namespace};
         const upper = [_]u8{internal_keys.user_namespace + 1};
-        var state = State{ .desired = next_schema.storage_mode };
+        var state = State{ .desired = next_schema.storage_mode, .external = next_schema.external_base_source != null };
         try self.core.store.scanWithContext(&lower, &upper, .{}, &state, State.visit);
         if (state.incompatible) return error.InvalidSchemaUpdateRequest;
         return state.row_count;
@@ -83136,10 +83145,22 @@ test "db document extraction chunks units through source artifact enrichment" {
     }
     var missing_dense = try db.search(alloc, .{ .index_name = "document_vectors", .dense = .{ .vector = query_vec, .k = 1 }, .limit = 1, .include_stored = false });
     defer missing_dense.deinit();
-    try std.testing.expectEqual(@as(usize, 0), missing_dense.hits.len);
-    var missing_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = sparse_query.indices, .values = sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
+    // Vectors are backed by their embedding artifacts, independently of the
+    // optional stored chunk payload used by the full-text index above.
+    try std.testing.expectEqual(@as(usize, 1), missing_dense.hits.len);
+    var updated_sparse_query = try deterministic_sparse.interface().embedSparse(alloc, "document_chunk_sparse_v1", "alpha beta delta");
+    defer updated_sparse_query.deinit(alloc);
+    var missing_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = updated_sparse_query.indices, .values = updated_sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
     defer missing_sparse.deinit();
-    try std.testing.expectEqual(@as(usize, 0), missing_sparse.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), missing_sparse.hits.len);
+    try db.core.store.delete(dense_artifact_key);
+    try db.core.store.delete(sparse_artifact_key);
+    var orphaned_dense = try db.search(alloc, .{ .index_name = "document_vectors", .dense = .{ .vector = query_vec, .k = 1 }, .limit = 1, .include_stored = false });
+    defer orphaned_dense.deinit();
+    try std.testing.expectEqual(@as(usize, 0), orphaned_dense.hits.len);
+    var orphaned_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = updated_sparse_query.indices, .values = updated_sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
+    defer orphaned_sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 0), orphaned_sparse.hits.len);
 
     try db.batch(.{
         .writes = &.{.{
@@ -84325,6 +84346,7 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-b",
             .dense_embedder = deterministic.interface(),
@@ -84339,14 +84361,17 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
         enrichment_lease.default_lease_key,
     );
     defer stale_lease.deinit();
-    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-    try std.testing.expect(try stale_lease.tryAcquire("worker-a", now_ms, 30_000));
-
     try db.addIndex(.{
         .name = "dv_v1",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
     });
+
+    // Installing the producer may replace its runtime and lease state. Pin
+    // the competing owner only after admission and before starting the worker.
+    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    try std.testing.expect(try stale_lease.tryAcquire("worker-a", now_ms, 30_000));
+    try db.enrichment_runtime.?.start();
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"blocked enrichment\"}" }},
@@ -102921,7 +102946,7 @@ test "db full text repair page replay is idempotent without compaction" {
     }
     try std.testing.expect(complete);
     try std.testing.expectEqual(@as(u32, 3), reopened.core.index_manager.textIndex(cfg.name).?.snapshot().liveDocCount());
-    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .limit = 3 });
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .count_only = true });
     defer all.deinit();
     try std.testing.expectEqual(@as(u32, 3), all.total_hits);
 }
@@ -132883,6 +132908,20 @@ test "document collectors embedding identity accepted and rejected keys clean ev
     }
     try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, rejected, "dense"));
     try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, db.core.index_manager, .{ .name = "dense", .kind = .dense_vector }, rejected));
+}
+test "db external lake rejects native mutations before and after cold reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("lake-owner");
+    defer directory.cleanup();
+    const external_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"amount\":{\"type\":\"integer\"}},\"additionalProperties\":false}}},\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"table_id\":\"events\",\"uri\":\"s3://bucket/events\",\"schema_fingerprint\":\"v1\"}}";
+    for (0..2) |iteration| {
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        if (iteration == 0) try db.setSchemaJson(alloc, external_schema);
+        try std.testing.expect(db.core.schema.?.external_base_source != null);
+        try std.testing.expectError(error.ExternalLakeReadOnly, db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"amount\":1}" }} }));
+        try std.testing.expectError(error.ExternalLakeReadOnly, db.batch(.{ .deletes = &.{"one"} }));
+    }
 }
 
 test "db extractEnrichments field-index planning is allocation atomic" {

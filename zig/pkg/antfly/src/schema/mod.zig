@@ -130,6 +130,7 @@ pub const CompiledTableValidator = struct {
     }
 
     pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
+        if (self.schema.external_base_source != null and writes.len != 0) return error.ExternalLakeReadOnly;
         try impl.validateWritesWithPlan(alloc, self.schema, writes, self.physical_fields, &self.execution);
     }
 
@@ -573,9 +574,12 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const default_type = try alloc.dupe(u8, if (schema.default_type.len > 0) schema.default_type else "_default");
     errdefer alloc.free(default_type);
     const ttl_field = try alloc.dupe(u8, schema.ttl_field);
+    errdefer alloc.free(ttl_field);
+    const external = if (schema.external_base_source) |source| try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, source) else null;
 
     return .{
         .version = schema.version,
+        .external_base_source = external,
         .default_type = default_type,
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = ttl_field,
@@ -2682,4 +2686,27 @@ test "runtime schema derives and validates index sort metadata" {
     );
     defer id_not_final.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, id_not_final));
+}
+
+test "external lake schema binding survives durable serialization and preserves ownership" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"orders","format":"iceberg","uri":"s3://bucket/orders","credentials":{"ref":"lake","scope":"orders"},"snapshot":{"mode":"snapshot_id","id":"123"},"schema_fingerprint":"schema-v7"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    parsed.deinit(alloc);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const bytes = try storage_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    const restored = try storage_schema.deserializeSchema(alloc, bytes);
+    defer storage_schema.freeSchema(alloc, restored);
+    try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, restored));
+    const source = restored.external_base_source.?.binding;
+    try std.testing.expectEqualStrings("123", source.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("lake", source.credential_ref.?.ref_id);
+    const projection = try storage_schema.serializeTextProjectionSchema(alloc, runtime);
+    defer alloc.free(projection);
+    const text_schema = try storage_schema.deserializeSchema(alloc, projection);
+    defer storage_schema.freeSchema(alloc, text_schema);
+    try std.testing.expect(text_schema.external_base_source == null);
 }

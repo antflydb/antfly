@@ -131,6 +131,7 @@ pub const TableApi = struct {
         CommittedGraphMetricMaterializationRejected,
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
+        ExternalLakeReadOnly,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
         HAFencedPrimary,
@@ -1803,6 +1804,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         // commit result instead of blindly replaying non-idempotent transforms.
         error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.ExternalLakeReadOnly => return .{ .status = 400, .body = try alloc.dupe(u8, "external lake tables are read-only") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },

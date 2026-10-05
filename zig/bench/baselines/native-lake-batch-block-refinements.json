@@ -1,0 +1,341 @@
+{
+  "date": "2026-10-04",
+  "command": "zig build sql-native-refinement-bench -Doptimize=ReleaseSafe -j2",
+  "source_base": "8710b74a780b55b0227cc2475179fe3e4ce8f97e",
+  "measurement_notes": [
+    "Local microbenchmarks with equal-output checks; no timing assertions.",
+    "Other local builds were active during collection; timings do not establish isolated before/after speedups or end-to-end throughput.",
+    "Expression, global and grouped aggregate, and window cases alternate scalar/refined order across three samples; sort and join have one sample per size.",
+    "Backing allocation counts and tracked allocator peaks do not measure process RSS.",
+    "Partitioned joins trade sequential writes, memory and first-row latency for fewer random reads. The join case starts directly with partitioning; production also copies the spilled build.",
+    "Typed-state cases measure current retained join/group state, not a before/after comparison.",
+    "The deterministic unit-test fixtures write 2,024,160 bytes with binary sort merging versus 1,354,191 with eight-way merging; partitioned aggregation writes 471,040 versus 5,840,368 for sorted updates.",
+    "Sort targets below 64 KiB use compact records; larger budgets admit typed blocks and their decoded merge workspace."
+  ],
+  "samples": [
+    {
+      "case": "typed_join_group_state",
+      "rows": 8192,
+      "join_ns": 3303834,
+      "join_peak_bytes": 1123639,
+      "join_allocations": 102,
+      "group_ns": 35828959,
+      "group_peak_bytes": 2252736,
+      "group_allocations": 8302
+    },
+    {
+      "case": "typed_join_group_state",
+      "rows": 32768,
+      "join_ns": 10844833,
+      "join_peak_bytes": 3779553,
+      "join_allocations": 132,
+      "group_ns": 137834875,
+      "group_peak_bytes": 8229704,
+      "group_allocations": 32903
+    },
+    {
+      "case": "float_expression",
+      "rows": 262144,
+      "sample": 0,
+      "scalar_ns": 24818333,
+      "vector_ns": 11850667,
+      "scalar_peak_bytes": 98376,
+      "vector_peak_bytes": 540888
+    },
+    {
+      "case": "global_aggregate",
+      "rows": 262144,
+      "sample": 0,
+      "scalar_ns": 21033458,
+      "batch_ns": 1365083,
+      "scalar_probes": 262143,
+      "batch_probes": 255,
+      "scalar_peak_bytes": 876,
+      "batch_peak_bytes": 876
+    },
+    {
+      "case": "float_expression",
+      "rows": 262144,
+      "sample": 1,
+      "scalar_ns": 24886541,
+      "vector_ns": 11678292,
+      "scalar_peak_bytes": 98376,
+      "vector_peak_bytes": 540888
+    },
+    {
+      "case": "global_aggregate",
+      "rows": 262144,
+      "sample": 1,
+      "scalar_ns": 21218416,
+      "batch_ns": 1391584,
+      "scalar_probes": 262143,
+      "batch_probes": 255,
+      "scalar_peak_bytes": 876,
+      "batch_peak_bytes": 876
+    },
+    {
+      "case": "float_expression",
+      "rows": 262144,
+      "sample": 2,
+      "scalar_ns": 24945916,
+      "vector_ns": 11572667,
+      "scalar_peak_bytes": 98376,
+      "vector_peak_bytes": 540888
+    },
+    {
+      "case": "global_aggregate",
+      "rows": 262144,
+      "sample": 2,
+      "scalar_ns": 21202417,
+      "batch_ns": 1329042,
+      "scalar_probes": 262143,
+      "batch_probes": 255,
+      "scalar_peak_bytes": 876,
+      "batch_peak_bytes": 876
+    },
+    {
+      "case": "float_expression",
+      "rows": 1048576,
+      "sample": 0,
+      "scalar_ns": 98853792,
+      "vector_ns": 47076000,
+      "scalar_peak_bytes": 98376,
+      "vector_peak_bytes": 540888
+    },
+    {
+      "case": "global_aggregate",
+      "rows": 1048576,
+      "sample": 0,
+      "scalar_ns": 85209166,
+      "batch_ns": 5371084,
+      "scalar_probes": 1048575,
+      "batch_probes": 1023,
+      "scalar_peak_bytes": 876,
+      "batch_peak_bytes": 876
+    },
+    {
+      "case": "float_expression",
+      "rows": 1048576,
+      "sample": 1,
+      "scalar_ns": 99712250,
+      "vector_ns": 47185541,
+      "scalar_peak_bytes": 98376,
+      "vector_peak_bytes": 540888
+    },
+    {
+      "case": "global_aggregate",
+      "rows": 1048576,
+      "sample": 1,
+      "scalar_ns": 84670250,
+      "batch_ns": 5449167,
+      "scalar_probes": 1048575,
+      "batch_probes": 1023,
+      "scalar_peak_bytes": 876,
+      "batch_peak_bytes": 876
+    },
+    {
+      "case": "float_expression",
+      "rows": 1048576,
+      "sample": 2,
+      "scalar_ns": 99632042,
+      "vector_ns": 46022083,
+      "scalar_peak_bytes": 98376,
+      "vector_peak_bytes": 540888
+    },
+    {
+      "case": "global_aggregate",
+      "rows": 1048576,
+      "sample": 2,
+      "scalar_ns": 85282166,
+      "batch_ns": 5161334,
+      "scalar_probes": 1048575,
+      "batch_probes": 1023,
+      "scalar_peak_bytes": 876,
+      "batch_peak_bytes": 876
+    },
+    {
+      "case": "grouped_columns",
+      "rows": 262144,
+      "sample": 0,
+      "scalar_ns": 39596666,
+      "batch_ns": 25646416,
+      "scalar_peak_bytes": 10436,
+      "batch_peak_bytes": 10436
+    },
+    {
+      "case": "grouped_columns",
+      "rows": 262144,
+      "sample": 1,
+      "scalar_ns": 39529625,
+      "batch_ns": 25285000,
+      "scalar_peak_bytes": 10436,
+      "batch_peak_bytes": 10436
+    },
+    {
+      "case": "grouped_columns",
+      "rows": 262144,
+      "sample": 2,
+      "scalar_ns": 39316750,
+      "batch_ns": 26370084,
+      "scalar_peak_bytes": 10436,
+      "batch_peak_bytes": 10436
+    },
+    {
+      "case": "grouped_columns",
+      "rows": 1048576,
+      "sample": 0,
+      "scalar_ns": 161135792,
+      "batch_ns": 108008709,
+      "scalar_peak_bytes": 10436,
+      "batch_peak_bytes": 10436
+    },
+    {
+      "case": "grouped_columns",
+      "rows": 1048576,
+      "sample": 1,
+      "scalar_ns": 157811667,
+      "batch_ns": 105948625,
+      "scalar_peak_bytes": 10436,
+      "batch_peak_bytes": 10436
+    },
+    {
+      "case": "grouped_columns",
+      "rows": 1048576,
+      "sample": 2,
+      "scalar_ns": 156669250,
+      "batch_ns": 106209208,
+      "scalar_peak_bytes": 10436,
+      "batch_peak_bytes": 10436
+    },
+    {
+      "case": "wide_window_updates",
+      "rows": 512,
+      "sample": 0,
+      "row_ns": 87925375,
+      "cell_ns": 9053042,
+      "row_written_bytes": 457200,
+      "cell_written_bytes": 80896
+    },
+    {
+      "case": "wide_window_updates",
+      "rows": 512,
+      "sample": 1,
+      "row_ns": 90574750,
+      "cell_ns": 11883375,
+      "row_written_bytes": 457200,
+      "cell_written_bytes": 80896
+    },
+    {
+      "case": "wide_window_updates",
+      "rows": 512,
+      "sample": 2,
+      "row_ns": 93349333,
+      "cell_ns": 12786791,
+      "row_written_bytes": 457200,
+      "cell_written_bytes": 80896
+    },
+    {
+      "case": "wide_window_updates",
+      "rows": 4096,
+      "sample": 0,
+      "row_ns": 729364208,
+      "cell_ns": 77527208,
+      "row_written_bytes": 3739848,
+      "cell_written_bytes": 675840
+    },
+    {
+      "case": "wide_window_updates",
+      "rows": 4096,
+      "sample": 1,
+      "row_ns": 762349458,
+      "cell_ns": 87226875,
+      "row_written_bytes": 3739848,
+      "cell_written_bytes": 675840
+    },
+    {
+      "case": "wide_window_updates",
+      "rows": 4096,
+      "sample": 2,
+      "row_ns": 773377083,
+      "cell_ns": 76883583,
+      "row_written_bytes": 3739848,
+      "cell_written_bytes": 675840
+    },
+    {
+      "case": "partitioned_join",
+      "rows_per_side": 1024,
+      "chained_ns": 65565416,
+      "partitioned_ns": 39876375,
+      "chained_first_row_ns": 15192583,
+      "partitioned_first_row_ns": 14387958,
+      "chained_peak_bytes": 54668,
+      "partitioned_peak_bytes": 100372,
+      "chained_written_bytes": 70656,
+      "partitioned_written_bytes": 54687,
+      "chained_reads": 2118,
+      "partitioned_reads": 69,
+      "chained_writes": 18,
+      "partitioned_writes": 69,
+      "chained_allocations": 5693,
+      "partitioned_allocations": 4979,
+      "filtered_probes": 510
+    },
+    {
+      "case": "partitioned_join",
+      "rows_per_side": 4096,
+      "chained_ns": 507399708,
+      "partitioned_ns": 141303583,
+      "chained_first_row_ns": 47574833,
+      "partitioned_first_row_ns": 48824125,
+      "chained_peak_bytes": 54668,
+      "partitioned_peak_bytes": 100020,
+      "chained_written_bytes": 282624,
+      "partitioned_written_bytes": 218529,
+      "chained_reads": 21082,
+      "partitioned_reads": 237,
+      "chained_writes": 70,
+      "partitioned_writes": 237,
+      "chained_allocations": 46693,
+      "partitioned_allocations": 18637,
+      "filtered_probes": 2006
+    },
+    {
+      "case": "external_sort",
+      "rows": 2048,
+      "unbuffered_ns": 242896292,
+      "buffered_ns": 312092541,
+      "unbuffered_first_row_ns": 202007209,
+      "buffered_first_row_ns": 273511500,
+      "unbuffered_peak_bytes": 15920,
+      "buffered_peak_bytes": 90641,
+      "spilled_bytes": 3088150,
+      "unbuffered_reads": 18408,
+      "buffered_reads": 899,
+      "unbuffered_writes": 12272,
+      "buffered_writes": 899,
+      "unbuffered_allocations": 18145,
+      "buffered_allocations": 25447,
+      "unbuffered_reallocations": 963,
+      "buffered_reallocations": 963
+    },
+    {
+      "case": "external_sort",
+      "rows": 8192,
+      "unbuffered_ns": 1005230750,
+      "buffered_ns": 1476081708,
+      "unbuffered_first_row_ns": 848437083,
+      "buffered_first_row_ns": 1328137875,
+      "unbuffered_peak_bytes": 15926,
+      "buffered_peak_bytes": 107249,
+      "spilled_bytes": 15964000,
+      "unbuffered_reads": 80160,
+      "buffered_reads": 4524,
+      "unbuffered_writes": 53440,
+      "buffered_writes": 4524,
+      "unbuffered_allocations": 76911,
+      "buffered_allocations": 124015,
+      "unbuffered_reallocations": 3854,
+      "buffered_reallocations": 3854
+    }
+  ]
+}

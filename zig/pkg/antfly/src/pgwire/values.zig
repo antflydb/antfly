@@ -194,6 +194,70 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
     };
 }
 
+/// Append a cell directly to a reusable DataRow buffer. Primitive and JSON
+/// values require no intermediate encoded allocation.
+pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
+    if (format > 1) return error.UnsupportedResultFormat;
+    if (format == 0) {
+        switch (kind) {
+            .boolean => {
+                if (value != .bool) return error.InvalidResult;
+                try writer.writeAll(if (value.bool) "t" else "f");
+            },
+            .integer => try writer.print("{d}", .{try integer(value)}),
+            .datetime => {
+                const text = try timestampText(a, value);
+                defer a.free(text);
+                try writer.writeAll(text);
+            },
+            .uuid => {
+                if (value != .string) return error.InvalidResult;
+                const canonical = @import("../common/uuid.zig").format(@import("../common/uuid.zig").parse(value.string) catch return error.InvalidResult);
+                try writer.writeAll(&canonical);
+            },
+            .json => try std.json.Stringify.value(value, .{}, writer),
+            else => if (value == .string) try writer.writeAll(value.string) else try std.json.Stringify.value(value, .{}, writer),
+        }
+        return;
+    }
+    switch (kind) {
+        .boolean => {
+            if (value != .bool) return error.InvalidResult;
+            try writer.writeByte(@intFromBool(value.bool));
+        },
+        .integer => try writer.writeInt(i64, try integer(value), .big),
+        .number => {
+            const number: f64 = switch (value) {
+                .float => |n| n,
+                .integer => |n| @floatFromInt(n),
+                .number_string, .string => |n| std.fmt.parseFloat(f64, n) catch return error.InvalidResult,
+                else => return error.InvalidResult,
+            };
+            if (!std.math.isFinite(number)) return error.InvalidResult;
+            try writer.writeInt(u64, @bitCast(number), .big);
+        },
+        .datetime => {
+            const nanos = try timestampNanos(value);
+            if (@mod(nanos, 1000) != 0) return error.UnsupportedResultPrecision;
+            try writer.writeInt(i64, @as(i64, @intCast(nanos / 1000)) - 946684800000000, .big);
+        },
+        .json => {
+            try writer.writeByte(1);
+            try std.json.Stringify.value(value, .{}, writer);
+        },
+        .uuid => {
+            if (value != .string) return error.InvalidResult;
+            const parsed = @import("../common/uuid.zig").parse(value.string) catch return error.InvalidResult;
+            try writer.writeAll(&parsed);
+        },
+        .string => {
+            if (value != .string) return error.InvalidResult;
+            try writer.writeAll(value.string);
+        },
+        .unknown => if (value == .string) try writer.writeAll(value.string) else try std.json.Stringify.value(value, .{}, writer),
+    }
+}
+
 fn encodeInteger(alloc: std.mem.Allocator, value: i64) ![]const u8 {
     const bytes = try alloc.alloc(u8, 8);
     std.mem.writeInt(i64, bytes[0..8], value, .big);
@@ -293,4 +357,25 @@ test "pgwire timestamp conversion uses postgres epoch and refuses precision loss
     const high_binary = try encode(alloc, .datetime, 1, high);
     try std.testing.expectEqual(high_nanos, try timestampNanos(try decode(alloc, 1184, 1, high_binary)));
     try std.testing.expectError(error.UnsupportedResultPrecision, encode(alloc, .datetime, 1, try timestampValue(alloc, std.math.maxInt(u64))));
+}
+
+test "pgwire direct cell encoding matches allocated text and binary formats" {
+    const a = std.testing.allocator;
+    const Case = struct { kind: Type, value: std.json.Value };
+    for ([_]Case{
+        .{ .kind = .integer, .value = .{ .integer = 9007199254740993 } },
+        .{ .kind = .number, .value = .{ .number_string = "1.0000000000000001" } },
+        .{ .kind = .boolean, .value = .{ .bool = false } },
+        .{ .kind = .string, .value = .{ .string = "native row" } },
+        .{ .kind = .json, .value = .null },
+        .{ .kind = .uuid, .value = .{ .string = "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11" } },
+        .{ .kind = .datetime, .value = .{ .integer = 946684800123456000 } },
+    }) |case| for ([_]u16{ 0, 1 }) |format| {
+        const expected = try encode(a, case.kind, format, case.value);
+        defer a.free(expected);
+        var out = std.Io.Writer.Allocating.init(a);
+        defer out.deinit();
+        try encodeInto(a, &out.writer, case.kind, format, case.value);
+        try std.testing.expectEqualSlices(u8, expected, out.written());
+    };
 }

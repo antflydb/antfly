@@ -96,3 +96,8 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+test {
+    _ = @import("serverless/query/lake_serving.zig");
+    _ = @import("serverless/external_source/schema_binding.zig");
+}

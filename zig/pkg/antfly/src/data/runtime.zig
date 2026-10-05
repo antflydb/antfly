@@ -12952,7 +12952,12 @@ pub const DataServer = struct {
                 if (req.restore_staging_scope) |scope| {
                     if (comptime linked_storage) {
                         const owner_source = try self.ensureKernelOwnerSource();
-                        restore_owner_descriptor = (try owner_source.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
+                        // Metadata publication can replace the resident hidden owner
+                        // between control preparation and proposal admission. Recover
+                        // its exact immutable plan instead of treating cache eviction
+                        // as a changed staging scope.
+                        const restore_io = self.dataRaftIo();
+                        restore_owner_descriptor = try owner_source.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, antfly.public_api.ProvisionedKernelOwnerSource.restoreDescriptorUseForBatch(req), .{ .deadline_ns = deadline_ns, .deadline_io = if (restore_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null, .cancellation = route.visibility_cancellation });
                     } else try admission_source.validateRestoreStagingScope(alloc, table_name, group_id, scope);
                 } else if (route.write_route_fence) |fence| {
                     // Preserve the remaining duration in the catalog's own
@@ -37777,6 +37782,163 @@ fn consumerTests() type {
             try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
             try std.testing.expectEqual(antfly.raft.host.HostedReplicaStatus.active, server.data_raft.?.host.status(78));
             _ = try std.Io.Dir.cwd().statFile(io_impl.io(), hidden_root, .{ .follow_symlinks = false });
+        }
+
+        test "restore publication recovers a cold owner through Raft admission" {
+            if (comptime !linked_storage) return error.SkipZigTest;
+            const alloc = std.testing.allocator;
+
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+
+            const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-cold-restore-admission", .{tmp.sub_path});
+            defer alloc.free(replica_root);
+
+            const Metadata = struct {
+                calls: usize = 0,
+                fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    return error.Timeout;
+                }
+            };
+            var metadata: Metadata = .{};
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &metadata, .vtable = &.{ .execute = Metadata.execute } };
+            var server = try DataServer.initFromMetadataApiUrl(alloc, .{
+                .metadata_request_executors = &.{executor},
+                .replica_root_dir = replica_root,
+                .store_registration = .{
+                    .node_id = 1,
+                    .store_id = 1,
+                    .api_url = "http://127.0.0.1:1",
+                },
+            }, "http://127.0.0.1:2");
+            defer server.deinit();
+
+            const snapshot = antfly.metadata_api.AdminSnapshot{
+                .status = .{ .metadata_group_id = 9, .metadata_epoch = 17, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = 77,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                    .store_id = 1,
+                    .node_id = 1,
+                    .role = "data",
+                    .live = true,
+                    .health_class = "healthy",
+                    .api_url = "http://127.0.0.1:1",
+                    .raft_url = "http://127.0.0.1:2",
+                }})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                    .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 1 },
+                    .store_id = 1,
+                    .peer_node_ids = &.{1},
+                }})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+            try server.syncDataRaftFromSnapshot(&snapshot, .linearizable);
+            try std.testing.expect(server.localDataRaftLeaderReady(77));
+
+            const Source = antfly.public_api.ProvisionedKernelOwnerSource;
+            const staging = @import("../storage/db/restore_staging_contract.zig");
+            const tables = @import("../api/tables.zig");
+            var parsed_schema = try tables.parseValidatedTableSchema(alloc, "{}");
+            defer parsed_schema.deinit(alloc);
+            const schema = try tables.deriveRuntimeTableSchema(alloc, parsed_schema);
+            defer @import("../storage/schema.zig").freeSchema(alloc, schema);
+            const encoded_schema = try @import("../storage/schema.zig").serializeSchema(alloc, schema);
+            defer alloc.free(encoded_schema);
+            const scope: staging.Scope = .{
+                .plan_id = @splat(1),
+                .plan_digest = @splat(2),
+                .source_artifact_digest = @splat(3),
+                .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 },
+                .target_namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+                .target_schema_digest = staging.digest(encoded_schema),
+            };
+            const bootstrap: staging.OwnerBootstrap = .{
+                .scope = scope,
+                .table_name = "docs",
+                .schema_json = "{}",
+                .indexes_json = "{}",
+                .byte_range = .{ .start = "", .end = "" },
+            };
+            const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
+            defer alloc.free(bootstrap_json);
+            const descriptor: kernel_owner_descriptor.Descriptor = .{
+                .lsm_root_generation = antfly.public_api.table_reads.backend_current_root_generation,
+                .identity = .{ .table_id = 7, .shard_id = 77, .range_id = 77 },
+                .schema_json = "{}",
+                .indexes_json = "{}",
+                .restore_bootstrap_json = bootstrap_json,
+            };
+            const Probe = struct {
+                owners: *Source,
+                descriptor: kernel_owner_descriptor.Descriptor,
+                scope: staging.Scope,
+                evicted: bool = false,
+                recovered: usize = 0,
+                accepted_index: ?u64 = null,
+                fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try context.ensureActive();
+                    try std.testing.expect(self.evicted);
+                    try std.testing.expectEqual(@as(u64, 77), group_id);
+                    try std.testing.expectEqualStrings("docs", name);
+                    try std.testing.expectEqual(self.scope.digest(), digest);
+                    try std.testing.expectEqual(self.scope.plan_id, plan_id);
+                    // Published metadata permits resolution, not a new import.
+                    try std.testing.expectEqual(Source.RestoreDescriptorUse.resolve, use);
+                    self.recovered += 1;
+                    var owned = self.descriptor;
+                    owned.schema_json = try allocator.dupe(u8, owned.schema_json);
+                    errdefer allocator.free(owned.schema_json);
+                    owned.indexes_json = try allocator.dupe(u8, owned.indexes_json);
+                    errdefer allocator.free(owned.indexes_json);
+                    owned.restore_bootstrap_json = try allocator.dupe(u8, owned.restore_bootstrap_json);
+                    return .{ .descriptor = owned };
+                }
+                fn reach(ptr: *anyopaque, event: DataRequestLifecycleEvent) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (event.phase == .routing_started) {
+                        try std.testing.expectEqual(@as(usize, 1), self.owners.retireTable("docs"));
+                        try std.testing.expect((try self.owners.cachedRestoreDescriptor(std.testing.allocator, 77, "docs", self.scope.digest())) == null);
+                        self.evicted = true;
+                    } else if (event.phase == .proposal_accepted) {
+                        self.accepted_index = event.log_index;
+                        // Stop after real proposal acceptance: apply/publication
+                        // semantics are covered by the compiled owner regression.
+                        return error.TestAdmissionObserved;
+                    }
+                }
+            };
+            const owners = try server.ensureKernelOwnerSource();
+            try owners.primeRestoreOwner(77, "docs", descriptor);
+            var warm = (try owners.cachedRestoreDescriptor(alloc, 77, "docs", scope.digest())) orelse return error.TestUnexpectedResult;
+            warm.deinit(alloc);
+            var probe = Probe{ .owners = owners, .descriptor = descriptor, .scope = scope };
+            _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &probe, .recover_fn = Probe.recover });
+            server.data_request_lifecycle_hook = .{ .ptr = &probe, .reach_fn = Probe.reach };
+            defer server.data_request_lifecycle_hook = null;
+            try std.testing.expectError(error.RaftBatchWriteOutcomeUnknown, server.proposeRaftBatchGroup(alloc, 77, "docs", .{
+                .restore_staging_scope = scope.digest(),
+                .restore_staging_plan_id = scope.plan_id,
+                .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } },
+                .sync_level = .propose,
+            }, .{ .discovery = .cached, .allow_remote_forward = false }));
+            try std.testing.expect(probe.evicted);
+            try std.testing.expectEqual(@as(usize, 1), probe.recovered);
+            try std.testing.expect((probe.accepted_index orelse return error.TestUnexpectedResult) > 0);
+            try std.testing.expectEqual(@as(usize, 0), metadata.calls);
         }
 
         test "local raft admission leaves global metadata refresh to control" {
