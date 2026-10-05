@@ -139,6 +139,7 @@ fn configureNativeTool(
 }
 
 pub fn build(b: *std.Build) void {
+    defer @import("antfly_platform").finalizeMacosSdk(b);
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's

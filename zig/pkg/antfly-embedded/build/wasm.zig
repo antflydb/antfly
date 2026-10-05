@@ -103,7 +103,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
-    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
+    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod, wasm_platform_mod);
     const wasm_sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, wasm_protobuf_mod);
     wasm_google_mod.addImport("httpx", httpx_mod);
     wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);

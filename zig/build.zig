@@ -74,6 +74,7 @@ pub const Artifacts = struct {
 /// Compose owners once. Consumers of this constructor can inspect the same
 /// artifacts used by public targets without maintaining a second build graph.
 pub fn create(b: *std.Build) ?Artifacts {
+    defer @import("antfly_platform").finalizeMacosSdk(b);
     defer @import("pkg/antfly-embedded/build/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b) orelse return null;
     const api_bench_standalone = shared.api_bench_standalone;
@@ -479,6 +480,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .hash_mod = hash_mod,
         .pdf_standard_fonts_mod = pdf_standard_fonts_mod,
         .font_mod = font_mod,
+        .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
@@ -515,7 +517,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = pdf_bench_optimize,
     });
     const pdf_bench_fonts = @import("build_support/antfly/fonts.zig").create(b, target, pdf_bench_optimize);
-    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts);
+    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts, platform_mod);
     const pdf_bench = pdf_build.addBenchmark(b, .{
         .root = b.path("lib/pdf"),
         .target = target,

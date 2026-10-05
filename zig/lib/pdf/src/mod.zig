@@ -3087,9 +3087,9 @@ test "native backend renders embedded fixture pdf first page png" {
 test "parsed rendering releases reader-owned runs with the reader allocator" {
     const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
 
-    var reader_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    var reader_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x50444601 });
     defer std.debug.assert(reader_gpa.deinit() == 0);
-    var output_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    var output_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x50444602 });
     defer std.debug.assert(output_gpa.deinit() == 0);
 
     var parsed = try reader.Reader.init(reader_gpa.allocator(), fixture);

@@ -351,6 +351,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     capi_conformance_mod.link_libc = true;
     const capi_header = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
         .c_source_file = b.path("pkg/antfly-embedded/include/antfly.h"),
         .target = target,
         .optimize = optimize,

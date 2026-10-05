@@ -821,7 +821,9 @@ This work is complete when:
 For cacheable native configuration, pass `-Dmacos-sdk=/absolute/path/to/MacOSX.sdk`
 (or set `SDK_PATH`). The shared SDK helper tracks the selected directory metadata,
 so replacing that SDK invalidates configuration. The CLI option takes precedence
-over `SDK_PATH`. All storage, inference, and finetuning owners use this helper.
+over `SDK_PATH`. A shared libc configuration makes this SDK authoritative for
+C compilation, linking, and C translation, including generated host tools. All
+storage, inference, and finetuning owners use this helper.
 Automatic `xcrun` discovery remains available and deliberately disables configure
 caching because Xcode selection is an external input. Pin an SDK for repeated
 local or CI builds; keep automatic discovery when following `xcode-select`.

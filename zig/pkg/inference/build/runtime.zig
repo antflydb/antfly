@@ -468,6 +468,7 @@ fn createCBindings(
 
     const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
     const onnx = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
         .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
         .target = target,
         .optimize = .debug,
@@ -475,6 +476,7 @@ fn createCBindings(
     });
     onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
     const ortgenai = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
         .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
         .target = target,
         .optimize = .debug,

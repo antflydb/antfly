@@ -658,7 +658,7 @@ pub fn create(b: *std.Build) ?Shared {
         .target = target,
         .optimize = optimize,
     });
-    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, hash_mod, font_mod, pdf_standard_fonts_mod);
+    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, hash_mod, font_mod, pdf_standard_fonts_mod, platform_mod);
 
     const tokenizer_build = @import("../../lib/tokenizer/build_support.zig");
     const sentencepiece_proto_source = tokenizer_build.generateSentencePieceProto(b, protobuf_dep.artifact("protoc-zig"), b.path("lib/tokenizer"));

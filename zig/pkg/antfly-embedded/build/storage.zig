@@ -98,6 +98,7 @@ pub fn makeLmdbEngineModule(
     mod.addOptions("build_options", build_options);
     mod.addImport("antfly_platform", platform_mod);
     const bindings = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
         .c_source_file = b.path("lib/lmdb/lmdb.h"),
         .target = target,
         .optimize = optimize,
