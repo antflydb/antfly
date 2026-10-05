@@ -235,12 +235,77 @@ def server_source(relative: str) -> bool:
     )
 
 
+def check_local_observation_contracts(relative: str, source: str) -> None:
+    """Keep routing identity and destination policy out of local event/planning ports."""
+    production = production_source(source)
+    masked = mask_literals(production)
+    if relative in {"storage/db/db.zig", "storage/db/query_visibility.zig"}:
+        hook = re.search(
+            r"\bpub\s+const\s+QueryVisibilityHook\s*=\s*struct\s*\{(.*?)\n\};",
+            masked,
+            re.DOTALL,
+        )
+        if hook and {"table_name", "group_id", "DB"}.intersection(
+            re.findall(r"\b\w+\b", hook[1])
+        ):
+            raise ValueError(
+                f"{relative} exposes server routing in local visibility hook"
+            )
+    if relative == "storage/db/document_child_range_effects.zig":
+        if re.search(r"\broute_status\b", masked) or any(
+            match[0] == '"remote_committed"' for match in LITERALS.finditer(production)
+        ):
+            raise ValueError(
+                f"{relative} interprets server child-range destination policy"
+            )
+
+
 def check_replication_contract(relative: str, source: str) -> None:
     """Reject server policy leaking back through the engine's borrowed ports."""
+    check_local_observation_contracts(relative, source)
     if relative not in {
         "storage/db/replication_contract.zig",
         "storage/db/commit_integration.zig",
         "storage/db/db.zig",
+        "storage/db/document_child_range_effects.zig",
+        "storage/db/document_child_range_outbox.zig",
+        "storage/db/portable_activation_recovery.zig",
+        "storage/db/quarantine_recovery.zig",
+        "storage/db/independent_maintenance.zig",
+        "storage/db/index_repair_scheduler.zig",
+        "storage/db/graph_cleanup_owner.zig",
+        "storage/db/native_projection_owner.zig",
+        "storage/db/runtime_restart_owner.zig",
+        "storage/db/cleanup_job_owner.zig",
+        "storage/db/query_visibility.zig",
+        "storage/db/coalesced_job_admission.zig",
+        "storage/db/dense_publication_admission.zig",
+        "storage/db/local_runtime_owner.zig",
+        "storage/db/embedding_activity_cache.zig",
+        "storage/db/source_pin_cleanup_owner.zig",
+        "storage/db/applied_sequence_coalescer.zig",
+        "storage/db/bulk_ingest_session.zig",
+        "storage/db/document_collectors.zig",
+        "storage/db/owned_keys.zig",
+        "storage/db/graph_field_plan.zig",
+        "storage/db/replay_vector_collectors.zig",
+        "storage/db/relational_read_session.zig",
+        "storage/db/read_projection.zig",
+        "storage/db/local_mutation.zig",
+        "storage/db/execution_resources.zig",
+        "storage/db/mutation_preparation.zig",
+        "storage/db/mutation_commit.zig",
+        "storage/db/mutation_materialization.zig",
+        "storage/db/result_collectors.zig",
+        "storage/db/materialized_sources.zig",
+        "storage/db/graph_restore_materialization.zig",
+        "storage/db/status_projection.zig",
+        "storage/db/managed_admission_owner.zig",
+        "storage/db/publication_recovery_owner.zig",
+        "storage/db/target_advance_tracker.zig",
+        "storage/db/schema_reconcile_owner.zig",
+        "storage/db/dense_catch_up_session_owner.zig",
+        "storage/db/enrichment_runtime_owner.zig",
     }:
         return
     source = mask_literals(production_source(source))
@@ -261,6 +326,9 @@ def check_replication_contract(relative: str, source: str) -> None:
         "raft_applied_entry_marker",
         "HAMirrorUnavailable",
         "primary_ha",
+        "getGroupCreatedAtMillis",
+        "ensureGroupCreatedAtMillis",
+        "groupCreatedAtMetadataKeyAlloc",
     }
     found = forbidden.intersection(re.findall(r"\b\w+\b", source))
     if found:
