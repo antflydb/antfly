@@ -41,7 +41,7 @@ const search_sources = @import("../serverless/search_sources.zig");
 const serverless_http_server = @import("../serverless_http_server.zig");
 const serverless_http_client = @import("../serverless_http_client.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
@@ -1027,7 +1027,7 @@ pub const Scenario = struct {
 };
 
 test "serverless workflow service rates compose and heal across publish and compaction" {
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     const fixture = try Scenario.Fixture.init(alloc);

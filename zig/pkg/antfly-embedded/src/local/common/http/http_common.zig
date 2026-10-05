@@ -411,10 +411,10 @@ test "http common types compile" {
 }
 
 test "http response uses its owning allocator" {
-    var owner_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(owner_gpa.deinit() == .ok);
-    var fallback_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(fallback_gpa.deinit() == .ok);
+    var owner_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.debug.assert(owner_gpa.deinit() == 0);
+    var fallback_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.debug.assert(fallback_gpa.deinit() == 0);
 
     const owner = owner_gpa.allocator();
     const headers = try owner.alloc(Header, 1);

@@ -15142,12 +15142,12 @@ fn implementationTests() type {
         }
 
         test "lsm backend shared cache owns loaded table allocations" {
-            var cache_gpa: std.heap.DebugAllocator(.{}) = .init;
-            defer std.debug.assert(cache_gpa.deinit() == .ok);
+            var cache_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+            defer std.debug.assert(cache_gpa.deinit() == 0);
             const cache_alloc = cache_gpa.allocator();
 
-            var backend_gpa: std.heap.DebugAllocator(.{}) = .init;
-            defer std.debug.assert(backend_gpa.deinit() == .ok);
+            var backend_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+            defer std.debug.assert(backend_gpa.deinit() == 0);
             const backend_alloc = backend_gpa.allocator();
 
             const test_alloc = std.testing.allocator;

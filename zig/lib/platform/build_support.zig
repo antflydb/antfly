@@ -183,12 +183,28 @@ pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, scr
 
 pub fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
-        // xcrun observes the selected Xcode installation outside configure inputs.
+    const sdk_root = macosSdkRoot(b, target) orelse return;
+    module.addSystemIncludePath(sdk_root.path(b, "usr/include"));
+    module.addLibraryPath(sdk_root.path(b, "usr/lib"));
+    module.addFrameworkPath(sdk_root.path(b, "System/Library/Frameworks"));
+}
+
+fn macosSdkRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    const key = "antfly_macos_sdk_root";
+    if (b.named_lazy_paths.get(key)) |root| return root;
+    // Declare once even when discovery fails and another owner retries it.
+    const explicit = if (!b.available_options_map.contains("macos-sdk"))
+        b.option([]const u8, "macos-sdk", "Explicit macOS SDK root (otherwise SDK_PATH or xcrun)")
+    else
+        null;
+    const sdk_root = explicit orelse b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // Automatic selection depends on Xcode's external configuration. Keep
+        // rediscovering it; explicit SDK inputs can reuse configure results.
         b.graph.poisonCache();
-        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return null;
     };
-    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
-    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
+    const root = b.graph.cwdRelativePath(sdk_root);
+    b.dependOnDirectoryMetadata(root);
+    b.addNamedLazyPath(key, root);
+    return root;
 }

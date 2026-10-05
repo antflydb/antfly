@@ -1716,6 +1716,71 @@ pub fn build(b: *std.Build) void {
                 self.assertEqual(result.returncode, 0, output)
                 self.assertIn(f"SDK_INCLUDE {path}/usr/include", output)
 
+    def test_explicit_sdk_reuses_pure_configuration_and_tracks_directory_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copyfile(
+                ZIG_ROOT / "lib/platform/build_support.zig",
+                root / "platform_build_support.zig",
+            )
+            (root / "build.zig").write_text(
+                """const std = @import("std");
+const support = @import("platform_build_support.zig");
+pub fn build(b: *std.Build) void {
+    std.debug.print("SDK_CONFIGURED\\n", .{});
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const module = b.createModule(.{ .target = target });
+    support.addMacosSdkPaths(b, module, target);
+    support.addMacosSdkPaths(b, module, target);
+    const run = b.addSystemCommand(&.{"/bin/echo", "SDK_INCLUDE"});
+    run.addDirectoryArg(module.include_dirs.items[0].path_system);
+    b.default_step.dependOn(&run.step);
+}
+"""
+            )
+            sdk = root / "explicit-sdk"
+            (sdk / "usr/include").mkdir(parents=True)
+            env = dict(os.environ)
+            # CLI selection wins over an environment override.
+            env["SDK_PATH"] = (
+                subprocess.check_output(
+                    ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True
+                ).strip()
+                if os.uname().sysname == "Darwin"
+                else str(root / "unused-sdk")
+            )
+            command = [
+                "zig",
+                "build",
+                f"-Dmacos-sdk={sdk}",
+                "--cache-poison=disallowed",
+                "--summary",
+                "all",
+                "--color",
+                "off",
+            ]
+
+            def build():
+                result = subprocess.run(
+                    command,
+                    cwd=root,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn(f"SDK_INCLUDE {sdk}/usr/include", output)
+                return output
+
+            self.assertIn("SDK_CONFIGURED", build())
+            self.assertNotIn("SDK_CONFIGURED", build())
+            # In-place SDK replacement must invalidate configuration too.
+            before = sdk.stat()
+            os.utime(sdk, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+            self.assertIn("SDK_CONFIGURED", build())
+
 
 if __name__ == "__main__":
     unittest.main()

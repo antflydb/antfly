@@ -15,7 +15,7 @@
 //! The browser runtime owns one target/profile and never receives native modules.
 const std = @import("std");
 const storage_build = @import("storage.zig");
-const platform_build = @import("../../../lib/platform/build_support.zig");
+const platform_build = @import("antfly_platform");
 const image_build = @import("../../../lib/image/build_support.zig");
 const pdf_build = @import("../../../lib/pdf/build_support.zig");
 const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");

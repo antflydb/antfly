@@ -13,7 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const addMacosSdkPaths = @import("../platform/build_support.zig").addMacosSdkPaths;
+const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 
 pub const AddTestsOptions = struct {
     root: std.Build.LazyPath,

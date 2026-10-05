@@ -17,7 +17,7 @@ const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedd
 const provider_limits = @import("antfly_local_sources").common_provider_limits;
 const reranking = @import("../reranking/mod.zig");
 
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 const valid_remote_generation =
     "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"remote-result\"}}]}";
@@ -150,7 +150,7 @@ pub const Scenario = struct {
             errdefer owner_allocator.destroy(self);
             self.* = .{
                 .owner_allocator = owner_allocator,
-                .fixture_allocator = .init,
+                .fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 }),
                 .allocator = undefined,
                 .vopr_io = undefined,
                 .http = undefined,
@@ -181,7 +181,7 @@ pub const Scenario = struct {
             self.limits.deinit();
             self.vopr_io.deinit();
             const owner_allocator = self.owner_allocator;
-            std.debug.assert(self.fixture_allocator.deinit() == .ok);
+            std.debug.assert(self.fixture_allocator.deinit() == 0);
             owner_allocator.destroy(self);
         }
 
