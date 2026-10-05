@@ -607,7 +607,10 @@ pub const Stream = struct {
                     // Revalidate delete object versions even on an index hit.
                     // A replaced object never inherits a cached equality set.
                     var versions = std.crypto.hash.sha2.Sha256.init(.{});
-                    const index_identity = try std.json.Stringify.valueAlloc(self.alloc, .{ .deletes = delete_plan, .inventory = self.source.inventory }, .{});
+                    const index_identity = if (self.source.plan_identity) |plan_key|
+                        try std.json.Stringify.valueAlloc(self.alloc, plan_key, .{})
+                    else
+                        try std.json.Stringify.valueAlloc(self.alloc, .{ .deletes = delete_plan, .inventory = self.source.inventory }, .{});
                     defer self.alloc.free(index_identity);
                     hash.update(index_identity);
                     var cacheable = true;
@@ -628,7 +631,7 @@ pub const Stream = struct {
                     const lease = cached orelse blk: {
                         const owned = try reader.cache.decoded.create(64 * 1024 * 1024);
                         errdefer owned.release();
-                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.create(owned.item.arena.allocator(), request) };
+                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.create(owned.item.budget.allocator(), request) };
                         try self.context.ensureActive();
                         if (cacheable and std.mem.eql(u8, &version_key, &owned.item.payload.prepared.object_versions)) reader.cache.decoded.publish(key, owned);
                         break :blk owned;

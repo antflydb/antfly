@@ -345,6 +345,7 @@ pub const ServingSource = struct {
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
     iceberg_schema: ?@import("lake_schema.zig").Detected = null,
     partition_rules: ?@import("lake_partition_pruning.zig").Rules = null,
+    plan_identity: ?[32]u8 = null,
     plan_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     delete_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     lazy_versions: bool = false,
@@ -374,6 +375,7 @@ pub const ServingSource = struct {
         errdefer if (iceberg_schema) |*value| value.deinit();
         var partition_rules: ?@import("lake_partition_pruning.zig").Rules = null;
         errdefer if (partition_rules) |*rules| rules.deinit();
+        var plan_identity: ?[32]u8 = null;
         var plan_lease: ?@import("lake_decoded_cache.zig").Lease = null;
         var deletes: ?serverless_query.LakeIcebergDeletePlan = null;
         errdefer if (plan_lease == null) if (deletes) |*value| value.deinit(alloc);
@@ -403,10 +405,11 @@ pub const ServingSource = struct {
                     hash.update("iceberg-plan-v1");
                     @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
                     const key = hash.finalResult();
+                    plan_identity = key;
                     const lease = shared.decoded.lookup(key) orelse blk_lease: {
                         const owned = try shared.decoded.create(64 * 1024 * 1024);
                         errdefer owned.release();
-                        owned.item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(owned.item.arena.allocator(), .{ .client = client, .source_id = binding.table_id, .metadata_uri = uri, .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() }, metadata_bytes) };
+                        owned.item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(owned.item.budget.allocator(), .{ .client = client, .source_id = binding.table_id, .metadata_uri = uri, .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() }, metadata_bytes) };
                         try context.ensureActive();
                         shared.decoded.publish(key, owned);
                         break :blk_lease owned;
@@ -455,7 +458,7 @@ pub const ServingSource = struct {
         const lazy_versions = cache != null and binding.format == .iceberg;
         const pinned_files: []bool = if (lazy_versions) try alloc.alloc(bool, inventory.files.len) else &.{};
         @memset(pinned_files, false);
-        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_lease = plan_lease, .lazy_versions = lazy_versions, .pinned_files = pinned_files };
+        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .lazy_versions = lazy_versions, .pinned_files = pinned_files };
     }
 
     fn cacheScope(alloc: std.mem.Allocator, store: object_store_support.OpenedObjectStore, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {

@@ -264,7 +264,8 @@ execution chunks scale with the statement memory quota. Native execution chunks
 have a 4,096-row upper bound, independent of response-page size.
 
 Large eligible lake scans can split into ordered ranges whose workers run the
-complete scan/filter/projection pipeline. Bounded typed queues apply backpressure;
+complete scan/filter/projection pipeline. Multi-file ranges discover footers
+lazily and own independent mutable object versions. Bounded typed queues apply backpressure;
 the consumer preserves source order and delivers valid rows before a later
 worker error. Early LIMIT completion and cancellation join workers before
 releasing the parent snapshot. OFFSET, small scans/budgets, external decision

@@ -24,7 +24,8 @@ pub const Item = struct {
     fn destroy(self: *Item, cache: *Cache) void {
         const parent = self.dependency;
         const a = self.budget.backing;
-        if (self.payload == .prepared) self.payload.prepared.destroy(self.arena.allocator());
+        if (self.payload == .prepared) self.payload.prepared.destroy(self.budget.allocator());
+        if (self.payload == .snapshot) self.payload.snapshot.deinit(self.budget.allocator());
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         a.destroy(self);

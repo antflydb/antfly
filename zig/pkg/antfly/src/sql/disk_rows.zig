@@ -185,6 +185,8 @@ pub const Rows = struct {
             self.invalidate(index);
             return;
         }
+        // Column inputs are immutable; updates require an explicit sidecar.
+        if (self.columnar != null) return error.InvalidSqlSpill;
         const before = try self.row(index);
         const values = try self.a.dupe(Datum, before.values);
         defer self.a.free(values);
@@ -371,6 +373,7 @@ test "SQL window column blocks skip wide payloads and preserve shared updates" {
     try rows.enableColumns();
     const payload: [8192]u8 = @splat('x');
     for (0..128) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(index) }), Datum.json(.{ .string = &payload }), .{} }, .keys = &.{}, .ordinal = index });
+    try std.testing.expectError(error.InvalidSqlSpill, rows.setCell(0, 0, Datum.json(.{ .integer = 99 })));
     try rows.enableColumnUpdates(2);
     const before = manager.read_bytes;
     for (0..128) |index| try std.testing.expectEqual(@as(i64, @intCast(index)), (try rows.cell(index, 0)).value.integer);

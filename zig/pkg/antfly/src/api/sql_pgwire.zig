@@ -1330,7 +1330,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             return cursor(ptr);
         }
         fn cursor(ptr: *anyopaque) catalog.Cursor {
-            return .{ .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .close = close };
+            return .{ .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .split_ordered = split, .close = close };
         }
         fn next(ptr: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1405,17 +1405,19 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         try std.testing.expectEqual(@as(?u64, 99), try child.count_rows.?(child.ptr));
     }
     const SplitSweep = struct {
-        fn run(a: std.mem.Allocator, parent: catalog.Cursor, fixture: *NativeCursor) !void {
+        fn run(a: std.mem.Allocator, parent: catalog.Cursor, fixture: *NativeCursor, ordered: bool) !void {
             const before_splits = fixture.splits;
             const before_closes = fixture.closes;
             defer std.debug.assert(fixture.closes - before_closes == 2 * (fixture.splits - before_splits));
-            const parts = (try parent.split_scan.?(parent.ptr, a, 2)).?;
+            const split = if (ordered) parent.split_ordered.? else parent.split_scan.?;
+            const parts = (try split(parent.ptr, a, 2)).?;
             defer a.free(parts);
             defer for (parts) |part| part.close(part.ptr);
             for (parts) |part| try std.testing.expectEqual(@as(?u64, 99), part.estimated_rows);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor });
+    try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor, false });
+    try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor, true });
     const closes_before_revoke = native_cursor.closes;
     try manager.removePermissionFromUser("alice", "docs", .table);
     {
@@ -1428,6 +1430,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try std.testing.expectError(error.Forbidden, cursor.count_rows.?(cursor.ptr));
     try std.testing.expectError(error.Forbidden, cursor.set_dynamic_filter.?(cursor.ptr, filter));
     try std.testing.expectError(error.Forbidden, cursor.split_scan.?(cursor.ptr, alloc, 2));
+    try std.testing.expectError(error.Forbidden, cursor.split_ordered.?(cursor.ptr, alloc, 2));
     for (children) |child| {
         try std.testing.expectError(error.Forbidden, child.next_columns.?(child.ptr, alloc, 1));
         try std.testing.expectError(error.Forbidden, child.count_rows.?(child.ptr));

@@ -199,6 +199,8 @@ const Owner = struct {
     context: operation.RequestContext,
     source: ?*serving.ServingSource = null,
     partition_source: ?*serving.ServingSource = null,
+    partition_versions_owned: bool = false,
+    borrowed_prepared: ?*@import("../serverless/query/lake_prepared_deletes.zig").Prepared = null,
     after: ?[]const u8 = null,
     before: ?[]const u8 = null,
     primary_key: ?[]const u8 = null,
@@ -284,7 +286,7 @@ const Owner = struct {
         if (self.stream.source.inventory.deleted_row_groups.len != 0) return null;
         if (self.stream.source.scanner.iceberg_delete_plan) |plan| if (plan.files.len != 0) return null;
         return self.stream.countAll() catch |err| switch (err) {
-            error.PreconditionFailed, error.VersionMismatch, error.ObjectNotFound => return error.ExternalLakeSnapshotMismatch,
+            error.PreconditionFailed, error.VersionMismatch, error.ObjectNotFound, error.FileNotFound => return error.ExternalLakeSnapshotMismatch,
             else => return err,
         };
     }
@@ -337,7 +339,7 @@ const Owner = struct {
         while (!self.exhausted) {
             if (self.batch == null or self.position == self.batch.?.rowCount()) {
                 self.batch = self.stream.next() catch |err| switch (err) {
-                    error.PreconditionFailed, error.VersionMismatch, error.ObjectNotFound => return error.ExternalLakeSnapshotMismatch,
+                    error.PreconditionFailed, error.VersionMismatch, error.ObjectNotFound, error.FileNotFound => return error.ExternalLakeSnapshotMismatch,
                     else => return err,
                 };
                 self.position = 0;
@@ -403,8 +405,12 @@ const Owner = struct {
         return .{ .rows = output, .owned_arena = arena, .after = page.after };
     }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
-        const children = (try splitScan(raw, a, maximum)) orelse return null;
         const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
+        // Multiple files form lazy contiguous ranges. Opening a later footer
+        // must not move its error ahead of an earlier successfully read prefix.
+        if (self.stream.files.len >= 2) return try self.splitChildren(a, @min(maximum, self.stream.files.len), true);
+        const children = (try splitScan(raw, a, maximum)) orelse return null;
         const work = self.stream.work.?;
         std.mem.sort(@import("../serverless/query/lake_stream.zig").ScanWork.Unit, work.units, self.stream.source.inventory, struct {
             fn less(inventory: @import("../serverless/external_source/types.zig").Inventory, left: @import("../serverless/query/lake_stream.zig").ScanWork.Unit, right: @import("../serverless/query/lake_stream.zig").ScanWork.Unit) bool {
@@ -427,6 +433,40 @@ const Owner = struct {
         if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
         const count = try self.stream.partitionCount(maximum);
         if (count < 2) return null;
+        return try self.splitChildren(a, count, false);
+    }
+    fn cloneVersionState(a: Allocator, source: *serving.ServingSource) !void {
+        const files = try a.alloc(@import("../serverless/external_source/types.zig").FileEntry, source.inventory.files.len);
+        var owned: usize = 0;
+        errdefer {
+            for (files[0..owned]) |file| {
+                a.free(file.etag);
+                a.free(file.version_id);
+            }
+            a.free(files);
+        }
+        for (source.inventory.files, files) |original, *file| {
+            file.* = original;
+            file.etag = try a.dupe(u8, original.etag);
+            errdefer a.free(file.etag);
+            file.version_id = try a.dupe(u8, original.version_id);
+            owned += 1;
+        }
+        const pinned = try a.dupe(bool, source.pinned_files);
+        source.inventory.files = files;
+        source.pinned_files = pinned;
+        source.alloc = a;
+        source.scanner.inventory = source.inventory;
+    }
+    fn freeVersionState(a: Allocator, source: *serving.ServingSource) void {
+        for (source.inventory.files) |file| {
+            a.free(file.etag);
+            a.free(file.version_id);
+        }
+        a.free(source.inventory.files);
+        a.free(source.pinned_files);
+    }
+    fn splitChildren(self: *Owner, a: Allocator, count: usize, ordered_files: bool) ![]catalog.Cursor {
         const cursors = try a.alloc(catalog.Cursor, count);
         errdefer a.free(cursors);
         var opened: usize = 0;
@@ -435,6 +475,8 @@ const Owner = struct {
             const source = try a.create(serving.ServingSource);
             errdefer a.destroy(source);
             source.* = self.stream.source.*;
+            if (ordered_files) try cloneVersionState(a, source);
+            errdefer if (ordered_files) freeVersionState(a, source);
             const parent_reader = source.scanner.shared_reader.?;
             const reader = try a.create(@import("../serverless/query/lake_serving_cache.zig").Reader);
             errdefer a.destroy(reader);
@@ -443,7 +485,9 @@ const Owner = struct {
             cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
             child.partition_source = source;
-            child.stream.work = self.stream.work;
+            child.partition_versions_owned = ordered_files;
+            child.borrowed_prepared = source.prepared_deletes;
+            if (!ordered_files) child.stream.work = self.stream.work;
             child.stream.partition_index = index;
             child.stream.partition_count = count;
             opened += 1;
@@ -456,6 +500,10 @@ const Owner = struct {
         self.mask_arena.deinit();
         self.stream.deinit();
         if (self.partition_source) |source| {
+            if (source.prepared_deletes != self.borrowed_prepared) {
+                if (source.delete_lease) |lease| lease.release() else if (source.prepared_deletes) |prepared| prepared.destroy(source.alloc);
+            }
+            if (self.partition_versions_owned) freeVersionState(self.alloc, source);
             self.alloc.destroy(source.scanner.shared_reader.?);
             self.alloc.destroy(source);
         }
@@ -1306,4 +1354,53 @@ test "lake SQL ordered splits preserve serial identity ordering" {
         if (page.after == null) break;
     };
     try std.testing.expectEqual(ids.items.len, seen);
+}
+
+test "lake SQL ordered file ranges defer later footer errors" {
+    const a = std.testing.allocator;
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 2, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 8 }, .{}, &lake.source);
+    defer parent.close(parent.ptr);
+    const owner: *Owner = @ptrCast(@alignCast(parent.ptr));
+    const later = lake.source.inventory.files[owner.stream.files[1]].object_uri;
+    const location = try @import("../serverless/query/lake_range_io.zig").objectLocationForUri(later);
+    var client = lake.memory.client();
+    try client.deleteObject(location.bucket, location.key, .{});
+    const children = (try parent.split_ordered.?(parent.ptr, a, 2)).?;
+    defer {
+        for (children) |child| child.close(child.ptr);
+        a.free(children);
+    }
+    const first = try children[0].next(children[0].ptr, a, 8);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 3), first.rows.len);
+    try std.testing.expectEqual(@as(i64, 1), first.rows[0].value.object.get("amount").?.integer);
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, children[1].next(children[1].ptr, a, 8));
+}
+
+test "lake SQL lazy ordered range ownership unwinds allocation failures" {
+    const a = std.testing.allocator;
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 2, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    const Sweep = struct {
+        fn run(failing: Allocator, source: *serving.ServingSource, table: catalog.Table) !void {
+            const parent = try openPinned(failing, table, .{ .fields = &.{"amount"}, .limit = 8 }, .{}, source);
+            defer parent.close(parent.ptr);
+            const children = (try parent.split_ordered.?(parent.ptr, failing, 2)).?;
+            defer {
+                for (children) |child| child.close(child.ptr);
+                failing.free(children);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Sweep.run, .{ &lake.source, lake.table });
 }
