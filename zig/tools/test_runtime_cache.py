@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import struct
@@ -404,21 +405,36 @@ class RuntimeCacheTest(unittest.TestCase):
                     )
 
     def test_runtime_owner_dependencies(self):
-        self.build("cache-probe")
-        self.assert_archives(self.build("cache-probe"))
-        for relative, consumers in (
+        owners = (
             ("zig/lib/mcp/src/root.zig", ("api_kernel",)),
             ("zig/lib/a2a/src/root.zig", ("api_kernel",)),
             (
                 "zig/lib/raft/src/root.zig",
                 ("distributed", "storage_kernel", "api_kernel"),
             ),
-        ):
+        )
+        for relative, _ in owners:
+            source = self.own(relative)
+            source.write_bytes(
+                source.read_bytes()
+                + b"\npub const cache_test_owner_revision: u8 = 1;\n"
+            )
+        before = self.probe(self.build("cache-probe"))
+        self.assert_archives(self.build("cache-probe"))
+        for relative, consumers in owners:
             with self.subTest(source=relative):
                 source = self.own(relative)
-                contents = source.read_bytes() + b"\n// owner dependency edit\n"
+                contents = source.read_bytes().replace(
+                    b"cache_test_owner_revision: u8 = 1;",
+                    b"cache_test_owner_revision: u8 = 2;",
+                )
+                self.assertNotEqual(contents, source.read_bytes())
                 source.write_bytes(contents)
-                self.assert_archives(self.build("cache-probe"), rebuilt=consumers)
+                changed = self.build("cache-probe")
+                self.assert_archives(changed, rebuilt=consumers)
+                after = self.probe(changed)
+                self.assertNotEqual(after, before)
+                before = after
                 self.assert_archives(self.build("cache-probe"))
                 source.unlink()
                 # Unrelated owners keep compiling without the dependency. Its
@@ -1627,6 +1643,70 @@ class RuntimeCacheTest(unittest.TestCase):
             digest.update(struct.pack("<Q", len(data)))
             digest.update(data)
         return digest.hexdigest()
+
+
+@unittest.skipUnless(os.name == "posix", "requires a POSIX xcrun fixture")
+class MacosSdkCacheTest(unittest.TestCase):
+    def test_sdk_discovery_tracks_selection_and_explicit_override(self):
+        # Isolate the shared helper: another owner poisoning the graph must not
+        # accidentally make this check pass.
+        sdk = None
+        if os.uname().sysname == "Darwin":
+            sdk = subprocess.check_output(
+                ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True
+            ).strip()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copyfile(
+                ZIG_ROOT / "lib/platform/build_support.zig",
+                root / "platform_build_support.zig",
+            )
+            (root / "build.zig").write_text(
+                """const std = @import("std");
+const support = @import("platform_build_support.zig");
+pub fn build(b: *std.Build) void {
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const module = b.createModule(.{ .target = target });
+    support.addMacosSdkPaths(b, module, target);
+    const run = b.addSystemCommand(&.{"/bin/echo", "SDK_INCLUDE"});
+    run.addDirectoryArg(module.include_dirs.items[0].path_system);
+    b.default_step.dependOn(&run.step);
+}
+"""
+            )
+            (root / "bin").mkdir()
+            xcrun = root / "bin/xcrun"
+            xcrun.write_text('#!/bin/sh\ncat "$ANTFLY_SDK_SELECTION"\n')
+            xcrun.chmod(0o755)
+            selection = root / "sdk-selection"
+            env = dict(
+                os.environ,
+                PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
+                ANTFLY_SDK_SELECTION=str(selection),
+            )
+            env.pop("SDK_PATH", None)
+            for name in ("sdk-a", "sdk-b", "sdk-explicit"):
+                path = root / name
+                if sdk is not None:
+                    # Zig's native macOS configurer also needs a valid SDK.
+                    path.symlink_to(sdk, target_is_directory=True)
+                else:
+                    (path / "usr/include").mkdir(parents=True)
+                if name == "sdk-explicit":
+                    env["SDK_PATH"] = str(path)
+                else:
+                    selection.write_text(str(path) + "\n")
+                result = subprocess.run(
+                    ["zig", "build", "--summary", "all", "--color", "off"],
+                    cwd=root,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn(f"SDK_INCLUDE {path}/usr/include", output)
 
 
 if __name__ == "__main__":

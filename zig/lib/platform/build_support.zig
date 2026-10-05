@@ -183,9 +183,11 @@ pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, scr
 
 pub fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
-        return;
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // xcrun observes the selected Xcode installation outside configure inputs.
+        b.graph.poisonCache();
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    };
     module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
     module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
     module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));

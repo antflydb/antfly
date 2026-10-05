@@ -32,6 +32,15 @@ pub const observability_probe_source =
     \\
 ;
 
+pub const owner_probe_source =
+    \\fn ownerRevision(comptime module: type) u64 {
+    \\    return if (@hasDecl(module, "cache_test_owner_revision"))
+    \\        module.cache_test_owner_revision
+    \\    else 0;
+    \\}
+    \\
+;
+
 pub fn check(artifact: *std.Build.Step.Compile) void {
     var seen = std.AutoHashMap(*std.Build.Module, void).init(artifact.step.owner.allocator);
     inspect(artifact, artifact.root_module, &seen);
