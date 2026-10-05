@@ -313,6 +313,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "serverless.manifest.codec.test.",
             "storage.resource_manager.test.",
             "storage.rowsource.external.test.",
+            "storage.rowsource.identity.test.",
+            "sql.disk_rows.test.",
         },
     },
     .{
@@ -535,7 +537,6 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "public-api-parity",
         .selection = "SQL API cross-table MERGE retains both source and target range proofs",
         .skip = &.{
-            "api.table_reads.consumerTests.Suite.test.api query contract graph evaluation preserves base hit paging and shard windows",
             "api.httpx_handler.test.httpx SQL",
             "api.httpx_handler.test.httpx FK source control rejects missing service token in legacy internal mode",
             "api.httpx_handler.test.httpx hidden handoff receipt rejects public caller even in legacy internal mode",
