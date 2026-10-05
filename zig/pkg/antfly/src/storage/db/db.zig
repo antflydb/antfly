@@ -69968,7 +69968,9 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expect(replay_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), replay_targets.target_identities.len);
     for (replay_targets.target_identities) |target|
-        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+        // Generated producers can replace or remove prior artifacts even
+        // when the originating source operation only adds a document.
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
 
     var materialized_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
         .documents = &.{.{ .key = "doc:a", .cleaned_value = "{}" }},
@@ -69982,7 +69984,7 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expect(materialized_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), materialized_targets.target_identities.len);
     for (materialized_targets.target_identities) |target|
-        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
 
     var deletion_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
         .deleted_keys = &.{"doc:a"},
@@ -83023,10 +83025,22 @@ test "db document extraction chunks units through source artifact enrichment" {
     }
     var missing_dense = try db.search(alloc, .{ .index_name = "document_vectors", .dense = .{ .vector = query_vec, .k = 1 }, .limit = 1, .include_stored = false });
     defer missing_dense.deinit();
-    try std.testing.expectEqual(@as(usize, 0), missing_dense.hits.len);
-    var missing_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = sparse_query.indices, .values = sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
+    // Vectors are backed by their embedding artifacts, independently of the
+    // optional stored chunk payload used by the full-text index above.
+    try std.testing.expectEqual(@as(usize, 1), missing_dense.hits.len);
+    var updated_sparse_query = try deterministic_sparse.interface().embedSparse(alloc, "document_chunk_sparse_v1", "alpha beta delta");
+    defer updated_sparse_query.deinit(alloc);
+    var missing_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = updated_sparse_query.indices, .values = updated_sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
     defer missing_sparse.deinit();
-    try std.testing.expectEqual(@as(usize, 0), missing_sparse.hits.len);
+    try std.testing.expectEqual(@as(usize, 1), missing_sparse.hits.len);
+    try db.core.store.delete(dense_artifact_key);
+    try db.core.store.delete(sparse_artifact_key);
+    var orphaned_dense = try db.search(alloc, .{ .index_name = "document_vectors", .dense = .{ .vector = query_vec, .k = 1 }, .limit = 1, .include_stored = false });
+    defer orphaned_dense.deinit();
+    try std.testing.expectEqual(@as(usize, 0), orphaned_dense.hits.len);
+    var orphaned_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = updated_sparse_query.indices, .values = updated_sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
+    defer orphaned_sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 0), orphaned_sparse.hits.len);
 
     try db.batch(.{
         .writes = &.{.{
@@ -84212,6 +84226,7 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
         .enrichment = .{
             .owner_id = "worker-b",
             .dense_embedder = deterministic.interface(),
@@ -84226,14 +84241,17 @@ test "db leased enrichment worker backs off while a stale owner holds the lease"
         enrichment_lease.default_lease_key,
     );
     defer stale_lease.deinit();
-    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
-    try std.testing.expect(try stale_lease.tryAcquire("worker-a", now_ms, 30_000));
-
     try db.addIndex(.{
         .name = "dv_v1",
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
     });
+
+    // Installing the producer may replace its runtime and lease state. Pin
+    // the competing owner only after admission and before starting the worker.
+    const now_ms = platform_time.realtimeNs() / std.time.ns_per_ms;
+    try std.testing.expect(try stale_lease.tryAcquire("worker-a", now_ms, 30_000));
+    try db.enrichment_runtime.?.start();
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"blocked enrichment\"}" }},
@@ -102808,7 +102826,7 @@ test "db full text repair page replay is idempotent without compaction" {
     }
     try std.testing.expect(complete);
     try std.testing.expectEqual(@as(u32, 3), reopened.core.index_manager.textIndex(cfg.name).?.snapshot().liveDocCount());
-    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .limit = 1 });
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .count_only = true });
     defer all.deinit();
     try std.testing.expectEqual(@as(u32, 3), all.total_hits);
 }

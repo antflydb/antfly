@@ -5556,7 +5556,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         return null;
     }
 
-    fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+    pub fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+        if (req.restore_staging) |control| switch (control) {
+            .finish => return .resolve,
+            else => {},
+        };
         // Empty-generation admission is installed after old-owner cutover,
         // while the target is still private. This is a bounded Plan-bound
         // recovery control, not a new import mutation; the storage apply
