@@ -1535,10 +1535,18 @@ class RuntimeCacheTest(unittest.TestCase):
         snowball = self.root / snowball_root / "german_stemmer.zig"
 
         self.build("regen-sql-grammar", "regen-snowball")
-        generated = {
-            path: (path.read_bytes(), path.stat().st_mtime_ns)
-            for path in (self.root / "cache/o").rglob("*.zig")
+        # Snapshot the generators' raw and formatted products. Zig 0.17 also
+        # stores configure metadata here (dependencies.zig), which can be
+        # rewritten independently of these producer/consumer contracts.
+        output_names = {"sql_grammar_root.zig"} | {
+            path.name for path in (self.root / snowball_root).glob("*.zig")
         }
+        generated = {}
+        for name in sorted(output_names):
+            paths = list((self.root / "cache/o").glob(f"*/{name}"))
+            self.assertTrue(paths, f"missing cached generator output: {name}")
+            for path in paths:
+                generated[path] = (path.read_bytes(), path.stat().st_mtime_ns)
         expected = {path: path.read_bytes() for path in (sql, snowball)}
         checked = self.build("sql-grammar-generated-check", "check-snowball")
         self.assertRegex(checked, r"run exe yacc-zig \(sql_grammar_root.zig\) cached")
