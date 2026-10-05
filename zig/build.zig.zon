@@ -34,7 +34,9 @@
     },
     .paths = .{
         "build.zig",
+        "embedded.build.zig",
         "build.zig.zon",
+        "build_support",
         "build_test_filters.zig",
         "pdf_standard_fonts.zig",
         "lib",
