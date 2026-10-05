@@ -487,14 +487,14 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
 test "restore publication recovers a cold compiled owner between preparation and admission" {
     const alloc = std.testing.allocator;
     const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
-    const staging = @import("db/restore_staging_contract.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
     const schema_json = "{}";
     const tables = @import("../api/tables.zig");
     var parsed = try tables.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const schema = try tables.deriveRuntimeTableSchema(alloc, parsed);
-    defer @import("schema.zig").freeSchema(alloc, schema);
-    const encoded_schema = try @import("schema.zig").serializeSchema(alloc, schema);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, schema);
+    const encoded_schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, schema);
     defer alloc.free(encoded_schema);
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
     const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
@@ -510,7 +510,7 @@ test "restore publication recovers a cold compiled owner between preparation and
         expected: staging.Scope,
         expected_use: Source.RestoreDescriptorUse = .resolve,
         reads: usize = 0,
-        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !Source.OwnedRestoreDescriptor {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             try std.testing.expectEqual(@as(u64, 7196), group_id);
@@ -553,7 +553,7 @@ test "restore publication recovers a cold compiled owner between preparation and
         authority: *Authority,
         root: []const u8,
         barrier: read_gate.ReadSafetyBarrier,
-        fn propose(ptr: *anyopaque, request: db_mod.types.BatchRequest, context: @import("../api/operation.zig").RequestContext) !void {
+        fn propose(ptr: *anyopaque, request: db_mod.types.BatchRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             try std.testing.expectEqual(self.authority.expected.plan_id, request.restore_staging_plan_id.?);

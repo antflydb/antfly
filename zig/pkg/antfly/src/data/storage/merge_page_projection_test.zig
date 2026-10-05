@@ -84,7 +84,7 @@ test "data raft merge pages chunk spool survives snapshot without exposing incom
     try snapshot.writer.writeByte(0);
     const primary_path = try std.fmt.allocPrintSentinel(alloc, "{s}/native", .{next_dir.path()}, 0);
     defer alloc.free(primary_path);
-    var primary = try @import("../../storage/docstore.zig").DocStore.open(alloc, primary_path.ptr, .{});
+    var primary = try @import("antfly_local_sources").storage_docstore.DocStore.open(alloc, primary_path.ptr, .{});
     defer primary.close();
     var restored = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = next_dir.path() });
     defer restored.deinit();
@@ -151,12 +151,12 @@ test "data raft merge pages persist atomic cursor through snapshot retry and pro
     try snapshot.writer.writeByte(0);
     const primary_path = try std.fmt.allocPrintSentinel(alloc, "{s}/native", .{second_dir.path()}, 0);
     defer alloc.free(primary_path);
-    var primary = try @import("../../storage/docstore.zig").DocStore.open(alloc, primary_path.ptr, .{});
+    var primary = try @import("antfly_local_sources").storage_docstore.DocStore.open(alloc, primary_path.ptr, .{});
     defer primary.close();
     const source_rows = try source.groupState(alloc, group);
     defer shard.freeGroupStateEntries(alloc, source_rows);
     for (source_rows) |item| {
-        const key = try @import("../../storage/internal_keys.zig").documentKeyAlloc(alloc, item.key);
+        const key = try @import("antfly_local_sources").storage_internal_keys.documentKeyAlloc(alloc, item.key);
         defer alloc.free(key);
         try primary.put(key, item.value);
     }

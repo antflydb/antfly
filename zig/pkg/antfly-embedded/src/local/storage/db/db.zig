@@ -78387,114 +78387,116 @@ test "db document extraction skips stable unit local rewrites without text consu
 // permanently stuck at 0 while indexed kept climbing. See ENRICHMENTS.md's
 // "Two-Stream Execution Model" and DENSE_INDEXING_LIFECYCLE.md.
 test "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter" {
-    try expectPluralSourceDenseConvergence(null);
+    try test_support.expectPluralSourceDenseConvergence(null);
 }
 
 // Shared real-DB scenario. Server tests supply their wire-status observer; the
 // local suite checks convergence without importing the server API facade.
-fn expectPluralSourceDenseConvergence(comptime observe: ?*const fn (Allocator, std.json.Value, types.DBStats) anyerror!void) !void {
-    const alloc = std.testing.allocator;
-    const Admission = enum { before_rows, after_chunks, after_embeddings };
-    for ([_]Admission{ .before_rows, .after_chunks, .after_embeddings }) |admission| {
-        var path_tmp = try TestDirectory.init("db");
-        defer path_tmp.cleanup();
-        const path = path_tmp.path().ptr;
-        defer cleanupTempDir(path);
+const plural_source_dense_test_support = if (builtin.is_test) struct {
+    pub fn expectPluralSourceDenseConvergence(comptime observe: ?*const fn (Allocator, std.json.Value, types.DBStats) anyerror!void) !void {
+        const alloc = std.testing.allocator;
+        const Admission = enum { before_rows, after_chunks, after_embeddings };
+        for ([_]Admission{ .before_rows, .after_chunks, .after_embeddings }) |admission| {
+            var path_tmp = try TestDirectory.init("db");
+            defer path_tmp.cleanup();
+            const path = path_tmp.path().ptr;
+            defer cleanupTempDir(path);
 
-        const document = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdh\"}";
-        var counting = CountingDenseEmbedder{};
-        var db = try DB.open(alloc, std.mem.span(path), .{
-            .enrichment = .{
-                .owner_id = "worker-a",
-                .dense_embedder = counting.interface(),
-            },
-        });
-        defer db.close();
+            const document = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdh\"}";
+            var counting = CountingDenseEmbedder{};
+            var db = try DB.open(alloc, std.mem.span(path), .{
+                .enrichment = .{
+                    .owner_id = "worker-a",
+                    .dense_embedder = counting.interface(),
+                },
+            });
+            defer db.close();
 
-        try db.addEnrichment(.{
-            .name = "document_units_v1",
-            .kind = .asset,
-            .field = "url",
-            .content_type = "application/json",
-            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-        });
-        try db.addEnrichment(.{
-            .name = "document_chunks_v1",
-            .kind = .chunk,
-            .field = "text",
-            .source_artifact_name = "document_units_v1",
-            .chunk_size = 8,
-        });
-        if (admission != .before_rows) {
-            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+            try db.addEnrichment(.{
+                .name = "document_units_v1",
+                .kind = .asset,
+                .field = "url",
+                .content_type = "application/json",
+                .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+            });
+            try db.addEnrichment(.{
+                .name = "document_chunks_v1",
+                .kind = .chunk,
+                .field = "text",
+                .source_artifact_name = "document_units_v1",
+                .chunk_size = 8,
+            });
+            if (admission != .before_rows) {
+                try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+                try db.runUntilIdle();
+            }
+            try db.addEnrichment(.{
+                .name = "document_chunk_dense_v1",
+                .kind = .embedding,
+                .field = "text",
+                .source_artifact_name = "document_chunks_v1",
+                .expected_dims = 3,
+            });
+            // Also exercise admission after the embeddings themselves are durable:
+            // the new consumer must bootstrap existing one-to-many artifacts.
+            if (admission == .after_embeddings) try db.runUntilIdle();
+            // Resolve the actual public config to storage config so the runtime and
+            // API observe precisely the same incarnation and config fingerprint.
+            var config = try std.json.parseFromSlice(std.json.Value, alloc,
+                \\{"name":"dv_document_chunks","type":"embeddings","dimension":3,"sources":[{"artifact":"document_chunk_dense_v1"}],"_index_incarnation":42}
+            , .{});
+            defer config.deinit();
+            const config_json = try @import("../../api/table_index_config.zig").extractIndexConfigJson(alloc, "dv_document_chunks", config.value);
+            defer alloc.free(config_json);
+            try db.addIndex(.{
+                .name = "dv_document_chunks",
+                .kind = .dense_vector,
+                .coverage_generation = 42,
+                .config_json = config_json,
+            });
+            if (admission == .before_rows) {
+                try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+            }
             try db.runUntilIdle();
+
+            try std.testing.expect(counting.calls > 0);
+
+            const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
+            try std.testing.expect(active_count > 1);
+            const stats = try db.stats(alloc);
+            defer types.freeDBStats(alloc, stats);
+            const item = for (stats.indexes) |item| {
+                if (std.mem.eql(u8, item.name, "dv_document_chunks")) break item;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expect(item.publication_target_ready);
+            try std.testing.expectEqual(active_count, item.publication_target_count);
+            try std.testing.expect(item.coverage_summary_ready);
+            try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
+            if (observe) |observer| try observer(alloc, config.value, stats);
+
+            // Before the fix this counter was permanently stuck at 0 (the guarded
+            // embedding-artifact write path never found a matching counter target),
+            // so `canAdvanceDerivedToTargetAsync` could never observe
+            // `denseCoverageMatchesTarget` and would defer to artifact maintenance
+            // forever.
+            try std.testing.expectEqual(
+                @as(?u64, active_count),
+                try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
+            );
+
+            // The counter equality above proves the durable target watermark
+            // converges; also prove the index is actually searchable end to end.
+            var search_result = try db.search(alloc, .{
+                .index_name = "dv_document_chunks",
+                .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
+                .limit = 5,
+                .search_effort = 1.0,
+            });
+            defer search_result.deinit();
+            try std.testing.expect(search_result.total_hits > 0);
         }
-        try db.addEnrichment(.{
-            .name = "document_chunk_dense_v1",
-            .kind = .embedding,
-            .field = "text",
-            .source_artifact_name = "document_chunks_v1",
-            .expected_dims = 3,
-        });
-        // Also exercise admission after the embeddings themselves are durable:
-        // the new consumer must bootstrap existing one-to-many artifacts.
-        if (admission == .after_embeddings) try db.runUntilIdle();
-        // Resolve the actual public config to storage config so the runtime and
-        // API observe precisely the same incarnation and config fingerprint.
-        var config = try std.json.parseFromSlice(std.json.Value, alloc,
-            \\{"name":"dv_document_chunks","type":"embeddings","dimension":3,"sources":[{"artifact":"document_chunk_dense_v1"}],"_index_incarnation":42}
-        , .{});
-        defer config.deinit();
-        const config_json = try @import("../../api/table_index_config.zig").extractIndexConfigJson(alloc, "dv_document_chunks", config.value);
-        defer alloc.free(config_json);
-        try db.addIndex(.{
-            .name = "dv_document_chunks",
-            .kind = .dense_vector,
-            .coverage_generation = 42,
-            .config_json = config_json,
-        });
-        if (admission == .before_rows) {
-            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
-        }
-        try db.runUntilIdle();
-
-        try std.testing.expect(counting.calls > 0);
-
-        const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
-        try std.testing.expect(active_count > 1);
-        const stats = try db.stats(alloc);
-        defer types.freeDBStats(alloc, stats);
-        const item = for (stats.indexes) |item| {
-            if (std.mem.eql(u8, item.name, "dv_document_chunks")) break item;
-        } else return error.TestUnexpectedResult;
-        try std.testing.expect(item.publication_target_ready);
-        try std.testing.expectEqual(active_count, item.publication_target_count);
-        try std.testing.expect(item.coverage_summary_ready);
-        try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
-        if (observe) |observer| try observer(alloc, config.value, stats);
-
-        // Before the fix this counter was permanently stuck at 0 (the guarded
-        // embedding-artifact write path never found a matching counter target),
-        // so `canAdvanceDerivedToTargetAsync` could never observe
-        // `denseCoverageMatchesTarget` and would defer to artifact maintenance
-        // forever.
-        try std.testing.expectEqual(
-            @as(?u64, active_count),
-            try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
-        );
-
-        // The counter equality above proves the durable target watermark
-        // converges; also prove the index is actually searchable end to end.
-        var search_result = try db.search(alloc, .{
-            .index_name = "dv_document_chunks",
-            .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
-            .limit = 5,
-            .search_effort = 1.0,
-        });
-        defer search_result.deinit();
-        try std.testing.expect(search_result.total_hits > 0);
     }
-}
+} else struct {};
 
 // `checkTargetAdvanceNoProgress` is `runUntilIdle`'s opt-in stall guard (task
 // requirement: fail fast with a named, bounded diagnostic instead of
@@ -130379,7 +130381,7 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
 // White-box hooks for server integration fixtures; absent from production builds.
 const fixture_owner = @This();
 pub const test_support = if (builtin.is_test) struct {
-    pub const expectPluralSourceDenseConvergence = fixture_owner.expectPluralSourceDenseConvergence;
+    pub const expectPluralSourceDenseConvergence = plural_source_dense_test_support.expectPluralSourceDenseConvergence;
     pub fn advanceArtifactUploadRecoveryMaintenance(db: *fixture_owner.DB) !bool {
         return db.advanceArtifactUploadRecoveryWithTrigger(.maintenance);
     }

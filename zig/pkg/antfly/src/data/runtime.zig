@@ -37779,13 +37779,13 @@ fn consumerTests() type {
             try std.testing.expect(server.localDataRaftLeaderReady(77));
 
             const Source = antfly.public_api.ProvisionedKernelOwnerSource;
-            const staging = @import("../storage/db/restore_staging_contract.zig");
+            const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
             const tables = @import("../api/tables.zig");
             var parsed_schema = try tables.parseValidatedTableSchema(alloc, "{}");
             defer parsed_schema.deinit(alloc);
             const schema = try tables.deriveRuntimeTableSchema(alloc, parsed_schema);
-            defer @import("../storage/schema.zig").freeSchema(alloc, schema);
-            const encoded_schema = try @import("../storage/schema.zig").serializeSchema(alloc, schema);
+            defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, schema);
+            const encoded_schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, schema);
             defer alloc.free(encoded_schema);
             const scope: staging.Scope = .{
                 .plan_id = @splat(1),
@@ -37818,7 +37818,7 @@ fn consumerTests() type {
                 evicted: bool = false,
                 recovered: usize = 0,
                 accepted_index: ?u64 = null,
-                fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+                fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !Source.OwnedRestoreDescriptor {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try context.ensureActive();
                     try std.testing.expect(self.evicted);
