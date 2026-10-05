@@ -6,7 +6,7 @@
 //! Transport-neutral metadata administration mutation operations.
 
 const std = @import("std");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const metadata_api = @import("api.zig");
 const metadata_table_manager = @import("table_manager.zig");
 

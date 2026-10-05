@@ -14,7 +14,7 @@
 
 const raft_engine = @import("raft_engine");
 const raft_trace_logger = @import("raft_trace_logger.zig");
-const stderr_writer = @import("stderr_writer.zig");
+const stderr_writer = @import("antfly_local_sources").tracing_stderr_writer;
 
 /// Server Raft events share the process output sink with local transaction events.
 pub fn stderrRaftTraceLogger() raft_engine.core.TraceLogger {

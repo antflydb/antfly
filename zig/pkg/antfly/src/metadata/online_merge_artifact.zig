@@ -17,8 +17,8 @@
 //! metadata cursor. Retrying a lost write response first reads that ledger.
 const std = @import("std");
 const online = @import("online_merge.zig");
-const transfer = @import("../storage/db/source_artifact_transfer.zig");
-const Context = @import("../api/operation.zig").RequestContext;
+const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
+const Context = @import("antfly_local_sources").api_operation.RequestContext;
 const Allocator = std.mem.Allocator;
 
 pub const Transport = struct {

@@ -28,7 +28,7 @@ The public contract target is the finished Go implementation:
 ### Storage Primitives
 
 Low-level DB snapshot and restore primitives already exist in
-[db.zig](pkg/antfly/src/storage/db/db.zig):
+[db.zig](pkg/antfly-embedded/src/local/storage/db/db.zig):
 
 - `DB.snapshot(id)`
 - `DB.restoreSnapshotTo(snapshot_root, path, opts)`

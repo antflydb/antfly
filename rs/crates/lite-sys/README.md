@@ -1,7 +1,7 @@
 # antfly-lite-sys
 
 Raw, hand-written `extern "C"` declarations for `libantfly`, the stable
-embedded Antfly C ABI (`zig/pkg/antfly/include/antfly.h`). There is no
+embedded Antfly C ABI (`zig/pkg/antfly-embedded/include/antfly.h`). There is no
 `bindgen`/`libclang` dependency: the header is small and stable enough that a
 hand-written mirror is easier to audit, and this crate does not require a C
 toolchain to build.

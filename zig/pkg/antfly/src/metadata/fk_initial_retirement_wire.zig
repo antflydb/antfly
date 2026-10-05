@@ -219,7 +219,7 @@ test "hosted initial FK retirement wire bounds exact store cursor and ACK" {
     bad_cursor[cursor.len - 1] = 'G';
     try std.testing.expectError(error.InvalidInitialFkRetirementPage, validateCursor(1, 13, bad_cursor[0..cursor.len]));
 
-    const identity = @import("../storage/db/root_signing_identity.zig");
+    const identity = @import("antfly_local_sources").storage_db_root_signing_identity;
     const seed: [32]u8 = @splat(7);
     const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: identity.State = .{

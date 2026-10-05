@@ -17,14 +17,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const admin_api = @import("../../admin/mod.zig");
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const routes = @import("../../raft/transport/routes.zig");
 const backup_manifest = @import("backup_manifest.zig");
 const fencing = @import("fencing.zig");
 const http_admin = @import("http_admin.zig");
 const primary_mod = @import("primary.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 

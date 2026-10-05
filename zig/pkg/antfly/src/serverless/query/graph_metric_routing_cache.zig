@@ -17,7 +17,7 @@
 //! pinned entries remain charged and admission bypasses a saturated cache.
 const std = @import("std");
 const codec = @import("../graph_metric_segment/codec.zig");
-const CancellationToken = @import("../../api/operation.zig").CancellationToken;
+const CancellationToken = @import("antfly_local_sources").api_operation.CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const Entry = struct {

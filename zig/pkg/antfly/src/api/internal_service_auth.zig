@@ -15,7 +15,7 @@
 //! Short-lived, audience-bound credentials for node-to-node API calls.
 
 const std = @import("std");
-const http_common = @import("../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const platform_time = @import("antfly_platform").time;
 
 pub const audience = "antfly-internal-v1";

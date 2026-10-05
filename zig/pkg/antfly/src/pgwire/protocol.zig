@@ -19,7 +19,7 @@ const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
 const commands = @import("session_commands.zig");
-const settings_catalog = @import("../sql/setting_catalog.zig");
+const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
 const Budget = @import("budget.zig").Budget;
 

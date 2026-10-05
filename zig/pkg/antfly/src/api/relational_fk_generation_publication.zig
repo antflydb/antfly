@@ -4,10 +4,10 @@
 //! only an identity/probe; the receiving owner must fetch its own exact,
 //! linearizable metadata decision before proposing a replicated transition.
 const std = @import("std");
-const operation = @import("operation.zig");
-const callback_abi = @import("../runtime_callback_abi.zig");
-const integrity = @import("../storage/db/relational_integrity_contract.zig");
-const identity = @import("../storage/db/doc_identity_namespace.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
+const integrity = @import("antfly_local_sources").storage_db_relational_integrity_contract;
+const identity = @import("antfly_local_sources").storage_db_doc_identity_namespace;
 
 pub const Action = enum { stage, activate, acknowledge, cancel };
 
@@ -358,7 +358,7 @@ test "initial FK child receipt binds hidden owner and empty state" {
 }
 
 test "FK generation schema Raft command keeps canonical JSON bytes on wire" {
-    const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
     const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
     const command: topology.Command = .{
         .action = .install_child_schema,

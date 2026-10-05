@@ -11,10 +11,10 @@ const std = @import("std");
 const httpx = @import("httpx");
 const generating = @import("antfly_generating");
 const vopr = @import("vopr");
-const generating_runtime = @import("../generating/mod.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const provider_limits = @import("../common/provider_limits.zig");
+const generating_runtime = @import("antfly_local_sources").generating_mod;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const provider_limits = @import("antfly_local_sources").common_provider_limits;
 const reranking = @import("../reranking/mod.zig");
 
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });

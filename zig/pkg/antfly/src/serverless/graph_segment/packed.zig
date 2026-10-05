@@ -17,8 +17,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
-const edge_type = @import("../../graph/edge_type.zig");
-const bounded = @import("../bounded_decode.zig");
+const edge_type = @import("antfly_local_sources").graph_edge_type;
+const bounded = @import("antfly_local_sources").serverless_bounded_decode;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const wire_magic = "AFSG";
 pub const wire_version: u16 = 9;

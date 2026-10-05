@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const object_storage = @import("../object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 
 pub const version: u16 = 1;
 const max_control_bytes = 16 * 1024 * 1024;

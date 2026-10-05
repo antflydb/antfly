@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const wal = @import("storage/wal.zig");
+pub const wal = @import("antfly_local_sources").storage_wal;
 
 pub const CommitStats = wal.CommitStats;
 pub const CommitBackend = wal.CommitBackend;
@@ -23,3 +23,6 @@ pub const WalStats = wal.WalStats;
 pub const FullStats = wal.FullStats;
 pub const WAL = wal.WAL;
 pub const platform_time = @import("antfly_platform").time;
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

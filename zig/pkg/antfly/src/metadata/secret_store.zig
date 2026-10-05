@@ -5,7 +5,7 @@
 //! preparation/read paths. Deterministic apply uses ciphertext framing alone.
 const std = @import("std");
 const collection = @import("../common/secret_collection.zig");
-const contract = @import("../common/secret_contract.zig");
+const contract = @import("antfly_local_sources").common_secret_contract;
 const service_mod = @import("service.zig");
 const time = @import("antfly_platform").time;
 

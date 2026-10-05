@@ -17,7 +17,7 @@
 //! metadata-only consumers from instantiating its physical storage vtable.
 
 const std = @import("std");
-const db_types = @import("../storage/db/types.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
 
 pub const Options = struct {
     enabled: bool = false,
