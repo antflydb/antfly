@@ -1655,6 +1655,35 @@ class RuntimeCacheTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "requires a POSIX xcrun fixture")
 class MacosSdkCacheTest(unittest.TestCase):
+    @unittest.skipUnless(
+        os.name == "posix" and os.uname().sysname == "Darwin",
+        "requires a native macOS SDK",
+    )
+    def test_standalone_inference_explicit_sdk_does_not_poison_configuration(self):
+        sdk = subprocess.check_output(
+            ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True
+        ).strip()
+        env = dict(os.environ)
+        env.pop("SDK_PATH", None)
+        with tempfile.TemporaryDirectory() as cache:
+            result = subprocess.run(
+                [
+                    "zig",
+                    "build",
+                    "--help",
+                    f"-Dmacos-sdk={sdk}",
+                    "--cache-poison=disallowed",
+                    "--cache-dir",
+                    cache,
+                ],
+                cwd=ZIG_ROOT / "pkg/inference",
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_sdk_discovery_tracks_selection_and_explicit_override(self):
         # Isolate the shared helper: another owner poisoning the graph must not
         # accidentally make this check pass.
