@@ -758,6 +758,22 @@ pub fn create(b: *std.Build) ?Artifacts {
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
     readers_mod.addImport("antfly_scraping", scraping_mod);
     readers_mod.addImport("antfly_image", image_mod);
+    const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple Vision OCR (macOS only)") orelse false;
+    if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
+        @panic("-Dapple-providers=true requires macOS and libc");
+    const apple_reader_options = b.addOptions();
+    apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
+    readers_mod.addOptions("apple_reader_options", apple_reader_options);
+    if (apple_reader_enabled) {
+        readers_mod.linkFramework("Foundation", .{});
+        readers_mod.linkFramework("CoreGraphics", .{});
+        readers_mod.linkFramework("ImageIO", .{});
+        readers_mod.linkFramework("Vision", .{});
+        readers_mod.addCSourceFile(.{
+            .file = b.path("lib/readers/src/apple_vision.m"),
+            .flags = &.{ "-fobjc-arc", "-fblocks" },
+        });
+    }
     inference_server_mod.addImport("antfly_readers", readers_mod);
     inference_server_mod.addImport("antfly_reader_config", reader_config_mod);
     inference_server_mod.addImport("antfly_extracting", extracting_mod);
@@ -897,6 +913,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     inference_work_mod.addImport("antfly_scraping", scraping_mod);
     inference_work_mod.addImport("antfly_image", image_mod);
+    readers_mod.addImport("antfly_inference_work", inference_work_mod);
+    readers_mod.addImport("antfly_platform", platform_mod);
     const inference_worker_wire_mod = b.createModule(.{
         .root_source_file = b.path("pkg/inference/src/host/worker_wire.zig"),
         .target = target,
@@ -1494,6 +1512,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
     const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
     lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
+    b.step("lib-readers-check", "Compile reader tests without executing them").dependOn(&lib_readers_tests.step);
 
     const lib_extracting_tests = b.addTest(.{
         .root_module = extracting_mod,
@@ -1538,6 +1557,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
     pdf_test_step.dependOn(&run_lib_pdf_tests.step);
     pdf_test_step.dependOn(&pdf_integration.run.step);
+    b.step("apple-pdf-ocr-test", "Run scanned PDF OCR and grounding through Apple Vision").dependOn(&pdf_integration.apple.step);
     b.step("pdf-ocr-integration-test", "Run native PDF rendering and encoded reader batching through the OCR coordinator").dependOn(&pdf_integration.run.step);
     b.step("pdf-model-qualification-test", "Run opt-in real Florence/Gemma4/ClipClap PDF qualification against ANTFLY_PDF_QUALIFICATION_URL").dependOn(&pdf_integration.qualification.step);
 

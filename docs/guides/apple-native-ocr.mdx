@@ -1,0 +1,143 @@
+---
+title: Native Apple OCR
+description: Use macOS Vision to extract text from images and scanned PDFs in Antfly
+---
+
+Antfly's opt-in `apple` reader uses macOS Vision to recognize text locally. It
+works on the tested macOS 15.6.1 machine without an OS upgrade, downloaded Antfly
+model, API key, or Apple Intelligence setting change. This first implementation
+covers OCR; Apple speech transcription and Foundation Models generation remain
+future work.
+
+## Build
+
+From the repository's `zig` directory, use its required Zig 0.17 toolchain:
+
+```bash
+zig build antfly -Dapple-providers=true
+```
+
+The flag requires a macOS target with libc and links Foundation, CoreGraphics,
+ImageIO, and Vision. It defaults to false. Builds without the flag, including
+Linux builds, report `AppleProviderUnavailable` when Apple OCR is invoked.
+Metal inference is independent; add `-Dmetal=false` if you want a CPU-only build
+of Antfly's other inference providers.
+
+## Configure an image reader
+
+Use this producer on an asset enrichment whose field contains a PNG or JPEG URL:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "apple",
+    "model": "vision-text",
+    "recognition_languages": ["en-US"],
+    "recognition_level": "accurate",
+    "uses_language_correction": false
+  }
+}
+```
+
+`model` is optional; `vision-text` is its only supported value. Language tags
+must be supported by the installed Vision runtime. `recognition_level` accepts
+`accurate` or `fast`. The defaults are accurate recognition, English, and no
+language correction. HTTP(S) and inline `data:image/...;base64,...` inputs use
+bounded downloads with private IP blocking. Local file URLs are blocked by the
+reader's default content security policy.
+
+Plain-text output contains recognized lines. For `content_type:
+"application/json"`, the reader returns its normal result array, including
+`regions_json`: a serialized array of text, confidence, bounding boxes, and
+`coordinate_space: "image_pixels_top_left"`.
+
+## Index scanned PDFs
+
+Use a document extraction producer to render PDF pages and feed their pixels
+directly to Vision. The PDF pipeline maps OCR boxes to page coordinates and
+retains text spans for grounding. This example creates an index over OCR chunks:
+
+```json
+{
+  "num_shards": 1,
+  "indexes": {
+    "document_text": {
+      "type": "full_text",
+      "field": "text",
+      "artifact_name": "document_chunks",
+      "enrichments": [
+        {
+          "name": "document_units",
+          "kind": "asset",
+          "field": "document_url",
+          "content_type": "application/json",
+          "producer": {
+            "type": "document_extraction",
+            "config": {
+              "ocr": {
+                "enabled": true,
+                "executor": "reader",
+                "mode": "always",
+                "render_dpi": 150,
+                "prompt_policy": "plain",
+                "config": {
+                  "provider": "apple",
+                  "model": "vision-text",
+                  "recognition_languages": ["en-US"]
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "document_chunks",
+          "kind": "chunk",
+          "field": "text",
+          "source_artifact_name": "document_units",
+          "chunk_size": 256,
+          "full_text_index": true
+        }
+      ]
+    }
+  }
+}
+```
+
+Send that body to `POST /db/v1/tables/documents`, then write documents whose
+`document_url` points to a PDF. An inline `data:application/pdf;base64,...` URL
+can carry a local PDF. `mode: "always"` forces OCR; use `auto` to retain the
+document pipeline's text-quality fallback behavior. An Apple reader implicitly
+selects the plain prompt policy when none is specified.
+
+## Limits and verification
+
+OCR accepts empty prompts or the compatibility marker `<OCR>`; arbitrary
+instructions and `max_tokens` are rejected. It recognizes text without table or
+multi-column reconstruction. Image batches execute serially, preserve order and
+page identity, and report serial execution. One native invocation runs at a time
+per process; competing invocations receive the retryable `AppleOcrBusy` error.
+
+Input limits are 16 Mi pixels per image, 64 Mi pixels per batch, eight images,
+64 MiB of encoded media, and 256 MiB of raw raster data. Output defaults to an
+8 MiB total response limit and fails instead of truncating. Cancellation and
+deadlines are cooperative; resources remain retained until Vision returns.
+
+Each invocation reserves a 384 MiB native workspace allowance in addition to
+Antfly buffers. This is scheduling admission, not a hard cap on OS model memory.
+Production document budgets now scale from 256 MiB to 1 GiB with host memory;
+small process envelopes can reject work with `DocumentExtractionWorkingSetTooLarge`.
+
+```bash
+zig build lib-readers-test antfly-apple-provider-test apple-pdf-ocr-test \
+  -Dapple-providers=true -Dmetal=false -j2
+zig build lib-readers-check -Dtarget=x86_64-linux-gnu -Dmetal=false
+```
+
+The native tests recognize a generated invoice image through encoded, borrowed
+RGBA, and inline data URI paths. The scanned PDF qualification uses real Vision
+OCR and checks exact text, page bounds, and grounding spans. They require access
+to macOS Vision services; restrictive process sandboxes may prevent recognition.
+The cross-build check verifies that disabled Linux readers compile without Apple
+frameworks. `scripts/apple-provider-probe.swift` also provides an independent
+Vision smoke test and can regenerate the image fixture with `--write-fixture`.

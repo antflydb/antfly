@@ -43807,6 +43807,7 @@ fn isUnavailableGeneratedTextModelError(kind: GeneratedUnitTextKind, err: anyerr
         error.ModelNotFound,
         error.ModelNotSpecified,
         error.UnsupportedReaderProvider,
+        error.AppleProviderUnavailable,
         => true,
         else => false,
     };

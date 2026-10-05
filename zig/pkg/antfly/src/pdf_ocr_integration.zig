@@ -28,6 +28,11 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next();
     if (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--qualify-apple")) {
+            var runtime = asset_producer_runtime.Runtime.init(alloc, &client);
+            defer runtime.deinit();
+            return enrichment_runtime.runApplePdfOcrGroundingIntegration(alloc, fixture.reader_two_lines_scanned_pdf, runtime.producer());
+        }
         if (!std.mem.eql(u8, arg, "--qualify-real")) return error.InvalidIntegrationArgument;
         return try runRealModelQualification(alloc, &client);
     }
