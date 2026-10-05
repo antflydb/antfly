@@ -198,6 +198,56 @@ test "resident program Metal compiled forward and retained cut VJP match native 
     }
 }
 
+test "resident program Metal batches dispatches in segments without changing results" {
+    if (comptime !options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var fixture = try Fixture.init(a);
+    defer fixture.graph.deinit();
+    var session = try seeded.Session.init(a, &fixture.graph, &.{fixture.seed}, &fixture.parameters, .{});
+    defer session.deinit();
+    var device = try Device.init(a);
+    defer device.deinit();
+    const gpu = device.backend.computeBackend();
+    var bindings = std.ArrayListUnmanaged(program_mod.Binding).empty;
+    defer bindings.deinit(a);
+    defer for (bindings.items) |binding| gpu.free(binding.value);
+    for (fixture.inputs) |input| {
+        var dims: [8]i32 = undefined;
+        const shape = shape32(fixture.graph.node(input.id).output_shape, &dims);
+        const value = if (input.indices.len == 0) try upload(&gpu, input.values, shape) else (try gpu.fromInt32Shape(input.indices, shape)).?;
+        bindings.append(a, .{ .node_id = session.differentiated.id_map[input.id], .value = value }) catch |err| {
+            gpu.free(value);
+            return err;
+        };
+    }
+    var unbatched = std.ArrayListUnmanaged([]f32).empty;
+    defer {
+        for (unbatched.items) |values| a.free(values);
+        unbatched.deinit(a);
+    }
+    // 0 completes every dispatch; 1 and 3 end segments mid-program.
+    for ([_]usize{ 0, 1, 3, 256 }) |dispatches| {
+        var forward = try program_mod.Program.init(a, &session.differentiated.graph, session.captures, .{ .max_batch_dispatches = dispatches });
+        defer forward.deinit();
+        const before = metal_tensor.memoryStatsSnapshot();
+        var captures = try forward.execute(a, &gpu, bindings.items, null);
+        for (captures.outputs, 0..) |output, i| {
+            const shape = forward.lowered.graph.node(forward.lowered.id_map[session.captures[i]]).output_shape;
+            const values = try a.alloc(f32, @intCast(shape.numElements().?));
+            defer a.free(values);
+            try gpu.glinerBoundaryDownload(output, values);
+            if (dispatches == 0) {
+                try unbatched.append(a, try a.dupe(f32, values));
+            } else try std.testing.expectEqualSlices(f32, unbatched.items[i], values);
+        }
+        captures.deinit(&gpu);
+        const after = metal_tensor.memoryStatsSnapshot();
+        try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
+    }
+    try std.testing.expect(unbatched.items.len > 0);
+}
+
 fn executionAllocationCheck(a: Allocator, backend: *metal.MetalCompute, program: *const program_mod.Program, input: program_mod.Binding) !void {
     const original = backend.allocator;
     backend.allocator = a;

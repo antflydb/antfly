@@ -14,28 +14,52 @@ class DiagnosticTests(unittest.TestCase):
             root = Path(tmp)
             zig = root / "zig"
             zig.write_text(
-                '#!/bin/sh\n'
+                "#!/bin/sh\n"
                 'if [ "$1" = build ]; then\n'
                 '  "$0" build-exe --name antfly-runtime-inference &\n'
                 '  wait "$!"\n'
-                'else\n'
-                '  sleep 1\n'
-                'fi\n'
+                "else\n"
+                "  sleep 1\n"
+                "fi\n"
             )
             zig.chmod(0o700)
             env = dict(os.environ, ZIG_BIN=str(zig))
             env.pop("sample_id", None)
-            result = subprocess.run([
-                "bash", str(script), "--out-dir", str(root / "logs"),
-                "--prefix", str(root / "prefix"), "--label", "test",
-                "--interval", "0.05", "--no-stack-sample",
-            ], env=env, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--out-dir",
+                    str(root / "logs"),
+                    "--prefix",
+                    str(root / "prefix"),
+                    "--label",
+                    "test",
+                    "--interval",
+                    "0.05",
+                    "--no-stack-sample",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("status=0\n", (root / "logs/test.summary.txt").read_text())
             trace = (root / "logs/test.rss.tsv").read_text()
             rows = [line.split("\t") for line in trace.splitlines()]
-            self.assertEqual(rows[0], ["timestamp", "elapsed_s", "pid", "rss_kb",
-                                       "rss_mb", "command", "sample_id"])
+            self.assertEqual(
+                rows[0],
+                [
+                    "timestamp",
+                    "elapsed_s",
+                    "pid",
+                    "rss_kb",
+                    "rss_mb",
+                    "command",
+                    "sample_id",
+                ],
+            )
             self.assertGreater(len(rows), 1)
             for row in rows[1:]:
                 self.assertEqual(len(row), 7)

@@ -7636,14 +7636,11 @@ pub const ApiHttpServer = struct {
         if (table_id == 0 or physical_table.len == 0 or database.len == 0) return error.RowPolicyCatalogChanged;
         var internal_context = context;
         internal_context.row_policy_install_authority = true;
-        const bytes = self.source.systemCatalog(alloc, internal_context, .{ .policy_publication_status = table_id }) catch |err| {
-            if (err == error.RowPolicyCatalogChanged) return null;
-            return err;
-        };
+        const bytes = try self.source.systemCatalog(alloc, internal_context, .{ .policy_publication_status = table_id });
         defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(@import("../system_catalog/policies.zig").PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
+        var parsed = try std.json.parseFromSlice(?@import("../system_catalog/policies.zig").PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        const publication = parsed.value;
+        const publication = parsed.value orelse return null;
         try publication.validateShape();
         if (publication.table_id != table_id or
             (schema_version != null and publication.schema_version != schema_version.?))
@@ -14049,10 +14046,9 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join, foreign_execution.context()) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
-            // Foreign-source capability validation is part of the public
-            // request contract. Keep its historical 400 classification;
-            // exact-sort rejection is already carried by its distinct error.
-            error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            // Valid requests outside the foreign source's capabilities use
+            // the same machine-readable 422 contract as native queries.
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
@@ -33469,9 +33465,11 @@ test "api http row policy signer skips absent admitted identity" {
     try std.testing.expect(ApiHttpServer.hasRowPolicyWritePrincipal(.{ .row_policy_credential = &present }));
 }
 
-test "ordinary read needs no principal without policy but active policy fails closed" {
+test "ordinary reads and writes distinguish absent policy from unavailable authority" {
     const Fixture = struct {
         active: bool = false,
+        disabled: bool = false,
+        failure: ?anyerror = null,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{} };
         }
@@ -33480,13 +33478,14 @@ test "ordinary read needs no principal without policy but active policy fails cl
             try std.testing.expect(call == .policy_publication_status);
             try std.testing.expectEqual(@as(u64, 7), call.policy_publication_status);
             try std.testing.expect(context.row_policy_install_authority);
-            if (!self.active) return error.RowPolicyCatalogChanged;
+            if (self.failure) |err| return err;
+            if (!self.active) return alloc.dupe(u8, "null");
             return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/policies.zig").PublicationStamp{
                 .table_id = 7,
                 .schema_version = 1,
                 .generation = 2,
                 .catalog_epoch = 3,
-                .phase = .active,
+                .phase = if (self.disabled) .disabled else .active,
             }, .{});
         }
     };
@@ -33499,6 +33498,17 @@ test "ordinary read needs no principal without policy but active policy fails cl
     try std.testing.expect((try server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1)) == null);
     fixture.active = true;
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1));
+    try std.testing.expectError(error.RowPolicyAuthenticationRequired, server.rowPolicyWriteProof(std.testing.allocator, .{}, 7, "docs", "main", 1));
+    fixture.disabled = true;
+    try std.testing.expect((try server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1)) == null);
+    try std.testing.expect((try server.rowPolicyWriteProof(std.testing.allocator, .{}, 7, "docs", "main", 1)) == null);
+    fixture.active = false;
+    try std.testing.expect((try server.rowPolicyWriteProof(std.testing.allocator, .{}, 7, "docs", "main", 1)) == null);
+    inline for (.{ error.RowPolicyCatalogChanged, error.RowPolicyUnsupported }) |failure| {
+        fixture.failure = failure;
+        try std.testing.expectError(failure, server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1));
+        try std.testing.expectError(failure, server.rowPolicyWriteProof(std.testing.allocator, .{}, 7, "docs", "main", 1));
+    }
 }
 
 test "api http server authenticates trusted principal" {
@@ -54684,6 +54694,9 @@ test "api http server executes direct foreign table aggregations through registr
             _ = ptr;
             aggregate_saw_no_deadline = params.execution_deadline_ns == null;
             aggregate_saw_cancellation = params.cancellation != null;
+            for (params.aggregations) |aggregation| {
+                if (std.mem.eql(u8, aggregation.definition.type_name, "geohash_grid")) return error.UnsupportedAggregate;
+            }
             const results = try inner_alloc.alloc(foreign_mod.NamedValue, 2);
             results[0] = .{
                 .name = try inner_alloc.dupe(u8, "version_stats"),
@@ -54764,6 +54777,29 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expect(DummyForeign.query_saw_cancellation);
     try std.testing.expect(DummyForeign.aggregate_saw_no_deadline);
     try std.testing.expect(DummyForeign.aggregate_saw_cancellation);
+
+    const unsupported_body =
+        \\{"aggregations":{"geo":{"type":"geohash_grid","field":"tier"}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers"}}}
+    ;
+    try std.testing.expectError(error.UnsupportedQueryRequest, server.executePublicTableQueryDispatchWithIdentity(
+        alloc,
+        dummy_source,
+        "pg_customers",
+        unsupported_body,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    ));
+    var unsupported_response = try server.publicQueryOperationErrorResponse("pg_customers", unsupported_body, error.UnsupportedQueryRequest);
+    defer unsupported_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_response.status);
+    var unsupported = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, unsupported_response.body, .{});
+    defer unsupported.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", unsupported.value.@"error");
 }
 
 test "query builder dependency 503 responses preserve public retry contract" {

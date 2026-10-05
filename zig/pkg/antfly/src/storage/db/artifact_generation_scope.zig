@@ -82,7 +82,7 @@ test "ordered artifact inventory extraction generation namespaces cannot alias c
 
 test "ordered artifact inventory extraction generations share resumable lifecycle without chunk visibility" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const generations = @import("artifact_chunk_generation.zig");
     const publication = @import("artifact_publication.zig");
     const Guard = struct {

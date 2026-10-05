@@ -27,6 +27,7 @@ pub const LocalTransitionResultKind = abi.LocalTransitionResultKind;
 pub const LocalTransitionRequest = abi.LocalTransitionRequest;
 pub const LocalTransitionResult = abi.LocalTransitionResult;
 pub const ContextResourceBudgetStats = abi.ContextResourceBudgetStats;
+pub const ContextMetricsResult = abi.ContextMetricsResult;
 pub const AggregationHit = abi.AggregationHit;
 pub const AggregationRequest = abi.AggregationRequest;
 pub const singleNamespaceStore = system_store_client.singleNamespaceStore;

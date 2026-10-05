@@ -31,6 +31,7 @@ const regex_mod = @import("../../../search/regex.zig");
 const wildcard_mod = @import("../../../search/wildcard.zig");
 const rfc3339 = @import("../../../common/rfc3339.zig");
 const doc_set = @import("../doc_set.zig");
+const member_identity = @import("member_identity.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const JsonView = @import("json_view.zig").View;
@@ -859,19 +860,11 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
     }
 
     for (set.hits, 0..) |hit, i| {
-        var cloned = types.SearchHit{
-            .id = try alloc.dupe(u8, hit.id),
-            .doc_ordinal = hit.doc_ordinal,
-            .score = hit.score,
-            .distance = hit.distance,
-        };
-        errdefer cloned.deinit(alloc);
-        cloned.source_table = if (hit.source_table) |table| try alloc.dupe(u8, table) else null;
-        cloned.stored_data = if (include_stored and hit.stored_data != null)
-            try alloc.dupe(u8, hit.stored_data.?)
-        else
-            null;
-        hits[i] = cloned;
+        // Keep hit metadata in one canonical clone path as SearchHit evolves.
+        // Stored source selection is independent of ancestor/child hydration.
+        var selected = hit;
+        if (!include_stored) selected.stored_data = null;
+        hits[i] = try selected.clone(alloc);
         initialized += 1;
     }
 
@@ -892,20 +885,42 @@ pub fn fuseNamedSets(
 ) !types.SearchResult {
     var ranked_results = try alloc.alloc(fusion_mod.RankedResult, named_sets.len);
     defer alloc.free(ranked_results);
+    var ranked_initialized: usize = 0;
+    defer for (ranked_results[0..ranked_initialized]) |result| alloc.free(result.hits);
 
-    const ordinal_complete = namedSetsHaveCompleteOrdinals(named_sets);
+    // Member identities include the complete artifact provenance and table.
+    // Intern every member into a private fusion key: public ids and parent
+    // ordinals can both be shared by distinct direct embedding members.
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const ordinal_complete = !member_mode and namedSetsHaveCompleteOrdinals(named_sets);
+    var member_entries: MemberFusionMap = .empty;
+    defer {
+        var it = member_entries.valueIterator();
+        while (it.next()) |entry| alloc.free(entry.key);
+        member_entries.deinit(alloc);
+    }
+    var members_by_key = std.StringHashMapUnmanaged(types.SearchHit).empty;
+    defer members_by_key.deinit(alloc);
     var ordinal_fusion_keys = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, OrdinalFusionEntry).empty;
     defer freeOrdinalFusionKeys(alloc, &ordinal_fusion_keys);
     var fusion_key_entries = std.StringHashMapUnmanaged(OrdinalFusionEntry).empty;
     defer fusion_key_entries.deinit(alloc);
     var ordinal_by_id = std.StringHashMapUnmanaged(?doc_set.DocOrdinal).empty;
     defer ordinal_by_id.deinit(alloc);
+    // Ancestor payloads hydrated per-arm (single-arm postprocessing) before
+    // fusion rebuilds hits from scratch; carried forward by fusion key so the
+    // materialized fused hit doesn't silently drop them (issue #930). Values
+    // borrow named_sets' hit memory, which outlives this call.
+    var ancestor_payloads = std.StringHashMapUnmanaged(AncestorPayload).empty;
+    defer ancestor_payloads.deinit(alloc);
 
     for (named_sets, 0..) |set, i| {
         var ranked_hits = try alloc.alloc(fusion_mod.RankedHit, set.hits.len);
         errdefer alloc.free(ranked_hits);
         for (set.hits, 0..) |hit, j| {
-            const ranked_doc_id = if (ordinal_complete) blk: {
+            const ranked_doc_id = if (member_mode)
+                try memberFusionKeyForHit(alloc, &member_entries, &members_by_key, hit)
+            else if (ordinal_complete) blk: {
                 const entry = try ordinalFusionEntryForHit(alloc, &ordinal_fusion_keys, &fusion_key_entries, hit);
                 break :blk entry.key;
             } else blk: {
@@ -919,6 +934,7 @@ pub fn fuseNamedSets(
                 }
                 break :blk hit.id;
             };
+            try recordAncestorPayload(alloc, &ancestor_payloads, ranked_doc_id, hit);
             const raw_score = if (hit.score) |score| score else 0.0;
             ranked_hits[j] = .{
                 .doc_id = ranked_doc_id,
@@ -929,8 +945,8 @@ pub fn fuseNamedSets(
             .index_name = fusionWeightName(set.name),
             .hits = ranked_hits,
         };
+        ranked_initialized += 1;
     }
-    defer for (ranked_results) |result| alloc.free(result.hits);
 
     if (req.merge_config) |config| try validateFusionWeights(config.weights, ranked_results);
 
@@ -962,10 +978,17 @@ pub fn fuseNamedSets(
             fusion_key_entries.get(hit.doc_id) orelse return error.UnsupportedQueryRequest
         else
             null;
-        const output_doc_id = if (representative) |entry| entry.representative_doc_id else hit.doc_id;
+        const member: ?types.SearchHit = if (member_mode)
+            members_by_key.get(hit.doc_id) orelse return error.UnsupportedQueryRequest
+        else
+            null;
+        const output_doc_id = if (member) |original| original.id else if (representative) |entry| entry.representative_doc_id else hit.doc_id;
+        const ancestors = ancestor_payloads.get(hit.doc_id);
         const materialized = blk: {
             const owned_id = try alloc.dupe(u8, output_doc_id);
             errdefer alloc.free(owned_id);
+            const source_table = if (member) |original| (if (original.source_table) |table| try alloc.dupe(u8, table) else null) else null;
+            errdefer if (source_table) |table| alloc.free(table);
             const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             errdefer types.freeIndexScores(alloc, owned_index_scores);
             const stored_data = if (req.include_stored)
@@ -973,12 +996,22 @@ pub fn fuseNamedSets(
             else
                 null;
             errdefer if (stored_data) |value| alloc.free(value);
+            const ancestor_source_data = if (ancestors) |a| (if (a.source) |s| try alloc.dupe(u8, s) else null) else null;
+            errdefer if (ancestor_source_data) |value| alloc.free(value);
+            const ancestor_unit_data = if (ancestors) |a| (if (a.unit) |u| try alloc.dupe(u8, u) else null) else null;
+            errdefer if (ancestor_unit_data) |value| alloc.free(value);
+            var owned_artifact_ref: ?types.ArtifactRef = if (ancestors) |a| (if (a.artifact_ref) |ref| try ref.clone(alloc) else null) else null;
+            errdefer if (owned_artifact_ref) |*ref| ref.deinit(alloc);
             break :blk types.SearchHit{
                 .id = owned_id,
-                .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
+                .source_table = source_table,
+                .doc_ordinal = if (member) |original| original.doc_ordinal else if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
                 .score = @floatCast(hit.score),
                 .index_scores = owned_index_scores,
                 .stored_data = stored_data,
+                .ancestor_source_data = ancestor_source_data,
+                .ancestor_unit_data = ancestor_unit_data,
+                .artifact_ref = owned_artifact_ref,
             };
         };
         hits[i] = materialized;
@@ -1004,11 +1037,70 @@ fn fusedTotalHitsRelation(named_sets: []const NamedResultSet) types.TotalHitsRel
     return .exact;
 }
 
+const MemberFusionMap = std.HashMapUnmanaged(
+    member_identity.Identity,
+    struct { key: []u8 },
+    member_identity.Context,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn memberFusionKeyForHit(
+    alloc: Allocator,
+    entries: *MemberFusionMap,
+    by_key: *std.StringHashMapUnmanaged(types.SearchHit),
+    hit: types.SearchHit,
+) ![]const u8 {
+    const identity = member_identity.Identity.fromHit(hit);
+    if (entries.get(identity)) |entry| return entry.key;
+    const key = try std.fmt.allocPrint(alloc, "__member:{d}", .{entries.count()});
+    errdefer alloc.free(key);
+    try entries.put(alloc, identity, .{ .key = key });
+    errdefer _ = entries.remove(identity);
+    try by_key.put(alloc, key, hit);
+    return key;
+}
+
 const OrdinalFusionEntry = struct {
     key: []const u8,
     representative_doc_id: []const u8,
     ordinal: doc_set.DocOrdinal,
 };
+
+/// Ancestor payloads hydrated by single-arm postprocessing
+/// (hydrateDirectChunkAncestors) before fusion runs. Borrowed byte slices
+/// from the source named_sets' hits; fuseNamedSets dupes them into the
+/// materialized fused hit rather than taking ownership here.
+const AncestorPayload = struct {
+    source: ?[]const u8 = null,
+    unit: ?[]const u8 = null,
+    // Borrowed from the source named_sets' hit, same lifetime guarantee as
+    // source/unit above; fuseNamedSets clones it into the materialized fused
+    // hit rather than taking ownership here.
+    artifact_ref: ?types.ArtifactRef = null,
+};
+
+/// Records the ancestor payload and artifact_ref (if any) carried by a
+/// pre-fusion hit under its fusion key, preferring any arm's hit that
+/// actually populated one for this member (issue #930: fusion previously
+/// rebuilt hits from scratch and silently dropped ancestor_source_data/
+/// ancestor_unit_data; artifact_ref -- a chunk/asset member's provenance --
+/// is lost by the same rebuild and needs the same carry-forward).
+fn recordAncestorPayload(
+    alloc: Allocator,
+    map: *std.StringHashMapUnmanaged(AncestorPayload),
+    key: []const u8,
+    hit: types.SearchHit,
+) !void {
+    if (hit.ancestor_source_data == null and hit.ancestor_unit_data == null and hit.artifact_ref == null) return;
+    const gop = try map.getOrPut(alloc, key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .source = hit.ancestor_source_data, .unit = hit.ancestor_unit_data, .artifact_ref = hit.artifact_ref };
+        return;
+    }
+    if (gop.value_ptr.source == null) gop.value_ptr.source = hit.ancestor_source_data;
+    if (gop.value_ptr.unit == null) gop.value_ptr.unit = hit.ancestor_unit_data;
+    if (gop.value_ptr.artifact_ref == null) gop.value_ptr.artifact_ref = hit.artifact_ref;
+}
 
 fn namedSetsHaveCompleteOrdinals(named_sets: []const NamedResultSet) bool {
     for (named_sets, 0..) |set, set_index| {
@@ -1105,12 +1197,18 @@ fn cloneGraphPathEdgeInfo(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
@@ -1150,6 +1248,8 @@ pub fn convertPatternMatchesToGraphMatches(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             if (path.len > 0) alloc.free(path);
@@ -2222,6 +2322,8 @@ fn discardGraphResultPaths(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(edges);
@@ -6602,6 +6704,73 @@ test "fuseNamedSets preserves fused per-index scores" {
     try std.testing.expectEqualStrings("sparse", result.hits[0].index_scores[1].index_name);
 }
 
+test "fuseNamedSets carries ancestor payloads through fusion (#930)" {
+    const alloc = std.testing.allocator;
+
+    // Only the full-text arm's hit carries the hydrated source ancestor;
+    // fusion must still surface it on the merged member-mode hit rather than
+    // rebuilding a bare {"id": ...} hit from scratch.
+    const text_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .score = 1.0, .ancestor_source_data = @constCast("{\"filename\":\"a.txt\"}") },
+    };
+    const vec_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .score = 0.5 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &text_hits, .total_hits = 1 },
+        .{ .name = "$embeddings_results", .hits = &vec_hits, .total_hits = 1 },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .return_mode = .member,
+        .limit = 5,
+        .include_stored = false,
+    }, &named_sets, .{ .ctx = null, .load_projected_document = Harness.loadProjectedDocument });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"filename\":\"a.txt\"}", result.hits[0].ancestor_source_data.?);
+}
+
+test "fuseNamedSets keeps distinct member-mode chunks sharing a parent ordinal (#931)" {
+    const alloc = std.testing.allocator;
+
+    const text_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .doc_ordinal = 7, .score = 1.0 },
+    };
+    const vec_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .doc_ordinal = 7, .score = 0.9 },
+        .{ .id = @constCast("chunk:a#1"), .doc_ordinal = 7, .score = 0.8 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &text_hits, .total_hits = 1 },
+        .{ .name = "$embeddings_results", .hits = &vec_hits, .total_hits = 2 },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .return_mode = .member,
+        .limit = 5,
+        .include_stored = false,
+    }, &named_sets, .{ .ctx = null, .load_projected_document = Harness.loadProjectedDocument });
+    defer result.deinit();
+
+    // Without the fix this collapses to one hit: both chunks share ordinal 7
+    // and ordinal-keyed fusion (used for non-member modes) would merge them.
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+}
+
 test "executeGraphQueries projects base hits to resolved doc-set for unbounded selectors" {
     const alloc = std.testing.allocator;
 
@@ -7545,4 +7714,112 @@ test "graph metric status clone owns active build worker id" {
     try std.testing.expectEqualStrings("worker-a", cloned[0].build_worker_id);
     try std.testing.expect(cloned[0].build_worker_id.ptr != worker_id.ptr);
     try std.testing.expectEqual(@as(u64, 12345), cloned[0].build_job_id);
+}
+
+test "cloneNamedSetAsResult retains complete member payload under allocation failure" {
+    const AllocationHarness = struct {
+        fn run(alloc: Allocator) !void {
+            const source = [_]types.SearchHit{.{
+                .id = @constCast("chunk:0"),
+                .stored_data = @constCast("{\"text\":true}"),
+                .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{ .index_name = "text", .score = 1.0 }}),
+                .chunk_hits = @constCast(&[_]types.ChunkHit{
+                    .{ .id = @constCast("child:0"), .stored_data = @constCast("{\"child\":true}"), .ancestor_source_data = @constCast("{\"source\":true}"), .artifact_ref = .{ .document_id = @constCast("doc:a"), .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 0 } },
+                    .{ .id = @constCast("child:1"), .ancestor_unit_data = @constCast("{\"unit\":true}") },
+                }),
+                .ancestor_source_data = @constCast("{\"source\":true}"),
+                .ancestor_unit_data = @constCast("{\"unit\":true}"),
+                .artifact_ref = .{
+                    .document_id = @constCast("doc:a"),
+                    .name = @constCast("chunks"),
+                    .kind = .chunk,
+                    .chunk_id = 0,
+                    .unit_id = @constCast("unit:a"),
+                    .source = .{ .kind = .asset, .name = @constCast("units"), .unit_id = @constCast("unit:a") },
+                },
+            }};
+            var result = try cloneNamedSetAsResult(alloc, .{ .name = "only", .hits = &source, .total_hits = 1 }, false);
+            defer result.deinit();
+            try std.testing.expect(result.hits[0].ancestor_source_data != null);
+            try std.testing.expect(result.hits[0].ancestor_unit_data != null);
+            try std.testing.expect(result.hits[0].stored_data == null);
+            try std.testing.expectEqual(@as(usize, 1), result.hits[0].index_scores.len);
+            try std.testing.expect(result.hits[0].artifact_ref != null);
+            try std.testing.expectEqual(@as(usize, 2), result.hits[0].chunk_hits.len);
+            try std.testing.expectEqualStrings(source[0].chunk_hits[0].stored_data.?, result.hits[0].chunk_hits[0].stored_data.?);
+            try std.testing.expectEqualStrings(source[0].chunk_hits[1].ancestor_unit_data.?, result.hits[0].chunk_hits[1].ancestor_unit_data.?);
+            var included = try cloneNamedSetAsResult(alloc, .{ .name = "only", .hits = &source, .total_hits = 1 }, true);
+            defer included.deinit();
+            try std.testing.expectEqualStrings(source[0].stored_data.?, included.hits[0].stored_data.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationHarness.run, .{});
+}
+
+test "fuseNamedSets preserves complete member identities under allocation failure" {
+    const AllocationHarness = struct {
+        fn run(alloc: Allocator) !void {
+            const first = [_]types.SearchHit{.{
+                .id = @constCast("doc:a"),
+                .source_table = @constCast("table:a"),
+                .doc_ordinal = 7,
+                .score = 0.8,
+                .artifact_ref = .{ .document_id = @constCast("doc:a"), .name = @constCast("first_embedding"), .kind = .embedding },
+            }};
+            const second = [_]types.SearchHit{.{
+                .id = @constCast("doc:a"),
+                .source_table = @constCast("table:a"),
+                .doc_ordinal = 7,
+                .score = 0.9,
+                .artifact_ref = .{ .document_id = @constCast("doc:a"), .name = @constCast("second_embedding"), .kind = .embedding },
+            }};
+            const Harness = struct {
+                fn load(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+                    return null;
+                }
+            };
+            inline for ([_]fusion_mod.FusionStrategy{ .rrf, .rsf }) |strategy| {
+                var result = try fuseNamedSets(alloc, .{ .return_mode = .member, .limit = 10, .include_stored = false, .merge_config = .{ .strategy = strategy } }, &.{
+                    .{ .name = "first", .hits = &first, .total_hits = 1 },
+                    .{ .name = "second", .hits = &second, .total_hits = 1 },
+                    .{ .name = "repeat", .hits = &first, .total_hits = 1 },
+                }, .{ .ctx = null, .load_projected_document = Harness.load });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+                try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+                for (result.hits) |hit| {
+                    try std.testing.expectEqualStrings("doc:a", hit.id);
+                    try std.testing.expectEqualStrings("table:a", hit.source_table.?);
+                    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 7), hit.doc_ordinal);
+                    if (std.mem.eql(u8, hit.artifact_ref.?.name, "first_embedding"))
+                        try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationHarness.run, .{});
+}
+
+test "fuseNamedSets member identity separates tables and ignores public id aliases" {
+    const alloc = std.testing.allocator;
+    const ref: types.ArtifactRef = .{ .document_id = @constCast("doc:a"), .name = @constCast("embedding"), .kind = .embedding };
+    const first = [_]types.SearchHit{.{ .id = @constCast("doc:a"), .source_table = @constCast("a"), .artifact_ref = ref, .score = 1 }};
+    const alias = [_]types.SearchHit{.{ .id = @constCast("alias"), .source_table = @constCast("a"), .artifact_ref = ref, .score = 1 }};
+    const other = [_]types.SearchHit{.{ .id = @constCast("doc:a"), .source_table = @constCast("b"), .artifact_ref = ref, .score = 1 }};
+    const Harness = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+    var result = try fuseNamedSets(alloc, .{ .return_mode = .chunk, .limit = 10, .include_stored = false }, &.{
+        .{ .name = "first", .hits = &first, .total_hits = 1 },
+        .{ .name = "alias", .hits = &alias, .total_hits = 1 },
+        .{ .name = "other", .hits = &other, .total_hits = 1 },
+    }, .{ .ctx = null, .load_projected_document = Harness.load });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    for (result.hits) |hit| {
+        try std.testing.expectEqualStrings("doc:a", hit.id);
+        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, hit.source_table.?, "a")) 2 else 1), hit.index_scores.len);
+    }
 }

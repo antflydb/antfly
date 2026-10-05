@@ -104,6 +104,7 @@ pub const graph_mod = antfly.graph;
 pub const traversal_mod = antfly.traversal;
 pub const paths_mod = antfly.paths;
 pub const graph_query_mod = antfly.graph_query;
+const relationship_filter = graph_query_mod.relationship_filter;
 pub const graph_pattern_mod = antfly.graph_pattern;
 pub const lite_restore_staging = antfly.lite.restore_staging;
 pub const portable_backup = antfly.portable_backup;
@@ -1260,6 +1261,7 @@ pub const JsonGraphNodeSelectorRequest = struct {
 };
 
 pub const JsonGraphQueryRequest = struct {
+    edge_filter: ?std.json.Value = null,
     name: []const u8,
     type: []const u8,
     index_name: []const u8,
@@ -1558,6 +1560,8 @@ pub const JsonSparseEnrichmentWrite = struct {
 };
 
 pub const JsonGraphWrite = struct {
+    edge_id: []const u8,
+    owner_document: []const u8,
     index_name: []const u8,
     source_b64: []u8,
     target_b64: []u8,
@@ -1569,6 +1573,8 @@ pub const JsonGraphWrite = struct {
 
     pub fn init(alloc: Allocator, write: db_mod.types.GraphEdgeWrite) !JsonGraphWrite {
         return .{
+            .edge_id = write.edge_id,
+            .owner_document = write.owner_document,
             .index_name = write.index_name,
             .source_b64 = try dupBase64(alloc, write.source),
             .target_b64 = try dupBase64(alloc, write.target),
@@ -1787,6 +1793,8 @@ pub fn decodeBatchWritesRequest(alloc: Allocator, request_json: []const u8) ![]d
 }
 
 pub const JsonEdge = struct {
+    edge_id_b64: ?[]u8 = null,
+    owner_document_b64: ?[]u8 = null,
     source_b64: []u8,
     target_b64: []u8,
     edge_type: []const u8,
@@ -1796,9 +1804,18 @@ pub const JsonEdge = struct {
     metadata_json: []const u8,
 
     pub fn init(alloc: Allocator, edge: db_mod.types.GraphEdge) !JsonEdge {
+        const source = try dupBase64(alloc, edge.source);
+        errdefer alloc.free(source);
+        const target = try dupBase64(alloc, edge.target);
+        errdefer alloc.free(target);
+        const id = if (edge.edge_id.len > 0) try dupBase64(alloc, edge.edge_id) else null;
+        errdefer if (id) |value| alloc.free(value);
+        const owner = if (edge.owner_document.len > 0) try dupBase64(alloc, edge.owner_document) else null;
         return .{
-            .source_b64 = try dupBase64(alloc, edge.source),
-            .target_b64 = try dupBase64(alloc, edge.target),
+            .source_b64 = source,
+            .target_b64 = target,
+            .edge_id_b64 = id,
+            .owner_document_b64 = owner,
             .edge_type = edge.edge_type,
             .weight = edge.weight,
             .created_at = edge.created_at,
@@ -1810,6 +1827,8 @@ pub const JsonEdge = struct {
     pub fn deinit(self: *JsonEdge, alloc: Allocator) void {
         alloc.free(self.source_b64);
         alloc.free(self.target_b64);
+        if (self.edge_id_b64) |value| alloc.free(value);
+        if (self.owner_document_b64) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -1819,6 +1838,7 @@ pub const JsonTraversalResult = struct {
     depth: u32,
     total_weight: f64,
     path_b64: ?[][]u8 = null,
+    path_edges: []JsonPathEdge = &.{},
 
     pub fn init(alloc: Allocator, item: db_mod.types.GraphTraversalResult) !JsonTraversalResult {
         var path_b64: ?[][]u8 = null;
@@ -1835,11 +1855,18 @@ pub const JsonTraversalResult = struct {
             }
             path_b64 = encoded;
         }
+        errdefer if (path_b64) |items| {
+            for (items) |key| alloc.free(key);
+            alloc.free(items);
+        };
+        const path_edges = try jsonPathEdgesAlloc(alloc, item.path_edges orelse &.{});
+        errdefer freeJsonPathEdges(alloc, path_edges);
         return .{
             .key_b64 = try dupBase64(alloc, item.key),
             .depth = item.depth,
             .total_weight = item.total_weight,
             .path_b64 = path_b64,
+            .path_edges = path_edges,
         };
     }
 
@@ -1849,6 +1876,7 @@ pub const JsonTraversalResult = struct {
             for (items) |entry| alloc.free(entry);
             alloc.free(items);
         }
+        freeJsonPathEdges(alloc, self.path_edges);
         self.* = undefined;
     }
 };
@@ -1856,24 +1884,64 @@ pub const JsonTraversalResult = struct {
 pub const JsonPathEdge = struct {
     source_b64: []u8,
     target_b64: []u8,
+    edge_id_b64: ?[]u8 = null,
+    owner_document_b64: ?[]u8 = null,
     edge_type: []const u8,
     weight: f64,
+    metadata_json: []const u8,
+    traversal_direction: ?u8 = null,
 
-    pub fn init(alloc: Allocator, edge: paths_mod.PathEdge) !JsonPathEdge {
+    pub fn init(alloc: Allocator, edge: anytype) !JsonPathEdge {
+        const source = try dupBase64(alloc, edge.source);
+        errdefer alloc.free(source);
+        const target = try dupBase64(alloc, edge.target);
+        errdefer alloc.free(target);
+        const id = if (edge.edge_id.len > 0) try dupBase64(alloc, edge.edge_id) else null;
+        errdefer if (id) |value| alloc.free(value);
+        const owner = if (edge.owner_document.len > 0) try dupBase64(alloc, edge.owner_document) else null;
         return .{
-            .source_b64 = try dupBase64(alloc, edge.source),
-            .target_b64 = try dupBase64(alloc, edge.target),
+            .source_b64 = source,
+            .target_b64 = target,
+            .edge_id_b64 = id,
+            .owner_document_b64 = owner,
             .edge_type = edge.edge_type,
             .weight = edge.weight,
+            .metadata_json = edge.metadata,
+            .traversal_direction = if (edge.traversal_direction) |direction| switch (direction) {
+                .out => 0,
+                .in => 1,
+                .both => 2,
+            } else null,
         };
     }
 
     pub fn deinit(self: *JsonPathEdge, alloc: Allocator) void {
         alloc.free(self.source_b64);
         alloc.free(self.target_b64);
+        if (self.edge_id_b64) |value| alloc.free(value);
+        if (self.owner_document_b64) |value| alloc.free(value);
         self.* = undefined;
     }
 };
+
+pub fn jsonPathEdgesAlloc(alloc: Allocator, edges: anytype) ![]JsonPathEdge {
+    const result = try alloc.alloc(JsonPathEdge, edges.len);
+    var count: usize = 0;
+    errdefer {
+        for (result[0..count]) |*edge| edge.deinit(alloc);
+        alloc.free(result);
+    }
+    for (edges, 0..) |edge, i| {
+        result[i] = try JsonPathEdge.init(alloc, edge);
+        count += 1;
+    }
+    return result;
+}
+
+pub fn freeJsonPathEdges(alloc: Allocator, edges: []JsonPathEdge) void {
+    for (edges) |*edge| edge.deinit(alloc);
+    alloc.free(edges);
+}
 
 pub const JsonPath = struct {
     nodes_b64: [][]u8,
@@ -2006,23 +2074,12 @@ pub const JsonGraphNode = struct {
             path_b64 = encoded;
         }
 
-        var path_edges = try alloc.alloc(JsonPathEdge, if (node.path_edges) |items| items.len else 0);
-        errdefer alloc.free(path_edges);
-        var edge_count: usize = 0;
-        errdefer {
-            for (path_edges[0..edge_count]) |*edge| edge.deinit(alloc);
-        }
-        if (node.path_edges) |items| {
-            for (items, 0..) |edge, i| {
-                path_edges[i] = .{
-                    .source_b64 = try dupBase64(alloc, edge.source),
-                    .target_b64 = try dupBase64(alloc, edge.target),
-                    .edge_type = try alloc.dupe(u8, edge.edge_type),
-                    .weight = edge.weight,
-                };
-                edge_count += 1;
-            }
-        }
+        errdefer if (path_b64) |items| {
+            for (items) |item| alloc.free(item);
+            alloc.free(items);
+        };
+        const path_edges = try jsonPathEdgesAlloc(alloc, node.path_edges orelse &.{});
+        errdefer freeJsonPathEdges(alloc, path_edges);
 
         return .{
             .key_b64 = try dupBase64(alloc, node.key),
@@ -5944,7 +6001,7 @@ pub export fn antfly_db_execute_graph_queries_json(
         identity_read_generation: ?u64 = null,
     };
 
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
 
     if (parsed.value.identity_read_generation == null) {
@@ -6068,8 +6125,10 @@ pub fn parseNamedGraphQueries(alloc: Allocator, requests: []const JsonGraphQuery
         for (queries[0..count]) |*query| deinitOwnedNamedGraphQuery(alloc, query);
     }
     for (requests, 0..) |request, i| {
+        const name = try alloc.dupe(u8, request.name);
+        errdefer alloc.free(name);
         queries[i] = .{
-            .name = try alloc.dupe(u8, request.name),
+            .name = name,
             .query = try parseGraphQueryRequestOwned(alloc, request),
         };
         count += 1;
@@ -6095,23 +6154,33 @@ pub fn parseNamedGraphInputSets(alloc: Allocator, requests: []const JsonNamedGra
     return sets;
 }
 
+fn parseEmbeddedRelationshipFilter(alloc: Allocator, value: ?std.json.Value) !relationship_filter.Filter {
+    return if (value) |filter| relationship_filter.parsePublicAlloc(alloc, filter) else .{};
+}
+
 pub fn parseGraphQueryRequestOwned(alloc: Allocator, request: JsonGraphQueryRequest) !graph_query_mod.GraphQuery {
+    const query_type: graph_query_mod.QueryType = if (std.mem.eql(u8, request.type, "neighbors")) .neighbors else if (std.mem.eql(u8, request.type, "traverse")) .traverse else if (std.mem.eql(u8, request.type, "shortest_path")) .shortest_path else if (std.mem.eql(u8, request.type, "k_shortest_paths")) .k_shortest_paths else return error.InvalidArgument;
+    const edge_filter = try parseEmbeddedRelationshipFilter(alloc, request.edge_filter);
+    errdefer edge_filter.deinit(alloc);
+    const index_name = try alloc.dupe(u8, request.index_name);
+    errdefer alloc.free(index_name);
+    var start_nodes = try parseGraphNodeSelectorRequestOwned(alloc, request.start_nodes);
+    errdefer deinitOwnedNodeSelector(alloc, &start_nodes);
+    var target_nodes = if (request.target_nodes) |target| try parseGraphNodeSelectorRequestOwned(alloc, target) else null;
+    errdefer if (target_nodes) |*target| deinitOwnedNodeSelector(alloc, target);
+    const edge_types = try cloneGraphEdgeTypes(alloc, request.edge_types);
+    errdefer {
+        for (edge_types) |edge_type| alloc.free(edge_type);
+        alloc.free(edge_types);
+    }
     return .{
-        .query_type = if (std.mem.eql(u8, request.type, "neighbors"))
-            .neighbors
-        else if (std.mem.eql(u8, request.type, "traverse"))
-            .traverse
-        else if (std.mem.eql(u8, request.type, "shortest_path"))
-            .shortest_path
-        else if (std.mem.eql(u8, request.type, "k_shortest_paths"))
-            .k_shortest_paths
-        else
-            return error.InvalidArgument,
-        .index_name = try alloc.dupe(u8, request.index_name),
-        .start_nodes = try parseGraphNodeSelectorRequestOwned(alloc, request.start_nodes),
-        .target_nodes = if (request.target_nodes) |target_nodes| try parseGraphNodeSelectorRequestOwned(alloc, target_nodes) else null,
+        .query_type = query_type,
+        .index_name = index_name,
+        .start_nodes = start_nodes,
+        .target_nodes = target_nodes,
         .params = .{
-            .edge_types = try cloneGraphEdgeTypes(alloc, request.edge_types),
+            .edge_types = edge_types,
+            .edge_filter = edge_filter,
             .direction = parseGraphDirection(request.direction),
             .max_depth = request.max_depth,
             .max_results = request.max_results,
@@ -6202,6 +6271,7 @@ pub fn deinitOwnedGraphQuery(alloc: Allocator, query: *graph_query_mod.GraphQuer
     alloc.free(@constCast(query.index_name));
     deinitOwnedNodeSelector(alloc, &query.start_nodes);
     if (query.target_nodes) |*target_nodes| deinitOwnedNodeSelector(alloc, target_nodes);
+    query.params.edge_filter.deinit(alloc);
     for (query.params.edge_types) |edge_type| alloc.free(@constCast(edge_type));
     if (query.params.edge_types.len > 0) alloc.free(query.params.edge_types);
     query.* = undefined;
@@ -6421,6 +6491,7 @@ pub export fn antfly_db_traverse_edges_json(
         index_name: []const u8,
         start_key_b64: []const u8,
         edge_types: []const []const u8 = &.{},
+        edge_filter: ?std.json.Value = null,
         direction: u8 = 0,
         max_depth: u32 = 3,
         min_weight: f64 = 0.0,
@@ -6429,8 +6500,10 @@ pub export fn antfly_db_traverse_edges_json(
         deduplicate_nodes: bool = true,
         include_paths: bool = false,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
+    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
+    defer edge_filter.deinit(handle.alloc);
     const start_key = decodeBase64Alloc(handle.alloc, parsed.value.start_key_b64) catch return .invalid_argument;
     defer handle.alloc.free(start_key);
     const direction: db_mod.types.GraphEdgeDirection = switch (parsed.value.direction) {
@@ -6441,6 +6514,7 @@ pub export fn antfly_db_traverse_edges_json(
     };
     const results = handle.db.traverseEdges(handle.alloc, parsed.value.index_name, start_key, .{
         .edge_types = parsed.value.edge_types,
+        .edge_filter = edge_filter,
         .direction = direction,
         .max_depth = parsed.value.max_depth,
         .min_weight = legacyGraphWeightBound(parsed.value.min_weight),
@@ -6510,14 +6584,17 @@ pub export fn antfly_db_find_shortest_path_json(
         source_b64: []const u8,
         target_b64: []const u8,
         edge_types: []const []const u8 = &.{},
+        edge_filter: ?std.json.Value = null,
         direction: u8 = 0,
         weight_mode: []const u8 = "min_hops",
         max_depth: u32 = 50,
         min_weight: f64 = 0.0,
         max_weight: f64 = 0.0,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
+    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
+    defer edge_filter.deinit(handle.alloc);
     const source = decodeBase64Alloc(handle.alloc, parsed.value.source_b64) catch return .invalid_argument;
     defer handle.alloc.free(source);
     const target = decodeBase64Alloc(handle.alloc, parsed.value.target_b64) catch return .invalid_argument;
@@ -6534,11 +6611,19 @@ pub export fn antfly_db_find_shortest_path_json(
         .max_weight
     else
         .min_hops;
-    const maybe_path = handle.db.findShortestPath(handle.alloc, parsed.value.index_name, source, target, parsed.value.edge_types, direction, weight_mode, parsed.value.max_depth, legacyGraphWeightBound(parsed.value.min_weight), legacyGraphWeightBound(parsed.value.max_weight)) catch |err| return capi.mapError(err);
+    const maybe_path = handle.db.findShortestPathWithOptions(handle.alloc, parsed.value.index_name, source, target, .{
+        .edge_types = parsed.value.edge_types,
+        .edge_filter = edge_filter,
+        .direction = direction,
+        .weight_mode = weight_mode,
+        .max_depth = parsed.value.max_depth,
+        .min_weight = legacyGraphWeightBound(parsed.value.min_weight),
+        .max_weight = legacyGraphWeightBound(parsed.value.max_weight),
+    }) catch |err| return capi.mapError(err);
     if (maybe_path == null) return .not_found;
+    defer paths_mod.freePath(handle.alloc, maybe_path.?);
     var payload = JsonPath.init(handle.alloc, maybe_path.?) catch return .internal;
     defer payload.deinit(handle.alloc);
-    defer paths_mod.freePath(handle.alloc, maybe_path.?);
     out_buf.* = stringifyJson(payload) catch return .internal;
     return .ok;
 }
@@ -6556,6 +6641,7 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         source_b64: []const u8,
         target_b64: []const u8,
         edge_types: []const []const u8 = &.{},
+        edge_filter: ?std.json.Value = null,
         direction: u8 = 0,
         weight_mode: []const u8 = "min_hops",
         max_depth: u32 = 50,
@@ -6563,8 +6649,10 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         max_weight: f64 = 0.0,
         k: u32 = 1,
     };
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
+    var parsed = std.json.parseFromSlice(Request, handle.alloc, request_json.bytes(), .{ .parse_numbers = false }) catch return .invalid_argument;
     defer parsed.deinit();
+    const edge_filter = parseEmbeddedRelationshipFilter(handle.alloc, parsed.value.edge_filter) catch return .invalid_argument;
+    defer edge_filter.deinit(handle.alloc);
     const source = decodeBase64Alloc(handle.alloc, parsed.value.source_b64) catch return .invalid_argument;
     defer handle.alloc.free(source);
     const target = decodeBase64Alloc(handle.alloc, parsed.value.target_b64) catch return .invalid_argument;
@@ -6581,7 +6669,15 @@ pub export fn antfly_db_find_k_shortest_paths_json(
         .max_weight
     else
         .min_hops;
-    const paths = handle.db.findKShortestPaths(handle.alloc, parsed.value.index_name, source, target, parsed.value.k, parsed.value.edge_types, direction, weight_mode, parsed.value.max_depth, legacyGraphWeightBound(parsed.value.min_weight), legacyGraphWeightBound(parsed.value.max_weight)) catch |err| return capi.mapError(err);
+    const paths = handle.db.findKShortestPathsWithOptions(handle.alloc, parsed.value.index_name, source, target, parsed.value.k, .{
+        .edge_types = parsed.value.edge_types,
+        .edge_filter = edge_filter,
+        .direction = direction,
+        .weight_mode = weight_mode,
+        .max_depth = parsed.value.max_depth,
+        .min_weight = legacyGraphWeightBound(parsed.value.min_weight),
+        .max_weight = legacyGraphWeightBound(parsed.value.max_weight),
+    }) catch |err| return capi.mapError(err);
     defer paths_mod.freePaths(handle.alloc, paths);
     var payload = handle.alloc.alloc(JsonPath, paths.len) catch return .internal;
     var count: usize = 0;

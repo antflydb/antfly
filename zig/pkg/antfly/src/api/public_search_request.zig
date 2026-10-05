@@ -125,14 +125,39 @@ pub fn parseEmbeddingsAlloc(
 
     var it = embeddings.map.iterator();
     while (it.next()) |entry| {
+        const index_name = try alloc.dupe(u8, entry.key_ptr.*);
+        errdefer alloc.free(index_name);
+        var query = try public_embedding_query_mod.parseEmbeddingValueAlloc(alloc, entry.value_ptr.*, default_k);
+        errdefer query.deinit(alloc);
         try items.append(alloc, .{
-            .index_name = try alloc.dupe(u8, entry.key_ptr.*),
-            .query = try public_embedding_query_mod.parseEmbeddingValueAlloc(alloc, entry.value_ptr.*, default_k),
+            .index_name = index_name,
+            .query = query,
         });
     }
     return .{
         .items = try items.toOwnedSlice(alloc),
     };
+}
+
+fn embeddingParsingAllocationScenario(alloc: std.mem.Allocator) !void {
+    const Wire = struct { embeddings: ?std.json.ArrayHashMap(std.json.Value) = null };
+    var json = try std.json.parseFromSlice(Wire, alloc,
+        \\{"embeddings":{"dense":[1,0.5],"sparse":{"packed_indices":"AQAAAA==","packed_values":"AAAAPw==","k":3}}}
+    , .{ .parse_numbers = false });
+    defer json.deinit();
+    var parsed = try parseEmbeddingsAlloc(alloc, json.value, 7);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), parsed.items.len);
+}
+
+test "embedding parsing releases partially owned entries on failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, embeddingParsingAllocationScenario, .{});
+    const Wire = struct { embeddings: ?std.json.ArrayHashMap(std.json.Value) = null };
+    var json = try std.json.parseFromSlice(Wire, std.testing.allocator,
+        \\{"embeddings":{"valid":[1,0.5],"invalid":{"indices":[-1],"values":[1]}}}
+    , .{ .parse_numbers = false });
+    defer json.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseEmbeddingsAlloc(std.testing.allocator, json.value, 7));
 }
 
 pub fn cloneRequestedIndexesAlloc(

@@ -4,7 +4,7 @@
 //! production child-owner apply still verifies the source fence, exact schema
 //! and catalog digests, and Raft marker before installing the new schema.
 const std = @import("std");
-const db_mod = @import("../storage/db/db.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const topology = @import("../storage/db/relational_integrity_topology.zig");
 const public_schema = @import("../schema/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");

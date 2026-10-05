@@ -443,7 +443,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         .public_schema_json_digest = candidate.public_schema_json_digest,
         .catalog_digest = candidate.catalog_digest,
     };
-    const db_options: @import("../../storage/db/db.zig").OpenOptions = .{ .identity_namespace = namespace, .initial_child_bootstrap = bootstrap, .start_optional_runtimes = false, .start_index_workers = false };
+    const db_options: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions = .{ .identity_namespace = namespace, .initial_child_bootstrap = bootstrap, .start_optional_runtimes = false, .start_index_workers = false };
     const child_fence: @import("../../storage/db/relational_integrity_topology_contract.zig").Fence = .{
         .role = .child_generation_source,
         .transition_id = child.table_id,
@@ -455,7 +455,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
         .catalog_digest = candidate.catalog_digest,
     };
     {
-        var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
+        var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
         try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .provision_initial_child, .fence = child_fence, .initial_child_provision = .{
@@ -497,7 +497,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
     defer store.freeTables(alloc, public_tables);
     try std.testing.expectEqual(@as(usize, 0), public_tables.len);
     {
-        var db = try @import("../../storage/db/db.zig").DB.open(alloc, db_path, db_options);
+        var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, db_path, db_options);
         defer db.close();
         try std.testing.expectError(error.InitialChildNotPublished, db.lookup(alloc, "unpublished", .{}));
         try @import("../../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = .{ .action = .release_initial_child, .fence = child_fence, .initial_child_control = .{
@@ -5914,7 +5914,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         };
         var context: u8 = 0;
         try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
-        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
+        try std.testing.expectError(error.MetadataReplicationPending, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
     try std.testing.expect(final_lsn > 8);
@@ -6996,7 +6996,10 @@ pub const RaftApplyStore = struct {
         };
         self.unlockHotStandbyTransition();
         transition_locked = false;
-        self.flushHotStandbyOutboxLocked() catch return error.MetadataMutationOutcomeUnknown;
+        // Local commit and sync succeeded. Failure to publish/acknowledge its
+        // outbox must preserve the committed catalog without poisoning local
+        // durability or admitting a subsequent mutation past that outbox.
+        self.flushHotStandbyOutboxLocked() catch return error.MetadataReplicationPending;
     }
 
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {
@@ -7847,7 +7850,15 @@ pub const RaftApplyStore = struct {
         if (table_id == 0) return error.InvalidRowPolicyPublication;
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
-        const stamp = try system_catalog_storage.loadPolicyPublicationStamp(alloc, &txn, group_id, table_id);
+        const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(alloc, &txn, group_id, table_id)) orelse {
+            // Absence is data, not an unsupported capability or a stale fence.
+            // A publication without its transactionally written stamp is corrupt.
+            if (try system_catalog_storage.loadPolicyPublication(alloc, &txn, group_id, table_id)) |publication| {
+                publication.deinit();
+                return error.RowPolicyCatalogChanged;
+            }
+            return alloc.dupe(u8, "null");
+        };
         if (stamp.topology_generation != 0 and
             !std.mem.eql(u8, &stamp.schema_record_digest, &([_]u8{0} ** 32)))
         {
@@ -8094,7 +8105,7 @@ pub const RaftApplyStore = struct {
     fn validatePolicyPublicationStampTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, publication: sql_policies.Publication) !void {
         if (publication.topology_generation == 0 or std.mem.eql(u8, &publication.schema_record_digest, &([_]u8{0} ** 32)))
             return self.validatePolicyOwnerCutTxn(txn, group_id, publication);
-        const stamp = try system_catalog_storage.loadPolicyPublicationStamp(self.alloc, txn, group_id, publication.table_id);
+        const stamp = (try system_catalog_storage.loadPolicyPublicationStamp(self.alloc, txn, group_id, publication.table_id)) orelse return error.RowPolicyCatalogChanged;
         if (!std.meta.eql(stamp, sql_policies.PublicationStamp.fromPublication(publication))) return error.RowPolicyCatalogChanged;
         try self.validatePolicyOwnerStampTxn(txn, group_id, stamp);
     }
@@ -28564,6 +28575,10 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
         const definition = try std.json.Stringify.valueAlloc(alloc, sql_policies.Command{ .expected_revision = 1, .change = .{ .put = record } }, .{});
         defer alloc.free(definition);
         try store.applyStandaloneCommand(group, .{ .apply_sql_policies = definition });
+        const absent_status = try store.sqlPolicyPublicationStatusJson(alloc, group, table.table_id);
+        defer alloc.free(absent_status);
+        try std.testing.expectEqualStrings("null", absent_status);
+
         try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = false, .expected_revision = 2 }));
         try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyBeginCommandJson(alloc, group, .{ .table_id = 7, .enable = true, .expected_revision = 1 }));
         var forged_publication = publication;
@@ -28599,6 +28614,28 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
             try unlock_txn.commit();
         }
         try store.applyStandaloneCommand(group, .{ .apply_sql_policy_publication = begin });
+
+        // Losing the stamp of an existing publication must fail closed rather
+        // than turning a protected table into an unprotected one.
+        {
+            const stamp_key = try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:policy-publication-stamp:{d}", .{ group, table.table_id });
+            defer alloc.free(stamp_key);
+            const stamp_bytes = blk: {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                const bytes = try alloc.dupe(u8, try txn.get(stamp_key));
+                errdefer alloc.free(bytes);
+                try txn.delete(stamp_key);
+                try txn.commit();
+                break :blk bytes;
+            };
+            defer alloc.free(stamp_bytes);
+            try std.testing.expectError(error.RowPolicyCatalogChanged, store.sqlPolicyPublicationStatusJson(alloc, group, table.table_id));
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(stamp_key, stamp_bytes);
+            try txn.commit();
+        }
         const full_cut_validations_after_begin = store.policy_full_owner_cut_validations;
         const pending_work_bytes = try store.sqlPolicyPublicationWorkJson(alloc, group, 0);
         defer alloc.free(pending_work_bytes);

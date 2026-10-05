@@ -191,7 +191,7 @@ pub fn stageInstall(
 }
 
 test "mapped restore admission install requires exact imported proof and persists atomically" {
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

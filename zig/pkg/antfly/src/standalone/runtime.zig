@@ -925,7 +925,13 @@ const LocalStandaloneMetadata = struct {
 
     fn beginCatalogMutationLocked(self: *LocalStandaloneMetadata) !CatalogMutation {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) return error.TableLifecycleConflict;
-        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        // A prior commit in this failed state is genuinely ambiguous (it may
+        // have landed before the outage). A brand-new proposal starting now
+        // never reaches the log, so its outcome is a known drop, not unknown.
+        if (self.catalog_durability_failed) return error.ProposalDropped;
+        // A previous locally committed mutation may still be waiting for HA
+        // acknowledgement. This proposal has not reached its transaction.
+        if (self.lifecycle_store) |store| store.flushHotStandbyOutbox() catch return error.ProposalDropped;
         return .{ .previous_epoch = self.epoch };
     }
 
@@ -1597,7 +1603,7 @@ const LocalStandaloneMetadata = struct {
     fn initialFkRetirementOwnership(
         ptr: *anyopaque,
         owner_group_id: u64,
-        proof: @import("../api/table_writes.zig").InitialFkRetirementProof,
+        proof: @import("../common/initial_fk_retirement_proof.zig").InitialFkRetirementProof,
     ) !antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try proof.validate();
@@ -2395,7 +2401,7 @@ const LocalStandaloneMetadata = struct {
         if (state.phase == .preparing_support) return null;
         const targets = try alloc.alloc(antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementTarget, state.plan.child_ranges.len);
         defer alloc.free(targets);
-        const proof: @import("../api/table_writes.zig").InitialFkRetirementProof = .{
+        const proof: @import("../common/initial_fk_retirement_proof.zig").InitialFkRetirementProof = .{
             .child_table_id = state.plan.child.table_id,
             .plan_id = state.plan.id,
             .plan_digest = state.plan_digest,
@@ -2814,7 +2820,9 @@ const LocalStandaloneMetadata = struct {
                 }
                 const delta = self.planCatalogTopologyLocked(a, command, dropping_table) catch |err| {
                     if (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists) {
-                        if (self.hot_standby_catalog_server) |server| server.acknowledgeHotStandbyExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
+                        if (self.lifecycle_store) |store| {
+                            store.flushHotStandbyOutbox() catch return error.MetadataMutationOutcomeUnknown;
+                        } else if (self.hot_standby_catalog_server) |server| server.acknowledgeHotStandbyExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
                     }
                     return err;
                 };
@@ -4215,6 +4223,14 @@ const LocalStandaloneMetadata = struct {
             } else null,
         };
         self.lifecycle_store.?.updateStandaloneCatalog(group_ids.main_metadata_group_id, self.durable_revision, update) catch |err| {
+            if (err == error.MetadataReplicationPending) {
+                // The local transaction is durable. Retain its projection and
+                // revision while the outbox gates future proposals and retries.
+                mutation.committed = true;
+                self.durable_revision += 1;
+                self.epoch = self.durable_revision;
+                return error.MetadataMutationOutcomeUnknown;
+            }
             if (err == error.MetadataMutationOutcomeUnknown) {
                 mutation.committed = true;
                 self.durable_revision = 0;
@@ -11446,6 +11462,9 @@ test "standalone initial external MATCH PARTIAL FK cancellation retires private 
 fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var tmp = std.testing.tmpDir(.{});
     var preserve = false;
     defer if (!preserve) tmp.cleanup();
@@ -11478,6 +11497,15 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
     try server.initApiServer();
+    // The data server's control round schedules session maintenance in the
+    // background, which independently drives this same FK initial-create
+    // publication via advanceFkInitialCreateBackgroundOnce. Left unpaused,
+    // that background driver races the explicit FkInitialCreateTestDriver
+    // steps below and can finish (or publish) the whole flow before the
+    // loop observes the phase it means to act on, exactly how the
+    // cancellation path intermittently missed its .staging_parents window.
+    // Pause it, matching the hosted FK fault-injection e2e tests.
+    try antfly.public_api.ApiHttpServer.FkInitialCreateTestDriver.pauseBackground(&server.http_server.?, io);
 
     const parent_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"parent_key","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"],"additionalProperties":false}}}}
@@ -11513,9 +11541,6 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     defer metadata.lifecycle_store.?.freeTables(alloc, before);
     try std.testing.expectEqual(@as(usize, 1), before.len);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
     var lost_parent_reply = false;
     var cancel_requested = false;
     var terminal = false;
@@ -11588,6 +11613,9 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
             metadata.attachRestoreRetirementOwnership();
             opened = true;
             try server.initApiServer();
+            // The restart replaces http_server with a fresh instance whose
+            // background session-maintenance scheduler starts unpaused.
+            try antfly.public_api.ApiHttpServer.FkInitialCreateTestDriver.pauseBackground(&server.http_server.?, io);
         } else antfly.public_api.ApiHttpServer.FkInitialCreateTestDriver.step(&server.http_server.?, .none) catch |err| switch (err) {
             // The background driver can advance the same durable intent
             // between work selection and its revision-fenced acknowledgement.
@@ -11792,6 +11820,9 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
     const control = antfly.public_api.relational_fk_generation_publication;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
     var tmp = std.testing.tmpDir(.{});
     var preserve = false;
     defer if (!preserve) tmp.cleanup();
@@ -11821,7 +11852,18 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
         metadata.deinit();
     };
     try std.testing.expect(metadata.localFkPublicationSupported());
-    if (ordinary) try server.initApiServer();
+    if (ordinary) {
+        try server.initApiServer();
+        // The data server's control round schedules session maintenance in
+        // the background, which independently drives the same FK generation
+        // publication via advanceFkGenerationPublicationBackgroundOnce. Left
+        // unpaused, it races the explicit FkGenerationPublicationTestDriver
+        // steps below and can finish installing the child schema before the
+        // loop observes .installing_child to inject the second reply loss,
+        // failing the `lost_install_reply` assertion. Pause it, matching the
+        // hosted FK fault-injection e2e tests.
+        try antfly.public_api.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(&server.http_server.?, io);
+    }
     const logical_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
@@ -11928,7 +11970,13 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
             metadata.data_server = &server;
             try std.testing.expect(metadata.localFkPublicationSupported());
             opened = true;
-            if (ordinary) try server.initApiServer();
+            if (ordinary) {
+                try server.initApiServer();
+                // A fresh http_server starts with its background scheduler
+                // unpaused; re-pause before the generation-publication round
+                // loop below single-steps it.
+                try antfly.public_api.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(&server.http_server.?, io);
+            }
         }
     }
     try std.testing.expectEqual(@as(usize, 4), receipts);
@@ -11985,6 +12033,9 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
                 metadata.data_server = &server;
                 opened = true;
                 try server.initApiServer();
+                // Re-pause the fresh http_server's background scheduler; see
+                // the comment at the earlier initApiServer() calls above.
+                try antfly.public_api.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(&server.http_server.?, io);
             }
         }
         const published = (try metadata.resolveSystemCatalogLocked(.{ .table = "nodes" })).?;
@@ -12352,7 +12403,7 @@ test "standalone canceled initial self FK retires exact private owners after res
     defer alloc.free(canceled_status_json);
     var canceled_status = try std.json.parseFromSlice(publication.InitialPublication, alloc, canceled_status_json, .{});
     defer canceled_status.deinit();
-    const proof: @import("../api/table_writes.zig").InitialFkRetirementProof = .{
+    const proof: @import("../common/initial_fk_retirement_proof.zig").InitialFkRetirementProof = .{
         .child_table_id = child.table_id,
         .plan_id = id,
         .plan_digest = canceled_status.value.plan_digest,
@@ -12506,11 +12557,19 @@ test "standalone catalog remote apply outage preserves committed creation and re
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("pending") != null);
     try std.testing.expect(try metadata.lifecycle_store.?.standaloneRevision() > before_revision);
-    try std.testing.expectEqual(@as(u64, 0), metadata.durable_revision);
+    try std.testing.expectEqual(before_revision + 1, metadata.durable_revision);
+    try std.testing.expect(!metadata.catalog_durability_failed);
+    var committed_snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
+    defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &committed_snapshot);
+    try std.testing.expect(committed_snapshot.tables.len > 0);
     const committed_lsn = primary.lastLsn();
     try std.testing.expect(committed_lsn != 0);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
-    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
+    // "pending" is a retry of an already-attempted mutation (ambiguous: it
+    // may have landed before the outage). "not_committed" is a brand-new
+    // proposal that never reaches the log while the durable outbox is pending,
+    // so beginCatalogMutationLocked reports it as a known drop.
+    try std.testing.expectError(error.ProposalDropped, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("not_committed") == null);
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
     metadata.deinit();
@@ -14317,6 +14376,9 @@ test "system catalog standalone imports main checkpoints and current logical see
                 } else try writeFileAtomically(alloc, runtime.ptr().io().?, path, input);
                 var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
                 defer metadata.deinit();
+                // Every standalone engine now shares the same authoritative
+                // lifecycle journal, so init() atomically imports catalog rows
+                // for both .local and .lite, not .local only.
                 try std.testing.expect(metadata.catalog_rows_initialized);
                 const renamed = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = if (from_main) .{ .action = .create, .kind = .database, .name = "warehouse" } else .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
                 alloc.free(renamed);
@@ -14346,8 +14408,6 @@ test "system catalog standalone imports main checkpoints and current logical see
                     txn_open = false;
                     try durable.sync(true);
                 } else {
-                    // Native authority no longer reads or overwrites the old
-                    // JSON checkpoint after the atomic one-time import.
                     try writeFileAtomically(alloc, runtime.ptr().io().?, path, "{broken legacy checkpoint");
                 }
             }
@@ -14355,6 +14415,8 @@ test "system catalog standalone imports main checkpoints and current logical see
                 var lite: ?antfly.lite.backend.Handle = if (engine == .lite) try antfly.lite.backend.Handle.open(alloc, path, .{}) else null;
                 defer if (lite) |*handle| handle.deinit();
                 const store = if (lite) |*handle| try handle.runtimeStoreForNamespace("system/metadata") else null;
+                // Both engines are unaffected by the legacy-key corruption
+                // above; native authority owns the catalog exclusively.
                 var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
                 defer metadata.deinit();
                 try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "warehouse") != null);

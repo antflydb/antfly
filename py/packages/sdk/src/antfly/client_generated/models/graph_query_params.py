@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+    from ..models.graph_relationship_filter import GraphRelationshipFilter
     from ..models.node_filter import NodeFilter
 
 
@@ -23,6 +24,11 @@ class GraphQueryParams:
     """Deprecated graph_searches traversal and path parameters.
 
     Attributes:
+        edge_filter (GraphRelationshipFilter | Unset): AND predicates applied to every relationship before neighbor
+            admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use
+            explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have
+            inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a
+            created_at value. Invalid timestamp properties never match.
         edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
@@ -44,6 +50,7 @@ class GraphQueryParams:
         algorithm_params (GraphQueryParamsAlgorithmParams | Unset):
     """
 
+    edge_filter: GraphRelationshipFilter | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     direction: EdgeDirection | Unset = UNSET
     max_depth: int | Unset = UNSET
@@ -60,6 +67,10 @@ class GraphQueryParams:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        edge_filter: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_filter, Unset):
+            edge_filter = self.edge_filter.to_dict()
+
         edge_types: list[str] | Unset = UNSET
         if not isinstance(self.edge_types, Unset):
             edge_types = self.edge_types
@@ -99,6 +110,8 @@ class GraphQueryParams:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if edge_filter is not UNSET:
+            field_dict["edge_filter"] = edge_filter
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
         if direction is not UNSET:
@@ -131,9 +144,17 @@ class GraphQueryParams:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+        from ..models.graph_relationship_filter import GraphRelationshipFilter
         from ..models.node_filter import NodeFilter
 
         d = dict(src_dict)
+        _edge_filter = d.pop("edge_filter", UNSET)
+        edge_filter: GraphRelationshipFilter | Unset
+        if isinstance(_edge_filter, Unset):
+            edge_filter = UNSET
+        else:
+            edge_filter = GraphRelationshipFilter.from_dict(_edge_filter)
+
         edge_types = cast(list[str], d.pop("edge_types", UNSET))
 
         _direction = d.pop("direction", UNSET)
@@ -181,6 +202,7 @@ class GraphQueryParams:
             algorithm_params = GraphQueryParamsAlgorithmParams.from_dict(_algorithm_params)
 
         graph_query_params = cls(
+            edge_filter=edge_filter,
             edge_types=edge_types,
             direction=direction,
             max_depth=max_depth,

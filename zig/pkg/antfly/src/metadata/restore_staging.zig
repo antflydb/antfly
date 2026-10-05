@@ -594,7 +594,14 @@ pub const Plan = struct {
                             return error.InvalidRestoreStaging;
                     }
                 }
-            } else if (target.rewrite == null and target.source_artifacts.len != 0 and target.source_artifacts[0].format == .portable) return error.InvalidRestoreStaging;
+            } else if (target.rewrite == null and target.source_artifacts.len != 0 and target.source_artifacts[0].format == .portable) {
+                // Only a relational target needs the generation-admission
+                // rewrite path to carry its FK proof; a plain (non-relational)
+                // portable restore has no generation semantics to prove.
+                var target_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, table.schema_json);
+                defer target_schema.deinit(alloc);
+                if (target_schema.storage_mode == .relational) return error.InvalidRestoreStaging;
+            }
             if (target.catalog_binding) |binding| {
                 if (binding.kind != .table or binding.id != table.table_id or binding.parent_id == 0 or
                     !std.mem.eql(u8, binding.storage_name, table.name)) return error.InvalidRestoreStaging;

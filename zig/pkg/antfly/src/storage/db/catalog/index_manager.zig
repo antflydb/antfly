@@ -310,8 +310,8 @@ pub const ManagedIndexRef = struct {
     /// the projection kind (for example status-only catalog entries).
     estimated_dense_vector_bytes: u64 = 0,
     /// How many times larger than the raw vector the estimate above is. The
-    /// unconstrained window ceiling scales with it, so only a real memory
-    /// budget shrinks the window; an unbudgeted node keeps its item count.
+    /// memory ceiling scales with it, while an independent work ceiling
+    /// preserves unscaled vector and non-vector work per window.
     dense_replay_working_set_factor: u64 = 1,
 };
 
@@ -816,6 +816,7 @@ const TextMergeScheduler = struct {
     last_merge_elapsed_ns: u64 = 0,
     last_merge_peak_task_alloc_bytes: u64 = 0,
     deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
 
     fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
         for (self.in_flight.items) |*merge| merge.deinit(alloc);
@@ -1728,6 +1729,17 @@ pub const IndexManager = struct {
         // producer admission sample this bit without taking every index's
         // apply mutex, so it must not be a plain concurrently-mutated bool.
         compaction_pending: std.atomic.Value(bool) = .init(false),
+        // A merge's byte reservation is sized from a point-in-time estimate,
+        // but deletion deltas that commit while the merge builds also compete
+        // inside that same fixed ceiling (see TextMergeBudgetAllocator). Under
+        // a sustained heavy write rate, a wide merge plan can take long enough
+        // to build that accumulating deltas alone exhaust the reservation,
+        // and retrying the identical plan hits the same wall every time since
+        // the write rate has not changed. Shrink the segment count admitted
+        // per attempt after such a failure so the next merge builds faster
+        // and has a narrower window to accumulate deltas in, and let it grow
+        // back on success so steady state is unaffected.
+        merge_segment_cap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
 
         pub fn lockAnalysisShared(self: *TextIndex) void {
             self.analysis_mutex.lockShared();
@@ -1950,12 +1962,21 @@ pub const IndexManager = struct {
                 defer reader.deinit();
                 for (0..reader.doc_count) |doc_idx| {
                     const doc_id: u32 = @intCast(doc_idx);
-                    if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        _ = ordinal;
-                        ordinal_count += 1;
-                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                    // The stored id is the document's own unique key and takes
+                    // priority: chunk members intentionally share their
+                    // parent's ordinal (see result_shape.zig), so an ordinal
+                    // alone cannot distinguish one chunk from its siblings.
+                    // Keying by ordinal first would collide every sibling
+                    // chunk into the same slot and discard the rest as
+                    // "duplicates" even though they are distinct live
+                    // documents. Ordinal-only identity remains correct for
+                    // any document that genuinely has no stored id.
+                    if (try reader.storedDoc(doc_id)) |stored| {
                         _ = stored;
                         id_count += 1;
+                    } else if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        _ = ordinal;
+                        ordinal_count += 1;
                     } else {
                         return error.MissingMergeDocumentIdentity;
                     }
@@ -1981,10 +2002,10 @@ pub const IndexManager = struct {
                 for (0..reader.doc_count) |doc_idx| {
                     const doc_id: u32 = @intCast(doc_idx);
                     const location: OutputLocation = .{ .segment = @intCast(output_idx), .doc = doc_id };
-                    if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        try insertOrdinal(ordinals, ordinal, location);
-                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                    if (try reader.storedDoc(doc_id)) |stored| {
                         try insertId(ids, stored.id, location);
+                    } else if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        try insertOrdinal(ordinals, ordinal, location);
                     } else unreachable;
                 }
             }
@@ -2891,6 +2912,18 @@ pub const IndexManager = struct {
     pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
 
     pub const GraphIndex = struct {
+        /// Volatile source refresh frontier for enrichment adjacency. Protected
+        /// by apply_mutex; never certifies consumer completion or replay retention.
+        /// A recreated/reopened generation starts from its durable checkpoint.
+        neighbor_source_sequence: u64 = 0,
+        neighbor_refresh: struct {
+            sequence: u64 = 0,
+            cursor: @import("../derived/change_journal.zig").GraphRefreshCursor = .{},
+            cleanup_phase: u8 = 0,
+            cleanup_cursor: ?[]u8 = null,
+        } = .{},
+        neighbor_refresh_applying: bool = false,
+
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
@@ -2900,6 +2933,16 @@ pub const IndexManager = struct {
         ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
+
+        pub fn invalidateNeighborSource(self: *@This()) void {
+            self.neighbor_source_sequence = 0;
+            if (!self.neighbor_refresh_applying) self.clearNeighborRefresh();
+        }
+
+        pub fn clearNeighborRefresh(self: *@This()) void {
+            if (self.neighbor_refresh.cleanup_cursor) |key| self.index.alloc.free(key);
+            self.neighbor_refresh = .{};
+        }
     };
 
     const OpenedIndex = union(types.IndexKind) {
@@ -5878,6 +5921,74 @@ pub const IndexManager = struct {
             }
         }
 
+        fn appendDenseFieldParsed(
+            alloc: Allocator,
+            field: DenseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, field.field_name, field.dims)) orelse return;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        fn appendSparseFieldParsed(
+            alloc: Allocator,
+            field: SparseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, field.field_name)) orelse return;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+
+        /// Document-mode analogue of
+        /// `appendIndexFieldEmbeddingsFromPreparedToExtractedWrite` for raw
+        /// writes that have no relational ordinal row to consult: both dense
+        /// and sparse direct-field vectors come from the parsed JSON body
+        /// alone, read against this owned per-generation snapshot instead of
+        /// the live `dense_indexes`/`sparse_indexes` catalog arrays. Safe to
+        /// call after the catalog lock that produced this snapshot has been
+        /// released, including across chunking/inference work.
+        pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            for (self.dense_fields) |field| {
+                if (hasExplicitDenseEmbedding(extracted.dense_embeddings, field.index_name)) continue;
+                try appendDenseFieldParsed(alloc, field, doc_key, root, extracted);
+            }
+            for (self.sparse_fields) |field| {
+                if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, field.index_name)) continue;
+                try appendSparseFieldParsed(alloc, field, doc_key, root, extracted);
+            }
+        }
+
         fn generatedConsumerSatisfied(
             extracted: mapper.ExtractedWrite,
             kind: enrichment_types.GeneratedEnrichmentKind,
@@ -6579,6 +6690,7 @@ pub const IndexManager = struct {
 
         pub fn reset(self: *@This(), index_name: []const u8) !void {
             const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            entry.invalidateNeighborSource();
             try entry.index.resetForArtifactRebuild();
             entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
         }
@@ -6739,6 +6851,7 @@ pub const IndexManager = struct {
     }
 
     fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        entry.clearNeighborRefresh();
         if (abandon_after_crash) {
             entry.index.abandonAfterCrash();
         } else {
@@ -6850,6 +6963,18 @@ pub const IndexManager = struct {
         }
         self.alloc.free(self.base_path);
         self.native_read_scratch.destroy();
+        // PR #957 review on the #938 escalation commit: the process-wide
+        // ResourceManager's replay-document-not-visible tracker is keyed in
+        // part by this IndexManager's own address (see
+        // resource_manager_mod.replayOwnerIdFromPtr), so it must be told
+        // this owner is gone -- both to let that address be reused by a
+        // later IndexManager without inheriting stale retry/skip state, and
+        // so the tracker cannot grow without bound across DB/table
+        // open-close churn. Do this before destroying resource_manager
+        // below, in case it is the same instance as owned_resource_manager.
+        if (self.resource_manager) |manager| {
+            manager.removeReplayNotVisibleOwner(resource_manager_mod.replayOwnerIdFromPtr(self));
+        }
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
@@ -9858,7 +9983,7 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) {
             const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
             errdefer self.alloc.free(entries);
@@ -10310,7 +10435,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) return .{};
         return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
     }
@@ -11739,6 +11864,7 @@ pub const IndexManager = struct {
                 );
             }
         }
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -11813,6 +11939,7 @@ pub const IndexManager = struct {
             try opened.append(self.alloc, cfg.name);
         }
 
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -12481,6 +12608,7 @@ pub const IndexManager = struct {
                 if (!should_delete) should_delete = cleanupRecordMatchesEmbedding(state.record, candidate);
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphRetirementIndexName(candidate, index_name) or
                         internal_keys.matchesGraphAssetStateIndexName(candidate, index_name) or
                         internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name) or
                         internal_keys.matchesGraphGlobalEdgeContenderIndexName(candidate, index_name);
@@ -13661,6 +13789,13 @@ pub const IndexManager = struct {
         }
     };
 
+    pub fn hasAssetNeighborContext(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (entry.kind == .asset and entry.neighbor_context_json.len != 0) return true;
+        }
+        return false;
+    }
+
     /// Read-only scheduling lookup for graph-edge mutations: does any
     /// admitted asset enrichment sample `neighbor_context` adjacency from the
     /// named graph index, and in which orientations? An edge write or delete
@@ -13995,6 +14130,17 @@ pub const IndexManager = struct {
         return out;
     }
 
+    fn artifactRequiresCommittedGraph(self: *const IndexManager, name: []const u8) bool {
+        var current = name;
+        var hops: usize = 0;
+        while (current.len != 0 and hops <= self.enrichments.items.len) : (hops += 1) {
+            const cfg = self.getEnrichmentByName(current) orelse return false;
+            if (cfg.neighbor_context_json.len != 0) return true;
+            current = cfg.source_artifact_name;
+        }
+        return false;
+    }
+
     pub fn planGeneratedEnrichments(
         self: *const IndexManager,
         alloc: Allocator,
@@ -14316,6 +14462,11 @@ pub const IndexManager = struct {
                     if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
                 ),
             };
+        }
+        for (requests.items) |*request| {
+            request.requires_committed_graph = request.neighbor_context_json.len != 0 or
+                self.artifactRequiresCommittedGraph(request.upstream_artifact_name) or
+                (request.input_kind != .document and self.artifactRequiresCommittedGraph(request.artifact_name));
         }
         return try requests.toOwnedSlice(alloc);
     }
@@ -15659,7 +15810,7 @@ pub const IndexManager = struct {
         // Use the publication predicate, including implicit full-text chunk
         // routing. A failed dependency inspection must conservatively schedule
         // replay, which will surface the error, never silently skip a delete.
-        return textIndexShouldConsumeDoc(self, entry, key) catch true;
+        return textIndexShouldRetireDeletedDoc(self, entry, key) catch true;
     }
 
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
@@ -17359,7 +17510,9 @@ pub const IndexManager = struct {
     }
 
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
-        return !self.graph_retirement_closed.load(.acquire);
+        if (self.graph_retirement_closed.load(.acquire)) return false;
+        if (self.primary_store) |store| if (store.graphEndpointCleanupBlocksReads() catch true) return false;
+        return true;
     }
 
     /// Call only while holding catalog_mutex exclusively. The Raft apply
@@ -17717,6 +17870,23 @@ pub const IndexManager = struct {
         defer entry.unlockAnalysisShared();
         if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
         return try textIndexShouldConsumeDoc(self, entry, key);
+    }
+
+    /// Like textPublicationContextConsumesKeyAssumeCatalogLocked, for a key
+    /// being deleted: also retires members of chunk artifacts that no longer
+    /// route into the index.
+    pub fn textPublicationContextRetiresDeletedKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldRetireDeletedDoc(self, entry, key);
     }
 
     /// Plan the natural segment fan-out before producer admission. Projection
@@ -18262,6 +18432,7 @@ pub const IndexManager = struct {
             .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeError(now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNs(now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
+            .forced_drains = self.text_merge_scheduler.forced_drains,
         };
 
         for (self.text_indexes.items) |*entry| {
@@ -18323,6 +18494,7 @@ pub const IndexManager = struct {
             .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNsForIndex(index_name, now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
+            .forced_drains = self.text_merge_scheduler.forced_drains,
         };
 
         const entry = self.textIndexEntry(index_name) orelse return stats;
@@ -21885,6 +22057,37 @@ pub const IndexManager = struct {
                 }
             },
         }
+        try self.validateNeighborDependencyGraph(cfg);
+    }
+
+    /// Neighbor sampling adds graph-source dependencies to the ordinary asset
+    /// DAG. Reject feedback through generated graph sources, including indirect
+    /// asset/chunk chains, before publication can schedule endpoint producers.
+    fn validateNeighborDependencyGraph(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        try self.visitNeighborDependencies(root, root, &seen);
+    }
+
+    fn visitNeighborDependencies(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, cfg: enrichment_catalog.EnrichmentConfig, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (seen.contains(cfg.name)) return;
+        try seen.put(self.alloc, cfg.name, {});
+        if (cfg.source_artifact_name.len != 0)
+            try self.visitNeighborArtifact(root, cfg.source_artifact_name, seen);
+        if (cfg.neighbor_context_json.len != 0) {
+            var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+            defer context.deinit(self.alloc);
+            for (self.graph_indexes.items) |entry| {
+                if (!std.mem.eql(u8, entry.config.name, context.graph_index)) continue;
+                for (entry.artifact_sources) |source|
+                    try self.visitNeighborArtifact(root, source.artifact_name, seen);
+            }
+        }
+    }
+
+    fn visitNeighborArtifact(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, name: []const u8, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (std.mem.eql(u8, root.name, name)) return error.InvalidEnrichmentConfig;
+        if (self.getEnrichmentByName(name)) |cfg| try self.visitNeighborDependencies(root, cfg.*, seen);
     }
 
     fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
@@ -22057,7 +22260,20 @@ pub const IndexManager = struct {
                 else => return err,
             };
             if (maybe_task) |task| return task;
-            if (!has_in_flight and !self.text_merge_scheduler.indexHasActiveQuarantine(entry.config.name, now_ns)) TextMergeScheduler.noteComplete(entry);
+            // A null task can mean genuinely nothing left to merge, or a
+            // transient planning miss (every eligible segment already
+            // in-flight or quarantined, a resource-pressure defer inside
+            // beginTextMergeTaskForEntry, etc). Clearing compaction_pending
+            // here without re-checking whether the index still needs a
+            // merge would drop the only signal that would have retried it:
+            // nothing else re-arms compaction_pending once it is cleared.
+            if (!has_in_flight and !self.text_merge_scheduler.indexHasActiveQuarantine(entry.config.name, now_ns)) {
+                if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
+                    TextMergeScheduler.schedule(entry);
+                } else {
+                    TextMergeScheduler.noteComplete(entry);
+                }
+            }
         }
         return null;
     }
@@ -22298,6 +22514,11 @@ pub const IndexManager = struct {
                 result.elapsed_ns,
                 result.peak_task_alloc_bytes,
             );
+            // A completed merge proves the current write rate can sustain a
+            // merge this wide; let the next plan use the policy's normal
+            // width again instead of staying shrunk from an earlier
+            // mid-build budget failure (see merge_segment_cap).
+            entry.merge_segment_cap.store(std.math.maxInt(u32), .release);
         }
         return applied;
     }
@@ -22305,6 +22526,23 @@ pub const IndexManager = struct {
     pub fn cancelTextMergeTask(self: *IndexManager, task: *const TextMergeTask) void {
         self.completeTextMergeTaskTracking(task);
         if (self.textIndexEntry(task.index_name)) |entry| TextMergeScheduler.schedule(entry);
+    }
+
+    /// Like `cancelTextMergeTask`, but for a merge whose byte reservation ran
+    /// out mid-build rather than at admission. Retrying the identical plan
+    /// would hit the same wall under the same write rate (deletion deltas
+    /// that commit while the merge builds compete inside that same fixed
+    /// ceiling; see `TextMergeBudgetAllocator` and `merge_segment_cap`), so
+    /// shrink the segment count admitted for this index's next attempt
+    /// instead of spinning on a doomed plan.
+    pub fn noteTextMergeResourceBudgetExceeded(self: *IndexManager, task: *const TextMergeTask) void {
+        self.completeTextMergeTaskTracking(task);
+        if (self.textIndexEntry(task.index_name)) |entry| {
+            const attempted: u32 = @intCast(task.merge_indices.len);
+            const shrunk = @max(2, attempted / 2);
+            entry.merge_segment_cap.store(shrunk, .release);
+            TextMergeScheduler.schedule(entry);
+        }
     }
 
     pub fn noteTextMergeFailure(self: *IndexManager, task: *const TextMergeTask, err: anyerror) void {
@@ -22357,7 +22595,24 @@ pub const IndexManager = struct {
         }
         if (infos.items.len < 2) return null;
 
-        const planned = (try activeTextMergePolicy().plan(self.alloc, infos.items)) orelse return null;
+        const policy = activeTextMergePolicy();
+        const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
+            // The tiered policy found nothing to merge (for example every
+            // eligible segment floors to the same effective size under
+            // floor_segment_size, or no pair fits under max_segment_size)
+            // while the index still holds more live segments than its
+            // steady-state tier target. Force-drain the smallest eligible
+            // segments so producer admission always has a merge in flight to
+            // wait on instead of retrying TextMergeBackpressureTimeout
+            // against a scheduler that gave up.
+            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            self.text_merge_scheduler.forced_drains += 1;
+            break :blk try text_index_maintenance.planForceDrainFromInfos(
+                self.alloc,
+                infos.items,
+                force_merge_max_segments_at_once,
+            );
+        };
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
@@ -22366,7 +22621,16 @@ pub const IndexManager = struct {
         // a smaller merge can make forward progress. Adapt admission down to
         // a pair before reporting pressure; otherwise a synchronous
         // `full_index` drain can mistake one oversized plan for no merge debt.
-        var admitted_len = planned.len;
+        //
+        // A prior execution of this same width may also have run out of its
+        // byte reservation mid-build (deletion deltas that commit while a
+        // wide merge is still building compete inside that same fixed
+        // ceiling), which the admission walk-down below cannot see since the
+        // static reservation estimate for this width alone still fits.
+        // Start from whatever width last actually finished instead of
+        // re-admitting the same doomed plan every attempt.
+        var admitted_len = @min(planned.len, @as(usize, entry.merge_segment_cap.load(.acquire)));
+        if (admitted_len < 2) admitted_len = @min(planned.len, 2);
         var task = while (true) {
             break self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned[0..admitted_len]) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
@@ -22720,10 +22984,15 @@ pub const IndexManager = struct {
             while (delta_iter.next()) |doc_id| {
                 if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
 
-                const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
-                    result.outputForOrdinal(ordinal)
-                else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
+                // Mirror buildPublicationLookup's identity priority: the
+                // stored id is the document's own unique key and must be
+                // checked first, since chunk members share their parent's
+                // ordinal and buildPublicationLookup keyed them by id, not
+                // ordinal, whenever a stored id was present.
+                const location = if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
                     result.outputForId(stored.id)
+                else if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
+                    result.outputForOrdinal(ordinal)
                 else
                     null;
                 const output = location orelse return error.MissingMergeDocumentIdentity;
@@ -25164,32 +25433,11 @@ pub const IndexManager = struct {
         return try doc_ids.toOwnedSlice(alloc);
     }
 
-    fn deleteGraphDocsEntry(self: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
-        var deletes = std.ArrayListUnmanaged(graph_mod.BatchDelete).empty;
-        defer {
-            for (deletes.items) |delete| {
-                self.alloc.free(@constCast(delete.source));
-                self.alloc.free(@constCast(delete.target));
-                self.alloc.free(@constCast(delete.edge_type));
-            }
-            deletes.deinit(self.alloc);
-        }
-
-        for (keys) |key| {
-            const edges = try entry.index.getPhysicalEdgesForDeletion(self.alloc, key, "", .both);
-            defer graph_mod.GraphIndex.freeEdges(self.alloc, edges);
-
-            for (edges) |edge| {
-                try deletes.append(self.alloc, .{
-                    .source = try self.alloc.dupe(u8, edge.source),
-                    .target = try self.alloc.dupe(u8, edge.target),
-                    .edge_type = try self.alloc.dupe(u8, edge.edge_type),
-                    .clear_all_private_state = true,
-                });
-            }
-        }
-
-        try entry.index.batchApply(&.{}, deletes.items);
+    fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
+        if (keys.len > 0) entry.invalidateNeighborSource();
+        // The graph index owns the relationship identity and ownership rules.
+        // Reuse its cleanup path for both endpoint and fact-document deletion.
+        try entry.index.deleteOwnedEdgesForDocs(keys);
     }
 
     fn applyGraphWritesEntry(self: *IndexManager, entry: *GraphIndex, writes: []const types.GraphEdgeWrite) !void {
@@ -25250,6 +25498,8 @@ pub const IndexManager = struct {
                     parsed.edge_type,
                     parsed.target_doc_key,
                     parsed.doc_key,
+                    parsed.edge_id,
+                    if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
                     &snapshots,
                 );
                 try state.entry.index.replaceContributionSnapshots(snapshots.items);
@@ -25335,18 +25585,14 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            // Range admission follows the OWNING document, exactly like the
-            // artifact key: an entity-sourced edge's canonical source key
-            // (write.owner non-empty) can hash into a different shard range
-            // than the producing document, and filtering by it would make
-            // the owner's shard silently drop the mutation.
-            const range_key = if (write.owner.len > 0) write.owner else write.source;
-            if (!self.keyInRange(range_key)) continue;
+            if (!self.keyInRange(if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
                 .target = write.target,
                 .edge_type = write.edge_type,
+                .edge_id = write.edge_id,
+                .owner_document = write.owner_document,
                 .weight = write.weight,
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
@@ -25357,18 +25603,24 @@ pub const IndexManager = struct {
         }
 
         for (deletes) |delete| {
-            const range_key = if (delete.owner.len > 0) delete.owner else delete.source;
-            if (!self.keyInRange(range_key)) continue;
+            if (!self.keyInRange(if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .edge_id = delete.edge_id,
+                .owner_document = delete.owner_document,
                 .owner = delete.owner,
-                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0,
+                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0 and delete.edge_id.len == 0,
             });
         }
 
+        // Ordinary replay can temporarily withdraw an owner in an older
+        // window before replaying its latest artifacts. A producer must refresh
+        // again rather than treating that intermediate sidecar as current.
+        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
+            entry.invalidateNeighborSource();
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
@@ -25377,7 +25629,7 @@ pub const IndexManager = struct {
             const arena = arena_state.allocator();
             var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
             for (batch_writes.items) |write| {
-                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, &snapshots);
+                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
             }
             for (batch_deletes.items) |delete| {
                 if (snapshot_mode == .retire_owner) {
@@ -25385,11 +25637,13 @@ pub const IndexManager = struct {
                         .source = delete.source,
                         .target = delete.target,
                         .edge_type = delete.edge_type,
-                        .owner = if (delete.owner.len > 0) delete.owner else delete.source,
+                        .edge_id = delete.edge_id,
+                        .owner_document = delete.owner_document,
+                        .owner = if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source,
                         .contributions = &.{},
                     });
                 } else {
-                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, &snapshots);
+                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
                 }
             }
             try entry.index.replaceContributionSnapshots(snapshots.items);
@@ -25404,9 +25658,11 @@ pub const IndexManager = struct {
         edge_type: []const u8,
         target: []const u8,
         owner: []const u8,
+        edge_id: []const u8,
+        owner_document: []const u8,
         snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
     ) !void {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
         const raw = primary.get(alloc, artifact_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -25452,7 +25708,9 @@ pub const IndexManager = struct {
             .source = source,
             .edge_type = edge_type,
             .target = target,
-            .owner = if (owner.len > 0) owner else source,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
+            .owner = if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source,
             .contributions = try contributors.toOwnedSlice(alloc),
         });
     }
@@ -29724,7 +29982,7 @@ pub const IndexManager = struct {
             for (legacy_keys) |key| self.alloc.free(@constCast(key));
         }
 
-        try sortLegacyOrdinalProbes(alloc, legacy_keys, missing_ordinals);
+        sortLegacyOrdinalProbes(legacy_keys, missing_ordinals);
         try mutable_txn.getManySorted(legacy_keys, legacy_values);
         for (legacy_values, missing_ordinals) |maybe_raw, ordinal| {
             if (maybe_raw) |raw| {
@@ -30106,6 +30364,18 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
     if (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
+}
+
+fn textIndexShouldRetireDeletedDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
+    if (try textIndexShouldConsumeDoc(self, entry, key)) return true;
+    // A chunk artifact whose enrichment was deleted no longer routes into the
+    // default index, but members it published earlier may still be posted
+    // there. Deleting its rows must also retire those postings; retiring an
+    // absent member is a no-op.
+    if (entry.chunk_name != null or entry.source_artifact_names.len > 0) return false;
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
+    const chunk_name = (try internal_keys.artifactNameView(key)) orelse return true;
+    return self.getEnrichment(.chunk, chunk_name) == null;
 }
 
 fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
@@ -30833,6 +31103,8 @@ pub const GraphNodeModel = enum {
 
 pub const GraphArtifactMapping = struct {
     node_model: GraphNodeModel = .document,
+    source_template: []u8 = "",
+    edge_id_template: []u8 = "",
     target_template: []u8 = "",
     edge_type_template: []u8 = "",
     weight_template: []u8 = "",
@@ -30840,30 +31112,24 @@ pub const GraphArtifactMapping = struct {
     context_doc_fields: []const []u8 = &.{},
 
     pub fn clone(alloc: Allocator, mapping: GraphArtifactMapping) !GraphArtifactMapping {
-        const context_doc_fields: [][]u8 = if (mapping.context_doc_fields.len > 0)
-            try alloc.alloc([]u8, mapping.context_doc_fields.len)
-        else
-            @constCast(&.{});
-        var initialized: usize = 0;
-        errdefer {
-            for (context_doc_fields[0..initialized]) |field| alloc.free(field);
-            if (context_doc_fields.len > 0) alloc.free(context_doc_fields);
+        var result = GraphArtifactMapping{ .node_model = mapping.node_model };
+        errdefer result.deinit(alloc);
+        inline for ([_][]const u8{ "source_template", "edge_id_template", "target_template", "edge_type_template", "weight_template", "metadata_template_json" }) |field| {
+            const value = @field(mapping, field);
+            if (value.len > 0) @field(result, field) = try alloc.dupe(u8, value);
         }
-        for (mapping.context_doc_fields, 0..) |field, i| {
-            context_doc_fields[i] = try alloc.dupe(u8, field);
-            initialized += 1;
+        if (mapping.context_doc_fields.len > 0) {
+            const fields = try alloc.alloc([]u8, mapping.context_doc_fields.len);
+            @memset(fields, @constCast(""));
+            result.context_doc_fields = fields;
+            for (mapping.context_doc_fields, fields) |field, *owned| owned.* = try alloc.dupe(u8, field);
         }
-        return .{
-            .node_model = mapping.node_model,
-            .target_template = if (mapping.target_template.len > 0) try alloc.dupe(u8, mapping.target_template) else "",
-            .edge_type_template = if (mapping.edge_type_template.len > 0) try alloc.dupe(u8, mapping.edge_type_template) else "",
-            .weight_template = if (mapping.weight_template.len > 0) try alloc.dupe(u8, mapping.weight_template) else "",
-            .metadata_template_json = if (mapping.metadata_template_json.len > 0) try alloc.dupe(u8, mapping.metadata_template_json) else "",
-            .context_doc_fields = context_doc_fields,
-        };
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactMapping, alloc: Allocator) void {
+        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.edge_id_template.len > 0) alloc.free(self.edge_id_template);
         if (self.target_template.len > 0) alloc.free(self.target_template);
         if (self.edge_type_template.len > 0) alloc.free(self.edge_type_template);
         if (self.weight_template.len > 0) alloc.free(self.weight_template);
@@ -30886,13 +31152,13 @@ pub const GraphArtifactSource = struct {
     mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
-        return .{
-            .artifact_name = try alloc.dupe(u8, source.artifact_name),
-            .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
-            .format = source.format,
-            .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
-            .mention_edge_type = if (source.mention_edge_type.len > 0) try alloc.dupe(u8, source.mention_edge_type) else "",
-        };
+        var result = GraphArtifactSource{ .artifact_name = @constCast(""), .format = source.format };
+        errdefer result.deinit(alloc);
+        result.artifact_name = try alloc.dupe(u8, source.artifact_name);
+        if (source.path.len > 0) result.path = try alloc.dupe(u8, source.path);
+        result.mapping = try GraphArtifactMapping.clone(alloc, source.mapping);
+        if (source.mention_edge_type.len > 0) result.mention_edge_type = try alloc.dupe(u8, source.mention_edge_type);
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactSource, alloc: Allocator) void {
@@ -32129,7 +32395,7 @@ pub fn graphConfigConsumesArtifact(alloc: Allocator, raw: []const u8, artifact_n
 }
 
 pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
@@ -32152,10 +32418,13 @@ pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     const max_edges_per_document: u32 = if (root.object.get("max_edges_per_document")) |value| blk: {
-        if (value != .integer or value.integer < 0 or value.integer > @as(i64, graph_asset_state.hard_max_edges_per_document)) {
-            return error.InvalidIndexConfig;
-        }
-        break :blk @intCast(value.integer);
+        const count = switch (value) {
+            .integer => |v| v,
+            .number_string => |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidIndexConfig,
+            else => return error.InvalidIndexConfig,
+        };
+        if (count < 0 or count > @as(i64, graph_asset_state.hard_max_edges_per_document)) return error.InvalidIndexConfig;
+        break :blk @intCast(count);
     } else 0;
     const artifact_sources: []GraphArtifactSource = if (root.object.get("sources") != null)
         try parseGraphArtifactSources(alloc, root)
@@ -32367,6 +32636,7 @@ fn jsonNumberAsF64(value: std.json.Value) !f64 {
     return switch (value) {
         .integer => |v| @floatFromInt(v),
         .float => |v| v,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidIndexConfig,
         else => error.InvalidIndexConfig,
     };
 }
@@ -32375,6 +32645,10 @@ fn jsonNumberAsU32(value: std.json.Value) !u32 {
     return switch (value) {
         .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
         .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        .number_string => |text| blk: {
+            const v = std.fmt.parseFloat(f64, text) catch return error.InvalidIndexConfig;
+            break :blk if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @as(u32, @intFromFloat(v)) else error.InvalidIndexConfig;
+        },
         else => error.InvalidIndexConfig,
     };
 }
@@ -32505,7 +32779,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
 
     if (root.object.get("nodes")) |nodes| {
         if (nodes != .object) return error.InvalidIndexConfig;
-        if (nodes.object.get("source") != null) return error.InvalidIndexConfig;
+        mapping.source_template = try parseOptionalGraphTemplate(alloc, nodes, "source");
         if (nodes.object.get("model")) |model| {
             if (model != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, model.string, "document")) {
@@ -32522,6 +32796,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
     if (root.object.get("edge")) |edge| {
         if (edge != .object) return error.InvalidIndexConfig;
         mapping.edge_type_template = try parseOptionalGraphTemplate(alloc, edge, "type");
+        mapping.edge_id_template = try parseOptionalGraphTemplate(alloc, edge, "edge_id");
         mapping.weight_template = try parseOptionalGraphTemplate(alloc, edge, "weight");
         if (edge.object.get("metadata")) |metadata| {
             mapping.metadata_template_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
@@ -32533,6 +32808,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
         mapping.context_doc_fields = try parseGraphContextDocFields(alloc, context);
     }
 
+    if (mapping.source_template.len > 0 and mapping.edge_id_template.len == 0) return error.InvalidIndexConfig;
     try validateGraphMappingTemplates(mapping);
     return mapping;
 }
@@ -32564,6 +32840,8 @@ fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]cons
 }
 
 fn validateGraphMappingTemplates(mapping: GraphArtifactMapping) !void {
+    try validateGraphTemplateDocFields(mapping.source_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.edge_id_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.target_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.edge_type_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.weight_template, mapping.context_doc_fields);
@@ -32862,7 +33140,7 @@ test "graph config parses artifact mapping templates and context fields" {
     try std.testing.expect(std.mem.indexOf(u8, mapping.metadata_template_json, "_item.evidence") != null);
 }
 
-test "graph config rejects source owner overrides undeclared doc fields and unsupported paths" {
+test "graph config rejects source mappings without ids undeclared doc fields and unsupported paths" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
@@ -33942,24 +34220,31 @@ fn legacyDenseOrdinalMappingKey(alloc: Allocator, index_name: []const u8, ordina
 /// byte order ("...:999" sorts after "...:1000"). Sorted multi-gets require
 /// ascending keys; Lite rejects anything else with InvalidBatch. Reorder the
 /// keys byte-wise, keeping each ordinal paired with its key.
-fn sortLegacyOrdinalProbes(alloc: Allocator, keys: [][]const u8, ordinals: []doc_identity.DocOrdinal) !void {
+fn sortLegacyOrdinalProbes(keys: [][]const u8, ordinals: []doc_identity.DocOrdinal) void {
     std.debug.assert(keys.len == ordinals.len);
-    const Probe = struct {
-        key: []const u8,
-        ordinal: doc_identity.DocOrdinal,
+    if (keys.len < 2) return;
+    var ordered = true;
+    for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
+        if (std.mem.order(u8, previous, key) == .gt) {
+            ordered = false;
+            break;
+        }
+    }
+    if (ordered) return;
+    const Context = struct {
+        keys: [][]const u8,
+        ordinals: []doc_identity.DocOrdinal,
 
-        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
-            return std.mem.lessThan(u8, lhs.key, rhs.key);
+        pub fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
+            return std.mem.lessThan(u8, ctx.keys[lhs], ctx.keys[rhs]);
+        }
+        pub fn swap(ctx: @This(), lhs: usize, rhs: usize) void {
+            std.mem.swap([]const u8, &ctx.keys[lhs], &ctx.keys[rhs]);
+            std.mem.swap(doc_identity.DocOrdinal, &ctx.ordinals[lhs], &ctx.ordinals[rhs]);
         }
     };
-    const probes = try alloc.alloc(Probe, keys.len);
-    defer alloc.free(probes);
-    for (probes, keys, ordinals) |*probe, key, ordinal| probe.* = .{ .key = key, .ordinal = ordinal };
-    std.sort.pdq(Probe, probes, {}, Probe.lessThan);
-    for (probes, keys, ordinals) |probe, *key, *ordinal| {
-        key.* = probe.key;
-        ordinal.* = probe.ordinal;
-    }
+    // Sort both arrays together, with no heap scratch or extra failure path.
+    std.sort.pdqContext(0, keys.len, Context{ .keys = keys, .ordinals = ordinals });
 }
 
 test "legacy dense ordinal probes are byte-ordered for sorted multi-gets" {
@@ -33971,12 +34256,36 @@ test "legacy dense ordinal probes are byte-ordered for sorted multi-gets" {
     // Numeric order is not byte order once the decimal widths differ.
     try std.testing.expect(std.mem.order(u8, keys[1], keys[2]) == .gt);
 
-    try sortLegacyOrdinalProbes(alloc, &keys, &ordinals);
+    sortLegacyOrdinalProbes(&keys, &ordinals);
     for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
         try std.testing.expect(std.mem.order(u8, previous, key) == .lt);
     }
     for (keys, ordinals) |key, ordinal| {
         const expected = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
+}
+
+test "legacy dense ordinal probes preserve pairs through partition sorting" {
+    const alloc = std.testing.allocator;
+    var ordinals: [257]doc_identity.DocOrdinal = undefined;
+    var keys: [ordinals.len][]const u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+    for (&keys, &ordinals, 0..) |*key, *ordinal, i| {
+        ordinal.* = @intCast((i * 73) % ordinals.len);
+        key.* = try legacyDenseOrdinalMappingKey(alloc, "vec:ordinal_member", ordinal.*);
+        initialized += 1;
+    }
+    sortLegacyOrdinalProbes(keys[0..0], ordinals[0..0]);
+    sortLegacyOrdinalProbes(keys[0..1], ordinals[0..1]);
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    // Repeat an already sorted batch to exercise the allocation-free fast path.
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    for (keys, ordinals, 0..) |key, ordinal, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, keys[i - 1], key));
+        const expected = try legacyDenseOrdinalMappingKey(alloc, "vec:ordinal_member", ordinal);
         defer alloc.free(expected);
         try std.testing.expectEqualStrings(expected, key);
     }
@@ -42775,6 +43084,173 @@ test "text merge task carries concurrent deletes into publication" {
     try std.testing.expectEqual(@as(u64, 11), published.liveDocCount());
 }
 
+test "text merge publication keeps every chunk member sharing one parent ordinal" {
+    // Chunk members intentionally share their parent document's ordinal
+    // (see result_shape.zig) but each still carries its own unique stored
+    // id, exactly like every real (non-benchmark) text-indexing path -
+    // introducer.zig's buildSegmentWithExtraSections calls
+    // addStoredDocBorrowed unconditionally for every document. A merge
+    // publication that keys identity by ordinal alone treats every sibling
+    // chunk after the first as a duplicate of the same identity and drops
+    // it; keying by the always-unique stored id first (this fix) must keep
+    // all of them.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+
+    // Build a segment the same way production chunk-backed indexing does:
+    // every document keeps its stored id (unlike indexTextKernelDocuments,
+    // which sets store_documents=false for its embedded-kernel-benchmark
+    // caller only).
+    const indexKeepingStoredIds = struct {
+        fn run(mgr: *IndexManager, e: *IndexManager.TextIndex, docs: []const introducer_mod.TextDocument) !void {
+            var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer segment_arena_state.deinit();
+            var build_ctx = TextSegmentSinkBuildContext{
+                .alloc = segment_arena_state.allocator(),
+                .projection_batch = .{ .docs = docs, .observed_field_analyzers = &.{} },
+                .text_analysis = e.text_analysis,
+                .build_options = .{ .resource_manager = mgr.resource_manager },
+            };
+            _ = try e.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
+            try mgr.finalizeTextBatchMutations(e, .{
+                .compact_text_segment_threshold = 2,
+                .defer_text_compaction = true,
+            }, .{ .indexed_any = true });
+        }
+    }.run;
+
+    // Parent "p1" has three chunks sharing ordinal 500, split across both
+    // source segments so the merge must reconcile a same-ordinal collision
+    // both within and across its inputs. Parent "p2" has one chunk with a
+    // different ordinal as a control.
+    const fields_p1_0 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk zero" }};
+    const fields_p1_1 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk one" }};
+    try indexKeepingStoredIds(&manager, entry, &.{
+        .{ .id = "chunk:p1:0", .stored_data = "{\"n\":0}", .text_fields = &fields_p1_0, .doc_ordinal = 500 },
+        .{ .id = "chunk:p1:1", .stored_data = "{\"n\":1}", .text_fields = &fields_p1_1, .doc_ordinal = 500 },
+    });
+
+    const fields_p1_2 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk two" }};
+    const fields_p2_0 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta chunk zero" }};
+    try indexKeepingStoredIds(&manager, entry, &.{
+        .{ .id = "chunk:p1:2", .stored_data = "{\"n\":2}", .text_fields = &fields_p1_2, .doc_ordinal = 500 },
+        .{ .id = "chunk:p2:0", .stored_data = "{\"n\":0}", .text_fields = &fields_p2_0, .doc_ordinal = 600 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), entry.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u64, 4), entry.persistent.snapshot().liveDocCount());
+
+    // Two segments sit well under the tiered policy's steady-state tier
+    // target, so drive the merge directly rather than through the
+    // scheduler (which would correctly decline to merge this few segments
+    // outside this test).
+    const snap = entry.persistent.acquireSnapshot();
+    defer snap.release();
+    var task = try manager.copyTextMergeTask("ft_v1", &entry.persistent, snap, &.{ 0, 1 });
+    defer task.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), task.merge_indices.len);
+    // beginTextMergeTaskForEntry performs these two steps after
+    // copyTextMergeTask; replicate them so the concurrent delete below
+    // records into this task's deletion state and finishTextMergeTask
+    // recognizes the task as still in flight instead of stale.
+    try entry.attachMergeDeletionState(alloc, task.deletion_state);
+    defer entry.detachMergeDeletionState(task.deletion_state);
+    try manager.text_merge_scheduler.registerSource(alloc, task.index_name, task.source, task.deletion_state);
+
+    // Race a delete of exactly one chunk (sharing ordinal 500 with two live
+    // siblings) against the unlocked build, the same way a concurrent
+    // rewrite races a scheduled merge in production.
+    const opts: IndexBatchOptions = .{ .defer_text_compaction = true };
+    try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{"chunk:p1:1"}, opts);
+
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    var merged_docs: u32 = 0;
+    for (result.prepared_segments) |*prepared| {
+        var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    for (result.segments) |segment_bytes| {
+        var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    // Nothing is dropped at merge-build time: the concurrent delete has not
+    // applied to the frozen snapshot the merge built from.
+    try std.testing.expectEqual(@as(u32, 4), merged_docs);
+
+    // The concurrent delete forces the off-lock identity lookup. Before this
+    // fix, building it raised error.DuplicateMergeDocumentIdentity the
+    // moment it saw the second document with ordinal 500 and silently
+    // dropped every subsequent same-ordinal sibling from the publication.
+    try std.testing.expectError(
+        error.TextMergePublicationLookupRequired,
+        manager.finishTextMergeTask(&task, &result),
+    );
+    try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
+    try std.testing.expect(result.publication_lookup_built);
+    // Every document here has a stored id, so identity is keyed by id, not
+    // by the shared ordinal: no ordinal-collision path was even exercised,
+    // and every chunk (including the two ordinal-500 siblings besides the
+    // one that raced a delete) kept its own distinct identity slot.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expect(result.outputForId("chunk:p1:0") != null);
+    try std.testing.expect(result.outputForId("chunk:p1:1") != null);
+    try std.testing.expect(result.outputForId("chunk:p1:2") != null);
+    try std.testing.expect(result.outputForId("chunk:p2:0") != null);
+
+    const applied = try manager.finishTextMergeTask(&task, &result);
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(@as(u64, 0), manager.textMergeStats().failed_merges);
+
+    const published = entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), published.segments.len);
+    // Exactly the raced delete's target is gone; its two ordinal-500
+    // siblings and the unrelated ordinal-600 chunk all survived.
+    try std.testing.expectEqual(@as(u32, 3), published.liveDocCount());
+
+    const seg = &published.segments[0];
+    var seen = std.StringHashMapUnmanaged(bool).empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |key| alloc.free(key.*);
+        seen.deinit(alloc);
+    }
+    for (0..seg.reader.doc_count) |doc_idx| {
+        const stored = (try seg.reader.storedDoc(@intCast(doc_idx))) orelse return error.TestUnexpectedResult;
+        const is_deleted = if (seg.shared.deleted) |*deleted| deleted.contains(@intCast(doc_idx)) else false;
+        try seen.put(alloc, try alloc.dupe(u8, stored.id), is_deleted);
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen.count());
+    try std.testing.expectEqual(true, seen.get("chunk:p1:1").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p1:0").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p1:2").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p2:0").?);
+}
+
 test "text merge deletion delta allocation failure invalidates task state" {
     const alloc = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
@@ -43889,11 +44365,26 @@ test "text merge failure quarantines source segments" {
     try std.testing.expectEqual(@as(u64, 1), stats.quarantined_merges);
     try std.testing.expectEqual(@as(u64, @intCast(task.source.len)), stats.quarantined_segments);
     try std.testing.expectEqualStrings("InvalidChunk", stats.last_merge_error.slice());
+    // Quarantine is scoped to the failed inputs, not the entire index.
+    // Force-drain debt may still schedule the remaining healthy segments.
+    var healthy_task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer healthy_task.deinit(alloc);
+    for (healthy_task.source) |healthy| {
+        for (task.source) |quarantined| {
+            try std.testing.expect(healthy.id != quarantined.id);
+        }
+    }
+    var healthy_result = try IndexManager.executeTextMergeTask(alloc, &healthy_task);
+    defer healthy_result.deinit(alloc);
+    try std.testing.expect(try manager.finishTextMergeTask(&healthy_task, &healthy_result));
+    // Only one healthy output remains, so no further merge can consume the
+    // failed inputs until their quarantine expires.
     var blocked_task = try manager.beginTextMergeTask();
     if (blocked_task) |*unexpected| {
         unexpected.deinit(alloc);
         return error.TestUnexpectedResult;
     }
+    try std.testing.expectEqual(stats.quarantined_segments, manager.textMergeStats().quarantined_segments);
 
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending.load(.acquire));
@@ -45156,6 +45647,51 @@ test "exact sparse vector generation remains eligible for mutation capture befor
 }
 const StoreBatchOptions = backend_types.BatchOptions;
 
+test "graph artifact mapping and source clones release partial allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const mapping = GraphArtifactMapping{
+                .source_template = @constCast("{{ _item.source }}"),
+                .edge_id_template = @constCast("{{ _doc.key }}"),
+                .target_template = @constCast("{{ _item.target }}"),
+                .edge_type_template = @constCast("RELATES_TO"),
+                .weight_template = @constCast("{{ _item.weight }}"),
+                .metadata_template_json = @constCast("{\"group_id\":\"g\"}"),
+                .context_doc_fields = &.{ @constCast("group_id"), @constCast("valid_at"), @constCast("") },
+            };
+            var copy = try GraphArtifactMapping.clone(alloc, mapping);
+            defer copy.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.edge_id_template, copy.edge_id_template);
+            var source = try GraphArtifactSource.clone(alloc, .{
+                .artifact_name = @constCast("facts"),
+                .path = @constCast("$.relations"),
+                .mapping = mapping,
+                .mention_edge_type = @constCast("MENTIONS"),
+            });
+            defer source.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.source_template, source.mapping.source_template);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "graph projection preserves numeric literals in configured templates" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"max_edges_per_document":10,"metrics":{"pagerank":{"damping":0.8,"tolerance":0.00001,"max_iterations":20}},"source":{"artifact":"facts","nodes":{"source":"{{ _item.source }}"},"edge":{"edge_id":18446744073709551615,"metadata":{"score":1.0000000000000001,"large":18446744073709551615}}}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 10), cfg.max_edges_per_document);
+    try std.testing.expectEqual(@as(u32, 20), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectEqual(@as(f64, 0.8), cfg.metric_configs[0].damping);
+    try std.testing.expectEqual(@as(f64, 0.00001), cfg.metric_configs[0].tolerance);
+    try std.testing.expectEqualStrings("18446744073709551615", cfg.artifact_sources[0].mapping.edge_id_template);
+    try std.testing.expectEqualStrings("{\"score\":1.0000000000000001,\"large\":18446744073709551615}", cfg.artifact_sources[0].mapping.metadata_template_json);
+    for ([_][]const u8{ "{\"max_edges_per_document\":-1}", "{\"max_edges_per_document\":1.5}", "{\"max_edges_per_document\":1000001}", "{\"metrics\":{\"pagerank\":{\"max_iterations\":1.5}}}" }) |raw| {
+        try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, raw));
+    }
+}
+
 test "replay matrix reads exact native base plus captured updates and fences deletes and newer generations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -45853,4 +46389,67 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
+}
+
+test "text force drain schedules policy misses above the tier target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = 1, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{});
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"title\"}" }});
+        const opts: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+        for (0..12) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"force drain {d}\"}}", .{i});
+            defer alloc.free(value);
+            try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+            try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+            if (i == 0) {
+                // Every source fits individually, but no pair fits the ordinary
+                // plan. A wider bounded merge can still compact their shared
+                // section overhead and reduce the segment count.
+                const first = manager.textIndexEntry("ft_v1").?.persistent.snapshot().segments[0];
+                const source_bytes = first.data.bytes().len;
+                setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = source_bytes + source_bytes / 2, .floor_segment_size = 0 });
+            }
+        }
+        const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+        try std.testing.expectEqual(@as(usize, 12), entry.persistent.snapshot().segments.len);
+        try std.testing.expect(entry.compaction_pending.load(.acquire));
+        if (try manager.beginTextMergeTask()) |returned| {
+            var task = returned;
+            defer task.deinit(alloc);
+            manager.cancelTextMergeTask(&task);
+        } else return error.ForceDrainWasNotScheduled;
+    }
+    // Reopen must discover the same debt even though no ordinary plan fits.
+    var reopened = try IndexManager.initWithOptions(alloc, path, .{});
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const reopened_entry = reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(reopened_entry.compaction_pending.load(.acquire));
+    var task = (try reopened.beginTextMergeTask()) orelse return error.ForceDrainWasNotScheduled;
+    defer task.deinit(alloc);
+    try std.testing.expect(task.source.len >= 2);
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(try reopened.finishTextMergeTask(&task, &result));
+    try std.testing.expect(reopened_entry.persistent.snapshot().segments.len < 12);
+    // A tier target that already covers all segments must still go idle.
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 20, .max_segment_size = 1, .floor_segment_size = 0 });
+    try std.testing.expect((try reopened.beginTextMergeTask()) == null);
+    try std.testing.expect(!reopened_entry.compaction_pending.load(.acquire));
 }

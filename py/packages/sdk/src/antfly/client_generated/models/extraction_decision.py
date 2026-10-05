@@ -29,9 +29,10 @@ class ExtractionDecision:
         confidence (float):
         confidence_method (ExtractionDecisionConfidenceMethod): Entropy confidence is not the probability that the
             selected label is correct.
-        act_probability (float): Auxiliary model estimate for acting. Does not authorize or execute a tool call.
         expected_value (float | Unset): Score decisions only; sum of zero-based level index times probability.
         true_probability (float | Unset): Boolean decisions only; probability of the true label.
+        act_probability (float | Unset): Auxiliary model estimate for acting, from models with an action head (Laya).
+            Does not authorize or execute a tool call.
     """
 
     name: str
@@ -40,9 +41,9 @@ class ExtractionDecision:
     probabilities: list[ExtractionLabelProbability]
     confidence: float
     confidence_method: ExtractionDecisionConfidenceMethod
-    act_probability: float
     expected_value: float | Unset = UNSET
     true_probability: float | Unset = UNSET
+    act_probability: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,11 +62,11 @@ class ExtractionDecision:
 
         confidence_method = self.confidence_method.value
 
-        act_probability = self.act_probability
-
         expected_value = self.expected_value
 
         true_probability = self.true_probability
+
+        act_probability = self.act_probability
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -77,13 +78,14 @@ class ExtractionDecision:
                 "probabilities": probabilities,
                 "confidence": confidence,
                 "confidence_method": confidence_method,
-                "act_probability": act_probability,
             }
         )
         if expected_value is not UNSET:
             field_dict["expected_value"] = expected_value
         if true_probability is not UNSET:
             field_dict["true_probability"] = true_probability
+        if act_probability is not UNSET:
+            field_dict["act_probability"] = act_probability
 
         return field_dict
 
@@ -109,11 +111,11 @@ class ExtractionDecision:
 
         confidence_method = ExtractionDecisionConfidenceMethod(d.pop("confidence_method"))
 
-        act_probability = d.pop("act_probability")
-
         expected_value = d.pop("expected_value", UNSET)
 
         true_probability = d.pop("true_probability", UNSET)
+
+        act_probability = d.pop("act_probability", UNSET)
 
         extraction_decision = cls(
             name=name,
@@ -122,9 +124,9 @@ class ExtractionDecision:
             probabilities=probabilities,
             confidence=confidence,
             confidence_method=confidence_method,
-            act_probability=act_probability,
             expected_value=expected_value,
             true_probability=true_probability,
+            act_probability=act_probability,
         )
 
         extraction_decision.additional_properties = d

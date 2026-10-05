@@ -616,6 +616,10 @@ from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
 from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
 from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
+from .graph_relationship_filter import GraphRelationshipFilter
+from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
+from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
+from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
@@ -2004,6 +2008,10 @@ __all__ = (
     "GraphQueryUnsupportedErrorError",
     "GraphQueryUnsupportedErrorReason",
     "GraphQueryUnsupportedErrorStatus",
+    "GraphRelationshipFilter",
+    "GraphRelationshipPropertyPredicate",
+    "GraphRelationshipPropertyPredicateOp",
+    "GraphRelationshipPropertyPredicateValueType",
     "GraphResolverConfig",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
