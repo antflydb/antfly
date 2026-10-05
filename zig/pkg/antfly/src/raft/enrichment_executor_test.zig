@@ -146,3 +146,42 @@ test "Evented groups can be reused after await and cancellation" {
     group.async(io, Work.complete, .{io});
     try group.await(io);
 }
+
+test "Evented parent cancellation preserves an in-progress group cancel join" {
+    if ((builtin.os.tag != .macos and builtin.os.tag != .linux) or !std.Io.fiber.supported)
+        return error.SkipZigTest;
+    var ev: Evented = undefined;
+    try ev.init(std.testing.allocator, .{});
+    defer ev.deinit();
+    const io = ev.io();
+    const Work = struct {
+        fn child(task_io: std.Io, ready: *std.Io.Event, finished: *std.atomic.Value(bool)) void {
+            const old = task_io.swapCancelProtection(.blocked);
+            defer _ = task_io.swapCancelProtection(old);
+            ready.set(task_io);
+            task_io.sleep(.fromMilliseconds(200), .awake) catch unreachable;
+            finished.store(true, .release);
+        }
+        fn parent(task_io: std.Io, ready: *std.Io.Event, finished: *std.atomic.Value(bool)) std.Io.Cancelable!void {
+            var child_ready: std.Io.Event = .unset;
+            var group: std.Io.Group = .init;
+            group.async(task_io, child, .{ task_io, &child_ready, finished });
+            child_ready.waitUncancelable(task_io);
+            ready.set(task_io);
+            // This join must finish even if the parent receives cancellation.
+            group.cancel(task_io);
+            // The parent cancellation must remain pending after the join.
+            try task_io.checkCancel();
+        }
+    };
+    for (0..2) |_| {
+        var ready: std.Io.Event = .unset;
+        var finished: std.atomic.Value(bool) = .init(false);
+        var parent = try io.concurrent(Work.parent, .{ io, &ready, &finished });
+        defer parent.cancel(io) catch {};
+        ready.waitUncancelable(io);
+        try io.sleep(.fromMilliseconds(10), .awake);
+        try std.testing.expectError(error.Canceled, parent.cancel(io));
+        try std.testing.expect(finished.load(.acquire));
+    }
+}

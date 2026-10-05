@@ -1437,11 +1437,14 @@ const Group = struct {
         const list = @atomicRmw(
             List,
             list_ptr,
-            .Add,
+            .Or,
             .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
             .monotonic,
         );
-        assert(!list.cancel_requested);
+        // A parent may itself be canceled while Group.cancel is joining its
+        // children. Keep that join registered and do not request child
+        // cancellation again or carry into the packed list pointer.
+        if (list.cancel_requested) return false;
         if (list.fibers.unpack()) |head| {
             var maybe_fiber: ?*Fiber = head;
             while (maybe_fiber) |fiber| {
