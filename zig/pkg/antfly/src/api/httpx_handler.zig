@@ -13800,9 +13800,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             while (true) {
                 var page = try stream.next(stream.context, alloc, request, 2);
                 defer page.result.deinit();
-                for (page.result.rows) |row| {
+                for (0..page.result.rowCount()) |row_index| {
+                    const cell = try page.result.cell(alloc, row_index, 0);
                     try std.testing.expect(offset < expected.len);
-                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), row[0].integer);
+                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), cell.value.integer);
                     offset += 1;
                 }
                 if (page.exhausted) break;

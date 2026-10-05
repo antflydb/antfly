@@ -567,6 +567,8 @@ pub const Sequential = struct {
     pending: std.ArrayList(Row) = .empty,
     pending_bytes: usize = 0,
     read_rows: []const Row = &.{},
+    read_single: [1]Row = undefined,
+    read_single_offset: ?u64 = null,
     read_first: u64 = 0,
     read_offset: u64 = 0,
     pub fn init(manager: *Manager, bytes: usize) !Sequential {
@@ -744,16 +746,19 @@ pub const Sequential = struct {
         self.read_first = 0;
         self.read_offset = 0;
         self.read_rows = &.{};
+        self.read_single_offset = null;
     }
     pub fn readBorrowed(self: *Sequential, offset: u64) !Decoded {
         try self.seal();
         if (offset >= self.size) return error.InvalidSqlSpill;
+        if (self.read_single_offset == offset) return .{ .row = self.read_single[0], .next = none, .matched = false, .following = offset + 1 };
         if (offset == 0 and self.read_first != 0) {
             self.read_first = 0;
             self.read_offset = 0;
             self.read_rows = &.{};
         }
         if (self.read_rows.len == 0 or offset == self.read_first + self.read_rows.len) {
+            self.read_single_offset = null;
             self.read_first = offset;
             _ = self.read_arena.reset(.free_all);
             const owned = self.read_arena.allocator();
@@ -768,6 +773,8 @@ pub const Sequential = struct {
                 self.read_first = offset + 1;
                 self.read_rows = &.{};
                 record.following = offset + 1;
+                self.read_single[0] = record.row;
+                self.read_single_offset = offset;
                 return record;
             }
             const len = std.mem.readInt(u64, header[0..8], .little);
@@ -785,7 +792,11 @@ pub const Sequential = struct {
             const key_width = try decoder.count();
             if (count == 0 or count > 256 or count > self.size - offset or width > 1024 or key_width > 256) return error.InvalidSqlSpill;
             const rows = try owned.alloc(Row, count);
-            for (rows) |*row| row.* = .{ .ordinal = try decoder.word(), .values = try owned.alloc(Datum, width), .keys = try owned.alloc(Datum, key_width) };
+            // Decode a complete block into contiguous cell storage. Borrowed
+            // row spans only slice these allocations, including partial retries.
+            const values = try owned.alloc(Datum, count * width);
+            const keys = try owned.alloc(Datum, count * key_width);
+            for (rows, 0..) |*row, index| row.* = .{ .ordinal = try decoder.word(), .values = values[index * width ..][0..width], .keys = keys[index * key_width ..][0..key_width] };
             try decodeColumns(&decoder, rows, false);
             try decodeColumns(&decoder, rows, true);
             if (decoder.position != payload.len) return error.InvalidSqlSpill;
@@ -807,6 +818,21 @@ pub const Sequential = struct {
         var result = decoded;
         result.row = .{ .values = values, .keys = keys, .ordinal = row.ordinal };
         return result;
+    }
+
+    pub const Block = struct { rows: []const Row, following: u64 };
+    /// A span of the current decoded block. It expires when another block is
+    /// loaded; retaining operators admit the whole span before advancing.
+    pub fn readBatchBorrowed(self: *Sequential, offset: u64, maximum: usize) !Block {
+        if (maximum == 0) return error.InvalidSqlLimit;
+        const first = try self.readBorrowed(offset);
+        if (self.read_rows.len == 0) {
+            self.read_single[0] = first.row;
+            return .{ .rows = &self.read_single, .following = first.following };
+        }
+        const begin: usize = @intCast(offset - self.read_first);
+        const count = @min(maximum, self.read_rows.len - begin);
+        return .{ .rows = self.read_rows[begin..][0..count], .following = offset + count };
     }
 };
 
@@ -1603,4 +1629,33 @@ test "SQL independent merge compaction jobs preserve sorted output and release f
         try std.testing.expect(sort.parallel_merges_started >= 2);
     }
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL borrowed spill blocks support partial admission retries and rewinds" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 4096);
+    defer file.close();
+    const wide: [4096]u8 = @splat('w');
+    for (0..37) |index| _ = try file.append(.{ .values = &.{if (index % 8 == 0) Datum.json(.{ .string = &wide }) else Datum.json(.{ .integer = @intCast(index) })}, .keys = &.{}, .ordinal = index }, none);
+    for (0..2) |_| {
+        file.rewind();
+        var offset: u64 = 0;
+        while (offset < file.size) {
+            const first = try file.readBatchBorrowed(offset, 7);
+            const again = try file.readBatchBorrowed(offset, 7);
+            try std.testing.expectEqual(first.rows.len, again.rows.len);
+            try std.testing.expectEqual(offset, again.rows[0].ordinal);
+            // Simulate bounded hash admission accepting only a prefix.
+            const accepted = @min(@as(usize, 2), again.rows.len);
+            for (again.rows[0..accepted], 0..) |row, i| try std.testing.expectEqual(offset + i, row.ordinal);
+            offset += accepted;
+        }
+        try std.testing.expectEqual(@as(u64, 37), offset);
+    }
 }

@@ -1050,8 +1050,8 @@ pub const Grouped = struct {
     }
     pub fn importPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
         if (cells.len != self.specs.len * 7) return error.InvalidSqlSpill;
-        const inputs = try self.backing.alloc(Datum, self.specs.len);
-        defer self.backing.free(inputs);
+        var input_storage: [256]Datum = undefined;
+        const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
         self.key_count = keys.len;
         if (self.external == null and self.limits.spill != null and !try self.canRetain(keys, inputs)) try self.startSpill();

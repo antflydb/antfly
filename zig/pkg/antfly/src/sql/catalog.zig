@@ -150,6 +150,8 @@ pub const ColumnPage = struct {
         const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
         if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
         const value: std.json.Value = switch (column.values) {
+            .dictionary_i64 => |values| .{ .integer = values.at(index) },
+            .dictionary_f64 => |values| .{ .float = values.at(index) },
             .i64 => |values| .{ .integer = values[index] },
             .f64 => |values| .{ .float = values[index] },
             .bool => |values| .{ .bool = values[index] },

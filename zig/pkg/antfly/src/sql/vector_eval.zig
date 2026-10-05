@@ -197,8 +197,8 @@ const ColumnInput = struct {
         const definition = self.columns[ordinal];
         const column = self.page.batch.findColumn(definition.name) orelse return false;
         const exact = switch (column.values) {
-            .i64 => definition.type == .integer or definition.type == .number,
-            .f64 => definition.type == .number,
+            .i64, .dictionary_i64 => definition.type == .integer or definition.type == .number,
+            .f64, .dictionary_f64 => definition.type == .number,
             .bool => definition.type == .boolean,
             .bytes, .dictionary_bytes => definition.type == .string,
             else => false,
@@ -211,6 +211,11 @@ const ColumnInput = struct {
                 continue;
             }
             const value: std.json.Value = switch (column.values) {
+                .dictionary_i64 => |v| .{ .integer = v.at(physical) },
+                .dictionary_f64 => |v| blk: {
+                    if (!std.math.isFinite(v.at(physical))) return error.SqlTypeMismatch;
+                    break :blk .{ .float = v.at(physical) };
+                },
                 .i64 => |v| .{ .integer = v[physical] },
                 .f64 => |v| blk: {
                     if (!std.math.isFinite(v[physical])) return error.SqlTypeMismatch;
@@ -260,6 +265,8 @@ const ColumnInput = struct {
                 continue;
             }
             const raw: std.json.Value = switch (column.values) {
+                .dictionary_i64 => |values| .{ .integer = values.at(index) },
+                .dictionary_f64 => |values| .{ .float = values.at(index) },
                 .i64 => |values| .{ .integer = values[index] },
                 .f64 => |values| .{ .float = values[index] },
                 .bool => |values| .{ .bool = values[index] },
@@ -620,6 +627,37 @@ test "SQL vector root text validation matches scalar and ignores discarded inter
                 try std.testing.expect((try program.evaluate(alloc, rows[0], &.{}, .{})).value.bool);
                 try std.testing.expect((try evaluate(alloc, &program, &rows, &.{})).?[0].value.bool);
             }
+        }
+    }
+}
+
+test "SQL numeric dictionary kernels preserve exact values nulls and selection order" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const definitions = [_]scalar.Column{ .{ .name = "n", .type = .integer }, .{ .name = "f", .type = .number } };
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" }, .{ .relational_key = "d" } },
+        .columns = &.{
+            .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 9007199254740993, -7 }, .indices = &.{ 0, 1, 99, 0 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+            .{ .name = "f", .values = .{ .dictionary_f64 = .{ .values = &.{ -0.0, 2.5 }, .indices = &.{ 1, 0, 99, 1 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+        },
+    }, .selection = &.{ 3, 2, 0, 1 } };
+    try page.batch.validate();
+    for ([_][]const u8{ "n + 1", "n > 9007199254740992", "n IS NULL", "f * 2.0", "f IS NULL" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+        defer program.deinit();
+        const actual = (try evaluateColumns(arena.allocator(), &program, page, &definitions, &.{})).?;
+        for (0..page.selection.len) |row| {
+            var cells: [2]Datum = undefined;
+            for (definitions, &cells) |definition, *value| {
+                const cell = try page.cell(arena.allocator(), row, definition.name);
+                value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
+            }
+            try std.testing.expectEqualDeep(try program.evaluate(arena.allocator(), &cells, &.{}, .{}), actual[row]);
         }
     }
 }

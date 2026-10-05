@@ -246,34 +246,33 @@ pub const Grouped = struct {
             try file.seal();
             self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = self.bytes / 2, .groups = std.math.maxInt(usize) });
             var offset: u64 = 0;
-            var scratch = std.heap.ArenaAllocator.init(self.a);
-            defer scratch.deinit();
             while (offset < file.size) {
                 try self.sort.manager.check();
-                _ = scratch.reset(.retain_capacity);
-                const row = try file.read(scratch.allocator(), offset);
-                offset = row.following;
-                if (row.row.values.len == 0 or row.row.values[0].value != .bool) return error.InvalidSqlSpill;
-                const partial_state = row.row.values[0].value.bool;
-                if (self.fallback == null and ((!partial_state and !self.nativeInputs(row.row.values[1..])) or !try self.local.?.canRetain(row.row.keys, if (partial_state) &.{} else row.row.values[1..]))) {
-                    const fallback = try self.a.create(Grouped);
-                    errdefer self.a.destroy(fallback);
-                    fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
-                    fallback.partitioned = false;
-                    fallback.sort.parallel_runs = self.parallel;
-                    errdefer fallback.deinit();
-                    try self.local.?.exportPartial(fallback);
-                    self.local.?.deinit();
-                    self.local = null;
-                    self.fallback = fallback;
+                const block = try file.readBatchBorrowed(offset, 256);
+                for (block.rows) |row| {
+                    if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
+                    const partial_state = row.values[0].value.bool;
+                    if (self.fallback == null and ((!partial_state and !self.nativeInputs(row.values[1..])) or !try self.local.?.canRetain(row.keys, if (partial_state) &.{} else row.values[1..]))) {
+                        const fallback = try self.a.create(Grouped);
+                        errdefer self.a.destroy(fallback);
+                        fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
+                        fallback.partitioned = false;
+                        fallback.sort.parallel_runs = self.parallel;
+                        errdefer fallback.deinit();
+                        try self.local.?.exportPartial(fallback);
+                        self.local.?.deinit();
+                        self.local = null;
+                        self.fallback = fallback;
+                    }
+                    if (self.fallback) |fallback| {
+                        try fallback.append(row);
+                    } else if (partial_state) {
+                        try self.local.?.importPartial(row.keys, row.values[1..], row.ordinal);
+                    } else {
+                        try self.local.?.addOrdered(row.keys, row.values[1..], row.ordinal);
+                    }
                 }
-                if (self.fallback) |fallback| {
-                    try fallback.append(row.row);
-                } else if (partial_state) {
-                    try self.local.?.importPartial(row.row.keys, row.row.values[1..], row.row.ordinal);
-                } else {
-                    try self.local.?.addOrdered(row.row.keys, row.row.values[1..], row.row.ordinal);
-                }
+                offset = block.following;
             }
             file.close();
             self.partitions[index] = null;

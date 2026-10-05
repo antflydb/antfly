@@ -285,7 +285,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_sql_tests = b.addRunArtifact(sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
-    sql_tests.step.max_rss = 1536 * 1024 * 1024;
+    sql_tests.step.max_rss = 3072 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.

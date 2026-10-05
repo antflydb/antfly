@@ -18,17 +18,16 @@ pub const Store = struct {
         self.arena.deinit();
     }
     pub fn append(self: *Store, result: backend.Result, max_rows: usize) !void {
-        if (result.rows.len > max_rows -| self.rows.items.len) return error.ProgramLimitExceeded;
+        if (result.rowCount() > max_rows -| self.rows.items.len) return error.ProgramLimitExceeded;
         const alloc = self.arena.allocator();
         if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-        for (result.rows, 0..) |row, i| {
-            if (row.len != result.columns.len) return error.InvalidResult;
-            const cells = try alloc.alloc(std.json.Value, row.len);
-            const nulls = try alloc.alloc(bool, row.len);
-            if (result.sql_nulls) |flags| if (flags[i].len != row.len) return error.InvalidResult;
-            for (row, cells, nulls, 0..) |value, *cell, *is_null, j| {
-                cell.* = try clone(alloc, value, 0);
-                is_null.* = if (result.sql_nulls) |flags| flags[i][j] else value == .null;
+        for (0..result.rowCount()) |i| {
+            const cells = try alloc.alloc(std.json.Value, result.columns.len);
+            const nulls = try alloc.alloc(bool, result.columns.len);
+            for (cells, nulls, 0..) |*cell, *is_null, j| {
+                const value = try result.cell(alloc, i, j);
+                cell.* = try clone(alloc, value.value, 0);
+                is_null.* = value.sql_null;
             }
             try self.rows.append(alloc, .{ .values = cells, .nulls = nulls });
         }

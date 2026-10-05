@@ -42,6 +42,14 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         pa.table(
             {
                 "amount": pa.array(range(count), type=pa.int64()),
+                "exact": pa.array(
+                    [None if i % 7 == 0 else 9007199254740993 + i % 3 for i in range(count)],
+                    type=pa.int64(),
+                ),
+                "measure": pa.array(
+                    [None if i % 7 == 0 else (i % 3) * 0.5 for i in range(count)],
+                    type=pa.float64(),
+                ),
                 "label": pa.array(
                     [None if i % 7 == 0 else f"row-{i}" for i in range(count)]
                 ),
@@ -329,6 +337,29 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 ) as connection,
                 connection.cursor() as cursor,
             ):
+                numeric = list(
+                    cursor.stream(
+                        "SELECT exact, measure + 0.25 FROM lake_events", size=37
+                    )
+                )
+                assert numeric == [
+                    (None, None)
+                    if i % 7 == 0
+                    else (9007199254740993 + i % 3, (i % 3) * 0.5 + 0.25)
+                    for i in range(count)
+                ]
+                cursor.execute(
+                    "SELECT exact, COUNT(*), SUM(measure) FROM lake_events "
+                    "WHERE exact IS NOT NULL GROUP BY exact ORDER BY exact"
+                )
+                assert cursor.fetchall() == [
+                    (
+                        9007199254740993 + k,
+                        sum(i % 3 == k and i % 7 != 0 for i in range(count)),
+                        sum((i % 3) * 0.5 for i in range(count) if i % 3 == k and i % 7 != 0),
+                    )
+                    for k in range(3)
+                ]
                 # Streaming delivery can return an explicit larger LIMIT
                 # while keeping each wire response page bounded.
                 large_seen = [

@@ -247,9 +247,7 @@ const Owner = struct {
             for (selected, 0..) |*keep, index| {
                 if (!keep.*) continue;
                 const one: catalog.ColumnPage = .{ .batch = view, .selection = &.{index} };
-                if (physical != null and physical.?.values == .dictionary_bytes and !physical.?.nulls.isNull(index)) {
-                    const id = physical.?.values.dictionary_bytes.indices[index];
-                    if (id >= physical.?.values.dictionary_bytes.values.len) return error.InvalidSqlBackendResponse;
+                if (if (physical) |column| try column.dictionaryId(index) else null) |id| {
                     if (dictionary.get(id)) |cached| {
                         keep.* = cached;
                     } else {

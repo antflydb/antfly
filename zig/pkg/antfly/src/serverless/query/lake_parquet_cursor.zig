@@ -139,7 +139,7 @@ pub const Cursor = struct {
             if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
                 // Resource policy is checked for each consumer, independently
                 // of the immutable physical interpretation of a page.
-                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v2", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
+                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v3", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
                 defer self.a.free(interpretation);
                 cache_key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
                 if (reader.cache.decoded.lookup(cache_key.?)) |lease| {
@@ -213,6 +213,9 @@ pub const Cursor = struct {
                 cache.publish(key, lease);
                 column.cached = lease;
             } else {
+                // Cursor-owned dictionaries outlive every uncached page. Only
+                // cache publication needs an independently retained dependency.
+                limits.borrow_dictionary = true;
                 column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
             }
             column.count = count;
@@ -371,6 +374,7 @@ pub const Cursor = struct {
             var vector = decoded;
             vector.values = switch (decoded.values) {
                 .dictionary_bytes => |values| .{ .dictionary_bytes = .{ .values = values.values, .indices = values.indices[begin..][0..count] } },
+                inline .dictionary_i64, .dictionary_f64 => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), .{ .values = values.values, .indices = values.indices[begin..][0..count] }),
                 inline else => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), values[begin..][0..count]),
             };
             if (decoded.nulls.bytes.len != 0) vector.nulls.bytes = decoded.nulls.bytes[begin..][0..count];

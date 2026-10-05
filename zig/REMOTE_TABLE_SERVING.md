@@ -51,6 +51,35 @@ The following paths remain required before claiming complete remote index servin
 This table is an acceptance gate. Helper tests or a configured index alone do not
 make any unfinished path query-ready.
 
+## Native execution and delivery
+
+Parquet's ordinary INT32/INT64 and FLOAT/DOUBLE dictionary pages retain their
+numeric dictionary values and row indices in the native scan path. Null slots do
+not reference dictionary entries. Cached decoded pages retain the dictionary
+lease; uncached pages borrow their cursor's dictionary. SQL kernels, Iceberg equality deletes,
+public row reads, and sidecar builders accept these representations. Predicate
+and dynamic-filter evaluation reuse dictionary results within each physical page.
+Logical timestamp conversion currently retains its expanded numeric path.
+
+Spilled joins admit borrowed blocks into typed hash state and reuse bounded
+candidate workspace. Group partitions consume borrowed blocks and import exact
+partial states without allocating a temporary input array per group. Partial
+admission, replay, skew fallback, and legacy wide records share the sequential
+reader's lifetime and retry contract.
+
+PostgreSQL delivery reads cells from retained execution columns directly. Result
+views preserve ownership through portal slicing; scroll/hold cursors copy cells
+at their spooling boundary. SQL NULL remains separate from JSON null, and datetime
+conversion occurs at encoding. Retained pages must be released before their stream
+closes. HTTP SQL still uses its bounded materialized result envelope; direct HTTP
+serialization and operational remote index/materialization selection remain open.
+
+The ReleaseSafe wide 100,000-by-100,000 spilled join benchmark produces the same
+aggregate checksum with approximately 0.70 million backing allocations, compared
+with approximately 1.37 million at PR979's reviewed head. These local timings are
+not a cross-machine throughput guarantee. Run `zig build sql-native-pipeline-bench
+-Doptimize=ReleaseSafe` to reproduce allocation and peak-memory measurements.
+
 ## Query and index UX
 
 Use the existing table/index create, get, list, delete, and maintenance operations.

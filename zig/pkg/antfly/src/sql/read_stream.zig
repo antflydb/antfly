@@ -25,6 +25,24 @@ pub const Page = struct {
     }
 };
 
+/// A bounded result lease. Payloads remain in retained execution columns until
+/// the transport has flushed them; consumers release the lease before close.
+pub const BatchPage = struct {
+    arena: std.heap.ArenaAllocator,
+    columns: []const describe.Column,
+    values: @import("execution_batch.zig").Batch,
+    exhausted: bool,
+    lease: ?*PendingColumns = null,
+    row_page: ?Page = null,
+
+    pub fn deinit(self: *BatchPage) void {
+        if (self.lease) |lease| lease.deinit();
+        if (self.row_page) |*page| page.deinit();
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 const Fixture = struct {
     offset: usize = 0,
     count: usize = 10000,
@@ -712,23 +730,84 @@ pub const Stream = struct {
     pub fn next(self: *Stream, max_rows: u32) !Page {
         if (self.failed) return error.SqlStreamFailed;
         if (max_rows == 0 or max_rows > 4096) return error.InvalidSqlLimit;
-        return self.pull(max_rows) catch |err| {
-            self.failed = true;
-            if (self.parallel) |pipeline| {
-                pipeline.close();
-                self.parallel = null;
+        return self.pull(max_rows) catch |err| return self.fail(err);
+    }
+
+    fn fail(self: *Stream, err: anyerror) anyerror {
+        self.failed = true;
+        if (self.parallel) |pipeline| {
+            pipeline.close();
+            self.parallel = null;
+        }
+        if (self.pending_columns) |page| page.deinit();
+        self.pending_columns = null;
+        if (self.spool) |spool| spool.close();
+        self.spool = null;
+        // A failed pull is terminal. Release native snapshots immediately;
+        // a portal that remains named must not retain storage admission.
+        if (self.cursor) |cursor| cursor.close(cursor.ptr);
+        self.cursor = null;
+        if (err == error.OutOfMemory and self.budget.exhausted) return error.SqlProgramLimitExceeded;
+        return err;
+    }
+
+    pub fn nextBatch(self: *Stream, max_rows: u32) !BatchPage {
+        if (self.failed) return error.SqlStreamFailed;
+        if (max_rows == 0 or max_rows > 4096) return error.InvalidSqlLimit;
+        return self.pullBatch(max_rows) catch |err| return self.fail(err);
+    }
+
+    fn pullBatch(self: *Stream, max_rows: u32) !BatchPage {
+        try self.context.checkpoint();
+        var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+        errdefer arena.deinit();
+        if (self.spool != null or !(self.pending_columns != null or self.columnsEligible())) {
+            var page = try self.pull(max_rows);
+            errdefer page.deinit();
+            const output = try arena.allocator().create(runtime.Output);
+            output.* = page.output;
+            const Rows = struct {
+                fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+                    const out: *runtime.Output = @ptrCast(@alignCast(raw));
+                    const value = out.rows[row][column];
+                    return .{ .value = value, .sql_null = if (out.sql_nulls) |flags| flags[row][column] else value == .null };
+                }
+            };
+            return .{ .arena = arena, .columns = page.output.columns, .values = .{ .reader = .{ .ptr = output, .read = Rows.cell, .count = page.output.rows.len, .width = page.output.columns.len } }, .exhausted = page.exhausted, .row_page = page };
+        }
+        if (self.delivery_error) |err| return err;
+        while (true) {
+            if (self.pending_columns == null) {
+                if (self.exhausted) return .{ .arena = arena, .columns = self.context.binding.columns, .values = .{ .rows = &.{} }, .exhausted = true };
+                self.pending_columns = try self.executeColumns(self.context.limits.executionRows());
+                self.pending_index = 0;
+                self.exhausted = false;
             }
-            if (self.pending_columns) |page| page.deinit();
-            self.pending_columns = null;
-            if (self.spool) |spool| spool.close();
-            self.spool = null;
-            // A failed pull is terminal. Release native snapshots immediately;
-            // a portal that remains named must not retain storage admission.
-            if (self.cursor) |cursor| cursor.close(cursor.ptr);
-            self.cursor = null;
-            if (err == error.OutOfMemory and self.budget.exhausted) return error.SqlProgramLimitExceeded;
-            return err;
-        };
+            const pending = self.pending_columns.?;
+            if (self.pending_index == pending.len()) {
+                if (pending.terminal_error) |err| return err;
+                self.exhausted = pending.exhausted;
+                pending.deinit();
+                self.pending_columns = null;
+                continue;
+            }
+            const begin = self.pending_index;
+            var end = begin;
+            var bytes: usize = 0;
+            while (end < pending.len() and end - begin < max_rows) {
+                for (0..self.context.binding.columns.len) |column| bytes +|= try @import("operators.zig").datumBytes(try pending.cell(arena.allocator(), end, column));
+                end += 1;
+                if (bytes >= self.context.limits.page_bytes) break;
+            }
+            const lease = try pending.view(begin, end);
+            self.pending_index = end;
+            if (end == pending.len() and pending.terminal_error == null) {
+                self.exhausted = pending.exhausted;
+                pending.deinit();
+                self.pending_columns = null;
+            }
+            return .{ .arena = arena, .columns = self.context.binding.columns, .values = .{ .retained = .{ .store = lease.values, .begin = lease.begin, .count = lease.len() } }, .exhausted = self.exhausted, .lease = lease };
+        }
     }
 
     fn pullSpool(self: *Stream, spool: *Spool, max_rows: u32) !Page {
@@ -1937,4 +2016,82 @@ test "SQL streaming joins own bounded spill state through paged delivery" {
     try std.testing.expectEqual(@as(usize, 8000), count);
     try std.testing.expectEqual(@as(i64, 31996000), checksum);
     try std.testing.expect(stream.stream_manager.?.written_bytes != 0);
+}
+
+test "SQL retained delivery survives subsequent pulls and preserves deferred errors" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |native| {
+        var fixture: Fixture = .{ .count = 40 };
+        var backend = fixture.backend();
+        var vtable = backend.vtable.*;
+        if (native) vtable.open_scan = NativeColumns.open;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(a, "SELECT n + 1 FROM docs", .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 32, .page_rows = 32 })).?;
+        defer stream.close();
+        var first = try stream.nextBatch(17);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 17), first.values.len());
+        if (native) try std.testing.expect(first.values == .retained);
+        var count: usize = 17;
+        while (true) {
+            var page = try stream.nextBatch(17);
+            defer page.deinit();
+            for (0..page.values.len()) |row| {
+                count += 1;
+                const value = try page.values.cell(a, row, 0);
+                try std.testing.expectEqual(@as(i64, @intCast(count)), value.value.integer);
+                try std.testing.expect(!value.sql_null);
+            }
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(@as(usize, 40), count);
+        try std.testing.expectEqual(@as(i64, 1), (try first.values.cell(a, 0, 0)).value.integer);
+        try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+    }
+    var fixture: Fixture = .{ .count = 2 };
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.open_scan = NativeColumns.open;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(a, "SELECT 1 / (1 - n) FROM docs", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{})).?;
+    defer stream.close();
+    var first = try stream.nextBatch(1);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.values.len());
+    try std.testing.expect(!first.exhausted);
+    try std.testing.expectError(error.SqlDivisionByZero, stream.nextBatch(1));
+    try std.testing.expectEqual(@as(i64, 1), (try first.values.cell(a, 0, 0)).value.integer);
+}
+
+fn retainedDeliveryAllocationScenario(a: std.mem.Allocator) !void {
+    var fixture: Fixture = .{ .count = 40 };
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.open_scan = NativeColumns.open;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(a, "SELECT n + 1 FROM docs", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 32, .page_rows = 32 })).?;
+    defer stream.close();
+    var count: usize = 0;
+    while (true) {
+        var page = try stream.nextBatch(7);
+        defer page.deinit();
+        for (0..page.values.len()) |row| {
+            count += 1;
+            try std.testing.expectEqual(@as(i64, @intCast(count)), (try page.values.cell(a, row, 0)).value.integer);
+        }
+        if (page.exhausted) break;
+    }
+    try std.testing.expectEqual(@as(usize, 40), count);
+}
+
+test "SQL retained delivery releases leases on every allocation failure" {
+    // Initialize shared compiler/kernel caches before measuring allocations.
+    try retainedDeliveryAllocationScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, retainedDeliveryAllocationScenario, .{});
 }

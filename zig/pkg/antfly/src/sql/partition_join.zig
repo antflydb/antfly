@@ -109,7 +109,7 @@ pub const Join = struct {
         }
     }
     fn nextOutput(self: *Join) !?Pair {
-        _ = self.output_arena.reset(.free_all);
+        _ = self.output_arena.reset(.{ .retain_with_limit = @min(8192, self.limits.bytes / 32) });
         const row = (try self.output.?.next(self.output_arena.allocator())) orelse {
             if (self.output_task) |*task| {
                 const result = task.await(self.manager.io);
@@ -350,7 +350,7 @@ pub const Join = struct {
                 while (offset < file.size) {
                     try self.manager.check();
                     _ = self.scratch.reset(.free_all);
-                    const row = try file.read(self.scratch.allocator(), offset);
+                    const row = try file.readBorrowed(offset);
                     const hash = (try operators.HashJoin.keyHash(row.row.keys)) orelse 0;
                     const child = &children[@intFromBool(hash & bit != 0)];
                     const target = if (build_side) &child.build else &child.probes;
@@ -390,43 +390,51 @@ pub const Join = struct {
                 var offset: u64 = 0;
                 var skew_fallback = false;
                 while (offset < file.size) {
-                    const row = try file.readBorrowed(offset);
-                    const hash = (try operators.HashJoin.keyHash(row.row.keys)) orelse 0;
-                    hash_union |= hash;
-                    hash_intersection &= hash;
-                    if (!skew_fallback) {
-                        const consumed = try self.hash.?.addBatchUntilFull(self.a, .{ .rows = &.{row.row.values} }, &.{row.row.keys});
-                        if (consumed == 0) {
-                            // Determine useful remaining bits before writing any
-                            // temporary hash-chain file. Skew alone needs chains.
-                            var remaining = row.following;
-                            while (remaining < file.size) {
-                                const scanned = try file.readBorrowed(remaining);
-                                const h = (try operators.HashJoin.keyHash(scanned.row.keys)) orelse 0;
-                                hash_union |= h;
-                                hash_intersection &= h;
-                                remaining = scanned.following;
-                            }
-                            if (try self.split(hash_union ^ hash_intersection)) {
-                                self.hash.?.deinit();
-                                self.hash = null;
-                                repartitioned = true;
-                                break;
-                            }
-                            skew_fallback = true;
-                            // Replay the retained prefix after lookahead. A sequential
-                            // reader cannot seek backward into an expired block.
-                            file.rewind();
-                            var replay: u64 = 0;
-                            while (replay < offset) {
-                                const prior = try file.readBorrowed(replay);
-                                replay = prior.following;
-                            }
-                            const current = try file.readBorrowed(offset);
-                            try self.hash.?.add(current.row.values, current.row.keys);
+                    const block = try file.readBatchBorrowed(offset, 256);
+                    var values: [256][]const Datum = undefined;
+                    var keys: [256][]const Datum = undefined;
+                    for (block.rows, 0..) |row, index| {
+                        const h = (try operators.HashJoin.keyHash(row.keys)) orelse 0;
+                        hash_union |= h;
+                        hash_intersection &= h;
+                        values[index] = row.values;
+                        keys[index] = row.keys;
+                    }
+                    if (skew_fallback) {
+                        for (block.rows) |row| try self.hash.?.add(row.values, row.keys);
+                        offset = block.following;
+                        continue;
+                    }
+                    const consumed = try self.hash.?.addBatchUntilFull(self.a, .{ .rows = values[0..block.rows.len] }, keys[0..block.rows.len]);
+                    offset += consumed;
+                    if (consumed == block.rows.len) continue;
+                    // Inspect remaining hashes without copying payloads. A useful
+                    // partition split wins over building a temporary disk chain.
+                    var remaining = offset;
+                    while (remaining < file.size) {
+                        const scanned = try file.readBatchBorrowed(remaining, 256);
+                        for (scanned.rows) |row| {
+                            const h = (try operators.HashJoin.keyHash(row.keys)) orelse 0;
+                            hash_union |= h;
+                            hash_intersection &= h;
                         }
-                    } else try self.hash.?.add(row.row.values, row.row.keys);
-                    offset = row.following;
+                        remaining = scanned.following;
+                    }
+                    if (try self.split(hash_union ^ hash_intersection)) {
+                        self.hash.?.deinit();
+                        self.hash = null;
+                        repartitioned = true;
+                        break;
+                    }
+                    skew_fallback = true;
+                    // Restore the forward reader after lookahead. This also
+                    // handles admission stopping in the middle of a block.
+                    file.rewind();
+                    var replay: u64 = 0;
+                    while (replay < offset) {
+                        const prior = try file.readBatchBorrowed(replay, @intCast(@min(256, offset - replay)));
+                        replay = prior.following;
+                    }
                 }
             }
             if (repartitioned) continue;
@@ -443,7 +451,7 @@ pub const Join = struct {
         }
         self.finished = true;
         if (self.parallel_builds) return self.nextParallel();
-        _ = self.candidate.reset(.free_all);
+        _ = self.candidate.reset(.{ .retain_with_limit = @min(8192, self.limits.bytes / 32) });
         while (try self.prepare()) {
             try self.manager.check();
             if (self.probe) |*probe| {
@@ -454,7 +462,7 @@ pub const Join = struct {
             if (self.active.?.probes) |*file| {
                 if (self.probe_offset < file.size) {
                     _ = self.probe_arena.reset(.free_all);
-                    const row = try file.read(self.probe_arena.allocator(), self.probe_offset);
+                    const row = try file.readBorrowed(self.probe_offset);
                     self.probe_offset = row.following;
                     self.left = row.row.values;
                     self.matched = false;
