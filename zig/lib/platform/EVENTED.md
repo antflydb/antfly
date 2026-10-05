@@ -9,19 +9,24 @@ uses Threaded. The optional enrichment executor supports both tested platforms.
 Both compatibility copies preserve Zig's MIT license and record the upstream
 source SHA-256. Dispatch adapts the release vtable, keeps timer cancellation state
 alive through resumption, and publishes future completion after switching away
-from the completed stack. On AArch64 it uses a C ABI assembly switch to preserve
-callee-saved registers and LR; the release inline switch corrupted live values in
-optimized builds. New fibers retain the upstream entry-message convention.
+from the completed stack. On AArch64 and x86_64 it uses a C ABI assembly switch
+to preserve callee-saved registers; the release inline switch corrupted live
+values in optimized builds. New fibers retain the upstream entry-message
+convention. Allocator protection uses an OS mutex and short group critical
+sections use a thread spin lock, since Dispatch callbacks cannot suspend a fiber.
+Group awaiting acknowledges parent cancellation after all children finish.
 
 The strict `zig build evented-enrichment-test` gate covers backend identity,
-group bookkeeping, sleeping tasks, immediate and delayed cancellation, repeated
+group bookkeeping, parent cancellation while awaiting `std.Io.Group` children,
+sleeping tasks, immediate and delayed cancellation, repeated
 concurrent completion, positional file read/write, and file synchronization.
 The Linux compatibility backend acknowledges timer cancellation after completion
 so cancellation of an already-submitted timeout returns `error.Canceled`.
 Run it in both debug and ReleaseFast modes. Linux requires a sufficiently recent
 kernel and a sandbox that permits io_uring; initialization failures are failures
-in this gate. macOS requires libc. Intel macOS is cross-compiled but these
-measurements and runtime checks use Apple Silicon.
+in this gate. macOS requires libc. The gate is also cross-compiled for Intel
+macOS and executed under Rosetta in Debug and ReleaseFast modes. Native Intel
+hardware has not been tested; the macOS measurements use Apple Silicon.
 
 Dispatch still lacks complete networking. Its positional file operations call
 blocking `preadv`, `pwritev`, and `fsync` from dispatched fibers; this experiment

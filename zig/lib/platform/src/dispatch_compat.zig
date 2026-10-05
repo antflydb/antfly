@@ -68,7 +68,7 @@ const main_loop_stack_size = 8 * 1024;
 
 queue: c.dispatch.queue_t,
 backing_allocator_needs_mutex: bool,
-backing_allocator_mutex: Mutex,
+backing_allocator_mutex: ThreadMutex,
 /// Does not need to be thread-safe if not used elsewhere.
 backing_allocator: Allocator,
 main_fiber: Fiber,
@@ -109,6 +109,9 @@ const Thread = struct {
     };
 
     noinline fn current() *Thread {
+        // Fibers can migrate between Dispatch workers. Keep each TLS lookup
+        // observable so LLVM cannot reuse a result across a stack switch.
+        asm volatile ("" ::: .{ .memory = true });
         return &self;
     }
 
@@ -318,6 +321,27 @@ const Fiber = struct {
     }
 };
 
+// Allocation and destruction also run on Dispatch callbacks with no active
+// fiber. Protect non-thread-safe allocators with an OS mutex, not a fiber wait.
+const ThreadMutex = struct {
+    raw: c.pthread_mutex_t = c.PTHREAD_MUTEX_INITIALIZER,
+
+    fn lock(mutex: *ThreadMutex) void {
+        const result = c.pthread_mutex_lock(&mutex.raw);
+        assert(result == .SUCCESS);
+    }
+
+    fn unlock(mutex: *ThreadMutex) void {
+        const result = c.pthread_mutex_unlock(&mutex.raw);
+        assert(result == .SUCCESS);
+    }
+
+    fn deinit(mutex: *ThreadMutex) void {
+        const result = c.pthread_mutex_destroy(&mutex.raw);
+        assert(result == .SUCCESS);
+    }
+};
+
 pub fn allocator(ev: *Evented) std.mem.Allocator {
     return if (ev.backing_allocator_needs_mutex) .{
         .ptr = ev,
@@ -332,7 +356,7 @@ pub fn allocator(ev: *Evented) std.mem.Allocator {
 
 fn alloc(userdata: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
+    ev.backing_allocator_mutex.lock();
     defer ev.backing_allocator_mutex.unlock();
     return ev.backing_allocator.rawAlloc(len, alignment, ret_addr);
 }
@@ -345,7 +369,7 @@ fn resize(
     ret_addr: usize,
 ) bool {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
+    ev.backing_allocator_mutex.lock();
     defer ev.backing_allocator_mutex.unlock();
     return ev.backing_allocator.rawResize(memory, alignment, new_len, ret_addr);
 }
@@ -358,14 +382,14 @@ fn remap(
     ret_addr: usize,
 ) ?[*]u8 {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
+    ev.backing_allocator_mutex.lock();
     defer ev.backing_allocator_mutex.unlock();
     return ev.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr);
 }
 
 fn free(userdata: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
-    ev.backing_allocator_mutex.lockUncancelable(ev);
+    ev.backing_allocator_mutex.lock();
     defer ev.backing_allocator_mutex.unlock();
     return ev.backing_allocator.rawFree(memory, alignment, ret_addr);
 }
@@ -570,7 +594,7 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng_mutex = undefined,
         .csprng = .uninitialized,
     };
-    try ev.backing_allocator_mutex.init(queue);
+    ev.backing_allocator_mutex = .{};
     errdefer ev.backing_allocator_mutex.deinit();
     var initialized_futexes: usize = 0;
     errdefer for (ev.futexes[0..initialized_futexes]) |*futex| futex.deinit();
@@ -744,15 +768,48 @@ const SwitchMessage = struct {
     }
 };
 
-// Use a C ABI call boundary on AArch64 so live values (including LR) are
-// saved on the old stack. The release inline assembly loses them in optimized
-// builds. New fibers still receive the switch message in x1, as upstream expects.
+// Use a C ABI call boundary so the compiler saves live caller-saved values on
+// the old stack. The naked switch preserves callee-saved registers explicitly.
+// New fibers receive the switch message in x1/rsi, as their entry points expect.
 noinline fn contextSwitch(message: *const SwitchMessage) *const SwitchMessage {
     const switched = if (builtin.cpu.arch == .aarch64) blk: {
         const call: *const fn (*const Io.fiber.Switch) callconv(.c) *const Io.fiber.Switch = @ptrCast(&contextSwitchAarch64);
         break :blk call(&message.contexts);
+    } else if (builtin.cpu.arch == .x86_64) blk: {
+        const call: *const fn (*const Io.fiber.Switch) callconv(.c) *const Io.fiber.Switch = @ptrCast(&contextSwitchX86_64);
+        break :blk call(&message.contexts);
     } else Io.fiber.contextSwitch(&message.contexts);
     return @fieldParentPtr("contexts", switched);
+}
+
+fn contextSwitchX86_64() callconv(.naked) void {
+    asm volatile (
+        \\ pushq %rbp
+        \\ pushq %rbx
+        \\ pushq %r12
+        \\ pushq %r13
+        \\ pushq %r14
+        \\ pushq %r15
+        \\ movq %rdi, %rsi
+        \\ movq 0(%rsi), %rax
+        \\ movq 8(%rsi), %rcx
+        \\ leaq 0f(%rip), %rdx
+        \\ movq %rsp, 0(%rax)
+        \\ movq %rbp, 8(%rax)
+        \\ movq %rdx, 16(%rax)
+        \\ movq 0(%rcx), %rsp
+        \\ movq 8(%rcx), %rbp
+        \\ jmpq *16(%rcx)
+        \\0:
+        \\ movq %rsi, %rax
+        \\ popq %r15
+        \\ popq %r14
+        \\ popq %r13
+        \\ popq %r12
+        \\ popq %rbx
+        \\ popq %rbp
+        \\ retq
+    );
 }
 
 fn contextSwitchAarch64() callconv(.naked) void {
@@ -1240,52 +1297,32 @@ const Group = struct {
         return @ptrCast(&group.ptr.state);
     }
 
+    // Group operations also run on Dispatch callbacks after a fiber has yielded.
+    // They cannot use the fiber futex: there is no active fiber stack to suspend
+    // there. These critical sections only update links and enqueue callbacks;
+    // none of them yield, so use a short thread-level spin lock.
     fn lock(group: Group, ev: *Evented) void {
+        _ = ev;
         const mutex = group.mutexPtr();
-        {
-            const old_state = @atomicRmw(
-                Group.Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = false, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            if (old_state.contended) {
-                futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-            }
-        }
-        while (true) {
-            var old_state = @atomicRmw(
-                Group.Mutex,
-                mutex,
-                .Or,
-                .{ .locked = true, .contended = true, .shared2 = 0 },
-                .acquire,
-            );
-            if (!old_state.locked) {
-                @branchHint(.likely);
-                return;
-            }
-            old_state.contended = true;
-            futexWaitUncancelable(ev, @ptrCast(mutex), @bitCast(old_state));
-        }
+        while (@atomicRmw(
+            Group.Mutex,
+            mutex,
+            .Or,
+            .{ .locked = true, .contended = false, .shared2 = 0 },
+            .acquire,
+        ).locked) std.atomic.spinLoopHint();
     }
 
     fn unlock(group: Group, ev: *Evented) void {
-        const mutex = group.mutexPtr();
+        _ = ev;
         const old_state = @atomicRmw(
             Group.Mutex,
-            mutex,
+            group.mutexPtr(),
             .And,
             .{ .locked = false, .contended = false, .shared2 = std.math.maxInt(u30) },
             .release,
         );
         assert(old_state.locked);
-        if (old_state.contended) futexWake(ev, @ptrCast(mutex), 1);
     }
 
     fn addFiber(group: Group, ev: *Evented, fiber: *Fiber) void {
@@ -1525,7 +1562,16 @@ fn groupAwait(
 ) Io.Cancelable!void {
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
+    // Capture the fiber before yielding: Dispatch may resume it on another
+    // worker, so the original thread-local state must not be reused.
+    const fiber = Thread.current().currentFiber();
     ev.yield(.{ .group_await = .{ .ptr = type_erased } });
+    if (fiber.cancel_protection.check() == .unblocked and
+        @atomicLoad(Fiber.CancelStatus, &fiber.cancel_status, .monotonic).requested)
+    {
+        fiber.cancel_protection.acknowledge();
+        return error.Canceled;
+    }
 }
 
 fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {

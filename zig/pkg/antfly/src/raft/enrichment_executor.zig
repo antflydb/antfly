@@ -135,6 +135,16 @@ pub fn testEventedExecutor(require_available: bool) !void {
         fn wait(task_io: std.Io) !void {
             try std.Io.sleep(task_io, .fromSeconds(3600), .awake);
         }
+        fn groupChild(task_io: std.Io) void {
+            task_io.sleep(.fromSeconds(3600), .awake) catch {};
+        }
+        fn groupParent(task_io: std.Io, ready: *std.Io.Event) std.Io.Cancelable!void {
+            var group: std.Io.Group = .init;
+            defer group.cancel(task_io);
+            group.async(task_io, groupChild, .{task_io});
+            ready.set(task_io);
+            try group.await(task_io);
+        }
         fn immediate(value: u64) u64 {
             return value;
         }
@@ -148,6 +158,17 @@ pub fn testEventedExecutor(require_available: bool) !void {
         var sleeping = try io.concurrent(Work.wait, .{io});
         try io.sleep(.fromMilliseconds(1), .awake);
         try std.testing.expectError(error.Canceled, sleeping.cancel(io));
+    }
+
+    // Cancel a parent awaiting actual Io.Group children, rather than only
+    // exercising the executor's group bookkeeping.
+    for (0..4) |_| {
+        var ready: std.Io.Event = .unset;
+        var parent = try io.concurrent(Work.groupParent, .{ io, &ready });
+        defer parent.cancel(io) catch {};
+        ready.waitUncancelable(io);
+        try io.sleep(.fromMilliseconds(1), .awake);
+        try std.testing.expectError(error.Canceled, parent.cancel(io));
     }
 
     // Immediate completion must not release a fiber while its stack is active.

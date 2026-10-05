@@ -1908,6 +1908,7 @@ fn groupAwait(
     const ev: *Evented = @ptrCast(@alignCast(userdata));
     _ = initial_token;
     ev.yield(null, .{ .group_await = .{ .ptr = type_erased } });
+    try checkCancel(userdata);
 }
 
 fn groupCancel(userdata: ?*anyopaque, type_erased: *Io.Group, initial_token: *anyopaque) void {
