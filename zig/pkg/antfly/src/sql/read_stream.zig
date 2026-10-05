@@ -266,6 +266,11 @@ const ParallelScan = struct {
         const cursor = source.cursor orelse return null;
         const split = cursor.split_ordered orelse return null;
         const io = source.context.backend.execution_io orelse return null;
+        // A bounded LIMIT must not spend its scan quota on speculative later
+        // ranges. Keep it serial until ordered progress can be admitted by
+        // the consumer independently of worker lookahead.
+        if (source.remaining != std.math.maxInt(usize)) return null;
+        if (cursor.estimated_rows) |rows| if (rows > source.context.limits.scan_rows) return null;
         if (source.skip != 0 or source.context.limits.retained_bytes < 16 * 1024 * 1024 or source.remaining < 8192) return null;
         if ((cursor.estimated_rows orelse 0) < 8192 and (cursor.estimated_bytes orelse 0) < 2 * 1024 * 1024) return null;
         const a = source.budget.allocator();
@@ -1184,7 +1189,7 @@ const OrderedColumns = struct {
 };
 test "SQL ordered parallel scan evaluates complete pipelines with bounded delivery" {
     const a = std.testing.allocator;
-    for ([_][]const u8{ "SELECT n + 1 FROM docs WHERE n % 2 = 0", "SELECT n + 1 FROM docs LIMIT 8192", "SELECT 1 / (9999 - n) FROM docs" }) |sql| {
+    for ([_][]const u8{ "SELECT n + 1 FROM docs WHERE n % 2 = 0", "SELECT n + 1 FROM docs", "SELECT 1 / (9999 - n) FROM docs" }) |sql| {
         var fixture: OrderedColumns = .{};
         var backend = Fixture.backend(undefined);
         var vtable = backend.vtable.*;
@@ -1217,7 +1222,27 @@ test "SQL ordered parallel scan evaluates complete pipelines with bounded delive
         try std.testing.expectEqual(@as(usize, 1), fixture.splits);
         try std.testing.expectEqual(@as(usize, 1), fixture.closes);
         for (fixture.children) |child| try std.testing.expectEqual(@as(usize, 1), child.closed);
-        try std.testing.expectEqual(@as(usize, if (failed) 9999 else if (std.mem.indexOf(u8, sql, "WHERE") != null) 5000 else 8192), seen);
+        try std.testing.expectEqual(@as(usize, if (failed) 9999 else if (std.mem.indexOf(u8, sql, "WHERE") != null) 5000 else 10000), seen);
         try std.testing.expect(stream.budget.peak <= stream.budget.limit);
     }
+}
+
+test "SQL ordered parallel scan declines bounded limit before spending scan quota" {
+    const a = std.testing.allocator;
+    var fixture: OrderedColumns = .{};
+    var backend = Fixture.backend(undefined);
+    var vtable = backend.vtable.*;
+    vtable.open_scan = OrderedColumns.open;
+    vtable.checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check;
+    backend.ptr = &fixture;
+    backend.vtable = &vtable;
+    backend.execution_io = std.testing.io;
+    var compiled = try compiler.compile(a, "SELECT n FROM docs LIMIT 8192", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_rows = 8192 })).?;
+    defer stream.close();
+    try std.testing.expectEqual(null, try ParallelScan.start(stream));
+    try std.testing.expectEqual(@as(usize, 0), fixture.splits);
 }

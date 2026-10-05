@@ -267,8 +267,8 @@ Large eligible lake scans can split into ordered ranges whose workers run the
 complete scan/filter/projection pipeline. Multi-file ranges discover footers
 lazily and own independent mutable object versions. Bounded typed queues apply backpressure;
 the consumer preserves source order and delivers valid rows before a later
-worker error. Early LIMIT completion and cancellation join workers before
-releasing the parent snapshot. OFFSET, small scans/budgets, external decision
+worker error. Early closure and cancellation join workers before
+releasing the parent snapshot. LIMIT/OFFSET, small scans/budgets, external decision
 expressions and scheduler saturation use the existing serial pipeline.
 Homogeneous hash keys compare retained primitive columns directly; batch hashing
 avoids transposing Datum rows and probing interleaves independent bucket chains.
