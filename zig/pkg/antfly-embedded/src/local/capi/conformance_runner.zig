@@ -295,7 +295,7 @@ const Runner = struct {
         const path: [:0]const u8 = if (str(fields, "path")) |name|
             try self.resolvePath(name)
         else if (default_path) |p|
-            try self.arena.dupeZ(u8, p)
+            try self.arena.dupeSentinel(u8, p, 0)
         else
             try self.resolvePath(null);
         const code = try self.openRaw(fields, path, &self.handle);

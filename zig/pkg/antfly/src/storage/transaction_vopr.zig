@@ -46,7 +46,7 @@ pub const Scenario = struct {
         phase: Phase = .begin,
         terminal_status: ?transactions.TxnStatus = null,
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             self.manager.deinit();
             self.runtime_store.deinit();
             self.backend.close();
@@ -140,8 +140,8 @@ pub const Scenario = struct {
         const persisted_status: i64 = if (state.phase == .begin)
             -1
         else
-            @intCast(@intFromEnum(try state.manager.getTransactionStatus(txn_id)));
-        try builder.addNamed(allocator, "storage.transaction.phase", @intCast(@intFromEnum(state.phase)));
+            @intCast(@backingInt(try state.manager.getTransactionStatus(txn_id)));
+        try builder.addNamed(allocator, "storage.transaction.phase", @intCast(@backingInt(state.phase)));
         try builder.addNamed(allocator, "storage.transaction.persisted_status", persisted_status);
         try builder.addNamed(allocator, "storage.transaction.terminal", @intFromBool(state.phase == .terminal));
     }

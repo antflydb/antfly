@@ -96,5 +96,5 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
-    @import("restore_provisioning_contract.zig").freeTable(alloc, record);
+    @import("record_memory.zig").freeTable(alloc, record);
 }

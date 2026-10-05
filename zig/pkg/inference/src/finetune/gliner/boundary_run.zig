@@ -335,7 +335,7 @@ test "boundary training run resumes ordered examples from optimizer counters acr
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/run.safetensors", .{temporary.sub_path});
     defer a.free(path);
     const digest = try plan.fingerprint(a);
-    var seen = [_][11]u8{.{0} ** 11} ** 3;
+    var seen = @as([3][11]u8, @splat(@splat(0)));
     var flushes: usize = 0;
     while (true) {
         const position = try plan.position(trainer.identity(), trainer.owner.accum_count);
@@ -363,7 +363,7 @@ test "boundary training run resumes ordered examples from optimizer counters acr
     }
     try std.testing.expectEqual(@as(usize, 3), flushes);
     try std.testing.expectEqual(@as(u64, 18), trainer.owner.step_count);
-    for (seen) |epoch| try std.testing.expectEqualSlices(u8, &(.{1} ** 11), &epoch);
+    for (seen) |epoch| try std.testing.expectEqualSlices(u8, &@as([11]u8, @splat(1)), &epoch);
     try std.testing.expectError(error.InvalidBoundaryTrainingProgress, plan.position(.{ .optimizer_step = 0, .microbatch_step = 6 }, 2));
 }
 
@@ -377,7 +377,7 @@ fn exerciseOrder(a: Allocator) !void {
     defer a.free(second);
     try std.testing.expectEqualSlices(u32, first, again);
     try std.testing.expect(!std.mem.eql(u32, first, second));
-    var seen = [_]bool{false} ** 17;
+    var seen = @as([17]bool, @splat(false));
     for (first) |index| {
         try std.testing.expect(index < 17 and !seen[index]);
         seen[index] = true;

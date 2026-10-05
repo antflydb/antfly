@@ -17,7 +17,7 @@
 const std = @import("std");
 const db = @import("antfly_local_sources").storage_db_replication_contract;
 const record = @import("antfly_local_sources").storage_db_replication_record;
-const staging = @import("antfly_local_sources").metadata_restore_provisioning_contract;
+const staging = @import("../metadata/restore_provisioning_contract.zig");
 const runtime_callback_abi = @import("antfly_local_sources").runtime_callback_abi;
 
 pub const Checkpoint = struct {

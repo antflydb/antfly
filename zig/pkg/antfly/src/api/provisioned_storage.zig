@@ -507,7 +507,7 @@ fn implementationTests() type {
                 .{ .budgets = large, .total = 64 * 1024 * MiB },
             }) |fixture| {
                 const budgets = fixture.budgets;
-                const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
+                const configured = budgets.options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
                 try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
                 try std.testing.expectEqual(configured.hard_limit_bytes * 7 / 8, configured.soft_limit_bytes);
                 try std.testing.expectEqual(
@@ -522,9 +522,9 @@ fn implementationTests() type {
             const medium = smartResourceBudgetsForTotal(12 * GiB);
             const large = smartResourceBudgetsForTotal(64 * GiB);
 
-            const small_hbc = small.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-            const medium_hbc = medium.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
-            const large_hbc = large.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const small_hbc = small.options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const medium_hbc = medium.options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+            const large_hbc = large.options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
 
             try std.testing.expectEqual(@as(u64, 2 * GiB / 3), small_hbc.hard_limit_bytes);
             try std.testing.expectEqual(@as(u64, 4 * GiB), medium_hbc.hard_limit_bytes);

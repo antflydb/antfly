@@ -55,7 +55,7 @@ pub const Scenario = struct {
     };
 
     const mode_ids = ids: {
-        var values: [@typeInfo(Mode).@"enum".fields.len]vopr.id.StableId = undefined;
+        var values: [@typeInfo(Mode).@"enum".field_names.len]vopr.id.StableId = undefined;
         for (std.meta.tags(Mode), 0..) |mode, index|
             values[index] = vopr.id.stable(name, @tagName(mode));
         break :ids values;
@@ -159,7 +159,7 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             self.service_rate_model.deinit();
             self.vopr_io.deinit();
             const owner_allocator = self.owner_allocator;

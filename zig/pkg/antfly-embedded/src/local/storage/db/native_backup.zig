@@ -156,7 +156,7 @@ pub const LoadedManifest = struct {
             if (!std.mem.eql(u8, invalid.name, name)) continue;
             // Integrity/missing evidence is more actionable than a later
             // compatibility observation over the same projection.
-            if (@intFromEnum(reason) < @intFromEnum(invalid.reason)) invalid.reason = reason;
+            if (@backingInt(reason) < @backingInt(invalid.reason)) invalid.reason = reason;
             return;
         }
         try self.invalid_projections.append(self.alloc, .{
@@ -226,7 +226,7 @@ const OwnedArtifact = struct {
     role: ArtifactRole,
     projection_name: []const u8,
 
-    fn deinit(self: *OwnedArtifact, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedArtifact, alloc: Allocator) void {
         alloc.free(self.path);
         alloc.free(self.install_path);
         alloc.free(self.sha256);
@@ -315,7 +315,7 @@ const PinnedArtifactFile = struct {
     relative_path: []u8,
     source: Source,
 
-    fn deinit(self: *PinnedArtifactFile, alloc: Allocator) void {
+    pub fn deinit(self: *PinnedArtifactFile, alloc: Allocator) void {
         alloc.free(self.relative_path);
         switch (self.source) {
             .pinned_file => |file| alloc.free(file.path),

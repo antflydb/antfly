@@ -581,7 +581,7 @@ fn ParsedResponse(comptime T: type) type {
         response: http_common.HttpResponse,
         parsed: std.json.Parsed(T),
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.parsed.deinit();
             self.response.deinit(self.alloc);
             self.alloc.free(self.request_uri);
@@ -594,7 +594,7 @@ const VerifiedFrame = struct {
     encoded: []u8,
     record: replication_record.RecordView,
 
-    fn deinit(self: *VerifiedFrame, alloc: Allocator) void {
+    pub fn deinit(self: *VerifiedFrame, alloc: Allocator) void {
         alloc.free(self.encoded);
         self.* = undefined;
     }
@@ -821,7 +821,7 @@ const TestPaths = struct {
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
@@ -848,10 +848,10 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
-        .standby_log = try alloc.dupeZ(u8, standby_log),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
+        .standby_log = try alloc.dupeSentinel(u8, standby_log, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress, 0),
     };
 }
 
@@ -878,7 +878,7 @@ const ApplyCapture = struct {
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
     fail_at_lsn: u64 = 0,
 
-    fn deinit(self: *ApplyCapture) void {
+    pub fn deinit(self: *ApplyCapture) void {
         for (self.payloads.items) |payload| self.alloc.free(payload);
         self.payloads.deinit(self.alloc);
         self.* = undefined;
@@ -954,7 +954,7 @@ const CorruptFrameExecutor = struct {
         };
     }
 
-    fn startResponse(self: *CorruptFrameExecutor, alloc: Allocator) !http_common.HttpResponse {
+    pub fn startResponse(self: *CorruptFrameExecutor, alloc: Allocator) !http_common.HttpResponse {
         const encoded = try replication_record.encodeAlloc(alloc, .{
             .kind = .batch_mutation,
             .payload_codec = .raw,
@@ -1028,7 +1028,7 @@ const WrongIdentityBatchExecutor = struct {
         };
     }
 
-    fn startResponse(self: *WrongIdentityBatchExecutor, alloc: Allocator) !http_common.HttpResponse {
+    pub fn startResponse(self: *WrongIdentityBatchExecutor, alloc: Allocator) !http_common.HttpResponse {
         const first = try replication_record.encodeAlloc(alloc, .{
             .kind = .batch_mutation,
             .payload_codec = .raw,
@@ -1130,7 +1130,7 @@ const StatusAckMismatchExecutor = struct {
         };
     }
 
-    fn startResponse(self: *StatusAckMismatchExecutor, alloc: Allocator) !http_common.HttpResponse {
+    pub fn startResponse(self: *StatusAckMismatchExecutor, alloc: Allocator) !http_common.HttpResponse {
         const encoded = try replication_record.encodeAlloc(alloc, .{
             .kind = .batch_mutation,
             .payload_codec = .raw,

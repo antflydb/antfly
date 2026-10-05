@@ -80,7 +80,7 @@ pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catal
             !std.mem.eql(u8, std.mem.sliceAsBytes(before.generations), std.mem.sliceAsBytes(next.generations)) or next.rows_scanned < before.rows_scanned) return error.InvalidConstraintRetirementCommand;
         if (next.phase == before.phase) {
             if (before.phase == .fenced or before.phase == .ready or std.mem.order(u8, next.cursor, before.cursor) != .gt) return error.InvalidConstraintRetirementCommand;
-        } else if (@intFromEnum(next.phase) != @intFromEnum(before.phase) + 1 or next.cursor.len != 0) return error.InvalidConstraintRetirementCommand;
+        } else if (@backingInt(next.phase) != @backingInt(before.phase) + 1 or next.cursor.len != 0) return error.InvalidConstraintRetirementCommand;
     } else if (next.phase != .fenced or next.rows_scanned != 0 or next.cursor.len != 0) return error.InvalidConstraintRetirementCommand;
     return .{ .intent = .{ .key = key, .value = command.next }, .predicate = .{ .key = key, .comparison = .exact_value, .expected_value = command.expected } };
 }
@@ -136,10 +136,12 @@ pub const Page = struct {
         progress.rows_scanned = std.math.add(u64, progress.rows_scanned, page_rows.rows.len) catch return error.InvalidConstraintRetirement;
         progress.cursor = if (page_rows.more) try owned.dupe(u8, reader.after.items) else "";
         if (!page_rows.more) progress.phase = if (phase == .foreign_keys) .unique else .ready;
+        const owned_result_routing_key = try activation.routingKey(owned, &reader.read);
+        const owned_result_next_progress = try progress.encode(owned);
         return .{ .arena = arena, .rows = page_rows, .phase = phase, .command = .{
-            .routing_key = try activation.routingKey(owned, &reader.read),
+            .routing_key = owned_result_routing_key,
             .expected = expected,
-            .next = try progress.encode(owned),
+            .next = owned_result_next_progress,
         } };
     }
 };

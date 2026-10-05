@@ -61,7 +61,7 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
             };
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+        pub fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
             var current = try snapshot(ptr);
             return contract.matches(&current);
         }

@@ -487,11 +487,11 @@ pub const ServerlessHttpClient = struct {
         return try self.requestJson(MetricsResponse, .GET, base_uri, "/metrics", null);
     }
 
-    fn listNamespaces(self: *ServerlessHttpClient, base_uri: []const u8) !std.json.Parsed([]serverless.NamespaceRecord) {
+    pub fn listNamespaces(self: *ServerlessHttpClient, base_uri: []const u8) !std.json.Parsed([]serverless.NamespaceRecord) {
         return try self.requestJson([]serverless.NamespaceRecord, .GET, base_uri, "/internal/v1/namespaces", null);
     }
 
-    fn listTables(self: *ServerlessHttpClient, base_uri: []const u8) !std.json.Parsed([]TableRecord) {
+    pub fn listTables(self: *ServerlessHttpClient, base_uri: []const u8) !std.json.Parsed([]TableRecord) {
         return try self.requestJson([]TableRecord, .GET, base_uri, "/tables", null);
     }
 
@@ -624,7 +624,7 @@ pub const ServerlessHttpClient = struct {
         return try self.requestJson(QueryHeadResponse, .GET, base_uri, path, null);
     }
 
-    fn queryTable(self: *ServerlessHttpClient, base_uri: []const u8, table_name: []const u8) !std.json.Parsed(TableQueryResponse) {
+    pub fn queryTable(self: *ServerlessHttpClient, base_uri: []const u8, table_name: []const u8) !std.json.Parsed(TableQueryResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/query", .{table_name});
         defer self.alloc.free(path);
         return try self.requestJson(TableQueryResponse, .GET, base_uri, path, null);

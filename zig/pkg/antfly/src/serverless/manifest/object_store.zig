@@ -17,7 +17,7 @@ const object_storage = @import("antfly_local_sources").storage_object_storage;
 const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
-const object_store_support = @import("../object_store_support.zig");
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const platform_clock = @import("antfly_platform").clock;
 
 const winner_visibility_attempts: usize = 5;
@@ -375,7 +375,7 @@ const ConditionalCreateRaceClient = struct {
         return client_impl;
     }
 
-    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 
     fn bucketExists(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));

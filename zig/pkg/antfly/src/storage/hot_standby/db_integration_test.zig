@@ -715,7 +715,7 @@ test "storage.hot_standby db waits for remote apply before completing derived en
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
@@ -1213,7 +1213,7 @@ test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutat
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
 }
 
@@ -1287,7 +1287,7 @@ test "storage.hot_standby db block sync policy waits for standby acknowledgement
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     var found = (try db.lookup(alloc, "doc:block", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
@@ -1578,7 +1578,7 @@ test "storage.hot_standby db session sync wait satisfies remote apply through st
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
@@ -1817,7 +1817,7 @@ test "storage.hot_standby db session sync wait remote write acknowledges durable
     try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), apply_failure.calls);
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
@@ -1906,7 +1906,7 @@ test "storage.hot_standby db primary progress sync wait observes reported remote
     try std.testing.expectEqual(@as(usize, 2), remote_ack.calls);
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
@@ -2018,7 +2018,7 @@ test "storage.hot_standby db primary progress sync wait returns would block with
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
 }
@@ -2224,7 +2224,7 @@ test "storage.hot_standby db primary progress sync wait survives primary restart
         target_lsn = primary.lastLsn();
         try std.testing.expectEqual(@as(u64, 1), target_lsn);
         try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
-        try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+        try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 
         const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
         try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
@@ -2317,7 +2317,7 @@ test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
     try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
 }
 
 test "storage.hot_standby db fail-closed sync policy rejects before local batch commit" {
@@ -2371,7 +2371,7 @@ test "storage.hot_standby db fail-closed sync policy rejects before local batch 
     }));
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
     try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
-    try std.testing.expectEqual(@intFromEnum(hot_standby_commit_gate_mod.Action.reject), gate_action.load(.acquire));
+    try std.testing.expectEqual(@backingInt(hot_standby_commit_gate_mod.Action.reject), gate_action.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
     try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
 }
@@ -3321,7 +3321,7 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
     var restarted_cleanup = false;
     var saw_pending_repair = false;
     var standby_gate: @import("public_gate_state.zig").State = .{};
-    standby_gate.role.store(@intFromEnum(@import("public_gate_state.zig").Role.standby), .release);
+    standby_gate.role.store(@backingInt(@import("public_gate_state.zig").Role.standby), .release);
     const replication_payload = try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(alloc, request, .{ .term = 1, .index = 1 });
     defer alloc.free(replication_payload);
     const replication_record: replication_record_mod.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = replication_payload };

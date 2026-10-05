@@ -397,7 +397,7 @@ fn NativeCredentialProvider(comptime lib: type, comptime Adapter: type, comptime
             return (try runtime.get(null)).readReported(alloc, req);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             lib.deinitConfig(self.alloc, &self.cfg);
             self.alloc.destroy(self);

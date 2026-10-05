@@ -17,15 +17,16 @@ behavior changes belong to #893.
 - `zig/pkg/antfly-server-api` owns generated server routers and extractors;
   shared generated types live in embedded. Authored schemas stay in
   `specs/openapi`, with the generator importing shared type modules.
-- Local API helpers and catalog/index reconciliation contracts remain under
-  `zig/pkg/antfly` until the local database owner can move as a complete unit.
-  Server replica catalogs, provisioning summaries, and coordination remain
-  with the server.
+- Local DB, API helpers, catalog/index reconciliation and portable lake execution
+  live under `zig/pkg/antfly-embedded/src/local`. Native embedded lake querying
+  includes Parquet/Iceberg readers and shared SQL cursors; server credential
+  resolution and distributed publication are adapters. Server replica catalogs,
+  provisioning DTOs and coordination remain with `zig/pkg/antfly`.
 
 ## Database and hot standby contracts
 
-`storage/db` owns apply receipts, durable outbox storage, replication policy
-values, effect codecs, and publication sequencing. Borrowed publisher and
+`storage/db` owns apply receipts, durable outbox storage, adapter-declared local
+commit requirements, effect codecs, and publication sequencing. Borrowed publisher and
 write-gate interfaces keep concrete hot standby runtimes outside DB production code.
 `storage/hot_standby` supplies the primary, standby, fencing, policy/metrics,
 and synchronous wait adapters. These interfaces preserve durable frame formats
@@ -100,12 +101,13 @@ dependency-owned modules using their owning builder, and the audit retains
 their declared imports back into Antfly sources.
 
 `python3 zig/tools/check_embedded_isolated_build.py` stages the working source
-inputs with server coordination and private C API implementations replaced
-by unconditional compile-time traps, then compiles the
-public C API and complete WASM artifact and checks their module graphs. It runs
+inputs with the entire server package omitted, then builds the native lake
+suite, file CLI, public C API and complete WASM artifact and checks their module
+graphs. It runs
 in `zig-full / x86_64` on main merges/full validation, not as a new per-PR gate.
-The traps satisfy Zig’s cache scans of dormant test imports; any live server
-import fails compilation and the module audit independently rejects its owner.
+No server stubs or copied implementations satisfy dormant imports. A live
+server import fails compilation and the module audit independently rejects its
+owner. Authored roots unused by the selected products remain lazy build inputs.
 
 Local index reconciliation has its own result summary; server provisioning
 keeps group/root counts separately. Local range observation limits and catalog
@@ -234,7 +236,7 @@ child-range destination selection, and group metadata remain under
 source catalog. Public C API and private server operation ownership are separate.
 
 The isolated product build omits the entire server package and builds Lite,
-the public C API, and WASM. The licensing PR still applies Apache classification
+the public C API, native lake tests, and WASM. The licensing PR still applies Apache classification
 to the local source closure; this structural PR preserves existing licenses.
 
 ## Review and merge order
@@ -243,3 +245,15 @@ The local-contract extraction (#969) is merged into main. Merge the physical
 separation (#953) next, before the licensing PR (#893), which applies its Apache
 boundary, packaging, and release changes on top. The source moves and DB
 refactors should then disappear from the licensing PR's diff against main.
+
+### Native lake capability and Zig 0.17 reconciliation
+
+The source split intentionally includes local lake analytics. The authoritative
+ownership and current API limitations are recorded in
+[embedded source ownership](../design/embedded-source-ownership.md). Portable
+Parquet/Iceberg execution and SQL cursors share one embedded owner with server
+consumers; node credential resolution and distributed publication are adapters.
+Provisioning DTOs stay server-owned. The independent `embedded-lake-test` target
+exercises this capability without the server source tree. Zig 0.17 migration
+changes must apply to the extracted build composition, source-owner partition
+collection, native C API, file CLI and browser build, not just server targets.

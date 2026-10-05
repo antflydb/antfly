@@ -63,7 +63,7 @@ const VersionedTestStore = struct {
         return .{ .allocator = alloc, .ptr = self, .vtable = &vtable };
     }
 
-    fn deinit(_: std.mem.Allocator, ptr: *anyopaque) void {
+    pub fn deinit(_: std.mem.Allocator, ptr: *anyopaque) void {
         const self: *VersionedTestStore = @ptrCast(@alignCast(ptr));
         self.backing.deinit();
     }

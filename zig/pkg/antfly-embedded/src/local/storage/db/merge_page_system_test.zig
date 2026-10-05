@@ -607,8 +607,8 @@ test "relational index system merge page admission bounds work and authenticates
     try std.testing.expectError(error.InvalidMergePage, pages.validateRequest(request));
     request = seal(request);
     try std.testing.expect(!std.mem.eql(u8, &digest, &request.merge_page.?.digest));
-    const too_many = [_]types.BatchWrite{.{ .key = "b", .value = "{}" }} ** (pages.max_rows + 1);
-    const times = [_]u64{123} ** (pages.max_rows + 1);
+    const too_many = @as([(pages.max_rows + 1)]types.BatchWrite, @splat(.{ .key = "b", .value = "{}" }));
+    const times = @as([(pages.max_rows + 1)]u64, @splat(123));
     request.writes = &too_many;
     request.merge_page.?.timestamps = &times;
     request = seal(request);

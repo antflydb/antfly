@@ -1421,7 +1421,7 @@ pub const PersistentIndex = struct {
         // Create subdirectories
         const index_path_raw = try std.fmt.allocPrint(alloc, "{s}/index", .{path_span});
         defer alloc.free(index_path_raw);
-        const index_path = try alloc.dupeZ(u8, index_path_raw);
+        const index_path = try alloc.dupeSentinel(u8, index_path_raw, 0);
         defer alloc.free(index_path);
         const index_path_span = index_path[0..index_path.len];
         if (builtin.os.tag != .freestanding and needs_host_dirs) {
@@ -1433,7 +1433,7 @@ pub const PersistentIndex = struct {
 
         const wal_path_raw = try std.fmt.allocPrint(alloc, "{s}/wal", .{path_span});
         defer alloc.free(wal_path_raw);
-        const wal_path = try alloc.dupeZ(u8, wal_path_raw);
+        const wal_path = try alloc.dupeSentinel(u8, wal_path_raw, 0);
         defer alloc.free(wal_path);
 
         var segment_files: ?SegmentFileStore = null;
@@ -3507,10 +3507,10 @@ pub const PersistentIndex = struct {
         const range_key = segmentRangeMetaKey(seg_id);
         var buf = try alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
         defer alloc.free(buf);
-        buf[0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.min_doc_key.len))));
+        buf[0..4].* = @bitCast(@as(u32, @as(u32, @intCast(key_range.min_doc_key.len))));
         @memcpy(buf[4..][0..key_range.min_doc_key.len], key_range.min_doc_key);
         const max_off = 4 + key_range.min_doc_key.len;
-        buf[max_off..][0..4].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(key_range.max_doc_key.len))));
+        buf[max_off..][0..4].* = @bitCast(@as(u32, @as(u32, @intCast(key_range.max_doc_key.len))));
         @memcpy(buf[max_off + 4 ..][0..key_range.max_doc_key.len], key_range.max_doc_key);
         try txn.put(.meta, &range_key, buf);
     }
@@ -5549,7 +5549,7 @@ fn reportReducedPersistentSchedule(
 fn randomPersistentAction(random: std.Random) PersistentSimAction {
     if (random.uintLessThan(u8, 5) == 0) return .reopen;
     const spec_index = random.uintLessThan(u8, 4);
-    return .{ .index_segment = @enumFromInt(spec_index) };
+    return .{ .index_segment = @fromBackingInt(@intCast(spec_index)) };
 }
 
 fn runPersistentReplayCase(

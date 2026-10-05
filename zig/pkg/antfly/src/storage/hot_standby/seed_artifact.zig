@@ -259,7 +259,7 @@ const GenerationCandidate = struct {
     generation: []u8,
     checkpoint_lsn: u64,
 
-    fn deinit(self: *GenerationCandidate, alloc: Allocator) void {
+    pub fn deinit(self: *GenerationCandidate, alloc: Allocator) void {
         alloc.free(self.generation);
         self.* = undefined;
     }
@@ -282,7 +282,7 @@ const OwnedFileReceipt = struct {
         };
     }
 
-    fn deinit(self: *OwnedFileReceipt, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedFileReceipt, alloc: Allocator) void {
         alloc.free(self.path);
         alloc.free(self.sha256);
         for (self.chunks) |chunk| alloc.free(chunk.sha256);

@@ -68,7 +68,7 @@ const modern_bert_linear_specs = [_]struct {
 };
 
 fn modernBertLinearSlot(layer: usize, kind: ModernBertLinearSlotKind) usize {
-    return layer * modern_bert_linear_specs.len + @intFromEnum(kind);
+    return layer * modern_bert_linear_specs.len + @backingInt(kind);
 }
 
 const ModernBertNormSlotKind = enum(u1) { attention, mlp };
@@ -77,7 +77,7 @@ const ModernBertNormSlotKind = enum(u1) { attention, mlp };
 /// Like the linear slots they stay attached to the model's Metal provider, so
 /// requests after the first upload no norm weights.
 fn modernBertNormSlot(layer: usize, kind: ModernBertNormSlotKind) usize {
-    return layer * 2 + @intFromEnum(kind);
+    return layer * 2 + @backingInt(kind);
 }
 fn modernBertEmbeddingNormSlot(config: Config) usize {
     return @as(usize, @intCast(config.num_hidden_layers)) * 2;
@@ -1818,11 +1818,11 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     });
     try putTestWeight(allocator, &store, "model.embeddings.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
     try putTestWeight(allocator, &store, "model.final_norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
-    try putTestWeight(allocator, &store, "model.layers.0.attn.Wqkv.weight", &.{ 12, 4 }, &([_]f32{0} ** 48));
-    try putTestWeight(allocator, &store, "model.layers.0.attn.Wo.weight", &.{ 4, 4 }, &([_]f32{0} ** 16));
+    try putTestWeight(allocator, &store, "model.layers.0.attn.Wqkv.weight", &.{ 12, 4 }, &(@as([48]f32, @splat(0))));
+    try putTestWeight(allocator, &store, "model.layers.0.attn.Wo.weight", &.{ 4, 4 }, &(@as([16]f32, @splat(0))));
     try putTestWeight(allocator, &store, "model.layers.0.mlp_norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
-    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wi.weight", &.{ 8, 4 }, &([_]f32{0} ** 32));
-    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wo.weight", &.{ 4, 4 }, &([_]f32{0} ** 16));
+    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wi.weight", &.{ 8, 4 }, &(@as([32]f32, @splat(0))));
+    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wo.weight", &.{ 4, 4 }, &(@as([16]f32, @splat(0))));
 
     const output = try forward(&cb, allocator, .{
         .vocab_size = 4,

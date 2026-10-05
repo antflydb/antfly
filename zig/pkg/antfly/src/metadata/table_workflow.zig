@@ -260,7 +260,7 @@ pub const TableWorkflow = struct {
     }
 };
 
-fn listProjectedPlacementVersionFences(
+pub fn listProjectedPlacementVersionFences(
     alloc: std.mem.Allocator,
     service: anytype,
 ) ![]metadata_reconciler.PlacementVersionFence {
@@ -277,7 +277,7 @@ fn listProjectedPlacementVersionFences(
 
 const PlacementVersionFenceKey = struct { group_id: u64, local_node_id: u64 };
 
-fn ensureCatalogWorkflowLease(service: anytype) !void {
+pub fn ensureCatalogWorkflowLease(service: anytype) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -287,7 +287,7 @@ fn ensureCatalogWorkflowLease(service: anytype) !void {
         try service.ensureCatalogWorkflowLease();
 }
 
-fn ensureReconciliationPlacementReadCut(service: anytype) !void {
+pub fn ensureReconciliationPlacementReadCut(service: anytype) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -297,7 +297,7 @@ fn ensureReconciliationPlacementReadCut(service: anytype) !void {
         try service.ensureReconciliationPlacementReadCut();
 }
 
-fn ensureReconciliationPlacementReadCutWithContext(service: anytype, request: api_operation.RequestContext) !void {
+pub fn ensureReconciliationPlacementReadCutWithContext(service: anytype, request: api_operation.RequestContext) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -307,7 +307,7 @@ fn ensureReconciliationPlacementReadCutWithContext(service: anytype, request: ap
         try service.ensureReconciliationPlacementReadCutWithContext(request);
 }
 
-fn preflightInitialPlacementForGroupWithContext(service: anytype, request: api_operation.RequestContext, group_id: u64) !void {
+pub fn preflightInitialPlacementForGroupWithContext(service: anytype, request: api_operation.RequestContext, group_id: u64) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -317,7 +317,7 @@ fn preflightInitialPlacementForGroupWithContext(service: anytype, request: api_o
         try service.preflightInitialPlacementForGroupWithContext(request, group_id);
 }
 
-fn preflightProjectedPlacementWithContext(service: anytype, request: api_operation.RequestContext) !void {
+pub fn preflightProjectedPlacementWithContext(service: anytype, request: api_operation.RequestContext) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -327,7 +327,7 @@ fn preflightProjectedPlacementWithContext(service: anytype, request: api_operati
         try service.preflightProjectedPlacementWithContext(request);
 }
 
-fn preflightTableRecordWithContext(service: anytype, request: api_operation.RequestContext, table: table_manager.TableRecord) !void {
+pub fn preflightTableRecordWithContext(service: anytype, request: api_operation.RequestContext, table: table_manager.TableRecord) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -337,7 +337,7 @@ fn preflightTableRecordWithContext(service: anytype, request: api_operation.Requ
         try service.preflightTableRecordWithContext(request, table);
 }
 
-fn ensureCatalogWorkflowLeaseWithContext(
+pub fn ensureCatalogWorkflowLeaseWithContext(
     service: anytype,
     request: api_operation.RequestContext,
 ) !void {
@@ -358,7 +358,7 @@ test "table workflow cancellation stops before reconciliation lease work" {
     const FakeService = struct {
         called: bool = false,
 
-        fn ensureCatalogWorkflowLeaseWithContext(
+        pub fn ensureCatalogWorkflowLeaseWithContext(
             self: *@This(),
             _: api_operation.RequestContext,
         ) !void {
@@ -376,7 +376,7 @@ test "table workflow cancellation stops before reconciliation lease work" {
     try std.testing.expect(!fake.called);
 }
 
-fn lockCatalogMutation(service: anytype) bool {
+pub fn lockCatalogMutation(service: anytype) bool {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -387,7 +387,7 @@ fn lockCatalogMutation(service: anytype) bool {
     return true;
 }
 
-fn unlockCatalogMutation(service: anytype, locked: bool) void {
+pub fn unlockCatalogMutation(service: anytype, locked: bool) void {
     if (!locked) return;
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
@@ -1048,7 +1048,7 @@ test "table workflow can reconcile projected local placement intents" {
         intents: std.ArrayListUnmanaged(raft_reconciler.PlacementIntent) = .empty,
         last_expected_version_fence: ?u64 = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.intents.items) |intent| if (intent.peer_node_ids.len > 0) self.alloc.free(intent.peer_node_ids);
             self.intents.deinit(self.alloc);
         }

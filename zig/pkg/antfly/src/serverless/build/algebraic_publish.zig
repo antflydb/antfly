@@ -17,7 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_manifest = @import("algebraic_manifest.zig");
-const algebraic_segment = @import("../algebraic_segment/mod.zig");
+const algebraic_segment = @import("antfly_local_sources").serverless_algebraic_segment_mod;
 const artifact_store = @import("../artifacts/store.zig");
 const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
@@ -130,7 +130,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         if (self.bytes) |bytes| self.alloc.free(bytes);
         self.* = undefined;
     }
@@ -153,7 +153,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         if (!std.mem.eql(u8, artifact_id, "mem:folds")) return error.ArtifactNotFound;
         const bytes = self.bytes orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, bytes);

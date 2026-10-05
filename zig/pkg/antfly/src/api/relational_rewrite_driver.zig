@@ -121,7 +121,7 @@ fn checkpointAfter(progress: jobs.RewriteProgress, pending: bool, count: u32) !j
     if (next.owner == count) {
         next.owner = 0;
         next.round = try std.math.add(u64, next.round, 1);
-        if (!next.pending) next.phase = @enumFromInt(@intFromEnum(next.phase) + 1);
+        if (!next.pending) next.phase = @fromBackingInt(@backingInt(next.phase) + 1);
         next.pending = false;
     }
     return next;

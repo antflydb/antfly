@@ -30,14 +30,14 @@ fn defaultGemma4ModelPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf" });
 }
 
-fn defaultAntflyBin(allocator: std.mem.Allocator) ![]u8 {
+fn defaultAntflyBin(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     if (try getEnvVarOwned(allocator, "ANTFLY_BIN")) |value| return value;
     const candidates = [_][]const u8{
         "./zig-out/bin/antfly-inference",
         "./zig-out/bin/antfly",
     };
     for (candidates) |candidate| {
-        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), candidate, .{}) catch continue;
+        std.Io.Dir.cwd().access(io, candidate, .{}) catch continue;
         return try allocator.dupe(u8, candidate);
     }
     return try allocator.dupe(u8, candidates[0]);
@@ -106,7 +106,7 @@ pub fn main() !void {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    const antfly_bin = try defaultAntflyBin(allocator);
+    const antfly_bin = try defaultAntflyBin(init.io, allocator);
     defer allocator.free(antfly_bin);
     const model = try defaultGemma4ModelPath(allocator);
     defer allocator.free(model);

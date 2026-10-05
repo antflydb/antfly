@@ -38,7 +38,7 @@ pub const Owner = struct {
             const work: *@This() = @ptrCast(@alignCast(ptr));
             try work.owner.run(work.port);
         }
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
             std.heap.page_allocator.destroy(work);
         }

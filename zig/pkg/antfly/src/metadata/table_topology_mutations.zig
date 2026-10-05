@@ -31,7 +31,7 @@ fn afterAdmission(err: anyerror) anyerror {
     return error.MetadataMutationOutcomeUnknown;
 }
 
-fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+pub fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     const Service = @TypeOf(svc.*);
     if (comptime @hasDecl(Service, "lockTableCatalogMutation")) {
         svc.lockTableCatalogMutation(table_name);
@@ -42,7 +42,7 @@ fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     }
 }
 
-fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+pub fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     const Service = @TypeOf(svc.*);
     if (comptime @hasDecl(Service, "unlockTableCatalogMutation")) {
         svc.unlockTableCatalogMutation(table_name);

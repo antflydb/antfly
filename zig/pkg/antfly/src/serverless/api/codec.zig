@@ -20,7 +20,7 @@ pub fn encodeMutationAlloc(alloc: Allocator, mutation: api_types.DocumentMutatio
     const body_len: usize = if (mutation.body) |body| body.len else 0;
     const buf = try alloc.alloc(u8, 1 + 4 + 4 + mutation.doc_id.len + body_len);
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(mutation.kind);
+    buf[pos] = @backingInt(mutation.kind);
     pos += 1;
     std.mem.writeInt(u32, buf[pos..][0..4], @intCast(mutation.doc_id.len), .little);
     pos += 4;
@@ -37,7 +37,7 @@ pub fn encodeMutationAlloc(alloc: Allocator, mutation: api_types.DocumentMutatio
 pub fn decodeMutationAlloc(alloc: Allocator, payload: []const u8) !api_types.DocumentMutation {
     if (payload.len < 1 + 4 + 4) return error.InvalidMutationPayload;
     var pos: usize = 0;
-    const kind: api_types.MutationKind = @enumFromInt(payload[pos]);
+    const kind: api_types.MutationKind = @fromBackingInt(@intCast(payload[pos]));
     pos += 1;
     const doc_id_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
     pos += 4;

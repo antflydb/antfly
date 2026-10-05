@@ -21,12 +21,12 @@ pub const Error = @import("antfly_local_sources").schema_relational_expression_e
 };
 
 pub fn classify(err: anyerror) ?Error {
-    inline for (@typeInfo(Error).error_set.?) |field| if (err == @field(Error, field.name)) return @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| if (err == @field(Error, field)) return @field(Error, field);
     return null;
 }
 
 pub fn decode(bytes: []const u8) ?Error {
-    inline for (@typeInfo(Error).error_set.?) |field| if (@import("std").mem.eql(u8, bytes, field.name)) return @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| if (@import("std").mem.eql(u8, bytes, field)) return @field(Error, field);
     return null;
 }
 
@@ -41,8 +41,8 @@ pub fn status(err: Error) u16 {
 
 test "relational row query errors preserve exact remote reasons and HTTP classes" {
     const testing = @import("std").testing;
-    inline for (@typeInfo(Error).error_set.?) |field| {
-        const err = @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| {
+        const err = @field(Error, field);
         try testing.expectEqual(err, classify(err).?);
         try testing.expectEqual(err, decode(@errorName(err)).?);
     }

@@ -1,6 +1,6 @@
 <!-- Reproduction commands use the consolidated graph benchmark binary. -->
 
-Build once from `zig/` with `zig build antfly-graph-bench -Doptimize=ReleaseFast`
+Build once from `zig/` with `zig build antfly-graph-bench -Doptimize=fast`
 (or `ReleaseSafe` for checked runs), then use the `prepare` subcommand below.
 The recorded optimization profiles and measurements describe the original runs.
 

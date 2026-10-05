@@ -5,7 +5,7 @@ const linked = @import("pkg/antfly/build/linked_tests.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const filters = @import("build_test_filters.zig").select(b.allocator, b.args orelse &.{}, &.{"fixture"});
+    const filters = @import("build_test_filters.zig").select(b.allocator, buildArguments(b) orelse &.{}, &.{"fixture"});
     const error_logs = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/local/test_error_logs.zig"),
         .target = target,
@@ -73,9 +73,24 @@ pub fn build(b: *std.Build) void {
     const concurrent = b.step("concurrency", "Verify test execution overlaps and is never cached");
     for ([_][]const u8{ "first", "second" }) |label| {
         const child = b.addSystemCommand(&.{"python3"});
-        child.addFileArg(b.path("barrier.py"));
+        child.addFileArg2(b.path("barrier.py"), .{ .make_absolute = true });
         child.addArg(label);
         @import("build_support/antfly/test_support.zig").configureTestRun(child);
         concurrent.dependOn(&child.step);
     }
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

@@ -272,7 +272,7 @@ test "relational index system rewrite program cache owns validates and budgets i
     };
     const intent: contract.Intent = .{ .source_schemas = &.{schema}, .target_schema = schema, .program_digest = reference.identity };
     var options: resources.Options = .{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 8 * 1024 * 1024 } };
-    options.budgets[@intFromEnum(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 4 * 1024 * 1024 };
+    options.budgets[@backingInt(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 4 * 1024 * 1024 };
     var manager = resources.ResourceManager.init(options);
     defer manager.deinit(alloc);
     var cache: Cache = .{};

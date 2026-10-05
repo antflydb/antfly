@@ -24,3 +24,9 @@ pub const process = @import("process.zig");
 pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");
+
+/// Linux fiber backend adapted to the pinned Zig release Io interface.
+pub const Evented = if (@import("builtin").os.tag == .linux and @import("std").Io.fiber.supported)
+    @import("io_uring_compat.zig")
+else
+    @import("std").Io.Evented;

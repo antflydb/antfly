@@ -23,7 +23,7 @@ pub const Progress = struct {
     chain: publication.Digest = @splat(0),
     enumerated: bool = false,
 
-    fn validate(self: Progress) !void {
+    pub fn validate(self: Progress) !void {
         if ((self.members == 0) != (self.cursor.len == 0) or
             (self.members == 0 and !std.mem.allEqual(u8, &self.chain, 0)) or
             self.cursor.len > checkpoints.max_cursor_bytes or self.scan_cursor.len > checkpoints.max_cursor_bytes or

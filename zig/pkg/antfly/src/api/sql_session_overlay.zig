@@ -218,7 +218,7 @@ test "SQL document session overlay retains full postimage and original conflict 
     try std.testing.expect(!(try page.rows[0].cell("j")).sql_null);
     try std.testing.expect((try page.rows[0].cell("missing")).sql_null);
     try std.testing.expectEqual(@as(u64, 7), page.rows[0].version);
-    try std.testing.expectEqual([_]u8{42} ** 32, page.rows[0].expected_content_digest.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(42)), page.rows[0].expected_content_digest.?);
     try std.testing.expectEqualStrings("9007199254740993", page.rows[0].document.?.object.get("extra").?.number_string);
     var wrong_epoch = table;
     wrong_epoch.schema_version = 3;

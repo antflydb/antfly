@@ -331,7 +331,7 @@ const RequestAuthentication = struct {
         return credential_identity.CredentialSourceIdentity.none();
     }
 
-    fn deinit(self: *RequestAuthentication, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *RequestAuthentication, alloc: std.mem.Allocator) void {
         if (self.token) |value| alloc.free(value);
         if (self.secret) |*value| value.deinit(alloc);
         self.* = undefined;
@@ -1331,7 +1331,7 @@ test "reranking runtime sends image documents to linked rerankers that accept im
         fn rerankTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const []const u8, _: inference_request_context.RequestContext) anyerror![]f32 {
             return error.TestUnexpectedResult;
         }
-        fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
+        pub fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             if (state.reject) return error.InvalidArguments;
             state.document_calls += 1;

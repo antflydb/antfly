@@ -60,13 +60,13 @@ const replay_hints = [_]change_journal_mod.TargetHint{
 };
 
 fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
-    return @intCast(@intFromEnum(hint));
+    return @intCast(@backingInt(hint));
 }
 
 fn replayHintFromSingleMask(mask: u8) ?change_journal_mod.TargetHint {
     if (mask == 0 or (mask & (mask - 1)) != 0) return null;
-    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
-        if (mask == (@as(u8, 1) << @intCast(field.value))) return @enumFromInt(field.value);
+    inline for (@typeInfo(change_journal_mod.TargetHint).@"enum".field_values) |field_value| {
+        if (mask == (@as(u8, 1) << @intCast(field_value))) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -1900,7 +1900,7 @@ pub const DocStore = struct {
                 for (keys.items) |key| try txn.delete(key);
                 if (done) {
                     try txn.put(internal_keys.graph_directory_reset_key, &.{current + 1});
-                    if (current == 1) try txn.put(internal_keys.graph_retirement_count_key, &([_]u8{0} ** 8));
+                    if (current == 1) try txn.put(internal_keys.graph_retirement_count_key, &(@as([8]u8, @splat(0))));
                 }
                 try txn.commit();
                 return false;
@@ -1998,7 +1998,7 @@ pub const DocStore = struct {
             break :blk try cursor.seekAtOrAfter(&.{internal_keys.user_namespace}) == null;
         };
         if (empty) {
-            try txn.put(internal_keys.graph_retirement_count_key, &([_]u8{0} ** 8));
+            try txn.put(internal_keys.graph_retirement_count_key, &(@as([8]u8, @splat(0))));
             try txn.put(internal_keys.graph_incoming_ready_key, "1");
         }
     }
@@ -4234,7 +4234,7 @@ test "docstore retained row effects fence foreign native adoption without blocki
             // Same logical namespace survives native transfer/reopen.
             try std.testing.expect(try retained_effects.read(&txn, @splat(1), 1, pin, 0) != null);
         }
-        const mutation = [_]u8{'t'} ** 2048;
+        const mutation = @as([2048]u8, @splat('t'));
         try std.testing.expectError(error.RetainedEffectsFull, store.put(target_key, &mutation));
         {
             // Native namespace adoption persists identity before target rows.
@@ -4740,7 +4740,7 @@ test "docstore releases payload policy before runtime writer admission" {
             return error.TestWriterAdmissionReleased;
         }
 
-        fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, _: backend_types.BatchOptions) anyerror!backend_erased.Batch {
+        pub fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, _: backend_types.BatchOptions) anyerror!backend_erased.Batch {
             return beginBatch(alloc, ptr);
         }
     };
@@ -5455,8 +5455,8 @@ test "docstore runtime lsm hint replay iteration avoids ordinary read snapshots"
     try std.testing.expectEqual(@as(usize, 1), replay_stats.matched_entries);
     try std.testing.expectEqual(@as(usize, 0), replay_stats.hint_filter_skips);
     const maintenance = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls);
-    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.namespace_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls);
+    try std.testing.expectEqual(@as(u64, 0), maintenance.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.namespace_read_txn)].calls);
 }
 
 test "docstore runtime lsm persists replay rows across namespace reopen" {

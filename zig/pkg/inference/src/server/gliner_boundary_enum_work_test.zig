@@ -101,8 +101,8 @@ pub const Fixture = struct {
             .parent_marker_mask = &.{},
         };
         defer prepared.deinit();
-        var indices = [_]ops.Span{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 }, .{ .start = 2, .end = 3 } } ** 2;
-        var valid = [_]bool{true} ** 6;
+        var indices = z17RepeatArray([_]ops.Span{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 }, .{ .start = 2, .end = 3 } }, 2);
+        var valid = @as([6]bool, @splat(true));
         const pool = ops.SharedPool{ .allocator = a, .batch = 2, .capacity = 3, .indices = &indices, .valid = &valid, .proposal_logits = &.{}, .compat_logits = &.{} };
         const scores = scoring.CandidateScoreView{ .batch = 2, .text_length = 3, .queries = 1, .pool = &pool, .pair_logits = &.{ 4, 4, 4, 4, 4, 4 }, .null_logits = null, .count_log_rates = null };
         var output = wire.ResponseWriter.init(a, 4096, self.request.items.len);
@@ -159,3 +159,9 @@ pub const Fixture = struct {
         return .{ .storage = storage, .object_logits = try alloc.dupe(f32, &.{5}), .instance_seeds = try alloc.dupe(?tasks.RecordSeed, &.{null}), .fields = fields };
     }
 };
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
+}

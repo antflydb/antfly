@@ -997,7 +997,7 @@ const RuntimeStatusLookup = struct {
         return lookup;
     }
 
-    fn deinit(self: *RuntimeStatusLookup) void {
+    pub fn deinit(self: *RuntimeStatusLookup) void {
         for (self.runtime_indexes) |*map| map.deinit(self.alloc);
         if (self.runtime_indexes.len > 0) self.alloc.free(self.runtime_indexes);
         self.expected_group_indexes.deinit(self.alloc);
@@ -1980,7 +1980,7 @@ const AggregatedIndexStatus = struct {
     coverage_config_mismatch_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
-    source_replay: [64]db_mod.types.IndexSourceReplayStatus = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64,
+    source_replay: [64]db_mod.types.IndexSourceReplayStatus = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" })),
     source_replay_count: usize = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
@@ -2035,7 +2035,7 @@ const AggregatedIndexStatus = struct {
 };
 
 fn canonicalizeConfiguredSourceReplay(aggregate: *AggregatedIndexStatus, configured_sources: []const []const u8) void {
-    var ordered = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64;
+    var ordered = @as([64]db_mod.types.IndexSourceReplayStatus, @splat(.{ .artifact_name = "" }));
     var ordered_count: usize = 0;
     for (configured_sources) |artifact_name| {
         if (ordered_count == ordered.len) break;
@@ -2172,7 +2172,7 @@ const IndexReadinessEvaluation = struct {
     complete: bool,
     state: IndexReadinessState,
 
-    fn evaluate(input: struct {
+    pub fn evaluate(input: struct {
         completion_fences: IndexCompletionFences,
         failed: bool,
         serving_failed: bool,
@@ -2558,9 +2558,9 @@ fn aggregateIndexStatusIndexed(
         aggregate.dense_native_storage_phase = if (materialization_count == 1)
             item.dense_native_storage_phase
         else
-            @enumFromInt(@min(
-                @intFromEnum(aggregate.dense_native_storage_phase),
-                @intFromEnum(item.dense_native_storage_phase),
+            @fromBackingInt(@min(
+                @backingInt(aggregate.dense_native_storage_phase),
+                @backingInt(item.dense_native_storage_phase),
             ));
         const public_item = publicShardIndexRuntimeView(item, runtime.stats.async_indexing);
         if (public_item.dense_vector_projection_pending) aggregate.dense_vector_projection_pending = true;
@@ -2595,7 +2595,7 @@ fn aggregateIndexStatusIndexed(
         aggregate.catch_up_applied_sequence += public_item.catch_up_applied_sequence;
         aggregate.catch_up_target_sequence += public_item.catch_up_target_sequence;
         if (public_item.catch_up_active) aggregate.catch_up_active = true;
-        if (@intFromEnum(public_item.catch_up_phase) > @intFromEnum(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
+        if (@backingInt(public_item.catch_up_phase) > @backingInt(aggregate.catch_up_phase)) aggregate.catch_up_phase = public_item.catch_up_phase;
         aggregateTextMergeStats(&aggregate.text_merge, item.text_merge);
         aggregateHbcCacheStats(&aggregate.hbc_cache, item.hbc_cache);
         aggregateHbcPostingStats(&aggregate.hbc_posting, item.hbc_posting);
@@ -3264,7 +3264,7 @@ fn appendCoverageIncompleteReasons(
         expected_config_hash,
     );
     const observation_current = authority.coverage_authoritative;
-    var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
+    var reasons = std.EnumSet(CoverageIncompleteReason).empty;
 
     if (!runtime_present) reasons.insert(.runtime_unavailable);
     if (runtime_present and !authority.convergence_authoritative)
@@ -4996,8 +4996,8 @@ fn expectCreatedObjectAllowlistCovers(
     comptime T: type,
     shape: public_index_contract.CreatedObjectShape,
 ) !void {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, field.name));
+    inline for (comptime std.meta.fieldNames(T)) |reflected_name| {
+        try std.testing.expect(public_index_contract.isAllowedCreatedObjectField(shape, reflected_name));
     }
 }
 
@@ -7618,11 +7618,11 @@ fn consumerTests() type {
             try expectCreatedObjectAllowlistCovers(indexes_openapi.IndexExecutionConfig, .index_execution);
             try expectCreatedObjectAllowlistCovers(indexes_openapi.ExecutionPolicy, .execution_policy);
 
-            inline for (@typeInfo(indexes_openapi.GraphArtifactProducerConfig).@"struct".fields) |field| {
-                try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(field.name));
+            inline for (comptime std.meta.fieldNames(indexes_openapi.GraphArtifactProducerConfig)) |reflected_name| {
+                try std.testing.expect(public_index_contract.isAllowedGraphArtifactRequestField(reflected_name));
             }
-            inline for (@typeInfo(indexes_openapi.EnrichmentConfig).@"struct".fields) |field| {
-                try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(field.name));
+            inline for (comptime std.meta.fieldNames(indexes_openapi.EnrichmentConfig)) |reflected_name| {
+                try std.testing.expect(public_index_contract.isAllowedEnrichmentRequestField(reflected_name));
             }
 
             inline for (.{

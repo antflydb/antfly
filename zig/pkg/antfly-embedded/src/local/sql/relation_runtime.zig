@@ -131,7 +131,11 @@ test "SQL sets distinguish typed JSON null and SQL NULL and release every alloca
         }
     };
     try Fixture.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    // SafeAllocator can grow the last bucket allocation depending on prior
+    // tests. Force allocate/copy growth so every OOM run visits the same sites,
+    // while retaining the backing allocator's leak and ownership checks.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fixture.run, .{});
 }
 
 test "SQL set admission rejects incompatible shapes and enforces the shared memory budget" {
@@ -168,7 +172,7 @@ fn Engine(comptime Context: type) type {
             if (self.work > self.context.limits.scan_rows *| 64) return error.SqlProgramLimitExceeded;
         }
 
-        fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self) void {
             for (self.recursions) |optional| if (optional) |worklist| worklist.deinit();
             var hashes = self.static_hashes.valueIterator();
             while (hashes.next()) |join| join.*.deinit();
@@ -348,7 +352,7 @@ fn Engine(comptime Context: type) type {
                 }
                 return self;
             }
-            fn deinit(self: *Iterator) void {
+            pub fn deinit(self: *Iterator) void {
                 if (self.result_cursor) |cursor| cursor.close();
                 if (self.page) |page| page.deinit();
                 if (self.left) |left| left.deinit();

@@ -49,7 +49,7 @@ pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value:
 const Compiled = union(enum) {
     comparison: predicate.Plan,
     expression: expressions.Plan,
-    fn deinit(self: *Compiled) void {
+    pub fn deinit(self: *Compiled) void {
         switch (self.*) {
             inline else => |*plan| plan.deinit(),
         }
@@ -127,7 +127,7 @@ pub const Set = struct {
             switch (plan) {
                 .comparison => |comparison| {
                     state.update(&comparison.tuple.fingerprint);
-                    state.update(&.{ @intFromEnum(comparison.op), @intFromBool(comparison.operand_null) });
+                    state.update(&.{ @backingInt(comparison.op), @intFromBool(comparison.operand_null) });
                     state.update(comparison.operand);
                 },
                 .expression => |expression| {

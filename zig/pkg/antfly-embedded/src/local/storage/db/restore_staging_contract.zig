@@ -229,8 +229,8 @@ pub fn admissionReceiptDigest(command: InstallGenerationAdmissions) !Digest {
             hash.update(&number);
             hash.update(name);
         }
-        hash.update(if (mapping.source_generation) |generation| &generation else &([_]u8{0} ** 16));
-        hash.update(if (mapping.target_generation) |generation| &generation else &([_]u8{0} ** 16));
+        hash.update(if (mapping.source_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
+        hash.update(if (mapping.target_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
         hash.update(&mapping.source_scope_digest);
     }
     var result: Digest = undefined;

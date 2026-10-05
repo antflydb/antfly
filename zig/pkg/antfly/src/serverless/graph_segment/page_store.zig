@@ -19,7 +19,7 @@ const tree = @import("page_tree.zig");
 const artifacts = @import("../artifacts/store.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const graph = @import("page_graph.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const ReadCache = struct {
     ptr: *anyopaque,
@@ -216,7 +216,7 @@ const TestArtifacts = struct {
         } };
     }
 
-    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 
     fn metadata(alloc: std.mem.Allocator, id: []const u8, len: usize) !artifacts.ArtifactMetadata {
         const owned = try alloc.dupe(u8, id);
@@ -335,7 +335,7 @@ test "serverless graph attempt identities isolate recreated content and retain r
     var reads: u64 = 10 * 1024 * 1024;
     var writes: u64 = 10 * 1024 * 1024;
     var pages: PageStore = .{ .domain = PageStore.namespaceDomain("test"), .attempt = @splat(1), .artifacts = &artifacts_store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-    const value = [_]u8{42} ** 16000;
+    const value = @as([16000]u8, @splat(42));
     const mutations = &[_]tree.Mutation{ .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value }, .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value } };
     const old: graph.Root = .{ .domain = pages.domain, .nodes = 4, .page = try tree.apply(alloc, pages.store(), null, mutations) };
     const old_ref = try pages.publishRoot(alloc, old, "graph");
@@ -373,7 +373,7 @@ test "serverless graph page artifact roots authenticate budget and replay interr
     var read_bytes: u64 = 10 * 1024 * 1024;
     var write_bytes: u64 = 10 * 1024 * 1024;
     var pages: PageStore = .{ .attempt = @splat(1), .domain = PageStore.namespaceDomain("test"), .artifacts = &artifacts_store, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes };
-    const value = [_]u8{42} ** 16000;
+    const value = @as([16000]u8, @splat(42));
     const root: graph.Root = .{ .domain = pages.domain, .nodes = 6, .edges = 0, .page = try tree.apply(alloc, pages.store(), null, &.{
         .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
         .{ .key = "c", .value = &value }, .{ .key = "d", .value = &value },

@@ -59,7 +59,7 @@ fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []c
 fn addLocalHttpxModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("lib/httpx/src/httpx.zig"),
@@ -73,7 +73,7 @@ pub const Shared = struct {
     conformance_fetch: bool,
     conformance_fixtures: []const u8,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     vopr_mod: *std.Build.Module,
     strip: bool,
     lmdb_backend: LmdbBackend,
@@ -271,7 +271,7 @@ pub fn create(b: *std.Build) ?Shared {
     b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers").dependOn(&snowball_steps.regen.step);
     b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current").dependOn(&snowball_steps.compare.step);
     const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
-    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .ReleaseSafe);
+    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .safe);
     const openapi_sources = addOpenApiSourceSteps(b, openapi_build, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
     update_public_openapi.addCopyFileToSource(openapi_sources.public_spec, "../openapi.yaml");
@@ -303,7 +303,7 @@ pub fn create(b: *std.Build) ?Shared {
         .root = b.path("lib/sql"),
         .target = target,
         .optimize = optimize,
-        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .ReleaseSafe),
+        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),
         .compare_tool = tools_build.addFileCompareTool(b, b.path("tools")),
         .grammar_label = "lib/sql/grammar/antfly_sql.y",
     });
@@ -351,7 +351,7 @@ pub fn create(b: *std.Build) ?Shared {
     // requires unrelated native imports this module does not provide.
     const pgwire_tests = b.addTest(.{
         .root_module = pgwire_test_mod,
-        .filters = b.args orelse &.{"pgwire"},
+        .filters = buildArguments(b) orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
     pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
@@ -449,6 +449,16 @@ pub fn create(b: *std.Build) ?Shared {
         .optimize = optimize,
         .link_libc = link_libc,
     });
+    const evented_enrichment_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft/enrichment_executor_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    evented_enrichment_test_mod.addImport("antfly_platform", platform_mod);
+    const evented_enrichment_tests = b.addTest(.{ .root_module = evented_enrichment_test_mod });
+    b.step("evented-enrichment-test", "Test enrichment io_uring lifetime, concurrent tasks, cancellation, and file I/O")
+        .dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
         .target = target,
@@ -487,10 +497,10 @@ pub fn create(b: *std.Build) ?Shared {
         .optimize = optimize,
     });
     // Isolated image/hash benchmarks own a fixed ReleaseFast profile.
-    const hash_bench_mod = if (optimize == .ReleaseFast) hash_mod else b.createModule(.{
+    const hash_bench_mod = if (optimize == .fast) hash_mod else b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     const vectorindex_mod = b.createModule(.{
         .root_source_file = b.path("lib/vectorindex/src/mod.zig"),
@@ -809,7 +819,7 @@ pub fn create(b: *std.Build) ?Shared {
         .paths = inference_config.paths,
         .backend = inference_config.backend,
         .graph = inference_graph,
-        .args = b.args,
+        .args = buildArguments(b),
         .step_prefix = "inference-",
         .add_native_process_test = platform_build.addNativeProcessTest,
         .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build inference tests once and filter them at runtime") orelse false,
@@ -818,13 +828,13 @@ pub fn create(b: *std.Build) ?Shared {
     const inference_wasm_jinja = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = inference_wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const inference_wasm_platform = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = inference_wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .link_libc = false,
     });
     const inference_steps = @import("../../pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
@@ -1302,5 +1312,20 @@ pub fn create(b: *std.Build) ?Shared {
         .inference_steps = inference_steps,
         .antfly_imports = antfly_imports,
         .production_antfly_imports = production_antfly_imports,
+    };
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
     };
 }

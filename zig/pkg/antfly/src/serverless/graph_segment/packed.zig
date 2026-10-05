@@ -18,7 +18,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const edge_type = @import("antfly_local_sources").graph_edge_type;
-const bounded = @import("../bounded_decode.zig");
+const bounded = @import("antfly_local_sources").serverless_bounded_decode;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const wire_magic = "AFSG";
 pub const wire_version: u16 = 9;
@@ -484,7 +484,7 @@ pub fn viewRetainedBytes(data: []const u8) !usize {
 const Dictionary = struct {
     map: std.StringHashMapUnmanaged(u32) = .empty,
     values: std.ArrayListUnmanaged([]const u8) = .empty,
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.map.deinit(alloc);
         self.values.deinit(alloc);
     }
@@ -510,7 +510,7 @@ const Encoding = struct {
     size: usize = header_len,
     local_edges: usize = 0,
     routing_extra: usize = 0,
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.nodes.deinit(alloc);
         self.edge_types.deinit(alloc);
     }

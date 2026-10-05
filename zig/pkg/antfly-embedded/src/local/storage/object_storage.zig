@@ -83,7 +83,7 @@ test "host object storage delegates through callbacks" {
     const HostContext = struct {
         backing: *MemoryObjectStorage,
 
-        fn deinit(_: Allocator, ptr: *anyopaque) void {
+        pub fn deinit(_: Allocator, ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self;
         }

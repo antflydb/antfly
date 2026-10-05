@@ -116,7 +116,7 @@ const RuntimeContext = struct {
         self.decode_runtime.configureForGptConfig(self.gpt_config);
     }
 
-    fn deinit(self: *RuntimeContext) void {
+    pub fn deinit(self: *RuntimeContext) void {
         self.decode_runtime.deinit();
         self.kv_manager.deinit();
         self.cb.deinit();

@@ -52,7 +52,7 @@ pub fn load(allocator: std.mem.Allocator, manifest_path: []const u8) !LoadedMani
     errdefer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const data = try compat.cwd().readFileAlloc(compat.io(), manifest_path, arena_alloc, .limited(16 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, arena_alloc, .limited(16 * 1024 * 1024));
     const parsed = try std.json.parseFromSliceLeaky(DatasetManifest, arena_alloc, data, .{
         .ignore_unknown_fields = true,
     });

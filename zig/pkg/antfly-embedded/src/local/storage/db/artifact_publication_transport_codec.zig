@@ -23,10 +23,10 @@ pub fn controlAdmissionHint(bytes: []const u8) bool {
     return mode != .publish;
 }
 comptime {
-    if (@typeInfo(publication.Command).@"struct".fields.len != 18 or
-        @typeInfo(publication.Source).@"struct".fields.len != 5 or
-        @typeInfo(publication.ArtifactSource).@"struct".fields.len != 4 or
-        @typeInfo(publication.Mutation).@"struct".fields.len != 4)
+    if (@typeInfo(publication.Command).@"struct".field_names.len != 18 or
+        @typeInfo(publication.Source).@"struct".field_names.len != 5 or
+        @typeInfo(publication.ArtifactSource).@"struct".field_names.len != 4 or
+        @typeInfo(publication.Mutation).@"struct".field_names.len != 4)
         @compileError("update compact publication transport projection");
 }
 
@@ -140,8 +140,8 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
     errdefer alloc.free(out);
     var writer: Writer = .{ .bytes = out };
     writer.write(magic);
-    writer.byte(@intFromEnum(command.mode));
-    writer.byte(@intFromEnum(command.producer_kind));
+    writer.byte(@backingInt(command.mode));
+    writer.byte(@backingInt(command.producer_kind));
     writer.write(&command.namespace);
     writer.writeU64(command.authority_epoch);
     writer.write(&command.catalog_digest);
@@ -176,7 +176,7 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
         writer.writeU32(source.source_index);
     }
     for (command.mutations) |mutation| {
-        writer.byte(@intFromEnum(mutation.family));
+        writer.byte(@backingInt(mutation.family));
         writer.blob(mutation.key);
         writer.byte(@intFromBool(mutation.value != null));
         if (mutation.value) |value| writer.blob(value);

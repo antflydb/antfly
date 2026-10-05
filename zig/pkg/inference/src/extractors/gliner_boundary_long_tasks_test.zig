@@ -114,7 +114,7 @@ const Corpus = struct {
                 .max_window_body_words = count,
                 .overlap_words = count - stride,
                 .max_windows = 3,
-                .inference_fingerprint = [_]u8{1} ** 32,
+                .inference_fingerprint = @as([32]u8, @splat(1)),
             });
             defer plan.deinit();
             try std.testing.expectEqual(@as(usize, 3), plan.windows.len);
@@ -203,9 +203,9 @@ const Progress = struct {
 };
 
 fn pinnedFiles(a: Allocator, directory: []const u8, pins: pipeline.PublishedModelFiles, control: Control) !void {
-    inline for (@typeInfo(pipeline.PublishedModelFiles).@"struct".fields) |field| {
-        const pin = @field(pins, field.name);
-        const path = try std.fs.path.join(a, &.{ directory, field.name });
+    inline for (comptime std.meta.fieldNames(pipeline.PublishedModelFiles)) |reflected_name| {
+        const pin = @field(pins, reflected_name);
+        const path = try std.fs.path.join(a, &.{ directory, reflected_name });
         defer a.free(path);
         const digest = try snapshot.digest(std.testing.io, std.Io.Dir.cwd(), path, 1024 * mib, control);
         try std.testing.expectEqual(pin.size_bytes, digest.size_bytes);

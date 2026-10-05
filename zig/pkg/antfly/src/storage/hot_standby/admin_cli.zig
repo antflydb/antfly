@@ -1341,7 +1341,7 @@ const SyncPolicyBuilder = struct {
     failure_policy: primary_mod.FailurePolicy = .block,
     standby_names: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *SyncPolicyBuilder, alloc: Allocator) void {
+    pub fn deinit(self: *SyncPolicyBuilder, alloc: Allocator) void {
         self.standby_names.deinit(alloc);
         self.* = undefined;
     }

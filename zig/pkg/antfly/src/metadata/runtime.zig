@@ -34,7 +34,7 @@ const StorageKernelContext = if (linked_storage)
     kernel_owner_client.Context
 else
     struct {
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.* = .{};
         }
     };
@@ -161,7 +161,7 @@ const CliConfig = struct {
     auth_enabled: ?bool = null,
     help: bool = false,
 
-    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.secret_store_paths.deinit(alloc);
         self.* = undefined;
     }
@@ -173,7 +173,7 @@ const Factory = struct {
     metadata_group_id: u64,
     metadata_peer_node_ids: []u64 = &.{},
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.metadata_peer_node_ids.len > 0) self.alloc.free(self.metadata_peer_node_ids);
         self.* = undefined;
     }
@@ -243,7 +243,7 @@ const ResolvedPaths = struct {
     auth_store_root_dir: []u8,
     extension_package_store_dir: []u8,
 
-    fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
@@ -297,7 +297,7 @@ pub const HealthSource = struct {
         const append = antfly.common.health_server.appendPromMetric;
 
         if (self.supervisor) |supervisor| {
-            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(supervisor.currentState()));
             try append(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
 
@@ -1607,7 +1607,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -1992,7 +1992,7 @@ fn resolveMetadataRuntimeSecretValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
         const raw = try alloc.dupe(u8, value);
@@ -3059,7 +3059,7 @@ const MetadataOwnershipTestPaths = struct {
         return .{ .local_node_id = 3, .replica_root_dir = self.replicas, .replica_catalog_path = self.catalog, .snapshot_root_dir = self.snapshots };
     }
 
-    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.replicas);
         alloc.free(self.catalog);
         alloc.free(self.snapshots);

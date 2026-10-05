@@ -41,7 +41,7 @@ const Fixture = struct {
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.job_key) |value| alloc.free(value);
         if (self.job_value) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
@@ -232,7 +232,7 @@ const Fixture = struct {
     fn persistence(self: *@This()) jobs.ReplicatedPersistence {
         return jobs.ReplicatedPersistence.fromLocal(self, .{ .load = load, .get = get, .create_with_staging = create, .put = put, .delete = delete, .delete_many = deleteMany });
     }
-    fn server(self: *@This()) !http.ApiHttpServer {
+    pub fn server(self: *@This()) !http.ApiHttpServer {
         return self.serverWith(null, null);
     }
     fn serverWith(self: *@This(), manager: ?*@import("../usermgr/mod.zig").UserManager, runtime: ?*@import("antfly_local_sources").storage_background_runtime.BackendRuntime) !http.ApiHttpServer {

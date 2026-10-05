@@ -108,7 +108,7 @@ pub const Client = struct {
         return response;
     }
 
-    fn validate(ptr: *anyopaque) !void {
+    pub fn validate(ptr: *anyopaque) !void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .validate, .schema_version = self.schema_version, .token = self.token });
         defer response.deinit(self.alloc);
@@ -283,7 +283,7 @@ fn consumerTests() type {
                 fn capture(raw: *anyopaque, _: std.mem.Allocator, _: metadata.CatalogRouteFence, _: u64, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.StatementReadFence {
                     return .{ .ptr = raw, .vtable = &.{ .validate = validate, .open = open, .release = release } };
                 }
-                fn validate(_: *anyopaque) !void {}
+                pub fn validate(_: *anyopaque) !void {}
                 fn release(raw: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.capture_closed += 1;

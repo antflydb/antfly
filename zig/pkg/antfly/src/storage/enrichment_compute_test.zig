@@ -30,7 +30,7 @@ test "enrichment compute boundary identity relay preserves origin and attributes
         error.InvalidPdfHeader,
         .enrichment_compute,
         abi.abi_version,
-        @intFromEnum(abi.EnrichmentOperation.render_pdf_page),
+        @backingInt(abi.EnrichmentOperation.render_pdf_page),
     );
     var forwarded: abi.FailureIdentity = .{};
     try client.acceptProviderFailure(
@@ -58,7 +58,7 @@ test "enrichment compute boundary identity relay preserves origin and attributes
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
     try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.EnrichmentOperation.validate_render_response),
+        @backingInt(abi.EnrichmentOperation.validate_render_response),
         replacement.operation,
     );
     try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
@@ -147,7 +147,7 @@ test "enrichment compute boundary preflight failures carry a complete identity" 
     try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
     try std.testing.expectEqual(abi.abi_version, failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.EnrichmentOperation.extract_stream),
+        @backingInt(abi.EnrichmentOperation.extract_stream),
         failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());

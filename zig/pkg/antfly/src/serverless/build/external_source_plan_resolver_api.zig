@@ -27,7 +27,7 @@ pub const ResolveRequest = struct {
     /// Borrowed, request-local publication authority. Discovery must not keep
     /// a shared mutable artifact-store pointer or upload before fencing.
     artifacts: *@import("../artifacts/store.zig").ArtifactStore,
-    previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
+    previous_artifacts: []const @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = &.{},
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 

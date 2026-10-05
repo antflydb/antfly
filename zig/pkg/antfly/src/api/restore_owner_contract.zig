@@ -15,7 +15,7 @@
 //! Pure, private shared-restore owner request and response contract.
 const std = @import("std");
 const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
-const metadata_staging = @import("antfly_local_sources").metadata_restore_provisioning_contract;
+const metadata_staging = @import("../metadata/restore_provisioning_contract.zig");
 const backups = @import("antfly_local_sources").api_backup_contract;
 /// Includes the 4 MiB rewrite program, a base64-encoded 1 MiB source
 /// chunk, and their binary-safe JSON byte-array expansion (at most four

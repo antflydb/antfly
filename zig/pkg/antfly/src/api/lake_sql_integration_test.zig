@@ -75,7 +75,7 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
     const alloc = std.testing.allocator;
     var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("lake");
     defer directory.cleanup();
-    const parquet = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .field_id = 1, .values = &.{ 1, 2, 3, 4, 5 } }});
+    const parquet = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .field_id = 1, .values = &.{ 1, 2, 3, 4, 5 } }});
     defer alloc.free(parquet);
     var filesystem = try @import("antfly_local_sources").storage_object_storage.FilesystemObjectStorage.init(alloc, directory.path());
     defer filesystem.deinit();
@@ -84,7 +84,7 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
     defer written.deinit(alloc);
     const source_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{directory.path()});
     defer alloc.free(source_uri);
-    const iceberg = @import("../serverless/query/lake_iceberg_snapshot.zig");
+    const iceberg = @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot;
     const manifest = try iceberg.buildTestDataManifestAlloc(alloc, &.{.{ .path = "object://antfly/part.parquet", .rows = 5, .bytes = parquet.len }});
     defer alloc.free(manifest);
     const manifest_list = try iceberg.buildTestManifestListAlloc(alloc, "object://antfly/metadata/data.avro", manifest.len, 1, 5);
@@ -206,7 +206,7 @@ test "lake SQL public residual scan reclaims page and distant timestamp memory" 
     const values = try alloc.alloc(i64, 20_000);
     defer alloc.free(values);
     @memset(values, 1);
-    const bytes = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .converted_type = 9, .values = values, .page_rows = 1024 }});
+    const bytes = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .converted_type = 9, .values = values, .page_rows = 1024 }});
     defer alloc.free(bytes);
     var put = try client.putObject("antfly", "part.parquet", bytes, .{});
     defer put.deinit(alloc);

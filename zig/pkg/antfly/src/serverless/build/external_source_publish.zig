@@ -21,12 +21,12 @@ const Allocator = std.mem.Allocator;
 const artifact_store = @import("../artifacts/store.zig");
 const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source = @import("antfly_local_sources").serverless_external_source_types;
-const external_source_codec = @import("../external_source/codec.zig");
+const external_source_codec = @import("antfly_local_sources").serverless_external_source_codec;
 const external_source_manifest = @import("external_source_manifest.zig");
 
 pub const PublishOptions = struct {
     artifact_name: []const u8 = &.{},
-    previous_artifacts: []const @import("../manifest/artifact_ref.zig").ArtifactRef = &.{},
+    previous_artifacts: []const @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef = &.{},
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
 };
 

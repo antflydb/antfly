@@ -17,6 +17,7 @@
 //! server test. Selection audits therefore include both compilation owners.
 const std = @import("std");
 const source_owner = @import("../../pkg/antfly-embedded/build/source_owner.zig");
+const paths = @import("source_paths.zig");
 const support = @import("test_support.zig");
 
 var processed: std.AutoHashMapUnmanaged(*std.Build.Step.Run, void) = .empty;
@@ -61,13 +62,14 @@ fn controlOnly(consumer: *std.Build.Module) bool {
     const module = consumer.import_table.get("storage_source_options") orelse return false;
     const path = module.root_source_file orelse return false;
     if (path != .generated) return false;
-    const options = path.generated.file.step.cast(std.Build.Step.Options) orelse return false;
+    const options = paths.producer(consumer.owner, path).?.cast(std.Build.Step.Options) orelse return false;
     return std.mem.indexOf(u8, options.contents.items, "control_only: bool = true;") != null;
 }
 
 fn sourceText(b: *std.Build, path: []const u8) ?[]const u8 {
     if (source_texts.get(path)) |text| return text;
     const text = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(64 * 1024 * 1024)) catch return null;
+    b.dependOnFileContents(.{ .cwd_relative = path });
     source_texts.put(b.allocator, path, text) catch @panic("OOM");
     return text;
 }
@@ -77,7 +79,7 @@ fn sourceText(b: *std.Build, path: []const u8) ?[]const u8 {
 /// facade remains a control contract; it deliberately does not resolve DB.
 fn requiresPhysical(b: *std.Build, path: []const u8) bool {
     if (physical_sources.get(path)) |value| return value;
-    const local = b.path("pkg/antfly-embedded/src/local").getPath(b);
+    const local = paths.authored(b, b.path("pkg/antfly-embedded/src/local")).?;
     var pending: std.ArrayList([]const u8) = .empty;
     pending.append(b.allocator, path) catch @panic("OOM");
     var seen = std.StringHashMap(void).init(b.allocator);
@@ -111,7 +113,7 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
 }
 
 fn physicalName(b: *std.Build, name: []const u8) bool {
-    const catalog = b.path("pkg/antfly-embedded/src/local/source_catalog.zig").getPath(b);
+    const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/local/source_catalog.zig")).?;
     const text = sourceText(b, catalog) orelse return false;
     const marker = b.fmt("pub const {s} = @import(\"", .{name});
     const offset = std.mem.indexOf(u8, text, marker) orelse return false;
@@ -124,9 +126,9 @@ fn physicalName(b: *std.Build, name: []const u8) bool {
 fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
     if (selected_names.get(consumer)) |names| return names;
     const source = consumer.root_source_file orelse return &.{};
-    const server = b.path("pkg/antfly/src").getPath(b);
+    const server = paths.authored(b, b.path("pkg/antfly/src")).?;
     var pending: std.ArrayList([]const u8) = .empty;
-    pending.append(b.allocator, source.getPath(b)) catch @panic("OOM");
+    pending.append(b.allocator, (paths.authored(b, source) orelse return &.{})) catch @panic("OOM");
     var seen = std.StringHashMap(void).init(b.allocator);
     var names: std.StringArrayHashMapUnmanaged(void) = .empty;
     var index: usize = 0;
@@ -231,6 +233,7 @@ fn partitionRun(b: *std.Build, artifact: *std.Build.Step.Compile, original: *std
         .bytes => |bytes| run.addArg(bytes),
         .artifact => |value| run.addPrefixedArtifactArg(value.prefix, artifact),
         .lazy_path => |value| run.addPrefixedFileArg(value.prefix, value.lazy_path),
+        .passthru => run.addPassthruArgs(),
         else => @panic("unsupported local test wrapper argument"),
     };
     run.environ_map = original.environ_map;
@@ -246,12 +249,6 @@ fn allowEmpty(run: *std.Build.Step.Run) void {
 }
 
 fn inventory(b: *std.Build, artifact: *std.Build.Step.Compile, original: *std.Build.Step.Run) *std.Build.Step.Run {
-    if (original.producer == null and hasArg(original, "--executable")) {
-        const run = partitionRun(b, artifact, original);
-        allowEmpty(run);
-        run.addArg("--list-tests");
-        return run;
-    }
     const run = b.addRunArtifact(artifact);
     run.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
     var i: usize = 0;
@@ -281,7 +278,7 @@ fn hasInventory(run: *std.Build.Step.Run, artifact: *std.Build.Step.Compile, fla
         if (arg != .lazy_path or previous == null or !std.mem.eql(u8, previous.?, flag)) continue;
         const path = arg.lazy_path.lazy_path;
         if (path != .generated) continue;
-        const inv = path.generated.file.step.cast(std.Build.Step.Run) orelse continue;
+        const inv = paths.producer(run.step.owner, path).?.cast(std.Build.Step.Run) orelse continue;
         if (producer(inv) == artifact) return true;
     }
     return false;
@@ -306,7 +303,11 @@ pub fn add(b: *std.Build) void {
         child.cwd = run.cwd;
         support.configureTestRun(child);
         if (run.producer != null) {
-            for (run.argv.items) |arg| if (arg == .bytes) child.addArg(arg.bytes);
+            for (run.argv.items) |arg| switch (arg) {
+                .bytes => |bytes| child.addArg(bytes),
+                .passthru => child.addPassthruArgs(),
+                else => {},
+            };
         }
         allowEmpty(child);
         child.addArg("--allow-empty-owner");
@@ -320,12 +321,12 @@ pub fn add(b: *std.Build) void {
             while (i < run.argv.items.len) : (i += 1) {
                 const arg = run.argv.items[i];
                 if (arg != .bytes) continue;
-                if (std.mem.startsWith(u8, arg.bytes, "--test-filter=")) {
-                    audit.addArgs(&.{ "--filter", arg.bytes["--test-filter=".len..] });
+                if ((std.mem.startsWith(u8, arg.bytes, "--test-filter=") or std.mem.startsWith(u8, arg.bytes, "--suite-filter="))) {
+                    audit.addArgs(&.{ "--filter", arg.bytes[(std.mem.indexOfScalar(u8, arg.bytes, '=').? + 1)..] });
                 } else if (std.mem.startsWith(u8, arg.bytes, "--skip-test-filter=")) {
                     audit.addArgs(&.{ "--skip-filter", arg.bytes["--skip-test-filter=".len..] });
                 } else {
-                    const flag = if (std.mem.eql(u8, arg.bytes, "--test-filter")) "--filter" else if (std.mem.eql(u8, arg.bytes, "--skip-test-filter")) "--skip-filter" else continue;
+                    const flag = if ((std.mem.eql(u8, arg.bytes, "--test-filter") or std.mem.eql(u8, arg.bytes, "--suite-filter"))) "--filter" else if (std.mem.eql(u8, arg.bytes, "--skip-test-filter")) "--skip-filter" else continue;
                     i += 1;
                     if (i >= run.argv.items.len or run.argv.items[i] != .bytes) @panic("missing test filter value");
                     audit.addArgs(&.{ flag, run.argv.items[i].bytes });
@@ -336,6 +337,8 @@ pub fn add(b: *std.Build) void {
                 audit.addArg("--inventory");
                 audit.addFileArg(inv.captureStdErr(.{}));
             }
+            audit.addArg("--");
+            audit.addPassthruArgs();
             allowEmpty(run);
             run.addArg("--allow-empty-owner");
             child.step.dependOn(&audit.step);
@@ -370,7 +373,7 @@ pub fn add(b: *std.Build) void {
             {
                 const path = arg.lazy_path.lazy_path;
                 if (path == .generated) {
-                    if (path.generated.file.step.cast(std.Build.Step.Run)) |inv| {
+                    if (paths.producer(b, path).?.cast(std.Build.Step.Run)) |inv| {
                         const executable = producer(inv) orelse continue;
                         const local = partition(b, executable) orelse continue;
                         if (hasInventory(run, local, previous.?)) continue;

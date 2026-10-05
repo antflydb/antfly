@@ -45,7 +45,7 @@ CONSUMERS = {
     "api-table-write-lifecycle-tests",
     "data-runtime-tests",
 }
-COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) Debug \S+ (cached|success)\b")
+COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) debug \S+ (cached|success)\b")
 
 
 # Cache manifests track literal imports even in unselected test bodies. Skip
@@ -327,7 +327,7 @@ def main() -> None:
             arguments = [
                 "build",
                 "check-storage-compilation",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Donnx=false",

@@ -9,7 +9,7 @@ release changes belong to the separate licensing PR.
 
 | Owner | Responsibility |
 | --- | --- |
-| `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, Lite, public C API and file CLI |
+| `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, portable lake readers, Lite, public C API and file CLI |
 | `pkg/antfly-embedded/src/inference` | Antfly inference providers and embedding integration |
 | `pkg/inference` | Model execution, inference host and native provider exports |
 | `pkg/antfly/src` | HTTP handlers, distributed transactions, Raft coordination, cluster metadata, hot standby, server storage-owner adapters and private C API |
@@ -40,11 +40,40 @@ Table-drop cleanup fences are shared local contracts. Metadata protocol activati
 membership barriers, and reallocation requests remain server coordination.
 Native SQL owns its pull stream, typed execution batches, parallel scheduling,
 spill operators, and result cursors in `src/local/sql`. Row-source value/identity
-contracts and external-table schema bindings are shared local contracts because
-the SQL catalog and persisted DB schema use them. Lake discovery, credential
-resolution, Parquet/Iceberg serving, HTTP integration, and concrete row-source
-adapters remain server-owned. The SQL refinement benchmark follows the local
-execution owner; Lake benchmarks follow server serving.
+contracts and external-table schema bindings belong to the local engine.
+Embedded lake querying is an intentional product capability, similar to using
+DuckDB against files and object storage. Portable Parquet/Iceberg readers,
+inventory discovery and validation, snapshot pinning, delete application,
+row identities and continuation checks, bounded caches, parallel scans and SQL
+cursors live in the local source owner. Sidecar and row-fragment codecs required
+by those readers are portable data operations, not cluster coordination.
+
+The native Zig package exposes these capabilities through `antfly_embedded.lake`.
+Its `sql_cursor` implements the shared SQL catalog cursor contract; callers can
+use it from their SQL backend without an HTTP server, Raft group or replica.
+`lake.host.OpenOptions` accepts a borrowed resolver for managed credential
+references. The resolver is needed only while opening a source; a successful
+open transfers the returned object-store owner to the source. Source close
+releases that owner. With no resolver, ordinary file/cloud URIs use the portable
+object-store implementation. The server resolves node connections and secrets
+in `configured_object_store_support.zig`, then supplies that port. It uses a thin
+`api/lake_sql_cursor.zig` adapter over the same cursor implementation.
+
+Cluster placement, distributed query orchestration, catalog publication,
+sidecar build coordination, managed credential policy and HTTP serving remain
+server-owned. `ProvisioningProjection` and restore source-artifact provisioning
+DTOs also remain server metadata; shared table-record memory helpers belong to
+local metadata. Inventory and portable manifest descriptors may be shared even
+when they describe externally stored data. Their presence does not grant local
+code responsibility for cluster publication.
+
+Parquet and Iceberg readers are implemented; the Lance metadata tag does not
+promise a Lance reader. This PR adds a native Zig capability, not a new C ABI,
+Python/npm command or stable convenience wrapper. Browser lake scans require a
+separate asynchronous host-I/O integration and are not exposed by the current
+WASM surface. The existing browser DB and inference source boundary remains
+independent of native lake I/O. The SQL refinement benchmark follows the local
+execution owner; Lake serving benchmarks remain server compositions.
 Existing shared contracts and generated OpenAPI ownership remain in their existing
 embedded/shared-library/server-API packages. Authored YAML remains in `specs/openapi`.
 
@@ -66,6 +95,7 @@ From `zig/`, build the local products with:
 ```sh
 zig build --build-file embedded.build.zig lite capi-smoke embedded-capi-check -Dmetal=false
 zig build --build-file embedded.build.zig wasm-test -Dmetal=false
+zig build --build-file embedded.build.zig embedded-lake-test -Dmetal=false
 ```
 
 The public library compiles its local C API directly and links native inference
@@ -119,3 +149,17 @@ Calling finalization twice does not duplicate
 partitions or inventories. Small real-build fixtures cover these contracts in
 `tools/test_local_test_partitions.py`; the normal product suites exercise the
 actual local/server fixture graph.
+
+## Licensing transition
+
+This PR keeps existing source licenses. The follow-on licensing PR must classify
+and audit the entire native lake dependency closure along with DB and inference
+as Apache-2.0. Do not infer Apache eligibility from directory names. Server
+credential adapters, provisioning and cluster publication remain ELv2. Future
+changes must extend the isolated embedded build and tests when they add a local
+reader or host integration, rather than importing the server query barrel.
+
+Build composition and test partitioning use Zig 0.17 configuration APIs.
+Generated inputs retain LazyPath ownership until make phase; authored imports
+inspected during configuration are registered as configure dependencies so the
+serialized build graph is invalidated when source ownership changes.

@@ -142,7 +142,8 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
         };
         try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(owned, child_json, fk.parent_table, parent_json);
     }
-    return .{ .arena = arena, .schema_json = child_json, .parents = try parents.toOwnedSlice(owned) };
+    const owned_result_parents = try parents.toOwnedSlice(owned);
+    return .{ .arena = arena, .schema_json = child_json, .parents = owned_result_parents };
 }
 
 /// One parent per maintenance turn. The final exact metadata CAS repeats

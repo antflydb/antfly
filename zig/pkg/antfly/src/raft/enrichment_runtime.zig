@@ -12,52 +12,15 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const leader_runtime = @import("leader_runtime.zig");
 const read_state_observer_mod = @import("antfly_read_state_observer");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
-pub const ExecutorBackend = enum {
-    simulated,
-    threaded,
-    evented,
-};
-
-pub const EnrichmentExecutor = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        start_group: *const fn (ptr: *anyopaque, group_id: u64) anyerror!void,
-        stop_group: *const fn (ptr: *anyopaque, group_id: u64) anyerror!void,
-        is_active: *const fn (ptr: *anyopaque, group_id: u64) bool,
-        backend: *const fn (ptr: *anyopaque) ExecutorBackend,
-    };
-
-    pub fn startGroup(self: EnrichmentExecutor, group_id: u64) !void {
-        try self.vtable.start_group(self.ptr, group_id);
-    }
-
-    pub fn stopGroup(self: EnrichmentExecutor, group_id: u64) !void {
-        try self.vtable.stop_group(self.ptr, group_id);
-    }
-
-    pub fn isActive(self: EnrichmentExecutor, group_id: u64) bool {
-        return self.vtable.is_active(self.ptr, group_id);
-    }
-
-    pub fn backend(self: EnrichmentExecutor) ExecutorBackend {
-        return self.vtable.backend(self.ptr);
-    }
-};
-
-// TODO: Re-enable Linux evented enrichment once std.Io.Evented/std.Io.Uring is
-// stable enough for this code path. In Zig 0.16, instantiating std.Io.Uring
-// trips stdlib error-set mismatches: std/Io/Uring.zig's dirOpenDir and
-// dirRealPathFile propagate openat's error.ReadOnlyFileSystem into std/Io/Dir.zig
-// error sets that do not include it.
-const supports_evented_executor = false;
+const executor_mod = @import("enrichment_executor.zig");
+pub const ExecutorBackend = executor_mod.ExecutorBackend;
+pub const EnrichmentExecutor = executor_mod.EnrichmentExecutor;
+pub const EventedExecutor = executor_mod.EventedExecutor;
 
 pub const Metrics = struct {
     gained_events: u64 = 0,
@@ -181,62 +144,6 @@ pub const ThreadedExecutor = struct {
 
     fn backend(_: *anyopaque) ExecutorBackend {
         return .threaded;
-    }
-};
-
-pub const EventedExecutor = if (!supports_evented_executor) struct {
-    pub fn init(_: std.mem.Allocator) !@This() {
-        return error.UnsupportedEventedBackend;
-    }
-} else struct {
-    alloc: std.mem.Allocator,
-    evented: std.Io.Evented,
-    active_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
-
-    pub fn init(alloc: std.mem.Allocator) !@This() {
-        var evented: std.Io.Evented = undefined;
-        try std.Io.Evented.init(&evented, alloc, .{});
-        return .{
-            .alloc = alloc,
-            .evented = evented,
-        };
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.active_groups.deinit(self.alloc);
-        std.Io.Evented.deinit(&self.evented);
-        self.* = undefined;
-    }
-
-    pub fn executor(self: *@This()) EnrichmentExecutor {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .start_group = startGroup,
-                .stop_group = stopGroup,
-                .is_active = isActive,
-                .backend = backend,
-            },
-        };
-    }
-
-    fn startGroup(ptr: *anyopaque, group_id: u64) !void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        try putActive(&self.active_groups, self.alloc, group_id);
-    }
-
-    fn stopGroup(ptr: *anyopaque, group_id: u64) !void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        removeActive(&self.active_groups, group_id);
-    }
-
-    fn isActive(ptr: *anyopaque, group_id: u64) bool {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.active_groups.contains(group_id);
-    }
-
-    fn backend(_: *anyopaque) ExecutorBackend {
-        return .evented;
     }
 };
 
@@ -461,13 +368,5 @@ test "threaded enrichment executor reports backend and activity" {
 }
 
 test "evented enrichment executor initializes when supported" {
-    if (!supports_evented_executor) {
-        try std.testing.expectError(error.UnsupportedEventedBackend, EventedExecutor.init(std.testing.allocator));
-        return;
-    }
-
-    var executor = try EventedExecutor.init(std.testing.allocator);
-    defer executor.deinit();
-    const iface = executor.executor();
-    try std.testing.expectEqual(ExecutorBackend.evented, iface.backend());
+    try executor_mod.testEventedExecutor(false);
 }

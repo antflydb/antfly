@@ -53,7 +53,7 @@ const BackendResources = union(BackendKind) {
         compute: *NativeCompute,
     },
 
-    fn deinit(self: *BackendResources, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *BackendResources, allocator: std.mem.Allocator) void {
         const native_backend = &self.native;
         native_backend.compute.computeBackend().deinit();
         native_backend.weights.resident_weights.deinit(allocator);

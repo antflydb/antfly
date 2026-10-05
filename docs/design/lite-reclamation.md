@@ -345,7 +345,7 @@ exercise existing backup/import/encryption/replay/resource contracts. Numerical
 throughput, latency-percentile, and I/O promises require workload benchmarks;
 correctness tests and structural page-growth bounds do not establish those claims.
 
-`zig build lite-native-benchmark -Doptimize=ReleaseFast` includes a capacity
+`zig build lite-native-benchmark -Doptimize=fast` includes a capacity
 reclamation workload with 1,024 overwrites of four 8 KiB documents under three
 fixed budgets. It reports peak physical bytes, retry/service counts, page I/O,
 and p50/p99 elapsed write times including cooperative retirement. This workload

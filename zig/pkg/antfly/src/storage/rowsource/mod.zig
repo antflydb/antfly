@@ -13,8 +13,8 @@
 // limitations.
 
 pub const types = @import("antfly_local_sources").storage_rowsource_types;
-pub const local = @import("local.zig");
-pub const external = @import("external.zig");
+pub const local = @import("antfly_local_sources").storage_rowsource_local;
+pub const external = @import("antfly_local_sources").storage_rowsource_external;
 
 pub const SourceKind = types.SourceKind;
 pub const NextBatchFn = types.NextBatchFn;

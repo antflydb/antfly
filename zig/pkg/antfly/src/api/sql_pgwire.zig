@@ -416,7 +416,7 @@ const OwnedRead = struct {
         return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate };
     }
 
-    fn validate(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request) !void {
+    pub fn validate(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request) !void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
         var job = StreamJob{ .adapter = self.adapter, .alloc = alloc, .credential = self.authority.credential, .request = request, .owner = self, .validate_only = true };
         try job.dispatch();
@@ -625,7 +625,7 @@ const Credential = struct {
         return self;
     }
 
-    fn validate(self: *const Credential) !void {
+    pub fn validate(self: *const Credential) !void {
         const current = self.manager.destinationGrantMac(self.principal, credential_domain) catch return error.Unauthorized;
         if (!std.crypto.timing_safe.eql([Mac.mac_length]u8, current, self.verifier_mac)) return error.Unauthorized;
     }
@@ -800,14 +800,14 @@ const Job = struct {
         }
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
         var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, guarded.backend()) catch |err| {
-            if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @enumFromInt(@intFromEnum(native_adapter.transaction_status));
+            if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);
             return err;
         };
         var transferred = false;
         defer if (!transferred) result.deinit();
-        if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @enumFromInt(@intFromEnum(native_adapter.transaction_status));
+        if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status));
         errdefer if (native_adapter.result_session_id) |id| {
             const transaction_id = @import("distributed_txn.zig").parseTxnIdHex(&id) catch unreachable;
             server.txn_sessions.setSqlFailed(server.alloc, transaction_id, true) catch {};
@@ -841,7 +841,7 @@ const Job = struct {
             .transaction_id = native_adapter.outcome_transaction_id,
             .ddl_receipt_json = if (result.output.ddl_receipt) |receipt| try std.json.Stringify.valueAlloc(self.alloc, receipt, .{ .emit_null_optional_fields = false }) else null,
             .session_id = if (native_adapter.result_session_id) |id| try self.alloc.dupe(u8, &id) else null,
-            .transaction_status = @enumFromInt(@intFromEnum(native_adapter.transaction_status)),
+            .transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status)),
             .owner = .{ .context = result.state, .release = releaseResult },
         };
         transferred = true;

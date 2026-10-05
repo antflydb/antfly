@@ -31,7 +31,7 @@ pub const Identity = struct {
     native_term: u64,
     native_index: u64,
 
-    fn validate(self: Identity) !void {
+    pub fn validate(self: Identity) !void {
         if (self.group_id == 0 or self.native_index > self.through_index or
             (self.native_index == 0) != (self.native_term == 0)) return error.InvalidSnapshot;
     }
@@ -253,7 +253,7 @@ test "relational index system native Raft snapshot preserves exact typed primary
     const certificate = try source.prepareOnlineSourcePublication(scope, .none);
     try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 2, .index = 2 });
     try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .timestamp_ns = 987654321, .writes = &.{.{ .key = "a", .value = "{\"n\":9007199254740993}" }} }, .{ .term = 2, .index = 5 });
-    const txn_id = [_]u8{7} ** 16;
+    const txn_id = @as([16]u8, @splat(7));
     _ = try source.beginReplicatedTransactionAtOrderedReceipt(txn_id, 987654322, 987654322, &.{"participant"}, false, false, .{ .term = 2, .index = 6 });
     try source.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{ .writes = &.{.{ .key = "prepared", .value = "{\"n\":4}" }} }, .{ .term = 2, .index = 7 });
     try @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } } }, .{ .term = 2, .index = 8 });

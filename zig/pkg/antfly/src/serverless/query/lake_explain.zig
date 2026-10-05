@@ -19,17 +19,17 @@
 //! advice from the serving observation stream.
 
 const std = @import("std");
-const artifact_ref = @import("../manifest/artifact_ref.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const lake_promotion = @import("../build/lake_promotion.zig");
-const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
+const sidecar_manifest = @import("antfly_local_sources").serverless_segment_sidecar_manifest;
 const lake_cache = @import("lake_cache.zig");
-const lake_rows = @import("lake_rows.zig");
-const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
-const lake_range_io = @import("lake_range_io.zig");
-const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
+const lake_rows = @import("antfly_local_sources").serverless_query_lake_rows;
+const lake_parquet_rowgroup = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
+const lake_range_io = @import("antfly_local_sources").serverless_query_lake_range_io;
+const lake_sidecar_selection = @import("antfly_local_sources").serverless_query_lake_sidecar_selection;
 const rowsource = @import("antfly_local_sources").storage_rowsource_types;
-const source_binding = @import("../segment/source_binding.zig");
+const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
 
 pub const Operation = enum {
     scan,
@@ -913,21 +913,21 @@ test "lake explain reports object range cache lane accounting" {
         .evicted_bytes = 128,
         .rejected_bytes = 64,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.metadata)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.metadata)] = .{
         .hits = 2,
         .misses = 1,
         .stored_bytes = 512,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.compressed_range)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.compressed_range)] = .{
         .misses = 5,
         .stored_bytes = 1024,
         .evicted_bytes = 128,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.serving_sidecar)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.serving_sidecar)] = .{
         .hits = 2,
         .stored_bytes = 512,
     };
-    stats.lanes[@intFromEnum(lake_range_io.CacheLane.broad_scan_scratch)] = .{
+    stats.lanes[@backingInt(lake_range_io.CacheLane.broad_scan_scratch)] = .{
         .misses = 1,
         .rejected_bytes = 64,
     };

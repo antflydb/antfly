@@ -227,17 +227,17 @@ test "restore staging driver shares stable identities and existing destination m
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expect(copied.plan.?.targets[0].replace == null);
     const catalog = @import("antfly_local_sources").system_catalog_domain;
-    const qualified = try catalog.restoreStorageNameAlloc(a, "table:" ++ "a" ** 32, .{
-        .database = "d" ** 128,
-        .namespace = "n" ** 128,
-        .table = "t" ** 255,
+    const qualified = try catalog.restoreStorageNameAlloc(a, "table:" ++ z17RepeatString("a", 32), .{
+        .database = z17RepeatString("d", 128),
+        .namespace = z17RepeatString("n", 128),
+        .table = z17RepeatString("t", 255),
     });
     const long_copy = try buildPlan(a, id, @splat(3), &.{.{
         .source_table_id = 9,
         .manifest = &manifest,
         .existing_name = qualified,
         .destination_name = qualified,
-        .catalog_binding = .{ .kind = .table, .id = 0, .parent_id = 2, .name = "t" ** 255, .storage_name = qualified },
+        .catalog_binding = .{ .kind = .table, .id = 0, .parent_id = 2, .name = z17RepeatString("t", 255), .storage_name = qualified },
     }}, &.{}, &.{}, "fail_if_exists");
     const long_plan = long_copy.plan.?;
     const long_target = long_plan.targets[0];
@@ -294,7 +294,7 @@ test "restore staging cohort proof binds every source identity and durable seal"
     const owner: cohort.Owner = .{ .table_name = "docs", .range_start = "", .range_end = "", .fence = fence, .artifact_id = "artifact", .capture_node_id = 44 };
     const receipt: cohort.SealReceipt = .{ .source_node_id = 44, .handle = .{ .fence = fence, .digest = @splat(2) } };
     var proof: cohort.Job = .{ .id = 7, .revision = 9, .attempt_id = "attempt", .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive", .tables = &.{.{ .table_id = 9, .name = "docs", .definition = @splat(1), .manifest_definition = cohort.manifestDefinition("docs", "", "{}", "", "{}", "[]") }}, .state = .{ .phase = .publishing, .metadata_digest = @splat(3), .owners = &.{owner} }, .seals = &.{receipt} };
-    var manifest: backup.TableBackupManifest = .{ .format = .native, .backup_id = "daily-docs", .table_name = "docs", .table_id = 9, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &.{.{ .group_id = 301, .start_key = "", .snapshot_path = "artifact/301", .artifact_size_bytes = 19, .artifact_sha256 = "ab" ** 32 }} };
+    var manifest: backup.TableBackupManifest = .{ .format = .native, .backup_id = "daily-docs", .table_name = "docs", .table_id = 9, .description = "", .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &.{.{ .group_id = 301, .start_key = "", .snapshot_path = "artifact/301", .artifact_size_bytes = 19, .artifact_sha256 = z17RepeatString("ab", 32) }} };
     const source = try cohortSource(a, proof, &manifest);
     try std.testing.expect(source.namespaces[0].eql(fence.namespace));
     const selected = try buildPlan(a, try staging.idForAttempt(11, 1), @splat(9), &.{source}, &.{}, &.{}, "fail_if_exists");
@@ -347,4 +347,15 @@ test "restore staging partial selection is dependency closed across both schema 
     try std.testing.expectError(error.RestoreDependencyMissing, validateSelection(a, &.{children}));
     try validateSelection(a, &.{ parents, children });
     try std.testing.expectError(error.DuplicateTableName, validateSelection(a, &.{ parents, parents }));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

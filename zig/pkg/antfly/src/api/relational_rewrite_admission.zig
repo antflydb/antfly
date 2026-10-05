@@ -287,7 +287,7 @@ test "distributed txn rewrite admission closes current and historical dependenci
             } else self.entries[0..0];
             return .{ .namespace = request.scope.fence.namespace, .eligible = self.eligible, .source_schemas = &self.one_schema, .generation_handoff = .{ .namespace = request.scope.fence.namespace, .admissions = admissions, .admissions_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, admissions), .retired_digest = @splat(7), .retired_count = 0, .intent = null, .seal = null }, .catalog_digest = @splat(5), .next_topology_epoch = 1, .next_consumer_epoch = 1, .donor_term = 1, .next_copy_sequence = 1 };
         }
-        fn releaseFacts(self: *@This(), _: wire.AdmissionFacts) void {
+        pub fn releaseFacts(self: *@This(), _: wire.AdmissionFacts) void {
             self.released += 1;
         }
     };

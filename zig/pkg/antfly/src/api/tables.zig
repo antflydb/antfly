@@ -347,7 +347,7 @@ pub fn freeTableStorageStatuses(alloc: std.mem.Allocator, statuses: []TableStora
 }
 
 fn readerPinCount(counts: [lsm_backend.reader_pin_kind_count]u64, kind: lsm_backend.ReaderPinKind) u64 {
-    return counts[@intFromEnum(kind)];
+    return counts[@backingInt(kind)];
 }
 
 pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {
@@ -726,7 +726,7 @@ fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) s
                 break :blk out;
             }
             var out: T = undefined;
-            inline for (info.fields) |field| @field(out, field.name) = try cloneSchemaProjection(field.type, alloc, @field(value, field.name));
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(out, reflected_name) = try cloneSchemaProjection(field_type, alloc, @field(value, reflected_name));
             break :blk out;
         },
         .@"union" => switch (value) {
@@ -1846,8 +1846,8 @@ fn validateNamedFullTextQueryIndexes(
 
 fn generatedSourceVectorStats(stats: @import("antfly_local_sources").storage_artifact_payload.Stats) metadata_openapi.VectorSourceStorageStatus {
     var out: metadata_openapi.VectorSourceStorageStatus = .{};
-    inline for (@typeInfo(@TypeOf(stats)).@"struct".fields) |field| {
-        @field(out, field.name) = @intCast(@min(@field(stats, field.name), std.math.maxInt(i64)));
+    inline for (comptime std.meta.fieldNames(@TypeOf(stats))) |reflected_name| {
+        @field(out, reflected_name) = @intCast(@min(@field(stats, reflected_name), std.math.maxInt(i64)));
     }
     return out;
 }

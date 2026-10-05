@@ -114,9 +114,9 @@ For CUDA throughput measurements, run the pretokenized E2E benchmark (model
 loading and tokenization remain outside the timed region):
 
 ```bash
-zig build -Dcuda=true -Doptimize=ReleaseFast bench-qwen3-embedding-e2e -- \
+zig build -Dcuda=true -Doptimize=fast bench-qwen3-embedding-e2e -- \
   --backend cuda --model-dir /path/to/qwen3-embedding-q8 --batch 8 --seq-len 256
-zig build -Dcuda=true -Doptimize=ReleaseFast bench-qwen3-embedding-e2e -- \
+zig build -Dcuda=true -Doptimize=fast bench-qwen3-embedding-e2e -- \
   --backend cuda --model-dir /path/to/qwen3-embedding-q8 --lengths 32,64,128,256
 ```
 

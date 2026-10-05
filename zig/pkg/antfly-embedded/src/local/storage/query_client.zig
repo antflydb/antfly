@@ -123,7 +123,7 @@ pub fn acceptProviderFailure(
             err,
             .storage_owner,
             abi.abi_version,
-            @intFromEnum(validation_operation),
+            @backingInt(validation_operation),
         );
         return err;
     };
@@ -133,7 +133,7 @@ pub fn acceptProviderFailure(
             error.InvalidBoundaryFailureIdentity,
             .storage_owner,
             abi.abi_version,
-            @intFromEnum(validation_operation),
+            @backingInt(validation_operation),
         );
         return error.InvalidBoundaryFailureIdentity;
     }

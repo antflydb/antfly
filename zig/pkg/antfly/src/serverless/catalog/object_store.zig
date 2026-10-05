@@ -17,7 +17,7 @@ const platform_sync = @import("antfly_platform").sync;
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
-const object_store_support = @import("../object_store_support.zig");
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 
 const PersistedNamespace = struct {
     name: []const u8,
@@ -40,7 +40,7 @@ const TableBinding = struct {
     read_schema_json: []u8,
     indexes_json: []u8,
 
-    fn deinit(self: *TableBinding, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *TableBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         alloc.free(self.namespace);
         alloc.free(self.schema_json);

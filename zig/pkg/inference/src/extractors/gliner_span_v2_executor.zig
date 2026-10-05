@@ -283,7 +283,7 @@ const PromptLengths = struct {
         };
     }
 
-    fn deinit(self: *PromptLengths, allocator: Allocator) void {
+    pub fn deinit(self: *PromptLengths, allocator: Allocator) void {
         allocator.free(self.alone_empty);
         self.* = undefined;
     }
@@ -309,7 +309,7 @@ pub const PreparedItem = struct {
     batches: []processor.PreparedBatch,
     prompt_tokens: usize,
 
-    fn deinit(self: *PreparedItem, allocator: Allocator) void {
+    pub fn deinit(self: *PreparedItem, allocator: Allocator) void {
         for (self.batches) |*batch| batch.deinit();
         allocator.free(self.batches);
         allocator.free(self.ranges);

@@ -435,7 +435,7 @@ const FileImage = struct {
     metadata: FileMetadata,
     hash: [std.crypto.hash.sha2.Sha256.digest_length]u8,
 
-    fn deinit(self: *FileImage, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FileImage, alloc: std.mem.Allocator) void {
         alloc.free(self.raw);
         self.* = undefined;
     }

@@ -220,8 +220,9 @@ fn resolveRunKeepAliveMs(config: ?*const common_config.Config) !u64 {
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(inference.server.WarmModelKind).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, value, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -802,7 +803,7 @@ pub fn spawnServerProcess(
     };
 }
 
-fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const configured_models_dir = try parseListModelsDir(args);
     const models_dir: []const u8 = configured_models_dir orelse defaultModelsDir(alloc);
 

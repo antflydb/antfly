@@ -84,7 +84,7 @@ request distributions because traffic is closed-loop.
 
 ```sh
 zig build antfly-system-catalog-bench
-zig build antfly-system-catalog-routing-bench -Doptimize=ReleaseFast
+zig build antfly-system-catalog-routing-bench -Doptimize=fast
 ```
 
 `antfly-system-catalog-bench` builds its own ReleaseFast executable. It reports five-sample medians
@@ -308,7 +308,7 @@ checks its result, but latency is an observation rather than a test assertion.
 ## Many-range control-plane reports and heartbeat framing
 
 ```sh
-ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=ReleaseFast
+ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=fast
 ```
 
 This opt-in storage workload uses 100, 1,000 and 10,000 groups per store. It
@@ -351,11 +351,11 @@ Use these component workloads for the costs paid by large multi-tenant clusters:
 
 ```sh
 # From zig/: compile both report executables before timing, then run serially.
-env ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=ReleaseFast -j1
+env ANTFLY_CATALOG_REPORT_BENCH=1 zig build antfly-system-catalog-report-bench -Doptimize=fast -j1
 # A node becomes reachable with a full retry backlog (100/1,000/4,096 frames).
-(cd lib/raft && zig build retry-bench -Doptimize=ReleaseFast -j1)
+(cd lib/raft && zig build retry-bench -Doptimize=fast -j1)
 # Drain 256/1,024/4,096 queued requests across 16 peers, excluding network/setup.
-env ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=ReleaseFast -j1
+env ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=fast -j1
 ```
 
 `ADMISSION_PLAN_BENCH` compares the previous clone/compare/apply preparation

@@ -24,7 +24,7 @@ pub const Keyring = struct {
     const Loaded = struct {
         id: []u8,
         key: record.DataKey,
-        fn deinit(self: *Loaded, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *Loaded, alloc: std.mem.Allocator) void {
             std.crypto.secureZero(u8, &self.key);
             alloc.free(self.id);
         }

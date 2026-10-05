@@ -180,7 +180,7 @@ pub fn validateLoadedGguf(allocator: Allocator, receipt: Receipt, config: model.
 
 test "gliner boundary bundle rejects missing duplicate unsafe and changed sidecars" {
     const a = std.testing.allocator;
-    const zero = "0" ** 64;
+    const zero = z17RepeatString("0", 64);
     const source = [_]FilePin{
         .{ .path = "model.safetensors", .size_bytes = 32, .sha256 = zero },
         .{ .path = "config.json", .size_bytes = 1, .sha256 = zero },
@@ -205,7 +205,7 @@ test "gliner boundary bundle rejects missing duplicate unsafe and changed sideca
     output[4] = output[3];
     try std.testing.expectError(error.InvalidGlinerBoundaryBundle, validate(receipt));
     output[4] = source[4];
-    output[4].sha256 = "1" ** 64;
+    output[4].sha256 = z17RepeatString("1", 64);
     try std.testing.expectError(error.InvalidGlinerBoundaryBundle, validate(receipt));
     output[4] = source[4];
     var incomplete = receipt;
@@ -241,4 +241,15 @@ test "gliner boundary identity binds artifact precision and the consumed sidecar
     changed = identity;
     changed.weight = Digest.of("Weight");
     try std.testing.expect(!std.mem.eql(u8, &identity.fingerprint(), &changed.fingerprint()));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

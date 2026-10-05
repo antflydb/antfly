@@ -11,7 +11,7 @@ const metal = @import("../backends/metal_runtime.zig");
 const metal_tensor = @import("../backends/metal_tensor.zig");
 const Allocator = std.mem.Allocator;
 const identity = seeded.StepIdentity{ .binding = @splat(17), .optimizer_step = 3, .microbatch = 5 };
-const decisions = [_]u8{23} ** 32;
+const decisions = @as([32]u8, @splat(23));
 const shape = ml.Shape.init(.f32, &.{2});
 
 const Graph = struct {

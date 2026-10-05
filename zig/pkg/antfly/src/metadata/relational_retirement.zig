@@ -123,7 +123,7 @@ pub fn transitionAllowed(alloc: std.mem.Allocator, before: topology.TableRecord,
     const diagnostic = failure_changed and phase == old.value.phase and verified_owners == old.value.verified_owners;
     const continuation = !failure_changed and old.value.failure.len == 0 and phase == old.value.phase and
         verified_owners == old.value.verified_owners + 1;
-    const phase_advance = !failure_changed and old.value.failure.len == 0 and @intFromEnum(phase) == @intFromEnum(old.value.phase) + 1 and
+    const phase_advance = !failure_changed and old.value.failure.len == 0 and @backingInt(phase) == @backingInt(old.value.phase) + 1 and
         verified_owners == 0 and (old.value.phase == .ready or old.value.verified_owners + 1 == old.value.owners.len);
     return std.mem.eql(u8, old_bytes, next_bytes) and
         (diagnostic or continuation or phase_advance) and

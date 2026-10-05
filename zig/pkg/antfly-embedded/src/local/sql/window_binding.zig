@@ -261,7 +261,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             },
             else => {},
         }
-        if (call.filter != null and @intFromEnum(kind) < @intFromEnum(Kind.count)) return error.UnsupportedSqlShape;
+        if (call.filter != null and @backingInt(kind) < @backingInt(Kind.count)) return error.UnsupportedSqlShape;
         const result_type: ast.ColumnType = switch (kind) {
             .row_number, .rank, .dense_rank, .ntile, .count => .integer,
             .avg, .percent_rank, .cume_dist => .number,

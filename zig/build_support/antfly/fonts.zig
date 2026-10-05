@@ -15,7 +15,7 @@
 const std = @import("std");
 
 /// PDF and web UI consume the same canonical design-system font assets.
-pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const files = b.addWriteFiles();
     _ = files.addCopyFile(b.path("../ts/packages/design-system/src/fonts/aeonik/Aeonik-Regular.ttf"), "Aeonik-Regular.ttf");
     _ = files.addCopyFile(b.path("../ts/packages/design-system/src/fonts/aeonik/Aeonik-Bold.ttf"), "Aeonik-Bold.ttf");

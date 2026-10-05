@@ -3,10 +3,10 @@
 //! Creation-only schema inference. Publication receives ordinary, fully bound
 //! schema JSON; SQL Describe and Execute never discover or mutate catalog types.
 const std = @import("std");
-const schema = @import("../serverless/query/lake_schema.zig");
+const schema = @import("antfly_local_sources").serverless_query_lake_schema;
 const binding_api = @import("antfly_local_sources").serverless_external_source_schema_binding;
 const A = std.mem.Allocator;
-pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("../serverless/query/lake_read_context.zig").Context) !?[]u8 {
+pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !?[]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, input, .{ .allocate = .alloc_always, .parse_numbers = false });
     defer parsed.deinit();
     const owned = parsed.arena.allocator();
@@ -25,23 +25,23 @@ pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configur
     try context.ensureActive();
     var store = try @import("../serverless/configured_object_store_support.zig").openBindingObjectStoreAlloc(a, binding.binding, options);
     defer store.deinit();
-    var contextual: @import("../serverless/query/lake_read_context.zig").Store = .{ .base = store.client, .context = context };
+    var contextual: @import("antfly_local_sources").serverless_query_lake_read_context.Store = .{ .base = store.client, .context = context };
     const client = contextual.client(a);
     const base = if (store.fs_client != null) try std.fmt.allocPrint(a, "object://{s}/{s}", .{ store.bucket, store.prefix }) else null;
     defer if (base) |value| a.free(value);
     var detected = switch (binding.binding.format) {
         .parquet => blk: {
-            var inventory = try @import("../serverless/external_source/mod.zig").planParquetPrefixInventoryFromObjectStorageAlloc(a, .{ .client = client, .bucket = store.bucket, .prefix = store.prefix, .source_id = binding.binding.table_id, .source_uri = binding.binding.source_uri, .object_uri_base = base, .schema_fingerprint = "auto" });
+            var inventory = try @import("antfly_local_sources").serverless_external_source_mod.planParquetPrefixInventoryFromObjectStorageAlloc(a, .{ .client = client, .bucket = store.bucket, .prefix = store.prefix, .source_id = binding.binding.table_id, .source_uri = binding.binding.source_uri, .object_uri_base = base, .schema_fingerprint = "auto" });
             defer inventory.deinit(a);
             if (binding.binding.snapshot_mode == .object_version_digest) if (!std.mem.eql(u8, inventory.snapshot_id, binding.binding.snapshot_mode.object_version_digest)) return error.ExternalLakeSnapshotMismatch;
-            var reader = @import("../serverless/query/lake_object_reader.zig").ObjectStorageRangeReader.init(client);
+            var reader = @import("antfly_local_sources").serverless_query_lake_object_reader.ObjectStorageRangeReader.init(client);
             break :blk try schema.parquetSchema(a, inventory, reader.parquetReader());
         },
         .iceberg => blk: {
-            const uri = try @import("../serverless/query/lake_serving.zig").ServingSource.icebergMetadataUriForOpenedStoreAlloc(a, client, store.bucket, store.prefix, binding.binding.source_uri, base);
+            const uri = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.icebergMetadataUriForOpenedStoreAlloc(a, client, store.bucket, store.prefix, binding.binding.source_uri, base);
             defer a.free(uri);
             var reader_client = client;
-            const bytes = try @import("../serverless/query/lake_iceberg_snapshot.zig").readFullObjectAlloc(a, &reader_client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
+            const bytes = try @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot.readFullObjectAlloc(a, &reader_client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
             defer a.free(bytes);
             break :blk try schema.icebergSchema(a, bytes, binding.binding.snapshot_mode.pinnedSnapshotId());
         },
@@ -87,7 +87,7 @@ test "lake SQL schema detection persists Parquet and Iceberg columns without dat
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const bytes = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 1, 2 }, .field_id = 1 }});
+    const bytes = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 1, 2 }, .field_id = 1 }});
     defer a.free(bytes);
     var put = try client.putObject("antfly", "part.parquet", bytes, .{});
     put.deinit(a);
@@ -131,7 +131,7 @@ test "lake SQL inferred Parquet union supplies missing nullable columns and fenc
     var fs = try @import("antfly_local_sources").storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
     defer fs.deinit();
     var client = fs.client();
-    const parquet = @import("../serverless/query/lake_parquet_rowgroup.zig");
+    const parquet = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
     for ([_][]const u8{ "amount", "note" }) |name| {
         const bytes = try parquet.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = name, .values = &.{ 1, 2 }, .field_id = 1 }});
         defer a.free(bytes);
@@ -193,14 +193,14 @@ test "lake SQL inferred decimal128 and signed timestamps execute through Parquet
     var client = filesystem.client();
     var big: [16]u8 = undefined;
     std.mem.writeInt(i128, &big, 99999999999999999999999999999999999999, .big);
-    const parquet = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{
+    const parquet = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{
         .{ .column_id = "ts", .field_id = 1, .converted_type = 9, .values = &.{ -1, 0, 1 } },
         .{ .column_id = "price", .field_id = 2, .converted_type = 5, .decimal_precision = 18, .decimal_scale = 2, .values = &.{ 9007199254740993, -1, 12300 } },
     }, &.{.{ .column_id = "big", .field_id = 3, .converted_type = 5, .decimal_precision = 38, .decimal_scale = 2, .values = &.{ &big, &big, &big } }});
     defer a.free(parquet);
     var put = try client.putObject("antfly", "part.parquet", parquet, .{});
     put.deinit(a);
-    const iceberg = @import("../serverless/query/lake_iceberg_snapshot.zig");
+    const iceberg = @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot;
     const manifest = try iceberg.buildTestDataManifestAlloc(a, &.{.{ .path = "object://antfly/part.parquet", .rows = 3, .bytes = parquet.len }});
     defer a.free(manifest);
     const manifest_list = try iceberg.buildTestManifestListAlloc(a, "object://antfly/metadata/data.avro", manifest.len, 1, 3);
@@ -319,7 +319,7 @@ test "external lake rejects uncommitted metadata and unsigned schema inference" 
     const input = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"iceberg\",\"uri\":\"file://{s}\"}}}}", .{directory.path()});
     defer a.free(input);
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, prepare(a, input, .{}, .{}));
-    const Source = @import("../serverless/query/lake_serving.zig").ServingSource;
+    const Source = @import("antfly_local_sources").serverless_query_lake_serving.ServingSource;
     var orphan_binding = (try binding_api.externalBindingFromSchemaJsonAlloc(a, input)).?;
     defer orphan_binding.deinit(a);
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, Source.open(a, .{ .storage_mode = .relational, .external_base_source = orphan_binding }, .{}));
@@ -333,7 +333,7 @@ test "external lake rejects uncommitted metadata and unsigned schema inference" 
         put.deinit(a);
         try std.testing.expectError(error.ExternalLakeSnapshotMismatch, prepare(a, input, .{}, .{}));
     }
-    const parquet = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .converted_type = 14, .values = &.{ 0, std.math.maxInt(i64), std.math.minInt(i64), -1 } }});
+    const parquet = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .converted_type = 14, .values = &.{ 0, std.math.maxInt(i64), std.math.minInt(i64), -1 } }});
     defer a.free(parquet);
     put = try client.putObject("antfly", "part.parquet", parquet, .{});
     put.deinit(a);
@@ -351,8 +351,8 @@ test "external lake rejects uncommitted metadata and unsigned schema inference" 
 test "lake SQL independent PyArrow compressed nullable fixtures infer and decode complete files" {
     const a = std.testing.allocator;
     for ([_][]const u8{
-        @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"),
-        @embedFile("../serverless/query/testdata/pyarrow_dictionary_nullable_snappy.parquet"),
+        @import("antfly_local_sources").serverless_query_lake_fixtures.pyarrow_plain_nullable_snappy,
+        @import("antfly_local_sources").serverless_query_lake_fixtures.pyarrow_dictionary_nullable_snappy,
     }) |bytes| {
         var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("lake-pyarrow");
         defer directory.cleanup();

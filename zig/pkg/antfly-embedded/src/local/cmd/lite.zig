@@ -50,7 +50,7 @@ const OwnedLookupRequest = struct {
     fields: [][]const u8 = &.{},
     lookup_opts: db_types.LookupOptions = .{},
 
-    fn deinit(self: *OwnedLookupRequest, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedLookupRequest, alloc: Allocator) void {
         freeFieldList(alloc, self.fields);
         self.* = undefined;
     }
@@ -72,7 +72,7 @@ const OwnedScanRequest = struct {
     fields: [][]const u8 = &.{},
     scan_opts: db_types.ScanOptions = .{},
 
-    fn deinit(self: *OwnedScanRequest, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedScanRequest, alloc: Allocator) void {
         if (self.from.len > 0) alloc.free(self.from);
         if (self.to.len > 0) alloc.free(self.to);
         freeFieldList(alloc, self.fields);
@@ -446,7 +446,7 @@ fn runUntilIdle(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
     writeJsonLine(io, json);
 }
 
-fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+pub fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
     const out_path = parseOutFlag(args);
@@ -534,7 +534,7 @@ fn copyStableAfliteToPath(allocator: Allocator, io: std.Io, path: []const u8, ou
     return try backend.copyStableSnapshot(out_path, replace);
 }
 
-fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+pub fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const source_path = args.next() orelse cli.fatal("backup path is required", .{});
     try requireRestoreSourcePath(source_path);
     var out_path: ?[]const u8 = null;
@@ -755,7 +755,7 @@ const PromoteOptions = struct {
     wait: bool = true,
     wait_timeout_ms: u64 = 30 * 60 * 1000,
 
-    fn deinit(self: *PromoteOptions, allocator: Allocator) void {
+    pub fn deinit(self: *PromoteOptions, allocator: Allocator) void {
         allocator.free(self.backup_id);
         allocator.free(self.location);
         self.* = undefined;
@@ -774,7 +774,7 @@ const PromoteSubmission = struct {
     restore_job_id: []u8,
     accepted_json: []u8,
 
-    fn deinit(self: *PromoteSubmission, allocator: Allocator) void {
+    pub fn deinit(self: *PromoteSubmission, allocator: Allocator) void {
         self.staged.deinit(allocator);
         allocator.free(self.restore_job_id);
         allocator.free(self.accepted_json);
@@ -1501,13 +1501,13 @@ test "lite schema index and enrichment commands round trip catalogs" {
     const enrichment_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/catalog-enrichment.json", .{tmp.sub_path});
     defer allocator.free(enrichment_path);
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const schema_path_z = try allocator.dupeZ(u8, schema_path);
+    const schema_path_z = try allocator.dupeSentinel(u8, schema_path, 0);
     defer allocator.free(schema_path_z);
-    const index_path_z = try allocator.dupeZ(u8, index_path);
+    const index_path_z = try allocator.dupeSentinel(u8, index_path, 0);
     defer allocator.free(index_path_z);
-    const enrichment_path_z = try allocator.dupeZ(u8, enrichment_path);
+    const enrichment_path_z = try allocator.dupeSentinel(u8, enrichment_path, 0);
     defer allocator.free(enrichment_path_z);
 
     {
@@ -1624,9 +1624,9 @@ test "lite query readonly runs while writer handle is open" {
     defer allocator.free(path);
     const query_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/query-readonly-active-writer.json", .{tmp.sub_path});
     defer allocator.free(query_path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const query_path_z = try allocator.dupeZ(u8, query_path);
+    const query_path_z = try allocator.dupeSentinel(u8, query_path, 0);
     defer allocator.free(query_path_z);
 
     var writer = try LiteDb.create(allocator, path, true);
@@ -1712,9 +1712,9 @@ test "lite backup command exports stable data while writer has open transaction"
     defer allocator.free(backup_path);
     const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-active-writer-restored.aflite", .{tmp.sub_path});
     defer allocator.free(restored_path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
 
     var writer = try LiteDb.create(allocator, path, true);
@@ -1772,9 +1772,9 @@ test "lite export subcommand dispatches portable backup alias" {
     defer allocator.free(backup_path);
     const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/export-alias-restored.aflite", .{tmp.sub_path});
     defer allocator.free(restored_path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
-    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
 
     {
@@ -1913,7 +1913,7 @@ test "lite check returns an error for invalid aflite files after writing report"
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("truncated_header", report.issue.?);
 
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const argv = [_][*:0]const u8{path_z.ptr};
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -2036,9 +2036,9 @@ test "lite backup output restores schema indexes enrichments and documents" {
         try source.db.runUntilIdle();
     }
 
-    const src_path_z = try allocator.dupeZ(u8, src_path);
+    const src_path_z = try allocator.dupeSentinel(u8, src_path, 0);
     defer allocator.free(src_path_z);
-    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
     const backup_argv = [_][*:0]const u8{ src_path_z.ptr, "--out", backup_path_z.ptr };
     var backup_args = std.process.Args.Iterator.init(.{ .vector = backup_argv[0..] });
@@ -2436,7 +2436,7 @@ test "lite restore malformed backup leaves target untouched" {
             .format_version = backup_codec.legacy_format_version,
             .flags = 0,
             .created_at_ns = 0,
-            .backup_id = [_]u8{0} ** 16,
+            .backup_id = @as([16]u8, @splat(0)),
             .table_count = 1,
             .shard_count = 1,
         });
@@ -2556,7 +2556,7 @@ test "lite status rejects internal bridge aflite files" {
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-internal-bridge.aflite", .{tmp.sub_path});
     defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     {
@@ -2844,7 +2844,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
     }
 
-    const location_z = try allocator.dupeZ(u8, location);
+    const location_z = try allocator.dupeSentinel(u8, location, 0);
     defer allocator.free(location_z);
     const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--connection", "local-reader", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
     var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
@@ -2858,7 +2858,7 @@ test "lite promote helper stages backup then submits normal restore request" {
         location: []const u8 = "",
         connection: []const u8 = "",
 
-        fn restore(ctx: *anyopaque, allocator_inner: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !PromoteRestoreAcceptance {
+        pub fn restore(ctx: *anyopaque, allocator_inner: Allocator, table: []const u8, request: antfly_client.types.RestoreRequest, _: ?[]const u8) !PromoteRestoreAcceptance {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.called = true;
             self.table = table;
@@ -2903,7 +2903,7 @@ const TestSecretKeyProvider = struct {
     const WrappedKey = Record.WrappedKey;
     const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
-    key: DataKey = [_]u8{7} ** 32,
+    key: DataKey = @as([32]u8, @splat(7)),
     unavailable: bool = false,
     unwrap_calls: usize = 0,
     fn provider(self: *@This()) KeyProvider {

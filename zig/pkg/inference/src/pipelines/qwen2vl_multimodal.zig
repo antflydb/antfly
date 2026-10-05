@@ -670,7 +670,7 @@ const StubTokenizer = struct {
     fn vocabSize(_: *anyopaque) usize {
         return 1024;
     }
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
 };
 
 test "prepare query text prefixes query" {

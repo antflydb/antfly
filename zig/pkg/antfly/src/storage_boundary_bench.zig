@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
         .identity_range_id = 1,
     });
     defer owner.deinit();
-    const padding = "x" ** 448;
+    const padding = z17RepeatString("x", 448);
     const documents = [2][]const u8{
         "{\"revision\":0,\"title\":\"alpha\",\"body\":\"" ++ padding ++ "\"}",
         "{\"revision\":1,\"title\":\"beta\",\"body\":\"" ++ padding ++ "\"}",
@@ -98,3 +98,13 @@ pub const antfly_sources = @import("source_owner_common.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
+}

@@ -307,7 +307,7 @@ fn testPath(alloc: std.mem.Allocator, comptime name: []const u8) ![:0]u8 {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
-    return try alloc.dupeZ(u8, raw);
+    return try alloc.dupeSentinel(u8, raw, 0);
 }
 
 fn baseRecord(lsn: u64, payload: []const u8) replication_record.Record {

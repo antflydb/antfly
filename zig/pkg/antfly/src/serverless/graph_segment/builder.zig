@@ -23,7 +23,7 @@ const Allocator = std.mem.Allocator;
 const Dictionary = struct {
     values: std.StringArrayHashMapUnmanaged(bool) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.values.keys()) |key| alloc.free(key);
         self.values.deinit(alloc);
     }

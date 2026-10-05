@@ -397,8 +397,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_retained_effects;
     _ = @import("antfly_local_sources").storage_source_pin_state;
     _ = @import("antfly_local_sources").storage_source_snapshot;
-    _ = @import("rowsource/external.zig");
-    _ = @import("rowsource/local.zig");
+    _ = @import("antfly_local_sources").storage_rowsource_external;
+    _ = @import("antfly_local_sources").storage_rowsource_local;
     _ = @import("rowsource/mod.zig");
     _ = @import("antfly_local_sources").storage_rowsource_types;
     _ = @import("antfly_local_sources").storage_schema;

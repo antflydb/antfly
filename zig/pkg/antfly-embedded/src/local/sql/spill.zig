@@ -1335,7 +1335,7 @@ test "SQL compressed spill validates decoded quotas and preserves matched flags"
     defer manager.deinit();
     var file = try manager.create();
     defer file.close();
-    const text = [_]u8{'x'} ** 8192;
+    const text: [8192]u8 = @splat('x');
     const offset = try file.append(.{ .values = &.{Datum.json(.{ .string = &text })}, .keys = &.{Datum.json(.{ .integer = 7 })}, .ordinal = 11 }, none);
     try std.testing.expectEqual(@as(u64, 1), manager.compressed_records);
     try std.testing.expect(file.size < 1024);
@@ -1362,7 +1362,7 @@ test "SQL buffered spill joins outstanding writes on cancelled close" {
     defer manager.deinit();
     var file = try manager.create();
     defer file.close();
-    const bytes = [_]u8{'x'} ** 4096;
+    const bytes: [4096]u8 = @splat('x');
     try file.writeRaw(0, &bytes);
     try file.writeRaw(4096, &bytes);
     canceled = true;
@@ -1447,7 +1447,7 @@ test "SQL sequential runs mix wide records and typed blocks across restarts" {
     defer manager.deinit();
     var file = try Sequential.init(&manager, 4096);
     defer file.close();
-    const wide = [_]u8{'w'} ** 4096;
+    const wide: [4096]u8 = @splat('w');
     for (0..17) |index| {
         const value = if (index % 8 == 0) Datum.json(.{ .string = &wide }) else Datum.json(.{ .integer = @intCast(index) });
         _ = try file.append(.{ .values = &.{value}, .keys = &.{}, .ordinal = index }, none);

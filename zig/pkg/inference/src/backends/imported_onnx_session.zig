@@ -200,7 +200,7 @@ const BackendContext = union(enum) {
         };
     }
 
-    fn deinit(self: *BackendContext, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *BackendContext, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .native => |*ctx| {
                 if (comptime build_options.enable_native) {
@@ -439,7 +439,7 @@ test "shared backend context retains exact compute backend identity" {
 }
 
 fn metalShaderValidationEnabledForTest() bool {
-    const c_std = @cImport(@cInclude("stdlib.h"));
+    const c_std = std.c;
     return c_std.getenv("MTL_SHADER_VALIDATION") != null;
 }
 
@@ -2531,7 +2531,7 @@ test "imported AveragePool roundtrip preserves padding divisors alignment and di
         dilated.kernel[axis] = 2;
         dilated.dilations[axis] = 2;
     }
-    var volume = [_]f32{0} ** 27;
+    var volume = @as([27]f32, @splat(0));
     volume[0] = 8;
     volume[26] = 16;
     volume[13] = 999; // A dilated window must not sample its center.
@@ -2657,7 +2657,7 @@ test "imported onnx session matches dynamic quantized integer matmul semantics" 
     var cast_inputs = [_][]const u8{"mm"};
     var cast_outputs = [_][]const u8{"out"};
     var cast_attrs = [_]proto.AttributeProto{
-        .{ .name = "to", .i = @intFromEnum(proto.DataType.float32), .attr_type = .int },
+        .{ .name = "to", .i = @backingInt(proto.DataType.float32), .attr_type = .int },
     };
     var nodes = [_]proto.NodeProto{
         .{ .op_type = "DynamicQuantizeLinear", .inputs = &dql_inputs, .outputs = &dql_outputs },
@@ -3430,7 +3430,7 @@ test "imported ONNX Metal shape cache shares weights and survives eviction" {
     const bias = try builder.parameter("bias", Shape.init(.f32, &.{32}));
     const sum = try builder.add(x, bias);
     try graph.markOutput(sum);
-    const bias_values = [_]f32{2} ** 32;
+    const bias_values = @as([32]f32, @splat(2));
     const bytes = try onnx_graph.exportGraph(allocator, &graph, .{ .parameter_initializers = &.{.{ .name = "bias", .shape = Shape.init(.f32, &.{32}), .data = .{ .f32 = &bias_values } }} });
     defer allocator.free(bytes);
     var dir = std.testing.tmpDir(.{});

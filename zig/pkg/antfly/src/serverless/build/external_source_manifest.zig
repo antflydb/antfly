@@ -19,7 +19,7 @@ const Allocator = std.mem.Allocator;
 const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source = @import("antfly_local_sources").serverless_external_source_types;
 const manifest_compatibility = @import("../manifest/compatibility.zig");
-const manifest_artifact = @import("../manifest/artifact_ref.zig");
+const manifest_artifact = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const PublishedArtifact = struct {

@@ -280,7 +280,7 @@ fn classifyIndexFamily(value: std.json.Value) ?ArtifactFamily {
 }
 
 fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (@intFromEnum(lhs) != @intFromEnum(rhs)) return false;
+    if (@backingInt(lhs) != @backingInt(rhs)) return false;
     return switch (lhs) {
         .null => true,
         .bool => |value| value == rhs.bool,

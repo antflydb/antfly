@@ -254,21 +254,21 @@ fn configOwnsText(comptime T: type) bool {
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
     var owned = cfg;
-    inline for (@typeInfo(Config).@"struct".fields) |field| {
-        if (comptime configOwnsText(field.type)) @field(owned, field.name) = null;
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime configOwnsText(field_type)) @field(owned, reflected_name) = null;
     }
     errdefer deinitConfig(alloc, &owned);
-    inline for (@typeInfo(Config).@"struct".fields) |field| {
-        if (comptime configOwnsText(field.type)) {
-            @field(owned, field.name) = try dupOpt(alloc, @field(cfg, field.name));
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime configOwnsText(field_type)) {
+            @field(owned, reflected_name) = try dupOpt(alloc, @field(cfg, reflected_name));
         }
     }
     return owned;
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
-    inline for (@typeInfo(Config).@"struct".fields) |field| {
-        if (comptime configOwnsText(field.type)) freeOpt(alloc, @field(cfg, field.name));
+    inline for (@typeInfo(Config).@"struct".field_names, @typeInfo(Config).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime configOwnsText(field_type)) freeOpt(alloc, @field(cfg, reflected_name));
     }
     cfg.* = undefined;
 }
@@ -485,7 +485,7 @@ const AntflyTranscriberState = struct {
         };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *AntflyTranscriberState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.api_url);
         self.alloc.free(self.model);
@@ -693,7 +693,7 @@ const OpenAiTranscriberState = struct {
         };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *OpenAiTranscriberState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.base_url);
         self.alloc.free(self.model);
@@ -858,7 +858,7 @@ const VertexTranscriberState = struct {
         }
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *VertexTranscriberState = @ptrCast(@alignCast(ptr));
         self.deinitState();
         self.alloc.destroy(self);

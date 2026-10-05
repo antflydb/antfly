@@ -339,7 +339,7 @@ pub const Scenario = struct {
             return false;
         }
 
-        fn finalize(self: *State) void {
+        pub fn finalize(self: *State) void {
             const mode = self.mode.?;
             switch (mode) {
                 .stt_success => self.result_classified = self.request_error == null and std.mem.eql(u8, self.transcript orelse "", "vopr transcript"),

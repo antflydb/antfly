@@ -65,7 +65,7 @@ pub const ColumnarWriter = struct {
             return .{ .chunks = .empty, .docs_in_current = 0 };
         }
 
-        fn deinit(self: *FieldData, alloc: Allocator) void {
+        pub fn deinit(self: *FieldData, alloc: Allocator) void {
             for (self.chunks.items) |*c| c.deinit(alloc);
             self.chunks.deinit(alloc);
         }
@@ -195,7 +195,7 @@ pub const ColumnarWriter = struct {
                 // Record chunk start offset (relative to data_start)
                 const chunk_offset: u64 = @intCast(out.items.len - data_start);
                 const off_pos = offset_table_pos + ci * 8;
-                out.items[off_pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, chunk_offset));
+                out.items[off_pos..][0..8].* = @bitCast(@as(u64, chunk_offset));
 
                 // Compress and write chunk
                 const compressed = try snappy.encode(self.alloc, chunk.items);
@@ -206,7 +206,7 @@ pub const ColumnarWriter = struct {
             // Record end offset
             const end_offset: u64 = @intCast(out.items.len - data_start);
             const end_off_pos = offset_table_pos + num_chunks * 8;
-            out.items[end_off_pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, end_offset));
+            out.items[end_off_pos..][0..8].* = @bitCast(@as(u64, end_offset));
 
             dir_pos += (num_chunks + 1) * 8;
         }
@@ -352,11 +352,11 @@ pub const ColumnarReader = struct {
 // ============================================================================
 
 fn appendU32LE(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, val: u32) !void {
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, val))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, val))));
 }
 
 fn appendU16LE(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, val: u16) !void {
-    try out.appendSlice(alloc, &@as([2]u8, @bitCast(std.mem.nativeToLittle(u16, val))));
+    try out.appendSlice(alloc, &@as([2]u8, @bitCast(@as(u16, val))));
 }
 
 // ============================================================================

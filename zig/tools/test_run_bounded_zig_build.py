@@ -82,6 +82,8 @@ class BoundedZigBuildTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        # These CI caps apply to Linux; the separate macOS reservation is
+        # checked by the runtime profile tests above.
         # Physical storage is its own archive. The distributed reservation no
         # longer includes DB codegen and cannot establish this admission check.
         required = int(claim.stderr.strip())
@@ -183,7 +185,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
-            ["build", "antfly-unit-test", "-Doptimize=Debug"],
+            ["build", "antfly-unit-test", "-Doptimize=debug"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -193,7 +195,7 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "zig",
                 "build",
                 "antfly-unit-test",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
                 "--maxrss",

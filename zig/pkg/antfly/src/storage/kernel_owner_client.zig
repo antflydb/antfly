@@ -571,7 +571,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_wait_for_sync(
             self.handle,
             &.{
-                .sync_level = @intFromEnum(sync_level),
+                .sync_level = @backingInt(sync_level),
                 .table_name = .fromSlice(table_name),
                 .cancellation_ctx = @ptrCast(@constCast(&cancellation)),
                 .cancellation_fn = Callback.cancelled,
@@ -611,7 +611,7 @@ pub const Owner = struct {
         backup_id: []const u8,
         format: abi.BackupFormat,
     ) !Response {
-        return self.backupWithControl(.{ .format = @intFromEnum(format), .table_name = .fromSlice(table_name), .backup_root = .fromSlice(backup_root), .backup_id = .fromSlice(backup_id) });
+        return self.backupWithControl(.{ .format = @backingInt(format), .table_name = .fromSlice(table_name), .backup_root = .fromSlice(backup_root), .backup_id = .fromSlice(backup_id) });
     }
 
     pub fn backupWithControl(self: *Owner, request: abi.BackupRequest) !Response {
@@ -940,7 +940,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_artifact_operation_json(
             self.handle,
             &.{
-                .operation = @intFromEnum(operation),
+                .operation = @backingInt(operation),
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
                 .cancellation_ctx = cancellation_ctx,
@@ -1019,7 +1019,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
-                .action = @intFromEnum(action),
+                .action = @backingInt(action),
                 .table_name = .fromSlice(table_name),
             },
             &result,
@@ -1031,7 +1031,7 @@ pub const Owner = struct {
     pub fn captureHotStandbySeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
-            .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
+            .action = @backingInt(abi.MaintenanceAction.capture_ha_seed_snapshot),
             .table_name = .fromSlice(table_name),
             .snapshot_token = .fromSlice(token),
             .destination_root = .fromSlice(destination),
@@ -1048,7 +1048,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
-                .action = @intFromEnum(abi.MaintenanceAction.prepare_ha_seed_snapshot),
+                .action = @backingInt(abi.MaintenanceAction.prepare_ha_seed_snapshot),
                 .table_name = .fromSlice(table_name),
                 .deadline_ns = deadline_ns,
             },

@@ -571,7 +571,7 @@ const ExistingOnnxInitializerReferenceContext = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.lazy_model.deinit(self.allocator);
         self.allocator.free(self.model_bytes);
         self.* = undefined;
@@ -738,7 +738,7 @@ const TopologicalSortResult = struct {
     graph: Graph,
     id_map: []NodeId,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const allocator = self.graph.allocator;
         self.graph.deinit();
         allocator.free(self.id_map);
@@ -1181,7 +1181,7 @@ fn buildParameterInitializerFromExportSource(
             );
         }
 
-        fn deinit(raw_context: ?*anyopaque, alloc: Allocator) void {
+        pub fn deinit(raw_context: ?*anyopaque, alloc: Allocator) void {
             const context = raw_context orelse return;
             const self: *@This() = @ptrCast(@alignCast(context));
             self.stream.deinit(self.stream.context, alloc);

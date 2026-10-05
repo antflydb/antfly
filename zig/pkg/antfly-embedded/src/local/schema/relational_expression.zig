@@ -489,7 +489,7 @@ pub const Set = struct {
                 generated_columns[binding.ordinal] = true;
             }
         }
-        var states = [_]u2{0} ** 256;
+        var states = @as([256]u2, @splat(0));
         var written: usize = 0;
         for (bindings, 0..) |_, i| try visit(bindings, order, &states, &written, i);
         const set = try alloc.create(Set);

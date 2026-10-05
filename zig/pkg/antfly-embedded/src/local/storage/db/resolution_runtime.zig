@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
@@ -534,7 +535,7 @@ const PendingRecordCommit = struct {
     artifact_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
     artifact_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
+    pub fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
         for (self.full_keys.items) |key| alloc.free(@constCast(key));
         for (self.graph_only_keys.items) |key| alloc.free(@constCast(key));
         for (self.artifact_writes.items) |write| alloc.free(@constCast(write.value));
@@ -575,7 +576,7 @@ pub fn reviewOverrideArtifactKeyAlloc(
 const StoreOverrideProvider = struct {
     parsed: std.json.Parsed(std.json.Value),
 
-    fn deinit(self: *StoreOverrideProvider) void {
+    pub fn deinit(self: *StoreOverrideProvider) void {
         self.parsed.deinit();
     }
     fn provider(self: *StoreOverrideProvider) resolver_lib.OverrideProvider {
@@ -2424,7 +2425,7 @@ const MapStore = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -2685,7 +2686,7 @@ const FakeStore = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *FakeStore) void {
+    pub fn deinit(self: *FakeStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -2808,7 +2809,7 @@ const CaptureWriter = struct {
     graph_only_calls: u64 = 0,
     handoff_calls: u64 = 0,
 
-    fn deinit(self: *CaptureWriter) void {
+    pub fn deinit(self: *CaptureWriter) void {
         for (self.keys.items) |k| self.alloc.free(k);
         self.keys.deinit(self.alloc);
     }
@@ -3203,7 +3204,7 @@ const FakeSource = struct {
         return .{ .matched_entries = matched, .last_sequence = last };
     }
 
-    fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
+    pub fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
     fn latest(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!u64 {
@@ -3964,7 +3965,7 @@ const FakeCandidateSource = struct {
     last_ann_k: usize = 0,
     last_scan_limit: usize = 0,
 
-    fn deinit(self: *FakeCandidateSource) void {
+    pub fn deinit(self: *FakeCandidateSource) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -4341,7 +4342,7 @@ test "SourceCandidateProvider shares prefix scans and negatively caches redirect
     var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 2 };
-    const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "one", .label = "person", .text = "Ada" }} ** 100;
+    const entities = @as([100]resolver_lib.ExtractedEntity, @splat(.{ .local_id = "one", .label = "person", .text = "Ada" }));
     var lists: [100][]const resolver_lib.Candidate = undefined;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

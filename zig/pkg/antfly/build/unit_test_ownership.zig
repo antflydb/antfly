@@ -29,9 +29,8 @@ pub fn apply(b: *std.Build, aggregate: *Step) *Step {
 }
 
 pub fn applyWithSourceOwners(b: *std.Build, aggregate: *Step, consumer_owner: ConsumerOwner) *Step {
-    const before = b.allocator.create(Step) catch @panic("OOM");
-    before.* = Step.init(.{ .id = .top_level, .name = "unit ownership baseline", .owner = b });
-    before.dependencies.appendSlice(aggregate.dependencies.items) catch @panic("OOM");
+    const before = privateTopLevel(b, "unit ownership baseline");
+    before.dependencies.appendSlice(b.allocator, aggregate.dependencies.items) catch @panic("OOM");
     var copies = std.AutoHashMap(*Step, *Step).init(b.allocator);
     for (aggregate.dependencies.items) |*dependency| dependency.* = copySelected(b, dependency.*, &copies, consumer_owner);
     return before;
@@ -40,8 +39,9 @@ pub fn applyWithSourceOwners(b: *std.Build, aggregate: *Step, consumer_owner: Co
 pub fn selection(run: *Step.Run, object: *Step.Compile) []const u8 {
     for (run.argv.items, 0..) |arg, index| {
         if (arg != .bytes) continue;
+        if (std.mem.startsWith(u8, arg.bytes, "--suite-filter=")) return arg.bytes["--suite-filter=".len..];
         if (std.mem.startsWith(u8, arg.bytes, "--test-filter=")) return arg.bytes["--test-filter=".len..];
-        if (std.mem.eql(u8, arg.bytes, "--test-filter") and index + 1 < run.argv.items.len) {
+        if ((std.mem.eql(u8, arg.bytes, "--test-filter") or std.mem.eql(u8, arg.bytes, "--suite-filter")) and index + 1 < run.argv.items.len) {
             const next = run.argv.items[index + 1];
             if (next == .bytes) return next.bytes;
         }
@@ -53,9 +53,11 @@ fn matchesSelection(argv: []const Step.Run.Arg, filters: []const []const u8, anc
     var has_runtime_filter = false;
     for (argv, 0..) |arg, index| {
         if (arg != .bytes) continue;
-        const filter = if (std.mem.startsWith(u8, arg.bytes, "--test-filter="))
+        const filter = if (std.mem.startsWith(u8, arg.bytes, "--suite-filter="))
+            arg.bytes["--suite-filter=".len..]
+        else if (std.mem.startsWith(u8, arg.bytes, "--test-filter="))
             arg.bytes["--test-filter=".len..]
-        else if (std.mem.eql(u8, arg.bytes, "--test-filter") and index + 1 < argv.len and argv[index + 1] == .bytes)
+        else if ((std.mem.eql(u8, arg.bytes, "--test-filter") or std.mem.eql(u8, arg.bytes, "--suite-filter")) and index + 1 < argv.len and argv[index + 1] == .bytes)
             argv[index + 1].bytes
         else
             continue;
@@ -71,25 +73,28 @@ fn matchesSelection(argv: []const Step.Run.Arg, filters: []const []const u8, anc
 
 test "ownership anchors survive prepended runtime and compile filters" {
     const argv = [_]Step.Run.Arg{
-        .{ .bytes = @constCast("--test-filter") },                   .{ .bytes = @constCast("system catalog") },
-        .{ .bytes = @constCast("--test-filter=backup heartbeat ") },
+        .{ .bytes = @constCast("--test-filter") },                    .{ .bytes = @constCast("system catalog") },
+        .{ .bytes = @constCast("--suite-filter=backup heartbeat ") },
     };
     try std.testing.expect(matchesSelection(&argv, &.{}, "backup heartbeat "));
     try std.testing.expect(matchesSelection(&.{}, &.{ "join planning", "public openapi contract" }, "public openapi contract"));
 }
 
 test "ownership anchors respect runtime scope and exact filter identity" {
-    const argv = [_]Step.Run.Arg{ .{ .bytes = @constCast("--test-filter") }, .{ .bytes = @constCast("focused") } };
-    try std.testing.expect(!matchesSelection(&argv, &.{"broad"}, "broad"));
-    try std.testing.expect(!matchesSelection(&argv, &.{}, "focus"));
+    for ([_][]const u8{ "--test-filter", "--suite-filter" }) |option| {
+        const argv = [_]Step.Run.Arg{ .{ .bytes = @constCast(option) }, .{ .bytes = @constCast("focused") } };
+        try std.testing.expect(matchesSelection(&argv, &.{"broad"}, "focused"));
+        try std.testing.expect(!matchesSelection(&argv, &.{"broad"}, "broad"));
+        try std.testing.expect(!matchesSelection(&argv, &.{}, "focus"));
+        try std.testing.expect(!matchesSelection(&argv, &.{}, "all"));
+    }
     try std.testing.expect(matchesSelection(&.{}, &.{}, "all"));
-    try std.testing.expect(!matchesSelection(&argv, &.{}, "all"));
 }
 
 fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, *Step), consumer_owner: ConsumerOwner) *Step {
     if (copies.get(original)) |copy| return copy;
     // Compilation/code generation is shared with focused targets.
-    if (original.id != .run and original.id != .top_level) return original;
+    if (original.tag != .run and original.tag != .top_level) return original;
     const original_run = original.cast(Step.Run);
     var skips: []const []const u8 = &.{};
     if (original_run) |run| blk: {
@@ -150,12 +155,17 @@ fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, 
         }
         break :blk &cloned.step;
     } else blk: {
-        const cloned = b.allocator.create(Step) catch @panic("OOM");
-        cloned.* = Step.init(.{ .id = .top_level, .name = original.name, .owner = b });
+        const cloned = privateTopLevel(b, original.name);
         break :blk cloned;
     };
     copy.max_rss = original.max_rss;
-    copy.dependencies = dependencies;
+    copy.dependencies = dependencies.moveToUnmanaged();
     copies.put(original, copy) catch @panic("OOM");
     return copy;
+}
+
+fn privateTopLevel(b: *std.Build, name: []const u8) *Step {
+    const node = b.allocator.create(Step.TopLevel) catch @panic("OOM");
+    node.* = .{ .step = Step.init(.{ .tag = .top_level, .name = name, .owner = b }), .description = "" };
+    return &node.step;
 }

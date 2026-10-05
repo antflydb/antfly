@@ -446,7 +446,7 @@ test "dictionary registry claim preserves a ready owner" {
         alloc: std.mem.Allocator,
         rows: std.StringHashMapUnmanaged([]u8) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iter = self.rows.iterator();
             while (iter.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);
@@ -503,7 +503,7 @@ test "dictionary registry claim preserves non-ready owners" {
         alloc: std.mem.Allocator,
         rows: std.StringHashMapUnmanaged([]u8) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iter = self.rows.iterator();
             while (iter.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);

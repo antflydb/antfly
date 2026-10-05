@@ -32,7 +32,7 @@ pub const Result = struct {
 pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result {
     // ReleaseSafe avoids LLVM inference miscompilation and V8's local-variable
     // limit for unoptimized database batch functions.
-    const optimize: std.builtin.OptimizeMode = .ReleaseSafe;
+    const optimize: std.lang.Optimize = .safe;
     const strip = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse false;
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -499,13 +499,13 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     atomic_fixture.rdynamic = true;
     atomic_fixture.export_memory = true;
     const run_atomic_fixture = b.addSystemCommand(&.{"node"});
-    run_atomic_fixture.addFileArg(b.path("lib/platform/tests/atomic_wasm_test.mjs"));
-    run_atomic_fixture.addFileArg(atomic_fixture.getEmittedBin());
+    run_atomic_fixture.addFileArg2(b.path("lib/platform/tests/atomic_wasm_test.mjs"), .{ .make_absolute = true });
+    run_atomic_fixture.addFileArg2(atomic_fixture.getEmittedBin(), .{ .make_absolute = true });
 
     const run_antfly_wasm_smoke = b.addSystemCommand(&.{
         "node",
-        b.getInstallPath(.prefix, "antfly-wasm/run.mjs"),
     });
+    run_antfly_wasm_smoke.addFileArg2(b.graph.path(.install_prefix, "antfly-wasm/run.mjs"), .{ .make_absolute = true });
     run_antfly_wasm_smoke.step.dependOn(&run_atomic_fixture.step);
     return .{
         .artifact = antfly_wasm,

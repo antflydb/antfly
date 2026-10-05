@@ -186,7 +186,7 @@ const StorageHarness = struct {
         return harness;
     }
 
-    fn deinit(self: *StorageHarness) void {
+    pub fn deinit(self: *StorageHarness) void {
         if (self.counting_ctx) |ctx| self.allocator.destroy(ctx);
         if (self.native_backing) |backing| {
             backing.deinit();
@@ -218,7 +218,7 @@ const SegmentRef = struct {
     bytes: usize,
     docs: usize,
 
-    fn deinit(self: *SegmentRef, allocator: Allocator) void {
+    pub fn deinit(self: *SegmentRef, allocator: Allocator) void {
         allocator.free(self.path);
         self.* = undefined;
     }
@@ -268,7 +268,7 @@ const Scenario = struct {
         };
     }
 
-    fn deinit(self: *Scenario) void {
+    pub fn deinit(self: *Scenario) void {
         self.storage_harness.storage().deleteTree(self.root_dir) catch {};
         for (self.segments.items) |*segment_ref| segment_ref.deinit(self.allocator);
         self.segments.deinit(self.allocator);

@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const started = time.monotonicNs();
     var budgets = @import("antfly_local_sources").storage_resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(@import("antfly_local_sources").storage_resource_manager.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 320 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 };
+    budgets[@backingInt(@import("antfly_local_sources").storage_resource_manager.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 320 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 };
     var manager = @import("antfly_local_sources").storage_resource_manager.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var store = try source.Store.openManaged(alloc, &manager, storage, root, !writing);

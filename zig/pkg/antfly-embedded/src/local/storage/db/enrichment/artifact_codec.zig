@@ -514,11 +514,11 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
     const kind_raw = data[pos];
     pos += @sizeOf(u8);
     const kind: Kind = switch (kind_raw) {
-        @intFromEnum(Kind.chunk_json) => .chunk_json,
-        @intFromEnum(Kind.dense_embedding) => .dense_embedding,
-        @intFromEnum(Kind.sparse_embedding) => .sparse_embedding,
-        @intFromEnum(Kind.asset) => .asset,
-        @intFromEnum(Kind.graph_edge) => .graph_edge,
+        @backingInt(Kind.chunk_json) => .chunk_json,
+        @backingInt(Kind.dense_embedding) => .dense_embedding,
+        @backingInt(Kind.sparse_embedding) => .sparse_embedding,
+        @backingInt(Kind.asset) => .asset,
+        @backingInt(Kind.graph_edge) => .graph_edge,
         else => return error.InvalidArtifactKind,
     };
     if (version != codec_version and !((version == graph_edge_codec_version or version == graph_edge_ttl_codec_version) and kind == .graph_edge)) {
@@ -600,7 +600,7 @@ test "ordered artifact inventory rejects contradictory authored vector envelopes
     raw[flags_offset + 1] = 1;
     try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
     raw[flags_offset + 1] = 0;
-    raw[flags_offset - 1] = @intFromEnum(Kind.asset);
+    raw[flags_offset - 1] = @backingInt(Kind.asset);
     try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
 }
 
@@ -610,7 +610,7 @@ fn writeHeader(dst: []u8, header: Header) void {
     var pos: usize = magic.len;
     std.mem.writeInt(u16, dst[pos..][0..2], header.version, .little);
     pos += @sizeOf(u16);
-    dst[pos] = @intFromEnum(header.kind);
+    dst[pos] = @backingInt(header.kind);
     pos += @sizeOf(u8);
     dst[pos] = @bitCast(header.flags);
     pos += @sizeOf(u8);

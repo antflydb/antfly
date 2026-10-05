@@ -280,7 +280,7 @@ const ParsedGraphEdgeKey = struct {
     edge_type: []u8,
     target: []u8,
 
-    fn deinit(self: *ParsedGraphEdgeKey, alloc: Allocator) void {
+    pub fn deinit(self: *ParsedGraphEdgeKey, alloc: Allocator) void {
         alloc.free(self.source);
         alloc.free(self.index_name);
         if (self.edge_id.len > 0) alloc.free(self.edge_id);
@@ -510,7 +510,7 @@ const DecodedGraphKeyComponent = struct {
     bytes: []const u8,
     owned: bool = false,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.owned) alloc.free(self.bytes);
         self.* = undefined;
     }
@@ -523,7 +523,7 @@ const ParsedReverseEdgeKeyView = struct {
     edge_id: DecodedGraphKeyComponent,
     owner_document: DecodedGraphKeyComponent,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.source.deinit(alloc);
         self.edge_type.deinit(alloc);
         self.target.deinit(alloc);
@@ -1160,7 +1160,7 @@ pub const GraphIndex = struct {
             self.* = .none;
         }
 
-        fn sync(self: *ReverseStoreOwner, force: bool) !void {
+        pub fn sync(self: *ReverseStoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
                 .lsm => |*handle| try handle.backend.sync(force),
@@ -1275,7 +1275,7 @@ pub const GraphIndex = struct {
         outgoing: ?backend_erased.ReadTxn = null,
         incoming: ?backend_erased.ReadTxn = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.outgoing) |*txn| txn.abort();
             if (self.incoming) |*txn| txn.abort();
             self.* = .{};
@@ -1727,7 +1727,7 @@ pub const GraphIndex = struct {
     const TargetContributionRuns = struct {
         entries: std.ArrayListUnmanaged(PackedF64Entry) = .empty,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.entries.items) |entry| alloc.free(entry.node);
             self.entries.deinit(alloc);
             self.* = undefined;
@@ -3380,7 +3380,7 @@ pub const GraphIndex = struct {
         edge_page_units: std.ArrayListUnmanaged(u64) = .empty,
         node_boundaries: std.ArrayListUnmanaged([]u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.edge_boundaries.items) |key| alloc.free(key);
             self.edge_boundaries.deinit(alloc);
             self.edge_page_units.deinit(alloc);
@@ -6045,7 +6045,7 @@ pub const GraphIndex = struct {
         pages: []GraphMetricBuildPageStatus = &.{},
         truncated: bool = false,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.pages) |*page| page.deinit(alloc);
             if (self.pages.len > 0) alloc.free(self.pages);
             self.* = undefined;
@@ -6057,7 +6057,7 @@ pub const GraphIndex = struct {
         completed_units: u64 = 0,
         total_units: u64 = 0,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.cursor.len > 0) alloc.free(self.cursor);
             self.* = undefined;
         }
@@ -6646,11 +6646,11 @@ pub const GraphIndex = struct {
         const root = std.mem.span(reverse_path);
         const outgoing_raw = try std.fmt.allocPrint(alloc, "{s}/forward", .{root});
         defer alloc.free(outgoing_raw);
-        const outgoing_path = try alloc.dupeZ(u8, outgoing_raw);
+        const outgoing_path = try alloc.dupeSentinel(u8, outgoing_raw, 0);
         defer alloc.free(outgoing_path);
         const reverse_raw = try std.fmt.allocPrint(alloc, "{s}/reverse", .{root});
         defer alloc.free(reverse_raw);
-        const private_reverse_path = try alloc.dupeZ(u8, reverse_raw);
+        const private_reverse_path = try alloc.dupeSentinel(u8, reverse_raw, 0);
         defer alloc.free(private_reverse_path);
         return try openWithPrivateStores(alloc, outgoing_path, private_reverse_path, index_name, opts);
     }
@@ -8137,7 +8137,7 @@ pub const GraphIndex = struct {
         rank: u64 = std.math.maxInt(u64),
         key_hex: []const u8 = "",
 
-        fn deinit(self: @This(), alloc: Allocator) void {
+        pub fn deinit(self: @This(), alloc: Allocator) void {
             alloc.free(self.value);
             if (self.key_hex.len > 0) alloc.free(self.key_hex);
         }
@@ -10430,7 +10430,7 @@ pub const GraphIndex = struct {
         attempt: u64,
         last_error: []u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.last_error.len > 0) alloc.free(self.last_error);
             self.* = undefined;
         }
@@ -10441,7 +10441,7 @@ pub const GraphIndex = struct {
         reached_end: bool = true,
         cursor: []u8 = "",
 
-        fn deinit(self: *PrefixDeletePageResult, alloc: Allocator) void {
+        pub fn deinit(self: *PrefixDeletePageResult, alloc: Allocator) void {
             if (self.cursor.len > 0) alloc.free(self.cursor);
             self.* = .{};
         }
@@ -10456,7 +10456,7 @@ pub const GraphIndex = struct {
         retry_count: u64 = 0,
         last_error: []const u8 = "",
 
-        fn deinit(self: GraphMetricFailureDetail, alloc: Allocator) void {
+        pub fn deinit(self: GraphMetricFailureDetail, alloc: Allocator) void {
             if (self.last_error.len > 0) alloc.free(self.last_error);
         }
     };
@@ -10584,7 +10584,7 @@ pub const GraphIndex = struct {
 
     fn encodeGraphMetricEdgeFilter(filter: GraphMetricEdgeFilter, out: []u8) void {
         std.debug.assert(out.len == graphMetricEdgeFilterEncodedLen(filter));
-        std.mem.writeInt(u64, out[0..8], @intFromEnum(filter.mode), .little);
+        std.mem.writeInt(u64, out[0..8], @backingInt(filter.mode), .little);
         std.mem.writeInt(u64, out[8..16], filter.types.len, .little);
         var offset: usize = graph_metric_edge_filter_header_len;
         for (filter.types) |edge_type| {
@@ -10599,8 +10599,8 @@ pub const GraphIndex = struct {
         if (raw.len < graph_metric_edge_filter_header_len) return null;
         const mode_raw = std.mem.readInt(u64, raw[0..8], .little);
         const mode: GraphMetricEdgeFilterMode = switch (mode_raw) {
-            @intFromEnum(GraphMetricEdgeFilterMode.all) => .all,
-            @intFromEnum(GraphMetricEdgeFilterMode.types) => .types,
+            @backingInt(GraphMetricEdgeFilterMode.all) => .all,
+            @backingInt(GraphMetricEdgeFilterMode.types) => .types,
             else => return null,
         };
         const count = std.math.cast(usize, std.mem.readInt(u64, raw[8..16], .little)) orelse return error.InvalidGraphMetricEdgeFilterMetadata;
@@ -10642,7 +10642,7 @@ pub const GraphIndex = struct {
             lease.target_generation,
             lease.started_at_ms,
             lease.lease_expires_at_ms,
-            @as(u64, @intFromEnum(lease.phase)),
+            @as(u64, @backingInt(lease.phase)),
             @as(u64, lease.iteration),
             lease.job_id,
             @as(u64, lease.worker_id.len),
@@ -10683,20 +10683,20 @@ pub const GraphIndex = struct {
         const phase_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const phase: GraphMetricBuildPhase = switch (phase_raw) {
-            @intFromEnum(GraphMetricBuildPhase.idle) => .idle,
-            @intFromEnum(GraphMetricBuildPhase.computing) => .computing,
-            @intFromEnum(GraphMetricBuildPhase.publishing) => .publishing,
-            @intFromEnum(GraphMetricBuildPhase.complete) => .complete,
-            @intFromEnum(GraphMetricBuildPhase.prepare_generation) => .prepare_generation,
-            @intFromEnum(GraphMetricBuildPhase.scan_edges_and_out_degree) => .scan_edges_and_out_degree,
-            @intFromEnum(GraphMetricBuildPhase.initialize_ranks) => .initialize_ranks,
-            @intFromEnum(GraphMetricBuildPhase.iterate_contributions) => .iterate_contributions,
-            @intFromEnum(GraphMetricBuildPhase.reduce_ranks) => .reduce_ranks,
-            @intFromEnum(GraphMetricBuildPhase.hits_hub_contributions) => .hits_hub_contributions,
-            @intFromEnum(GraphMetricBuildPhase.hits_hub_reduce_ranks) => .hits_hub_reduce_ranks,
-            @intFromEnum(GraphMetricBuildPhase.check_convergence) => .check_convergence,
-            @intFromEnum(GraphMetricBuildPhase.publish_generation) => .publish_generation,
-            @intFromEnum(GraphMetricBuildPhase.cleanup_old_generations) => .cleanup_old_generations,
+            @backingInt(GraphMetricBuildPhase.idle) => .idle,
+            @backingInt(GraphMetricBuildPhase.computing) => .computing,
+            @backingInt(GraphMetricBuildPhase.publishing) => .publishing,
+            @backingInt(GraphMetricBuildPhase.complete) => .complete,
+            @backingInt(GraphMetricBuildPhase.prepare_generation) => .prepare_generation,
+            @backingInt(GraphMetricBuildPhase.scan_edges_and_out_degree) => .scan_edges_and_out_degree,
+            @backingInt(GraphMetricBuildPhase.initialize_ranks) => .initialize_ranks,
+            @backingInt(GraphMetricBuildPhase.iterate_contributions) => .iterate_contributions,
+            @backingInt(GraphMetricBuildPhase.reduce_ranks) => .reduce_ranks,
+            @backingInt(GraphMetricBuildPhase.hits_hub_contributions) => .hits_hub_contributions,
+            @backingInt(GraphMetricBuildPhase.hits_hub_reduce_ranks) => .hits_hub_reduce_ranks,
+            @backingInt(GraphMetricBuildPhase.check_convergence) => .check_convergence,
+            @backingInt(GraphMetricBuildPhase.publish_generation) => .publish_generation,
+            @backingInt(GraphMetricBuildPhase.cleanup_old_generations) => .cleanup_old_generations,
             else => return null,
         };
         const iteration: u32 = if (version == 2 or version == 3) blk: {
@@ -10741,7 +10741,7 @@ pub const GraphIndex = struct {
             job.started_at_ms,
             job.updated_at_ms,
             job.lease_expires_at_ms,
-            @as(u64, @intFromEnum(job.phase)),
+            @as(u64, @backingInt(job.phase)),
             @as(u64, job.iteration),
             job.retry_count,
             job.completed_units,
@@ -10781,20 +10781,20 @@ pub const GraphIndex = struct {
         const phase_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const phase: GraphMetricBuildPhase = switch (phase_raw) {
-            @intFromEnum(GraphMetricBuildPhase.idle) => .idle,
-            @intFromEnum(GraphMetricBuildPhase.computing) => .computing,
-            @intFromEnum(GraphMetricBuildPhase.publishing) => .publishing,
-            @intFromEnum(GraphMetricBuildPhase.complete) => .complete,
-            @intFromEnum(GraphMetricBuildPhase.prepare_generation) => .prepare_generation,
-            @intFromEnum(GraphMetricBuildPhase.scan_edges_and_out_degree) => .scan_edges_and_out_degree,
-            @intFromEnum(GraphMetricBuildPhase.initialize_ranks) => .initialize_ranks,
-            @intFromEnum(GraphMetricBuildPhase.iterate_contributions) => .iterate_contributions,
-            @intFromEnum(GraphMetricBuildPhase.reduce_ranks) => .reduce_ranks,
-            @intFromEnum(GraphMetricBuildPhase.hits_hub_contributions) => .hits_hub_contributions,
-            @intFromEnum(GraphMetricBuildPhase.hits_hub_reduce_ranks) => .hits_hub_reduce_ranks,
-            @intFromEnum(GraphMetricBuildPhase.check_convergence) => .check_convergence,
-            @intFromEnum(GraphMetricBuildPhase.publish_generation) => .publish_generation,
-            @intFromEnum(GraphMetricBuildPhase.cleanup_old_generations) => .cleanup_old_generations,
+            @backingInt(GraphMetricBuildPhase.idle) => .idle,
+            @backingInt(GraphMetricBuildPhase.computing) => .computing,
+            @backingInt(GraphMetricBuildPhase.publishing) => .publishing,
+            @backingInt(GraphMetricBuildPhase.complete) => .complete,
+            @backingInt(GraphMetricBuildPhase.prepare_generation) => .prepare_generation,
+            @backingInt(GraphMetricBuildPhase.scan_edges_and_out_degree) => .scan_edges_and_out_degree,
+            @backingInt(GraphMetricBuildPhase.initialize_ranks) => .initialize_ranks,
+            @backingInt(GraphMetricBuildPhase.iterate_contributions) => .iterate_contributions,
+            @backingInt(GraphMetricBuildPhase.reduce_ranks) => .reduce_ranks,
+            @backingInt(GraphMetricBuildPhase.hits_hub_contributions) => .hits_hub_contributions,
+            @backingInt(GraphMetricBuildPhase.hits_hub_reduce_ranks) => .hits_hub_reduce_ranks,
+            @backingInt(GraphMetricBuildPhase.check_convergence) => .check_convergence,
+            @backingInt(GraphMetricBuildPhase.publish_generation) => .publish_generation,
+            @backingInt(GraphMetricBuildPhase.cleanup_old_generations) => .cleanup_old_generations,
             else => return null,
         };
         const iteration_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
@@ -10917,10 +10917,10 @@ pub const GraphIndex = struct {
         inline for (.{
             @as(u64, 3),
             page.job_id,
-            @as(u64, @intFromEnum(page.phase)),
+            @as(u64, @backingInt(page.phase)),
             @as(u64, page.iteration),
             page.page_id,
-            @as(u64, @intFromEnum(page.state)),
+            @as(u64, @backingInt(page.state)),
             page.lease_expires_at_ms,
             page.attempt,
             page.completed_units,
@@ -10933,7 +10933,7 @@ pub const GraphIndex = struct {
             @as(u64, @bitCast(page.total_delta)),
             @as(u64, @bitCast(page.rank_sum)),
             if (page.converged) @as(u64, 1) else @as(u64, 0),
-            @as(u64, @intFromEnum(page.range_kind)),
+            @as(u64, @backingInt(page.range_kind)),
             @as(u64, page.range_lower.len),
             @as(u64, page.range_upper.len),
             @as(u64, page.output_prefix.len),
@@ -10975,10 +10975,10 @@ pub const GraphIndex = struct {
         const state_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const state: GraphMetricBuildPageState = switch (state_raw) {
-            @intFromEnum(GraphMetricBuildPageState.pending) => .pending,
-            @intFromEnum(GraphMetricBuildPageState.leased) => .leased,
-            @intFromEnum(GraphMetricBuildPageState.complete) => .complete,
-            @intFromEnum(GraphMetricBuildPageState.failed) => .failed,
+            @backingInt(GraphMetricBuildPageState.pending) => .pending,
+            @backingInt(GraphMetricBuildPageState.leased) => .leased,
+            @backingInt(GraphMetricBuildPageState.complete) => .complete,
+            @backingInt(GraphMetricBuildPageState.failed) => .failed,
             else => return null,
         };
         const lease_expires_at_ms = std.mem.readInt(u64, raw[offset..][0..8], .little);
@@ -11021,13 +11021,13 @@ pub const GraphIndex = struct {
             const range_kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
             offset += 8;
             const decoded_range_kind: GraphMetricBuildPageRangeKind = switch (range_kind_raw) {
-                @intFromEnum(GraphMetricBuildPageRangeKind.full) => .full,
-                @intFromEnum(GraphMetricBuildPageRangeKind.reverse_edges) => .reverse_edges,
-                @intFromEnum(GraphMetricBuildPageRangeKind.nodes) => .nodes,
-                @intFromEnum(GraphMetricBuildPageRangeKind.scores) => .scores,
-                @intFromEnum(GraphMetricBuildPageRangeKind.contributions) => .contributions,
-                @intFromEnum(GraphMetricBuildPageRangeKind.job_control) => .job_control,
-                @intFromEnum(GraphMetricBuildPageRangeKind.summary) => .summary,
+                @backingInt(GraphMetricBuildPageRangeKind.full) => .full,
+                @backingInt(GraphMetricBuildPageRangeKind.reverse_edges) => .reverse_edges,
+                @backingInt(GraphMetricBuildPageRangeKind.nodes) => .nodes,
+                @backingInt(GraphMetricBuildPageRangeKind.scores) => .scores,
+                @backingInt(GraphMetricBuildPageRangeKind.contributions) => .contributions,
+                @backingInt(GraphMetricBuildPageRangeKind.job_control) => .job_control,
+                @backingInt(GraphMetricBuildPageRangeKind.summary) => .summary,
                 else => return null,
             };
             const decoded_range_lower_len: usize = @intCast(std.mem.readInt(u64, raw[offset..][0..8], .little));
@@ -11084,9 +11084,9 @@ pub const GraphIndex = struct {
         inline for (.{
             @as(u64, 1),
             summary.job_id,
-            @as(u64, @intFromEnum(summary.phase)),
+            @as(u64, @backingInt(summary.phase)),
             @as(u64, summary.iteration),
-            @as(u64, @intFromEnum(summary.state)),
+            @as(u64, @backingInt(summary.state)),
             summary.expected_pages,
             summary.completed_pages,
             summary.failed_pages,
@@ -11108,7 +11108,7 @@ pub const GraphIndex = struct {
         inline for (.{
             @as(u64, 1),
             progress.job_id,
-            @as(u64, @intFromEnum(progress.phase)),
+            @as(u64, @backingInt(progress.phase)),
             @as(u64, progress.iteration),
             progress.expected_pages,
             progress.pending_pages,
@@ -11168,9 +11168,9 @@ pub const GraphIndex = struct {
         const state_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const state: GraphMetricBuildPhaseState = switch (state_raw) {
-            @intFromEnum(GraphMetricBuildPhaseState.pending) => .pending,
-            @intFromEnum(GraphMetricBuildPhaseState.complete) => .complete,
-            @intFromEnum(GraphMetricBuildPhaseState.failed) => .failed,
+            @backingInt(GraphMetricBuildPhaseState.pending) => .pending,
+            @backingInt(GraphMetricBuildPhaseState.complete) => .complete,
+            @backingInt(GraphMetricBuildPhaseState.failed) => .failed,
             else => return null,
         };
         const expected_pages = std.mem.readInt(u64, raw[offset..][0..8], .little);
@@ -11290,7 +11290,7 @@ pub const GraphIndex = struct {
             record.job_id,
             record.target_generation,
             record.score_generation,
-            @as(u64, @intFromEnum(record.phase)),
+            @as(u64, @backingInt(record.phase)),
             @as(u64, record.iteration),
             record.retry_count,
         }) |value| {
@@ -11339,7 +11339,7 @@ pub const GraphIndex = struct {
     fn encodeGraphMetricEvent(event: GraphMetricEvent, out: *[graph_metric_event_encoded_len]u8) void {
         var offset: usize = 0;
         inline for (.{
-            @as(u64, @intFromEnum(event.kind)),
+            @as(u64, @backingInt(event.kind)),
             event.at_ms,
             event.target_edge_generation,
             event.published_generation,
@@ -11356,11 +11356,11 @@ pub const GraphIndex = struct {
         const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
         offset += 8;
         const kind: GraphMetricEventKind = switch (kind_raw) {
-            @intFromEnum(GraphMetricEventKind.publish) => .publish,
-            @intFromEnum(GraphMetricEventKind.delete) => .delete,
-            @intFromEnum(GraphMetricEventKind.pause) => .pause,
-            @intFromEnum(GraphMetricEventKind.@"resume") => .@"resume",
-            @intFromEnum(GraphMetricEventKind.failed) => .failed,
+            @backingInt(GraphMetricEventKind.publish) => .publish,
+            @backingInt(GraphMetricEventKind.delete) => .delete,
+            @backingInt(GraphMetricEventKind.pause) => .pause,
+            @backingInt(GraphMetricEventKind.@"resume") => .@"resume",
+            @backingInt(GraphMetricEventKind.failed) => .failed,
             else => return null,
         };
         const at_ms = std.mem.readInt(u64, raw[offset..][0..8], .little);
@@ -11457,7 +11457,7 @@ pub const GraphIndex = struct {
             return result;
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.types.deinit(alloc);
             self.* = undefined;
         }
@@ -11480,11 +11480,11 @@ pub const GraphIndex = struct {
 
     fn graphMetricConfigFingerprint(cfg: GraphMetricConfig) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        graphMetricConfigFingerprintHashU64(&hasher, @intFromEnum(cfg.kind));
+        graphMetricConfigFingerprintHashU64(&hasher, @backingInt(cfg.kind));
         graphMetricConfigFingerprintHashU64(&hasher, @as(u64, @bitCast(cfg.damping)));
         graphMetricConfigFingerprintHashU64(&hasher, @as(u64, @bitCast(cfg.tolerance)));
         graphMetricConfigFingerprintHashU64(&hasher, cfg.max_iterations);
-        graphMetricConfigFingerprintHashU64(&hasher, @intFromEnum(cfg.edge_filter.mode));
+        graphMetricConfigFingerprintHashU64(&hasher, @backingInt(cfg.edge_filter.mode));
         graphMetricConfigFingerprintHashU64(&hasher, cfg.edge_filter.types.len);
         var last: ?[]const u8 = null;
         var emitted: usize = 0;
@@ -11528,20 +11528,20 @@ pub const GraphIndex = struct {
 
     fn graphMetricBuildPhaseFromRaw(phase_raw: u64) ?GraphMetricBuildPhase {
         return switch (phase_raw) {
-            @intFromEnum(GraphMetricBuildPhase.idle) => .idle,
-            @intFromEnum(GraphMetricBuildPhase.computing) => .computing,
-            @intFromEnum(GraphMetricBuildPhase.publishing) => .publishing,
-            @intFromEnum(GraphMetricBuildPhase.complete) => .complete,
-            @intFromEnum(GraphMetricBuildPhase.prepare_generation) => .prepare_generation,
-            @intFromEnum(GraphMetricBuildPhase.scan_edges_and_out_degree) => .scan_edges_and_out_degree,
-            @intFromEnum(GraphMetricBuildPhase.initialize_ranks) => .initialize_ranks,
-            @intFromEnum(GraphMetricBuildPhase.iterate_contributions) => .iterate_contributions,
-            @intFromEnum(GraphMetricBuildPhase.reduce_ranks) => .reduce_ranks,
-            @intFromEnum(GraphMetricBuildPhase.hits_hub_contributions) => .hits_hub_contributions,
-            @intFromEnum(GraphMetricBuildPhase.hits_hub_reduce_ranks) => .hits_hub_reduce_ranks,
-            @intFromEnum(GraphMetricBuildPhase.check_convergence) => .check_convergence,
-            @intFromEnum(GraphMetricBuildPhase.publish_generation) => .publish_generation,
-            @intFromEnum(GraphMetricBuildPhase.cleanup_old_generations) => .cleanup_old_generations,
+            @backingInt(GraphMetricBuildPhase.idle) => .idle,
+            @backingInt(GraphMetricBuildPhase.computing) => .computing,
+            @backingInt(GraphMetricBuildPhase.publishing) => .publishing,
+            @backingInt(GraphMetricBuildPhase.complete) => .complete,
+            @backingInt(GraphMetricBuildPhase.prepare_generation) => .prepare_generation,
+            @backingInt(GraphMetricBuildPhase.scan_edges_and_out_degree) => .scan_edges_and_out_degree,
+            @backingInt(GraphMetricBuildPhase.initialize_ranks) => .initialize_ranks,
+            @backingInt(GraphMetricBuildPhase.iterate_contributions) => .iterate_contributions,
+            @backingInt(GraphMetricBuildPhase.reduce_ranks) => .reduce_ranks,
+            @backingInt(GraphMetricBuildPhase.hits_hub_contributions) => .hits_hub_contributions,
+            @backingInt(GraphMetricBuildPhase.hits_hub_reduce_ranks) => .hits_hub_reduce_ranks,
+            @backingInt(GraphMetricBuildPhase.check_convergence) => .check_convergence,
+            @backingInt(GraphMetricBuildPhase.publish_generation) => .publish_generation,
+            @backingInt(GraphMetricBuildPhase.cleanup_old_generations) => .cleanup_old_generations,
             else => null,
         };
     }
@@ -12453,7 +12453,7 @@ pub const GraphIndex = struct {
         sealed: ?*@import("sealed_vector_cache.zig").Cache = null,
         admission_ticket: ?u64 = null,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.owned.items) |bytes| alloc.free(bytes);
             self.owned.deinit(alloc);
             self.map.deinit(alloc);
@@ -13681,7 +13681,7 @@ pub const GraphIndex = struct {
         }
 
         var hasher = std.hash.Wyhash.init(0x9DA8_316C_5294_EB77);
-        graphMetricConfigFingerprintHashU64(&hasher, @intFromEnum(page.phase));
+        graphMetricConfigFingerprintHashU64(&hasher, @backingInt(page.phase));
         graphMetricConfigFingerprintHashU64(&hasher, page.iteration);
         graphMetricConfigFingerprintHashU64(&hasher, completed_units);
         graphMetricConfigFingerprintHashU64(&hasher, @bitCast(accumulated));
@@ -21973,7 +21973,7 @@ test "graph metric ordinal progress owns cursor before storage iteration advance
             fn close(_: *@This()) void {}
         };
         const ThisOuter = @This();
-        fn openCursor(self: *@This()) !Cursor {
+        pub fn openCursor(self: *@This()) !Cursor {
             return .{ .txn = self };
         }
     };
@@ -22337,7 +22337,7 @@ test "graph metric ordinal topology checkpoints stop at byte admission for long 
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    const kind = "x" ** edge_type_mod.max_bytes;
+    const kind = z17RepeatString("x", edge_type_mod.max_bytes);
     const config = GraphMetricConfig{ .name = "rank", .kind = .pagerank, .edge_filter = .{ .mode = .types, .types = &.{kind} }, .max_iterations = 2 };
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .metric_configs = &.{config} });
     defer graph.close();
@@ -25197,7 +25197,7 @@ const GraphMetricVectorSlotForTest = struct {
     iteration: u32,
     node: []const u8,
 
-    fn read(self: @This(), txn: anytype) !f64 {
+    pub fn read(self: @This(), txn: anytype) !f64 {
         const key = try self.graph.topologyKey(txn, self.metric, self.job_id, try GraphIndex.graphMetricNodeSlotKey(self.graph.alloc, self.metric, self.job_id, self.node));
         defer self.graph.alloc.free(key);
         const slot = try GraphIndex.readU64OrZero(txn, key);
@@ -36461,7 +36461,7 @@ test "graph durable writes reject invalid edge types before mutation" {
     try std.testing.expectError(error.InvalidGraphEdges, graph.addEdge("a", "b", "", 1, 0, 0, ""));
     try std.testing.expectError(
         error.InvalidGraphEdges,
-        graph.addEdge("a", "b", "x" ** (edge_type_mod.max_bytes + 1), 1, 0, 0, ""),
+        graph.addEdge("a", "b", &@as([edge_type_mod.max_bytes + 1]u8, @splat('x')), 1, 0, 0, ""),
     );
     const edges = try graph.getEdges(alloc, "a", "", .out);
     defer GraphIndex.freeEdges(alloc, edges);
@@ -39111,6 +39111,17 @@ test "graph edge ttl incoming existence charges expired reverse rows across keys
     defer empty.deinit(alloc);
     try std.testing.expect(!empty.has_incoming[0]);
     try std.testing.expectEqual(@as(usize, 0), empty.scanned_rows);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }
 
 test "graph relationship integration isolates TTL contributors and recovers interrupted clears" {

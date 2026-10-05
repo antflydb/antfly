@@ -506,5 +506,5 @@ test "SQL joined mutations release every failed allocation without partial commi
             try std.testing.expectEqual(@as(usize, 1), backend.commits);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

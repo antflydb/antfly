@@ -109,11 +109,11 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer if (metadata_alive) metadata.deinit();
     try metadata.start();
     try metadata.bootstrapLocal(2193, 1);
-    var meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+    var meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     var meta_raft_alive = true;
     defer if (meta_raft_alive) meta_raft.deinit();
     try meta_raft.start();
-    var meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+    var meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     var meta_control_alive = true;
     defer if (meta_control_alive) meta_control.deinit();
     try meta_control.start();
@@ -153,11 +153,11 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         };
         break;
     } else return error.StoreRegistrationNotVisible;
-    var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+    var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     var data_raft_alive = true;
     defer if (data_raft_alive) data_raft.deinit();
     try data_raft.start();
-    var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+    var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     var data_control_alive = true;
     defer if (data_control_alive) data_control.deinit();
     try data_control.start();
@@ -258,10 +258,13 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     const reader = mounted_api.table_reads orelse return error.Unavailable;
     var ready = false;
     var last_error: ?anyerror = null;
-    for (0..128) |_| {
+    // A production-cadence election can exceed 128 short polling sleeps.
+    // Bound this read-only readiness barrier by elapsed time instead.
+    const ready_deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < ready_deadline) {
         const observed = reader.lookup(alloc, parent_name.?, parent_start.?, .{
             .relational_topology_json = "{\"mode\":\"identity\"}",
-            .execution_deadline_ns = platform.time.monotonicNs() +| 500 * std.time.ns_per_ms,
+            .execution_deadline_ns = @min(ready_deadline, platform.time.monotonicNs() +| 500 * std.time.ns_per_ms),
         }, .read_index) catch |err| {
             last_error = err;
             try io.sleep(.fromMilliseconds(20), .awake);
@@ -412,10 +415,10 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
             try metadata.bootstrapLocal(2193, 1);
             meta_api = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
             try driver.pauseBackground(meta_api, io);
-            meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+            meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             meta_raft_alive = true;
             try meta_raft.start();
-            meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+            meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
             meta_control_alive = true;
             try meta_control.start();
             const reopen_deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
@@ -457,10 +460,10 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
                 };
                 break;
             } else return error.StoreRegistrationNotVisible;
-            data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+            data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             data_raft_alive = true;
             try data_raft.start();
-            data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+            data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
             data_control_alive = true;
             try data_control.start();
             const next_base = try data.baseUri(alloc);

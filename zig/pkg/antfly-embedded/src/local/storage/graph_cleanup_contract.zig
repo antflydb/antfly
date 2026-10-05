@@ -7,7 +7,7 @@ pub const Guard = struct {
     endpoint: []const u8,
     generation: u64,
     kind: enum { endpoint, owner_replay } = .endpoint,
-    checkpoint_digest: [32]u8 = [_]u8{0} ** 32,
+    checkpoint_digest: [32]u8 = @as([32]u8, @splat(0)),
 };
 const magic = "GEC2";
 pub fn matchesKey(key: []const u8, endpoint: []const u8) bool {
@@ -71,7 +71,7 @@ pub fn encodeOwnerJobAlloc(alloc: std.mem.Allocator, job: OwnerJob) ![]u8 {
     const value = try alloc.alloc(u8, 21 + job.owner.len + job.cursor.len);
     @memcpy(value[0..4], "GOR3");
     std.mem.writeInt(u64, value[4..12], job.generation, .little);
-    value[12] = @intFromEnum(job.phase);
+    value[12] = @backingInt(job.phase);
     std.mem.writeInt(u32, value[13..17], @intCast(job.owner.len), .little);
     std.mem.writeInt(u32, value[17..21], @intCast(job.cursor.len), .little);
     @memcpy(value[21..][0..job.owner.len], job.owner);

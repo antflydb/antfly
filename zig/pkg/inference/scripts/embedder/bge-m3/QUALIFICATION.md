@@ -55,7 +55,7 @@ For batch four, the graph has 2603 nodes in one Metal partition, 389 shared init
 
 ## Reproduce
 
-Build `zig build inference-build-bge-m3-benchmark -Doptimize=ReleaseFast` from `zig/`, then use the three installed directories with `qualify_formats.py`, as shown in [Model Downloads](../../../../../../docs/guides/model-downloads.mdx). The standard matrix uses `--batches 1,2,4,8,16 --require-resident-onnx`.
+Build `zig build inference-build-bge-m3-benchmark -Doptimize=fast` from `zig/`, then use the three installed directories with `qualify_formats.py`, as shown in [Model Downloads](../../../../../../docs/guides/model-downloads.mdx). The standard matrix uses `--batches 1,2,4,8,16 --require-resident-onnx`.
 
 For additional runs:
 

@@ -25,20 +25,20 @@ fn openDebugLogsEnabled() bool {
     return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
-fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
+pub fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
     if (@hasDecl(BackendType, "beginOpenPhase")) return backend.beginOpenPhase(phase);
     return 0;
 }
 
-fn finishOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype, start_ns: u64) void {
+pub fn finishOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype, start_ns: u64) void {
     if (@hasDecl(BackendType, "finishOpenPhase")) backend.finishOpenPhase(phase, start_ns);
 }
 
-fn recordOpenManifestLoaded(comptime BackendType: type, backend: *BackendType, loaded_manifest: bool) void {
+pub fn recordOpenManifestLoaded(comptime BackendType: type, backend: *BackendType, loaded_manifest: bool) void {
     if (@hasDecl(BackendType, "recordOpenManifestLoaded")) backend.recordOpenManifestLoaded(loaded_manifest);
 }
 
-fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) void {
+pub fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) void {
     if (@hasDecl(BackendType, "recordOpenReplayComplete")) backend.recordOpenReplayComplete();
 }
 
@@ -61,11 +61,11 @@ fn cleanupRecoveredRunFiles(comptime BackendType: type, backend: *BackendType, s
     }
 }
 
-fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
+pub fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
     if (@hasDecl(BackendType, "finishOpenSuccess")) backend.finishOpenSuccess();
 }
 
-fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
+pub fn finishOpenFailure(comptime BackendType: type, backend: *BackendType) void {
     if (@hasDecl(BackendType, "finishOpenFailure")) backend.finishOpenFailure();
 }
 

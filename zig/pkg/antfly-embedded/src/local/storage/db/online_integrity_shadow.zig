@@ -99,10 +99,10 @@ pub fn cleanup(alloc: std.mem.Allocator, txn: anytype, donor: ByteRange, after: 
     defer cursor.close();
     const initial = if (after.len != 0) (try integrity.parseKey(after)).kind else integrity.Kind.claim;
     for ([_]integrity.Kind{ .claim, .reference, .job }) |kind| {
-        if (@intFromEnum(kind) < @intFromEnum(initial)) continue;
+        if (@backingInt(kind) < @backingInt(initial)) continue;
         var prefix: [integrity.namespace.len + 1]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
-        prefix[integrity.namespace.len] = @intFromEnum(kind);
+        prefix[integrity.namespace.len] = @backingInt(kind);
         const lower = try std.mem.concat(alloc, u8, &.{ &prefix, donor.start });
         defer alloc.free(lower);
         const resuming = kind == initial and after.len != 0;

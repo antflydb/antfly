@@ -570,7 +570,7 @@ test "compaction publication uses the borrowed clock for bounded preparation" {
 }
 
 test "compaction publication atomic fence scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     const allocator = std.heap.smp_allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

@@ -44,7 +44,7 @@ const Slot = struct {
     last_lsn: u64 = 0,
     last_timestamp_ns: u64 = 0,
 
-    fn deinit(self: *Slot, alloc: Allocator) void {
+    pub fn deinit(self: *Slot, alloc: Allocator) void {
         alloc.free(self.doc_id);
         if (self.body) |body| alloc.free(body);
         self.* = undefined;

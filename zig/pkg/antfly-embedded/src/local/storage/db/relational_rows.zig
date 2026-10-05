@@ -78,7 +78,7 @@ pub const Budget = struct {
     target_bytes: usize = 0,
     time_ns: u64 = 5 * std.time.ns_per_ms,
 
-    fn validate(self: Budget) !void {
+    pub fn validate(self: Budget) !void {
         if (self.rows == 0 or self.rows > 4096 or self.records == 0 or self.records > 65_536 or
             self.output_bytes == 0 or self.output_bytes > 16 * 1024 * 1024 or
             self.target_bytes > self.output_bytes or
@@ -209,7 +209,7 @@ pub const Reader = struct {
             copy.* = try owned.dupe(u8, field);
         }
         const range_raw = read.get(range_state.range_key) catch |err| switch (err) {
-            error.NotFound => &([_]u8{0} ** 8),
+            error.NotFound => &(@as([8]u8, @splat(0))),
             else => return err,
         };
         const range = try range_state.decodeRangeAlloc(owned, range_raw);

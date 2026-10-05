@@ -67,8 +67,8 @@ pub const Catalog = struct {
         @memcpy(out[0..4], magic);
         std.mem.writeInt(u32, out[4..8], format_version, .little);
         out[8] = @intFromBool(self.mode_initialized);
-        out[9] = @intFromEnum(self.storage_mode);
-        out[10] = @intFromEnum(self.index_state);
+        out[9] = @backingInt(self.storage_mode);
+        out[10] = @backingInt(self.index_state);
         out[11] = @intFromBool(self.reconciled);
         std.mem.writeInt(u32, out[12..16], self.active_schema_version, .little);
         std.mem.writeInt(u32, out[16..20], self.schema_format_version, .little);
@@ -76,7 +76,7 @@ pub const Catalog = struct {
         std.mem.writeInt(u64, out[24..32], self.row_count, .little);
         std.mem.writeInt(u64, out[32..40], self.generation, .little);
         std.mem.writeInt(u64, out[40..48], self.transaction_admission_bytes, .little);
-        out[48] = @intFromEnum(self.row_policy_phase);
+        out[48] = @backingInt(self.row_policy_phase);
         std.mem.writeInt(u64, out[56..64], self.row_policy_generation, .little);
         std.mem.writeInt(u64, out[64..72], self.row_policy_catalog_epoch, .little);
         return out;
@@ -88,13 +88,13 @@ pub const Catalog = struct {
         if (version != format_version and version != 2) return error.UnsupportedTableCatalogVersion;
         if ((version == 2 and data.len != 48) or (version == format_version and data.len != encoded_len)) return error.InvalidTableCatalog;
         const row_count = std.mem.readInt(u64, data[24..32], .little);
-        if (data[8] > 1 or data[9] > @intFromEnum(schema_mod.StorageMode.relational) or
-            data[10] > @intFromEnum(IndexState.failed) or data[11] > 1 or row_count > 1)
+        if (data[8] > 1 or data[9] > @backingInt(schema_mod.StorageMode.relational) or
+            data[10] > @backingInt(IndexState.failed) or data[11] > 1 or row_count > 1)
             return error.InvalidTableCatalog;
         const catalog: Catalog = .{
             .mode_initialized = data[8] == 1,
-            .storage_mode = @enumFromInt(data[9]),
-            .index_state = @enumFromInt(data[10]),
+            .storage_mode = @fromBackingInt(data[9]),
+            .index_state = @fromBackingInt(data[10]),
             .reconciled = data[11] == 1,
             .active_schema_version = std.mem.readInt(u32, data[12..16], .little),
             .schema_format_version = std.mem.readInt(u32, data[16..20], .little),
@@ -179,7 +179,7 @@ test "table catalog has a stable canonical representation" {
     corrupt[48] = 3;
     try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(&corrupt));
     corrupt = encoded;
-    corrupt[48] = @intFromEnum(RowPolicyPhase.active);
+    corrupt[48] = @backingInt(RowPolicyPhase.active);
     try std.testing.expectError(error.InvalidTableCatalog, Catalog.decode(&corrupt));
 
     const preparing: Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 3, .row_policy_phase = .preparing, .row_policy_generation = 11, .row_policy_catalog_epoch = 19 };

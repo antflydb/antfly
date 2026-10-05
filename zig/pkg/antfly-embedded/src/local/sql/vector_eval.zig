@@ -421,7 +421,7 @@ test "SQL vector live workspace supports long expressions floats strings and boo
     defer compiled.deinit();
     var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
     defer program.deinit();
-    const rows = [_][]const Datum{&.{Datum.json(.{ .integer = 2 })}} ** 1024;
+    const rows: [1024][]const Datum = @splat(&.{Datum.json(.{ .integer = 2 })});
     var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 256 * 1024 };
     const values = (try evaluate(budget.allocator(), &program, &rows, &.{})).?;
     defer budget.allocator().free(values);
@@ -435,7 +435,7 @@ test "SQL direct column kernels preserve physical selection and SQL nulls" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const types = @import("../storage/rowsource/types.zig");
-    const refs = [_]types.RowRef{.{ .relational_key = "r" }} ** 6;
+    const refs: [6]types.RowRef = @splat(.{ .relational_key = "r" });
     const numbers = [_]i64{ 4, 9007199254740993, -3, 7, 0, 11 };
     const nulls = [_]u8{ 0, 0, 0, 1, 0, 0 };
     const columns = [_]types.ColumnVector{.{ .name = "n", .values = .{ .i64 = &numbers }, .nulls = .{ .bytes = &nulls } }};
@@ -579,7 +579,7 @@ test "SQL native typed columns preserve finite-number coercion and selected null
     var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
     defer program.deinit();
     const types = @import("../storage/rowsource/types.zig");
-    const refs = [_]types.RowRef{.{ .relational_key = "r" }} ** 4;
+    const refs: [4]types.RowRef = @splat(.{ .relational_key = "r" });
     const values = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), 4.0 };
     const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &.{.{ .name = "n", .values = .{ .f64 = &values }, .nulls = .{ .bytes = &.{ 1, 0, 0, 0 } } }} }, .selection = &.{ 0, 3 } };
     const output = (try evaluateColumns(a, &program, page, &definitions, &.{})).?;

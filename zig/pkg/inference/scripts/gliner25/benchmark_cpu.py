@@ -560,7 +560,7 @@ def checked_ready(
         if ready.get(key) != expected:
             raise BenchmarkError(f"{arm} ready contract differs: {key}")
     if arm == "native" and (
-        ready.get("build_mode") != "ReleaseFast"
+        ready.get("build_mode") != "fast"
         or ready.get("scheduler")
         != (
             "bounded_io"

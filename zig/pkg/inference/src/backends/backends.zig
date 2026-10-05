@@ -234,7 +234,7 @@ test "embedded session policy fails before selecting an uninterruptible backend"
     );
 }
 
-const backend_order_capacity = std.meta.fields(BackendType).len;
+const backend_order_capacity = std.meta.fieldNames(BackendType).len;
 
 const RequiredBackendConfig = struct {
     backend: ?BackendType = null,

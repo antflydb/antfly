@@ -964,7 +964,7 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+    const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
     defer alloc.free(path);
     var store = try docstore.DocStore.open(alloc, path, .{});
     defer store.close();
@@ -985,7 +985,7 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
     for (&nodes, 0..) |*node, ordinal| {
         var id: publication.Digest = @splat(0);
         std.mem.writeInt(u64, id[24..32], ordinal + 1, .big);
-        node.* = .{ .id = id, .kind = @enumFromInt(ordinal % 5), .scope = .document, .name = "fixture" };
+        node.* = .{ .id = id, .kind = @fromBackingInt(@intCast(ordinal % 5)), .scope = .document, .name = "fixture" };
     }
     var plan: Plan = .{ .arena = std.heap.ArenaAllocator.init(alloc), .catalog = authority.catalog_digest, .digest = @splat(8), .nodes = &nodes, .providers = &.{}, .definitions = .empty, .has_projection_requirements = true };
     defer plan.deinit();

@@ -210,7 +210,7 @@ const Markers = struct {
         return result;
     }
     fn id(self: Markers, marker: Marker) i32 {
-        return self.ids[@intFromEnum(marker)];
+        return self.ids[@backingInt(marker)];
     }
 };
 
@@ -463,7 +463,7 @@ const Builder = struct {
         }
         const fragments = try self.allocator.alloc([]const u8, 6 + fields.len * 2);
         fragments[0] = "(";
-        fragments[1] = marker_names[@intFromEnum(Marker.p)];
+        fragments[1] = marker_names[@backingInt(Marker.p)];
         fragments[2] = try header.toOwnedSlice(self.allocator);
         fragments[3] = "(";
         try self.appendEncoded(fragments[0]);
@@ -474,7 +474,7 @@ const Builder = struct {
         const positions = try self.allocator.alloc(usize, fields.len);
         for (fields, positions, 0..) |field, *position, i| {
             const owned_name = try self.allocator.dupe(u8, field.name);
-            fragments[4 + i * 2] = marker_names[@intFromEnum(marker)];
+            fragments[4 + i * 2] = marker_names[@backingInt(marker)];
             fragments[5 + i * 2] = owned_name;
             position.* = self.ids.items.len;
             try self.appendMarker(marker);

@@ -349,7 +349,7 @@ pub const Scenario = struct {
                 self.proposals += 1;
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 if (self.committed) |*command| command.deinit(self.allocator);
             }
         };

@@ -462,7 +462,8 @@ pub fn importBytes(a: Allocator, config_bytes: []const u8, tensor_bytes: []const
     const modules = try validateTensors(scratch, config, tensors, limits, control);
     const receipt = try makeReceipt(binding, config, modules, config_bytes, tensor_bytes, control);
     if (receipt_bytes) |raw| try verifyReceipt(a, receipt, raw, limits);
-    return .{ .arena = arena, .config = config, .config_bytes = try scratch.dupe(u8, config_bytes), .tensors = tensors, .modules = modules, .receipt = receipt, .receipt_digest = if (receipt_bytes) |raw| try digestBytes(raw, control) else null };
+    const owned_result_config_bytes = try scratch.dupe(u8, config_bytes);
+    return .{ .arena = arena, .config = config, .config_bytes = owned_result_config_bytes, .tensors = tensors, .modules = modules, .receipt = receipt, .receipt_digest = if (receipt_bytes) |raw| try digestBytes(raw, control) else null };
 }
 pub fn importDirectory(a: Allocator, directory: []const u8, binding: Binding, limits: Limits, control: ?Control) !Loaded {
     try check(control);
@@ -661,7 +662,7 @@ const MergedAccess = struct {
         const self: *MergedAccess = @ptrCast(@alignCast(raw));
         return self.base.listNames(a);
     }
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
 };
 fn validateBase(a: Allocator, backbone: model.Backbone, owner: *access_mod.SafetensorsAccess, control: ?Control) !void {
     try safetensors.validateReader(a, &owner.source.reader);
@@ -749,7 +750,7 @@ pub fn materializeMerged(a: Allocator, io: std.Io, source_dir: []const u8, adapt
 fn testBinding(backbone: model.Backbone) Binding {
     var frozen: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash("synthetic frozen checkpoint", &frozen, .{});
-    return .{ .source = .{ .backbone = backbone, .precision = .fp32, .weight = bundle.Digest.of("synthetic frozen checkpoint"), .sidecars = .{bundle.Digest.of("synthetic sidecar")} ** 4 }, .schema_sha256 = .{0x25} ** 32, .frozen_weight_sha256 = frozen };
+    return .{ .source = .{ .backbone = backbone, .precision = .fp32, .weight = bundle.Digest.of("synthetic frozen checkpoint"), .sidecars = @splat(bundle.Digest.of("synthetic sidecar")) }, .schema_sha256 = @splat(0x25), .frozen_weight_sha256 = frozen };
 }
 
 test "GLiNER2.5 adapter files preserve digest bytes with bounded copy and hash cancellation" {
@@ -906,14 +907,14 @@ fn testTensors(left: []const f32) [3]NamedTensor {
 fn importAllocationFailures(a: Allocator, config_bytes: []const u8, tensor_bytes: []const u8) !void {
     var loaded = try importBytes(a, config_bytes, tensor_bytes, null, testBinding(.small), .{}, null);
     defer loaded.deinit();
-    const merged = try mergeTensor(a, loaded.modules[0], &([_]f32{1} ** 384), .{}, null);
+    const merged = try mergeTensor(a, loaded.modules[0], &(@as([384]f32, @splat(1))), .{}, null);
     defer a.free(merged);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const validated = try validateLoaded(arena.allocator(), &loaded, .{}, null);
     const unaligned = try a.alloc(u8, merged.len * 4 + 1);
     defer a.free(unaligned);
-    try mergeInto(validated.modules[0], &([_]f32{1} ** 384), std.mem.bytesAsSlice(f32, unaligned[1..]), .{}, null);
+    try mergeInto(validated.modules[0], &(@as([384]f32, @splat(1))), std.mem.bytesAsSlice(f32, unaligned[1..]), .{}, null);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(merged), unaligned[1..]);
 }
 
@@ -962,7 +963,7 @@ test "GLiNER2.5 adapter files reject unsupported malformed config and clean canc
     const weight_path = try std.fs.path.join(scratch, &.{ parent, "tiny.safetensors" });
     try checkpoint.save(a, weight_path, &tensors);
     const bytes = try c_file.readFileMax(scratch, weight_path, 32 * 1024);
-    try std.testing.checkAllAllocationFailures(a, importAllocationFailures, .{ test_config, bytes });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, importAllocationFailures, .{ test_config, bytes });
     var loaded = try importBytes(a, test_config, bytes, null, testBinding(.small), .{}, null);
     defer loaded.deinit();
     const modules = @constCast(loaded.modules);
@@ -1001,11 +1002,11 @@ test "GLiNER2.5 adapter full merge rejects incomplete canonical model before pub
         digest.* = bundle.Digest.of(bytes);
     }
     const model_path = try std.fs.path.join(scratch, &.{ source, "model.safetensors" });
-    try checkpoint.save(a, model_path, &.{.{ .name = "boundary_head.count_head.weight", .shape = &.{ 1, 384 }, .data = &([_]f32{1} ** 384) }});
+    try checkpoint.save(a, model_path, &.{.{ .name = "boundary_head.count_head.weight", .shape = &.{ 1, 384 }, .data = &(@as([384]f32, @splat(1))) }});
     const model_bytes = try c_file.readFileMax(scratch, model_path, 32 * 1024);
     binding.source.weight = bundle.Digest.of(model_bytes);
     std.crypto.hash.sha2.Sha256.hash(model_bytes, &binding.frozen_weight_sha256, .{});
-    const tensors = testTensors(&([_]f32{0.1} ** 768));
+    const tensors = testTensors(&(@as([768]f32, @splat(0.1))));
     const tensor_path = try std.fs.path.join(scratch, &.{ parent, "adapter.safetensors" });
     try checkpoint.save(a, tensor_path, &tensors);
     const tensor_bytes = try c_file.readFileMax(scratch, tensor_path, 32 * 1024);

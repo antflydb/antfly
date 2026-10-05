@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -812,7 +813,7 @@ const MapStore = struct {
     map: std.StringHashMapUnmanaged([]u8) = .empty,
     put_count: usize = 0,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -830,7 +831,7 @@ const MapStore = struct {
         self.put_count += 1;
     }
 
-    fn backendStore(self: *MapStore) BackendStore {
+    pub fn backendStore(self: *MapStore) BackendStore {
         return .{ .store_ptr = self };
     }
 
@@ -952,7 +953,7 @@ const CaptureSink = struct {
     batch_calls: usize = 0,
     lost_replies: usize = 0,
 
-    fn deinit(self: *CaptureSink) void {
+    pub fn deinit(self: *CaptureSink) void {
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.tables.items) |t| self.alloc.free(t);
         for (self.storage_tables.items) |maybe_table| if (maybe_table) |table| self.alloc.free(table);
@@ -1377,7 +1378,7 @@ const FakeSource = struct {
         return .{ .matched_entries = matched, .last_sequence = last };
     }
 
-    fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
+    pub fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
     fn latest(ptr: *anyopaque, _: Allocator, from_sequence: u64, hint: replay_source_mod.TargetHint) anyerror!u64 {

@@ -126,7 +126,7 @@ const Lease = struct {
     fn path(self: Lease, name: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.root, name });
     }
-    fn deinit(self: *Lease) void {
+    pub fn deinit(self: *Lease) void {
         self.held.deinit();
         pin.reclaimReleased(self.db, self.scope) catch {};
         self.alloc.free(self.root);

@@ -38,7 +38,7 @@ const Work = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try drain(self.port);
     }
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         std.heap.page_allocator.destroy(self);
     }

@@ -65,7 +65,7 @@ pub const Snapshot = struct {
 
 test "dynamic statement snapshot must be explicitly supplied by the fenced owner" {
     const Fixture = struct {
-        fn validate(_: *anyopaque) !void {}
+        pub fn validate(_: *anyopaque) !void {}
         fn open(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: types.ScanOptions) !View {
             return error.TestUnexpectedResult;
         }

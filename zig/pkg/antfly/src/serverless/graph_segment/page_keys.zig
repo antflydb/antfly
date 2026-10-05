@@ -65,7 +65,7 @@ pub const Key = struct {
     pub fn adjacency(alloc: Allocator, id: []const u8, direction: Direction, kind: ?[]const u8) !Key {
         var key = try node(alloc, id);
         errdefer key.deinit(alloc);
-        try key.append(alloc, &.{@intFromEnum(direction)});
+        try key.append(alloc, &.{@backingInt(direction)});
         if (kind) |value| try key.component(alloc, value);
         return key;
     }
@@ -278,7 +278,7 @@ test "serverless graph page key prefixes route exact nodes and preserve numeric 
 
 test "serverless graph page keys admit the stored edge type byte limit" {
     const alloc = std.testing.allocator;
-    const kind = [_]u8{'k'} ** @import("antfly_local_sources").graph_edge_type.max_bytes;
+    const kind = @as([@import("antfly_local_sources").graph_edge_type.max_bytes]u8, @splat('k'));
     var key = try Key.edge(alloc, .{ .source = "source", .target = "target", .kind = &kind }, .outgoing);
     defer key.deinit(alloc);
     var scratch: [tree.max_key_bytes]u8 = undefined;

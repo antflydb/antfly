@@ -421,7 +421,7 @@ const CollectCtx = struct {
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     values: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *CollectCtx) void {
+    pub fn deinit(self: *CollectCtx) void {
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.values.items) |v| self.alloc.free(v);
         self.keys.deinit(self.alloc);

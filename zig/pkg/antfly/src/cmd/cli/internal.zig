@@ -136,7 +136,7 @@ fn metadata(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     cli.fatal("unknown internal metadata subcommand: {s}", .{subcommand});
 }
 
-fn metadataStatus(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+pub fn metadataStatus(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
     var resp = try client.getStatus();
     defer resp.deinit();
     if (resp.data) |data| {

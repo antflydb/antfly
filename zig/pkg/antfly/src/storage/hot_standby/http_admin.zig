@@ -1718,7 +1718,7 @@ const ActionReceiptDocument = struct {
     state: []const u8,
     node_id: []const u8,
 
-    fn deinit(self: *ActionReceiptDocument, alloc: Allocator) void {
+    pub fn deinit(self: *ActionReceiptDocument, alloc: Allocator) void {
         alloc.free(self.action_id);
         alloc.free(self.target);
         self.* = undefined;
@@ -2369,7 +2369,7 @@ const QuerySyncPolicy = struct {
     policy: ?primary_mod.SyncPolicy = null,
     owned_standby_names: []const []const u8 = &.{},
 
-    fn deinit(self: *QuerySyncPolicy, alloc: Allocator) void {
+    pub fn deinit(self: *QuerySyncPolicy, alloc: Allocator) void {
         for (self.owned_standby_names) |name| alloc.free(name);
         alloc.free(self.owned_standby_names);
         self.* = undefined;
@@ -2696,7 +2696,7 @@ const TestPaths = struct {
     fence_wal: [:0]u8,
     backup_root: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
@@ -2731,12 +2731,12 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
-        .standby_log = try alloc.dupeZ(u8, standby_log),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress),
-        .fence_wal = try alloc.dupeZ(u8, fence_wal),
-        .backup_root = try alloc.dupeZ(u8, backup_root),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
+        .standby_log = try alloc.dupeSentinel(u8, standby_log, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress, 0),
+        .fence_wal = try alloc.dupeSentinel(u8, fence_wal, 0),
+        .backup_root = try alloc.dupeSentinel(u8, backup_root, 0),
     };
 }
 
@@ -5088,7 +5088,7 @@ test "storage.hot_standby primary status observes catalog outside the HA lock wi
     const Catalog = struct {
         empty: bool = true,
         state_mutex: std.atomic.Mutex = .unlocked,
-        fn read(ptr: *anyopaque) !bool {
+        pub fn read(ptr: *anyopaque) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // Model a catalog writer acquiring HA state while the catalog is
             // observed. Fail deterministically instead of hanging on inversion.

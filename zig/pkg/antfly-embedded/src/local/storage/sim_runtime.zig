@@ -326,7 +326,7 @@ pub const ModeledDevice = struct {
         volatile_bytes: []u8 = &.{},
         durable_bytes: ?*DurableBytes = null,
 
-        fn deinit(self: *FileState, alloc: Allocator) void {
+        pub fn deinit(self: *FileState, alloc: Allocator) void {
             if (self.volatile_bytes.len > 0) alloc.free(self.volatile_bytes);
             if (self.durable_bytes) |snapshot| snapshot.release(alloc);
             self.* = undefined;
@@ -336,7 +336,7 @@ pub const ModeledDevice = struct {
     const DirtyDirectory = struct {
         paths: std.StringHashMapUnmanaged(void) = .empty,
 
-        fn deinit(self: *DirtyDirectory, alloc: Allocator) void {
+        pub fn deinit(self: *DirtyDirectory, alloc: Allocator) void {
             var it = self.paths.keyIterator();
             while (it.next()) |path| alloc.free(path.*);
             self.paths.deinit(alloc);
@@ -611,7 +611,7 @@ pub const ModeledDevice = struct {
         @memcpy(file.volatile_bytes[offset..end], bytes);
     }
 
-    fn sync(ptr: *anyopaque, path: []const u8) !void {
+    pub fn sync(ptr: *anyopaque, path: []const u8) !void {
         const self: *ModeledDevice = @ptrCast(@alignCast(ptr));
         self.mutex.lock();
         defer self.mutex.unlock();

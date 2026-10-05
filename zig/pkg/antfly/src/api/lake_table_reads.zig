@@ -108,7 +108,7 @@ fn normalizeConditions(a: std.mem.Allocator, table: catalog.Table, input: []cons
         const kind = (try table.column(condition.column)).type;
         var value = condition.value orelse .null;
         if (value == .string and kind == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
-        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null else try @import("lake_values.zig").comparisonValue(a, value, kind);
+        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null else try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, value, kind);
     }
     return result;
 }
@@ -119,7 +119,7 @@ fn matchesNormalized(a: std.mem.Allocator, row: catalog.Row, table: catalog.Tabl
     for (conditions) |condition| {
         const stored = try row.cell(condition.column);
         const kind = (try table.column(condition.column)).type;
-        const cell: @import("antfly_local_sources").sql_scalar.Datum = .{ .value = try @import("lake_values.zig").comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
+        const cell: @import("antfly_local_sources").sql_scalar.Datum = .{ .value = try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
         const operand = condition.value orelse .null;
         const match = switch (condition.op) {
             .is_null => cell.sql_null,

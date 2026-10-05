@@ -144,7 +144,7 @@ pub const StdHttpListener = struct {
         listener: *StdHttpListener,
         stream: std.Io.net.Stream,
 
-        fn deinit(self: *ConnectionTask) void {
+        pub fn deinit(self: *ConnectionTask) void {
             const listener = self.listener;
             listener.unregisterActiveStream(&self.stream);
             self.stream.close(listener.io_impl.io());
@@ -796,7 +796,7 @@ pub const StdHttpListener = struct {
             // retryable response instead of leaving expensive work running
             // until their own timeout while the listener runs out of FDs.
             try request.respond("service overloaded; retry later", .{
-                .status = @enumFromInt(429),
+                .status = @fromBackingInt(@intCast(429)),
                 .keep_alive = false,
                 .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
             });
@@ -823,7 +823,7 @@ pub const StdHttpListener = struct {
                     _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
                     if (consumes_expensive_slot) {
                         try request.respond("query cancellation capacity unavailable", .{
-                            .status = @enumFromInt(503),
+                            .status = @fromBackingInt(@intCast(503)),
                             .keep_alive = false,
                             .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
                         });
@@ -836,7 +836,7 @@ pub const StdHttpListener = struct {
                 _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
                 if (consumes_expensive_slot) {
                     try request.respond("query cancellation capacity unavailable", .{
-                        .status = @enumFromInt(503),
+                        .status = @fromBackingInt(@intCast(503)),
                         .keep_alive = false,
                         .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
                     });
@@ -902,7 +902,7 @@ pub const StdHttpListener = struct {
         }
 
         try request.respond(response.body, .{
-            .status = @enumFromInt(response.status),
+            .status = @fromBackingInt(@intCast(response.status)),
             .keep_alive = false,
             .extra_headers = extra_headers,
         });
@@ -924,7 +924,7 @@ pub const StdHttpListener = struct {
             };
         }
 
-        fn startResponse(ptr: *anyopaque, alloc: std.mem.Allocator, response: common.StreamingResponse) !void {
+        pub fn startResponse(ptr: *anyopaque, alloc: std.mem.Allocator, response: common.StreamingResponse) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.body_writer != null) return error.ResponseAlreadyStarted;
 
@@ -947,7 +947,7 @@ pub const StdHttpListener = struct {
 
             self.body_writer = try self.request.respondStreaming(self.buffer, .{
                 .respond_options = .{
-                    .status = @enumFromInt(response.status),
+                    .status = @fromBackingInt(@intCast(response.status)),
                     .keep_alive = false,
                     .extra_headers = extra_headers,
                 },
@@ -1987,7 +1987,7 @@ test "std http listener recovers after 128 real clients abandon saturated querie
 
     const bound_addr = listener.boundAddress() orelse return error.TestUnexpectedResult;
     const client_io = std.Io.Threaded.global_single_threaded.io();
-    var clients = [_]?std.Io.net.Stream{null} ** 128;
+    var clients = @as([128]?std.Io.net.Stream, @splat(null));
     defer for (&clients) |*slot| {
         if (slot.*) |*client| client.close(client_io);
         slot.* = null;
@@ -2652,7 +2652,7 @@ test "std http listener retains a bounded worker plateau and recovers descriptor
     var warmed_thread_ceiling: ?usize = null;
 
     for (0..rounds) |_| {
-        var clients = [_]?std.Io.net.Stream{null} ** batch_size;
+        var clients = @as([batch_size]?std.Io.net.Stream, @splat(null));
         defer for (&clients) |*maybe_stream| {
             if (maybe_stream.*) |*stream| stream.close(client_io);
         };

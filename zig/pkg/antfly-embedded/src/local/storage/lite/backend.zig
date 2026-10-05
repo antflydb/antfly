@@ -144,7 +144,7 @@ pub const Handle = struct {
         index_base_path: []u8,
         runtime_store: *backend_erased.Store,
 
-        fn deinit(self: *NamespaceRuntime, allocator: Allocator) void {
+        pub fn deinit(self: *NamespaceRuntime, allocator: Allocator) void {
             self.runtime_store.deinit();
             allocator.destroy(self.runtime_store);
             allocator.free(self.index_base_path);
@@ -963,10 +963,10 @@ test "lite backend capabilities contract is stable" {
         "object_storage_primary",
     };
 
-    const fields = @typeInfo(Capabilities).@"struct".fields;
-    try std.testing.expectEqual(expected_fields.len, fields.len);
-    inline for (fields, 0..) |field, i| {
-        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    const field_names = @typeInfo(Capabilities).@"struct".field_names;
+    try std.testing.expectEqual(expected_fields.len, field_names.len);
+    inline for (field_names, 0..) |reflected_name, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], reflected_name);
     }
 
     const allocator = std.testing.allocator;
@@ -1040,10 +1040,10 @@ test "lite backend inference status reports disabled as clean state" {
         "process_memory_limit_source",
     };
 
-    const fields = @typeInfo(InferenceStatus).@"struct".fields;
-    try std.testing.expectEqual(expected_fields.len, fields.len);
-    inline for (fields, 0..) |field, i| {
-        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    const field_names = @typeInfo(InferenceStatus).@"struct".field_names;
+    try std.testing.expectEqual(expected_fields.len, field_names.len);
+    inline for (field_names, 0..) |reflected_name, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], reflected_name);
     }
 
     const status = inferenceStatusForProfile(.native);
@@ -1370,7 +1370,7 @@ test "lite backend auto rejects invalid native headers without fallback" {
     defer allocator.free(unsupported_version_path);
 
     {
-        var encoded: [native.header_size]u8 = .{0} ** native.header_size;
+        var encoded: [native.header_size]u8 = @splat(0);
         @memcpy(encoded[0.."AFLITE0X".len], "AFLITE0X");
         var file = try std.Io.Dir.cwd().createFile(std.testing.io, invalid_magic_path, .{});
         defer file.close(std.testing.io);

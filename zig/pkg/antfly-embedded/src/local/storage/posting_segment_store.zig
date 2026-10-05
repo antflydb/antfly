@@ -1057,7 +1057,7 @@ pub const Store = struct {
                 bytes += extent.committed_bytes;
                 if (bytes != prefix_bytes or extent.covered_source_sequence != covered_source_sequence) continue;
                 var remaining = current;
-                remaining.sealed_wals = [_]posting_wal.Checkpoint.SealedWal{.{}} ** posting_wal.Checkpoint.max_sealed_wals;
+                remaining.sealed_wals = @as([posting_wal.Checkpoint.max_sealed_wals]posting_wal.Checkpoint.SealedWal, @splat(.{}));
                 remaining.sealed_wal_count = @intCast(current.sealed_wal_count - i - 1);
                 @memcpy(remaining.sealed_wals[0..remaining.sealed_wal_count], current.sealed_wals[i + 1 .. current.sealed_wal_count]);
                 reused_wals = remaining;

@@ -24,7 +24,7 @@ const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 
-fn lockCatalogMutation(service: anytype) bool {
+pub fn lockCatalogMutation(service: anytype) bool {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -35,7 +35,7 @@ fn lockCatalogMutation(service: anytype) bool {
     return true;
 }
 
-fn unlockCatalogMutation(service: anytype, locked: bool) void {
+pub fn unlockCatalogMutation(service: anytype, locked: bool) void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
@@ -1323,7 +1323,7 @@ test "extension lifecycle binds public scope to durable table identity" {
     const Service = struct {
         store: FakeStore = .{},
         metadata_group_id: u64 = 1,
-        fn projectedStore(self: *@This()) ?*FakeStore {
+        pub fn projectedStore(self: *@This()) ?*FakeStore {
             return &self.store;
         }
     };

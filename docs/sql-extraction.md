@@ -364,7 +364,7 @@ backing allocations fell from 68,120 to 2,585 (96.2%), cumulative allocated
 bytes from 123,311,135 to 96,572,855, and peak tracked memory remained about
 1.29 MB. The fixture aggregates its 32,640 matches to isolate join processing
 from result materialization. Reproduce the allocation budget with
-`zig build sql-test -Doptimize=ReleaseSafe -- --test-filter 'SQL high fanout join'`.
+`zig build sql-test -Doptimize=safe -- --test-filter 'SQL high fanout join'`.
 These allocator measurements are not production-throughput evidence or a
 complete release gate.
 
@@ -3284,7 +3284,7 @@ Runtime tests saturate producer admission while admitting a finalize hint, and
 verify scheduler refusal and shutdown release the exact queue reservations.
 These are component guarantees, not deployment activation proof.
 
-Focused checks (from `zig/`, with `-Doptimize=Debug`):
+Focused checks (from `zig/`, with `-Doptimize=debug`):
 
 - `zig build antfly-ordered-artifact-test`
 - `zig build antfly-retained-transfer-test`

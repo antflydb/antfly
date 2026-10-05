@@ -17,7 +17,7 @@ pub fn borrow(alloc: std.mem.Allocator, txn: *erased.ReadTxn) erased.Store {
     } };
 }
 
-fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 fn capabilities(_: *anyopaque) types.Capabilities {
     return .{ .read_snapshots = .snapshot };
 }

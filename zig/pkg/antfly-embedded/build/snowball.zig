@@ -49,7 +49,7 @@ pub const snowball_compiler_sources = [_][]const u8{
 };
 
 pub fn addSnowballModule(b: *std.Build, antfly_mod: *std.Build.Module) void {
-    const snowball_mod = b.addModule("snowball", .{
+    const snowball_mod = b.createModule(.{
         .root_source_file = b.path(snowball_generated_root ++ "/root.zig"),
     });
 
@@ -99,7 +99,7 @@ fn formatGenerated(b: *std.Build, source: std.Build.LazyPath, basename: []const 
     // Formatting produces a separate cached file; the compiler's output stays immutable.
     const fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--stdin" });
     fmt.step.name = b.fmt("format Snowball {s}", .{basename});
-    fmt.addFileInput(.{ .cwd_relative = b.graph.zig_exe });
+    fmt.addFileInput(b.graph.cwdRelativePath(b.graph.zig_exe));
     fmt.setStdIn(.{ .lazy_path = source });
     return fmt.captureStdOut(.{ .basename = basename });
 }
@@ -121,11 +121,11 @@ pub fn addSnowballGeneratedOutputs(
     var stemmers: [snowball_languages.len]std.Build.LazyPath = undefined;
     inline for (snowball_languages, 0..) |lang, idx| {
         const run = b.addRunArtifact(snowball_compiler);
-        run.addFileArg(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})));
+        run.addFileArg2(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})), .{ .make_absolute = true });
         run.addArg("-zig");
         run.addArg("-o");
         const basename = b.fmt("{s}_stemmer.zig", .{lang});
-        stemmers[idx] = formatGenerated(b, run.addOutputFileArg(basename), basename);
+        stemmers[idx] = formatGenerated(b, run.addOutputFileArg2(basename, .{ .make_absolute = true }), basename);
     }
 
     return .{
@@ -151,13 +151,13 @@ pub fn addSteps(b: *std.Build) struct {
 
     const compare_tool = addFileCompareTool(b, b.path("tools"));
     const compare = b.addRunArtifact(compare_tool);
-    compare.addFileArg(generated.root);
-    compare.addFileArg(b.path(snowball_generated_root ++ "/root.zig"));
-    compare.addFileArg(generated.env);
-    compare.addFileArg(b.path(snowball_generated_root ++ "/env.zig"));
+    compare.addFileArg2(generated.root, .{ .make_absolute = true });
+    compare.addFileArg2(b.path(snowball_generated_root ++ "/root.zig"), .{ .make_absolute = true });
+    compare.addFileArg2(generated.env, .{ .make_absolute = true });
+    compare.addFileArg2(b.path(snowball_generated_root ++ "/env.zig"), .{ .make_absolute = true });
     for (snowball_languages, 0..) |lang, idx| {
-        compare.addFileArg(generated.stemmers[idx]);
-        compare.addFileArg(b.path(snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang})));
+        compare.addFileArg2(generated.stemmers[idx], .{ .make_absolute = true });
+        compare.addFileArg2(b.path(snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang})), .{ .make_absolute = true });
     }
     return .{ .regen = update, .compare = compare };
 }

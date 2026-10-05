@@ -36,7 +36,7 @@ pub fn open(
         !validBool(request.model_commit_backend_completions) or request.path.len == 0)
         return .invalid_argument;
 
-    const path = alloc.dupeZ(u8, request.path.slice()) catch return .out_of_memory;
+    const path = alloc.dupeSentinel(u8, request.path.slice(), 0) catch return .out_of_memory;
     defer alloc.free(path);
     const group_commit_max_requests = std.math.cast(usize, request.group_commit_max_requests) orelse
         return .invalid_argument;

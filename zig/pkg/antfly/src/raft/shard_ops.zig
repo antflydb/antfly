@@ -208,7 +208,7 @@ pub const OwnedShardOperationAdapter = struct {
     };
 
     var registry_buckets: [registry_bucket_count]RegistryBucket =
-        [_]RegistryBucket{.{}} ** registry_bucket_count;
+        @as([registry_bucket_count]RegistryBucket, @splat(.{}));
     var next_context_id: std.atomic.Value(u64) = .init(1);
 
     const AdmissionTest = if (builtin.is_test) struct {
@@ -253,7 +253,7 @@ pub const OwnedShardOperationAdapter = struct {
     const CallLease = struct {
         state: *State,
 
-        fn deinit(self: *CallLease) void {
+        pub fn deinit(self: *CallLease) void {
             const state = self.state;
             state.lock();
             std.debug.assert(state.active_calls > 0);

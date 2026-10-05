@@ -209,7 +209,7 @@ Pull-request CI runs fast required checks:
 
 - `zig build check-snowball`
 - `make zig-unit-test`
-- `zig build -Doptimize=ReleaseFast antfly`
+- `zig build -Doptimize=fast antfly`
 - shared release-binary smoke checks
 - `e2e-base`
 - TLA checks when relevant files change
@@ -365,7 +365,7 @@ external-service, model, browser, or slow integration coverage. Run the same
 base tier locally with the release binaries:
 
 ```sh
-zig build -Doptimize=ReleaseFast antfly
+zig build -Doptimize=fast antfly
 
 ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/antfly pytest -q \
   -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow" \
@@ -566,10 +566,10 @@ There are no separate algebraic test or guardrail targets. Benchmark sweeps use
 
 ## Retrieval agent contracts
 
-`zig build antfly-retrieval-test -Doptimize=ReleaseFast` runs the retrieval
+`zig build antfly-retrieval-test -Doptimize=fast` runs the retrieval
 contracts, including tree retrieval and model-directed graph navigation, without
 the separate HTTP-linked serving harness. To select the navigation regressions:
 
 ```sh
-zig build antfly-retrieval-test -Doptimize=ReleaseFast -- --test-filter 'retrieval graph navigation'
+zig build antfly-retrieval-test -Doptimize=fast -- --test-filter 'retrieval graph navigation'
 ```

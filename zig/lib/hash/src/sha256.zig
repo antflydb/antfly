@@ -393,7 +393,7 @@ test "SHA256 optional instruction path is exercised when present" {
     if (!hardwareAvailable()) return error.SkipZigTest;
     var expected: [32]u8 = undefined;
     var actual: [32]u8 = undefined;
-    const bytes = [_]u8{0x71} ** 8193;
+    const bytes = @as([8193]u8, @splat(0x71));
     RuntimeSha256.hash(&bytes, &expected, .{ .portable = true });
     RuntimeSha256.hash(&bytes, &actual, .{});
     try std.testing.expectEqualSlices(u8, &expected, &actual);

@@ -52,7 +52,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                     .id = addId(spec),
                     .name = "storage.index_manager.add_doc",
                     .kind = .workload,
-                    .parameter = @intFromEnum(spec),
+                    .parameter = @backingInt(spec),
                 });
             }
             try list.append(allocator, .{ .id = reopen_id, .name = "storage.index_manager.reopen", .kind = .maintenance });
@@ -82,7 +82,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                 try events.emitNamed(allocator, .state_change, "storage.index_manager.split_handoff_complete", world.decisions);
                 return vopr.outcome.TransitionOutcome.applied();
             }
-            const spec: fixture.DocSpec = @enumFromInt(@as(u2, @intCast(selected.parameter)));
+            const spec: fixture.DocSpec = @fromBackingInt(@as(u2, @intCast(selected.parameter)));
             if (selected.id != addId(spec)) return error.UnknownIndexManagerVoprTransition;
             try world.harness.apply(.{ .add_doc = spec });
             try events.emitNamed(allocator, .client_response, "storage.index_manager.document_acknowledged", @intCast(selected.parameter));
@@ -136,7 +136,7 @@ pub fn replay(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !
 }
 
 fn addId(spec: fixture.DocSpec) u64 {
-    return vopr.id.derive("storage.index_manager.doc", add_base, @intFromEnum(spec));
+    return vopr.id.derive("storage.index_manager.doc", add_base, @backingInt(spec));
 }
 
 fn runRecordReplay(seed: u64) !void {

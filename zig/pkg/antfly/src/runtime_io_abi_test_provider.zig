@@ -9,7 +9,6 @@ const vtable: std.Io.VTable = blk: {
     table.dirOpenFile = open;
     table.sleep = sleep;
     table.operate = operate;
-    table.netSend = send;
     table.fileWriteFilePositional = copyFile;
     table.batchAwaitAsync = batchAwait;
     break :blk table;
@@ -24,12 +23,11 @@ fn sleep(ptr: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
     return std.Options.debug_io.vtable.sleep(ptr, timeout);
 }
 fn operate(ptr: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-    if (inject) return .{ .file_read_streaming = error.InputOutput };
+    if (inject) return switch (operation) {
+        .net_send => .{ .net_send = .{ error.NetworkDown, 0 } },
+        else => .{ .file_read_streaming = error.InputOutput },
+    };
     return std.Options.debug_io.vtable.operate(ptr, operation);
-}
-fn send(ptr: ?*anyopaque, socket: std.Io.net.Socket.Handle, messages: []std.Io.net.OutgoingMessage, flags: std.Io.net.SendFlags) struct { ?std.Io.net.Socket.SendError, usize } {
-    if (inject) return .{ error.NetworkDown, 0 };
-    return std.Options.debug_io.vtable.netSend(ptr, socket, messages, flags);
 }
 fn copyFile(ptr: ?*anyopaque, file: std.Io.File, header: []const u8, reader: *std.Io.File.Reader, limit: std.Io.Limit, offset: u64) std.Io.File.WriteFilePositionalError!usize {
     if (inject) {

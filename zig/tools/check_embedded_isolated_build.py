@@ -13,7 +13,7 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Compile public C API and browser artifacts without server implementations."""
+"""Compile lake, public C API, and browser artifacts without server implementations."""
 
 from __future__ import annotations
 
@@ -130,6 +130,7 @@ def main() -> None:
                 "lite",
                 "capi-smoke",
                 "embedded-capi-check",
+                "embedded-lake-test",
                 "embedded-native-module-boundary-check",
                 "embedded-wasm-module-boundary-check",
                 "wasm-test",

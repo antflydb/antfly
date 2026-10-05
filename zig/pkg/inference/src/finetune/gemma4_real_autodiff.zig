@@ -1143,7 +1143,7 @@ pub fn saveTrainerAsGemmaBundle(
     var adapter_inspect = try gemma4.inspectCheckpoint(allocator, adapter_model_dir);
     defer gemma4.freeInspectionSummary(allocator, &adapter_inspect);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, gemma4.adapter_checkpoint_file_name });
     defer allocator.free(adapter_checkpoint_path);
     const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, gemma4.adapter_config_file_name });
@@ -1327,9 +1327,9 @@ fn projectHiddenRowsToLogits(
     }
     if (leading_count != 1) return error.InvalidPreferenceReadback;
 
-    var starts = [_]i64{0} ** ml.graph.shape.max_rank;
-    var limits = [_]i64{0} ** ml.graph.shape.max_rank;
-    var strides = [_]i64{1} ** ml.graph.shape.max_rank;
+    var starts = @as([ml.graph.shape.max_rank]i64, @splat(0));
+    var limits = @as([ml.graph.shape.max_rank]i64, @splat(0));
+    var strides = @as([ml.graph.shape.max_rank]i64, @splat(1));
     for (hidden_shape.dims[0..rank], 0..) |dim, idx| limits[idx] = dim;
     starts[row_axis] = @intCast(row_start);
     limits[row_axis] = @intCast(row_start + row_count);
@@ -1695,18 +1695,18 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
     for (tensors) |tensor| {
         for (tensor.data) |item| {
             const bits: u32 = @bitCast(item);
             var bits_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &bits_buf, bits, .little);
-            try file.writeStreamingAll(compat.io(), &bits_buf);
+            try file.writeStreamingAll(compat.testingIo(), &bits_buf);
         }
     }
 }
@@ -1748,7 +1748,7 @@ fn writeAdapterConfigJson(
             .target_modules = target_modules,
         }, .{ .whitespace = .indent_2 }, &buffer.writer);
     }
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn copySupportingArtifactIfPresent(
@@ -1762,7 +1762,7 @@ fn copySupportingArtifactIfPresent(
     defer allocator.free(contents);
     const dst_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst_path, .data = contents });
 }
 
 test "makeTrainerInputForExample builds masked one-hot targets" {

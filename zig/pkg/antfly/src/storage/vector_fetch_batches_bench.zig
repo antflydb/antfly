@@ -28,7 +28,7 @@ const Worker = struct {
     requests: [256]native.ExactReadRequest = undefined,
     payload: [256 * 1536 * 4]u8 = undefined,
     fn add(self: *@This(), stats: native.ReadBatchStats) void {
-        inline for (std.meta.fields(native.ReadDispatchStats)) |f| @field(self.stats, f.name) += @field(stats.dispatch, f.name);
+        inline for (comptime std.meta.fieldNames(native.ReadDispatchStats)) |f_name| @field(self.stats, f_name) += @field(stats.dispatch, f_name);
         self.reads += stats.physical_reads;
         self.bytes += stats.physical_bytes;
     }
@@ -146,7 +146,7 @@ test "vector block complete fetch batch replay benchmark" {
                 try std.testing.expectEqual(expected_checksum *% repeats, w.checksum);
                 try std.testing.expectEqual(if (manager.dense_exact_mapped) 0 else expected_reads * repeats, w.reads);
                 try std.testing.expectEqual(if (manager.dense_exact_mapped) 0 else expected_bytes * repeats, w.bytes);
-                inline for (std.meta.fields(native.ReadDispatchStats)) |f| @field(total, f.name) += @field(w.stats, f.name);
+                inline for (comptime std.meta.fieldNames(native.ReadDispatchStats)) |f_name| @field(total, f_name) += @field(w.stats, f_name);
             }
             try std.testing.expectEqual(@as(u32, 0), manager.denseReadTaskStats().active);
             std.debug.print("fetch_replay {f}\n", .{std.json.fmt(.{ .pipeline = pipeline, .mapped = manager.dense_exact_mapped, .aggregate = manager.dense_aggregate_admission, .bypass = bypass, .concurrency = concurrency, .round = round, .inline_reads = inline_reads, .single_helper = single_helper, .split = split, .profiled = manager.dense_read_profile, .logical_batches = batches.len * repeats * concurrency, .reads = if (manager.dense_exact_mapped) 0 else expected_reads * repeats * concurrency, .bytes = if (manager.dense_exact_mapped) 0 else expected_bytes * repeats * concurrency, .elapsed_ns = elapsed, .cpu_ns = cpu_elapsed, .dispatch = total }, .{})});

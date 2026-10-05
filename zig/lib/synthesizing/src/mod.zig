@@ -256,7 +256,7 @@ const OpenAiSynthesizerState = struct {
         };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *OpenAiSynthesizerState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.base_url);
         self.alloc.free(self.model);

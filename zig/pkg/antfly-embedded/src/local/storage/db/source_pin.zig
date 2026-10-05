@@ -44,8 +44,8 @@ const CleanupCursor = struct {
         @memcpy(buffer[0..4], "SGC1");
         buffer[4..28].* = self.namespace;
         buffer[28..60].* = self.pin;
-        buffer[60] = @intFromEnum(self.mode);
-        buffer[61] = @intFromEnum(self.tree);
+        buffer[60] = @backingInt(self.mode);
+        buffer[61] = @backingInt(self.tree);
         std.mem.writeInt(u16, buffer[62..64], @intCast(self.directory.len), .little);
         @memcpy(buffer[64..][0..self.directory.len], self.directory.bytes());
         const body_len = 64 + self.directory.len;

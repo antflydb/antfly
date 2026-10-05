@@ -1214,7 +1214,7 @@ pub const ApiHttpClient = struct {
             status: u16 = 0,
             error_body: std.ArrayListUnmanaged(u8) = .empty,
 
-            fn deinit(adapter: *@This()) void {
+            pub fn deinit(adapter: *@This()) void {
                 adapter.error_body.deinit(adapter.alloc);
             }
 
@@ -4099,10 +4099,10 @@ test "relational row query remote transaction prepare preserves scalar validatio
     };
     var executor: Executor = .{ .status = 400, .body = "" };
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
-    inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.?) |field| {
-        const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field.name);
+    inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+        const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
         executor.status = @import("relational_row_errors.zig").status(reason);
-        executor.body = field.name;
+        executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
     executor.status = 500;
@@ -4465,7 +4465,7 @@ fn consumerTests() type {
                 .table_name = "docs",
                 .index_name = "semantic_idx",
                 .indexes_json = "{}",
-                .indexes_digest = [_]u8{0x11} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .indexes_digest = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x11)),
             };
             var executor = Executor{ .status = 200, .body = "{\"state\":\"accepted\",\"serviceable\":false,\"error_code\":null}" };
             var client = ApiHttpClient.init(std.testing.allocator, executor.iface());
@@ -4479,16 +4479,16 @@ fn consumerTests() type {
             try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.observed, observed.state);
             try std.testing.expect(observed.serviceable);
 
-            inline for (std.meta.fields(metadata_mod.IndexActivationProgress.FailureCode)) |field| {
+            inline for (comptime std.meta.fieldNames(metadata_mod.IndexActivationProgress.FailureCode)) |reflected_name| {
                 executor.body = try std.fmt.allocPrint(
                     std.testing.allocator,
                     "{{\"state\":\"action_required\",\"serviceable\":false,\"error_code\":\"{s}\"}}",
-                    .{field.name},
+                    .{reflected_name},
                 );
                 defer std.testing.allocator.free(@constCast(executor.body));
                 const progress = try client.activateGroupIndex("http://127.0.0.1:8080", target);
                 try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.action_required, progress.state);
-                try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, field.name), progress.error_code.?);
+                try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, reflected_name), progress.error_code.?);
             }
 
             executor = .{ .status = 400, .body = "InvalidArgument" };
@@ -4522,7 +4522,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(alloc, 503, "write unavailable"));
             try std.testing.expectEqual(error.TransactionPrepareAbortedUnavailable, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true}"));
             try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":false}"));
-            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true,\"padding\":\"" ++ ("x" ** 1024) ++ "\"}"));
+            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}"));
             try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(alloc, 409, "standby is read-only"));
         }
 
@@ -5507,9 +5507,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
             ));
@@ -5544,9 +5544,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
                 .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
@@ -5581,9 +5581,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
                 .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
@@ -5776,7 +5776,7 @@ fn consumerTests() type {
                 empty_splits: [0]@import("../metadata/transition_state.zig").SplitTransitionRecord = .{},
                 empty_merges: [0]@import("../metadata/transition_state.zig").MergeTransitionRecord = .{},
 
-                fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                     if (self.owns_created_table and self.created_table != null) {
                         metadata_table_manager.freeTable(alloc, self.created_table.?);
                     }
@@ -5832,7 +5832,7 @@ fn consumerTests() type {
 
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-                fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
+                pub fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.created = true;
                     _ = table_name;
@@ -5849,7 +5849,7 @@ fn consumerTests() type {
                     self.owns_created_table = false;
                 }
 
-                fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) !void {
+                pub fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.owns_created_table and self.created_table != null) {
                         metadata_table_manager.freeTable(alloc, self.created_table.?);
@@ -5859,7 +5859,7 @@ fn consumerTests() type {
                     self.owns_created_table = false;
                 }
 
-                fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, schema_json: []const u8) !void {
+                pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, schema_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.created_table) |*table| {
                         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
@@ -5898,7 +5898,7 @@ fn consumerTests() type {
                     };
                 }
 
-                fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const next = try @import("indexes.zig").addIndexToTableIndexesJson(alloc, self.indexes_json, index_name, index_json);
                     if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
@@ -5917,7 +5917,7 @@ fn consumerTests() type {
                     self.owns_created_table = true;
                 }
 
-                fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
+                pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const next = (try @import("indexes.zig").removeIndexFromTableIndexesJson(alloc, self.indexes_json, index_name)) orelse return error.IndexNotFound;
                     if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
@@ -6341,7 +6341,7 @@ fn consumerTests() type {
                     return error.UnsupportedOperation;
                 }
 
-                fn commitTransaction(
+                pub fn commitTransaction(
                     _: *anyopaque,
                     _: std.mem.Allocator,
                     _: []const txn_api.TableCommitRequest,
@@ -6500,4 +6500,15 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

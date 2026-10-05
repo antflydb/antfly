@@ -72,7 +72,7 @@ test "graph retirement digest matches production index config extraction for exp
         try std.testing.expectEqualDeep((try graphRetirementDigest(alloc, 100, 200, indexes_json)).?, graph_config.retirementDigest(100, 200, (try graph_config.fromLoaded(alloc, &.{loaded})).?));
     }
 }
-pub const ProvisioningProjection = @import("antfly_local_sources").metadata_restore_provisioning_contract.ProvisioningProjection;
+pub const ProvisioningProjection = @import("restore_provisioning_contract.zig").ProvisioningProjection;
 pub const ProvisioningRequest = struct { node_id: u64 };
 
 pub fn scopeProvisioningForNode(alloc: std.mem.Allocator, projection: ProvisioningProjection, node_id: u64, placements: []const @import("../raft/reconciler.zig").PlacementIntent) !ProvisioningProjection {
@@ -169,7 +169,7 @@ pub const ProvisioningSnapshot = struct {
 /// external parent activates its generation tombstone. Cancellation after
 /// this point would revive old children without their inverse references.
 pub const State = enum { importing, validating, cutover, activating, published, canceling, canceled, preparing_sources };
-pub const SourceArtifact = @import("antfly_local_sources").metadata_restore_provisioning_contract.SourceArtifact;
+pub const SourceArtifact = @import("restore_provisioning_contract.zig").SourceArtifact;
 pub const SourceRangeGenerationAdmissions = struct {
     target_group_id: u64,
     source_namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace,
@@ -909,7 +909,7 @@ pub fn generationHandoffOldFenceDigest(fence: @import("antfly_local_sources").st
     hash.update("antfly old owner graph and generation handoff v1");
     hash.update(&try fence.encode());
     hash.update(&handoff_seal_digest);
-    hash.update(if (graph_seal_digest) |digest| &digest else &([_]u8{0} ** 32));
+    hash.update(if (graph_seal_digest) |digest| &digest else &(@as([32]u8, @splat(0))));
     var result: Digest = undefined;
     hash.final(&result);
     return result;
@@ -1262,11 +1262,11 @@ pub const ParentActivationDecision = struct {
 
 fn writeAuthority(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
-    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |field| {
-        try stream.objectField(field.name);
-        if (comptime std.mem.eql(u8, field.name, "plan_id") or std.mem.eql(u8, field.name, "receipt")) {
-            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(@field(value, field.name), stream);
-        } else try stream.write(@field(value, field.name));
+    inline for (comptime std.meta.fieldNames(@TypeOf(value))) |reflected_name| {
+        try stream.objectField(reflected_name);
+        if (comptime std.mem.eql(u8, reflected_name, "plan_id") or std.mem.eql(u8, reflected_name, "receipt")) {
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(@field(value, reflected_name), stream);
+        } else try stream.write(@field(value, reflected_name));
     }
     try stream.endObject();
 }

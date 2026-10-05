@@ -466,14 +466,14 @@ const HttpExtractorState = struct {
         return .{ .ptr = state, .vtable = &.{ .extract = extract, .deinit = deinit } };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *HttpExtractorState = @ptrCast(@alignCast(ptr));
         self.cfg.deinit(self.alloc);
         if (self.source_table) |source_table| self.alloc.free(source_table);
         self.alloc.destroy(self);
     }
 
-    fn extract(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
+    pub fn extract(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror!Response {
         const self: *HttpExtractorState = @ptrCast(@alignCast(ptr));
         const metadata = try requestJsonAlloc(alloc, self.cfg, req);
         defer alloc.free(metadata);
@@ -1013,7 +1013,7 @@ test "extracting response envelope ownership and exact extension numbers survive
 
 test "extracting response envelope bounds nesting before allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const deeply_nested = "[" ** 65 ++ "0" ++ "]" ** 65;
+    const deeply_nested = z17RepeatString("[", 65) ++ "0" ++ z17RepeatString("]", 65);
     try std.testing.expectError(error.InvalidExtractionResponse, parseResponse(failing.allocator(), deeply_nested, .{ .item_count = 1 }));
     try std.testing.expectError(error.InvalidExtractionResponse, parseResponse(failing.allocator(), "{}", .{ .item_count = 1, .max_response_bytes = 1 }));
 }
@@ -1116,4 +1116,15 @@ test "extracting antfly provider posts canonical extract request" {
     if (run_err) |err| return err;
     defer result.?.deinit();
     try std.testing.expect(std.mem.indexOf(u8, result.?.json, "\"object\":\"extraction\"") != null);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

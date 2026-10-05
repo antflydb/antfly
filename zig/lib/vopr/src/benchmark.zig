@@ -358,7 +358,7 @@ pub const BugResult = struct {
         var seen: [5]bool = @splat(false);
         for (self.strategies) |result| {
             try result.validate();
-            const ordinal = @intFromEnum(result.strategy);
+            const ordinal = @backingInt(result.strategy);
             if (seen[ordinal]) return error.DuplicateSearchStrategy;
             seen[ordinal] = true;
         }
@@ -457,7 +457,7 @@ fn explorerStrategy(
         .system = "vopr-search-quality-benchmark",
         .histories = histories,
         .transition_budget = Scenario.transition_budget,
-        .seed = @as(u64, 0x5ea2_c420_26) +% @intFromEnum(strategy) +% Scenario.failure_fingerprint,
+        .seed = @as(u64, 0x5ea2_c420_26) +% @backingInt(strategy) +% Scenario.failure_fingerprint,
         .uniform_percent = policy_config.uniform_percent,
         .splice_percent = policy_config.splice_percent,
         .checkpoint_percent = policy_config.checkpoint_percent,
@@ -656,11 +656,11 @@ test "search-quality benchmark repeatedly discovers a multi-bug corpus with ever
     try result.validate();
     try std.testing.expectEqual(@as(usize, 3), result.bugs.len);
     for (result.bugs) |bug| {
-        const starvation = bug.strategies[@intFromEnum(SearchStrategy.starvation)];
+        const starvation = bug.strategies[@backingInt(SearchStrategy.starvation)];
         try std.testing.expectEqual(@as(u64, 1_000_000), starvation.discovery_probability_ppm);
         try std.testing.expectEqual(@as(u64, 64), starvation.repeated_occurrences);
-        try std.testing.expect(bug.strategies[@intFromEnum(SearchStrategy.spliced)].policy_exercises > 0);
-        try std.testing.expect(bug.strategies[@intFromEnum(SearchStrategy.checkpoint_assisted)].policy_exercises > 0);
+        try std.testing.expect(bug.strategies[@backingInt(SearchStrategy.spliced)].policy_exercises > 0);
+        try std.testing.expect(bug.strategies[@backingInt(SearchStrategy.checkpoint_assisted)].policy_exercises > 0);
     }
     const rendered = try result.renderJsonAlloc(std.testing.allocator);
     defer std.testing.allocator.free(rendered);

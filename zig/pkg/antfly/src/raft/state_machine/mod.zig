@@ -94,7 +94,7 @@ pub fn encodeCommittedEntries(alloc: std.mem.Allocator, entries: []const @import
     for (entries) |entry| {
         try appendInt(alloc, &out, u64, entry.term);
         try appendInt(alloc, &out, u64, entry.index);
-        try out.append(alloc, @intFromEnum(entry.entry_type));
+        try out.append(alloc, @backingInt(entry.entry_type));
         try appendInt(alloc, &out, u32, @intCast(entry.data.len));
         try out.appendSlice(alloc, entry.data);
     }
@@ -118,7 +118,7 @@ pub fn decodeCommittedEntries(alloc: std.mem.Allocator, encoded: []const u8) ![]
         const term = try readInt(encoded, &pos, u64);
         const index = try readInt(encoded, &pos, u64);
         if (pos >= encoded.len) return error.InvalidCommittedEntriesEncoding;
-        const entry_type: @import("raft_engine").core.types.EntryType = @enumFromInt(encoded[pos]);
+        const entry_type: @import("raft_engine").core.types.EntryType = @fromBackingInt(@intCast(encoded[pos]));
         pos += 1;
         const data_len = try readInt(encoded, &pos, u32);
         if (pos + data_len > encoded.len) return error.InvalidCommittedEntriesEncoding;

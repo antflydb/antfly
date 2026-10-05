@@ -26,7 +26,7 @@ pub fn conditionIdentity(plan: predicate.Plan) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly partial index conjunct v1");
     hash.update(&plan.tuple.fingerprint);
-    hash.update(&.{ @intFromEnum(plan.op), @intFromBool(plan.operand_null) });
+    hash.update(&.{ @backingInt(plan.op), @intFromBool(plan.operand_null) });
     hash.update(plan.operand);
     var result: [32]u8 = undefined;
     hash.final(&result);

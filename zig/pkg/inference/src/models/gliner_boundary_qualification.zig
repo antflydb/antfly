@@ -116,15 +116,15 @@ pub const LengthContract = struct {
     padded_sequence_tokens: Range,
 
     pub fn valid(self: LengthContract) bool {
-        inline for (@typeInfo(LengthContract).@"struct".fields) |field| {
-            if (!@field(self, field.name).valid()) return false;
+        inline for (comptime std.meta.fieldNames(LengthContract)) |reflected_name| {
+            if (!@field(self, reflected_name).valid()) return false;
         }
         return true;
     }
 
     pub fn contains(self: LengthContract, observed: LengthContract) bool {
-        inline for (@typeInfo(LengthContract).@"struct".fields) |field| {
-            if (!@field(self, field.name).contains(@field(observed, field.name))) return false;
+        inline for (comptime std.meta.fieldNames(LengthContract)) |reflected_name| {
+            if (!@field(self, reflected_name).contains(@field(observed, reflected_name))) return false;
         }
         return true;
     }
@@ -174,15 +174,15 @@ fn fieldLimitError(comptime field_name: []const u8) LengthLimitError {
 /// blame the first field as a conservative default (still a genuine
 /// bounded-length rejection, not an unreviewed request shape).
 fn blamedLengthDimension(entries: []const Entry, previous: u64, observed: LengthContract) LengthLimitError {
-    inline for (@typeInfo(LengthContract).@"struct".fields) |field| {
+    inline for (comptime std.meta.fieldNames(LengthContract)) |reflected_name| {
         var covered = false;
         for (entries, 0..) |entry, index| {
             const bit = @as(u64, 1) << @intCast(index);
-            if (previous & bit != 0 and @field(entry.lengths, field.name).contains(@field(observed, field.name))) covered = true;
+            if (previous & bit != 0 and @field(entry.lengths, reflected_name).contains(@field(observed, reflected_name))) covered = true;
         }
-        if (!covered) return fieldLimitError(field.name);
+        if (!covered) return fieldLimitError(reflected_name);
     }
-    return fieldLimitError(@typeInfo(LengthContract).@"struct".fields[0].name);
+    return fieldLimitError(@typeInfo(LengthContract).@"struct".field_names[0]);
 }
 
 /// Data only. Identity includes all five file sizes and digests, the variant,
@@ -208,7 +208,7 @@ pub const Entry = struct {
 //    (testdata/gliner25/pipeline_cases_base.json) -- entities, relations,
 //    entity attributes, classification, natural/latent/anchorless records,
 //    legacy structures, enum fields, constrained classification, and
-//    JointIE -- via `zig build inference-test -Doptimize=ReleaseFast --
+//    JointIE -- via `zig build inference-test -Doptimize=fast --
 //    --test-filter "gliner boundary"` with ANTFLY_GLINER25_BASE_MODEL_DIR
 //    set to the pulled artifact: "gliner boundary pipeline Python parity
 //    pinned base checkpoint all inference tasks" and "gliner boundary
@@ -621,8 +621,8 @@ fn equalIdentity(expected: bundle.Identity, actual: bundle.Identity) bool {
 }
 
 fn containsFeatures(supported: Features, required: Features) bool {
-    inline for (@typeInfo(Feature).@"enum".fields) |field| {
-        const feature: Feature = @enumFromInt(field.value);
+    inline for (@typeInfo(Feature).@"enum".field_names, @typeInfo(Feature).@"enum".field_values) |_, field_value| {
+        const feature: Feature = @fromBackingInt(field_value);
         if (required.contains(feature) and !supported.contains(feature)) return false;
     }
     return true;
@@ -651,11 +651,11 @@ fn startEntries(entries: []const Entry, consumed: bundle.Identity, backend: Back
         remaining |= @as(u64, 1) << @intCast(index);
     }
     if (remaining == 0) return error.UnsupportedGlinerBoundaryRuntime;
-    return @enumFromInt(remaining);
+    return @fromBackingInt(remaining);
 }
 
 fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: LengthContract) QualificationError!void {
-    const previous = @intFromEnum(candidates.*);
+    const previous = @backingInt(candidates.*);
     candidates.* = .rejected;
     if (!validEntries(entries) or !observed.valid()) return error.UnsupportedGlinerBoundaryRuntime;
     const valid_mask = if (entries.len == max_entries) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(entries.len)) - 1;
@@ -668,7 +668,7 @@ fn narrowEntries(entries: []const Entry, candidates: *Candidates, observed: Leng
         const bit = @as(u64, 1) << @intCast(index);
         if (previous & bit != 0 and entry.lengths.contains(observed)) remaining |= bit;
     }
-    candidates.* = @enumFromInt(remaining);
+    candidates.* = @fromBackingInt(remaining);
     if (remaining == 0) return blamedLengthDimension(entries, previous, observed);
 }
 
@@ -718,15 +718,15 @@ test "boundary qualification production table denies every unreviewed variant pr
     try std.testing.expect(@import("gliner_boundary.zig").runtime_available);
     try std.testing.expect(hasPublishedProfiles());
     var identity = testIdentity();
-    const features = Features.initFull();
-    inline for (@typeInfo(@TypeOf(identity.backbone)).@"enum".fields) |variant| {
-        identity.backbone = @enumFromInt(variant.value);
-        inline for (@typeInfo(@TypeOf(identity.precision)).@"enum".fields) |precision| {
-            identity.precision = @enumFromInt(precision.value);
-            inline for (@typeInfo(Backend).@"enum".fields) |backend| {
+    const features = Features.full;
+    inline for (@typeInfo(@TypeOf(identity.backbone)).@"enum".field_names, @typeInfo(@TypeOf(identity.backbone)).@"enum".field_values) |_, variant_value| {
+        identity.backbone = @fromBackingInt(variant_value);
+        inline for (@typeInfo(@TypeOf(identity.precision)).@"enum".field_names, @typeInfo(@TypeOf(identity.precision)).@"enum".field_values) |_, precision_value| {
+            identity.precision = @fromBackingInt(precision_value);
+            inline for (@typeInfo(Backend).@"enum".field_names, @typeInfo(Backend).@"enum".field_values) |_, backend_value| {
                 try std.testing.expect(!hasQualifiedIdentity(identity));
-                try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, @enumFromInt(backend.value), features));
-                try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, @enumFromInt(backend.value), features, testLengths()));
+                try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, @fromBackingInt(backend_value), features));
+                try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, @fromBackingInt(backend_value), features, testLengths()));
             }
         }
     }
@@ -829,8 +829,8 @@ test "boundary qualification requires one row for a mixed feature contract" {
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{ entity, classification }, entity.identity, .native, mixed.features, entity.lengths));
     try matchEntries(&.{mixed}, entity.identity, .native, mixed.features, entity.lengths);
     try matchEntries(&.{mixed}, entity.identity, .native, entity.features, entity.lengths);
-    inline for (@typeInfo(Feature).@"enum".fields) |field| {
-        const feature: Feature = @enumFromInt(field.value);
+    inline for (@typeInfo(Feature).@"enum".field_names, @typeInfo(Feature).@"enum".field_values) |_, field_value| {
+        const feature: Feature = @fromBackingInt(field_value);
         if (feature != .entities) {
             var required = entity.features;
             required.insert(feature);
@@ -858,25 +858,25 @@ test "boundary qualification keeps source and native JointIE contracts in one ro
 
 test "boundary qualification checks every inclusive geometry endpoint and unit" {
     const row = testEntry();
-    inline for (@typeInfo(LengthContract).@"struct".fields) |field| {
+    inline for (comptime std.meta.fieldNames(LengthContract)) |reflected_name| {
         var observed = row.lengths;
-        const range = @field(row.lengths, field.name);
-        @field(observed, field.name) = Range.exact(range.min);
+        const range = @field(row.lengths, reflected_name);
+        @field(observed, reflected_name) = Range.exact(range.min);
         try matchEntries(&.{row}, row.identity, .native, row.features, observed);
-        @field(observed, field.name) = Range.exact(range.max);
+        @field(observed, reflected_name) = Range.exact(range.max);
         try matchEntries(&.{row}, row.identity, .native, row.features, observed);
         // A single field outside its row's range, with the rest of the
         // contract otherwise valid, is a bounded-length rejection: it must
         // name exactly this field, not the generic error.
-        @field(observed, field.name) = Range.exact(range.max + 1);
-        try std.testing.expectError(fieldLimitError(field.name), matchEntries(&.{row}, row.identity, .native, row.features, observed));
+        @field(observed, reflected_name) = Range.exact(range.max + 1);
+        try std.testing.expectError(fieldLimitError(reflected_name), matchEntries(&.{row}, row.identity, .native, row.features, observed));
         if (range.min != 0) {
-            @field(observed, field.name) = Range.exact(range.min - 1);
-            try std.testing.expectError(fieldLimitError(field.name), matchEntries(&.{row}, row.identity, .native, row.features, observed));
+            @field(observed, reflected_name) = Range.exact(range.min - 1);
+            try std.testing.expectError(fieldLimitError(reflected_name), matchEntries(&.{row}, row.identity, .native, row.features, observed));
         }
         // An internally-invalid range (min > max) is a malformed observation,
         // not a bounded-length rejection: it fails before any row is checked.
-        @field(observed, field.name) = .{ .min = 2, .max = 1 };
+        @field(observed, reflected_name) = .{ .min = 2, .max = 1 };
         try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&.{row}, row.identity, .native, row.features, observed));
     }
     // Few words do not excuse an encoded sequence made large by schema tokens.
@@ -957,7 +957,7 @@ test "boundary qualification rejects malformed or oversized tables before matchi
     const rows: [max_entries + 1]Entry = @splat(row);
     try matchEntries(rows[0..max_entries], row.identity, .native, row.features, row.lengths);
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, matchEntries(&rows, row.identity, .native, row.features, row.lengths));
-    var invalid_selection: Candidates = @enumFromInt(@as(u64, 1) << 63);
+    var invalid_selection: Candidates = @fromBackingInt(@as(u64, 1) << 63);
     try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, narrowEntries(&.{row}, &invalid_selection, row.lengths));
     // Even test-supplied synthetic selections cannot access a production row:
     // the public narrow() always checks against the real production table, so

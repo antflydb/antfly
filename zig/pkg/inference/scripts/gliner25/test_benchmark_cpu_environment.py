@@ -29,7 +29,7 @@ class ThreadBudgetTests(unittest.TestCase):
             "dtype": "float32",
             "threads": 32,
             "qualification": False,
-            "build_mode": "ReleaseFast",
+            "build_mode": "fast",
             "scheduler": "serial_io",
             "cases_sha256": "hash",
             "system_blas": True,

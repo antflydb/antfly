@@ -20,7 +20,7 @@ pub const Backend = struct {
     prefix: []const u8,
     consistency: enum { unsupported, linearizable_cas } = .unsupported,
 
-    fn validate(self: Backend) !void {
+    pub fn validate(self: Backend) !void {
         if (self.consistency != .linearizable_cas) return error.UnsupportedOperation;
         if (self.bucket.len == 0 or (self.prefix.len > 0 and self.prefix[self.prefix.len - 1] == '/')) return error.InvalidArgument;
     }

@@ -37,12 +37,12 @@ baselines. Use the full warmup/iteration protocol below for performance claims.
 
 ```bash
 cd zig/pkg/inference
-zig build bench-qwen3-embedding-e2e -Doptimize=ReleaseFast -- \
+zig build bench-qwen3-embedding-e2e -Doptimize=fast -- \
     --model-dir ~/.antfly/inference/models/<qwen3-embedding> \
     --backend metal --batch 32 --seq-len 256 --warmup 3 --iters 20
 
 # Ragged mode (per-item token lengths, padded to batch max):
-zig build bench-qwen3-embedding-e2e -Doptimize=ReleaseFast -- \
+zig build bench-qwen3-embedding-e2e -Doptimize=fast -- \
     --model-dir ~/.antfly/inference/models/<qwen3-embedding> \
     --lengths 20,256,1024 --warmup 3 --iters 20
 
@@ -321,7 +321,7 @@ present.
 ### Correctness and build evidence
 
 - Fresh serial package production build from `zig/pkg/inference`:
-  `zig build -j1 -Doptimize=ReleaseFast -Dmetal=true -Donnx=false -Dpjrt=false`.
+  `zig build -j1 -Doptimize=fast -Dmetal=true -Donnx=false -Dpjrt=false`.
 - Fresh server with no performance enable flags and
   `TERMITE_EMBED_RESIDENT_FAIL_CLOSED=1`: all 78 q8_0 gates passed, including
   oracle, MRL, batch equivalence, 8192-token truncation, retrieval, and role

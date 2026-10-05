@@ -18,6 +18,7 @@ class LocalTestPartitions(unittest.TestCase):
         self.root = Path(temporary.name)
         for relative in (
             "build_support/antfly/test_partitions.zig",
+            "build_support/antfly/source_paths.zig",
             "pkg/antfly-embedded/build/source_owner.zig",
             "pkg/antfly-embedded/src/local/test_runner.zig",
             "pkg/antfly-embedded/src/local/test_error_logs.zig",
@@ -81,7 +82,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/fixture.zig"),
-        .target = target, .optimize = .Debug,
+        .target = target, .optimize = .debug,
     });
     owner.attach(root);
     const options = b.addOptions();
@@ -89,7 +90,7 @@ pub fn build(b: *std.Build) void {
     root.addOptions("options", options);
     root.addImport("antfly_test_error_logs", b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/local/test_error_logs.zig"),
-        .target = target, .optimize = .Debug,
+        .target = target, .optimize = .debug,
     }));
     const tests = b.addTest(.{
         .name = "fixture", .root_module = root,
@@ -103,7 +104,7 @@ pub fn build(b: *std.Build) void {
         run.addArtifactArg(tests);
         run.addArgs(&.{ "--partition-filter", "owned", "--" });
     }
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("test", "Run both owners").dependOn(&run.step);
     owner.finalize(b);
     if (b.option(bool, "aggregate", "Apply aggregate exclusions") orelse false)
@@ -143,6 +144,11 @@ pub fn build(b: *std.Build) void {
         self.assertIn("test filter matched no declared tests", output)
         self.assertIn("local owned...", self.build("--test-filter=local owned"))
         output = self.build("--test-filter=missing", succeeds=False)
+        self.assertIn("test filter matched no declared tests", output)
+
+    def test_suite_filter_cannot_silently_empty_the_union(self):
+        self.assertIn("local owned...", self.build("--suite-filter", "local owned"))
+        output = self.build("--suite-filter", "missing", succeeds=False)
         self.assertIn("test filter matched no declared tests", output)
 
     def test_script_wrapper_runs_both_owners_and_audits_selection(self):

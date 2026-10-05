@@ -17,7 +17,7 @@ const Identity = record.Identity;
 const KeyProvider = record.KeyProvider;
 const WrappedKey = record.WrappedKey;
 const TestProvider = struct {
-    key: DataKey = [_]u8{7} ** 32,
+    key: DataKey = @as([32]u8, @splat(7)),
     unavailable: bool = false,
     unwrap_calls: usize = 0,
     fn provider(self: *@This()) KeyProvider {
@@ -538,7 +538,7 @@ test "secret backend publication identities distinguish competing deletes and re
 }
 
 test "secret backend S3 opening uses refreshable bootstrap credential sources" {
-    const support = @import("serverless/object_store_support.zig");
+    const support = @import("antfly_local_sources").serverless_object_store_support;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials", .data = "[native-test]\naws_access_key_id = native-access\naws_secret_access_key = native-secret\naws_session_token = native-session\n" });

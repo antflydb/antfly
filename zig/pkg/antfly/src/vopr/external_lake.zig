@@ -8,13 +8,13 @@ const objectstore = @import("objectstore");
 const vopr = @import("vopr");
 const binding_mod = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source = @import("antfly_local_sources").serverless_external_source_types;
-const iceberg_metadata = @import("../serverless/external_source/iceberg_metadata.zig");
-const iceberg_snapshot = @import("../serverless/query/lake_iceberg_snapshot.zig");
-const lake_object_reader = @import("../serverless/query/lake_object_reader.zig");
-const lake = @import("../serverless/query/lake_parquet_rowgroup.zig");
-const range_io = @import("../serverless/query/lake_range_io.zig");
-const lake_rows = @import("../serverless/query/lake_rows.zig");
-const lake_scan_plan = @import("../serverless/query/lake_scan_plan.zig");
+const iceberg_metadata = @import("antfly_local_sources").serverless_external_source_iceberg_metadata;
+const iceberg_snapshot = @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot;
+const lake_object_reader = @import("antfly_local_sources").serverless_query_lake_object_reader;
+const lake = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
+const range_io = @import("antfly_local_sources").serverless_query_lake_range_io;
+const lake_rows = @import("antfly_local_sources").serverless_query_lake_rows;
+const lake_scan_plan = @import("antfly_local_sources").serverless_query_lake_scan_plan;
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
@@ -105,7 +105,7 @@ pub const Scenario = struct {
             return bytes;
         }
 
-        fn read(self: *@This(), object_version: []const u8) ![]u8 {
+        pub fn read(self: *@This(), object_version: []const u8) ![]u8 {
             const object = range_io.ObjectRef{
                 .bucket = "bucket",
                 .key = "table/data.parquet",

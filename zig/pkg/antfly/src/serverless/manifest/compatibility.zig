@@ -17,7 +17,7 @@
 //! artifact family, or required stats sidecar it cannot safely interpret.
 
 const std = @import("std");
-const artifact_ref = @import("artifact_ref.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const Policy = struct {

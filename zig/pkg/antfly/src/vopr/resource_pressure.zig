@@ -17,7 +17,7 @@ const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const lite_backend = @import("antfly_local_sources").storage_lite_backend;
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
-const lake = @import("../serverless/query/lake_parquet_rowgroup.zig");
+const lake = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
@@ -550,7 +550,7 @@ pub const Scenario = struct {
             resource_manager.Slice.lsm_compaction_work,
             resource_manager.Slice.inference_scratch_working_set,
             resource_manager.Slice.lake_range_cache_queue,
-        }) |slice| options.budgets[@intFromEnum(slice)] = .{ .soft_limit_bytes = 480_000, .hard_limit_bytes = 640_000 };
+        }) |slice| options.budgets[@backingInt(slice)] = .{ .soft_limit_bytes = 480_000, .hard_limit_bytes = 640_000 };
         return options;
     }
 

@@ -36,7 +36,7 @@ pub const Record = struct {
     pub fn encode(self: @This()) [114]u8 {
         var raw: [114]u8 = @splat(0);
         std.mem.writeInt(u64, raw[0..8], self.format_epoch, .little);
-        raw[8] = @intFromEnum(self.state);
+        raw[8] = @backingInt(self.state);
         raw[9] = @intFromBool(self.bidirectional);
         std.mem.writeInt(u64, raw[10..18], self.generation, .little);
         @memcpy(raw[18..50], &self.filter);

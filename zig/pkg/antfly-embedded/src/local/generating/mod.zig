@@ -263,7 +263,7 @@ const BackendState = struct {
         };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
         switch (self.provider) {
             .openai => |*provider| provider.deinit(),

@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const row_fragment = @import("../row_fragment/mod.zig");
+const row_fragment = @import("antfly_local_sources").serverless_row_fragment_mod;
 const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const BuildOptions = struct {

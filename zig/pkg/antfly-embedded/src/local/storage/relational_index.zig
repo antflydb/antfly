@@ -642,8 +642,8 @@ pub const RelationalIndexDefinition = struct {
 
     pub fn fromIndex(index: RelationalIndex) RelationalIndexDefinition {
         var result: RelationalIndexDefinition = undefined;
-        inline for (std.meta.fields(RelationalIndexDefinition)) |field|
-            @field(result, field.name) = @field(index, field.name);
+        inline for (comptime std.meta.fieldNames(RelationalIndexDefinition)) |reflected_name|
+            @field(result, reflected_name) = @field(index, reflected_name);
         return result;
     }
 };

@@ -66,16 +66,16 @@ pub fn create(service: anytype, executor: http.RequestExecutor, capabilities: on
 
 fn validatePreparedFields(request: types.BatchRequest, comptime allowed: []const []const u8) !void {
     const empty: types.BatchRequest = .{};
-    inline for (std.meta.fields(types.BatchRequest)) |field| {
+    inline for (@typeInfo(types.BatchRequest).@"struct".field_names, @typeInfo(types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
         const permitted = comptime blk: {
-            for (allowed) |name| if (std.mem.eql(u8, field.name, name)) break :blk true;
+            for (allowed) |name| if (std.mem.eql(u8, reflected_name, name)) break :blk true;
             break :blk false;
         };
         if (!permitted) {
-            const actual = @field(request, field.name);
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+            const actual = @field(request, reflected_name);
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                 if (actual.len != 0) return error.OnlineMergeReceiptMismatch;
-            } else if (!std.meta.eql(actual, @field(empty, field.name))) return error.OnlineMergeReceiptMismatch;
+            } else if (!std.meta.eql(actual, @field(empty, reflected_name))) return error.OnlineMergeReceiptMismatch;
         }
     }
 }
@@ -99,17 +99,17 @@ fn validatePrepared(state: online.State, operation_kind: @FieldType(io_contract.
         if (actual.kind == .accept and !std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{})) return error.OnlineMergeReceiptMismatch;
         if ((actual.kind == .accept or actual.kind == .rollback) and std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{})) expected.copy_attempt = .{};
         if (!std.meta.eql(actual.copy_attempt, types.MergeCopyAttempt{}) and !std.meta.eql(actual.copy_attempt, state.scope.copy_attempt)) return error.OnlineMergeReceiptMismatch;
-        inline for (std.meta.fields(types.MergeReplicationCheckpoint)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "page_source_catalogs")) {
+        inline for (@typeInfo(types.MergeReplicationCheckpoint).@"struct".field_names, @typeInfo(types.MergeReplicationCheckpoint).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime std.mem.eql(u8, reflected_name, "page_source_catalogs")) {
                 if ((actual.page_source_catalogs == null) != (expected.page_source_catalogs == null)) return error.OnlineMergeReceiptMismatch;
                 if (actual.page_source_catalogs) |left| {
                     const right = expected.page_source_catalogs.?;
                     if (!std.mem.eql(u8, left.indexes, right.indexes) or !std.mem.eql(u8, left.enrichments, right.enrichments) or
                         !std.mem.eql(u8, left.resolvers, right.resolvers)) return error.OnlineMergeReceiptMismatch;
                 }
-            } else if (comptime field.type == []const u8) {
-                if (!std.mem.eql(u8, @field(actual, field.name), @field(expected, field.name))) return error.OnlineMergeReceiptMismatch;
-            } else if (!std.meta.eql(@field(actual, field.name), @field(expected, field.name))) return error.OnlineMergeReceiptMismatch;
+            } else if (comptime field_type == []const u8) {
+                if (!std.mem.eql(u8, @field(actual, reflected_name), @field(expected, reflected_name))) return error.OnlineMergeReceiptMismatch;
+            } else if (!std.meta.eql(@field(actual, reflected_name), @field(expected, reflected_name))) return error.OnlineMergeReceiptMismatch;
         }
         return;
     }

@@ -38,12 +38,12 @@ pub const runtime_library_link_order = [_]RuntimeLibraryUnit{
 };
 
 comptime {
-    const unit_count = std.meta.fields(RuntimeLibraryUnit).len;
+    const unit_count = @typeInfo(RuntimeLibraryUnit).@"enum".field_names.len;
     if (runtime_library_link_order.len != unit_count)
         @compileError("runtime_library_link_order must contain every runtime library unit exactly once");
-    var seen = [_]bool{false} ** unit_count;
+    var seen = @as([unit_count]bool, @splat(false));
     for (runtime_library_link_order) |unit| {
-        const index = @intFromEnum(unit);
+        const index = @backingInt(unit);
         if (seen[index])
             @compileError("runtime_library_link_order contains a duplicate runtime library unit");
         seen[index] = true;
@@ -63,7 +63,7 @@ const addMacosSdkPaths = @import("../../../lib/platform/build_support.zig").addM
 
 pub const AddRuntimeOptions = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     link_libc: bool,
     sanitize_thread: bool,
@@ -81,7 +81,7 @@ pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
     antfly_main: *std.Build.Step.Compile,
     run_linked_inference_abi_integration: *std.Build.Step.Run,
-    runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
+    runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile,
 };
 
 pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
@@ -130,7 +130,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .root_module = antfly_main_mod,
     });
 
-    var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
+    var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
         // The server executable and focused server artifacts reuse their owning
         // runtime units. Public embedded products have independent owners.
@@ -212,7 +212,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
         );
         runtime_unit_step.dependOn(&role_artifact.step);
-        runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
+        runtime_library_artifacts[@backingInt(unit)] = role_artifact;
         if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
@@ -249,12 +249,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .root_module = linked_inference_abi_integration_mod,
     });
     linked_inference_abi_integration.root_module.linkLibrary(
-        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?,
+        runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
-        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
+        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
 
     if (runtime_artifact_role) |role| {
@@ -282,26 +282,26 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_exe.link_gc_sections = true;
         switch (role) {
             .cli => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.cli)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
             },
             .data, .metadata => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?);
             },
             .inference => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
             },
             .standalone => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
             },
         }
         if (role != .inference) {
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.storage_kernel)].?);
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.storage_kernel)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
         }
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);

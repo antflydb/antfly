@@ -186,7 +186,7 @@ pub fn encodeIndexStatusSnapshot(status_snapshot: IndexStatusSnapshot, out: *[in
     var offset: usize = 0;
     inline for (.{
         index_status_magic,
-        @as(u64, @intFromEnum(status_snapshot.kind)),
+        @as(u64, @backingInt(status_snapshot.kind)),
         status_snapshot.doc_count,
         status_snapshot.term_count,
         status_snapshot.edge_count,
@@ -212,11 +212,11 @@ pub fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
     const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
     offset += 8;
     const kind: types.IndexKind = switch (kind_raw) {
-        @intFromEnum(types.IndexKind.full_text) => .full_text,
-        @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
-        @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
-        @intFromEnum(types.IndexKind.graph) => .graph,
-        @intFromEnum(types.IndexKind.algebraic) => .algebraic,
+        @backingInt(types.IndexKind.full_text) => .full_text,
+        @backingInt(types.IndexKind.dense_vector) => .dense_vector,
+        @backingInt(types.IndexKind.sparse_vector) => .sparse_vector,
+        @backingInt(types.IndexKind.graph) => .graph,
+        @backingInt(types.IndexKind.algebraic) => .algebraic,
         else => return error.InvalidIndexStatusSnapshot,
     };
     return .{

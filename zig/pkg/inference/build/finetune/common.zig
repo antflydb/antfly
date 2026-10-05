@@ -50,7 +50,7 @@ pub const Context = struct {
     test_compile_max_rss: usize = 7 * 1024 * 1024 * 1024,
 
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     identities: @import("../jit_identity.zig").Modules,
@@ -176,7 +176,7 @@ pub fn addCommand(ctx: Context, spec: CommandSpec) Command {
 
     const run = b.addRunArtifact(exe);
     run.setCwd(ctx.root orelse b.path("."));
-    if (ctx.args orelse b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     if (ctx.publish_targets) {
         const step = b.step(spec.name, spec.description);
         step.dependOn(&run.step);
@@ -399,9 +399,9 @@ fn configureSystemBlas(ctx: Context, module: *std.Build.Module) void {
         return;
     }
     if (ctx.blas_root) |root| {
-        module.addIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/include", .{root}) });
-        module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = ctx.b.fmt("{s}/lib", .{root}) });
+        module.addIncludePath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/include", .{root})));
+        module.addLibraryPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/lib", .{root})));
+        module.addRPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/lib", .{root})));
     }
     module.linkSystemLibrary("openblas", .{});
 }
@@ -424,13 +424,14 @@ fn configureMetal(
 
 fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
     if (ctx.target.result.os.tag != .macos) return;
-    const sdk_root = ctx.b.sysroot orelse
-        ctx.b.graph.environ_map.get("SDK_PATH") orelse
-        std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse
-        return;
-    module.addSystemIncludePath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = ctx.b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    const sdk_root = ctx.b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // xcrun observes the selected Xcode installation outside configure inputs.
+        ctx.b.graph.poisonCache();
+        break :sdk std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse return;
+    };
+    module.addSystemIncludePath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
@@ -460,5 +461,20 @@ pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {
         .enable_system_blas = ctx.backend.enable_system_blas,
         .blas_root = ctx.backend.blas_root,
         .enable_metal = ctx.backend.enable_metal,
+    };
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
     };
 }

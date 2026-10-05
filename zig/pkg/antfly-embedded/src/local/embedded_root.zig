@@ -70,3 +70,6 @@ pub const antfly_sources = if (@import("builtin").os.tag == .freestanding)
     @import("source_owner_embedded_db.zig")
 else
     @import("source_owner_storage.zig");
+
+// Lake scans currently require native synchronous file/object-store I/O.
+pub const lake = if (@import("builtin").os.tag == .freestanding) struct {} else @import("lake.zig");

@@ -136,9 +136,9 @@ ANTFLY_GLINER25_DECIDE_MODEL_DIR=~/.antfly/inference/models/fastino/GLiNER2.5-De
 ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR=~/.antfly/inference/models/fastino/GLiNER2.5-Decide-Q8_0 \
   zig build inference-test -- --test-filter "GLiNER2.5-Decide"
 
-# Stage latency breakdown (use -Doptimize=ReleaseFast for meaningful numbers)
+# Stage latency breakdown (use -Doptimize=fast for meaningful numbers)
 ANTFLY_GLINER25_DECIDE_BENCH=1 ANTFLY_GLINER25_DECIDE_MODEL_DIR=<model or bundle> \
-  zig build inference-test -Doptimize=ReleaseFast -- --test-filter "Decide Metal latency"
+  zig build inference-test -Doptimize=fast -- --test-filter "Decide Metal latency"
 ```
 
 The model card's "potential outputs" are illustrative: upstream itself returns

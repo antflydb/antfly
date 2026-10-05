@@ -84,6 +84,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             // Accepted for compatibility with the default test runner.
         } else if (std.mem.eql(u8, arg, "--listen=-")) {
             // Accepted defensively; this runner does not implement the server protocol.
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            appendFilter(arena, "--test-filter", &include_filters, arg);
         } else {
             std.debug.panic("unrecognized command line argument: {s}", .{arg});
         }
@@ -165,7 +167,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         // boundary instead of reporting an anonymous signal.
         std.debug.print("{d}/{d} {s}...", .{ current_count, total_count, test_fn.name });
         const setup_start = timingNow(trace_timings, clock_io);
-        testing.allocator_instance = .{};
+        testing.allocator_instance = .init(std.heap.page_allocator, .{});
         testing.io_instance = .init(testing.allocator, .{
             .argv0 = .init(init.args),
             .environ = init.environ,
@@ -201,7 +203,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         const io_end = timingNow(trace_timings, clock_io);
         if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);
         if (trace_cleanup) std.debug.print("CLEANUP allocator_deinit begin {s}\n", .{test_fn.name});
-        if (testing.allocator_instance.deinit() == .leak) {
+        if (testing.allocator_instance.deinit() != 0) {
             leak_count += 1;
         }
         const allocator_end = timingNow(trace_timings, clock_io);
@@ -389,12 +391,12 @@ pub fn log(
     args: anytype,
 ) void {
     @disableInstrumentation();
-    if (@intFromEnum(message_level) <= @intFromEnum(std.log.Level.err)) {
+    if (@backingInt(message_level) <= @backingInt(std.log.Level.err)) {
         _ = log_err_count.fetchAdd(1, .monotonic);
     }
     // Match Zig's default runner: tests may opt into info/debug output via
     // testing.log_level, while warnings and all error accounting stay visible.
-    if (@intFromEnum(message_level) > @intFromEnum(testing.log_level)) return;
+    if (@backingInt(message_level) > @backingInt(testing.log_level)) return;
     std.debug.print("[{s}] ({s}): ", .{
         @tagName(message_level),
         @tagName(scope),

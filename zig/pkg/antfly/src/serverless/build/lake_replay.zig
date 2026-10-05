@@ -20,7 +20,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const rowsource = @import("antfly_local_sources").storage_rowsource_types;
-const source_binding = @import("../segment/source_binding.zig");
+const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
 const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const Buffer = struct {
@@ -130,7 +130,7 @@ const OwnedBatch = struct {
         return owned;
     }
 
-    fn deinit(self: *OwnedBatch, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
         alloc.free(@constCast(self.batch.snapshot.table_id));
         alloc.free(@constCast(self.batch.snapshot.snapshot_id));
         for (self.batch.row_refs) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);

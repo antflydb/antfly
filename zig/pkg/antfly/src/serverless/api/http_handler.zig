@@ -126,7 +126,7 @@ const SearchExecution = struct {
     requested_limit: usize,
     profile_requested: bool,
 
-    fn deinit(self: *SearchExecution, alloc: Allocator) void {
+    pub fn deinit(self: *SearchExecution, alloc: Allocator) void {
         query_mod.freeSearchHits(alloc, self.hits);
         if (self.session) |*session| session.deinit();
         self.status.deinit(alloc);
@@ -146,7 +146,7 @@ const ServerlessAggregationComputation = struct {
     requests: []const db_mod.aggregations.SearchAggregationRequest = &.{},
     results: []db_mod.aggregations.SearchAggregationResult,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         query_api.freeAggregationRequests(alloc, self.requests);
         db_mod.aggregations.deinitResults(alloc, self.results);
         self.* = undefined;
@@ -156,7 +156,7 @@ const ServerlessAggregationComputation = struct {
 const ServerlessAggregationContextOwned = struct {
     ctx: db_mod.aggregations.Context = .{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         distributed_stats_mod.deinitTextFieldStats(alloc, self.ctx.distributed_text_stats);
         db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, self.ctx.distributed_background_text_stats);
         self.* = undefined;
@@ -167,7 +167,7 @@ const SignificantTermFieldSet = struct {
     field: []u8,
     terms: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.field);
         for (self.terms.items) |term| alloc.free(term);
         self.terms.deinit(alloc);
@@ -942,7 +942,7 @@ pub const HttpHandler = struct {
                             .ready => .ready,
                             .rejected => .rejected,
                         };
-                        status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
+                        status.rejection_reason = @fromBackingInt(@backingInt(metric_ref.graph_metric_rejection_reason));
                     }
                 }
                 statuses[initialized] = status;
@@ -3295,7 +3295,7 @@ pub const HttpHandler = struct {
     const PublicGraphMetricColumns = struct {
         columns: []query_mod.graph_metric_reader.ScoreColumn,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.columns) |*column| column.deinit(alloc);
             if (self.columns.len > 0) alloc.free(self.columns);
             self.* = undefined;
@@ -6528,7 +6528,7 @@ const BudgetedMutationOverlay = struct {
     items: []query_materializer.Mutation,
     lease: graph_work_budget_mod.RetainedLease,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         freeMaterializerMutations(alloc, self.items);
         self.lease.deinit();
         self.* = undefined;
@@ -6552,7 +6552,7 @@ const PublicDocumentRef = struct {
     last_lsn: u64,
     last_timestamp_ns: u64,
 
-    fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
+    pub fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
         switch (self.body) {
             .owned => |body| {
                 alloc.free(self.doc_id);
@@ -6606,7 +6606,7 @@ const PublicGraphRequestCache = struct {
         };
     }
 
-    fn deinit(self: *PublicGraphRequestCache) void {
+    pub fn deinit(self: *PublicGraphRequestCache) void {
         if (self.facts_reader) |reader| {
             const alloc = self.facts_allocation.allocator();
             var bodies = self.facts_bodies.iterator();
@@ -6905,7 +6905,11 @@ const PublicGraphRequestCache = struct {
         var application_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, application_peak_bytes);
         defer application_lease.deinit();
 
-        var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
+        var slots = std.ArrayListUnmanaged(PublicDocumentRef){
+            .items = base,
+            .capacity = base.len,
+            .pointer_stability = .{},
+        };
         base = &.{};
         defer {
             for (slots.items) |*slot| slot.deinit(self.handler.alloc);
@@ -9105,7 +9109,7 @@ const ServerlessGraphMetricStatus = struct {
     materializer_fingerprint: u64 = 0,
     published_generation: u64 = 0,
 
-    fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
+    pub fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
         alloc.free(self.index_name);
         alloc.free(self.metric_name);
         self.* = undefined;
@@ -10130,7 +10134,7 @@ const OwnedJsonValueSlice = struct {
     alloc: Allocator,
     values: []std.json.Value,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.values) |*value| deinitJsonValue(self.alloc, value);
         self.alloc.free(self.values);
     }

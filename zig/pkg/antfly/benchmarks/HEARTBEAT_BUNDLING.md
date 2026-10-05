@@ -68,7 +68,7 @@ node-liveness coalescing would require separate correctness work.
 From `zig/lib/raft`:
 
 ```sh
-zig build heartbeat-bench -Doptimize=ReleaseFast
+zig build heartbeat-bench -Doptimize=fast
 ```
 
 The benchmark sends one heartbeat for each of 100, 1,000 and 10,000 idle groups
@@ -103,8 +103,8 @@ count reduction is insufficient if it increases hot-group tail latency or
 changes election behavior.
 
 Retry recovery and HTTP scheduling have separate reproducible targets:
-`zig build retry-bench -Doptimize=ReleaseFast` in `lib/raft`, and
-`ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=ReleaseFast`
+`zig build retry-bench -Doptimize=fast` in `lib/raft`, and
+`ANTFLY_HTTP_SCHEDULER_BENCH=1 zig build antfly-http-scheduler-bench -Doptimize=fast`
 from `zig`. Retry draining compacts survivors in order in one pass. HTTP scheduling
 uses per-peer FIFO queues and a ready-peer list, with one in-flight request per peer
 and condition-variable wakeups. These tests retain byte/frame reservations across

@@ -70,7 +70,7 @@ fn encode(value: Progress) [encoded_size]u8 {
     @memcpy(bytes[4..28], &value.namespace);
     std.mem.writeInt(u64, bytes[28..36], value.consumer_epoch, .little);
     @memcpy(bytes[36..68], &value.pin);
-    bytes[68] = @intFromEnum(value.phase);
+    bytes[68] = @backingInt(value.phase);
     std.mem.writeInt(u64, bytes[69..77], value.start, .little);
     std.mem.writeInt(u64, bytes[77..85], value.acknowledged, .little);
     std.mem.writeInt(u64, bytes[85..93], value.through_sequence, .little);
@@ -78,7 +78,7 @@ fn encode(value: Progress) [encoded_size]u8 {
     @memcpy(bytes[101..133], &value.cut_digest);
     std.mem.writeInt(u64, bytes[133..141], value.admitted_applied_index, .little);
     @memcpy(bytes[141..173], &value.snapshot_certificate);
-    bytes[173] = @intFromEnum(value.snapshot_phase);
+    bytes[173] = @backingInt(value.snapshot_phase);
     @memcpy(bytes[174..206], &value.local_seal_digest);
     bytes[206] = @intFromBool(value.local_cleanup_complete);
     @memset(bytes[certificate_offset..checksum_offset], 0);

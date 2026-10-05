@@ -12,7 +12,7 @@ pub const Error = error{
 };
 
 pub fn classify(err: anyerror) ?Error {
-    inline for (@typeInfo(Error).error_set.?) |field| if (err == @field(Error, field.name)) return @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| if (err == @field(Error, field)) return @field(Error, field);
     return null;
 }
 
@@ -24,8 +24,8 @@ pub const rewrite_required_message = "changing stored generated definitions requ
 
 test "scalar runtime validation excludes resource failures and schema rewrite conflicts" {
     const testing = @import("std").testing;
-    inline for (@typeInfo(Error).error_set.?) |field| {
-        const err = @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| {
+        const err = @field(Error, field);
         try testing.expectEqual(err, classify(err).?);
         try testing.expectEqual(err != error.GeneratedColumnRewriteRequired, isInvalidInput(err));
     }

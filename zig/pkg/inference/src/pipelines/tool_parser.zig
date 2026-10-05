@@ -97,7 +97,7 @@ const FunctionGemmaParser = struct {
     pending_argument_delta: ?[]u8 = null,
     completed_tool_delta: ?ToolCallDeltaUpdate = null,
 
-    fn deinit(self: *FunctionGemmaParser) void {
+    pub fn deinit(self: *FunctionGemmaParser) void {
         if (self.owns_tokens) {
             self.allocator.free(self.tokens.start_function_decl);
             self.allocator.free(self.tokens.end_function_decl);
@@ -533,7 +533,7 @@ const JsonToolParser = struct {
     tool_calls: std.ArrayListUnmanaged(ToolCall) = .empty,
     emitted_call_count: usize = 0,
 
-    fn deinit(self: *JsonToolParser) void {
+    pub fn deinit(self: *JsonToolParser) void {
         self.buffer.deinit(self.allocator);
         for (self.tool_calls.items) |*call| call.deinit(self.allocator);
         self.tool_calls.deinit(self.allocator);
@@ -629,7 +629,7 @@ const ActiveCall = struct {
     emitted_name: bool = false,
     emitted_args_len: usize = 0,
 
-    fn deinit(self: *ActiveCall, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ActiveCall, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
         self.* = undefined;
@@ -1567,7 +1567,7 @@ fn findPrimaryGgufPath(allocator: std.mem.Allocator, model_dir: []const u8) ![]u
         return error.MissingFunctionGemmaTokens;
     }
 
-    const model_dir_z = try allocator.dupeZ(u8, model_dir);
+    const model_dir_z = try allocator.dupeSentinel(u8, model_dir, 0);
     defer allocator.free(model_dir_z);
 
     const dir = c_file.c.opendir(model_dir_z.ptr);

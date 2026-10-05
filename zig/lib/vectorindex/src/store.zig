@@ -427,7 +427,7 @@ pub fn namespaceReadTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
-        fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
             if (@hasDecl(Handle, "getManySorted")) {
@@ -441,7 +441,7 @@ pub fn namespaceReadTxnFrom(
             }
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: Namespace) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: Namespace) anyerror!Cursor {
             return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
         }
     };
@@ -488,7 +488,7 @@ pub fn namespaceWriteTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
-        fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
         }
 
@@ -496,7 +496,7 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
 
-        fn appendPut(ptr: *anyopaque, namespace: Namespace, key: []const u8, value: []const u8) anyerror!void {
+        pub fn appendPut(ptr: *anyopaque, namespace: Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.appendPut(try mapNamespace(namespace), key, value);
         }
 
@@ -504,7 +504,7 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: Namespace) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: Namespace) anyerror!Cursor {
             return try cursorFrom(alloc, try unbox(ptr).handle.openCursor(try mapNamespace(namespace)));
         }
     };
@@ -555,7 +555,7 @@ pub fn namespaceBatchFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
-        fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
         }
 
@@ -563,7 +563,7 @@ pub fn namespaceBatchFrom(
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
 
-        fn appendPut(ptr: *anyopaque, namespace: Namespace, key: []const u8, value: []const u8) anyerror!void {
+        pub fn appendPut(ptr: *anyopaque, namespace: Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.appendPut(try mapNamespace(namespace), key, value);
         }
 
@@ -601,7 +601,7 @@ pub fn namespaceStoreFrom(
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn deinit(alloc: Allocator, ptr: *anyopaque) void {
+        pub fn deinit(alloc: Allocator, ptr: *anyopaque) void {
             const state = unbox(ptr);
             if (@hasDecl(Handle, "deinit")) {
                 state.handle.deinit();
@@ -617,7 +617,7 @@ pub fn namespaceStoreFrom(
             return try namespaceWriteTxnFrom(alloc, try unbox(ptr).handle.beginWrite(), LocalNamespace, mapNamespace);
         }
 
-        fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceReadTxn {
+        pub fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceReadTxn {
             const HandleDecl = switch (@typeInfo(Handle)) {
                 .pointer => |pointer| pointer.child,
                 else => Handle,
@@ -632,7 +632,7 @@ pub fn namespaceStoreFrom(
             return try namespaceBatchFrom(alloc, try unbox(ptr).handle.beginBatch(), LocalNamespace, mapNamespace);
         }
 
-        fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: BatchOptions) anyerror!NamespaceBatch {
+        pub fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: BatchOptions) anyerror!NamespaceBatch {
             const HandleDecl = switch (@typeInfo(Handle)) {
                 .pointer => |pointer| pointer.child,
                 else => Handle,

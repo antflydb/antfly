@@ -831,7 +831,7 @@ const RequestLease = struct {
     gate: *RequestGate,
     io: Io,
 
-    fn deinit(self: *RequestLease) void {
+    pub fn deinit(self: *RequestLease) void {
         self.gate.release(self.io);
         self.* = undefined;
     }
@@ -5956,7 +5956,7 @@ test "H1 error envelopes use actual status for buffered and writer responses" {
         .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "+404" },
         .{ .status = 404, .body_bytes = 257, .accepted = false, .raw_status = "4_04" },
     };
-    const payload = [_]u8{'e'} ** 4097;
+    const payload = @as([4097]u8, @splat('e'));
     for (cases) |case| {
         client.config.max_error_response_size = case.error_limit;
         for ([_]bool{ false, true }) |to_writer| {
@@ -6035,7 +6035,7 @@ test "error envelope writer preserves upstream response start ordering" {
     defer client.deinit();
     var session = TlsSession.init(TlsConfig.insecure(allocator), std.testing.io);
     defer session.deinit();
-    const payload = [_]u8{'e'} ** 4097;
+    const payload = @as([4097]u8, @splat('e'));
     for (cases) |case| {
         var writer: Writer = .{ .reject = case.reject };
         var parser = Parser.initResponse(allocator);
