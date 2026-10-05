@@ -8,8 +8,8 @@
 const std = @import("std");
 const owner_mod = @import("retained_read_owner.zig");
 const registry = @import("../storage/retained_read_registry.zig");
-const types = @import("../storage/db/types.zig");
-const reads = @import("table_read_source.zig");
+const types = @import("antfly_local_sources").storage_db_types;
+const reads = @import("antfly_local_sources").api_table_read_source;
 const time = @import("antfly_platform").time;
 
 pub const max_request_bytes = 4 << 20;
@@ -38,7 +38,7 @@ pub const Request = struct {
 };
 
 pub const Response = struct {
-    range_proofs: []const @import("../storage/range_protection.zig").Proof = &.{},
+    range_proofs: []const @import("antfly_local_sources").storage_range_protection.Proof = &.{},
     token: ?registry.Token = null,
     busy: bool = false,
     sequence: u64 = 0,
@@ -148,7 +148,7 @@ fn encode(alloc: std.mem.Allocator, response: Response) ![]u8 {
     // Bound actual writer growth, including JSON string escaping, before it
     // allocates. Returned bytes have no allocator callbacks and may be freed
     // directly through the backing allocator after this budget goes away.
-    var budget: @import("../sql/memory_budget.zig") = .{ .backing = alloc, .limit = max_response_bytes };
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = alloc, .limit = max_response_bytes };
     const bytes = std.json.Stringify.valueAlloc(budget.allocator(), response, .{}) catch |err| {
         if (budget.exhausted) return error.RetainedReadPageTooLarge;
         return err;

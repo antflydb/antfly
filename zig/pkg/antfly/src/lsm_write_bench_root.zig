@@ -13,6 +13,9 @@
 // limitations.
 
 pub const bloom = @import("bloom");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 pub const platform_time = @import("antfly_platform").time;
-pub const storage_backend = @import("storage/backend_types.zig");
+pub const storage_backend = @import("antfly_local_sources").storage_backend_types;
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

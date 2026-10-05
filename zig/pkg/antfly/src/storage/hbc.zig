@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const hbc_adapter = @import("hbc_adapter.zig");
+const hbc_adapter = @import("antfly_local_sources").storage_hbc_adapter;
 const vectorindex_hbc = @import("antfly_vectorindex").hbc;
 
 pub const HBCConfig = hbc_adapter.HBCConfig;

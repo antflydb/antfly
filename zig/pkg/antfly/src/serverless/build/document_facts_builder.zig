@@ -20,12 +20,12 @@ const facts = @import("document_facts.zig");
 const builder = @import("builder.zig");
 const page_store = @import("../graph_segment/page_store.zig");
 const tree = @import("../graph_segment/page_tree.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const materializer = @import("../query/materializer.zig");
 const catalog = @import("../catalog/types.zig");
 const sources = @import("../search_sources.zig");
 const document_projection = @import("../document_projection.zig");
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
 const query_reader = @import("../query/indexed_reader.zig");
 
 pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_json: []const u8) ![32]u8 {
@@ -57,7 +57,7 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     const digests = try alloc.alloc([32]u8, chunked.len);
     defer alloc.free(digests);
     for (chunked, digests) |source, *digest| {
-        var cfg = try @import("../../chunking/types.zig").parseConfigFromSlice(alloc, source.chunker_json);
+        var cfg = try @import("antfly_local_sources").chunking_types.parseConfigFromSlice(alloc, source.chunker_json);
         defer cfg.deinit(alloc);
         const semantic = try std.json.Stringify.valueAlloc(alloc, .{
             .field = if (source.source_template.len == 0) source.source_field else "",

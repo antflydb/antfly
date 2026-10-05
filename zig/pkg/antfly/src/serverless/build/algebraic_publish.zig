@@ -17,9 +17,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_manifest = @import("algebraic_manifest.zig");
-const algebraic_segment = @import("../algebraic_segment/mod.zig");
+const algebraic_segment = @import("antfly_local_sources").serverless_algebraic_segment_mod;
 const artifact_store = @import("../artifacts/store.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const PublishOptions = struct {
     source_kind: algebraic_segment.SourceKind,

@@ -180,7 +180,7 @@ The key is to avoid forcing all joins through the heavy path.
 
 ## File Boundaries
 
-- [json_helpers.zig](pkg/antfly/src/api/json_helpers.zig)
+- [json_helpers.zig](pkg/antfly-embedded/src/local/api/json_helpers.zig)
   is the generic JSON utility layer used by join code:
   - path extraction
   - clone/deinit
@@ -272,7 +272,7 @@ ordered by operational payoff:
   - lease/handoff/retry behavior
 - Do not force arbitrary stored documents into fake static types. Keep that
   dynamic work behind
-  [json_helpers.zig](pkg/antfly/src/api/json_helpers.zig).
+  [json_helpers.zig](pkg/antfly-embedded/src/local/api/json_helpers.zig).
 
 ### Explicit Non-Goals
 

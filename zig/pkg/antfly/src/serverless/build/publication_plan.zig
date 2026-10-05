@@ -17,13 +17,13 @@ const Allocator = std.mem.Allocator;
 const catalog_types = @import("../catalog/types.zig");
 const builder_mod = @import("builder.zig");
 const search_sources = @import("../search_sources.zig");
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
-const external_binding = @import("../external_source/catalog_binding.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
+const external_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_plan_resolver_api = @import("external_source_plan_resolver_api.zig");
-const manifest_base_source = @import("../manifest/base_source.zig");
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
-pub const OwnedExternalTableBinding = @import("../external_source/schema_binding.zig").OwnedExternalTableBinding;
+pub const OwnedExternalTableBinding = @import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding;
 
 pub const ExternalSourcePlanResolveRequest = external_source_plan_resolver_api.ResolveRequest;
 pub const ExternalSourcePlanResolver = external_source_plan_resolver_api.Resolver;
@@ -249,7 +249,7 @@ pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
     return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);
 }
 
-pub const externalBindingFromSchemaJsonAlloc = @import("../external_source/schema_binding.zig").externalBindingFromSchemaJsonAlloc;
+pub const externalBindingFromSchemaJsonAlloc = @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc;
 
 test "metadata republish reasons report when any flag is set" {
     try std.testing.expect(!(MetadataRepublishReasons{}).any());

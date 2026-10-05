@@ -1,9 +1,9 @@
 //! Metadata-only microbenchmark. Full service qualification owns payload I/O
 //! and scoring measurements. Run with ANTFLY_VECTOR_MEMBER_MICROBENCH=1.
 const std = @import("std");
-const native = @import("vector_block_store.zig");
+const native = @import("antfly_local_sources").storage_vector_block_store;
 const block = @import("antfly_vectorindex").vector_block;
-const lsm = @import("lsm_backend/mod.zig");
+const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
 const time = @import("antfly_platform").time;
 extern "c" fn getenv([*:0]const u8) ?[*:0]const u8;
 

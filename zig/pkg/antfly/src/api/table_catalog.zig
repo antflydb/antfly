@@ -30,7 +30,7 @@ const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 /// One absolute monotonic budget shared by snapshot capture and all CPU-side
 /// routing work that follows it. The periodic checkpoint keeps large catalog
 /// scans interruptible without putting a clock read on every range.
-pub const RoutingBudget = @import("routing_budget.zig").RoutingBudget;
+pub const RoutingBudget = @import("antfly_local_sources").api_routing_budget.RoutingBudget;
 
 /// Narrow a fence in its own clock domain. A timestamp and its clock are one
 /// budget; callers must never compare raw timestamps from different clocks.
@@ -1943,8 +1943,8 @@ pub const TableGroupDescriptorProjection = struct {
     doc_identity_range_id: u64,
     schema_json: []u8,
     indexes_json: []u8,
-    table_storage: ?@import("../common/table_storage.zig").Settings,
-    initial_range: ?@import("../storage/byte_range.zig").ByteRange = null,
+    table_storage: ?@import("antfly_local_sources").common_table_storage.Settings,
+    initial_range: ?@import("antfly_local_sources").storage_byte_range.ByteRange = null,
     restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
     pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
@@ -2117,8 +2117,8 @@ fn descriptorProjectionFromValues(
     doc_identity_range_id: u64,
     schema_json: []const u8,
     indexes_json: []const u8,
-    table_storage: ?@import("../common/table_storage.zig").Settings,
-    initial_range: ?@import("../storage/byte_range.zig").ByteRange,
+    table_storage: ?@import("antfly_local_sources").common_table_storage.Settings,
+    initial_range: ?@import("antfly_local_sources").storage_byte_range.ByteRange,
     restore: ?@import("../storage/restore_identity.zig").Identity,
 ) !TableGroupDescriptorProjection {
     const owned_schema_json = try alloc.dupe(u8, schema_json);

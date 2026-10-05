@@ -70,10 +70,10 @@ const Mock = struct {
     fn source(self: *Mock) backend.Backend {
         return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = Mock.execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
-    fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("../sql/setting_catalog.zig").RawSnapshot {
+    fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.setting_snapshots += 1;
-        const definitions = try alloc.alloc(@import("../sql/setting_catalog.zig").Definition, 3);
+        const definitions = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.Definition, 3);
         definitions[0] = .{ .identity = .{ .id = 1, .generation = self.setting_generation }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
         definitions[1] = .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "owner" } };
         definitions[2] = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.tenant_id", .kind = .string, .session_writable = true, .default = .{ .string = "unassigned" } };
@@ -1469,7 +1469,7 @@ test "pgwire original prepared read executes text and deallocates connection sta
 test "pgwire original prepared CTE INSERT defers mutation until execute" {
     // sql-0005: protocol session owns PREPARE; the typed runtime body is tested separately.
     const alloc = std.testing.allocator;
-    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0005")) break entry.object.get("sql").?.string;
@@ -1499,7 +1499,7 @@ test "pgwire original prepared CTE INSERT defers mutation until execute" {
 
 test "pgwire original prepared CTE mutations defer UPDATE DELETE and MERGE" {
     const alloc = std.testing.allocator;
-    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     for ([_]struct { id: []const u8, execute: []const u8, tag: []const u8 }{
         .{ .id = "sql-0006", .execute = "EXECUTE cte_write_plan\x00", .tag = "UPDATE 2" },

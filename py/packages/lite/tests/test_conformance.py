@@ -15,7 +15,7 @@
 """Runs the shared libantfly conformance cases through the public
 antfly_lite API.
 
-See zig/pkg/antfly/capi-conformance/README.md for the case format. This is a
+See zig/pkg/antfly-embedded/capi-conformance/README.md for the case format. This is a
 straight port of go/pkg/lite/conformance_cgo_test.go's semantics: every
 runner (C, Go, Python, Rust) executes the same declarative cases so the
 bindings stay behaviorally identical.

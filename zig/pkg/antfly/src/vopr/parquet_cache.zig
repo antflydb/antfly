@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const lake = @import("../serverless/query/lake_parquet_rowgroup.zig");
+const lake = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {

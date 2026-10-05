@@ -16,8 +16,8 @@
 //! regular file under an exclusive generation lease, recording a durable byte
 //! cursor; then use the same source conversion/verifier as online migration.
 const std = @import("std");
-const db = @import("db/db.zig");
-const contract = @import("../common/vector_migration.zig");
+const db = @import("antfly_local_sources").storage_db_db;
+const contract = @import("antfly_local_sources").common_vector_migration;
 const files = @import("../common/migration_files.zig");
 const fs = @import("antfly_runtime_fs").fs_paths;
 const platform = @import("antfly_platform");
@@ -153,7 +153,7 @@ fn copyChunk(alloc: Allocator, io: std.Io, live: []const u8, staging: []const u8
 pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Request, options: Options) !Result {
     try request.validate();
     if (request.mode != .offline) return error.InvalidVectorMigrationState;
-    var transition = try @import("db/generation_lifecycle.zig").beginProcessExclusiveWithRuntimeAndIo(root, options.open.backend_runtime, io);
+    var transition = try @import("antfly_local_sources").storage_db_generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(root, options.open.backend_runtime, io);
     defer transition.deinit();
     try transition.reconcilePublished();
     const live = transition.path;
@@ -262,8 +262,8 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
     // rereads current artifacts and candidate keys in adjacent compressed
     // blocks; retain that bounded working set instead of rereading/decompressing
     // a block for each point check. Preserve caller-supplied caches and budgets.
-    const resources = @import("resource_manager.zig");
-    const lsm = @import("lsm_backend/mod.zig");
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
     var owned_manager: ?*resources.ResourceManager = null;
     defer if (owned_manager) |manager| {
         manager.deinit(alloc);
@@ -325,7 +325,7 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
 pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Request, options: db.OpenOptions) !void {
     try request.validate();
     if (request.mode != .offline) return error.InvalidVectorMigrationState;
-    var transition = try @import("db/generation_lifecycle.zig").beginProcessExclusiveWithRuntimeAndIo(root, options.backend_runtime, io);
+    var transition = try @import("antfly_local_sources").storage_db_generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(root, options.backend_runtime, io);
     defer transition.deinit();
     try transition.reconcilePublished();
     var open = options;
