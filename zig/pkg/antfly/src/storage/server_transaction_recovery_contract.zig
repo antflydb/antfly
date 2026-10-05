@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: ELv2
 const std = @import("std");
 const platform_clock = @import("antfly_platform").clock;
-const transactions_mod = @import("transactions.zig");
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
 
 pub const ResolveParticipantFn = *const fn (*anyopaque, transactions_mod.TxnId, []const u8, transactions_mod.TxnStatus, u64) anyerror!void;
 

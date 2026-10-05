@@ -16,7 +16,7 @@
 //! Checkpoints bracket every remote operation, renewing the namespace lease
 //! throughout multi-page listing/footer discovery. Ownership stays with caller.
 const std = @import("std");
-const storage = @import("../../storage/object_storage.zig");
+const storage = @import("antfly_local_sources").storage_object_storage;
 const Token = @import("antfly_cancellation").CancellationToken;
 const Allocator = std.mem.Allocator;
 

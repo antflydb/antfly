@@ -16,13 +16,13 @@
 //! locking and pending-record ownership stay in storage; this adapter owns
 //! HA log publication, recovery matching, policy evaluation, and waits.
 const std = @import("std");
-const replication_contract = @import("../db/replication_contract.zig");
+const replication_contract = @import("antfly_local_sources").storage_db_replication_contract;
 const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
 const hot_standby_primary_mod = @import("primary.zig");
 const hot_standby_commit_gate_mod = @import("commit_gate.zig");
 const replication_effects_mod = @import("effects.zig");
-const outbox = @import("../db/durable_outbox.zig");
-const Namespace = @import("../db/doc_identity_namespace.zig").Namespace;
+const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+const Namespace = @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace;
 
 pub const SyncWaitFn = *const fn (*anyopaque, *anyopaque, u64, hot_standby_primary_mod.SyncPolicy) anyerror!void;
 

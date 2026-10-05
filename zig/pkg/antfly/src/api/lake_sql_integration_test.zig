@@ -15,10 +15,10 @@
 const std = @import("std");
 const server_mod = @import("http_server.zig");
 const Adapter = @import("sql_execution.zig").Adapter;
-const domain = @import("../system_catalog/domain.zig");
-const operation = @import("operation.zig");
-const reads = @import("table_read_source.zig");
-const read_view = @import("../storage/relational_read_view.zig").View;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const operation = @import("antfly_local_sources").api_operation;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const read_view = @import("antfly_local_sources").storage_relational_read_view.View;
 
 const Fixture = struct {
     lake_schema: []const u8,
@@ -73,18 +73,18 @@ const Fixture = struct {
 
 test "lake SQL API binds external catalog sources for aggregates joins public rows and read-only rejection" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("lake");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("lake");
     defer directory.cleanup();
-    const parquet = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .field_id = 1, .values = &.{ 1, 2, 3, 4, 5 } }});
+    const parquet = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .field_id = 1, .values = &.{ 1, 2, 3, 4, 5 } }});
     defer alloc.free(parquet);
-    var filesystem = try @import("../storage/object_storage.zig").FilesystemObjectStorage.init(alloc, directory.path());
+    var filesystem = try @import("antfly_local_sources").storage_object_storage.FilesystemObjectStorage.init(alloc, directory.path());
     defer filesystem.deinit();
     var client = filesystem.client();
     var written = try client.putObject("antfly", "part.parquet", parquet, .{});
     defer written.deinit(alloc);
     const source_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{directory.path()});
     defer alloc.free(source_uri);
-    const iceberg = @import("../serverless/query/lake_iceberg_snapshot.zig");
+    const iceberg = @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot;
     const manifest = try iceberg.buildTestDataManifestAlloc(alloc, &.{.{ .path = "object://antfly/part.parquet", .rows = 5, .bytes = parquet.len }});
     defer alloc.free(manifest);
     const manifest_list = try iceberg.buildTestManifestListAlloc(alloc, "object://antfly/metadata/data.avro", manifest.len, 1, 5);
@@ -111,7 +111,7 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         const encoded = try std.json.Stringify.valueAlloc(alloc, schema_json.value, .{});
         defer alloc.free(encoded);
         var fixture: Fixture = .{ .lake_schema = encoded };
-        var backend_runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        var backend_runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
         defer backend_runtime.deinit();
         const cache_root = try std.fmt.allocPrint(alloc, "{s}/cache-{s}", .{ directory.path(), format });
         defer alloc.free(cache_root);
@@ -138,9 +138,9 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         };
         for (cases) |case| {
             var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
-            var compiled = try @import("../sql/compiler.zig").compile(alloc, case.sql, .{});
+            var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, case.sql, .{});
             defer compiled.deinit();
-            var result = try @import("../sql/runtime.zig").execute(alloc, adapter.backend(), &compiled, &.{}, .{});
+            var result = try @import("antfly_local_sources").sql_runtime.execute(alloc, adapter.backend(), &compiled, &.{}, .{});
             defer result.deinit();
             try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
             try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
@@ -158,22 +158,22 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         // treat a lake source as unprotected after the latest-main policy fix.
         fixture.policy_catalog_changed = true;
         var changing_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
-        var changing_count = try @import("../sql/compiler.zig").compile(alloc, "SELECT COUNT(*) FROM events", .{});
+        var changing_count = try @import("antfly_local_sources").sql_compiler.compile(alloc, "SELECT COUNT(*) FROM events", .{});
         defer changing_count.deinit();
-        try std.testing.expectError(error.RowPolicyCatalogChanged, @import("../sql/runtime.zig").execute(alloc, changing_adapter.backend(), &changing_count, &.{}, .{}));
+        try std.testing.expectError(error.RowPolicyCatalogChanged, @import("antfly_local_sources").sql_runtime.execute(alloc, changing_adapter.backend(), &changing_count, &.{}, .{}));
         fixture.policy_catalog_changed = false;
         try std.testing.expectEqual(fixture.native_opened, fixture.native_closed);
         try std.testing.expectEqual(@as(usize, 1), fixture.native_opened);
         var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
-        var explanation = try @import("../sql/compiler.zig").compile(alloc, "EXPLAIN (VERBOSE, FORMAT JSON) SELECT SUM(amount) FROM events", .{});
+        var explanation = try @import("antfly_local_sources").sql_compiler.compile(alloc, "EXPLAIN (VERBOSE, FORMAT JSON) SELECT SUM(amount) FROM events", .{});
         defer explanation.deinit();
-        var explained = try @import("../sql/runtime.zig").execute(alloc, adapter.backend(), &explanation, &.{}, .{});
+        var explained = try @import("antfly_local_sources").sql_runtime.execute(alloc, adapter.backend(), &explanation, &.{}, .{});
         defer explained.deinit();
         try std.testing.expect(std.mem.indexOf(u8, explained.output.rows[0][0].string, "Lake Scan") != null);
         try std.testing.expect(std.mem.indexOf(u8, explained.output.rows[0][0].string, format) != null);
-        var insert = try @import("../sql/compiler.zig").compile(alloc, "INSERT INTO events (_id, amount) VALUES ('new', 7)", .{});
+        var insert = try @import("antfly_local_sources").sql_compiler.compile(alloc, "INSERT INTO events (_id, amount) VALUES ('new', 7)", .{});
         defer insert.deinit();
-        try std.testing.expectError(error.ExternalLakeReadOnly, @import("../sql/runtime.zig").execute(alloc, adapter.backend(), &insert, &.{}, .{}));
+        try std.testing.expectError(error.ExternalLakeReadOnly, @import("antfly_local_sources").sql_runtime.execute(alloc, adapter.backend(), &insert, &.{}, .{}));
         var request = try @import("http_route_helpers.zig").parseRelationalRowQueryRequest(alloc, "{\"fields\":[\"amount\"],\"conditions\":[{\"column\":\"amount\",\"op\":\"gt\",\"value\":3}],\"limit\":1}");
         defer request.deinit(alloc);
         const ndjson = (try @import("lake_table_reads.zig").query(alloc, &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, request)).?;
@@ -204,9 +204,9 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         var restarted = server_mod.ApiHttpServer.init(alloc, cfg, status_source, table_reads, null);
         defer restarted.deinit();
         var restarted_adapter: Adapter = .{ .server = &restarted, .identity = &identity, .context = .{} };
-        var restart_query = try @import("../sql/compiler.zig").compile(alloc, "SELECT SUM(amount) FROM events", .{});
+        var restart_query = try @import("antfly_local_sources").sql_compiler.compile(alloc, "SELECT SUM(amount) FROM events", .{});
         defer restart_query.deinit();
-        var restart_result = try @import("../sql/runtime.zig").execute(alloc, restarted_adapter.backend(), &restart_query, &.{}, .{});
+        var restart_result = try @import("antfly_local_sources").sql_runtime.execute(alloc, restarted_adapter.backend(), &restart_query, &.{}, .{});
         defer restart_result.deinit();
         try std.testing.expectEqualStrings("15", restart_result.output.rows[0][0].string);
         const stats = restarted.requestStats();
@@ -219,23 +219,23 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
 
 test "lake SQL public residual scan reclaims page and distant timestamp memory" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("lake-residual-memory");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("lake-residual-memory");
     defer directory.cleanup();
-    var fs = try @import("../storage/object_storage.zig").FilesystemObjectStorage.init(alloc, directory.path());
+    var fs = try @import("antfly_local_sources").storage_object_storage.FilesystemObjectStorage.init(alloc, directory.path());
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
     const values = try alloc.alloc(i64, 20_000);
     defer alloc.free(values);
     @memset(values, 1);
-    const bytes = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .converted_type = 9, .values = values, .page_rows = 1024 }});
+    const bytes = try @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .converted_type = 9, .values = values, .page_rows = 1024 }});
     defer alloc.free(bytes);
     var put = try client.putObject("antfly", "part.parquet", bytes, .{});
     defer put.deinit(alloc);
     const schema_json = try std.fmt.allocPrint(alloc, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"amount\":{{\"type\":\"datetime\"}}}}}}}}}},\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"v1\"}}}}", .{directory.path()});
     defer alloc.free(schema_json);
     var fixture: Fixture = .{ .lake_schema = schema_json };
-    var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    var runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
     var server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
     defer server.deinit();
@@ -243,7 +243,7 @@ test "lake SQL public residual scan reclaims page and distant timestamp memory" 
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
     var request = try @import("http_route_helpers.zig").parseRelationalRowQueryRequest(alloc, "{\"fields\":[\"amount\"],\"conditions\":[{\"column\":\"amount\",\"op\":\"is_not_distinct\",\"value\":\"2500-01-01\"}],\"limit\":1}");
     defer request.deinit(alloc);
-    var budget: @import("../sql/memory_budget.zig") = .{ .backing = alloc, .limit = 4 * 1024 * 1024 };
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = alloc, .limit = 4 * 1024 * 1024 };
     {
         const ndjson = (try @import("lake_table_reads.zig").query(budget.allocator(), &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, request)).?;
         defer budget.allocator().free(ndjson);

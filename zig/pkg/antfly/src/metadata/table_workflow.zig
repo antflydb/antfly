@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const api_operation = @import("../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const control_loop = @import("control_loop.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const placement_planner = @import("placement_planner.zig");

@@ -25,8 +25,8 @@ const metric_segment = @import("../graph_metric_segment/mod.zig");
 const metric_kernel = @import("lake_graph_metric.zig");
 const artifacts = @import("../artifacts/mod.zig");
 const sources = @import("../search_sources.zig");
-const external_binding = @import("../external_source/catalog_binding.zig");
-const base_source = @import("../manifest/base_source.zig");
+const external_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const NamedAction = struct {
     kind: manifests.ArtifactKind,
@@ -360,7 +360,7 @@ fn rejectionPlanUnchanged(alloc: Allocator, specs: []const metrics.IndexSpec, re
     return metric_kernel.admissionPlanUnchanged(alloc, requests.items, previous, .{});
 }
 
-fn snapshot(kind: @import("../../storage/rowsource/types.zig").SourceKind, source: manifests.ExternalBaseSource, source_id: []const u8) lake.LakeSourceSnapshot {
+fn snapshot(kind: @import("antfly_local_sources").storage_rowsource_types.SourceKind, source: manifests.ExternalBaseSource, source_id: []const u8) lake.LakeSourceSnapshot {
     return .{ .source_kind = kind, .source_id = source_id, .snapshot_id = source.snapshot_id, .schema_fingerprint = source.schema_fingerprint };
 }
 
@@ -653,7 +653,7 @@ test "serverless external metadata plan reports exact named work and converges a
 }
 
 test "serverless external source identity separates selectors from resolved evidence" {
-    for ([_]@import("../external_source/types.zig").Format{ .parquet, .iceberg, .lance }) |format| {
+    for ([_]@import("antfly_local_sources").serverless_external_source_types.Format{ .parquet, .iceberg, .lance }) |format| {
         const before: external_binding.Binding = .{
             .table_id = "docs",
             .format = format,

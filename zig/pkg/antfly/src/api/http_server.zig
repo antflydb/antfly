@@ -14,10 +14,10 @@
 
 const std = @import("std");
 const join_planning = @import("join_planning.zig");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const system_catalog_routes = @import("../system_catalog/routes.zig");
 const system_catalog_operations = @import("../system_catalog/operations.zig");
-const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const ant_json = @import("antfly-json");
 const kernel_abi = @import("kernel_abi.zig");
 const builtin = @import("builtin");
@@ -28,27 +28,27 @@ const storage_source_options = @import("storage_source_options");
 const openapi_specs = @import("antfly_openapi_specs");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const common_secrets = @import("../common/secrets.zig");
-const index_repair_status = @import("../common/index_repair_status.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const api_operation = @import("operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const backup_cohort_driver = @import("backup_cohort_driver.zig");
-const search_pattern_filter = @import("../search/pattern_filter.zig");
+const search_pattern_filter = @import("antfly_local_sources").search_pattern_filter;
 const backups_api = @import("backups.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const restore_staging = @import("../metadata/restore_staging.zig");
-var restore_staging_diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
-const batch_api = @import("batch.zig");
+var restore_staging_diagnostic_gate: @import("antfly_local_sources").api_bounded_diagnostic_gate.Gate = .{};
+const batch_api = @import("antfly_local_sources").api_batch;
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
-const graph_wire_envelope = @import("graph_wire_envelope.zig");
+const graph_wire_envelope = @import("antfly_local_sources").api_graph_wire_envelope;
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
-const coverage_policy = @import("coverage_policy.zig");
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
 const table_contract = @import("table_contract.zig");
-const stored_destination_authorization = @import("stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const internal_service_auth = @import("internal_service_auth.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -63,7 +63,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
-const schema_mod = @import("../schema/mod.zig");
+const schema_mod = @import("antfly_local_sources").schema_mod;
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_mod = @import("../raft/mod.zig");
@@ -73,11 +73,11 @@ const db_mod = struct {
     // A handful of tests still construct the concrete storage DB directly;
     // keep that dependency test-only so it cannot rejoin the API codegen unit.
     pub const DB = if (builtin.is_test) @import("antfly_source_root").antfly_sources.physical_db.DB else struct {};
-    pub const backfill_state = if (builtin.is_test) @import("../storage/db/backfill_state.zig") else struct {};
-    pub const types = @import("../storage/db/types.zig");
-    pub const RuntimePreflightSummary = @import("../storage/db/runtime_preflight.zig").RuntimePreflightSummary;
-    pub const background_runtime = @import("../storage/background_runtime.zig");
-    pub const aggregations = @import("../storage/db/aggregations_contract.zig");
+    pub const backfill_state = if (builtin.is_test) @import("antfly_local_sources").storage_db_backfill_state else struct {};
+    pub const types = @import("antfly_local_sources").storage_db_types;
+    pub const RuntimePreflightSummary = @import("antfly_local_sources").storage_db_runtime_preflight.RuntimePreflightSummary;
+    pub const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+    pub const aggregations = @import("antfly_local_sources").storage_db_aggregations_contract;
     pub const SortRejectionDiagnostic = db_query_search.SortRejectionDiagnostic;
 
     pub const resetLastSortRejectionDiagnostic = db_query_search.resetLastSortRejectionDiagnostic;
@@ -85,23 +85,23 @@ const db_mod = struct {
     pub const peekLastSortRejectionDiagnostic = db_query_search.peekLastSortRejectionDiagnostic;
     pub const takeLastSortRejectionDiagnostic = db_query_search.takeLastSortRejectionDiagnostic;
 };
-const graph_mod = @import("../graph/graph.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const db_query_search = @import("../storage/db/runtime_preflight.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const db_query_search = @import("antfly_local_sources").storage_db_runtime_preflight;
 const reranking_runtime = @import("../reranking/mod.zig");
-const storage_schema = @import("../storage/schema.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
+const storage_schema = @import("antfly_local_sources").storage_schema;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 const table_catalog = @import("table_catalog.zig");
 const tables_api = @import("tables.zig");
-const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("table_read_source.zig");
+const table_reads = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_reads else @import("antfly_local_sources").api_table_read_source;
 const table_router = @import("table_router.zig");
-const table_writes = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_writes else @import("table_write_source.zig");
-const table_index_config = @import("table_index_config.zig");
+const table_writes = if (builtin.is_test) @import("antfly_source_root").antfly_sources.table_writes else @import("antfly_local_sources").api_table_write_source;
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 const hot_standby_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
 const hot_standby_http_operation = @import("../storage/hot_standby/http_operation.zig");
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
-const public_search_request = @import("public_search_request.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
+const public_search_request = @import("antfly_local_sources").api_public_search_request;
 const public_limits = @import("antfly_public_limits");
 const query_builder_agent = @import("query_builder_agent.zig");
 const request_admission_policy = @import("request_admission_policy.zig");
@@ -122,30 +122,30 @@ const contextual_operations = @import("contextual_operations.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 var batch_conflict_diagnostic_gate: http_route_helpers.RelationalReadDiagnosticGate = .{};
 const transactions_api = @import("transactions.zig");
-const docstore_mod = if (builtin.is_test) @import("../storage/docstore.zig") else struct {};
+const docstore_mod = if (builtin.is_test) @import("antfly_local_sources").storage_docstore else struct {};
 const routes = @import("http_routes.zig");
-const runtime_status = @import("runtime_status.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 const foreign_mod = @import("../foreign/mod.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 const eval_openapi = @import("antfly_eval_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_topology_mutations = @import("../metadata/table_topology_mutations.zig");
 const raft_mutation_forwarding = @import("raft_mutation_forwarding.zig");
 const metadata_server = @import("../metadata/server.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
 const sql_plan_cache = @import("../sql/plan_cache.zig");
 const sql_schema_cache = @import("sql_schema_cache.zig");
 const cache_budget = @import("antfly_cache_budget");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const connections_api = @import("connections.zig");
-const common_config = @import("../common/config.zig");
-const generating_runtime = @import("../generating/mod.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const generating_runtime = @import("antfly_local_sources").generating_mod;
 const usermgr = @import("../usermgr/mod.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
@@ -157,7 +157,7 @@ const mcp = @import("antfly_mcp");
 const a2a = @import("antfly_a2a");
 const protocol_adapters = @import("protocol_adapters.zig");
 const ard_catalog = @import("ard_catalog.zig");
-const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const runtime_callback_abi = @import("antfly_local_sources").runtime_callback_abi;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const parseOwnedJsonObjectMapAlloc = json_helpers.parseOwnedJsonObjectMapAlloc;
@@ -609,9 +609,9 @@ fn waitForRestoreCutoverFence(
     writes: table_writes.TableWriteSource,
     table_name: []const u8,
     range_key: []const u8,
-    expected: @import("../storage/db/relational_integrity_topology.zig").Fence,
-    graph_scope: ?@import("../storage/db/graph_retirement_seal.zig").Scope,
-    handoff_intent: ?@import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffIntent,
+    expected: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence,
+    graph_scope: ?@import("antfly_local_sources").storage_db_graph_retirement_seal.Scope,
+    handoff_intent: ?@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.GenerationHandoffIntent,
 ) !void {
     // A read-index status can prove that an earlier begin reached the owner
     // even if its response was lost. Reissuing begin on every readiness poll
@@ -620,7 +620,7 @@ fn waitForRestoreCutoverFence(
     while (true) {
         var response = (try reads.topologyStatus(alloc, table_name, range_key, "{\"mode\":\"status\"}")) orelse return error.RestoreStagingWait;
         defer response.deinit(alloc);
-        const status = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Observation, alloc, response.json, .{});
+        const status = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Observation, alloc, response.json, .{});
         defer status.deinit();
         if (status.value.fence) |fence| {
             if (fence.eql(expected)) {
@@ -640,9 +640,9 @@ fn waitForGraphRetirementSeal(
     writes: table_writes.TableWriteSource,
     table_name: []const u8,
     range_key: []const u8,
-    scope: @import("../storage/db/graph_retirement_seal.zig").Scope,
+    scope: @import("antfly_local_sources").storage_db_graph_retirement_seal.Scope,
 ) ![32]u8 {
-    const seal = @import("../storage/db/graph_retirement_seal.zig");
+    const seal = @import("antfly_local_sources").storage_db_graph_retirement_seal;
     var response = (try reads.topologyStatus(alloc, table_name, range_key, "{\"mode\":\"graph_retirement\"}")) orelse return error.RestoreStagingWait;
     defer response.deinit(alloc);
     const parsed = try std.json.parseFromSlice(seal.Status, alloc, response.json, .{});
@@ -670,7 +670,7 @@ fn requireGenerationHandoffReceiptAuthority(
     reads: table_reads.TableReadSource,
     table_name: []const u8,
     range_key: []const u8,
-    namespace: @import("../storage/db/doc_identity.zig").Namespace,
+    namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
     group: ?u64,
     scope: ?[32]u8,
     plan_id: ?[16]u8,
@@ -689,7 +689,7 @@ fn requireGenerationHandoffReceiptAuthority(
     else
         try reads.lookup(alloc, table_name, range_key, options, .read_index)) orelse return error.RestoreStagingWait;
     defer response.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, alloc, response.json, .{});
+    var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, response.json, .{});
     defer parsed.deinit();
     if (!parsed.value.namespace.eql(namespace)) return error.RestoreStagingScopeChanged;
     parsed.value.requireGenerationHandoffReceipts() catch |err| {
@@ -702,7 +702,7 @@ fn requireGenerationHandoffReceiptAuthority(
 }
 
 test "staged restore native handoff capability fails closed without authorizing irreversible cancellation" {
-    const Identity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+    const Identity = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
     const Mock = struct {
         identity: Identity,
         fn lookup(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, options: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.LookupResponse {
@@ -769,7 +769,7 @@ fn readGenerationHandoffPreflight(
     reads: table_reads.TableReadSource,
     table_name: []const u8,
     range_key: []const u8,
-    fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+    fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
     plan_id: [16]u8,
     plan_digest: [32]u8,
     handoff: @import("../metadata/restore_staging.zig").GenerationHandoffRange,
@@ -778,7 +778,7 @@ fn readGenerationHandoffPreflight(
     const stages = @import("../metadata/restore_staging.zig");
     var response = (try reads.lookup(alloc, table_name, range_key, .{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.RestoreStagingWait;
     defer response.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(@import("../storage/db/empty_generation_handoff.zig").Summary, alloc, response.json, .{ .allocate = .alloc_always });
+    var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_empty_generation_handoff.Summary, alloc, response.json, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     const summary = parsed.value;
     const intent = summary.intent orelse return error.RestoreStagingWait;
@@ -798,7 +798,7 @@ fn waitForGenerationHandoffSeal(
     writes: table_writes.TableWriteSource,
     table_name: []const u8,
     range_key: []const u8,
-    fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+    fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
     plan_id: [16]u8,
     plan_digest: [32]u8,
     handoff: @import("../metadata/restore_staging.zig").GenerationHandoffRange,
@@ -806,7 +806,7 @@ fn waitForGenerationHandoffSeal(
     const stages = @import("../metadata/restore_staging.zig");
     var response = (try reads.topologyStatus(alloc, table_name, range_key, "{\"mode\":\"generation_handoff_seal\"}")) orelse return error.RestoreStagingWait;
     defer response.deinit(alloc);
-    var parsed = try std.json.parseFromSlice(@import("../storage/db/empty_generation_handoff.zig").SealStatus, alloc, response.json, .{});
+    var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_empty_generation_handoff.SealStatus, alloc, response.json, .{});
     defer parsed.deinit();
     const summary = parsed.value;
     const intent = summary.intent orelse return error.RestoreStagingScopeChanged;
@@ -851,7 +851,7 @@ test "restore cutover readiness waits without exponential retry" {
 
 test "restore cutover lost begin reply waits for the same fence to drain" {
     const alloc = std.testing.allocator;
-    const Fence = @import("../storage/db/relational_integrity_topology.zig").Fence;
+    const Fence = @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence;
     const expected: Fence = .{
         .transition_id = 7,
         .attempt = 1,
@@ -874,7 +874,7 @@ test "restore cutover lost begin reply waits for the same fence to drain" {
             try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_topology_json);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             self.read_count += 1;
-            return .{ .json = try std.json.Stringify.valueAlloc(a, @import("../metadata/backup_cohort.zig").Observation{ .fence = self.fence, .drained = self.drained }, .{}), .version = 0 };
+            return .{ .json = try std.json.Stringify.valueAlloc(a, @import("antfly_local_sources").metadata_backup_cohort.Observation{ .fence = self.fence, .drained = self.drained }, .{}), .version = 0 };
         }
 
         fn batch(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: db_mod.types.BatchRequest) !?void {
@@ -909,7 +909,7 @@ test "restore cutover lost begin reply waits for the same fence to drain" {
 
 test "graph retirement seal lost reply resolves from read-index owner receipt" {
     const alloc = std.testing.allocator;
-    const Seal = @import("../storage/db/graph_retirement_seal.zig");
+    const Seal = @import("antfly_local_sources").storage_db_graph_retirement_seal;
     const scope: Seal.Scope = .{
         .fence = .{ .transition_id = 7, .attempt = 1, .admission_epoch = 1, .peer_group_id = 401, .owner_group_id = 301, .role = .rewrite_source, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
         .plan_id = @splat(1),
@@ -1422,7 +1422,7 @@ fn restoreWorkerAuthorityMatches(
 
 /// Process-local admission shared by every protocol adapter that invokes the
 /// public application operations below.
-pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
+pub const RequestAdmission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
 
 pub const HotStandbyMutationPolicySnapshot = struct {
     failover_safe_mutations_only: bool = false,
@@ -1642,7 +1642,7 @@ pub const ApiHttpServerConfig = struct {
     backup_operation_timeout_ms: u64 = common_config.default_backup_operation_timeout_ms,
     /// Per-request graph execution ceilings owned by the operator. These are
     /// never populated from the public graph-query DSL.
-    graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
+    graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
@@ -1685,7 +1685,7 @@ pub const ApiHttpServerConfig = struct {
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     imported_runtime_io: ?RuntimeIoViews = null,
-    storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
+    storage_maintenance: ?*@import("antfly_local_sources").storage_maintenance.Coordinator = null,
     /// Node-local Raft quarantine diagnostics and fenced recovery. The source
     /// owns runtime serialization; handlers never access a Raft host directly.
     raft_quarantine_admin: ?RaftQuarantineAdminSource = null,
@@ -1718,7 +1718,7 @@ pub const ApiHttpServerConfig = struct {
     /// storage directory; null without local storage keeps memory-only reads.
     lake_cache_root: ?[]const u8 = null,
     lake_cache_enabled: ?bool = null,
-    lake_cache_policy: ?@import("../serverless/query/lake_parquet_rowgroup.zig").PersistentObjectRangeCachePolicy = null,
+    lake_cache_policy: ?@import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCachePolicy = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     /// A scheduling hint only; durable activation/retirement still fences
@@ -2013,7 +2013,7 @@ pub const StatusSource = struct {
         end_vector_migration_command: ?*const fn (ptr: *anyopaque, table_name: []const u8) void = null,
         replace_table_definition_stamped: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!?metadata_api.CatalogMutationStamp = null,
         get_backup_cohort: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, job_id: u64, request: api_operation.RequestContext) anyerror!?[]u8 = null,
-        list_backup_cohorts: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) anyerror![]@import("../storage/docstore.zig").OwnedKVPair = null,
+        list_backup_cohorts: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) anyerror![]@import("antfly_local_sources").storage_docstore.OwnedKVPair = null,
         compare_and_set_backup_cohort: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, write: @import("../metadata/storage/raft_apply_store.zig").BackupCohortWrite, request: api_operation.RequestContext) anyerror!void = null,
         get_restore_staging: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, id: [16]u8, request: api_operation.RequestContext) anyerror!?[]u8 = null,
         get_restore_staging_authority: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, input: @import("../metadata/restore_staging.zig").AuthorityRequest, request: api_operation.RequestContext) anyerror!@import("../metadata/restore_staging.zig").AuthorityResponse = null,
@@ -2148,7 +2148,7 @@ pub const StatusSource = struct {
         return BoundaryAbi.call("get_backup_cohort", self.boundary_dispatch, callback, .{ self.ptr, alloc, job_id, request });
     }
 
-    pub fn listBackupCohorts(self: StatusSource, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("../storage/docstore.zig").OwnedKVPair {
+    pub fn listBackupCohorts(self: StatusSource, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("antfly_local_sources").storage_docstore.OwnedKVPair {
         const callback = self.vtable.list_backup_cohorts orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("list_backup_cohorts", self.boundary_dispatch, callback, .{ self.ptr, alloc, after, limit, request });
     }
@@ -2465,7 +2465,7 @@ pub const StatusSource = struct {
                 return store.getBackupCohort(alloc, svc.metadata_group_id, job_id);
             }
 
-            fn listBackupCohorts(ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("../storage/docstore.zig").OwnedKVPair {
+            fn listBackupCohorts(ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: api_operation.RequestContext) ![]@import("antfly_local_sources").storage_docstore.OwnedKVPair {
                 const svc = cast(ptr);
                 try svc.ensureLinearizableReadWithContext(request);
                 const store = svc.projectedStore() orelse return error.MissingMetadataStore;
@@ -2475,7 +2475,7 @@ pub const StatusSource = struct {
             fn compareAndSetBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, write: @import("../metadata/storage/raft_apply_store.zig").BackupCohortWrite, request: api_operation.RequestContext) !void {
                 const svc = cast(ptr);
                 try request.ensureActive();
-                const cohort = @import("../metadata/backup_cohort.zig");
+                const cohort = @import("antfly_local_sources").metadata_backup_cohort;
                 if (write.job_id == 0 or write.value.len == 0 or write.value.len >
                     @as(usize, if (write.expected_revision == 0) cohort.Job.max_encoded_bytes else 4096)) return error.InvalidBackupCohort;
                 // Canonicalize before proposal: semantically valid input with
@@ -3907,7 +3907,7 @@ pub const ApiHttpServer = struct {
     /// parameter state; every execution still binds against its own snapshot.
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
-    lake_read_cache: @import("../serverless/query/lake_serving_cache.zig").Cache,
+    lake_read_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache,
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
@@ -3917,8 +3917,8 @@ pub const ApiHttpServer = struct {
         first_request_started_at_ns: u64 = 0,
         first_request_elapsed_ms: u64 = 0,
         query_embedding_cache: query_embedding_cache.Stats = .{},
-        lake_range_cache: @import("../serverless/query/lake_serving_cache.zig").Cache.Stats = .{},
-        lake_disk_cache: ?@import("../serverless/query/lake_parquet_rowgroup.zig").PersistentObjectRangeCacheStats = null,
+        lake_range_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.Stats = .{},
+        lake_disk_cache: ?@import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCacheStats = null,
         incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
@@ -4118,7 +4118,7 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
             .sql_plan_cache = sql_plan_cache.Cache.init(owner_alloc, .{}),
             .sql_schema_cache = sql_schema_cache.Cache.init(owner_alloc),
-            .lake_read_cache = @import("../serverless/query/lake_serving_cache.zig").Cache.initWithMemoryLimit(owner_alloc, if (cfg.node_config) |config| config.lake_cache.max_memory_bytes else 64 * 1024 * 1024),
+            .lake_read_cache = @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(owner_alloc, if (cfg.node_config) |config| config.lake_cache.max_memory_bytes else 64 * 1024 * 1024),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
@@ -5242,7 +5242,7 @@ pub const ApiHttpServer = struct {
             else => return err,
         }) orelse return;
         defer page_response.deinit(self.alloc);
-        var page = try std.json.parseFromSlice(?@import("../storage/db/relational_integrity_generation_retirement.zig").GcCommand, self.alloc, page_response.json, .{ .allocate = .alloc_always });
+        var page = try std.json.parseFromSlice(?@import("antfly_local_sources").storage_db_relational_integrity_generation_retirement.GcCommand, self.alloc, page_response.json, .{ .allocate = .alloc_always });
         defer page.deinit();
         if (page.value) |command| {
             var routed = command;
@@ -5574,7 +5574,7 @@ pub const ApiHttpServer = struct {
     fn advanceRowPolicyPublicationOnce(self: *ApiHttpServer) !void {
         if (!self.cfg.catalog_publication_authority_available) return;
         const coordinator = @import("row_policy_publication_coordinator.zig");
-        const policies = @import("../system_catalog/policies.zig");
+        const policies = @import("antfly_local_sources").system_catalog_policies;
         const context: api_operation.RequestContext = .{
             .deadline_ns = platform_time.monotonicNs() +| 20 * std.time.ns_per_s,
             .setting_admin = true,
@@ -5603,7 +5603,7 @@ pub const ApiHttpServer = struct {
                 const driver: *@This() = @ptrCast(@alignCast(ptr));
                 return driver.server.source.systemCatalog(a, driver.context, .{ .policy_install_snapshot = request });
             }
-            fn install(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, group: u64, request: policies.InstallRequest) !@import("../storage/db/row_policy_bundle.zig").Receipt {
+            fn install(ptr: *anyopaque, a: std.mem.Allocator, name: []const u8, group: u64, request: policies.InstallRequest) !@import("antfly_local_sources").storage_db_row_policy_bundle.Receipt {
                 const driver: *@This() = @ptrCast(@alignCast(ptr));
                 return driver.server.executeRowPolicyInstall(a, name, group, request, driver.context);
             }
@@ -5620,13 +5620,13 @@ pub const ApiHttpServer = struct {
     /// SQL has already checked table-admin authorization. Metadata resolves
     /// schema and owner descriptors again under a leader read-index and
     /// rechecks them at Raft apply; this API supplies only a logical target.
-    pub fn beginRowPolicyPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: @import("../system_catalog/domain.zig").Target, enable: bool) !void {
+    pub fn beginRowPolicyPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, target: @import("antfly_local_sources").system_catalog_domain.Target, enable: bool) !void {
         try context.ensureActive();
         try target.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const domain = @import("../system_catalog/domain.zig");
+        const domain = @import("antfly_local_sources").system_catalog_domain;
         const resolved_bytes = try self.source.systemCatalog(a, context, .{ .resolve_many = .{ .targets = &.{target} } });
         const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, resolved_bytes, .{ .allocate = .alloc_always });
         if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
@@ -7399,7 +7399,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn liveSourceVectorStatus(statuses: []const runtime_status.LocalTableRuntimeStatus) ?@import("../storage/artifact_payload.zig").Stats {
+    fn liveSourceVectorStatus(statuses: []const runtime_status.LocalTableRuntimeStatus) ?@import("antfly_local_sources").storage_artifact_payload.Stats {
         // Source mode is admitted only for one shard. Read its resident-owner
         // observation; do not open files or trigger maintenance from status.
         for (statuses) |status| {
@@ -7651,7 +7651,7 @@ pub const ApiHttpServer = struct {
         internal_context.row_policy_install_authority = true;
         const bytes = try self.source.systemCatalog(alloc, internal_context, .{ .policy_publication_status = table_id });
         defer alloc.free(bytes);
-        var parsed = try std.json.parseFromSlice(?@import("../system_catalog/policies.zig").PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
+        var parsed = try std.json.parseFromSlice(?@import("antfly_local_sources").system_catalog_policies.PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const publication = parsed.value orelse return null;
         try publication.validateShape();
@@ -10761,14 +10761,14 @@ pub const ApiHttpServer = struct {
         receipt: ?*public_table_http.TableApi.BackupExecutionReceipt,
         writer_lease_role: TableBackupWriterLeaseRole,
         request: api_operation.RequestContext,
-        sealed_handles: []const @import("backup_contract.zig").SealedHandle,
+        sealed_handles: []const @import("antfly_local_sources").api_backup_contract.SealedHandle,
     ) !void {
         if (!std.mem.eql(u8, table.name, table_name)) return error.TableNotFound;
         if (table.read_schema_json.len > 0) {
             // Only a coherent sealed cut may capture both schema generations.
             // Legacy independent snapshots still lack that authority.
             if (sealed_handles.len == 0) return error.UnsupportedBackupMigrationState;
-            try @import("../schema/restore_migration.zig").validate(self.alloc, table.schema_json, table.read_schema_json);
+            try @import("antfly_local_sources").schema_restore_migration.validate(self.alloc, table.schema_json, table.read_schema_json);
         }
         const admission_now: u64 = @intCast(std.Io.Timestamp.now(io, .real).toNanoseconds());
         var writer_fence = fence;
@@ -11401,8 +11401,8 @@ pub const ApiHttpServer = struct {
         fence: backups_api.TableBackupFence,
         backup_location: *backups_api.BackupLocation,
         request: api_operation.RequestContext,
-        cohort: ?@import("../storage/db/relational_integrity_topology.zig").Fence,
-        sealed_handles: []const @import("backup_contract.zig").SealedHandle,
+        cohort: ?@import("antfly_local_sources").storage_db_relational_integrity_topology.Fence,
+        sealed_handles: []const @import("antfly_local_sources").api_backup_contract.SealedHandle,
     ) ![]backups_api.ShardSnapshot {
         if (cohort) |value| if (format != .native or value.owner_group_id != group_id or value.namespace.table_id != fence.table_id or value.role != .backup_snapshot)
             return error.InvalidBackupFence;
@@ -11566,7 +11566,7 @@ pub const ApiHttpServer = struct {
         if (record.key.len > self.backup_cohort_recovery_cursor.len) return error.InvalidBackupCohort;
         @memcpy(self.backup_cohort_recovery_cursor[0..record.key.len], record.key);
         self.backup_cohort_recovery_cursor_len = record.key.len;
-        const parsed = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, self.alloc, record.value, .{});
+        const parsed = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Job, self.alloc, record.value, .{});
         defer parsed.deinit();
         if (parsed.value.terminal() or parsed.value.attempt_id.len == 0) return;
         var location = try backups_api.openBackupLocationWithOptions(self.alloc, parsed.value.location, .{ .secret_store = self.cfg.secret_store, .node_config = self.cfg.node_config, .connection = parsed.value.connection, .required_capability = "backup.write", .network_io = self.sharedApiNetworkIo(), .filesystem_io = self.sharedApiFilesystemIo() });
@@ -11593,7 +11593,7 @@ pub const ApiHttpServer = struct {
         };
         defer manifest.deinit(self.alloc);
         if (manifest.cohort_json.len == 0) return error.BackupCohortChanged;
-        const proof = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, self.alloc, manifest.cohort_json, .{});
+        const proof = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Job, self.alloc, manifest.cohort_json, .{});
         defer proof.deinit();
         if (proof.value.id != session.parsed.value.id or !std.mem.eql(u8, &(try proof.value.planDigest(self.alloc)), &(try session.parsed.value.planDigest(self.alloc)))) return error.BackupCohortChanged;
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, manifest, .{});
@@ -12635,7 +12635,7 @@ pub const ApiHttpServer = struct {
     pub fn prepareLakeCache(self: *ApiHttpServer) !void {
         const config = if (self.cfg.node_config) |node| node.lake_cache else common_config.Config.LakeCacheConfig{};
         if (!(self.cfg.lake_cache_enabled orelse config.enabled)) return;
-        const policy = self.cfg.lake_cache_policy orelse @import("../serverless/query/lake_parquet_rowgroup.zig").PersistentObjectRangeCachePolicy{
+        const policy = self.cfg.lake_cache_policy orelse @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.PersistentObjectRangeCachePolicy{
             .max_total_bytes = config.max_disk_bytes,
             .max_entries = config.max_entries,
             .max_write_queue_bytes = config.max_write_queue_bytes,
@@ -13117,7 +13117,7 @@ pub const ApiHttpServer = struct {
     /// Bindings become owned session state; existing physical identities keep
     /// their pinned public labels even if the catalog has since renamed them.
     pub fn authorizeAndBindIntegrityMutations(self: *ApiHttpServer, alloc: std.mem.Allocator, request: api_operation.RequestContext, tables: []const distributed_txn.TableCommitRequest, candidate: ?*transactions_api.OwnedTransactionCommitRequest) !void {
-        const integrity = @import("relational_integrity_commit.zig");
+        const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         const authorize = self.cfg.auth_enabled or request.principal != null;
         if (self.source.vtable.system_catalog == null or (!authorize and candidate == null))
             return integrity.authorizePrimaryMutations(request, self.cfg.auth_enabled, tables);
@@ -13162,8 +13162,8 @@ pub const ApiHttpServer = struct {
 
     /// Shared public transaction preparation. Original predicates survive
     /// schema/catalog fencing and cascade dependency expansion unchanged.
-    pub fn preparePublicCommitWithIntegrity(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !@import("relational_integrity_commit.zig").Prepared {
-        const integrity = @import("relational_integrity_commit.zig");
+    pub fn preparePublicCommitWithIntegrity(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !@import("antfly_local_sources").api_relational_integrity_commit.Prepared {
+        const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         var preparation_request = request;
         if (self.sharedApiIo()) |io| preparation_request.fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse
@@ -13272,7 +13272,7 @@ pub const ApiHttpServer = struct {
     };
 
     fn selectIntegritySnapshot(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !?IntegritySnapshotSelection {
-        const integrity = @import("relational_integrity_commit.zig");
+        const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         if (snapshot_opt == null and self.cfg.deployment_mode != .standalone)
@@ -13322,10 +13322,10 @@ pub const ApiHttpServer = struct {
         tables: []const distributed_txn.TableCommitRequest,
         sync_level: db_mod.types.SyncLevel,
         request: api_operation.RequestContext,
-        retained_preparation: *?@import("relational_integrity_commit.zig").Prepared,
+        retained_preparation: *?@import("antfly_local_sources").api_relational_integrity_commit.Prepared,
     ) !?distributed_txn.CommitOutcome {
         std.debug.assert(retained_preparation.* == null);
-        const integrity = @import("relational_integrity_commit.zig");
+        const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse {
             return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
         };
@@ -13444,7 +13444,7 @@ pub const ApiHttpServer = struct {
             error.Cancelled, error.Canceled => return error.Canceled,
             error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.ResourceTemporarilyUnavailable => return error.Unavailable,
             else => {
-                if (@import("../schema/relational_expression_errors.zig").isInvalidInput(err)) return error.InvalidBatchRequest;
+                if (@import("antfly_local_sources").schema_relational_expression_errors.isInvalidInput(err)) return error.InvalidBatchRequest;
                 std.log.err("public table batch schema validation failed table={s} err={}", .{ table_name, err });
                 public_table_http.setLastBatchFailureName(err);
                 return error.InternalFailure;
@@ -13470,7 +13470,7 @@ pub const ApiHttpServer = struct {
         // the transaction protocol, preserve its typed outcome instead of
         // reporting cancellation for a write that may already be durable.
         try ensureTableOperationActive(request);
-        var retained_preparation: ?@import("relational_integrity_commit.zig").Prepared = null;
+        var retained_preparation: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
         defer if (retained_preparation) |*prepared| prepared.deinit();
         const outcome = (self.commitPublicTableBatchWithIntegrity(alloc, source, &tables, req.sync_level, request, &retained_preparation) catch |err| switch (err) {
             error.RelationalIndexKeyTooLarge => return error.RelationalIndexKeyTooLarge,
@@ -16193,7 +16193,7 @@ pub const ApiHttpServer = struct {
     /// an FK and drop/recreate cannot silently attach it to a different table.
     pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed_json: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
         const normalized = try context.platformDeadline();
-        const inferred = if (before.len == 0) try @import("lake_schema_detection.zig").prepare(alloc, proposed_json, .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store }, .{ .io = self.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }) else null;
+        const inferred = if (before.len == 0) try @import("lake_schema_detection.zig").prepare(alloc, proposed_json, .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store }, .{ .io = self.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }) else null;
         defer if (inferred) |bytes| alloc.free(bytes);
         const proposed = inferred orelse proposed_json;
         if (self.source.vtable.system_catalog == null) {
@@ -16395,9 +16395,9 @@ pub const ApiHttpServer = struct {
         }
         const Observer = struct {
             server: *ApiHttpServer,
-            facts: ?std.json.Parsed(@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts) = null,
+            facts: ?std.json.Parsed(@import("antfly_local_sources").storage_db_online_merge_io_contract.AdmissionFacts) = null,
             context: api_operation.RequestContext,
-            pub fn readFacts(observer: *@This(), table: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request) !@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts {
+            pub fn readFacts(observer: *@This(), table: []const u8, request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request) !@import("antfly_local_sources").storage_db_online_merge_io_contract.AdmissionFacts {
                 try ensureTableOperationActive(observer.context);
                 const scratch = observer.server.alloc;
                 const raw = try observer.server.executeRewriteSource(scratch, table, request, observer.context);
@@ -16407,10 +16407,10 @@ pub const ApiHttpServer = struct {
                 // bounded proof and interns unique schema definitions. Keeping
                 // every owner's duplicated history in the request arena would
                 // make memory grow with owners times history size.
-                var parsed = try std.json.parseFromSlice(@import("../storage/db/online_merge_io_contract.zig").AdmissionFacts, scratch, raw, .{ .allocate = .alloc_always });
+                var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_online_merge_io_contract.AdmissionFacts, scratch, raw, .{ .allocate = .alloc_always });
                 errdefer parsed.deinit();
                 const facts = parsed.value;
-                const limits = @import("../storage/db/relational_rewrite_contract.zig");
+                const limits = @import("antfly_local_sources").storage_db_relational_rewrite_contract;
                 if (facts.source_schemas.len > limits.max_source_schemas) return error.RelationalRewriteBudgetExceeded;
                 var size: usize = 0;
                 for (facts.source_schemas) |definition| {
@@ -16420,7 +16420,7 @@ pub const ApiHttpServer = struct {
                 observer.facts = parsed;
                 return facts;
             }
-            pub fn releaseFacts(observer: *@This(), _: @import("../storage/db/online_merge_io_contract.zig").AdmissionFacts) void {
+            pub fn releaseFacts(observer: *@This(), _: @import("antfly_local_sources").storage_db_online_merge_io_contract.AdmissionFacts) void {
                 if (observer.facts) |*parsed| parsed.deinit();
                 observer.facts = null;
             }
@@ -16841,7 +16841,7 @@ pub const ApiHttpServer = struct {
         }) orelse error.MethodNotAllowed;
     }
 
-    fn executePublicTableIndexMaintenance(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action, body: []const u8, request: api_operation.RequestContext) public_table_http.TableApi.ExecuteIndexMaintenanceError![]u8 {
+    fn executePublicTableIndexMaintenance(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Action, body: []const u8, request: api_operation.RequestContext) public_table_http.TableApi.ExecuteIndexMaintenanceError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
         const writer = self.table_writes orelse return error.MethodNotAllowed;
@@ -17862,7 +17862,7 @@ pub const ApiHttpServer = struct {
         job.* = parsed;
     }
 
-    pub fn submitRewriteSource(self: *ApiHttpServer, table: []const u8, request: @import("../storage/db/types.zig").BatchRequest, context: api_operation.RequestContext) !void {
+    pub fn submitRewriteSource(self: *ApiHttpServer, table: []const u8, request: @import("antfly_local_sources").storage_db_types.BatchRequest, context: api_operation.RequestContext) !void {
         try context.ensureActive();
         _ = (try (self.table_writes orelse return error.UnsupportedOperation).batch(self.alloc, table, request)) orelse return error.RestoreValidationPending;
         try context.ensureActive();
@@ -18140,9 +18140,9 @@ pub const ApiHttpServer = struct {
                 const pending_handoff: ?struct {
                     table_name: []const u8,
                     range: metadata_table_manager.RangeRecord,
-                    fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+                    fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
                     handoff: stages.GenerationHandoffRange,
-                    graph_scope: ?@import("../storage/db/graph_retirement_seal.zig").Scope,
+                    graph_scope: ?@import("antfly_local_sources").storage_db_graph_retirement_seal.Scope,
                 } = handoff_scan: for (job.value.plan.targets) |target| {
                     if (owner_cursor < validation_owner_count) break :handoff_scan null;
                     if (target.generation_handoffs.len == 0) continue;
@@ -18263,7 +18263,7 @@ pub const ApiHttpServer = struct {
             if (target_index == job.value.plan.targets.len) {
                 if (phase == .cutover or phase == .canceling or phase == .activating) {
                     var parent_index = range_index;
-                    const selected_parent: ?struct { parent: stages.ExternalFkParent, range: metadata_table_manager.RangeRecord, fence: @import("../storage/db/relational_integrity_topology.zig").Fence } = for (job.value.plan.external_fk_parents) |parent| {
+                    const selected_parent: ?struct { parent: stages.ExternalFkParent, range: metadata_table_manager.RangeRecord, fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence } = for (job.value.plan.external_fk_parents) |parent| {
                         if (parent_index < parent.ranges.len) {
                             const range = parent.ranges[parent_index];
                             const fence = for (parent.fences) |item| {
@@ -18308,7 +18308,7 @@ pub const ApiHttpServer = struct {
                                 zig017_return_error = error.RestoreValidationPending;
                                 break :zig017_failure error.RestoreValidationPending;
                             };
-                            var entries: [128]@import("../storage/db/relational_integrity_topology_contract.zig").ParentRetirementEntry = undefined;
+                            var entries: [128]@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.ParentRetirementEntry = undefined;
                             for (selected.parent.foreign_keys, 0..) |foreign, index| entries[index] = .{ .child_table_id = foreign.child_table_id, .child_table_name = foreign.child_table_name, .constraint_name = foreign.constraint_name, .generation = foreign.generation, .next_generation = foreign.next_generation };
                             _ = ((writes.batch(self.alloc, selected.parent.table.name, .{ .relational_topology = .{ .fence = selected.fence, .action = .stage_parent_retirement, .parent_retirement = .{ .plan_digest = job.value.plan_digest, .entries = entries[0..selected.parent.foreign_keys.len] } } }) catch |zig017_err| {
                                 zig017_return_error = zig017_err;
@@ -18447,7 +18447,7 @@ pub const ApiHttpServer = struct {
                                 break :zig017_failure error.RestoreValidationPending;
                             };
                             defer status.deinit(self.alloc);
-                            var parsed = (std.json.parseFromSlice(?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt, self.alloc, status.json, .{}) catch |zig017_err| {
+                            var parsed = (std.json.parseFromSlice(?@import("antfly_local_sources").storage_db_restore_staging_contract.GenerationAdmissionReceipt, self.alloc, status.json, .{}) catch |zig017_err| {
                                 zig017_return_error = zig017_err;
                                 return zig017_err;
                             });
@@ -18545,7 +18545,7 @@ pub const ApiHttpServer = struct {
                     }
                     var old_index = parent_index;
                     if (phase == .activating) old_index = std.math.maxInt(usize);
-                    const selected: ?struct { table: metadata_table_manager.TableRecord, range: metadata_table_manager.RangeRecord, fence: @import("../storage/db/relational_integrity_topology.zig").Fence, rewrite_source: ?@import("../storage/db/online_source_contract.zig").Scope, graph_scope: ?@import("../storage/db/graph_retirement_seal.zig").Scope, handoff: ?stages.GenerationHandoffRange } = for (job.value.plan.targets) |target| {
+                    const selected: ?struct { table: metadata_table_manager.TableRecord, range: metadata_table_manager.RangeRecord, fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence, rewrite_source: ?@import("antfly_local_sources").storage_db_online_source_contract.Scope, graph_scope: ?@import("antfly_local_sources").storage_db_graph_retirement_seal.Scope, handoff: ?stages.GenerationHandoffRange } = for (job.value.plan.targets) |target| {
                         if (target.replace) |old| {
                             if (old.fences.len != old.ranges.len) return zig017_failure: {
                                 zig017_return_error = error.RestoreSourceProofMissing;
@@ -18859,7 +18859,7 @@ pub const ApiHttpServer = struct {
             // Index readiness is a bounded owner job, not a single-call
             // transition. Keep the imported generation hidden while it builds.
             if (phase == .validating and result.phase == .imported) continue;
-            const expected_phase: @import("../storage/db/restore_staging.zig").Phase = switch (phase) {
+            const expected_phase: @import("antfly_local_sources").storage_db_restore_staging.Phase = switch (phase) {
                 .importing => .imported,
                 .validating => .validated,
                 .published => .published,
@@ -19076,7 +19076,7 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const proof = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, a, manifest.cohort_json, .{ .allocate = .alloc_always });
+        const proof = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Job, a, manifest.cohort_json, .{ .allocate = .alloc_always });
         if (!std.mem.eql(u8, proof.value.backup_id, req.backup_id)) return error.BackupIntegrityFailure;
         const state_json = (try self.restore_job_store.load(self.alloc, restore.job_id)) orelse return error.RestoreJobFenced;
         defer self.alloc.free(state_json);
@@ -19162,11 +19162,11 @@ pub const ApiHttpServer = struct {
             target.table.indexes_json = try stored_destination_authorization.sealIndexesJsonForPrincipalAlloc(a, target.table.indexes_json, target.table.name, effective, authorizer);
         }
         for (@constCast(plan.targets)) |*target| if (target.replace) |*old| {
-            const fences = try a.alloc(@import("../storage/db/relational_integrity_topology.zig").Fence, old.ranges.len);
+            const fences = try a.alloc(@import("antfly_local_sources").storage_db_relational_integrity_topology.Fence, old.ranges.len);
             for (old.ranges, fences) |range, *fence| {
                 var response = (try (self.table_reads orelse return error.UnsupportedOperation).topologyStatus(self.alloc, old.table.name, range.start_key, "{\"mode\":\"identity\"}")) orelse return error.TableNotFound;
                 defer response.deinit(self.alloc);
-                const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+                const Identity = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
                 const native = try std.json.parseFromSlice(Identity, a, response.json, .{ .ignore_unknown_fields = true });
                 fence.* = .{ .transition_id = backup_cohort_driver.idForAttempt(&id), .attempt = staging_attempt, .admission_epoch = native.value.next_epoch, .owner_group_id = range.group_id, .peer_group_id = range.group_id, .role = .backup_snapshot, .namespace = native.value.namespace, .catalog_digest = native.value.catalog_digest };
             }
@@ -21175,7 +21175,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn createStorageMigration(self: *ApiHttpServer, table_name: []const u8, body: []const u8) ![]u8 {
-        const migration = @import("../common/vector_migration.zig");
+        const migration = @import("antfly_local_sources").common_vector_migration;
         var create = try std.json.parseFromSlice(migration.CreateRequest, self.alloc, body, .{});
         defer create.deinit();
         const command = migration.Command{ .action = .start, .request = .{ .job_id = create.value.job_id, .mode = .online, .budget = create.value.budget } };
@@ -21185,7 +21185,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn getStorageMigration(self: *ApiHttpServer, table_name: []const u8, job_id: []const u8) ![]u8 {
-        const migration = @import("../common/vector_migration.zig");
+        const migration = @import("antfly_local_sources").common_vector_migration;
         const command = migration.Command{ .action = .status, .request = .{ .job_id = job_id, .mode = .online } };
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, command, .{});
         defer self.alloc.free(encoded);
@@ -21193,7 +21193,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn advanceStorageMigration(self: *ApiHttpServer, table_name: []const u8, job_id: []const u8, body: []const u8) ![]u8 {
-        const migration = @import("../common/vector_migration.zig");
+        const migration = @import("antfly_local_sources").common_vector_migration;
         var action = try std.json.parseFromSlice(migration.JobCommand, self.alloc, body, .{});
         defer action.deinit();
         const status = try self.getStorageMigration(table_name, job_id);
@@ -21215,7 +21215,7 @@ pub const ApiHttpServer = struct {
     /// Durable admission is persisted before touching the table owner. If the
     /// response is lost, the same command resumes the original admitted job.
     pub fn executeVectorMigration(self: *ApiHttpServer, table_name: []const u8, body: []const u8) ![]u8 {
-        const migration = @import("../common/vector_migration.zig");
+        const migration = @import("antfly_local_sources").common_vector_migration;
         if (!self.cfg.deployment_mode.isStandalone() or self.source.vtable.publish_vector_migration_table == null)
             return error.VectorStoreRequiresLocalSingleShardTable;
         var command = try std.json.parseFromSlice(migration.Command, self.alloc, body, .{});
@@ -22108,7 +22108,7 @@ pub const ApiHttpServer = struct {
                 // unrelated destination. Keep dependency remapping explicit.
                 for ([_][]const u8{ manifest.schema_json, manifest.read_schema_json }) |json| {
                     if (json.len == 0) continue;
-                    var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(self.alloc, json);
+                    var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(self.alloc, json);
                     defer schema.deinit(self.alloc);
                     if (schema.foreign_keys) |fks| if (fks.value.len != 0)
                         return contextualJsonErrorResponse(self.alloc, 409, "foreign-key table copies require a dependency-complete cluster restore preserving source bindings");
@@ -23495,8 +23495,8 @@ test "staged portable restore proves terminal correctness with a bounded extende
 
 test "staged restore worker preserves generated mixed cohorts across HTTP owner faults" {
     const source_errors = @import("restore_source_errors.zig");
-    inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
-        const err = @field(@import("../schema/relational_expression_errors.zig").Error, field);
+    inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+        const err = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
         try std.testing.expectEqual(err != error.GeneratedColumnRewriteRequired, source_errors.permanent(err));
     }
     try std.testing.expect(source_errors.permanent(error.InvalidBatchRequest));
@@ -23756,7 +23756,7 @@ fn portableForeignKeyRestoreGuarded(alloc: std.mem.Allocator, manifest: *const b
     for (manifest.shards) |shard| if (shard.accepted_generation_summary.len != 0) return true;
     for ([_][]const u8{ manifest.schema_json, manifest.read_schema_json }) |json| {
         if (json.len == 0) continue;
-        var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, json);
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, json);
         defer schema.deinit(alloc);
         if (schema.foreign_keys) |foreign_keys| if (foreign_keys.value.len != 0) return true;
     }
@@ -23772,7 +23772,7 @@ fn clusterPortableForeignKeyRestoreGuarded(
 ) !bool {
     if (builtin.is_test and test_permit) return false;
     if (manifest.cohort_json.len != 0) {
-        var proof = try std.json.parseFromSlice(@import("../metadata/backup_cohort.zig").Job, alloc, manifest.cohort_json, .{});
+        var proof = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.Job, alloc, manifest.cohort_json, .{});
         defer proof.deinit();
         if (proof.value.artifact_format == .native) return false;
     }
@@ -26244,7 +26244,7 @@ fn isStorageMaintenancePath(path: []const u8) bool {
     return std.mem.eql(u8, path, admin_routes.maintenance) or std.mem.startsWith(u8, path, admin_routes.maintenance ++ "/");
 }
 
-fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) metadata_openapi.StorageRuntimeStatus {
+fn storageRuntimeStatus(status: @import("antfly_local_sources").storage_maintenance.Status) metadata_openapi.StorageRuntimeStatus {
     return .{
         .engine = status.engine,
         .format = status.format,
@@ -26780,7 +26780,7 @@ fn admittedTablePermissionAllowed(
 /// effective before the next protected table operation.
 pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?AuthenticatedIdentity, schema_json: []const u8) !bool {
     _ = identity orelse return true;
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     if (parsed.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign_key| {
         // Defining a dependency can expose existence and block parent writes.
@@ -26902,7 +26902,7 @@ fn graphResolverValueDestinationsAllowed(
 }
 
 test "storage migration job observation preserves admitted and unpublished catalog state" {
-    const migration = @import("../common/vector_migration.zig");
+    const migration = @import("antfly_local_sources").common_vector_migration;
     const alloc = std.testing.allocator;
     const Fake = struct {
         commands: migration.CommandAdmissions = .{},
@@ -27022,7 +27022,7 @@ test "storage migration job observation preserves admitted and unpublished catal
 }
 
 test "storage migration command admission fences delayed starts across handlers" {
-    const migration = @import("../common/vector_migration.zig");
+    const migration = @import("antfly_local_sources").common_vector_migration;
     const Db = @import("antfly_source_root").antfly_sources.physical_db.DB;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -34224,7 +34224,7 @@ test "ordinary reads and writes distinguish absent policy from unavailable autho
             try std.testing.expect(context.row_policy_install_authority);
             if (self.failure) |err| return err;
             if (!self.active) return alloc.dupe(u8, "null");
-            return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/policies.zig").PublicationStamp{
+            return std.json.Stringify.valueAlloc(alloc, @import("antfly_local_sources").system_catalog_policies.PublicationStamp{
                 .table_id = 7,
                 .schema_version = 1,
                 .generation = 2,
@@ -39168,7 +39168,7 @@ test "api http server rewrite job authorization follows the complete cohort" {
 
 test "api http server coordinated batch outcomes retain prepared names and conflict keys" {
     const alloc = std.testing.allocator;
-    const integrity = @import("relational_integrity_commit.zig");
+    const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
     const read_gate = @import("../raft/read_gate.zig");
     const public_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}
@@ -39316,7 +39316,7 @@ test "api http server stale no-FK catalog cannot take uncoordinated batch path" 
     const writes: table_writes.TableWriteSource = .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_batch = Fake.commit } };
     var server = ApiHttpServer.init(alloc, .{ .deployment_mode = .distributed }, source, reads, writes);
     const requests = [_]distributed_txn.TableCommitRequest{.{ .table_name = "rows", .writes = &.{.{ .key = "orphan", .value = "{\"id\":2,\"parent\":1}" }} }};
-    var retained: ?@import("relational_integrity_commit.zig").Prepared = null;
+    var retained: ?@import("antfly_local_sources").api_relational_integrity_commit.Prepared = null;
     defer if (retained) |*prepared| prepared.deinit();
     try std.testing.expectError(error.ExpectedFkPreparation, server.commitPublicTableBatchWithIntegrity(alloc, writes, &requests, .write, .{}, &retained));
     try std.testing.expectEqual(@as(usize, 1), fake.authoritative_calls);
@@ -41357,7 +41357,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     );
     defer alloc.free(body);
 
-    @import("../test_error_logs.zig").expectErrorLogs(1);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     var first = try executeHttpxTestRequest(&server, .{ .method = .POST, .uri = commit_uri, .content_type = "application/json", .body = body });
     defer first.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), first.status);
@@ -42656,7 +42656,7 @@ test "api http server authenticates bounded online merge owner routes" {
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table_name: []const u8, request: contract.Request, context: @import("operation.zig").RequestContext) ![]u8 {
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, group: u64, table_name: []const u8, request: contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             try std.testing.expectEqual(@as(u64, 2), group);
@@ -44555,7 +44555,7 @@ test "api http server unified relational index CRUD uses schema CAS without arti
         fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, options: db_mod.types.LookupOptions, consistency: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(.read_index, consistency);
-            const native = @import("../storage/db/relational_index_status_contract.zig");
+            const native = @import("antfly_local_sources").storage_db_relational_index_status_contract;
             var request = try std.json.parseFromSlice(native.Request, allocator, options.relational_index_status_json, .{});
             defer request.deinit();
             var parsed = try schema_mod.parseValidatedTableSchema(allocator, self.table.schema_json);
@@ -44566,9 +44566,9 @@ test "api http server unified relational index CRUD uses schema CAS without arti
             const temporary = arena.allocator();
             const definitions = (try parsed.relationalIndexDefinitions(temporary)).?;
             const runtime = try schema_mod.deriveRelationalCheckLayout(temporary, parsed);
-            var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(temporary, runtime);
+            var layout = try @import("antfly_local_sources").storage_db_algebraic_relational_row_codec.PhysicalLayout.init(temporary, runtime);
             defer layout.deinit();
-            var tuple = try @import("../storage/db/relational_index_keys.zig").TuplePlan.init(temporary, runtime, &layout, definitions[0].keys);
+            var tuple = try @import("antfly_local_sources").storage_db_relational_index_keys.TuplePlan.init(temporary, runtime, &layout, definitions[0].keys);
             defer tuple.deinit();
             const index_status = native.Status{
                 .table_id = 42,
@@ -44595,7 +44595,7 @@ test "api http server unified relational index CRUD uses schema CAS without arti
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?table_reads.ScanResponse {
             return error.UnexpectedCall;
         }
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
             return error.UnexpectedCall;
         }
     };
@@ -56322,7 +56322,7 @@ test "backup heartbeat internal shard progresses with exhausted async capacity" 
 }
 
 test "backup heartbeat cluster admission failure permits same ID retry" {
-    @import("../test_error_logs.zig").expectErrorLogs(1);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     try testBackupHeartbeatCapacity(.cluster, true);
 }
 

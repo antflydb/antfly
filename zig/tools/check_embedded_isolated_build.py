@@ -13,17 +13,16 @@
 # Elastic License 2.0 for the specific language governing permissions and
 # limitations.
 
-"""Compile public C API and browser artifacts without server implementations."""
+"""Compile lake, public C API, and browser artifacts without server implementations."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-
-from audit_embedded_source_boundary import server_source
 
 
 def stage_sources(repository: Path, destination: Path) -> int:
@@ -38,29 +37,72 @@ def stage_sources(repository: Path, destination: Path) -> int:
         relative = Path(raw.decode())
         # Build inputs and source-generation tooling; bindings and application
         # assets are unrelated to either compilation owner.
-        if relative.parts[0] not in {"zig", "specs", "scripts"}:
+        if relative.parts[0] not in {
+            "zig",
+            "specs",
+            "scripts",
+        } and not relative.as_posix().startswith(
+            "ts/packages/design-system/src/fonts/"
+        ):
             continue
         source = repository / relative
         if not source.is_file():
             continue
-        prefix = "zig/pkg/antfly/src/"
-        if relative.as_posix().startswith(prefix) and server_source(
-            relative.as_posix().removeprefix(prefix)
-        ):
+        # No stubs or copied server source: even dormant literal imports must
+        # belong to embedded, a shared library, or an explicit test capability.
+        if relative.parts[:3] == ("zig", "pkg", "antfly"):
             removed += 1
-            # Zig scans relative imports in dormant test/target branches for
-            # cache inputs. Retain only an unconditional compile-time trap,
-            # never a server implementation: a live import must fail closed.
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(
-                'comptime { @compileError("server implementation unavailable in embedded build"); }\n'
-            )
             continue
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
     return removed
+
+
+def smoke_lite(stage: Path) -> None:
+    """Exercise durable local operations using the server-free executable."""
+    executable = stage / "zig/zig-out/bin/antfly-lite"
+    database = stage / "smoke.aflite"
+    restored = stage / "restored.aflite"
+    backup = stage / "smoke.afb"
+    request = stage / "batch.json"
+    request.write_text(json.dumps({"inserts": {"doc:smoke": {"title": "embedded"}}}))
+
+    def run(*args: object) -> str:
+        result = subprocess.run(
+            [str(executable), *(str(arg) for arg in args)],
+            cwd=stage,
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Lite command failed: {args}\n{result.stderr}")
+        return result.stdout
+
+    run("init", database)
+    run("batch", database, "--file", request)
+    run("backup", database, "--out", backup)
+    run("restore", backup, "--out", restored)
+    document = json.loads(run("lookup", restored, "--key", "doc:smoke", "--readonly"))
+    if document.get("_source") != {"title": "embedded"}:
+        raise RuntimeError(f"Lite backup/restore lost the document: {document}")
+    run("check", restored)
+    worker = subprocess.run(
+        [str(executable), "inference", "_worker"],
+        cwd=stage,
+        input="",
+        text=True,
+        capture_output=True,
+        timeout=15,
+    )
+    if worker.returncode:
+        raise RuntimeError(
+            f"Lite inference worker failed to shut down on EOF: {worker.stderr}"
+        )
+    print(
+        "Server-free Lite init/batch/backup/restore/lookup/check and worker shutdown passed",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -76,23 +118,32 @@ def main() -> None:
         stage = Path(directory)
         removed = stage_sources(repository, stage)
         print(
-            f"Staged embedded build: {removed} server implementations replaced with compile-time traps",
+            f"Staged embedded build: {removed} server files omitted",
             flush=True,
         )
         subprocess.run(
             [
                 args.zig,
                 "build",
+                "--build-file",
+                "embedded.build.zig",
+                "lite",
+                "capi-smoke",
+                "capi-conformance",
                 "embedded-capi-check",
+                "embedded-lake-test",
+                "embedded-package-test",
+                "aws-credentials-test",
                 "embedded-native-module-boundary-check",
                 "embedded-wasm-module-boundary-check",
-                "wasm",
+                "wasm-test",
                 "-Dmetal=false",
                 *flags,
             ],
             cwd=stage / "zig",
             check=True,
         )
+        smoke_lite(stage)
 
 
 if __name__ == "__main__":

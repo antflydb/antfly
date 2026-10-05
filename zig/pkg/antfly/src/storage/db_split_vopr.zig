@@ -7,7 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
 const db = @import("antfly_source_root").antfly_sources.physical_db;
-const fixture = @import("db/db_split_sim_fixture.zig");
+const fixture = @import("antfly_local_sources").storage_db_db_split_sim_fixture;
 
 const add_base = vopr.id.stable("transition", "storage.db_split.add_doc");
 const reopen_source_id = vopr.id.stable("transition", "storage.db_split.reopen_source");

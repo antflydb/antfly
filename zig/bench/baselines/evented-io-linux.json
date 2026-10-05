@@ -1,0 +1,766 @@
+{
+  "created_utc": "2026-10-05T17:24:03.197415+00:00",
+  "source_commit": "8fd2dedfca4e9e418101f849f2160571bba32a47",
+  "environment": {
+    "host": {
+      "platform": "macOS-15.6.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "cpu": "Apple M4 Max"
+    },
+    "filesystem": "anonymous Docker volume on VM disk; host cache/storage shared",
+    "container_image": "alpine:3.22",
+    "kernel": "Linux 120cc33ff76a 7.0.14-linuxkit #1 SMP PREEMPT Fri Sep 18 10:19:32 UTC 2026 aarch64 Linux",
+    "container_memory_bytes": 536870912
+  },
+  "samples_per_case": 7,
+  "binary_sha256": "acd18d8241fd81dc6d92fdba907728a92644e0bef6b12678c23ac1a909c07d0e",
+  "fixture": {
+    "block_size": 4096,
+    "read_file_bytes": 67108864,
+    "read_operations": 16384,
+    "write_operations": 128,
+    "fsync_after_each_write": true,
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "order": "alternating backend order; one warmup per case"
+  },
+  "limitations": [
+    "Reads use a warmed page cache, not controlled cold storage.",
+    "fsync tests filesystem synchronization, not power-loss recovery or macOS F_FULLFSYNC.",
+    "These I/O measurements do not establish Lite, LSM, full-text, or vector application performance.",
+    "Linux Docker results reflect a VM filesystem, not bare-metal Linux storage."
+  ],
+  "positional_summary": [
+    {
+      "workload": "cached_read",
+      "concurrency": 1,
+      "median_ns": {
+        "threaded": 8561041,
+        "evented": 12144541
+      },
+      "evented_over_threaded": 1.4185822728801323
+    },
+    {
+      "workload": "cached_read",
+      "concurrency": 8,
+      "median_ns": {
+        "threaded": 2623625,
+        "evented": 3917625
+      },
+      "evented_over_threaded": 1.4932107294297012
+    },
+    {
+      "workload": "cached_read",
+      "concurrency": 32,
+      "median_ns": {
+        "threaded": 2958708,
+        "evented": 4226417
+      },
+      "evented_over_threaded": 1.428467087661236
+    },
+    {
+      "workload": "durable_write",
+      "concurrency": 1,
+      "median_ns": {
+        "threaded": 19037875,
+        "evented": 25555708
+      },
+      "evented_over_threaded": 1.3423613717392304
+    },
+    {
+      "workload": "durable_write",
+      "concurrency": 8,
+      "median_ns": {
+        "threaded": 8010833,
+        "evented": 9490167
+      },
+      "evented_over_threaded": 1.184666688220813
+    },
+    {
+      "workload": "durable_write",
+      "concurrency": 32,
+      "median_ns": {
+        "threaded": 5986333,
+        "evented": 8838542
+      },
+      "evented_over_threaded": 1.4764534482127873
+    }
+  ],
+  "positional_samples": [
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 9175417
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 12144541
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 12947167
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 8255958
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 8561041
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 12157417
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 12134375
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 8629542
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 8549792
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 12153000
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 12073542
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 8802625
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 8387916
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 11561167
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 2478334
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 4210208
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 4150875
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 2946708
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 2734583
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 3974250
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 3917625
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 2621792
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 2465917
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 3746375
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 3712917
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 2623625
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 2955208
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 3839291
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 3115083
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 4226417
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 4337875
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 2682333
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 2587458
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 8647500
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 4176667
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 3013709
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 2958708
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 3935958
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 4122000
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 3054750
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 2773959
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 4249666
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 21407459
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 26950833
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 24898291
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 19858958
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 19037875
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 22762208
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 24278375
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 16912292
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 19652083
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 31829125
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 28727917
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 18373208
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 18383625
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 25555708
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 6883542
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 9887666
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 8944916
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 7006625
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 8010833
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 10514166
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 10129166
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 8278125
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 8084042
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 8752917
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 9490167
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 6833375
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 8830208
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 8349375
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 6289625
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 5678625
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 8446834
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 5986333
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 5514875
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 10170750
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 9503625
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 5765166
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 6175125
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 11226666
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 7832750
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 5121917
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 8908625
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 8838542
+    }
+  ]
+}

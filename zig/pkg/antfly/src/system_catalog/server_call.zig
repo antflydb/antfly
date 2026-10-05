@@ -14,7 +14,7 @@
 
 //! Server catalog command envelope and admission policy.
 const std = @import("std");
-const domain = @import("domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const Read = domain.Read;
 const Request = domain.Request;
 const ResolveMany = domain.ResolveMany;
@@ -23,9 +23,9 @@ const TableStatusTarget = domain.TableStatusTarget;
 const Target = domain.Target;
 
 pub const Call = union(enum) {
-    setting_snapshot: @import("settings.zig").Scope,
-    policy_snapshot: @import("policies.zig").SnapshotRequest,
-    policy_install_snapshot: @import("policies.zig").InstallRequest,
+    setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
+    policy_snapshot: @import("antfly_local_sources").system_catalog_policies.SnapshotRequest,
+    policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
     /// Returns a PublicationStamp, or JSON null when no policy was provisioned.
     /// Unsupported capabilities and inconsistent publications remain errors.
     policy_publication_status: u64,
@@ -33,11 +33,11 @@ pub const Call = union(enum) {
     policy_publication_work: u64,
     /// Trusted metadata ingress derives the owner cut; callers supply no
     /// owner descriptors or policy bundle bytes.
-    policy_publication_begin: @import("policies.zig").BeginRequest,
+    policy_publication_begin: @import("antfly_local_sources").system_catalog_policies.BeginRequest,
     /// Administrator-authored draft definition. Never activates enforcement.
-    policy_definition_mutate: @import("policies.zig").Command,
+    policy_definition_mutate: @import("antfly_local_sources").system_catalog_policies.Command,
     /// Private coordinator-only transition. Never accepted from public SQL.
-    policy_publication_mutate: @import("policies.zig").PublicationCommand,
+    policy_publication_mutate: @import("antfly_local_sources").system_catalog_policies.PublicationCommand,
     fk_generation_publication_begin: @import("../metadata/fk_generation_publication.zig").Plan,
     fk_generation_publication_mutate: @import("../metadata/fk_generation_publication.zig").Command,
     fk_generation_publication_status: u64,
@@ -59,7 +59,7 @@ pub const Call = union(enum) {
     store_root_enrollment_status: @import("../metadata/store_root_enrollment.zig").Identity,
     fk_initial_retirement_signed_page: @import("../metadata/fk_initial_retirement_wire.zig").SignedPageRequest,
     fk_initial_retirement_ack: @import("../metadata/fk_initial_retirement_wire.zig").AckRequest,
-    setting_mutate: @import("settings.zig").Request,
+    setting_mutate: @import("antfly_local_sources").system_catalog_settings.Request,
     list_tables: TableList,
     export_snapshot: void,
     read: Read,

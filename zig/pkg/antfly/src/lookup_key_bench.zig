@@ -1,8 +1,8 @@
 //! Isolates the storage-key preparation used by real document collectors.
 const std = @import("std");
-const Counter = @import("allocation_bench_support.zig").Counter;
-const Scratch = @import("storage/db/lookup_key_scratch.zig").Scratch;
-const keys = @import("storage/internal_keys.zig");
+const Counter = @import("antfly_local_sources").allocation_bench_support.Counter;
+const Scratch = @import("antfly_local_sources").storage_db_lookup_key_scratch.Scratch;
+const keys = @import("antfly_local_sources").storage_internal_keys;
 const time = @import("antfly_platform").time;
 
 pub fn main(init: std.process.Init) !void {

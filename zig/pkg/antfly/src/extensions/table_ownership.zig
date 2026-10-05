@@ -7,7 +7,7 @@ const std = @import("std");
 const extension_domain = @import("mod.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const json_helpers = @import("../api/json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 
 pub fn memberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
     if (member.table_name.len != 0) return member.table_name;

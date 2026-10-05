@@ -4,7 +4,7 @@
 const std = @import("std");
 const catalog = @import("../api/table_catalog.zig");
 const metadata = @import("../metadata/api.zig");
-const topology = @import("../common/topology_records.zig");
+const topology = @import("antfly_local_sources").common_topology_records;
 
 /// A bounded worker round resumes this immutable routing generation rather
 /// than recapturing or searching the catalog for every visited group.

@@ -7,8 +7,8 @@
 
 const std = @import("std");
 const distributed_join = @import("distributed_join.zig");
-const operation = @import("operation.zig");
-const table_reads = @import("table_read_source.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const table_reads = @import("antfly_local_sources").api_table_read_source;
 
 pub const Error = operation.ApiError || error{
     InvalidQueryRequest,

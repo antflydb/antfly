@@ -1,10 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
 const Allocator = std.mem.Allocator;
 
 const Fixture = struct {
@@ -249,7 +249,7 @@ test "SQL conflict assignment subqueries fail closed before owner-side masked Ap
 }
 
 test "SQL original conflict scalar cases require a deferred owner-side read" {
-    const corpus = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     for ([_][]const u8{ "sql-1411", "sql-1440" }) |id| {
         const sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
@@ -467,7 +467,7 @@ test "SQL conflict binder separates partial arbiter predicates from DO UPDATE fi
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (n) VALUES (3) ON CONFLICT (n) WHERE n >= 2 DO UPDATE SET n = excluded.n WHERE items.n < 9", .{});
     defer compiled.deinit();
     const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer, .nullable = false }} };
-    const bound = try @import("conflict.zig").bind(alloc, backend, table, compiled.statement.insert.table, compiled.statement.insert.conflict.?, &.{}, &.{});
+    const bound = try @import("antfly_local_sources").sql_conflict.bind(alloc, backend, table, compiled.statement.insert.table, compiled.statement.insert.conflict.?, &.{}, &.{});
     try std.testing.expectEqual(@as(usize, 1), bound.arbiter_conditions.len);
     try std.testing.expectEqual(catalog.Condition.Op.gte, bound.arbiter_conditions[0].op);
     try std.testing.expectEqual(@as(i64, 2), bound.arbiter_conditions[0].value.integer);
@@ -506,7 +506,7 @@ test "SQL native generated identity VALUES SELECT and explicit identity share pr
 }
 
 test "SQL decisions in conflict predicates assignments and returning retain atomic fences" {
-    const Provider = @import("decision_eval.zig").testing.Provider;
+    const Provider = @import("antfly_local_sources").sql_decision_eval.testing.Provider;
     const cases = [_]struct { sql: []const u8, calls: usize, affected: usize }{
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability(CAST(excluded.n AS TEXT),'Refund?','local')>0.8 THEN items.n+excluded.n ELSE 0 END WHERE ai_probability(CAST(items.n AS TEXT),'Refund?','local')>0.8 RETURNING ai_probability(CAST(n AS TEXT),'Refund?','local')", .calls = 3, .affected = 1 },
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability('unused','Refund?','local')>0.8 THEN 7 ELSE 0 END WHERE FALSE", .calls = 0, .affected = 0 },
@@ -553,7 +553,7 @@ test "SQL conflict decisions batch fenced owner rows across bounded pages" {
     }
     try sql.appendSlice(a, " ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability(CAST(excluded.n AS TEXT),'Refund?','local')>0.8 THEN items.n+excluded.n ELSE 0 END WHERE ai_probability(CAST(items.n AS TEXT),'Refund?','local')>0.8");
     var fixture: Fixture = .{};
-    var provider: @import("decision_eval.zig").testing.Provider = .{};
+    var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
     var backend = fixture.backend();
     backend.decision_provider = provider.provider();
     var compiled = try compiler.compile(a, sql.items, .{});
@@ -577,7 +577,7 @@ test "SQL conflict decisions respect configured row and byte pages" {
     const a = std.testing.allocator;
     for ([_]runtime.Limits{ .{ .page_rows = 1 }, .{ .page_bytes = 1 }, .{ .page_rows = 2 } }) |limits| {
         var fixture: Fixture = .{};
-        var provider: @import("decision_eval.zig").testing.Provider = .{};
+        var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
         var backend = fixture.backend();
         backend.decision_provider = provider.provider();
         var compiled = try compiler.compile(a, "INSERT INTO items (_id,n) VALUES ('existing-0',3),('existing-1',3),('existing-2',3) ON CONFLICT (_id) DO UPDATE SET n=CASE WHEN ai_probability(CAST(excluded.n AS TEXT),'Refund?','local')>0.8 THEN items.n+excluded.n ELSE 0 END WHERE ai_probability(CAST(items.n AS TEXT),'Refund?','local')>0.8 RETURNING ai_probability(CAST(n AS TEXT),'Refund?','local')", .{});
@@ -595,7 +595,7 @@ test "SQL conflict decisions respect configured row and byte pages" {
 }
 
 test "SQL EXPLAIN exposes deferred conflict decision queries without owner reads" {
-    const Provider = @import("decision_eval.zig").testing.Provider;
+    const Provider = @import("antfly_local_sources").sql_decision_eval.testing.Provider;
     var fixture: Fixture = .{ .guarded = true, .dynamic = true };
     var provider: Provider = .{};
     var backend = fixture.backend();

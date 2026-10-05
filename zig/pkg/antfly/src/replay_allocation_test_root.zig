@@ -1,8 +1,8 @@
 test {
-    _ = @import("storage/db/artifact_ids.zig");
-    _ = @import("storage/db/lookup_key_scratch.zig");
-    _ = @import("storage/db/doc_identity.zig");
-    _ = @import("storage/db/document_read_scratch.zig");
-    _ = @import("storage/db/derived/derived_worker.zig");
-    _ = @import("storage/db/derived/change_journal.zig");
+    _ = @import("antfly_local_sources").storage_db_artifact_ids;
+    _ = @import("antfly_local_sources").storage_db_lookup_key_scratch;
+    _ = @import("antfly_local_sources").storage_db_doc_identity;
+    _ = @import("antfly_local_sources").storage_db_document_read_scratch;
+    _ = @import("antfly_local_sources").storage_db_derived_derived_worker;
+    _ = @import("antfly_local_sources").storage_db_derived_change_journal;
 }

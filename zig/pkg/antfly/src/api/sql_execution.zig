@@ -15,14 +15,14 @@
 //! SQL adapter to the existing authenticated catalog and relational row APIs.
 const std = @import("std");
 const http_server = @import("http_server.zig");
-const catalog = @import("../sql/catalog.zig");
-const ast = @import("../sql/ast.zig");
-const system_catalog = @import("../system_catalog/domain.zig");
-const operation = @import("operation.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
+const operation = @import("antfly_local_sources").api_operation;
 const helpers = @import("http_route_helpers.zig");
 const wire = @import("antfly_metadata_openapi").types;
-const db_types = @import("../storage/db/types.zig");
-const setting_catalog = @import("../sql/setting_catalog.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
+const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 
 const SettingOverlaySource = enum { durable_session, connection };
 
@@ -104,7 +104,7 @@ fn supportsRangeGuards(server: *const http_server.ApiHttpServer) bool {
 fn rejectTransactionalDdl(statement: ast.Statement) !void {
     // Catalog and publication operations have their own durable commit
     // boundary; a surrounding SQL ROLLBACK cannot undo them.
-    if (@import("../sql/ddl_runtime.zig").accepts(statement)) return error.UnsupportedSqlExecution;
+    if (@import("antfly_local_sources").sql_ddl_runtime.accepts(statement)) return error.UnsupportedSqlExecution;
 }
 
 pub const Adapter = struct {
@@ -113,7 +113,7 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
-    decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
+    decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
     session_namespace: ?[]const u8 = null,
@@ -128,11 +128,11 @@ pub const Adapter = struct {
     connection_revision: ?u64 = null,
     connection_generation: ?u64 = null,
     result_session_id: ?[32]u8 = null,
-    transaction_status: @import("../sql/session.zig").Status = .idle,
+    transaction_status: @import("antfly_local_sources").sql_session.Status = .idle,
     active_transaction: ?[16]u8 = null,
     staged: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     range_reads: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
-    dynamic_snapshot: ?*@import("table_read_source.zig").RelationalStatementSnapshot = null,
+    dynamic_snapshot: ?*@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot = null,
     dynamic_table: ?[]const u8 = null,
     ranges_staged: bool = false,
     inserting: bool = false,
@@ -148,7 +148,7 @@ pub const Adapter = struct {
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
 
-    pub fn decisionRuntime(self: *Adapter) !?@import("../functions/runtime.zig").Runtime {
+    pub fn decisionRuntime(self: *Adapter) !?@import("antfly_local_sources").functions_runtime.Runtime {
         if (self.server.cfg.node_config) |config| {
             if (config.registry.decider_configs.count() > 0) {
                 const normalized = try self.context.platformDeadline();
@@ -166,9 +166,9 @@ pub const Adapter = struct {
         return null;
     }
 
-    pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("../sql/compiler.zig").Compiled, parameters: []const std.json.Value, limits: @import("../sql/runtime.zig").Limits, guarded_backend: ?catalog.Backend) !@import("../sql/runtime.zig").Result {
+    pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
         var zig017_return_error: ?anyerror = null;
-        var decision_runtime: ?@import("../functions/runtime.zig").Runtime = null;
+        var decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null;
         const previous_provider = self.decision_provider;
         defer self.decision_provider = previous_provider;
         decision_runtime = try self.decisionRuntime();
@@ -186,7 +186,7 @@ pub const Adapter = struct {
             self.policy_proofs = null;
         }
         const session_api = @import("sql_session.zig");
-        const sessions = @import("../sql/session.zig");
+        const sessions = @import("antfly_local_sources").sql_session;
         const previous_database = self.database;
         const previous_namespace = self.namespace;
         const previous_setting_overlay = self.setting_overlay;
@@ -256,7 +256,7 @@ pub const Adapter = struct {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            var result = (@import("../sql/runtime.zig").Result.empty(alloc, "SET CONSTRAINTS") catch |zig017_err| {
+            var result = (@import("antfly_local_sources").sql_runtime.Result.empty(alloc, "SET CONSTRAINTS") catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -298,7 +298,7 @@ pub const Adapter = struct {
                 .release => "RELEASE",
             };
             // Allocate the acknowledgement before mutating durable state.
-            var result = (@import("../sql/runtime.zig").Result.empty(alloc, tag) catch |zig017_err| {
+            var result = (@import("antfly_local_sources").sql_runtime.Result.empty(alloc, tag) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -418,7 +418,7 @@ pub const Adapter = struct {
                     self.dynamic_snapshot = null;
                     self.dynamic_table = null;
                 }
-                var dynamic: ?@import("table_read_source.zig").RelationalStatementSnapshot = null;
+                var dynamic: ?@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot = null;
                 defer if (dynamic) |snapshot| snapshot.deinit();
                 var dynamic_scratch = std.heap.ArenaAllocator.init(alloc);
                 defer dynamic_scratch.deinit();
@@ -461,7 +461,7 @@ pub const Adapter = struct {
                     active_backend.coordinated_index_reads = self.range_reads != null and staged.tables.len == 0;
                     active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null;
                 }
-                var output = (@import("../sql/runtime.zig").execute(alloc, active_backend, compiled, parameters, limits) catch |zig017_err| {
+                var output = (@import("antfly_local_sources").sql_runtime.execute(alloc, active_backend, compiled, parameters, limits) catch |zig017_err| {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
@@ -511,7 +511,7 @@ pub const Adapter = struct {
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
-        return @import("../sql/runtime.zig").execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
+        return @import("antfly_local_sources").sql_runtime.execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         };
@@ -540,18 +540,18 @@ pub const Adapter = struct {
     fn generateRowId(ptr: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
-        return @import("../storage/row_identity.zig").generate(alloc, self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution);
+        return @import("antfly_local_sources").storage_row_identity.generate(alloc, self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution);
     }
 
     fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
-        const integrity = @import("relational_integrity_commit.zig");
-        const predicates = try @import("../sql/conflict_predicate.zig").toNative(alloc, conditions);
-        const keys = try @import("../sql/conflict_predicate.zig").expressionsToNative(alloc, expressions);
+        const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, conditions);
+        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, expressions);
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
-        const writes = try @import("../sql/mutation_images.zig").writes(db_types.BatchWrite, alloc, mutations);
+        const writes = try @import("antfly_local_sources").sql_mutation_images.writes(db_types.BatchWrite, alloc, mutations);
         const previous = if (self.staged) |staged| try staged.distributedTables(alloc) else &.{};
         const owners = try integrity.resolveConflictOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, columns, keys, predicates, writes, previous, self.context);
         try self.verify(alloc, table);
@@ -561,8 +561,8 @@ pub const Adapter = struct {
     }
 
     fn conflictGuards(alloc: std.mem.Allocator, mutations: []const catalog.Mutation) !?@import("transactions.zig").TableCommitRequest.ConflictGuards {
-        const integrity = @import("relational_integrity_commit.zig");
-        const Command = @import("../storage/db/relational_integrity_contract.zig").Command;
+        const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+        const Command = @import("antfly_local_sources").storage_db_relational_integrity_contract.Command;
         var generation: ?[32]u8 = null;
         var commands: std.ArrayList(Command) = .empty;
         for (mutations) |mutation| if (mutation.conflict_guard) |proof| {
@@ -735,7 +735,7 @@ pub const Adapter = struct {
         adapter: *Adapter,
         schema_version: u32,
         require_primary_digest: bool = false,
-        view: @import("table_read_source.zig").RelationalReadView,
+        view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
 
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
@@ -809,7 +809,7 @@ pub const Adapter = struct {
     const LakeStatement = struct {
         alloc: std.mem.Allocator,
         cursors: []catalog.Cursor,
-        sources: std.AutoHashMapUnmanaged(u64, *@import("../serverless/query/lake_serving.zig").ServingSource) = .empty,
+        sources: std.AutoHashMapUnmanaged(u64, *@import("antfly_local_sources").serverless_query_lake_serving.ServingSource) = .empty,
         opened: usize = 0,
         native: ?catalog.StatementRead = null,
         fn close(raw: *anyopaque) void {
@@ -853,13 +853,14 @@ pub const Adapter = struct {
                 try self.checkLakeRead(scratch.allocator(), request.table);
                 try self.server.prepareLakeCache();
                 if (owner.sources.contains(request.table.id)) continue;
-                const source = try alloc.create(@import("../serverless/query/lake_serving.zig").ServingSource);
+                const source = try alloc.create(@import("antfly_local_sources").serverless_query_lake_serving.ServingSource);
                 errdefer alloc.destroy(source);
-                const schema: @import("../storage/schema.zig").TableSchema = .{ .storage_mode = .relational, .external_base_source = request.table.external_base_source };
+                const schema: @import("antfly_local_sources").storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = request.table.external_base_source };
                 const normalized = try self.context.platformDeadline();
-                source.* = try @import("../serverless/query/lake_serving.zig").ServingSource.openCached(alloc, schema, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
+                const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
+                source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
                 errdefer source.deinit();
-                try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);
         }
@@ -918,7 +919,7 @@ pub const Adapter = struct {
 
     const StatementRead = struct {
         alloc: std.mem.Allocator,
-        native: @import("table_read_source.zig").RelationalStatementRead,
+        native: @import("antfly_local_sources").api_table_read_source.RelationalStatementRead,
         wrappers: []ReadCursor,
         cursors: []catalog.Cursor,
         overlays: bool,
@@ -937,7 +938,7 @@ pub const Adapter = struct {
 
     const DynamicStatementRead = struct {
         alloc: std.mem.Allocator,
-        views: []@import("table_read_source.zig").RelationalReadView,
+        views: []@import("antfly_local_sources").api_table_read_source.RelationalReadView,
         view_count: usize = 0,
         opened: usize = 0,
         wrappers: []ReadCursor,
@@ -962,7 +963,7 @@ pub const Adapter = struct {
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
         const retained = try alloc.create(DynamicStatementRead);
         errdefer alloc.destroy(retained);
-        const views = try alloc.alloc(@import("table_read_source.zig").RelationalReadView, requests.len);
+        const views = try alloc.alloc(@import("antfly_local_sources").api_table_read_source.RelationalReadView, requests.len);
         errdefer alloc.free(views);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
@@ -1011,7 +1012,7 @@ pub const Adapter = struct {
                 if (!std.mem.eql(u8, staged.physicalName(old.table_name), bound_table)) continue;
                 if (old.schema_version != null and old.schema_version != request.table.schema_version) return error.CatalogGenerationChanged;
                 if (old.range_guards) |guards| {
-                    var checked = try @import("range_read_guards.zig").merge(temporary, guards.value, guarded.owner_proofs);
+                    var checked = try @import("antfly_local_sources").api_range_read_guards.merge(temporary, guards.value, guarded.owner_proofs);
                     checked.deinit();
                 }
             };
@@ -1038,7 +1039,7 @@ pub const Adapter = struct {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
-        const scans = try temporary.alloc(@import("table_read_source.zig").RelationalStatementScan, requests.len);
+        const scans = try temporary.alloc(@import("antfly_local_sources").api_table_read_source.RelationalStatementScan, requests.len);
         const overlay_staged = self.staged != null and self.staged.?.tables.len != 0;
         for (requests, scans) |request, *input| {
             var query_request = request.request;
@@ -1086,7 +1087,7 @@ pub const Adapter = struct {
                     if (!std.mem.eql(u8, staged.physicalName(old.table_name), request.table.physical_name)) continue;
                     if (old.schema_version != null and old.schema_version != request.table.schema_version) return error.CatalogGenerationChanged;
                     if (old.range_guards) |guards| {
-                        var checked = try @import("range_read_guards.zig").merge(temporary, guards.value, proofs);
+                        var checked = try @import("antfly_local_sources").api_range_read_guards.merge(temporary, guards.value, proofs);
                         checked.deinit();
                     }
                 };
@@ -1144,7 +1145,7 @@ pub const Adapter = struct {
     fn prepareMutations(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
-        const images = @import("../sql/mutation_images.zig");
+        const images = @import("antfly_local_sources").sql_mutation_images;
         const writes = try images.writes(db_types.BatchWrite, alloc, input);
         if (writes.len == 0) return input;
         const source = self.server.table_reads orelse return error.UnsupportedSqlExecution;
@@ -1163,7 +1164,7 @@ pub const Adapter = struct {
         // RETURNING requires SELECT policy on the resulting row as well as
         // write authority. Do not publish postimages that an ordinary read hides.
         if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |json| {
-            var filter = try @import("../search/pattern_filter.zig").PreparedPatternFilter.init(alloc, json);
+            var filter = try @import("antfly_local_sources").search_pattern_filter.PreparedPatternFilter.init(alloc, json);
             defer filter.deinit();
             for (result) |mutation| if (mutation.row) |row| {
                 if (!try filter.matchesJson(alloc, mutation.key, row)) return error.Forbidden;
@@ -1284,8 +1285,8 @@ pub fn sqlState(err: anyerror) []const u8 {
     return diagnostic(err).code;
 }
 
-pub const diagnostic = @import("../sql/errors.zig").describe;
-pub const diagnosticMessage = @import("../sql/errors.zig").message;
+pub const diagnostic = @import("antfly_local_sources").sql_errors.describe;
+pub const diagnosticMessage = @import("antfly_local_sources").sql_errors.message;
 
 const MutationFailure = struct { err: anyerror, transaction_id: ?[32]u8 = null };
 
@@ -1402,7 +1403,7 @@ test "SQL transaction rejects policy definition and publication DDL before dispa
         "ALTER TABLE accounts ENABLE ROW LEVEL SECURITY",
         "ALTER TABLE accounts DISABLE ROW LEVEL SECURITY",
     }) |sql| {
-        var compiled = try @import("../sql/compiler.zig").compile(std.testing.allocator, sql, .{});
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(error.UnsupportedSqlExecution, rejectTransactionalDdl(compiled.statement));
     }
@@ -1427,7 +1428,7 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
                 try std.testing.expect(context.row_policy_install_authority);
                 const mode: *u8 = @ptrCast(@alignCast(ptr));
                 if (mode.* == 0) return alloc.dupe(u8, "null");
-                const policies = @import("../system_catalog/policies.zig");
+                const policies = @import("antfly_local_sources").system_catalog_policies;
                 const owner: policies.Publication.OwnerIdentity = .{ .group_id = 1, .descriptor_digest = std.mem.zeroes([32]u8) };
                 const ack: policies.Publication.OwnerAck = .{ .owner = owner, .catalog_epoch = 1, .phase = if (mode.* == 3) .pending_disable else .pending_install, .applied_term = 1, .applied_index = 1, .bundle_digest = std.mem.zeroes([32]u8) };
                 const serving_ack: policies.Publication.OwnerAck = .{ .owner = owner, .catalog_epoch = 1, .phase = if (mode.* == 3) .serving_disable else .serving_install, .applied_term = 1, .applied_index = 2, .bundle_digest = std.mem.zeroes([32]u8) };
@@ -1496,7 +1497,7 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
 }
 
 test "SQL API document preparation uses native normalization and retains mutation fences" {
-    const read_source = @import("table_read_source.zig");
+    const read_source = @import("antfly_local_sources").api_table_read_source;
     const View = read_source.RelationalReadView;
     const Fake = struct {
         normalized: bool = false,
@@ -1545,10 +1546,10 @@ test "SQL API document preparation uses native normalization and retains mutatio
 }
 
 test "SQL API guarded sessions retain reads and atomic MERGE writes across transaction boundaries" {
-    const reads = @import("table_read_source.zig");
-    const contract = @import("distributed_txn_contract.zig");
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const contract = @import("antfly_local_sources").api_distributed_txn_contract;
     const metadata = @import("../metadata/api.zig");
-    const compiler = @import("../sql/compiler.zig");
+    const compiler = @import("antfly_local_sources").sql_compiler;
     const View = reads.RelationalReadView;
     const Fake = struct {
         const schema = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
@@ -1572,7 +1573,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         full_scans: usize = 0,
         unknown_commit: bool = false,
         views: [2]View = undefined,
-        records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 3, .name = "physical", .schema_json = schema }},
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 3, .name = "physical", .schema_json = schema }},
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -1609,7 +1610,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
             _ = scan_index;
             self.proof_calls += 1;
             if (self.fail_proof_call == self.proof_calls) return error.TestProofUnavailable;
-            const observations = try alloc.dupe(@import("range_read_guards.zig").Proof, &.{.{ .bucket = 98, .generation = self.generation }});
+            const observations = try alloc.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, &.{.{ .bucket = 98, .generation = self.generation }});
             return alloc.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = observations }});
         }
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !View.Page {
@@ -1856,10 +1857,10 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
 }
 
 test "SQL API cross-table MERGE retains both source and target range proofs" {
-    const reads = @import("table_read_source.zig");
-    const contract = @import("distributed_txn_contract.zig");
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const contract = @import("antfly_local_sources").api_distributed_txn_contract;
     const metadata = @import("../metadata/api.zig");
-    const compiler = @import("../sql/compiler.zig");
+    const compiler = @import("antfly_local_sources").sql_compiler;
     const View = reads.RelationalReadView;
     const Fake = struct {
         const Self = @This();
@@ -1878,7 +1879,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         };
         states: [2]State = undefined,
         views: [2]View = undefined,
-        records: [3]@import("../common/topology_records.zig").TableRecord = .{
+        records: [3]@import("antfly_local_sources").common_topology_records.TableRecord = .{
             .{ .table_id = 3, .name = "physical_usage", .schema_json = schema },
             .{ .table_id = 4, .name = "physical_source", .schema_json = schema },
             .{ .table_id = 5, .name = "physical_archive", .schema_json = schema },
@@ -1956,7 +1957,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
             if ((table_id != 3 and self.fail_source_proof) or (table_id == 3 and self.prepared_cte_merge_case and self.fail_merge_proof)) return error.TestProofUnavailable;
             const group_id: u64 = if (table_id == 3) 5 else if (table_id == 4) 7 else 9;
             const range_id: u64 = if (table_id == 3) 6 else if (table_id == 4) 8 else 10;
-            const observations = try alloc.dupe(@import("range_read_guards.zig").Proof, &.{.{ .bucket = @intCast(table_id), .generation = 1 }});
+            const observations = try alloc.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, &.{.{ .bucket = @intCast(table_id), .generation = 1 }});
             return alloc.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = table_id, .topology_epoch = 4, .route = .{ .group_id = group_id, .range_id = range_id, .identity_namespace = .{ .table_id = table_id, .shard_id = group_id, .range_id = range_id } } }, .proofs = observations }});
         }
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !View.Page {
@@ -2094,7 +2095,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
             return .{ .committed = .{ .participant_count = 2 } };
         }
     };
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer parsed.deinit();
     const sql = for (parsed.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0579")) break entry.object.get("sql").?.string;
@@ -2109,9 +2110,9 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0584")) break entry.object.get("sql").?.string;
     } else return error.TestMissingCorpusCase;
     var fake: Fake = .{};
-    var backend_runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    var backend_runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
-    var prepared_backend = @import("../storage/mem_backend.zig").Backend.init(std.testing.allocator, .{});
+    var prepared_backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(std.testing.allocator, .{});
     defer prepared_backend.close();
     var prepared_store = try prepared_backend.runtimeStore(std.testing.allocator, .{ .name = "merge-prepared-test" });
     defer prepared_store.deinit();
@@ -2751,8 +2752,8 @@ test "SQL no-op mutations authorize read and write before consulting catalog" {
     // Reaching server/catalog would be invalid: denied read-and-write bindings
     // must fail before metadata access, including contradictory/no-op writes.
     var adapter = Adapter{ .server = undefined, .identity = &identity, .context = .{} };
-    const compiler = @import("../sql/compiler.zig");
-    const runtime = @import("../sql/runtime.zig");
+    const compiler = @import("antfly_local_sources").sql_compiler;
+    const runtime = @import("antfly_local_sources").sql_runtime;
     for ([_][]const u8{ "DELETE FROM docs WHERE _id = NULL", "UPDATE docs SET name = 'x' WHERE _id = 'a' AND _id = 'b'" }) |statement| {
         var compiled = try compiler.compile(std.testing.allocator, statement, .{});
         defer compiled.deinit();
@@ -2780,13 +2781,13 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
 
 test "SQL direct conflict scalar uses one guarded native cut through owner and commit" {
     const alloc = std.testing.allocator;
-    const reads = @import("table_read_source.zig");
-    const contract = @import("distributed_txn_contract.zig");
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const contract = @import("antfly_local_sources").api_distributed_txn_contract;
     const metadata = @import("../metadata/api.zig");
-    const compiler = @import("../sql/compiler.zig");
-    const integrity = @import("relational_integrity_commit.zig");
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
-    const native_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+    const compiler = @import("antfly_local_sources").sql_compiler;
+    const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+    const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+    const native_catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
     const View = reads.RelationalReadView;
     const Fake = struct {
         const Self = @This();
@@ -2809,8 +2810,8 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
         absence_case: bool = false,
         views: [2]View = undefined,
         states: [2]State = undefined,
-        records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 3, .name = "physical_usage", .schema_json = schema }},
-        ranges: [1]@import("../common/topology_records.zig").RangeRecord = .{.{ .group_id = 5, .table_id = 3, .start_key = "" }},
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 3, .name = "physical_usage", .schema_json = schema }},
+        ranges: [1]@import("antfly_local_sources").common_topology_records.RangeRecord = .{.{ .group_id = 5, .table_id = 3, .start_key = "" }},
         fn status(_: *anyopaque) !metadata.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -2849,9 +2850,9 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
             if (opts.relational_integrity_catalog) return .{ .json = try allocator.dupe(u8, self.envelope), .version = 0 };
             if (opts.relational_integrity_jobs_json.len != 0) {
                 if (!self.claim) return null;
-                const request = try std.json.parseFromSliceLeaky(struct { address: @import("../storage/db/relational_integrity_contract.zig").Address }, allocator, opts.relational_integrity_jobs_json, .{ .ignore_unknown_fields = true });
-                const owner: @import("../storage/db/relational_integrity_contract.zig").Claim = .{ .tuple = self.tuple, .parent_table = "physical_usage", .parent_key = "stored-1", .schema_version = 1 };
-                return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .address = request.address, .claim = owner, .references = &[_]@import("../storage/db/relational_integrity_contract.zig").Reference{} }, .{}), .version = 0 };
+                const request = try std.json.parseFromSliceLeaky(struct { address: @import("antfly_local_sources").storage_db_relational_integrity_contract.Address }, allocator, opts.relational_integrity_jobs_json, .{ .ignore_unknown_fields = true });
+                const owner: @import("antfly_local_sources").storage_db_relational_integrity_contract.Claim = .{ .tuple = self.tuple, .parent_table = "physical_usage", .parent_key = "stored-1", .schema_version = 1 };
+                return .{ .json = try std.json.Stringify.valueAlloc(allocator, .{ .address = request.address, .claim = owner, .references = &[_]@import("antfly_local_sources").storage_db_relational_integrity_contract.Reference{} }, .{}), .version = 0 };
             }
             if (opts.relational_activation_json.len == 0) {
                 if (std.mem.eql(u8, key, "stored-1")) return .{ .json = try allocator.dupe(u8, "{\"id\":\"u1\",\"status\":\"ready\",\"quantity\":8,\"amount\":5}"), .version = 9, .expected_content_digest = @splat(9) };
@@ -2896,7 +2897,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
         }
         fn proofs(ptr: *anyopaque, allocator: std.mem.Allocator, index: usize) ![]reads.RelationalStatementRead.OwnerRangeProof {
             const self: *Self = @ptrCast(@alignCast(ptr));
-            const observations = try allocator.dupe(@import("range_read_guards.zig").Proof, &.{.{ .bucket = if (self.states[index].absent) 99 else 98, .generation = 1 }});
+            const observations = try allocator.dupe(@import("antfly_local_sources").api_range_read_guards.Proof, &.{.{ .bucket = if (self.states[index].absent) 99 else 98, .generation = 1 }});
             return allocator.dupe(reads.RelationalStatementRead.OwnerRangeProof, &.{.{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = observations }});
         }
         fn next(ptr: *anyopaque, allocator: std.mem.Allocator, _: u32) !View.Page {
@@ -2971,9 +2972,9 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
     fake.tuple = try alloc.dupe(u8, try integrity.testConflictTuple(tuple_arena.allocator(), source, &fake.records, "physical_usage", &.{"id"}, .{ .key = "proposed-1", .value = "{\"id\":\"u1\",\"status\":\"ready\",\"quantity\":1}" }));
     defer alloc.free(fake.tuple);
     fake.claim = true;
-    var backend_runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    var backend_runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
-    var prepared_backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var prepared_backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer prepared_backend.close();
     var prepared_store = try prepared_backend.runtimeStore(alloc, .{ .name = "native-conflict-capture-test" });
     defer prepared_store.deinit();
@@ -2984,7 +2985,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
     var identity = try http_server.cloneCatalogIdentity(alloc, .{ .username = @constCast("native_conflict_writer"), .permissions = &permissions });
     defer if (identity) |*owned| owned.deinit(alloc);
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
-    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     const sql = for (corpus.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-1411")) break entry.object.get("sql").?.string;

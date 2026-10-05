@@ -30,7 +30,7 @@ import (
 )
 
 // Runs the shared libantfly conformance cases (see
-// zig/pkg/antfly/capi-conformance/README.md) through the Go binding.
+// zig/pkg/antfly-embedded/capi-conformance/README.md) through the Go binding.
 func TestConformance(t *testing.T) {
 	casesDir := filepath.Join("..", "..", "..", "zig", "pkg", "antfly", "capi-conformance", "cases")
 	files, err := filepath.Glob(filepath.Join(casesDir, "*.json"))

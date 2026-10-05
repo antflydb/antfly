@@ -6,7 +6,7 @@
 //! Transport-neutral metadata extension lifecycle operations.
 
 const std = @import("std");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const extension_domain = @import("../extensions/mod.zig");
 
 pub const Source = struct {

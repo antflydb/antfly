@@ -164,7 +164,7 @@ test "opaque owner standalone rewrite authority is durable and cannot be selecte
             \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
         ),
     };
-    const wire = @import("db/online_merge_io_contract.zig");
+    const wire = @import("antfly_local_sources").storage_db_online_merge_io_contract;
     const request: wire.Request = .{
         .scope = .{ .authority = .native, .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 0, .admission_epoch = 0, .owner_group_id = 72, .peer_group_id = 82, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(0) }, .receiver_namespace = .{ .table_id = 8, .shard_id = 82, .range_id = 82 }, .consumer_epoch = 0, .copy_attempt = .{} },
         .operation = .{ .admission = .donor },
@@ -178,7 +178,7 @@ test "opaque owner standalone rewrite authority is durable and cannot be selecte
         defer response.deinit();
         const facts = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, response.bytes(), .{});
         defer facts.deinit();
-        try std.testing.expectEqual(@import("db/online_source_contract.zig").Authority.native, facts.value.authority);
+        try std.testing.expectEqual(@import("antfly_local_sources").storage_db_online_source_contract.Authority.native, facts.value.authority);
         try std.testing.expectEqual(@as(u64, 0), facts.value.donor_term);
         try std.testing.expect(facts.value.eligible);
         try std.testing.expectEqual(@as(usize, 1), facts.value.source_schemas.len);
@@ -194,10 +194,10 @@ test "opaque owner standalone rewrite authority is durable and cannot be selecte
 
 test "opaque owner cold reopen preserves frozen document and relational backup cohorts" {
     const alloc = std.testing.allocator;
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const json = @import("db/relational_integrity_handoff_contract.zig");
-    const transition = @import("db/relational_transition_contract.zig");
-    const seal = @import("db/native_backup_seal_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const json = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
     const Read = struct {
         fn call(comptime T: type, handle: ?*anyopaque, request: transition.Request) !std.json.Parsed(T) {
             const body = try json.encode(std.testing.allocator, request);
@@ -322,7 +322,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     );
     try std.testing.expectEqualDeep(failure, forwarded);
 
-    @import("../test_error_logs.zig").expectErrorLogs(1);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     var malformed = failure;
     malformed.operation = 0;
     var replacement: abi.FailureIdentity = .{};
@@ -347,12 +347,12 @@ test "local query identity relay preserves origin and attributes protocol defect
 
 test "opaque owner source artifact transfer resumes across replicas without donor inode authority" {
     const alloc = std.testing.allocator;
-    const transfer = @import("db/source_artifact_transfer.zig");
-    const contract = @import("../api/local_query_contract.zig");
-    const batch = @import("../api/batch.zig");
-    const source = @import("db/online_source_contract.zig");
+    const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const batch = @import("antfly_local_sources").api_batch;
+    const source = @import("antfly_local_sources").storage_db_online_source_contract;
     const Call = struct {
-        fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("../api/operation.zig").RequestContext) ![]u8 {
+        fn transport(ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, request: transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
             try context.ensureActive();
             try std.testing.expectEqual(@as(u64, 7201), group);
             try std.testing.expectEqualStrings("docs", table);
@@ -370,7 +370,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
             defer response.deinit();
             return std.json.parseFromSlice(T, std.testing.allocator, response.bytes(), .{ .allocate = .alloc_always });
         }
-        fn apply(owner: *client.Owner, request: @import("db/types.zig").BatchRequest, index: u64) !void {
+        fn apply(owner: *client.Owner, request: @import("antfly_local_sources").storage_db_types.BatchRequest, index: u64) !void {
             const json = try batch.encodeBatchRequest(std.testing.allocator, request);
             defer std.testing.allocator.free(json);
             var response = try owner.replicatedBatchAtRaftEntryJson("docs", json, 1, index);
@@ -403,7 +403,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     defer alloc.free(identity_request);
     var identity_response = try donor.lookupJson("docs", identity_request);
     defer identity_response.deinit();
-    var identity = try std.json.parseFromSlice(@import("db/relational_integrity_topology_contract.zig").Identity, alloc, identity_response.bytes(), .{});
+    var identity = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, identity_response.bytes(), .{});
     defer identity.deinit();
     const scope: source.Scope = .{ .fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = 57, .attempt = 1, .owner_group_id = 7201, .peer_group_id = 7202, .role = .merge_source, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest }, .receiver_namespace = .{ .table_id = 72, .shard_id = 7202, .range_id = 7202 }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
     for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .online_source = .{ .admit = .{ .scope = scope } } }, 2);
@@ -411,13 +411,13 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     defer alloc.free(pin_json);
     var publication = try donor.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
     defer publication.deinit();
-    var certificate = try std.json.parseFromSlice(@import("source_snapshot.zig").Certificate, alloc, publication.bytes(), .{});
+    var certificate = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, publication.bytes(), .{});
     defer certificate.deinit();
     for ([_]*client.Owner{ &donor, &target }) |owner| try Call.apply(owner, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate.value } } }, 3);
     // Simulate native-state transfer containing the durable published ledger
     // but none of another replica's filesystem pins or local stat receipts.
     target.deinit();
-    const target_pin = try @import("db/source_pin.zig").pathAlloc(alloc, target_path, scope);
+    const target_pin = try @import("antfly_local_sources").storage_db_source_pin.pathAlloc(alloc, target_path, scope);
     defer alloc.free(target_pin);
     try std.Io.Dir.cwd().deleteTree(std.testing.io, target_pin);
     target = try client.Owner.open(target_options);
@@ -548,9 +548,9 @@ test "opaque owner source artifact transfer resumes across replicas without dono
 
 test "opaque owner online source controls and status survive compiled boundary restart" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const batch = @import("../api/batch.zig");
-    const source = @import("db/online_source_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const batch = @import("antfly_local_sources").api_batch;
+    const source = @import("antfly_local_sources").storage_db_online_source_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-source-controls", .{tmp.sub_path});
@@ -571,7 +571,7 @@ test "opaque owner online source controls and status survive compiled boundary r
     defer alloc.free(identity_request);
     var identity_response = try owner.lookupJson("docs", identity_request);
     defer identity_response.deinit();
-    var identity = try std.json.parseFromSlice(@import("db/relational_integrity_topology_contract.zig").Identity, alloc, identity_response.bytes(), .{});
+    var identity = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, identity_response.bytes(), .{});
     defer identity.deinit();
     const scope: source.Scope = .{
         .fence = .{ .admission_epoch = identity.value.next_epoch, .transition_id = 19, .attempt = 2, .owner_group_id = 7101, .peer_group_id = 7102, .role = .merge_source, .namespace = identity.value.namespace, .catalog_digest = identity.value.catalog_digest },
@@ -605,7 +605,7 @@ test "opaque owner online source controls and status survive compiled boundary r
     defer alloc.free(pin_json);
     var publication = try owner.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) });
     defer publication.deinit();
-    var certificate = try std.json.parseFromSlice(@import("source_snapshot.zig").Certificate, alloc, publication.bytes(), .{});
+    var certificate = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, publication.bytes(), .{});
     defer certificate.deinit();
     try std.testing.expectEqual(@as(u64, 1), certificate.value.cut.applied_index);
     try std.testing.expect(certificate.value.cut.namespace.eql(scope.fence.namespace));
@@ -622,9 +622,9 @@ test "opaque owner online source controls and status survive compiled boundary r
 
 test "opaque owner relational handoff preserves binary proofs across the compiled boundary" {
     const alloc = std.testing.allocator;
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const handoff = @import("db/relational_integrity_handoff_contract.zig");
-    const contract = @import("db/relational_transition_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const contract = @import("antfly_local_sources").storage_db_relational_transition_contract;
     // A fixed /tmp literal collides with any other process (including a
     // concurrent test run) that opens the same path, surfacing spurious
     // GenerationTransitionActive failures. Use a per-run unique directory
@@ -724,11 +724,11 @@ test "opaque owner relational handoff preserves binary proofs across the compile
 
 test "opaque owner exports exact backup seals and reclaims pins without opening the source" {
     const alloc = std.testing.allocator;
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const handoff = @import("db/relational_integrity_handoff_contract.zig");
-    const transition = @import("db/relational_transition_contract.zig");
-    const seal = @import("db/native_backup_seal_contract.zig");
-    const backup = @import("../api/backup_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
+    const backup = @import("antfly_local_sources").api_backup_contract;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -855,9 +855,9 @@ test "opaque ordinary owner range initialization preserves durable authority and
             defer unbounded.deinit();
             try Driver.put(&unbounded, if (std.mem.eql(u8, scenario, "outside")) "z" else "b");
             if (comptime std.mem.eql(u8, scenario, "frozen")) {
-                const topology = @import("db/relational_integrity_topology_contract.zig");
-                const handoff = @import("db/relational_integrity_handoff_contract.zig");
-                const identity_request = try handoff.encode(alloc, @as(@import("db/relational_transition_contract.zig").Request, .identity));
+                const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+                const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+                const identity_request = try handoff.encode(alloc, @as(@import("antfly_local_sources").storage_db_relational_transition_contract.Request, .identity));
                 defer alloc.free(identity_request);
                 var identity_response: abi.OwnedBytes = .{};
                 defer abi.antfly_storage_owner_buffer_destroy(&identity_response);
@@ -929,13 +929,13 @@ test "opaque ordinary owner range initialization preserves durable authority and
 
 test "opaque portable and native restore preserve bounded range through captured replicated pages" {
     const alloc = std.testing.allocator;
-    const staging = @import("db/restore_staging_contract.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
     const restore = @import("../api/restore_owner_contract.zig");
-    const topology = @import("db/relational_integrity_topology_contract.zig");
-    const handoff = @import("db/relational_integrity_handoff_contract.zig");
-    const transition = @import("db/relational_transition_contract.zig");
-    const seal = @import("db/native_backup_seal_contract.zig");
-    const batch_wire = @import("../api/batch.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const handoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
+    const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
+    const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
+    const batch_wire = @import("antfly_local_sources").api_batch;
     const Driver = struct {
         owner: *client.Owner,
         index: u64 = 0,
@@ -971,8 +971,8 @@ test "opaque portable and native restore preserve bounded range through captured
     var context = client.Context{};
     try context.ensure();
     defer context.deinit();
-    const schema_bytes = try @import("schema.zig").serializeSchema(scratch, .{});
-    const source_namespace: @import("db/doc_identity.zig").Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
+    const schema_bytes = try @import("antfly_local_sources").storage_schema.serializeSchema(scratch, .{});
+    const source_namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 71, .shard_id = 7101, .range_id = 7101 };
     const source_path = try std.fmt.allocPrint(scratch, "{s}/source", .{root});
     var source = try client.Owner.open(.{
         .context = context.handle,
@@ -1025,7 +1025,7 @@ test "opaque portable and native restore preserve bounded range through captured
             .sealed_handle_json = .fromSlice(pin.bytes()),
         });
         defer exported.deinit();
-        const shards = try std.json.parseFromSliceLeaky([]@import("../api/backup_contract.zig").ShardSnapshot, scratch, exported.bytes(), .{});
+        const shards = try std.json.parseFromSliceLeaky([]@import("antfly_local_sources").api_backup_contract.ShardSnapshot, scratch, exported.bytes(), .{});
         try std.testing.expectEqual(@as(usize, 1), shards.len);
         try std.testing.expectEqualStrings("a", shards[0].start_key);
         var digest: [32]u8 = undefined;
@@ -1090,7 +1090,7 @@ test "opaque portable and native restore preserve bounded range through captured
 
 test "opaque hidden restore prepares without mutation and reopens exact canceled scope" {
     const alloc = std.testing.allocator;
-    const staging = @import("db/restore_staging_contract.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
     const restore = @import("../api/restore_owner_contract.zig");
     const Prepared = struct { response: restore.Response, batch_json: ?[]const u8 = null };
     const path = "/tmp/antfly-kernel-hidden-restore";
@@ -1102,7 +1102,7 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     var storage_context = client.Context{};
     try storage_context.ensure();
     defer storage_context.deinit();
-    const schema_bytes = try @import("schema.zig").serializeSchema(alloc, .{});
+    const schema_bytes = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, .{});
     defer alloc.free(schema_bytes);
     const scope: staging.Scope = .{
         .plan_id = @splat(1),
@@ -1249,8 +1249,8 @@ const TestWalOptions = struct {
     backend: ?Backend = null,
     storage: ?*anyopaque = null,
     lsm_options: Empty = .{},
-    clock: @import("sim_runtime.zig").Clock = @import("sim_runtime.zig").real_clock,
-    commit_scheduler: @import("sim_runtime.zig").CompletionScheduler = @import("sim_runtime.zig").real_completion_scheduler,
+    clock: @import("antfly_local_sources").storage_sim_runtime.Clock = @import("antfly_local_sources").storage_sim_runtime.real_clock,
+    commit_scheduler: @import("antfly_local_sources").storage_sim_runtime.CompletionScheduler = @import("antfly_local_sources").storage_sim_runtime.real_completion_scheduler,
     artificial_sync_delay_ns: u64 = 0,
     group_commit_window_ns: u64 = 0,
     group_commit_max_requests: usize = 64,
@@ -1473,7 +1473,7 @@ test "opaque storage context owns Lite system namespaces auth and table owners" 
 
 test "opaque storage owner preserves source-vector policy and status across reopen" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-vectors");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-source-vectors");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
     for ([_]abi.DenseEmbeddingStorage{ .vector_store, .persisted }, 0..) |policy, iteration| {
@@ -1521,7 +1521,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
         fn notify(ptr: ?*anyopaque, table: abi.BorrowedBytes, group: u64, sequence: u64, has_sequence: u8, json: abi.BorrowedBytes) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             if (!std.mem.eql(u8, table.slice(), "docs") or group != 7001 or has_sequence == 0 or sequence == 0) self.invalid.store(true, .release);
-            var targets = std.json.parseFromSlice([]@import("db/types.zig").IndexTargetVisibility, std.heap.page_allocator, json.slice(), .{}) catch {
+            var targets = std.json.parseFromSlice([]@import("antfly_local_sources").storage_db_types.IndexTargetVisibility, std.heap.page_allocator, json.slice(), .{}) catch {
                 self.invalid.store(true, .release);
                 return;
             };
@@ -1537,7 +1537,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
         }
     };
     var observer = Observer{};
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-target-observer");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-target-observer");
     defer directory.cleanup();
     var owner = try client.Owner.open(.{
         .path = .fromSlice(std.mem.span(directory.path().ptr)),
@@ -1560,7 +1560,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
 test "opaque storage owner schedules source verification after reopen without traffic" {
     const alloc = std.testing.allocator;
     const time = @import("antfly_platform").time;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-source-maintenance");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-source-maintenance");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
     {
@@ -1762,7 +1762,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
             self.rows += 1;
             if (self.stop_on_row) return error.ConsumerStoppedAfterRow;
         }
-        fn sink(self: *@This()) @import("../runtime_scan_sink.zig").ScanStreamSink {
+        fn sink(self: *@This()) @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink {
             return .{ .context = self, .start_fn = start, .write_fn = write };
         }
     };
@@ -1934,7 +1934,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         const label = try std.testing.allocator.dupe(u8, "tenant.public.events");
         defer std.testing.allocator.free(label);
         const response = try owner.queryJsonWithOptions("docs", query_json, .{
-            .execution = @import("local_query_controls.zig").executionOptions(.{ .response_table_name = label }),
+            .execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(.{ .response_table_name = label }),
         });
         @memset(label, 0xaa);
         break :label_scope response;
@@ -3253,7 +3253,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
     defer primary.close();
     var target = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/target" });
     defer target.deinit();
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     const key = "\x00\x00__api_restore_jobs__:000000000000002a";
     const initial = "{\"job_id\":42,\"phase\":\"queued\"}";
     const updated = "{\"job_id\":42,\"phase\":\"importing\"}";
@@ -3360,7 +3360,7 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
         .sync_wait_ctx = &promote,
         .sync_wait_fn = Promote.wait,
     }));
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{
         .key = "\x00\x00__api_restore_jobs__:000000000000002a",
         .value = "{\"job_id\":42,\"phase\":\"queued\"}",
@@ -3378,7 +3378,7 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
 test "opaque metadata initial FK reservation preserves placement authority across snapshot" {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -3389,7 +3389,7 @@ test "opaque metadata initial FK reservation preserves placement authority acros
     defer alloc.free(restored_path);
     var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = source_path, .no_sync = true });
     defer store.deinit();
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}
@@ -3468,7 +3468,7 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
     defer alloc.free(restored_path);
     var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = source_path, .no_sync = true });
     defer store.deinit();
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     const target: staging.Target = .{ .source_table_id = 1, .table = .{ .table_id = 11, .name = "private", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} };
     const plan: staging.Plan = .{ .id = @splat(255), .cohort_digest = @splat(9), .targets = &.{target} };
     try Helper.apply(&store, group, .{ .id = plan.id, .action = .reserve, .plan = plan });
@@ -3525,7 +3525,7 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
 test "opaque metadata compound rewrite admission preserves job and source reservation across native snapshot" {
     const alloc = std.testing.allocator;
     const stages = @import("../metadata/restore_staging.zig");
-    const group = @import("../common/group_ids.zig").main_metadata_group_id;
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -3538,7 +3538,7 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     const range: @import("../metadata/table_manager.zig").RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
     try source.applyStandaloneCommand(group, .{ .upsert_table = original });
     try source.applyStandaloneCommand(group, .{ .upsert_range = range });
-    const scope: @import("db/online_source_contract.zig").Scope = .{
+    const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
         .receiver_namespace = .{ .table_id = 10, .shard_id = 401, .range_id = 401 },
         .consumer_epoch = 1,
@@ -3560,7 +3560,7 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
                 .target_group_id = 401,
                 .source_namespace = scope.fence.namespace,
                 .admissions = &.{},
-                .admissions_digest = try @import("portable_backup.zig").sourceGenerationAdmissionSummaryDigest(scope.fence.namespace, &.{}),
+                .admissions_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(scope.fence.namespace, &.{}),
                 .retired_digest = @splat(8),
                 .retired_count = 0,
             }},
@@ -3836,7 +3836,7 @@ test "failed owner configuration releases its writer and context lease" {
 }
 
 test "status text preserves its string wire representation and rejects oversized input" {
-    const Text = @import("db/types.zig").InlineStatusText(4);
+    const Text = @import("antfly_local_sources").storage_db_types.InlineStatusText(4);
     const alloc = std.testing.allocator;
     const json = try std.json.Stringify.valueAlloc(alloc, Text.init("test"), .{});
     defer alloc.free(json);
@@ -3847,7 +3847,7 @@ test "status text preserves its string wire representation and rejects oversized
 }
 
 test "interactive admission state is shared with the physical owner" {
-    const activity = @import("db/enrichment/enrichment_types.zig");
+    const activity = @import("antfly_local_sources").storage_db_enrichment_enrichment_types;
     const before = abi.antfly_storage_interactive_activity(0, 0);
     _ = activity.interactive_embed_inflight.fetchAdd(1, .monotonic);
     defer _ = activity.interactive_embed_inflight.fetchSub(1, .monotonic);
@@ -3860,9 +3860,9 @@ test "interactive admission state is shared with the physical owner" {
 
 test "storage query wire preserves empty projection and decoded sort profile lifetime" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const query = @import("../api/query_contract.zig");
-    const types = @import("db/types.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const query = @import("antfly_local_sources").api_query_contract;
+    const types = @import("antfly_local_sources").storage_db_types;
     const wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
         .include_all_fields = false,
         .include_stored = false,
@@ -3908,7 +3908,7 @@ test "storage query wire preserves empty projection and decoded sort profile lif
     defer allocation_wire.deinit(alloc);
     try std.testing.checkAllAllocationFailures(alloc, struct {
         fn decode(failing: std.mem.Allocator, bytes: []const u8) !void {
-            var result = try @import("../api/local_query_contract.zig").parseStorageKernelSearchResult(failing, bytes);
+            var result = try @import("antfly_local_sources").api_local_query_contract.parseStorageKernelSearchResult(failing, bytes);
             defer result.deinit();
             try result.setOwnedSortProfile(result.sort_profile.?);
         }
@@ -3917,8 +3917,8 @@ test "storage query wire preserves empty projection and decoded sort profile lif
 
 test "storage and shard query contracts preserve search effort" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const query = @import("../api/query_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const query = @import("antfly_local_sources").api_query_contract;
     // Start at the public request parser, as the benchmark adapter does.
     // Both the in-process storage boundary and shard forwarding re-encode it.
     for ([_]?f32{ null, 0, 0.35, 0.5, 1 }) |effort| {
@@ -3947,7 +3947,7 @@ test "storage and shard query contracts preserve search effort" {
 
 test "storage query contract embedding numbers preserve relationship precision" {
     const alloc = std.testing.allocator;
-    const query = @import("../api/query_contract.zig");
+    const query = @import("antfly_local_sources").api_query_contract;
     const body =
         \\{"embeddings":{"dense":[1,0.5,1e-3],"sparse":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["dense","sparse"],"limit":9,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
     ;
@@ -3957,7 +3957,7 @@ test "storage query contract embedding numbers preserve relationship precision" 
     try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, public.req.sparse_queries[0].query.indices);
     try std.testing.expectEqual(@as(u32, 4), public.req.sparse_queries[0].query.k);
     try std.testing.expectEqualStrings("1.0000000000000001", public.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
-    const contract = @import("../api/local_query_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
     const wire = try contract.encodeStorageKernelQueryRequest(alloc, public.req);
     defer alloc.free(wire);
     var internal = try query.parseQueryRequest(alloc, null, "docs", wire);
@@ -3981,9 +3981,9 @@ test "storage query contract embedding numbers preserve relationship precision" 
 
 test "storage query contract preserves each vector candidate budget" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
-    const query = @import("../api/query_contract.zig");
-    const controls = @import("local_query_controls.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const query = @import("antfly_local_sources").api_query_contract;
+    const controls = @import("antfly_local_sources").storage_local_query_controls;
     const wire = try contract.encodeStorageKernelQueryRequest(alloc, .{
         .limit = 100,
         .dense_queries = &.{
@@ -4116,7 +4116,7 @@ test "opaque context stores use the borrowed VOPR filesystem and release handles
 
 test "opaque owner lookup and typed scans preserve metadata scope digest and row versions" {
     const alloc = std.testing.allocator;
-    const contract = @import("../api/local_query_contract.zig");
+    const contract = @import("antfly_local_sources").api_local_query_contract;
     const path = "/tmp/antfly-kernel-relational-lookup-scan";
     cleanup(path);
     defer cleanup(path);
@@ -4210,7 +4210,7 @@ test "opaque WAL rejects custom simulation hooks even without a context pointer"
 
 test "opaque metadata secret collection preserves binary ciphertext across owner ABI" {
     const alloc = std.testing.allocator;
-    const records = @import("../common/secret_record.zig");
+    const records = @import("antfly_local_sources").common_secret_record;
     const collections = @import("../common/secret_collection.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
