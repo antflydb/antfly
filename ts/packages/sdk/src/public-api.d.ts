@@ -12733,7 +12733,7 @@ export interface components {
          * @description The STT provider to use.
          * @enum {string}
          */
-        STTProvider: "openai" | "vertex" | "antfly";
+        STTProvider: "openai" | "vertex" | "antfly" | "apple";
         /**
          * @description Speech-to-text provider for the `transcriber` enrichment shorthand.
          *
@@ -12787,6 +12787,11 @@ export interface components {
             diarization?: boolean;
             /** @description Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast. */
             max_download_bytes?: number;
+            /**
+             * @description For Apple transcription, explicitly permit preparing and installing the selected on-device Speech assets.
+             * @default false
+             */
+            download_assets?: boolean;
         };
         /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
         EnrichmentConfig: {
@@ -13320,11 +13325,24 @@ export interface components {
              */
             presence_penalty?: number;
         };
+        /** @description On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported. */
+        AppleGeneratorConfig: {
+            /** @enum {string} */
+            provider?: "apple";
+            /**
+             * @description Only system is supported; requests are validated by the native provider.
+             * @default system
+             */
+            model?: string;
+            /** @default 256 */
+            max_tokens?: number;
+            temperature?: number;
+        };
         /**
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "antfly";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "antfly" | "apple";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -13334,7 +13352,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"] | components["schemas"]["AppleGeneratorConfig"]) & {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };

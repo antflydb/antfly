@@ -78,6 +78,25 @@ test "embedded canonical generation preserves tool definitions returned calls an
 }
 pub const parseConfigFromValue = lib.parseConfigFromValue;
 
+test "Apple generation backend bypasses HTTP quotas and honors request deadlines" {
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(alloc, &client, .{
+        .request_context = .{ .io = std.testing.io, .deadline_ns = 1 },
+    });
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "system", .url = "" };
+    if (!lib.apple_native.enabled) {
+        try std.testing.expectError(error.AppleIntelligenceProviderUnavailable, factory.factory().create(alloc, cfg));
+        return;
+    }
+    var generator = try factory.factory().create(alloc, cfg);
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    try std.testing.expect(state.quota == null);
+    try std.testing.expectError(error.Timeout, generator.generate(alloc, "system", &.{.{ .role = .user, .content = .{ .text = "hello" } }}));
+}
+
 pub const BackendFactory = struct {
     alloc: std.mem.Allocator,
     http: *httpx.Client,
@@ -164,6 +183,7 @@ const BackendState = struct {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
         embedded_antfly: managed_embedder.AntflyProvider,
+        apple: void,
         vertex: vertex_provider.Provider,
         gemini: vertex_provider.GeminiProvider,
     },
@@ -183,6 +203,8 @@ const BackendState = struct {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
+        try cfg.validate();
+        if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
         state.limits = limits;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
@@ -243,13 +265,15 @@ const BackendState = struct {
                 if (cfg.capability_revision) |revision| try provider.setCapabilityRevision(revision);
                 break :blk .{ .remote_antfly = provider };
             },
+            .apple => .{ .apple = {} },
             else => return error.UnsupportedGeneratorProvider,
         };
 
         errdefer switch (state.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.deinit(),
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
         };
+        if (state.provider == .apple) return .{ .ptr = state, .vtable = &.{ .generate = generate, .deinit = deinit } };
         const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         if (state.provider == .embedded_antfly and policy.enabled()) return error.UnsupportedLocalRateLimit;
         state.quota = try limits.acquire(state.quotaIdentity(cfg.model), policy);
@@ -268,7 +292,7 @@ const BackendState = struct {
         switch (self.provider) {
             .openai => |*provider| provider.deinit(),
             .remote_antfly => |*provider| provider.deinit(),
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
             .vertex => |*provider| provider.deinit(),
             .gemini => |*provider| provider.deinit(),
         }
@@ -288,7 +312,7 @@ const BackendState = struct {
             .remote_antfly => |provider| provider.base_url,
             .vertex => |provider| provider.base_url,
             .gemini => |provider| provider.base_url,
-            .embedded_antfly => "",
+            .embedded_antfly, .apple => "",
         };
         return .{
             .operation = .generation,
@@ -323,8 +347,13 @@ const BackendState = struct {
                     .cancellation = cancellation,
                 }),
                 .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
-                .embedded_antfly => {},
+                .embedded_antfly, .apple => {},
             }
+        }
+        if (self.provider == .apple) {
+            const timeout = if (self.request_context) |context| try context.remainingTimeoutMs() else try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), 120_000);
+            const cancellation = if (self.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn);
+            return lib.generateApple(alloc, self.cfg, model, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
         try validateGenerationMessagesTokenBudget(self.cfg, messages);
@@ -338,13 +367,14 @@ const BackendState = struct {
         const observer = quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
         }
         defer switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = null,
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
         };
         var result = switch (self.provider) {
+            .apple => unreachable,
             .openai => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
                     if (try optionalBearerAuthHeaderOwned(self, alloc, api_key_ref)) |auth_header| {

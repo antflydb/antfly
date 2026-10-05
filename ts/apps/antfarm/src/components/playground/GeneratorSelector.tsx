@@ -18,6 +18,7 @@ import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "gemma-3-1b-it",
+  apple: "system",
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
   openai: "gpt-4.1",
@@ -27,6 +28,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "Antfly (Local)",
+  apple: "Apple (On Device)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
   openai: "OpenAI",
@@ -43,6 +45,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "apple",
   "gemini",
   "vertex",
   "openai",
@@ -146,11 +149,20 @@ export function GeneratorSelector({
     }
     const nextProvider = provider as GeneratorProvider;
     const liveDefault = liveGenerators[nextProvider]?.[0];
+    if (nextProvider === "apple") {
+      onChange({
+        provider: "apple",
+        model: "system",
+        max_tokens: value.max_tokens ?? 256,
+        ...(value.temperature !== undefined && { temperature: value.temperature }),
+      });
+      return;
+    }
     onChange({
       ...value,
       provider: nextProvider,
       model: liveDefault || GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
-    });
+    } as GeneratorConfig);
   };
 
   return (

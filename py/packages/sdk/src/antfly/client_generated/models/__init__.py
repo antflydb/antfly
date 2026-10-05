@@ -47,6 +47,8 @@ from .antfly_type import AntflyType
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
+from .apple_generator_config import AppleGeneratorConfig
+from .apple_generator_config_provider import AppleGeneratorConfigProvider
 from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
@@ -1454,6 +1456,8 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
+    "AppleGeneratorConfig",
+    "AppleGeneratorConfigProvider",
     "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",

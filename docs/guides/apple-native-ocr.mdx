@@ -1,13 +1,13 @@
 ---
-title: Native Apple OCR
-description: Use macOS Vision to extract text from images and scanned PDFs in Antfly
+title: Native Apple providers
+description: Use macOS native OCR, file transcription, and Apple Intelligence text generation in Antfly
 ---
 
-Antfly's opt-in `apple` reader uses macOS Vision to recognize text locally. It
-works on the tested macOS 15.6.1 machine without an OS upgrade, downloaded Antfly
-model, API key, or Apple Intelligence setting change. This first implementation
-covers OCR; Apple speech transcription and Foundation Models generation remain
-future work.
+Antfly's opt-in `apple` provider uses Vision for OCR, SpeechAnalyzer for file
+transcription, and Foundation Models for on-device text generation. All three
+use one build flag, `-Dapple-providers=true`, and task-specific model aliases.
+They have independent availability: working OCR or transcription does not imply
+that the Apple Intelligence generation model is ready.
 
 ## Build
 
@@ -17,11 +17,70 @@ From the repository's `zig` directory, use its required Zig 0.17 toolchain:
 zig build antfly -Dapple-providers=true
 ```
 
-The flag requires a macOS target with libc and links Foundation, CoreGraphics,
-ImageIO, and Vision. It defaults to false. Builds without the flag, including
-Linux builds, report `AppleProviderUnavailable` when Apple OCR is invoked.
-Metal inference is independent; add `-Dmetal=false` if you want a CPU-only build
-of Antfly's other inference providers.
+The combined provider requires macOS 26 or newer and a macOS 27 SDK / Swift 6
+command-line toolchain. It is tested on macOS 27.0.1, Apple M4 Max. The OCR API
+alone was also tested on macOS 15.6.1 before the Swift providers were added;
+the combined binary is not qualified for that older OS.
+
+The flag defaults to false and requires a macOS target with libc. Disabled and
+Linux builds compile without Swift or Apple frameworks and return an explicit
+unavailable error for native calls. Metal inference is independent; add
+`-Dmetal=false` to disable Metal for Antfly's other inference providers.
+
+## Generate text
+
+Use this generator configuration in the existing generation endpoints or a
+generator enrichment:
+
+```json
+{"provider": "apple", "model": "system", "max_tokens": 256, "temperature": 0.2}
+```
+
+`model` defaults to `system`, its only supported value. Each request creates a
+fresh on-device session. System instructions and alternating user/assistant text
+history preserve their roles. Tools, image/audio attachments, remote endpoints,
+API keys, HTTP rate limits, and other sampling options are rejected.
+
+Availability is checked on every call. `AppleModelNotReady` means macOS has not
+made its local model available; `AppleIntelligenceDisabled` and
+`AppleIntelligenceProviderUnavailable` identify distinct states. On macOS 27,
+Apple's settings are under **Siri**. No model download, cloud fallback, or settings
+change is performed by a generation request. Context overflow and refusal are
+explicit errors; output is bounded rather than silently truncated.
+
+## Transcribe recordings
+
+Use this transcriber configuration in a transcriber enrichment:
+
+```json
+{
+  "provider": "apple",
+  "model": "speech-transcriber",
+  "language_code": "en-US",
+  "timestamps": true,
+  "download_assets": false
+}
+```
+
+`model` is optional. The locale defaults to `en-US` and must be supported by the
+installed SpeechTranscriber runtime. Installed assets are used without a setup
+download. Set `download_assets: true` explicitly to allow Apple's asset installer
+when a requested locale is missing. Unsupported locales and missing assets have
+distinct errors. Diarization and live transcription are not supported.
+
+Audio URLs use Antfly's bounded downloader, including inline data URIs, HTTP(S),
+and S3 credentials supplied with the request. The default download limit is
+128 MiB, which is also the adapter's maximum. Recordings must be readable by
+AVAudioFile and no longer than one hour. A unique temporary recording is removed
+when analysis ends. Responses contain final text, phrase segments, and word
+time ranges when requested; no confidence or speaker IDs are fabricated.
+
+Generation and speech share one active native invocation per process. Competing
+calls receive retryable `AppleNativeBusy`; batches execute serially. Each call
+reserves a 512 MiB native workspace allowance; transcription also reserves its
+bounded recording download. These are scheduling allowances, not hard limits on
+Apple's model memory. Cancellation and deadlines are cooperative and retain all
+borrowed buffers until the native task actually finishes.
 
 ## Configure an image reader
 
@@ -129,9 +188,11 @@ Production document budgets now scale from 256 MiB to 1 GiB with host memory;
 small process envelopes can reject work with `DocumentExtractionWorkingSetTooLarge`.
 
 ```bash
-zig build lib-readers-test antfly-apple-provider-test apple-pdf-ocr-test \
+zig build lib-readers-test lib-generating-test lib-transcribing-test \
+  antfly-apple-provider-test apple-pdf-ocr-test \
   -Dapple-providers=true -Dmetal=false -j2
-zig build lib-readers-check -Dtarget=x86_64-linux-gnu -Dmetal=false
+zig build lib-readers-check lib-generating-check lib-transcribing-check \
+  -Dtarget=x86_64-linux-gnu -Dmetal=false
 ```
 
 The native tests recognize a generated invoice image through encoded, borrowed
@@ -141,3 +202,11 @@ to macOS Vision services; restrictive process sandboxes may prevent recognition.
 The cross-build check verifies that disabled Linux readers compile without Apple
 frameworks. `scripts/apple-provider-probe.swift` also provides an independent
 Vision smoke test and can regenerate the image fixture with `--write-fixture`.
+
+The speech fixture checks exact text and phrase/word timestamps. Generation tests
+exercise configuration, cancellation, and the model's readiness error; when the
+model is available they also check real output and its byte limit. On the macOS 27 test machine, Foundation Models initially reported
+`modelNotReady`, then became available. Real generation, role-preserving history
+recall, and output-limit enforcement passed once the OS model was ready. The standalone C driver
+`scripts/apple-intelligence-probe.c` can query availability or exercise the same
+Swift C ABI independently of Antfly.

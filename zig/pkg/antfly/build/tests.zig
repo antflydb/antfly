@@ -143,7 +143,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const apple_provider_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "apple OCR", "document extraction Apple" },
+        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
     });
     const apple_provider_test_step = b.step("antfly-apple-provider-test", "Run Apple OCR provider and PDF integration tests");
     apple_provider_test_step.dependOn(&b.addRunArtifact(apple_provider_tests).step);

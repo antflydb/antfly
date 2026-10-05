@@ -37,6 +37,53 @@ pub const AntflySTTConfig = struct {
     }
 };
 
+/// On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported.
+pub const AppleSTTConfig = struct {
+    model: ?[]const u8 = null,
+    /// Supported Speech locale; Apple transcription does not infer a language.
+    language_code: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    /// Explicitly permit preparing and installing the selected Speech assets.
+    download_assets: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", true },
+        .{ "language_code", "language_code", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "download_assets", "download_assets", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.language_code) |value| {
+            try jw.objectField("language_code");
+            try jw.write(value);
+        }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Audio encoding format.
 pub const AudioFormat = enum {
     mp3,
@@ -255,6 +302,9 @@ pub const STTConfig = struct {
     use_enhanced: ?bool = null,
     /// Inference API URL. Falls back to ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    timestamps: ?bool = null,
+    /// Explicitly permit preparing and installing the selected Speech assets.
+    download_assets: ?bool = null,
     provider: STTProvider,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -269,6 +319,8 @@ pub const STTConfig = struct {
         .{ "enable_automatic_punctuation", "enable_automatic_punctuation", true },
         .{ "use_enhanced", "use_enhanced", true },
         .{ "api_url", "api_url", true },
+        .{ "timestamps", "timestamps", true },
+        .{ "download_assets", "download_assets", true },
         .{ "provider", "provider", false },
     };
 
@@ -322,6 +374,14 @@ pub const STTConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
+        if (self.timestamps) |value| {
+            try jw.objectField("timestamps");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
+            try jw.write(value);
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
         try jw.endObject();
@@ -333,12 +393,14 @@ pub const STTProvider = enum {
     openai,
     vertex,
     antfly,
+    apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .openai => "openai",
             .vertex => "vertex",
             .antfly => "antfly",
+            .apple => "apple",
         };
         try jw.write(s);
     }
@@ -352,6 +414,7 @@ pub const STTProvider = enum {
             .{ "openai", .openai },
             .{ "vertex", .vertex },
             .{ "antfly", .antfly },
+            .{ "apple", .apple },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

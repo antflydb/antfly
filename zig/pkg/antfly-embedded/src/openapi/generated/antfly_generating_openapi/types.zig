@@ -144,6 +144,52 @@ pub const AnthropicGeneratorConfig = struct {
     }
 };
 
+/// On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported.
+pub const AppleGeneratorConfig = struct {
+    provider: ?[]const u8 = null,
+    /// Only system is supported; requests are validated by the native provider.
+    model: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "model", "model", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for the AWS Bedrock generative AI provider.
 pub const BedrockGeneratorConfig = struct {
     /// The Bedrock model ID to use.
@@ -687,6 +733,7 @@ pub const GeneratorProvider = enum {
     openai,
     openrouter,
     antfly,
+    apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -696,6 +743,7 @@ pub const GeneratorProvider = enum {
             .openai => "openai",
             .openrouter => "openrouter",
             .antfly => "antfly",
+            .apple => "apple",
         };
         try jw.write(s);
     }
@@ -712,6 +760,7 @@ pub const GeneratorProvider = enum {
             .{ "openai", .openai },
             .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
+            .{ "apple", .apple },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

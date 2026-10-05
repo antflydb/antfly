@@ -25430,6 +25430,7 @@ components:
         - openai
         - vertex
         - antfly
+        - apple
       description: The STT provider to use.
     TranscriberEnrichmentConfig:
       description: >-
@@ -25518,6 +25519,12 @@ components:
           minimum: 1
           description: Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers
             a one hour voice memo or podcast.
+        download_assets:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: true
+          description: For Apple transcription, explicitly permit preparing and installing the selected
+            on-device Speech assets.
     EnrichmentConfig:
       type: object
       description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
@@ -26435,6 +26442,28 @@ components:
       required:
         - provider
         - model
+    AppleGeneratorConfig:
+      type: object
+      description: On-device Apple Foundation Models generation. Requires a macOS Apple provider build,
+        Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling
+        and media attachments are not supported.
+      properties:
+        provider:
+          type: string
+          enum:
+            - apple
+        model:
+          type: string
+          default: system
+          description: Only system is supported; requests are validated by the native provider.
+        max_tokens:
+          type: integer
+          minimum: 1
+          default: 256
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
     GeneratorProvider:
       type: string
       enum:
@@ -26444,6 +26473,7 @@ components:
         - openai
         - openrouter
         - antfly
+        - apple
       description: Generator providers implemented by Antfly's generation runtime.
     GeneratorConfig:
       description: >
@@ -26456,6 +26486,7 @@ components:
             - $ref: '#/components/schemas/AntflyGeneratorConfig'
             - $ref: '#/components/schemas/OpenAIGeneratorConfig'
             - $ref: '#/components/schemas/OpenRouterGeneratorConfig'
+            - $ref: '#/components/schemas/AppleGeneratorConfig'
         - properties:
             rate_limit:
               x-go-type-skip-optional-pointer: false

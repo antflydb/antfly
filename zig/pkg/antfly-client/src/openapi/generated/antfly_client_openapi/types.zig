@@ -2112,6 +2112,52 @@ pub const ApiKeyWithSecret = struct {
     }
 };
 
+/// On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported.
+pub const AppleGeneratorConfig = struct {
+    provider: ?[]const u8 = null,
+    /// Only system is supported; requests are validated by the native provider.
+    model: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "model", "model", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment.
 pub const ArtifactIndexSource = struct {
     /// Stable name of a generated artifact stream.
@@ -14840,6 +14886,7 @@ pub const GeneratorProvider = enum {
     openai,
     openrouter,
     antfly,
+    apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -14849,6 +14896,7 @@ pub const GeneratorProvider = enum {
             .openai => "openai",
             .openrouter => "openrouter",
             .antfly => "antfly",
+            .apple => "apple",
         };
         try jw.write(s);
     }
@@ -14865,6 +14913,7 @@ pub const GeneratorProvider = enum {
             .{ "openai", .openai },
             .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
+            .{ "apple", .apple },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -37223,12 +37272,14 @@ pub const STTProvider = enum {
     openai,
     vertex,
     antfly,
+    apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .openai => "openai",
             .vertex => "vertex",
             .antfly => "antfly",
+            .apple => "apple",
         };
         try jw.write(s);
     }
@@ -37242,6 +37293,7 @@ pub const STTProvider = enum {
             .{ "openai", .openai },
             .{ "vertex", .vertex },
             .{ "antfly", .antfly },
+            .{ "apple", .apple },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -41307,6 +41359,8 @@ pub const TranscriberEnrichmentConfig = struct {
     diarization: ?bool = null,
     /// Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
     max_download_bytes: ?i64 = null,
+    /// For Apple transcription, explicitly permit preparing and installing the selected on-device Speech assets.
+    download_assets: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -41322,6 +41376,7 @@ pub const TranscriberEnrichmentConfig = struct {
         .{ "timestamps", "timestamps", true },
         .{ "diarization", "diarization", true },
         .{ "max_download_bytes", "max_download_bytes", true },
+        .{ "download_assets", "download_assets", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -41378,6 +41433,10 @@ pub const TranscriberEnrichmentConfig = struct {
         }
         if (self.max_download_bytes) |value| {
             try jw.objectField("max_download_bytes");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
             try jw.write(value);
         }
         try jw.endObject();

@@ -758,12 +758,39 @@ pub fn create(b: *std.Build) ?Artifacts {
     readers_mod.addImport("antfly_reader_config", reader_config_mod);
     readers_mod.addImport("antfly_scraping", scraping_mod);
     readers_mod.addImport("antfly_image", image_mod);
-    const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple Vision OCR (macOS only)") orelse false;
+    const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
         @panic("-Dapple-providers=true requires macOS and libc");
     const apple_reader_options = b.addOptions();
     apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
-    readers_mod.addOptions("apple_reader_options", apple_reader_options);
+    const apple_options_module = apple_reader_options.createModule();
+    readers_mod.addImport("apple_reader_options", apple_options_module);
+    const apple_native_mod = b.createModule(.{
+        .root_source_file = b.path("lib/apple_native/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    apple_native_mod.addImport("apple_native_options", apple_options_module);
+    apple_native_mod.addImport("antfly_platform", platform_mod);
+    apple_native_mod.addImport("httpx", httpx_mod);
+    generating_mod.addImport("antfly_apple_native", apple_native_mod);
+    transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
+    var apple_swift_library_path: ?std.Build.LazyPath = null;
+    if (apple_reader_enabled) {
+        const swift = b.addSystemCommand(&.{ "xcrun", "swiftc", "-parse-as-library", "-swift-version", "6", "-target", if (target.result.cpu.arch == .aarch64) "arm64-apple-macos26.0" else "x86_64-apple-macos26.0", "-module-cache-path" });
+        swift.addDirectoryArg(std.Build.LazyPath.cache_root.path(b, "apple-swift-modules"));
+        swift.addArg("-emit-object");
+        swift.addFileArg(b.path("lib/apple_native/src/bridge.swift"));
+        swift.addArg("-o");
+        apple_native_mod.addObjectFile(swift.addOutputFileArg("apple-native.o"));
+        const apple_sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--show-sdk-path" }), " \t\r\n");
+        apple_swift_library_path = .{ .cwd_relative = b.fmt("{s}/usr/lib/swift", .{apple_sdk}) };
+        apple_native_mod.addLibraryPath(apple_swift_library_path.?);
+        inline for (.{ "swiftCore", "swift_Concurrency", "swiftFoundation", "swiftDispatch", "swift_StringProcessing", "swiftAVFoundation", "swiftCoreAudio", "swiftCoreFoundation", "swiftCoreImage", "swiftCoreMIDI", "swiftIOKit", "swiftMetal", "swiftObjectiveC", "swiftQuartzCore", "swiftUniformTypeIdentifiers", "swiftXPC", "swift_Builtin_float", "swiftsimd" }) |library|
+            apple_native_mod.linkSystemLibrary(library, .{});
+        inline for (.{ "Foundation", "FoundationModels", "Speech", "AVFoundation", "CoreMedia" }) |framework|
+            apple_native_mod.linkFramework(framework, .{});
+    }
     if (apple_reader_enabled) {
         readers_mod.linkFramework("Foundation", .{});
         readers_mod.linkFramework("CoreGraphics", .{});
@@ -1430,7 +1457,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = generating_mod,
     });
     const run_lib_generating_tests = b.addRunArtifact(lib_generating_tests);
+    // Model readiness and installed speech assets can change without code edits.
+    run_lib_generating_tests.has_side_effects = apple_reader_enabled;
     const lib_generating_test_step = b.step("lib-generating-test", "Run standalone lib/generating tests");
+    b.step("lib-generating-check", "Compile generating tests without executing them").dependOn(&lib_generating_tests.step);
     lib_generating_test_step.dependOn(&run_lib_generating_tests.step);
 
     const lib_embeddings_tests = b.addTest(.{
@@ -1725,7 +1755,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = transcribing_mod,
     });
     const run_lib_transcribing_tests = b.addRunArtifact(lib_transcribing_tests);
+    run_lib_transcribing_tests.has_side_effects = apple_reader_enabled;
     const lib_transcribing_test_step = b.step("lib-transcribing-test", "Run standalone lib/transcribing tests");
+    b.step("lib-transcribing-check", "Compile transcribing tests without executing them").dependOn(&lib_transcribing_tests.step);
     lib_transcribing_test_step.dependOn(&run_lib_transcribing_tests.step);
 
     const audio_conformance = audio_build.addConformance(b, .{
@@ -1824,6 +1856,12 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("linked-inference-abi-integration-test", "Run the production-linked inference function-table and binary-payload ABI probe").dependOn(&runtime.run_linked_inference_abi_integration.step);
     owner_tests.standalone_runtime_test_step.dependOn(&runtime.run_linked_inference_abi_integration.step);
     const antfly_main = runtime.antfly_main;
+    // Static runtime archives propagate Swift libraries, but their search paths
+    // must also be attached to the executable and shared-library link roots.
+    if (apple_swift_library_path) |path| {
+        antfly_main.root_module.addLibraryPath(path);
+        libantfly_link_mod.addLibraryPath(path);
+    }
     const runtime_library_artifacts = runtime.runtime_library_artifacts;
     const consumer_test_metadata = @import("lib/build_info/build_support.zig").create(b, .{
         .root = b.path("lib/build_info"),
@@ -1836,6 +1874,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     var linked_consumer_modules: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
     defer linked_consumer_modules.deinit(b.allocator);
     for (owner_tests.linked_consumer_tests) |tests| {
+        if (apple_swift_library_path) |path| tests.root_module.addLibraryPath(path);
         const entry = linked_consumer_modules.getOrPut(b.allocator, tests.root_module) catch @panic("OOM");
         if (entry.found_existing) continue;
         tests.root_module.addObject(consumer_test_metadata.object);

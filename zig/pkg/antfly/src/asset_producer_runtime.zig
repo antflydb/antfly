@@ -735,7 +735,12 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
-                remote = parsed.generator.url.len > 0 or parsed.generator.provider != .antfly;
+                remote = parsed.generator.provider != .apple and (parsed.generator.url.len > 0 or parsed.generator.provider != .antfly);
+                if (parsed.generator.provider == .apple) {
+                    try @import("antfly_generating").apple_native.checkAvailable();
+                    native_workspace_bytes = @import("antfly_generating").apple_native.workspace_bytes;
+                    break :blk .borrowed_binary;
+                }
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -772,7 +777,15 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const cfg = self.routedTranscriberConfig(parsed.value);
-                remote = !isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl());
+                try cfg.validate();
+                remote = cfg.provider != .apple and !isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl());
+                if (cfg.provider == .apple) {
+                    try transcribing.apple_native.checkAvailable();
+                    // The adapter owns its bounded downloaded recording; Swift
+                    // borrows it while AVAudioFile streams decoded samples.
+                    native_workspace_bytes = transcribing.apple_native.workspace_bytes + (cfg.max_download_bytes orelse transcribing.default_max_download_bytes);
+                    break :blk .borrowed_binary;
+                }
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -913,6 +926,7 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
+                if (parsed.generator.provider == .apple) break :blk false;
                 const local = self.antfly_provider orelse break :blk true;
                 if (parsed.generator.provider != .antfly or parsed.generator.url.len != 0)
                     break :blk true;
@@ -946,6 +960,7 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const cfg = self.routedTranscriberConfig(parsed.value);
+                if (cfg.provider == .apple) break :blk false;
                 const local = self.antfly_provider orelse break :blk true;
                 if (!isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
                 break :blk local.transcribe_audio_with_context != null;
@@ -1322,6 +1337,10 @@ pub const Runtime = struct {
     // Planning already owns a parsed, routed configuration. Reuse it so the
     // bounded contract resolver need not retain a second JSON/config tree.
     fn canGenerateBatchWithConfig(self: *Runtime, parsed: GeneratorProducerConfig, requests: []const asset_producer.Request) bool {
+        if (parsed.generator.provider == .apple) {
+            for (requests) |request| if (request.media.len > 0) return false;
+            return parsed.tool_output == .content;
+        }
         var all_have_media = true;
         for (requests) |request| {
             if (request.media.len > 0 and !request.inline_media_trusted) return false;
@@ -2047,6 +2066,10 @@ pub const Runtime = struct {
                 for (content_parts) |part| if (part != .text) return error.UnsupportedMediaTokenBudget;
             }
         };
+        if (cfg.provider == .apple) {
+            const outputs = try self.produceBatchSequential(alloc, requests);
+            return asset_producer.producedBatchFromOutputs(alloc, requests, outputs, inference_work.ExecutionReport.serial(requests.len));
+        }
         if (cfg.provider != .antfly) return error.BatchIncompatible;
         if (cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
         if (cfg.tools_json != null or cfg.tool_choice_json != null or parsed_cfg.tool_output != .content) return error.BatchIncompatible;
@@ -2286,6 +2309,7 @@ pub const Runtime = struct {
         // from durable user configuration.
         cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
+        if (cfg_parsed.value.provider == .apple) return self.produceBatchSequential(alloc, requests);
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl()))
             return self.produceRemoteCompatibilityBatch(alloc, requests);
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;

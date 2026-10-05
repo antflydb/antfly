@@ -7,13 +7,29 @@ Models provides Apple Intelligence generation. Availability of one must not impl
 availability of the others. Start with OCR, validate generation and transcription
 on macOS 26, and treat macOS 27 additions as a separate capability tier.
 
-Status: the first OCR slice is implemented in the Zig runtime behind
-`-Dapple-providers=true`: Vision text recognition, image readers, borrowed PDF
-rasters, and OCR grounding. Generation and transcription remain planned work.
-See [the native OCR guide](../guides/apple-native-ocr.mdx) for configuration and
-verification. The remaining sections describe the broader design, including
-capabilities that have not been implemented. Investigated on October 5, 2026 against `origin/main`
-at `a77d2a7aed129f95ed2ec2d3a2280e4f79d8ab8b`, in
+Status: OCR, text generation, and file transcription are implemented in the Zig
+runtime behind the single `-Dapple-providers=true` flag. Vision uses the existing
+Objective-C bridge; Foundation Models and SpeechAnalyzer share an in-process
+Swift bridge in `zig/lib/apple_native`. The public provider name is `apple`, with
+`vision-text`, `system`, and `speech-transcriber` aliases. SDKs and the generator
+selector have been regenerated/updated.
+
+See [the native provider guide](../guides/apple-native-ocr.mdx) for current
+configuration, bounds, and verification. On macOS 27.0.1 / SDK 27, real OCR and
+file transcription work, including phrase/word timestamps. Foundation Models
+initially reported `modelNotReady`, then became available without an Antfly
+settings change. Real text generation, history recall, and byte bounds passed.
+
+The combined opt-in build targets macOS 26+, uses the SDK 27 Swift toolchain, and
+strongly links its frameworks. Older macOS combined-binary deployment, Lite host
+qualification, packaging/signing, structured generation, tool calling, live
+transcription, image prompting, and PCC remain future work. There is no separate
+`apple-intelligence` build flag. Disabled/Linux builds do not link Swift.
+
+The remainder records the original investigation and proposed broader roadmap,
+including contracts beyond the current synchronous bounded implementation.
+Investigated October 5, 2026 against `origin/main` at
+`a77d2a7aed129f95ed2ec2d3a2280e4f79d8ab8b`, in
 `.worktrees/apple-intelligence-provider`, branch `research/apple-intelligence-provider`.
 
 ## Apple API choices
@@ -146,11 +162,10 @@ integration.
 
 Use one public provider name, `apple`, with task-specific model aliases. These
 aliases select an API/use case, not downloadable Antfly model weights. Proposed
-aliases are `vision-text`, `speech-transcriber`, and `system`. They do not exist
-in today's config schema. Keep `provider: antfly` behavior unchanged and do not
+aliases are `vision-text`, `speech-transcriber`, and `system`. These aliases are now supported in the config schema. Keep `provider: antfly` behavior unchanged and do not
 change existing defaults merely because a Mac is eligible.
 
-Illustrative future configurations, not currently accepted:
+Current configurations (advanced options below remain roadmap items):
 
 ```yaml
 # Reader config
@@ -294,8 +309,9 @@ permissions to the file-transcription path without evidence.
 The OCR bridge and image/PDF integration below have now been delivered through
 `zig/lib/readers/src/apple.zig` and `apple_vision.m`. They are gated by an opt-in
 macOS build flag and use an OS-independent unavailable error on disabled builds.
-The broader shared bridge, generation, speech, and schema additions remain
-planned. The original sequence follows for those later stages.
+The shared Swift bridge, text generation, file speech, and schema additions have
+also been implemented. The original sequence below remains a qualification
+roadmap, especially for real generation and advanced features.
 
 1. On a macOS 26 development host, prove Foundation Models generation/availability,
    SpeechTranscriber file analysis, setup downloads, cancellation, and CLI/headless
