@@ -241,11 +241,18 @@ pub fn create(b: *std.Build) ?Shared {
     platform_test_step.dependOn(&platform_tests.one_shot_unit.step);
     if (platform_tests.one_shot_process) |process| platform_test_step.dependOn(process);
 
+    const platform_mod = platform_build.createModule(b, .{
+        .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, false);
     const standalone_runtime_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, true, false);
     const production_build_options = makeRootBuildOptions(b, false, with_tla, link_libc, false, true);
-    const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
+    const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options, platform_mod);
     const raft_engine_mod = b.createModule(.{
         .root_source_file = b.path("lib/raft/src/root.zig"),
         .target = target,
@@ -442,13 +449,6 @@ pub fn create(b: *std.Build) ?Shared {
     // Protobuf wire format
     const protobuf_dep = b.dependency("protobuf", .{ .target = target, .optimize = optimize });
     const protobuf_mod = protobuf_dep.module("protobuf");
-    const platform_mod = platform_build.createModule(b, .{
-        .root_source_file = b.path("lib/platform/src/root.zig"),
-        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = link_libc,
-    });
     const evented_enrichment_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft/enrichment_executor_test.zig"),
         .target = target,
@@ -456,8 +456,19 @@ pub fn create(b: *std.Build) ?Shared {
     });
     evented_enrichment_test_mod.addImport("antfly_platform", platform_mod);
     const evented_enrichment_tests = b.addTest(.{ .root_module = evented_enrichment_test_mod });
-    b.step("evented-enrichment-test", "Test enrichment io_uring lifetime, concurrent tasks, cancellation, and file I/O")
-        .dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+    const evented_enrichment_step = b.step("evented-enrichment-test", "Test enrichment Evented lifetime, concurrent tasks, cancellation, and file I/O");
+    evented_enrichment_step.dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+    if (target.result.os.tag == .macos and
+        (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64))
+    {
+        const dispatch_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/platform/src/dispatch_compat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        evented_enrichment_step.dependOn(&b.addRunArtifact(dispatch_tests).step);
+    }
 
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),

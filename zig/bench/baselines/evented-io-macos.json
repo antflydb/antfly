@@ -1,0 +1,2130 @@
+{
+  "created_utc": "2026-10-05T17:20:19.873147+00:00",
+  "source_commit": "fc5b7963d7e9486f87617bc43166a6646a1c9bb3",
+  "environment": {
+    "host": {
+      "platform": "macOS-15.6.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "cpu": "Apple M4 Max"
+    },
+    "filesystem": "host temporary directory"
+  },
+  "samples_per_case": 7,
+  "binary_sha256": "9fa3a99d998523bc8cab731e6e09a339bdc5d0fa196100fc1e6707f835d5f431",
+  "fixture": {
+    "block_size": 4096,
+    "read_file_bytes": 67108864,
+    "read_operations": 16384,
+    "write_operations": 128,
+    "fsync_after_each_write": true,
+    "concurrency": [
+      1,
+      8,
+      32
+    ],
+    "order": "alternating backend order; one warmup per case"
+  },
+  "limitations": [
+    "Reads use a warmed page cache, not controlled cold storage.",
+    "fsync tests filesystem synchronization, not power-loss recovery or macOS F_FULLFSYNC.",
+    "These I/O measurements do not establish Lite, LSM, full-text, or vector application performance.",
+    "Linux Docker results reflect a VM filesystem, not bare-metal Linux storage."
+  ],
+  "positional_summary": [
+    {
+      "workload": "cached_read",
+      "concurrency": 1,
+      "median_ns": {
+        "threaded": 9362750,
+        "evented": 9795666
+      },
+      "evented_over_threaded": 1.0462381244826573
+    },
+    {
+      "workload": "cached_read",
+      "concurrency": 8,
+      "median_ns": {
+        "threaded": 12298166,
+        "evented": 12510000
+      },
+      "evented_over_threaded": 1.0172248447451433
+    },
+    {
+      "workload": "cached_read",
+      "concurrency": 32,
+      "median_ns": {
+        "threaded": 15196708,
+        "evented": 15211417
+      },
+      "evented_over_threaded": 1.0009679069966995
+    },
+    {
+      "workload": "durable_write",
+      "concurrency": 1,
+      "median_ns": {
+        "threaded": 2333084,
+        "evented": 2260708
+      },
+      "evented_over_threaded": 0.968978399406108
+    },
+    {
+      "workload": "durable_write",
+      "concurrency": 8,
+      "median_ns": {
+        "threaded": 3115875,
+        "evented": 3234667
+      },
+      "evented_over_threaded": 1.0381247643117903
+    },
+    {
+      "workload": "durable_write",
+      "concurrency": 32,
+      "median_ns": {
+        "threaded": 4298709,
+        "evented": 4070875
+      },
+      "evented_over_threaded": 0.9469994363423996
+    }
+  ],
+  "positional_samples": [
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 9032000
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 9408083
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 10364584
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 9362750
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 9235000
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 9837708
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 10234250
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 9282000
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 9488084
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 9737750
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 9795666
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 9509000
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 10044833
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 9293083
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 12386625
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 12510000
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 12548041
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 12298166
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 12385833
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 12380542
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 12393708
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 12292166
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 12237333
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 12312084
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 12659000
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 12242000
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 12415583
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 12581917
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 15117708
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 16384,
+      "elapsed_ns": 14810500
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 15199666
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 16384,
+      "elapsed_ns": 14411833
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 15175083
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 16384,
+      "elapsed_ns": 15211417
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 15397917
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 16384,
+      "elapsed_ns": 15283709
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 15780875
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 16384,
+      "elapsed_ns": 15259333
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 15304084
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 16384,
+      "elapsed_ns": 15652834
+    },
+    {
+      "backend": "threaded",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 15196708
+    },
+    {
+      "backend": "evented",
+      "workload": "cached_read",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 16384,
+      "elapsed_ns": 14620750
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 2333084
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 2173542
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 2021125
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 1982542
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 2345458
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 2213416
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 2501750
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 2393458
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 2454875
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 2600708
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 2674916
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 2283416
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 2155792
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 1,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 2260708
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 3025750
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 3123125
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 3234667
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 3300792
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 3115875
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 3154208
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 3083041
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 3041417
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 2952584
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 3240208
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 3279458
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 3140084
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 3175500
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 8,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 3321291
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 4207917
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 0,
+      "operations": 128,
+      "elapsed_ns": 3784041
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 4070875
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 1,
+      "operations": 128,
+      "elapsed_ns": 4003667
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 4384750
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 2,
+      "operations": 128,
+      "elapsed_ns": 3873334
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 4110625
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 3,
+      "operations": 128,
+      "elapsed_ns": 4298709
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 4262459
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 4,
+      "operations": 128,
+      "elapsed_ns": 4426583
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 3870584
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 5,
+      "operations": 128,
+      "elapsed_ns": 4353125
+    },
+    {
+      "backend": "threaded",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 4966250
+    },
+    {
+      "backend": "evented",
+      "workload": "durable_write",
+      "concurrency": 32,
+      "sample": 6,
+      "operations": 128,
+      "elapsed_ns": 4122333
+    }
+  ],
+  "lmdb_command_flags": [
+    "--samples",
+    "1",
+    "--cycles",
+    "8",
+    "--keys",
+    "512",
+    "--dups",
+    "32",
+    "--named-keys",
+    "128",
+    "--async-io",
+    "--kv-only"
+  ],
+  "lmdb_summary": [
+    {
+      "workload": "kv_roundtrip",
+      "phase": null,
+      "median_ns": {
+        "threaded": 19016917,
+        "evented": 19539042
+      },
+      "evented_over_threaded": 1.0274558173651387
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "median_ns": {
+        "threaded": 678331,
+        "evented": 680334
+      },
+      "evented_over_threaded": 1.00295283571
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "median_ns": {
+        "threaded": 15910127,
+        "evented": 15939836
+      },
+      "evented_over_threaded": 1.0018673012478152
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "median_ns": {
+        "threaded": 1682419,
+        "evented": 2137293
+      },
+      "evented_over_threaded": 1.2703690341110032
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "median_ns": {
+        "threaded": 304751,
+        "evented": 319751
+      },
+      "evented_over_threaded": 1.0492205111714155
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "median_ns": {
+        "threaded": 25875,
+        "evented": 26292
+      },
+      "evented_over_threaded": 1.0161159420289856
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "median_ns": {
+        "threaded": 876000,
+        "evented": 1005000
+      },
+      "evented_over_threaded": 1.1472602739726028
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "median_ns": {
+        "threaded": 77000,
+        "evented": 84000
+      },
+      "evented_over_threaded": 1.0909090909090908
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "median_ns": {
+        "threaded": 323000,
+        "evented": 342000
+      },
+      "evented_over_threaded": 1.0588235294117647
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "median_ns": {
+        "threaded": 22000,
+        "evented": 23000
+      },
+      "evented_over_threaded": 1.0454545454545454
+    },
+    {
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "median_ns": {
+        "threaded": 147000,
+        "evented": 153000
+      },
+      "evented_over_threaded": 1.0408163265306123
+    }
+  ],
+  "lmdb_samples": [
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19016917,
+      "ops_per_sec": 215807.85,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 745959,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15910127,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1682419,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 339789,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 25082,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 895000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 74000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 339000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 22000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 147000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19873750,
+      "ops_per_sec": 206503.55,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 678792,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 16230709,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2137293,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 356666,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 25624,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 982000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 82000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 352000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 22000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 149000,
+      "sample": 0
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 18879500,
+      "ops_per_sec": 217378.64,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 637749,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15426876,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2013084,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 300378,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 25833,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 968000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 71000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 346000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 23000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 160000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 18912083,
+      "ops_per_sec": 217004.12,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 701831,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15908124,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1649582,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 303254,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 26167,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 870000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 67000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 301000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 27000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 188000,
+      "sample": 1
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19028542,
+      "ops_per_sec": 215676.01,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 651165,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 16061791,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1712543,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 302543,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 25875,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 910000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 88000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 338000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 23000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 153000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19326917,
+      "ops_per_sec": 212346.34,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 680334,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15604084,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2226749,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 329874,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 27000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 1038000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 90000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 337000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 23000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 160000,
+      "sample": 2
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19539042,
+      "ops_per_sec": 210041.0,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 718000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15939836,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2083541,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 319751,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 26292,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 954000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 73000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 334000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 18000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 148000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19318584,
+      "ops_per_sec": 212437.93,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 678331,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 16305958,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1702457,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 301207,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 26207,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 876000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 84000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 315000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 22000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 146000,
+      "sample": 3
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 18721209,
+      "ops_per_sec": 219216.61,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 634874,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15853835,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1605501,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 306249,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 24667,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 855000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 77000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 323000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 19000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 145000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19462750,
+      "ops_per_sec": 210864.34,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 686502,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15720333,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2231669,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 318542,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 27209,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 1055000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 94000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 333000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 26000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 145000,
+      "sample": 4
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 20838167,
+      "ops_per_sec": 196946.31,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 697458,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 16963168,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2320291,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 348875,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 30169,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 1086000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 100000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 363000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 22000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 159000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19337042,
+      "ops_per_sec": 212235.15,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 653916,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 16200043,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1783374,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 360624,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 26584,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 949000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 77000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 370000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 31000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 169000,
+      "sample": 5
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 18725500,
+      "ops_per_sec": 219166.38,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 690128,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 15740123,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 1615875,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 304751,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 24666,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 838000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 73000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 300000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 21000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "threaded",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 139000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "ops": 4104,
+      "ns": 19966625,
+      "ops_per_sec": 205543.0,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "write_open",
+      "ns": 670668,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "put_loop",
+      "ns": 16368958,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "commit",
+      "ns": 2125625,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_open",
+      "ns": 316667,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "read_get",
+      "ns": 26291,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "publish",
+      "ns": 1005000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "page_write",
+      "ns": 84000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "data_sync",
+      "ns": 342000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_write",
+      "ns": 26000,
+      "sample": 6
+    },
+    {
+      "backend": "zig",
+      "async_runtime": "evented",
+      "workload": "kv_roundtrip",
+      "phase": "meta_sync",
+      "ns": 153000,
+      "sample": 6
+    }
+  ],
+  "lmdb_binary_sha256": {
+    "threaded": "ec6ed7d424df3a5874cecd60f6aa544b89a148e6c3ec4200048d3608a7c3bd60",
+    "evented": "4171be33aa743ae1f8446b8cc905edab6edb80f7c12f326cc85a67be743894c8"
+  }
+}

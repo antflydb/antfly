@@ -4991,7 +4991,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     storage_vopr_runtime_test_step.dependOn(&run_storage_vopr_runtime_tests.step);
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
-    const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
+    const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options, platform_mod);
     const storage_lmdb_soak_test_mod = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod, hash_mod);
     const storage_lmdb_soak_tests = b.addTest(.{
         .root_module = storage_lmdb_soak_test_mod,
@@ -5145,7 +5145,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     wal_replay_step.dependOn(&run_wal_replay_tests.step);
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
-    const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
+    const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options, platform_mod);
     const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod, hash_mod);
     antfly_imports.configureRuntimeContracts(wal_soak_test_mod);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
@@ -5237,7 +5237,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     persistent_vopr_step.dependOn(&run_persistent_vopr_tests.step);
 
     const persistent_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
-    const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
+    const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options, platform_mod);
     const persistent_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, persistent_soak_build_options, persistent_soak_engine_mod, platform_mod, hash_mod);
     antfly_imports.configureRuntimeContracts(persistent_soak_test_mod);
     persistent_soak_test_mod.addImport("bloom", bloom_mod);
