@@ -142,6 +142,8 @@ pub const Backend = struct {
     };
 };
 
+/// Result pages must be released before close or detach: native page arenas
+/// may borrow the stream's shared memory admission and retained column metadata.
 pub const ReadStream = struct {
     context: *anyopaque,
     columns: []const Column,

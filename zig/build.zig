@@ -287,9 +287,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     // remains below the full database compilation and integration test roots.
     sql_tests.step.max_rss = 1536 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
-    // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
+    // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
-    run_sql_tests.step.max_rss = 192 * 1024 * 1024;
+    run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
@@ -1168,6 +1168,24 @@ pub fn create(b: *std.Build) ?Artifacts {
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.link_libc = link_libc;
+    const refinement_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.storage_boundary.configureSources(refinement_bench_mod, false, false);
+    refinement_bench_mod.addImport("sql_parser", sql_parser_mod);
+    refinement_bench_mod.addImport("antfly_platform", platform_mod);
+    refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    refinement_bench_mod.addImport("antfly_regex", regex_mod);
+    refinement_bench_mod.addImport("antfly_hash", hash_mod);
+    refinement_bench_mod.addImport("bloom", bloom_mod);
+    refinement_bench_mod.link_libc = link_libc;
+    const refinement_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native refinements benchmark"} });
+    b.step("sql-native-refinement-bench", "Compare native expression, aggregate and window spill refinements").dependOn(&b.addRunArtifact(refinement_bench).step);
+    const pipeline_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native pipeline refinements benchmark"} });
+    b.step("sql-native-pipeline-bench", "Compare shared typed DAGs and block result delivery").dependOn(&b.addRunArtifact(pipeline_bench).step);
+
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;

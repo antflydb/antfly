@@ -37,6 +37,10 @@ pub const ColumnChunk = struct {
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
     field_id: ?i32 = null,
+    offset_index_offset: ?u64 = null,
+    offset_index_length: ?u32 = null,
+    column_index_offset: ?u64 = null,
+    column_index_length: ?u32 = null,
     stats_min_i64: ?i64 = null,
     stats_max_i64: ?i64 = null,
     stats_min_bytes: ?[]u8 = null,
@@ -59,6 +63,13 @@ pub const ColumnChunk = struct {
     }
 
     pub fn validate(self: ColumnChunk, file_len: u64) !void {
+        for ([_]struct { offset: ?u64, len: ?u32 }{
+            .{ .offset = self.offset_index_offset, .len = self.offset_index_length },
+            .{ .offset = self.column_index_offset, .len = self.column_index_length },
+        }) |index| {
+            if ((index.offset == null) != (index.len == null)) return error.InvalidExternalSourceInventory;
+            if (index.offset) |offset| if (offset > file_len or index.len.? == 0 or index.len.? > file_len - offset) return error.InvalidExternalSourceInventory;
+        }
         if (self.column_id.len == 0) return error.InvalidExternalSourceInventory;
         if (self.compressed_len == 0) return error.InvalidExternalSourceInventory;
         if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
@@ -96,7 +107,6 @@ pub const RowGroup = struct {
     }
 
     pub fn validate(self: RowGroup, file_len: u64) !void {
-        if (self.row_count == 0) return error.InvalidExternalSourceInventory;
         if (self.total_byte_len != 0) {
             if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
             if (self.total_byte_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;
@@ -107,6 +117,36 @@ pub const RowGroup = struct {
                 if (std.mem.eql(u8, previous.column_id, chunk.column_id)) return error.InvalidExternalSourceInventory;
             }
         }
+    }
+};
+
+pub const FieldMetric = struct {
+    field_id: i32,
+    value: []u8,
+    pub fn normalize(metrics: []FieldMetric) !void {
+        std.mem.sort(FieldMetric, metrics, {}, struct {
+            fn less(_: void, left: FieldMetric, right: FieldMetric) bool {
+                return left.field_id < right.field_id;
+            }
+        }.less);
+        for (metrics, 0..) |metric, index| {
+            if (metric.field_id < 0 or (index != 0 and metrics[index - 1].field_id == metric.field_id)) return error.InvalidExternalSourceInventory;
+        }
+    }
+    pub fn freeAll(a: Allocator, metrics: []FieldMetric) void {
+        for (metrics) |metric| a.free(metric.value);
+        a.free(metrics);
+    }
+    pub fn cloneAll(a: Allocator, metrics: []const FieldMetric) ![]FieldMetric {
+        const out = try a.alloc(FieldMetric, metrics.len);
+        errdefer a.free(out);
+        var initialized: usize = 0;
+        errdefer for (out[0..initialized]) |metric| a.free(metric.value);
+        for (metrics, out) |metric, *copy| {
+            copy.* = .{ .field_id = metric.field_id, .value = try a.dupe(u8, metric.value) };
+            initialized += 1;
+        }
+        return out;
     }
 };
 
@@ -121,9 +161,13 @@ pub const FileEntry = struct {
     partition_spec_id: ?i32 = null,
     partition_field_count: u32 = 0,
     partition_values: []PartitionValue = &.{},
+    lower_bounds: []FieldMetric = &.{},
+    upper_bounds: []FieldMetric = &.{},
     row_groups: []RowGroup,
 
     pub fn deinit(self: *FileEntry, alloc: Allocator) void {
+        FieldMetric.freeAll(alloc, self.lower_bounds);
+        FieldMetric.freeAll(alloc, self.upper_bounds);
         alloc.free(self.file_id);
         alloc.free(self.object_uri);
         if (self.etag.len > 0) alloc.free(self.etag);
