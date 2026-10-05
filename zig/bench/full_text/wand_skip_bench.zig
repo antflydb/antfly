@@ -166,7 +166,7 @@ fn fmtRatio(num: u64, denom: u64) f32 {
 
 pub fn main(init: std.process.Init) !void {
     // This is a latency benchmark, so use the same low-overhead allocator as
-    // the other production-oriented full-text benches. DebugAllocator's
+    // the other production-oriented full-text benches. SafeAllocator's
     // bookkeeping otherwise becomes part of the first chunk/collector setup
     // and can dominate short scorer runs.
     const alloc = std.heap.c_allocator;

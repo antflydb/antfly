@@ -12,7 +12,7 @@ const foreign = @import("../foreign/source.zig");
 const table_writes = @import("antfly_local_sources").api_table_write_source;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const table_manager = @import("../metadata/table_manager.zig");
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
@@ -1092,7 +1092,7 @@ pub const Scenario = struct {
 };
 
 test "replication backfill service rates compose and heal across production snapshot and stream" {
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     var world = try Scenario.init(alloc);

@@ -59,7 +59,7 @@ pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(
         setStripRecursively(imported_module, visited);
     }
 }
-const addMacosSdkPaths = @import("../../../lib/platform/build_support.zig").addMacosSdkPaths;
+const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 
 pub const AddRuntimeOptions = struct {
     target: std.Build.ResolvedTarget,

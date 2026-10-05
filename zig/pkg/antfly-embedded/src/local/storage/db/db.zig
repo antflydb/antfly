@@ -62050,8 +62050,8 @@ test "relational columnar bootstrap yields across artifact-only owners" {
 
 test "relational columnar scheduler batches deferred discovery before ready work and persists timers" {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -62598,8 +62598,8 @@ fn testColumnarSelection(comptime physical_plan: bool) !void {
     // Keep 768 rows for physical plans: 512 changes block layout and selects
     // sequential reads instead of late materialization. The semantic matrix
     // retains boundary keys on a smaller fixture without asserting that plan.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -62719,8 +62719,8 @@ test "relational columnar late materialization pins snapshots and releases visit
 
 test "relational columnar sequential selection preserves dirty owners bounds and limits" {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -62834,8 +62834,8 @@ test "relational columnar bound scan benchmark" {
 }
 
 fn testRelationalBoundScan(benchmark: bool) !void {
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     const row_count: usize = if (benchmark) 768 else 2 * @import("column_read_cache.zig").max_rows;
     relational_columns.test_disable_deadline = true;
@@ -63001,8 +63001,8 @@ test "relational columnar production LSM physical churn benchmark" {
 
 fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -63592,8 +63592,8 @@ test "relational columnar delete waves coalesce adjacent underfilled ranges" {
 
 test "relational columnar clean coalescing preserves typed cells without primary reads" {
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.initFast("db");
@@ -64229,8 +64229,8 @@ test "relational columnar typed masks avoid vector expansion and eliminated colu
 
 test "relational columnar bounded compaction splits empty ranges and resumes canceled staging" {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     // The explicit block limit below, not elapsed wall time, defines quanta.
     relational_columns.test_disable_deadline = true;
@@ -68905,8 +68905,8 @@ test "db dense and sparse vector searches apply stored symbolic filters before f
 
 test "db dense stored symbolic filter candidate window covers offset pagination" {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_tmp = try TestDirectory.init("db");
@@ -97858,8 +97858,8 @@ test "db paged merge ttl-state probes bound memory across source fan-in" {
     defer alloc.free(lifetime_key);
     var timestamp: [8]u8 = undefined;
     std.mem.writeInt(u64, &timestamp, 1, .big);
-    var bounded: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .{ .backing_allocator = alloc, .requested_memory_limit = 64 * 1024 };
-    defer std.debug.assert(bounded.deinit() == .ok);
+    var bounded = @import("../test_allocator.zig").BoundedAllocator.init(alloc, 64 * 1024);
+    defer std.debug.assert(bounded.deinit() == 0);
     const probe_alloc = bounded.allocator();
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer writes.deinit(probe_alloc);
@@ -125902,8 +125902,8 @@ test "db graph ownership restore cursor resumes one artifact index exactly" {
 
 test "db graph ownership restore materializes large artifacts in published segments" {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();

@@ -183,12 +183,80 @@ pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, scr
 
 pub fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
-        // xcrun observes the selected Xcode installation outside configure inputs.
+    const sdk_root = macosSdkRoot(b, target) orelse return;
+    module.addSystemIncludePath(sdk_root.path(b, "usr/include"));
+    module.addLibraryPath(sdk_root.path(b, "usr/lib"));
+    module.addFrameworkPath(sdk_root.path(b, "System/Library/Frameworks"));
+}
+
+fn macosSdkRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    const key = "antfly_macos_sdk_root";
+    if (b.named_lazy_paths.get(key)) |root| return root;
+    // Declare once even when discovery fails and another owner retries it.
+    const explicit = if (!b.available_options_map.contains("macos-sdk"))
+        b.option([]const u8, "macos-sdk", "Explicit macOS SDK root (otherwise SDK_PATH or xcrun)")
+    else
+        null;
+    const sdk_root = explicit orelse b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // Automatic selection depends on Xcode's external configuration. Keep
+        // rediscovering it; explicit SDK inputs can reuse configure results.
         b.graph.poisonCache();
-        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return null;
     };
-    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
-    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
+    const root = b.graph.cwdRelativePath(sdk_root);
+    b.dependOnDirectoryMetadata(root);
+    b.addNamedLazyPath(key, root);
+    return root;
+}
+
+/// Pass the selected SDK to the compiler and translator, rather than adding
+/// fallback search paths behind Zig's automatically discovered libc.
+pub fn macosSdkLibCFile(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    if (target.result.os.tag != .macos) return null;
+    const key = "antfly_macos_sdk_libc";
+    if (b.named_lazy_paths.get(key)) |file| return file;
+    const root = macosSdkRoot(b, target) orelse return null;
+    const sdk = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, root.relative.sub_path, b.allocator) catch |err|
+        std.debug.panic("cannot resolve macOS SDK: {t}", .{err});
+    const file = b.addWriteFiles().add("macos-sdk-libc.txt", b.fmt(
+        "include_dir={s}/usr/include\nsys_include_dir={s}/usr/include\ncrt_dir={s}/usr/lib\ncc_dir=\nmsvc_lib_dir=\nkernel32_lib_dir=\ndarwin_sdk_dir={s}\n",
+        .{ sdk, sdk, sdk, sdk },
+    ));
+    b.addNamedLazyPath(key, file);
+    return file;
+}
+
+/// Configure every macOS artifact after its owners have constructed the graph,
+/// including linked libraries and generated host tools.
+pub fn finalizeMacosSdk(b: *std.Build) void {
+    if (!b.named_lazy_paths.contains("antfly_macos_sdk_root")) return;
+    var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+    var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+    for (b.top_level_steps.values()) |top| visitSdkStep(b, &top.step, &steps, &modules);
+}
+
+fn visitSdkStep(b: *std.Build, step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    // setLibCFile adds a dependency; traverse existing dependencies first.
+    for (step.dependencies.items) |dependency| visitSdkStep(b, dependency, steps, modules);
+    if (step.cast(std.Build.Step.Compile)) |artifact| {
+        if (artifact.root_module.resolved_target) |target| {
+            if (target.result.os.tag == .macos and artifact.libc_file == null)
+                artifact.setLibCFile(macosSdkLibCFile(b, target));
+        }
+        visitSdkModule(b, artifact.root_module, steps, modules);
+    }
+}
+
+fn visitSdkModule(b: *std.Build, module: *std.Build.Module, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    if (module.root_source_file) |source| switch (source) {
+        .generated => |generated| visitSdkStep(b, b.graph.generated_files.items[@backingInt(generated.index)], steps, modules),
+        else => {},
+    };
+    for (module.link_objects.items) |object| switch (object) {
+        .other_step => |artifact| visitSdkStep(b, &artifact.step, steps, modules),
+        else => {},
+    };
+    for (module.import_table.values()) |dependency| visitSdkModule(b, dependency, steps, modules);
 }

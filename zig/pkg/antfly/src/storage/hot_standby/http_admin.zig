@@ -4942,10 +4942,10 @@ test "storage.hot_standby http admin implemented admin routes are documented" {
 }
 
 test "storage.hot_standby http admin exposes request executor" {
-    var owner_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(owner_gpa.deinit() == .ok);
-    var caller_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(caller_gpa.deinit() == .ok);
+    var owner_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x48410101 });
+    defer std.debug.assert(owner_gpa.deinit() == 0);
+    var caller_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x48410102 });
+    defer std.debug.assert(caller_gpa.deinit() == 0);
 
     var server = Server.init(owner_gpa.allocator(), .{});
     defer server.deinit();
