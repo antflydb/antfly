@@ -138,7 +138,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.orderedApplyReceipt()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
-            if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
+            if (database.independent_maintenance.future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
             for (0..100) |_| {
                 if (!graph.ownershipTransitionPending()) break;
@@ -2980,25 +2980,45 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             try txn.put(counter_key, &saved_counter);
             try txn.commit();
         }
+        const owner = @import("../capi/server_owner.zig");
         const Capture = struct {
             refused: bool = true,
+            calls: usize = 0,
             hint: ?transport.RecoveryHint = null,
-            fn enqueue(ptr: *anyopaque, namespace: [24]u8, bytes: []const u8) !void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                if (self.refused) return error.ResourceLimitExceeded;
-                self.hint = (try transport.RecoveryHint.decode(bytes)) orelse return error.InvalidBatchRequest;
-                try std.testing.expectEqualDeep(namespace, self.hint.?.namespace);
+            fn enqueue(ptr: ?*anyopaque, group_id: u64, namespace: *const [24]u8, bytes: owner.kernel_owner_abi.BorrowedBytes) callconv(.c) owner.kernel_owner_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+                if (group_id != 77) return .invalid_argument;
+                self.calls += 1;
+                if (self.refused) return .resource_limit_exceeded;
+                self.hint = (transport.RecoveryHint.decode(bytes.slice()) catch return .invalid_argument) orelse return .invalid_argument;
+                if (!std.mem.eql(u8, namespace, &self.hint.?.namespace)) return .invalid_argument;
+                return .ok;
             }
         };
         var capture: Capture = .{};
-        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
+        var hooks: owner.StorageOwnerRuntimeHooks = .{
+            .group_id = 77,
+            .config = .{ .artifact_publication_ctx = &capture, .artifact_publication_enqueue_fn = Capture.enqueue },
+        };
+        db.local_execution.artifact_publication_dispatcher = hooks.artifactPublicationDispatcher();
         defer db.local_execution.artifact_publication_dispatcher = null;
-        try std.testing.expectError(error.ResourceLimitExceeded, db.advanceArtifactUploadRecovery());
-        try std.testing.expectEqual(@as(u64, 0), db.artifact_upload_recovery_cursor.load(.acquire));
+        try std.testing.expectError(error.ResourceLimitExceeded, engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(u64, 0), hooks.artifact_upload_recovery.cursor.load(.acquire));
+        try std.testing.expect(hooks.artifact_upload_recovery.retry_after_ns.load(.acquire) != 0);
+        // Pin the deadline ahead of every possible runtime tick. Suppression
+        // must happen before the recovery/admission callback, even after refusal.
+        hooks.artifact_upload_recovery.retry_after_ns.store(std.math.maxInt(u64), .release);
         capture.refused = false;
+        try std.testing.expect(!try engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(usize, 1), capture.calls);
         try std.testing.expect(try db.advanceArtifactUploadRecovery());
         recovered = capture.hint.?;
         try std.testing.expectEqual(@as(u64, 4), recovered.?.created_index);
+        try std.testing.expectEqual(@as(usize, 2), capture.calls);
+        // The next maintenance opportunity uses the same production binding.
+        hooks.artifact_upload_recovery.retry_after_ns.store(0, .release);
+        try std.testing.expect(try engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(usize, 3), capture.calls);
         // A delayed hint for a retired incarnation advances only the Raft
         // watermark. It cannot consume this upload or credit a receipt.
         var stale = recovered.?.request();
@@ -3219,9 +3239,9 @@ test "db ordered artifact inventory idle upload retirement replays across owners
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 const inventory = try transport.recoveryInventory(&read, namespace);
-                var tracker: transport.RecoveryTracker = .{};
+                var tracker: @import("artifact_upload_recovery.zig").RecoveryTracker = .{};
                 try std.testing.expect(tracker.observe(inventory, 0, 0) == null);
-                const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
+                const hint = tracker.observe(inventory, @import("artifact_upload_recovery.zig").RecoveryTracker.idle_ns, 0).?;
                 if (before_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else before_chunk = hint;
             }
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = begin.proposedManifest().root(), .chunk_base64 = base64 } }, .{ .term = 1, .index = 6 });
@@ -3231,9 +3251,9 @@ test "db ordered artifact inventory idle upload retirement replays across owners
             const inventory = try transport.recoveryInventory(&read, namespace);
             try std.testing.expectEqual(@as(usize, 1), inventory.count);
             try std.testing.expect(!inventory.entries[0].complete);
-            var tracker: transport.RecoveryTracker = .{};
+            var tracker: @import("artifact_upload_recovery.zig").RecoveryTracker = .{};
             _ = tracker.observe(inventory, 0, 0);
-            const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
+            const hint = tracker.observe(inventory, @import("artifact_upload_recovery.zig").RecoveryTracker.idle_ns, 0).?;
             if (after_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else after_chunk = hint;
         }
         var reopened = try DB.open(alloc, path, options);
@@ -4168,4 +4188,34 @@ test "server ordered graph cleanup applies complete planner pages and duplicate 
     }
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
     try std.testing.expect((try db.prepareGraphEndpointCleanupBatch(alloc)) == null);
+}
+
+test "server group timestamp survives relational schema upgrade and reopen" {
+    const metadata = @import("server_group_metadata.zig");
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("server-group-schema");
+    defer directory.cleanup();
+    const schema_v1 = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}";
+    const schema_v2 = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"note\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}";
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_v1);
+        try std.testing.expectEqual(@as(u64, 1234), try metadata.ensureGroupCreatedAtMillis(&db, alloc, 7, 1234));
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_v2);
+        try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
+        try std.testing.expectEqual(@as(u64, 1234), try metadata.ensureGroupCreatedAtMillis(&db, alloc, 7, 5678));
+        const raw = (try db.get(alloc, "\x00\x00__metadata__:data_group_created_at:7")).?;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("1234", raw);
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
+    }
 }

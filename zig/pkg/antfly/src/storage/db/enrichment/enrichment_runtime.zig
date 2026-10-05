@@ -5002,6 +5002,9 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .lease_fencing_enabled = true,
             .graph_stage_recovery_pending = true,
         };
+        // Providers transfer only on successful return. Unwind local ownership
+        // allocations without releasing another worker's durable lease.
+        errdefer runtime.ownership.deinitPreserveLease(alloc);
         runtime.applied_sequence = try enrichment_state.loadAppliedSequence(alloc, store, scope_name);
         const persisted_status = try enrichment_state.loadRuntimeStatus(alloc, store, scope_name);
         restorePersistedRuntimeStatus(&runtime, persisted_status);

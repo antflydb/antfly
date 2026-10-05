@@ -12,6 +12,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
+const server_document_child_range = @import("../storage/server_document_child_range.zig");
+const server_query_visibility = @import("../storage/server_query_visibility.zig");
+const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const local_write_contract = @import("local_write_contract.zig");
@@ -2187,7 +2191,7 @@ pub const ProvisionedTableWriteCache = struct {
     /// managed DB gets a group-specific `PromotionOwner` so only the local leader
     /// promotes resolution replay into cross-shard entity writes.
     promotion_leadership_source: ?PromotionLeadershipSourceContract = null,
-    coordinated_ttl: ?db_mod.coordinated_ttl.Port = null,
+    coordinated_ttl: ?server_coordinated_ttl.Port = null,
     /// Optional HA ownership gate applied when this cache opens managed writer
     /// DBs. Changing the gate retires live cached DBs so the next operation
     /// reopens with the correct primary/standby role and background runtimes.
@@ -2299,7 +2303,7 @@ pub const ProvisionedTableWriteCache = struct {
         hot_standby_write_gate_generation: ?u64 = null,
         table_name: []u8,
         managed_config_fingerprint: [32]u8,
-        promotion_owner_state: PromotionOwnerState = .{},
+        runtime_hook_state: RuntimeHookState = .{},
         db: if (control_only_storage_sources) void else db_mod.DB,
         schema_json: ?[]u8 = null,
         active_leases: usize = 0,
@@ -2316,13 +2320,14 @@ pub const ProvisionedTableWriteCache = struct {
         auto_bulk_ingest_finishing: bool = false,
 
         fn detachRuntimeHooks(self: *Entry) void {
-            self.db.setCoordinatedTtl(null, 0);
             if (comptime control_only_storage_sources) return;
+            self.db.setCoordinatedTtl(null);
             self.db.setQueryVisibilityHook(null);
             self.db.setResolutionCandidateSource(null);
             self.db.setEntitySink(null);
             self.db.setPromotionOwner(null);
-            self.promotion_owner_state = .{};
+            self.runtime_hook_state.ttl_binding.set(0, null);
+            self.runtime_hook_state.leadership_source = null;
         }
 
         fn archiveLsmOwnerCloneStats(
@@ -2481,11 +2486,13 @@ pub const ProvisionedTableWriteCache = struct {
 
     pub const PromotionLeadershipSource = PromotionLeadershipSourceContract;
 
-    const PromotionOwnerState = struct {
+    const RuntimeHookState = struct {
         group_id: u64 = 0,
         leadership_source: ?PromotionLeadershipSourceContract = null,
+        ttl_binding: server_coordinated_ttl.Binding = .{},
+        visibility_binding: server_query_visibility.Binding = .{},
 
-        fn owner(self: *PromotionOwnerState) ?db_mod.PromotionOwner {
+        fn owner(self: *RuntimeHookState) ?db_mod.PromotionOwner {
             if (self.leadership_source == null) return null;
             return .{ .ptr = self, .vtable = &owner_vtable };
         }
@@ -2493,26 +2500,26 @@ pub const ProvisionedTableWriteCache = struct {
         const owner_vtable = db_mod.PromotionOwner.VTable{ .is_local_owner = isLocalOwner };
 
         fn isLocalOwner(ptr: *anyopaque) bool {
-            const self: *PromotionOwnerState = @ptrCast(@alignCast(ptr));
+            const self: *RuntimeHookState = @ptrCast(@alignCast(ptr));
             const source = self.leadership_source orelse return true;
             return source.isLocalLeader(self.group_id);
         }
     };
 
-    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, table_name: []const u8, group_id: u64, owner_state: ?*PromotionOwnerState) void {
+    fn applyRuntimeHooksToDb(self: *ProvisionedTableWriteCache, db: *db_mod.DB, table_name: []const u8, group_id: u64, owner_state: ?*RuntimeHookState) void {
         // Every managed owner, including adopted startup/restore owners, must
         // bind signed policy proofs to its stable cache-entry table identity.
         db.local_execution.row_policy_table_name = table_name;
-        db.setCoordinatedTtl(self.coordinated_ttl, group_id);
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
         if (owner_state) |state| {
-            state.* = .{
-                .group_id = group_id,
-                .leadership_source = self.promotion_leadership_source,
-            };
+            state.group_id = group_id;
+            state.leadership_source = self.promotion_leadership_source;
+            state.ttl_binding.set(group_id, self.coordinated_ttl);
+            db.setCoordinatedTtl(state.ttl_binding.port());
             db.setPromotionOwner(state.owner());
         } else {
+            db.setCoordinatedTtl(null);
             db.setPromotionOwner(null);
         }
     }
@@ -2573,7 +2580,7 @@ pub const ProvisionedTableWriteCache = struct {
             return;
         }
         for (self.entries.items) |entry| {
-            self.applyRuntimeHooksToDb(&entry.db, entry.table_name, entry.group_id, &entry.promotion_owner_state);
+            self.applyRuntimeHooksToDb(&entry.db, entry.table_name, entry.group_id, &entry.runtime_hook_state);
         }
     }
 
@@ -2622,7 +2629,7 @@ pub const ProvisionedTableWriteCache = struct {
         candidate_source: ?db_mod.CandidateSource,
         entity_sink_value: ?db_mod.EntitySink,
         leadership_source: ?PromotionLeadershipSourceContract,
-        ttl_port: ?db_mod.coordinated_ttl.Port,
+        ttl_port: ?server_coordinated_ttl.Port,
     ) void {
         const ttl_equal = if (self.coordinated_ttl) |current|
             if (ttl_port) |next| current.ptr == next.ptr and current.expire_fn == next.expire_fn else false
@@ -3257,7 +3264,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         try self.entries.append(self.alloc, owned_entry);
         // Artifact-issue mutations invalidate their compact status summary in
@@ -3628,7 +3635,7 @@ pub const ProvisionedTableWriteCache = struct {
             .active_leases = 1,
             .bulk_ingest_session_open = start_bulk_session,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         prepared.schema_json = null;
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
@@ -3687,7 +3694,7 @@ pub const ProvisionedTableWriteCache = struct {
             .allow_generation_adoption = true,
             .allow_active_generation_adoption = true,
         };
-        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.promotion_owner_state);
+        self.applyRuntimeHooksToDb(&owned_entry.db, owned_entry.table_name, group_id, &owned_entry.runtime_hook_state);
         try owned_entry.db.activateResolverReplayRuntimes();
         errdefer owned_entry.deinit(self.alloc, self.backend_runtime);
 
@@ -6150,6 +6157,7 @@ const DocumentChildRangeDispatchContext = struct {
     fn dispatcher(self: *DocumentChildRangeDispatchContext) db_mod.DocumentArtifactChildRangeDispatcher {
         return .{
             .ptr = self,
+            .select_destination = server_document_child_range.selectPersistedDestination,
             .apply = apply,
         };
     }
@@ -6988,7 +6996,7 @@ pub const ProvisionedTableWriteSource = struct {
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
     promotion_leadership_source: ?PromotionLeadershipSource = null,
-    coordinated_ttl: ?db_mod.coordinated_ttl.Port = null,
+    coordinated_ttl: ?server_coordinated_ttl.Port = null,
     replication_write_gate: ?db_mod.ReplicationWriteGate = null,
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
@@ -7533,7 +7541,7 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
-    pub fn withCoordinatedTtl(self: *ProvisionedTableWriteSource, port: ?db_mod.coordinated_ttl.Port) *ProvisionedTableWriteSource {
+    pub fn withCoordinatedTtl(self: *ProvisionedTableWriteSource, port: ?server_coordinated_ttl.Port) *ProvisionedTableWriteSource {
         self.coordinated_ttl = port;
         self.syncRuntimeHooksToCaches();
         return self;
@@ -7663,19 +7671,17 @@ pub const ProvisionedTableWriteSource = struct {
         db: *db_mod.DB,
         table_name: []const u8,
         group_id: u64,
-        owner_state: *ProvisionedTableWriteCache.PromotionOwnerState,
+        owner_state: *ProvisionedTableWriteCache.RuntimeHookState,
     ) void {
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
-        owner_state.* = .{
-            .group_id = group_id,
-            .leadership_source = self.promotion_leadership_source,
-        };
+        owner_state.group_id = group_id;
+        owner_state.leadership_source = self.promotion_leadership_source;
         db.setPromotionOwner(owner_state.owner());
         // Cold repair owners must report the same durable pending/clear edges
         // as resident writers. DB.close() clears this hook with a callback
         // barrier before table_name leaves the caller's scope.
-        db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table_name, group_id, db));
+        db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&owner_state.visibility_binding, table_name, group_id, db));
     }
 
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
@@ -12349,7 +12355,7 @@ pub const ProvisionedTableWriteSource = struct {
                         cached.db,
                     );
                     if (mode == .default or mode == .default_async) {
-                        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+                        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
                     }
                     return cached;
                 },
@@ -12403,7 +12409,7 @@ pub const ProvisionedTableWriteSource = struct {
                         prepared_open.?.deinit(cache.alloc);
                         prepared_open = null;
                         if (mode == .default or mode == .default_async) {
-                            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+                            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
                         }
                         return cached;
                     },
@@ -12615,7 +12621,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try cache.reserveRetiredEntriesCapacityLocked(1);
                 const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
                 if (mode == .default or mode == .default_async) {
-                    adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
+                    adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&adopted.entry.?.runtime_hook_state.visibility_binding, adopted.entry.?.table_name, group_id, adopted.db));
                 }
                 if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
                 break :blk adopted;
@@ -12861,17 +12867,12 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn managedDerivedVisibilityHook(
         self: *ProvisionedTableWriteSource,
+        binding: *server_query_visibility.Binding,
         table_name: []const u8,
         group_id: u64,
         db: *db_mod.DB,
     ) db_mod.QueryVisibilityHook {
-        return .{
-            .ptr = self,
-            .table_name = table_name,
-            .group_id = group_id,
-            .db = db,
-            .on_change = onManagedDerivedVisibilityEvent,
-        };
+        return binding.bind(.{ .ptr = self, .table_name = table_name, .group_id = group_id, .owner = db, .notify = onManagedDerivedVisibilityEvent });
     }
 
     fn publishManagedRuntimeStatusBestEffort(
@@ -14310,7 +14311,7 @@ pub const ProvisionedTableWriteSource = struct {
         var cached_db: ?ProvisionedTableWriteCache.CachedDb = null;
         defer if (cached_db) |*cached| cached.deinit(alloc);
         var uncached_db: ?db_mod.DB = null;
-        var uncached_promotion_owner_state: ProvisionedTableWriteCache.PromotionOwnerState = .{};
+        var uncached_runtime_hook_state: ProvisionedTableWriteCache.RuntimeHookState = .{};
         var db = db_blk: {
             if (live_owner_guard) |guard| break :db_blk guard.db;
             if (startup_cache) |cache| {
@@ -14401,7 +14402,7 @@ pub const ProvisionedTableWriteSource = struct {
                 };
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
-            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_promotion_owner_state);
+            self.applyRuntimeHooksToUncachedDb(&uncached_db.?, table_name, group_id, &uncached_runtime_hook_state);
             break :db_blk &uncached_db.?;
         };
         defer if (uncached_db) |*owned| owned.close();
@@ -15852,14 +15853,14 @@ pub const ProvisionedTableWriteSource = struct {
                         status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                         status.source_vectors = owned.db.sourceVectorStats() catch status.source_vectors;
                         if (status.created_at_millis == 0) {
-                            status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
+                            status.created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(owned.db, alloc, group_id) catch null) orelse 0;
                         }
                         break :blk status;
                     }
                 }
                 var status = runtime_status.LocalTableRuntimeStatus{
                     .group_id = group_id,
-                    .created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0,
+                    .created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(owned.db, alloc, group_id) catch null) orelse 0,
                     .source_vectors = owned.db.sourceVectorStats() catch return error.WriterLocked,
                     .stats = try owned.db.runtimeStatusStatsConsistent(alloc),
                     .lsm_storage_stats = lsmStorageStatsFromDb(owned.db),
@@ -15890,7 +15891,7 @@ pub const ProvisionedTableWriteSource = struct {
                 status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                 status.source_vectors = owned.db.sourceVectorStats() catch status.source_vectors;
                 if (status.created_at_millis == 0) {
-                    status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
+                    status.created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(owned.db, std.heap.page_allocator, group_id) catch null) orelse 0;
                 }
             },
         }
@@ -28184,7 +28185,7 @@ fn reconcileCachedLocalTableIndexCreate(
         var cached = try self.getOrOpenCachedDbForLocalMutationAlreadyLocked(cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, table_name, self.secret_store, self.remote_content) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
@@ -28236,7 +28237,7 @@ fn reconcileCachedLocalTableIndexDrop(
         var cached = try self.getOrOpenCachedDbForLocalMutationAlreadyLocked(cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         reconfigureManagedDbEnrichmentRuntime(
             alloc,
@@ -28337,7 +28338,7 @@ fn putCachedLocalArtifactEnrichment(
         var cached = try self.getOrOpenCachedDbForLocalMutation(alloc, cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         const mutation_err: ?anyerror = blk: {
             putArtifactEnrichmentInDb(alloc, cached.db, artifact_name, enrichment_json) catch |err| break :blk err;
@@ -28407,7 +28408,7 @@ fn dropCachedLocalArtifactEnrichment(
         var cached = try self.getOrOpenCachedDbForLocalMutation(alloc, cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         const mutation_err: ?anyerror = blk: {
             _ = deleteArtifactEnrichmentFromDbByName(alloc, cached.db, artifact_name) catch |err| break :blk err;
@@ -41221,7 +41222,8 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
 
-            const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
+            var visibility_binding: server_query_visibility.Binding = .{};
+            const hook = source.managedDerivedVisibilityHook(&visibility_binding, "docs", 7001, &db);
             hook.notify(.{ .change = .publish });
 
             var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -41835,7 +41837,8 @@ fn implementationTests() type {
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
             source.runtime_status_cache = &snapshot_cache;
-            const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
+            var visibility_binding: server_query_visibility.Binding = .{};
+            const hook = source.managedDerivedVisibilityHook(&visibility_binding, "docs", 7001, &db);
 
             try db.batch(.{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
@@ -53030,16 +53033,27 @@ fn implementationTests() type {
             defer alloc.free(replica_root_dir);
             const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
             defer alloc.free(path);
+            const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
 
             {
-                var db = try openManagedDbWithIndexesJson(
+                var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
                     alloc,
                     path,
                     "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                    null,
+                    null,
+                    table_reads.backend_current_root_generation,
+                    null,
+                    .default,
+                    null,
+                    identity_namespace,
                 );
                 defer db.close();
+                try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
+                // Vector candidates require a primary document. An embedding-only
+                // write has no row and is correctly excluded by presence checks.
                 try db.batch(.{
-                    .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"seed document\",\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
                     // The replay fields exercised below are supplied by the live
                     // status fixture. Make the separate read-cache/HBC precondition
                     // deterministic instead of racing asynchronous dense indexing.
@@ -53067,7 +53081,8 @@ fn implementationTests() type {
                 };
                 var profiled = try read_lease.db.searchDenseProfiled(alloc, req, req.dense.?);
                 defer profiled.result.deinit();
-                try std.testing.expect(profiled.result.hits.len >= 1);
+                try std.testing.expectEqual(@as(usize, 1), profiled.result.hits.len);
+                try std.testing.expectEqualStrings("doc:a", profiled.result.hits[0].id);
             }
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());

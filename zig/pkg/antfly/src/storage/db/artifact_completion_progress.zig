@@ -802,7 +802,7 @@ test "ordered artifact inventory completion control verifies independent roots b
     defer if (queue.bytes) |bytes| alloc.free(bytes);
     source.local_execution.artifact_publication_dispatcher = .{ .ptr = &queue, .enqueue = Queue.enqueue };
     defer source.local_execution.artifact_publication_dispatcher = null;
-    source.artifact_producer_work_retry_after_ns.store(0, .release);
+    source.artifact_producer_scheduler.retry_after_ns.store(0, .release);
     _ = try source.advanceArtifactProducerWorkPage();
     var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(alloc, queue.bytes orelse return error.TestUnexpectedResult);
     defer decoded.deinit();

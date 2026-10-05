@@ -4787,7 +4787,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
-    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery." };
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range.", "storage.server_group_metadata." };
     const server_db_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &server_db_filters,
@@ -5595,6 +5595,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = db_test_mod,
         .filters = &.{
             "document collectors release",
+            "db computeEnrichments",
+            "db extractEnrichments",
+            "materialized preserved sources",
             "document collectors sparse",
             "document collectors embedding identity",
             "document collectors duplicate delete",
@@ -5781,6 +5784,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     release_blocker_regression_step.dependOn(&run_release_blocker_regression_tests.step);
     unit_test_step.dependOn(&run_release_blocker_regression_tests.step);
+
+    // A focused entry point for the local maintenance ports. The ordinary
+    // support shard and server DB suite retain aggregate test ownership.
+    const local_maintenance_tests = b.addTest(.{
+        .name = "local-maintenance-contract-tests",
+        .root_module = antfly_test_mod,
+        .filters = &.{ "storage.source_authority.", "storage.db.promotion_runtime.", "storage.db.artifact_publication_transport.", "storage.db.artifact_producer_scheduler.", "storage.db.publication_outbox_recovery.", "storage.db.document_child_range_manifest.", "storage.db.document_child_range_effects.", "storage.db.document_child_range_outbox.", "storage.db.quarantine_recovery.", "storage.db.independent_maintenance.", "storage.db.index_repair_scheduler.", "storage.db.graph_cleanup_owner.", "storage.db.native_projection_owner.", "storage.db.runtime_restart_owner.", "storage.db.cleanup_job_owner.", "storage.db.query_visibility.", "storage.db.source_pin_cleanup_owner.", "storage.db.applied_sequence_coalescer.", "storage.db.bulk_ingest_session.", "storage.db.target_advance_tracker.", "storage.db.schema_reconcile_owner.", "storage.db.dense_catch_up_session_owner.", "storage.db.enrichment_runtime_owner.", "storage.db.coalesced_job_admission.", "storage.db.dense_publication_admission.", "storage.db.local_runtime_owner.", "storage.db.embedding_activity_cache.", "storage.db.managed_admission_owner.", "storage.db.result_collectors.", "storage.db.materialized_sources.", "storage.db.graph_restore_materialization.", "storage.db.status_projection.", "storage.db.document_collectors.", "storage.db.graph_field_plan.", "storage.db.owned_keys.", "storage.db.read_projection.", "storage.db.replay_vector_collectors.", "storage.db.publication_recovery_owner.", "ownership init releases", "generator config ownership" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_local_maintenance_tests = addCuratedTestRunArtifact(b, local_maintenance_tests, local_maintenance_tests.filters);
+    b.step("antfly-local-maintenance-test", "Run local maintenance requirement and recovery contract regressions").dependOn(&run_local_maintenance_tests.step);
+
+    const producer_maintenance_tests = b.addTest(.{
+        .name = "producer-maintenance-tests",
+        .root_module = db_test_mod,
+        .filters = &.{ "artifact projection construction releases", "overwritten document keys release", "db lookup includes unified artifact projection", "db enrichment reconfigure", "async dense catch-up", "async context dense catch-up", "dense target advance is not blocked", "target advance maintenance handoff", "target advance stuck tracking", "target advance debt logging", "db bulk ingest write commits", "db bulk ingest resolves transforms", "db bulk ingest applies pure-doc", "db bulk ingest keeps direct writes visible", "db relational mode stores authoritative", "relational initial storage mode cannot strand schemaless transaction intents", "owned db reconciles published schema indexes", "db ordered artifact inventory producer", "storage.db.artifact_completion_progress.", "storage.hot_standby durable outbox recovery", "db coordinated ttl", "db ttl cleanup rechecks", "db ttl cleanup defers", "portable activation retry", "db portable activation gate", "db quarantined index self-heals", "db targeted quarantine retry", "db dispatches generated document child range", "document child range partition preserves", "db retries remote document child range", "db managed visibility hook rehydrates", "db dense auto bulk finish wakes weak-sync", "db searches fail fast without joining portable", "db enrichment status changes notify", "relational columnar maintenance survives", "relational columnar artifact backoff", "owned DB open starts self-retaining workers", "resident index repair scheduler", "db enrichment restart supervisor", "db structural mutation autonomously retries", "db graph endpoint cleanup pages", "db dense target reads atomic", "document collectors release", "db computeEnrichments", "db extractEnrichments", "materialized preserved sources", "db managed admission", "db graph ownership restore", "db restore graph ownership replay", "native publication finalization forwards raced source completion", "db runtime-only status overlay preserves a resident enrichment worker" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-producer-maintenance-test", "Run durable producer, publication recovery, and TTL observation regressions").dependOn(&addCuratedTestRunArtifact(b, producer_maintenance_tests, producer_maintenance_tests.filters).step);
 
     // A small independently compilable entry point for work-count regressions
     // and repeated measurements. The ordinary storage gate also owns them.
@@ -6061,6 +6083,41 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_publication_owner.",
             "storage.db.artifact_publication_resolution.",
             "storage.db.artifact_publication_transport.",
+            "storage.db.artifact_producer_scheduler.",
+            "storage.db.publication_outbox_recovery.",
+            "storage.db.document_child_range_manifest.",
+            "storage.db.document_child_range_effects.",
+            "storage.db.document_child_range_outbox.",
+            "storage.db.quarantine_recovery.",
+            "storage.db.independent_maintenance.",
+            "storage.db.index_repair_scheduler.",
+            "storage.db.graph_cleanup_owner.",
+            "storage.db.native_projection_owner.",
+            "storage.db.runtime_restart_owner.",
+            "storage.db.cleanup_job_owner.",
+            "storage.db.query_visibility.",
+            "storage.db.source_pin_cleanup_owner.",
+            "storage.db.applied_sequence_coalescer.",
+            "storage.db.bulk_ingest_session.",
+            "storage.db.target_advance_tracker.",
+            "storage.db.schema_reconcile_owner.",
+            "storage.db.dense_catch_up_session_owner.",
+            "storage.db.enrichment_runtime_owner.",
+            "storage.db.coalesced_job_admission.",
+            "storage.db.dense_publication_admission.",
+            "storage.db.local_runtime_owner.",
+            "storage.db.embedding_activity_cache.",
+            "storage.db.managed_admission_owner.",
+            "storage.db.result_collectors.",
+            "storage.db.materialized_sources.",
+            "storage.db.graph_restore_materialization.",
+            "storage.db.status_projection.",
+            "storage.db.document_collectors.",
+            "storage.db.graph_field_plan.",
+            "storage.db.owned_keys.",
+            "storage.db.read_projection.",
+            "storage.db.replay_vector_collectors.",
+            "storage.db.publication_recovery_owner.",
             "storage.db.artifact_publication_transport_codec.",
             "storage.db.artifact_publication_wire.",
             "storage.db.artifact_reconcile.",
@@ -6225,6 +6282,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.document_mutation_revision.",
+            "storage.source_authority.",
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
@@ -6238,12 +6297,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.backup_restore.",
             "storage.backup_repository.",
             "storage.coverage_identity.",
-            "storage.coordinated_ttl.",
             "storage.data_raft_projection_wire.",
             "storage.db_split_vopr.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
-            "storage.document_mutation_revision.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
@@ -6333,7 +6390,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }
-    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig" }) |source| {
+    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig", "server_query_visibility.zig", "server_document_child_range.zig", "server_group_metadata.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }

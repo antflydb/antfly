@@ -68,7 +68,7 @@ pub const RecordWrite = struct {
     target_hints: ?[]const change_journal_mod.TargetHint = null,
     /// Publish completion metadata only after the writer finishes the primary,
     /// split-delta, and HA handoff. The DB writer batches this metadata while
-    /// it still owns the HA mutation/fencing boundary.
+    /// it still owns the hot-standby mutation/fencing boundary.
     publish_resolution_handoff: bool = false,
 };
 

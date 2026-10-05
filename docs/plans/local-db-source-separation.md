@@ -162,6 +162,66 @@ the normal unit aggregate. Their white-box hooks are available only in test
 builds. Local maintenance regressions remain owned by the storage engine shard;
 `antfly-local-transaction-recovery-test` provides a focused run.
 
+## Local mutation, collection, and read owners
+
+`storage/db/execution_resources.zig` owns the canonical local execution state,
+async/batch resource views, prepared-row allocator, contention statistics, memo
+models, and owned result types. DB aliases these definitions for compatibility;
+foreground and recovery use the same nominal types and shared resource owners.
+This module imports neither DB nor a mutation pipeline. Destruction helpers and
+small codecs required by these owners live with them.
+
+`storage/db/local_mutation.zig` composes three compile-time implementation
+families and retains the borrowed `Context`, invocation `Execution`, and
+operation-dependent scratch owners. `mutation_preparation.zig` owns request
+coalescing, pinned read checks, prepared rows, and generated memo preparation.
+`mutation_commit.zig` owns the authoritative commit path, admission, durable
+receipts, transaction resolution, and ordered publication.
+`mutation_materialization.zig` owns derived effects, artifact production,
+coverage, and replay materialization. Their calls resolve at compile time:
+there is no runtime dispatch, duplicate mutation pipeline, or additional
+allocation from this composition.
+
+Both foreground DB writes and synchronous recovery call those same operations.
+The remaining binding supplies open configuration, existing pure codec and
+collection entry points, and live cache/fault-injection pointers; shared
+execution and result types are imported from their canonical source owner.
+DB retains resource lifetime, resident scheduling, caller acknowledgement, and
+the ordered read/commit admission boundaries. Each invocation owns private
+scratch while borrowing stable resource pointers.
+
+`storage/db/replay_vector_collectors.zig` owns dense/sparse replay collectors,
+artifact identity decoding, sparse field reads, and result destruction. Numeric
+payloads and artifact keys retain their original borrowed lifetimes; cloned
+identities remain owned. Tombstone compaction preserves the allocation length
+needed to free the original array and does not turn deleted inputs into upserts.
+
+`storage/db/graph_field_plan.zig` uses one builder for live and pinned-snapshot
+field-derived graph writes. It allocates both merged output arrays before
+changing either extracted result. Errors leave the original contributions
+intact; successful publication transfers element ownership once. The shared
+`storage/db/owned_keys.zig` reserves list capacity before cloning a key, so list
+growth cannot leak a clone. Ordered collection preserves duplicates; unique
+collection deduplicates explicitly. Allocation sweeps cover both planners, existing
+contributions, empty field targets, deduplication, and public extraction with an
+actual configured graph index.
+
+`storage/db/relational_read_session.zig` owns retained relational readers,
+policy leases, proofs, cancellation/deadline checks and filter destruction.
+`storage/db/read_projection.zig` owns artifact projection and transaction/column
+materialization from a borrowed local core and pinned read transaction. DB still
+acquires the admitted snapshot, validates generations and holds statement/read
+fences; projection contexts retain no DB pointer. Document sessions retain their
+existing owner in `document_rows.zig`.
+Artifact projection adopts incoming values only after every fallible grouping
+step succeeds. Owned string/key insertion has a cleanup owner until adoption.
+Allocation sweeps cover first insertion, nested artifact references, conversion
+to a group, subsequent array growth, and ordered overwritten-key collection.
+
+The authored and resolved native/WASM boundary checks cover these owners. Their
+existing ELv2 headers are preserved until the licensing PR applies the Apache
+classification to the full embedded source closure.
+
 ## Remaining separation
 
 The physical DB and its complete local source closure must still move into
