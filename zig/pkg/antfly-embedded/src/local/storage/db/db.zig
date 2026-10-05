@@ -78385,6 +78385,12 @@ test "db document extraction skips stable unit local rewrites without text consu
 // permanently stuck at 0 while indexed kept climbing. See ENRICHMENTS.md's
 // "Two-Stream Execution Model" and DENSE_INDEXING_LIFECYCLE.md.
 test "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter" {
+    try expectPluralSourceDenseConvergence(null);
+}
+
+// Shared real-DB scenario. Server tests supply their wire-status observer; the
+// local suite checks convergence without importing the server API facade.
+fn expectPluralSourceDenseConvergence(comptime observe: ?*const fn (Allocator, std.json.Value, types.DBStats) anyerror!void) !void {
     const alloc = std.testing.allocator;
     const Admission = enum { before_rows, after_chunks, after_embeddings };
     for ([_]Admission{ .before_rows, .after_chunks, .after_embeddings }) |admission| {
@@ -78433,7 +78439,6 @@ test "db dense index consuming a chunk-then-embed source via plural sources conf
         if (admission == .after_embeddings) try db.runUntilIdle();
         // Resolve the actual public config to storage config so the runtime and
         // API observe precisely the same incarnation and config fingerprint.
-        const indexes_api = @import("../../api/indexes.zig");
         var config = try std.json.parseFromSlice(std.json.Value, alloc,
             \\{"name":"dv_document_chunks","type":"embeddings","dimension":3,"sources":[{"artifact":"document_chunk_dense_v1"}],"_index_incarnation":42}
         , .{});
@@ -78464,18 +78469,7 @@ test "db dense index consuming a chunk-then-embed source via plural sources conf
         try std.testing.expectEqual(active_count, item.publication_target_count);
         try std.testing.expect(item.coverage_summary_ready);
         try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
-        const runtime_status = @import("../../api/runtime_status.zig");
-        var runtime_items = [_]runtime_status.LocalTableRuntimeStatus{.{
-            .group_id = 1,
-            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-            .stats = stats,
-        }};
-        var local_statuses = runtime_status.LocalTableRuntimeStatuses{ .items = &runtime_items };
-        const encoded = try indexes_api.encodeSingleIndexLookup(alloc, "dv_document_chunks", config.value, &local_statuses);
-        defer alloc.free(encoded);
-        try ant_json.testing.expectSubsetJsonText(alloc,
-            \\{"status":{"backfill_state":"ready","backfill_active":false,"backfill_progress":1.0,"rebuilding":false,"dense_publish_pending":false,"publication":{"complete":true},"coverage":{"complete":true,"healthy":true},"readiness":{"state":"ready","pending_reasons":[],"sources":[{"artifact":"document_chunk_dense_v1","state":"ready","pending_reasons":[]}]},"milestones":{"complete":{"reached":true}}}}
-        , encoded);
+        if (observe) |observer| try observer(alloc, config.value, stats);
 
         // Before the fix this counter was permanently stuck at 0 (the guarded
         // embedding-artifact write path never found a matching counter target),
@@ -93823,7 +93817,7 @@ test "managed dense physical migration is online and uses durable repair intent"
     const dense_stats = for (stats.indexes) |item| {
         if (std.mem.eql(u8, item.name, "dense_idx")) break item;
     } else return error.TestUnexpectedResult;
-    try std.testing.expect(stats.async_indexing.dense_admission.finalizing);
+    try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
     try std.testing.expect(!dense_stats.dense_vector_projection_pending);
 }
 
@@ -106013,12 +106007,12 @@ test "db dense finalization owner drains requests queued during publication" {
     claim_lock.unlock();
     try std.testing.expect(claimed);
     defer finishDenseProjectionFinalization(db.async_context);
-    try std.testing.expect(db.snapshotAsyncIndexingStats().dense_admission.finalizing);
+    try std.testing.expect(db.snapshotAsyncIndexingStats().dense_projection_finalizing);
     try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpoint(db.async_context, config.name, applied));
     try std.testing.expect(db.async_context.dense_admission.finalization_requested);
     try std.testing.expect(try drainClaimedDenseProjectionFinalizations(db.async_context));
     try std.testing.expect(!db.async_context.dense_admission.finalizing.load(.acquire));
-    try std.testing.expect(!db.snapshotAsyncIndexingStats().dense_admission.finalizing);
+    try std.testing.expect(!db.snapshotAsyncIndexingStats().dense_projection_finalizing);
 
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
@@ -106090,7 +106084,7 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
     const dense_stats = for (stats.indexes) |item| {
         if (std.mem.eql(u8, item.name, config.name)) break item;
     } else return error.TestUnexpectedResult;
-    try std.testing.expect(stats.async_indexing.dense_admission.finalizing);
+    try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
     try std.testing.expect(!dense_stats.dense_vector_projection_pending);
 }
 
@@ -130367,6 +130361,7 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
 // White-box hooks for server integration fixtures; absent from production builds.
 const fixture_owner = @This();
 pub const test_support = if (builtin.is_test) struct {
+    pub const expectPluralSourceDenseConvergence = fixture_owner.expectPluralSourceDenseConvergence;
     pub fn advanceArtifactUploadRecoveryMaintenance(db: *fixture_owner.DB) !bool {
         return db.advanceArtifactUploadRecoveryWithTrigger(.maintenance);
     }
@@ -130482,11 +130477,11 @@ test "document extraction catalog snapshot releases every allocation on failure"
         };
         const Lock = struct {
             held: bool = false,
-            fn lockShared(self: *@This()) void {
+            pub fn lockShared(self: *@This()) void {
                 std.debug.assert(!self.held);
                 self.held = true;
             }
-            fn unlockShared(self: *@This()) void {
+            pub fn unlockShared(self: *@This()) void {
                 std.debug.assert(self.held);
                 self.held = false;
             }
@@ -130508,13 +130503,13 @@ test "document extraction catalog snapshot releases every allocation on failure"
                 names[0] = try alloc.dupe(u8, "consumer");
                 return names;
             }
-            fn denseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8, _: u32) ![][]u8 {
+            pub fn denseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8, _: u32) ![][]u8 {
                 return self.indexes(alloc);
             }
-            fn sparseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8) ![][]u8 {
+            pub fn sparseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8) ![][]u8 {
                 return self.indexes(alloc);
             }
-            fn textIndexesForChunk(self: *@This(), alloc: Allocator, _: []const u8, _: bool) ![][]u8 {
+            pub fn textIndexesForChunk(self: *@This(), alloc: Allocator, _: []const u8, _: bool) ![][]u8 {
                 return self.indexes(alloc);
             }
         };

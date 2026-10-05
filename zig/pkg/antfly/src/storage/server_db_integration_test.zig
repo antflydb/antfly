@@ -4219,3 +4219,25 @@ test "server group timestamp survives relational schema upgrade and reopen" {
         try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
     }
 }
+
+// The wire readiness assertion belongs to the server API; reuse the local
+// convergence scenario so it observes real committed index state.
+test "server index status reports ready for converged plural-source dense artifacts" {
+    const Observer = struct {
+        fn observe(alloc: Allocator, config: std.json.Value, stats: engine.test_support.types.DBStats) !void {
+            const runtime_status = @import("antfly_local_sources").api_runtime_status;
+            var runtime_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+                .group_id = 1,
+                .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+                .stats = stats,
+            }};
+            var local_statuses = runtime_status.LocalTableRuntimeStatuses{ .items = &runtime_items };
+            const encoded = try @import("../api/indexes.zig").encodeSingleIndexLookup(alloc, "dv_document_chunks", config, &local_statuses);
+            defer alloc.free(encoded);
+            try @import("antfly-json").testing.expectSubsetJsonText(alloc,
+                \\{"status":{"backfill_state":"ready","backfill_active":false,"backfill_progress":1.0,"rebuilding":false,"dense_publish_pending":false,"publication":{"complete":true},"coverage":{"complete":true,"healthy":true},"readiness":{"state":"ready","pending_reasons":[],"sources":[{"artifact":"document_chunk_dense_v1","state":"ready","pending_reasons":[]}]},"milestones":{"complete":{"reached":true}}}}
+            , encoded);
+        }
+    };
+    try engine.test_support.expectPluralSourceDenseConvergence(Observer.observe);
+}
