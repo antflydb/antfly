@@ -3464,7 +3464,7 @@ fn writeResourceMetricsSnapshot(writer: *std.Io.Writer, snapshot: resource_manag
     try health_metrics.appendPromMetric(writer, "antfly_dense_physically_ordered_batches_total", "counter", "Rerank payload batches ordered by retained file and offset", snapshot.dense_read_tasks.physically_ordered_batches);
     try health_metrics.appendPromMetric(writer, "antfly_dense_physically_ordered_requests_total", "counter", "Rerank payload requests ordered by retained file and offset", snapshot.dense_read_tasks.physically_ordered_requests);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_used_bytes", "gauge", "Aggregate physical host memory currently charged to ResourceManager", snapshot.memory.used_bytes);
-    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Peak aggregate physical host memory charged to ResourceManager", snapshot.memory.peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Upper bound on aggregate charged memory, summing independently recorded ledger peaks", snapshot.memory.peak_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_bytes", "gauge", "Aggregate managed host-memory soft limit", snapshot.memory.soft_limit_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_bytes", "gauge", "Aggregate managed host-memory hard limit", snapshot.memory.hard_limit_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_events_total", "counter", "Aggregate managed host-memory soft-limit events", snapshot.memory.soft_limit_events);
@@ -3483,7 +3483,7 @@ fn writeResourceMetricsSnapshot(writer: *std.Io.Writer, snapshot: resource_manag
     try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_cancellations_total", "counter", "Queued dense searches cancelled before admission", snapshot.dense_search_admission.cancellations);
     try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_wait_ns_total", "counter", "Cumulative nanoseconds dense queries spent queued for candidate-scan permits", snapshot.dense_search_admission.wait_ns);
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
-    try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
+    try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Upper bound on resource slice charged bytes, summing independently recorded ledger peaks");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_bytes, "antfly_resource_hard_limit_bytes", "gauge", "Resource slice hard limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_events, "antfly_resource_soft_limit_events_total", "counter", "Resource slice soft-limit events");

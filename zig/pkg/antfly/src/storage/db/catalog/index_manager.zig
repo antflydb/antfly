@@ -310,8 +310,8 @@ pub const ManagedIndexRef = struct {
     /// the projection kind (for example status-only catalog entries).
     estimated_dense_vector_bytes: u64 = 0,
     /// How many times larger than the raw vector the estimate above is. The
-    /// unconstrained window ceiling scales with it, so only a real memory
-    /// budget shrinks the window; an unbudgeted node keeps its item count.
+    /// memory ceiling scales with it, while an independent work ceiling
+    /// preserves unscaled vector and non-vector work per window.
     dense_replay_working_set_factor: u64 = 1,
 };
 

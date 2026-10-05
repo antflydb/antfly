@@ -662,6 +662,12 @@ pub const DenseReplayWindowBudgetOptions = struct {
     default_bytes: u64,
     max_bytes: u64,
     min_bytes: u64 = dense_replay_window_min_bytes,
+    working_set_factor: u64 = 1,
+};
+
+pub const DenseReplayWindowLimits = struct {
+    work_bytes: u64,
+    working_set_bytes: u64,
 };
 
 pub const DenseReplayWindowResult = struct {
@@ -1127,6 +1133,7 @@ pub const ResourceManager = struct {
     dense_physically_ordered_batches: @import("antfly_platform").atomic.Value(u64) = .init(0),
     dense_physically_ordered_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
+    /// Adaptive window size in original work units, independent of storage estimates.
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
     dense_replay_last_write_pressure_ns: u64 = 0,
@@ -3459,6 +3466,12 @@ pub const ResourceManager = struct {
     }
 
     pub fn denseReplayWindowBudget(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) u64 {
+        return self.denseReplayWindowLimits(options).working_set_bytes;
+    }
+
+    /// Adapt in original work units. Scale only the memory estimate, then
+    /// cap it against the same live slice headroom under this lock.
+    pub fn denseReplayWindowLimits(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) DenseReplayWindowLimits {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -3482,7 +3495,14 @@ pub const ResourceManager = struct {
 
         current = clampU64(current, options.min_bytes, cap);
         self.dense_replay_window_budget_bytes = current;
-        return current;
+        const factor = @max(@as(u64, 1), options.working_set_factor);
+        if (factor == 1) return .{ .work_bytes = current, .working_set_bytes = current };
+        const memory_cap = self.denseReplayWindowHardCapLocked(.{
+            .default_bytes = options.default_bytes *| factor,
+            .max_bytes = options.max_bytes *| factor,
+            .min_bytes = options.min_bytes,
+        });
+        return .{ .work_bytes = current, .working_set_bytes = @min(current *| factor, memory_cap) };
     }
 
     pub fn noteDenseReplayWindowResult(self: *ResourceManager, result: DenseReplayWindowResult) void {

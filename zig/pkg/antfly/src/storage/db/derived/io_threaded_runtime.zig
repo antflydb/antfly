@@ -1499,6 +1499,8 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
             .max_items_per_window = policy.max_items_per_window,
             .max_chunk_bytes = policy.max_chunk_bytes,
             .estimated_dense_vector_bytes = policy.estimated_dense_vector_bytes,
+            .max_work_chunk_bytes = policy.max_work_chunk_bytes,
+            .dense_replay_working_set_factor = policy.dense_replay_working_set_factor,
             .target_sequence = worker.target_sequence,
         },
     );
