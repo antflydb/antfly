@@ -338,6 +338,30 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     )
                 ]
                 assert large_seen == list(range(1000, 9192))
+                wide_seen = list(
+                    cursor.stream(
+                        "SELECT amount, payload, amount + 1 FROM lake_large LIMIT 8192 OFFSET 1000",
+                        size=137,
+                    )
+                )
+                assert len(wide_seen) == 8192
+                for index, (amount, payload, incremented) in enumerate(wide_seen, 1000):
+                    assert amount == index and incremented == index + 1
+                    assert payload == "".join(
+                        hashlib.sha256(f"{index}:{j}".encode()).hexdigest()
+                        for j in range(4)
+                    )
+                grouped = list(
+                    cursor.stream(
+                        "SELECT amount % 100 AS bucket, COUNT(*), SUM(amount), 100 / (amount % 100) "
+                        "FROM lake_large GROUP BY amount % 100 HAVING amount % 100 > 0 ORDER BY bucket",
+                        size=17,
+                    )
+                )
+                assert grouped == [
+                    (bucket, 100, 495000 + 100 * bucket, 100 // bucket)
+                    for bucket in range(1, 100)
+                ]
                 projected = [
                     row[0]
                     for row in cursor.stream(

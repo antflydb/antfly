@@ -7,12 +7,18 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
 pub const Batch = union(enum) {
+    /// Stable retained columns; ownership belongs to the enclosing lease.
+    retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
+    /// Operator-specific column access without constructing a row matrix.
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
     mapped: struct { source: *const Batch, ordinals: []const usize, kinds: []const @import("ast.zig").ColumnType, selection: []const usize },
     pub fn len(self: Batch) usize {
         return switch (self) {
+            .retained => |v| v.count,
+            .reader => |v| v.count,
             .columns => |v| v.page.selection.len,
             .rows => |v| v.len,
             .vectors => |v| v.count,
@@ -21,6 +27,8 @@ pub const Batch = union(enum) {
     }
     pub fn width(self: Batch) usize {
         return switch (self) {
+            .retained => |v| v.store.columns.len,
+            .reader => |v| v.width,
             .columns => |v| v.definitions.len,
             .rows => |v| if (v.len == 0) 0 else v[0].len,
             .vectors => |v| v.values.len,
@@ -30,6 +38,8 @@ pub const Batch = union(enum) {
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
+            .retained => |v| v.store.cell(a, v.begin + index, column),
+            .reader => |v| v.read(v.ptr, a, index, column),
             .rows => |v| v[index][column],
             .vectors => |v| v.values[column][index],
             .mapped => |v| blk: {

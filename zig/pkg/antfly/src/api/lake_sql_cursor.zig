@@ -124,11 +124,13 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch };
     var estimated_rows: u64 = 0;
     var estimated_bytes: u64 = 0;
+    var split_bytes: usize = 32 * 1024;
     for (source.inventory.files) |file| {
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
+        split_bytes +|= @sizeOf(@import("../serverless/external_source/types.zig").FileEntry) + @sizeOf(usize) + @sizeOf(bool) + file.etag.len + file.version_id.len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .close = Owner.close };
+    return .{ .ordered_split_bytes = split_bytes, .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {

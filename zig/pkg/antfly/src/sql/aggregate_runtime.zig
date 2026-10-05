@@ -327,21 +327,43 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const group = (try grouped.nextResult(alloc)) orelse break;
-        const cells = try alloc.alloc(Datum, group.keys.len + group.aggregates.len);
-        @memcpy(cells[0..group.keys.len], group.keys);
-        @memcpy(cells[group.keys.len..], group.aggregates);
-        if (bound.having) |program| {
-            const result = try context.evaluate(alloc, program, cells);
-            if (result.sql_null) continue;
-            if (result.value != .bool) return error.SqlTypeMismatch;
-            if (!result.value.bool) continue;
+        const groups = (try grouped.nextResultBatch(alloc, context.limits.executionRows(), false)) orelse break;
+        const Cells = struct {
+            groups: operators.GroupBatch,
+            selection: ?[]const usize = null,
+            fn cell(raw: *anyopaque, a: std.mem.Allocator, row: usize, column: usize) anyerror!Datum {
+                const reader: *@This() = @ptrCast(@alignCast(raw));
+                const index = if (reader.selection) |selected| selected[row] else row;
+                return if (column < reader.groups.keys.width()) reader.groups.keys.cell(a, index, column) else reader.groups.aggregates.cell(a, index, column - reader.groups.keys.width());
+            }
+        };
+        var reader: Cells = .{ .groups = groups };
+        var batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &reader, .read = Cells.cell, .count = groups.ordinals.len, .width = groups.keys.width() + groups.aggregates.width() } };
+        const predicates = if (bound.having) |*program| try resultValues(context, alloc, program, batch) else null;
+        var selected: std.ArrayList(usize) = .empty;
+        for (0..batch.len()) |row| {
+            if (predicates) |values| {
+                if (values[row].sql_null) continue;
+                if (values[row].value != .bool) return error.SqlTypeMismatch;
+                if (!values[row].value.bool) continue;
+            }
+            try selected.append(alloc, row);
         }
+        reader.selection = selected.items;
+        batch.reader.count = selected.items.len;
+        const outputs = try alloc.alloc([]const Datum, bound.outputs.len);
+        const ordering = try alloc.alloc([]const Datum, bound.orders.len);
+        for (bound.outputs, outputs) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
+        for (bound.orders, ordering) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
+        // TopK owns admitted rows; reuse these small boundary slices rather
+        // than allocating each group's input/output/key row matrix.
         const values = try alloc.alloc(Datum, bound.outputs.len);
-        for (bound.outputs, values) |program, *value| value.* = try context.evaluate(alloc, program, cells);
         const keys = try alloc.alloc(Datum, bound.orders.len);
-        for (bound.orders, keys) |program, *value| value.* = try context.evaluate(alloc, program, cells);
-        try top.add(.{ .values = values, .keys = keys, .ordinal = group.ordinal });
+        for (selected.items, 0..) |physical, row| {
+            for (outputs, values) |column, *value| value.* = column[row];
+            for (ordering, keys) |column, *key| key.* = column[row];
+            try top.add(.{ .values = values, .keys = keys, .ordinal = groups.ordinals[physical] });
+        }
     }
     if (context.sink != null) return context.emitTop(&top, offset, limit, statement.limit == null);
     const ordered = try top.finishPage(context.arena, offset, limit + @intFromBool(statement.limit == null));
@@ -365,4 +387,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         null_row.* = sql_nulls;
     }
     return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = nulls, .pattern_sources = sources, .command_tag = "SELECT" };
+}
+
+fn resultValues(context: anytype, a: std.mem.Allocator, program: *const scalar.Program, batch: @import("execution_batch.zig").Batch) ![]const Datum {
+    if (try @import("vector_eval.zig").evaluateBatch(a, program, batch, context.parameters)) |values| return values;
+    const values = try a.alloc(Datum, batch.len());
+    for (values, 0..) |*value, row| value.* = try context.evaluate(a, program.*, try batch.row(a, row));
+    return values;
 }

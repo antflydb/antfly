@@ -43,8 +43,8 @@ pub const Grouped = struct {
             defer arena.deinit();
             while (true) {
                 _ = arena.reset(.retain_capacity);
-                const result = (try self.child.nextImpl(arena.allocator(), self.exact)) orelse break;
-                try output.append(.{ .keys = result.keys, .values = result.aggregates, .ordinal = result.ordinal });
+                const result = (try self.child.nextBatch(arena.allocator(), 64, self.exact)) orelse break;
+                try output.appendBatch(result.aggregates, result.keys, result.ordinals);
             }
         }
         fn close(self: *Reduction) void {
@@ -76,6 +76,7 @@ pub const Grouped = struct {
     reductions: [2]?*Reduction = @splat(null),
     next_lane: usize = 0,
     reductions_started: usize = 0,
+    result_view: ?@import("parallel_output.zig").Pipe.View = null,
     pub fn init(a: Allocator, manager: *spill.Manager, specs: []const operators.AggregateSpec, key_count: usize, bytes: usize) !Grouped {
         const backing = manager.allocator();
         _ = a;
@@ -86,6 +87,7 @@ pub const Grouped = struct {
         } else true };
     }
     pub fn deinit(self: *Grouped) void {
+        if (self.result_view) |view| view.deinit();
         for (&self.reductions) |*slot| if (slot.*) |job| {
             job.close();
             slot.* = null;
@@ -232,7 +234,12 @@ pub const Grouped = struct {
                 self.a.destroy(fallback);
                 self.fallback = null;
             }
-            if (self.partition_index == self.partitions.len) return null;
+            if (!try self.loadPartition()) return null;
+        }
+    }
+    fn loadPartition(self: *Grouped) !bool {
+        while (true) {
+            if (self.partition_index == self.partitions.len) return false;
             const index = self.partition_index;
             self.partition_index += 1;
             const file = if (self.partitions[index]) |*open| open else continue;
@@ -270,7 +277,71 @@ pub const Grouped = struct {
             }
             file.close();
             self.partitions[index] = null;
+            return true;
         }
+    }
+    pub fn nextBatch(self: *Grouped, a: Allocator, maximum: usize, exact: bool) anyerror!?operators.GroupBatch {
+        if (maximum == 0) return error.InvalidSqlLimit;
+        if (self.result_view) |view| {
+            view.deinit();
+            self.result_view = null;
+        }
+        if (self.partitioned and self.parallel and self.bytes >= 512 * 1024) while (true) {
+            try self.startReductions(exact);
+            const lane = if (self.reductions[self.next_lane] != null) self.next_lane else 1 - self.next_lane;
+            const job = self.reductions[lane] orelse return null;
+            if (job.exact != exact) return error.InvalidSqlBackendResponse;
+            const result = if (job.output) |pipe| blk: {
+                if (try pipe.nextBatch(maximum)) |view| {
+                    self.result_view = view;
+                    break :blk operators.GroupBatch{ .keys = view.keys(), .aggregates = view.values(), .ordinals = view.ordinals() };
+                }
+                if (job.task) |*task| {
+                    const status = task.await(self.sort.manager.io);
+                    job.task = null;
+                    try status;
+                }
+                if (pipe.terminal_error) |err| return err;
+                break :blk null;
+            } else try job.child.nextBatch(a, maximum, exact);
+            if (result) |batch| {
+                self.output_count += batch.ordinals.len;
+                return batch;
+            }
+            job.close();
+            self.reductions[lane] = null;
+            self.next_lane = 1 - lane;
+        };
+        if (self.partitioned) while (true) {
+            if (self.local) |local| {
+                if (try local.nextResultBatch(a, maximum, exact)) |batch| {
+                    self.output_count += batch.ordinals.len;
+                    return batch;
+                }
+                local.deinit();
+                self.local = null;
+            }
+            if (self.fallback) |fallback| {
+                if (try fallback.nextBatch(a, maximum, exact)) |batch| {
+                    self.output_count += batch.ordinals.len;
+                    return batch;
+                }
+                fallback.deinit();
+                self.a.destroy(fallback);
+                self.fallback = null;
+            }
+            if (!try self.loadPartition()) return null;
+        };
+        // The sorted skew/general-aggregate reducer owns its scalar states.
+        // Preserve that boundary without forcing native reducers through it.
+        const result = (try self.nextImpl(a, exact)) orelse return null;
+        const keys = try a.alloc([]const Datum, 1);
+        keys[0] = result.keys;
+        const values = try a.alloc([]const Datum, 1);
+        values[0] = result.aggregates;
+        const ordinals = try a.alloc(u64, 1);
+        ordinals[0] = result.ordinal;
+        return .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = values }, .ordinals = ordinals };
     }
     fn same(left: []const Datum, right: []const Datum) !bool {
         if (left.len != right.len) return error.InvalidSqlSpill;

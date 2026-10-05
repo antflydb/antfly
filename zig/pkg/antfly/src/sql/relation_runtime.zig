@@ -287,6 +287,7 @@ fn Engine(comptime Context: type) type {
             emitted: bool = false,
             hash_join: ?*operators.HashJoin = null,
             partition_join: ?*@import("partition_join.zig").Join = null,
+            join_view: ?@import("parallel_output.zig").Pipe.View = null,
             probe: ?operators.HashJoin.Probe = null,
             probe_arena: std.heap.ArenaAllocator,
             probe_payload: @import("execution_batch.zig").Batch = .{ .rows = &.{} },
@@ -358,6 +359,7 @@ fn Engine(comptime Context: type) type {
                 if (self.left) |left| left.deinit();
                 if (self.right) |right| right.deinit();
                 if (self.values_leaf) |leaf| leaf.deinit();
+                if (self.join_view) |view| view.deinit();
                 if (self.partition_join) |join| join.close();
                 if (self.scan_filter) |filter| filter.close();
                 if (!self.borrowed_hash) if (self.hash_join) |join| join.deinit();
@@ -368,6 +370,26 @@ fn Engine(comptime Context: type) type {
             }
             fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 try self.engine.checkpoint();
+                if (self.join_view) |view| {
+                    view.deinit();
+                    self.join_view = null;
+                }
+                if (self.partition_join) |join| if (try join.nextTypedBatch(maximum)) |view| {
+                    self.join_view = view;
+                    const source = try a.create(@import("execution_batch.zig").Batch);
+                    source.* = view.values();
+                    if (!self.flipped_join) return source.*;
+                    const ordinals = try a.alloc(usize, self.node.columns.len);
+                    const kinds = try a.alloc(@import("ast.zig").ColumnType, self.node.columns.len);
+                    const selection = try a.alloc(usize, view.count);
+                    const width = self.node.operation.join.left.columns.len;
+                    for (ordinals, kinds, self.node.columns, 0..) |*ordinal, *kind, column, index| {
+                        ordinal.* = if (index < width) self.node.operation.join.right.columns.len + index else index - width;
+                        kind.* = column.type;
+                    }
+                    for (selection, 0..) |*index, i| index.* = i;
+                    return .{ .mapped = .{ .source = source, .ordinals = ordinals, .kinds = kinds, .selection = selection } };
+                };
                 if (self.cached_rows == null and self.left != null and self.node.operation == .query) {
                     const query = self.node.operation.query;
                     const decisions = @import("decision_eval.zig");
@@ -1125,6 +1147,7 @@ fn Engine(comptime Context: type) type {
             table: catalog.Table,
             ordinal: u64 = 0,
             opened: bool = false,
+            pending_failure: ?anyerror = null,
 
             fn iface(self: *Adapter) catalog.Backend {
                 return .{ .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
@@ -1164,9 +1187,13 @@ fn Engine(comptime Context: type) type {
             /// a JSON object per joined/projected row for the next operator.
             fn nextColumns(ptr: *anyopaque, a: Allocator, limit: u32) anyerror!catalog.ColumnPage {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
+                if (self.pending_failure) |err| return err;
                 const types = @import("../storage/rowsource/types.zig");
                 const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
-                const batch = try self.iterator.nextBatch(a, wanted, null);
+                var failure: ?anyerror = null;
+                const batch = try self.iterator.nextBatch(a, wanted, &failure);
+                self.pending_failure = failure;
+                if (batch.len() == 0) if (failure) |err| return err;
                 const refs = try a.alloc(types.RowRef, batch.len());
                 const selection = try a.alloc(usize, batch.len());
                 for (refs, selection, 0..) |*ref, *index, offset| {
@@ -1283,6 +1310,10 @@ fn Source(comptime Context: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             return Engine(Context).Adapter.next(&self.adapter, alloc, limit);
         }
+        fn nextColumns(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *Self = @ptrCast(@alignCast(raw));
+            return Engine(Context).Adapter.nextColumns(&self.adapter, alloc, limit);
+        }
         fn closeCursor(raw: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(raw));
             self.close();
@@ -1292,7 +1323,7 @@ fn Source(comptime Context: type) type {
 
 pub fn openCursor(context: anytype) !catalog.Cursor {
     const owner = try Source(@TypeOf(context)).create(context);
-    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .close = @TypeOf(owner.*).closeCursor };
+    return .{ .ptr = owner, .next = @TypeOf(owner.*).next, .next_columns = if (Engine(@TypeOf(context)).Adapter.hasPatterns(owner.iterator.?.node, 0)) null else @TypeOf(owner.*).nextColumns, .close = @TypeOf(owner.*).closeCursor };
 }
 
 pub fn execute(context: anytype) anyerror!@import("runtime.zig").Output {

@@ -460,6 +460,11 @@ pub const Aggregate = struct {
 };
 
 pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, distinct: bool = false };
+pub const GroupBatch = struct {
+    keys: @import("execution_batch.zig").Batch,
+    aggregates: @import("execution_batch.zig").Batch,
+    ordinals: []const u64,
+};
 pub const GroupResult = struct { keys: []const Datum, aggregates: []const Datum, ordinal: u64 };
 
 /// Build-side ownership for a streaming hash join. Probe rows remain borrowed
@@ -830,6 +835,44 @@ pub const Grouped = struct {
         }
         self.clearGroups();
         self.external = external;
+    }
+    /// Borrowed columns remain valid until the next result pull. Retaining
+    /// consumers admit them directly; scalar consumers materialize at the edge.
+    pub fn nextResultBatch(self: *Grouped, a: Allocator, maximum: usize, exact: bool) !?GroupBatch {
+        if (maximum == 0) return error.InvalidSqlLimit;
+        if (self.failed) return error.InvalidSqlBackendResponse;
+        if (self.external) |external| {
+            const result = try external.nextBatch(a, maximum, exact);
+            if (result != null and external.output_count > self.limits.groups) return error.SqlProgramLimitExceeded;
+            self.finished = true;
+            return result;
+        }
+        if (self.result_cursor == self.groups.items.len) return null;
+        const begin = self.result_cursor;
+        const count = @min(maximum, self.groups.items.len - begin);
+        const ordinals = try a.alloc(u64, count);
+        for (self.groups.items[begin..][0..count], ordinals) |group, *ordinal| ordinal.* = group.ordinal;
+        const Reader = struct {
+            group: *Grouped,
+            begin: usize,
+            exact: bool,
+            fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
+                const reader: *@This() = @ptrCast(@alignCast(raw));
+                const index = reader.begin + row;
+                if (!reader.exact) return reader.group.state_columns[column].finish(index);
+                const state = try reader.group.state_columns[column / 7].snapshot(alloc, index);
+                return @import("aggregate_partial.zig").cell(alloc, state, column % 7);
+            }
+        };
+        const reader = try a.create(Reader);
+        reader.* = .{ .group = self, .begin = begin, .exact = exact };
+        self.result_cursor += count;
+        self.finished = true;
+        return .{
+            .keys = .{ .retained = .{ .store = &self.key_columns, .begin = begin, .count = count } },
+            .aggregates = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .count = count, .width = self.specs.len * (if (exact) @as(usize, 7) else 1) } },
+            .ordinals = ordinals,
+        };
     }
     pub fn nextResult(self: *Grouped, alloc: Allocator) !?GroupResult {
         if (self.external) |external| {
@@ -1789,4 +1832,51 @@ test "SQL bounded native join admission transfers a prefix without a chain spool
         matches += 1;
     }
     try std.testing.expectEqual(@as(usize, count), matches);
+}
+
+fn groupBatchScenario(a: Allocator) !void {
+    const specs = [_]AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .bool_or, .input_type = .boolean } };
+    const grouped = try Grouped.create(a, &specs, .{});
+    defer grouped.deinit();
+    for (0..128) |row| try grouped.add(&.{ Datum.json(.{ .integer = @intCast(row % 8) }), if (row % 2 == 0) .{} else Datum.json(.null) }, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = @intCast(row) }), Datum.json(.{ .bool = row % 2 == 0 }) });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var seen: usize = 0;
+    while (true) {
+        _ = arena.reset(.free_all);
+        const batch = (try grouped.nextResultBatch(arena.allocator(), 3, false)) orelse break;
+        for (0..batch.ordinals.len) |row| {
+            const key = (try batch.keys.cell(a, row, 0)).value.integer;
+            const null_ = try batch.keys.cell(a, row, 1);
+            try std.testing.expectEqual(@mod(key, 2) == 0, null_.sql_null);
+            try std.testing.expectEqual(@as(i64, 16), (try batch.aggregates.cell(a, row, 0)).value.integer);
+            try std.testing.expectEqual(16 * key + 960, (try batch.aggregates.cell(a, row, 1)).value.integer);
+            try std.testing.expectEqual(@mod(key, 2) == 0, (try batch.aggregates.cell(a, row, 2)).value.bool);
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), seen);
+}
+test "SQL grouped result batches preserve null domains and unwind allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, groupBatchScenario, .{});
+}
+
+test "SQL typed aggregate partial batches preserve i128 sums through cancellation" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{.{ .kind = .sum, .input_type = .integer }};
+    const positive = try Grouped.create(a, &specs, .{});
+    defer positive.deinit();
+    const merged = try Grouped.create(a, &specs, .{});
+    defer merged.deinit();
+    for (0..3) |_| try positive.add(&.{Datum.json(.{ .integer = 7 })}, &.{Datum.json(.{ .integer = std.math.maxInt(i64) })});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const batch = (try positive.nextResultBatch(arena.allocator(), 64, true)).?;
+    try std.testing.expectEqual(@as(usize, 7), batch.aggregates.width());
+    const sum = try batch.aggregates.cell(arena.allocator(), 0, 1);
+    try std.testing.expectEqualStrings("27670116110564327421", sum.value.number_string);
+    try merged.importPartial(try batch.keys.row(arena.allocator(), 0), try batch.aggregates.row(arena.allocator(), 0), batch.ordinals[0]);
+    for (0..3) |_| try merged.add(&.{Datum.json(.{ .integer = 7 })}, &.{Datum.json(.{ .integer = -std.math.maxInt(i64) })});
+    const result = (try merged.nextResultBatch(arena.allocator(), 64, false)).?;
+    try std.testing.expectEqual(@as(i64, 0), (try result.aggregates.cell(a, 0, 0)).value.integer);
 }

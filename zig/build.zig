@@ -289,7 +289,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
-    run_sql_tests.step.max_rss = 384 * 1024 * 1024;
+    run_sql_tests.step.max_rss = 512 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),

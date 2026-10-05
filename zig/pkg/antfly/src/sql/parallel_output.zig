@@ -8,6 +8,7 @@ const spill = @import("spill.zig");
 const operators = @import("operators.zig");
 const Store = @import("typed_store.zig").Store;
 const A = std.mem.Allocator;
+const Batch = @import("execution_batch.zig").Batch;
 const Block = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
@@ -15,6 +16,8 @@ const Block = struct {
     keys: Store,
     ordinals: std.ArrayList(u64) = .empty,
     bytes: usize = 0,
+    failed: bool = false,
+    refs: std.atomic.Value(usize) = .init(1),
     fn create(a: A) !*Block {
         const self = try a.create(Block);
         self.* = .{ .a = a, .arena = .init(a), .values = undefined, .keys = undefined };
@@ -22,15 +25,26 @@ const Block = struct {
         self.keys = .init(self.arena.allocator());
         return self;
     }
-    fn append(self: *Block, row: operators.Row) !void {
-        _ = try self.values.append(row.values);
-        _ = try self.keys.append(row.keys);
-        try self.ordinals.append(self.arena.allocator(), row.ordinal);
-        self.bytes +|= @sizeOf(operators.Row);
-        for (row.values) |value| self.bytes +|= try operators.datumBytes(value);
-        for (row.keys) |value| self.bytes +|= try operators.datumBytes(value);
+    fn appendBatch(self: *Block, values: Batch, keys: Batch, ordinals: []const u64) !void {
+        if (self.failed or values.len() != keys.len() or values.len() != ordinals.len) return error.InvalidSqlBackendResponse;
+        errdefer self.failed = true;
+        // Reserve structural metadata first. Never publish a partially updated
+        // column set after a failed allocation or normalization.
+        try self.ordinals.ensureUnusedCapacity(self.arena.allocator(), ordinals.len);
+        try self.values.appendBatch(values);
+        try self.keys.appendBatch(keys);
+        self.ordinals.appendSliceAssumeCapacity(ordinals);
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        for (0..values.len()) |row| {
+            _ = scratch.reset(.retain_capacity);
+            self.bytes +|= @sizeOf(operators.Row);
+            for (0..values.width()) |column| self.bytes +|= try operators.datumBytes(try values.cell(scratch.allocator(), row, column));
+            for (0..keys.width()) |column| self.bytes +|= try operators.datumBytes(try keys.cell(scratch.allocator(), row, column));
+        }
     }
     fn close(self: *Block) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const a = self.a;
         self.values.deinit();
         self.keys.deinit();
@@ -53,15 +67,55 @@ pub const Pipe = struct {
         self.queue = .init(&self.slots);
         return self;
     }
+    pub const View = struct {
+        block: *Block,
+        begin: usize,
+        count: usize,
+        pub fn deinit(self: View) void {
+            self.block.close();
+        }
+        pub fn values(self: View) Batch {
+            return .{ .retained = .{ .store = &self.block.values, .begin = self.begin, .count = self.count } };
+        }
+        pub fn keys(self: View) Batch {
+            return .{ .retained = .{ .store = &self.block.keys, .begin = self.begin, .count = self.count } };
+        }
+        pub fn ordinals(self: View) []const u64 {
+            return self.block.ordinals.items[self.begin..][0..self.count];
+        }
+        pub fn ordinal(self: View, index: usize) u64 {
+            return self.block.ordinals.items[self.begin + index];
+        }
+    };
     pub fn append(self: *Pipe, row: operators.Row) !void {
+        return self.appendBatch(.{ .rows = &.{row.values} }, .{ .rows = &.{row.keys} }, &.{row.ordinal});
+    }
+    pub fn appendBatch(self: *Pipe, values: Batch, keys: Batch, ordinals: []const u64) !void {
         try self.manager.check();
         if (self.pending == null) self.pending = try Block.create(self.manager.allocator());
-        try self.pending.?.append(row);
+        try self.pending.?.appendBatch(values, keys, ordinals);
         if (self.pending.?.bytes >= self.block_bytes or self.pending.?.ordinals.items.len >= 64) try self.flush();
+    }
+    /// Join padding is written column by column; concatenated Datum rows are
+    /// needed only when a residual expression actually evaluates them.
+    pub fn appendJoined(self: *Pipe, left: ?[]const @import("scalar.zig").Datum, right: ?[]const @import("scalar.zig").Datum, left_width: usize, right_width: usize) !void {
+        const Parts = struct {
+            left: ?[]const @import("scalar.zig").Datum,
+            right: ?[]const @import("scalar.zig").Datum,
+            width: usize,
+            fn cell(raw: *anyopaque, _: A, _: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+                const parts_: *@This() = @ptrCast(@alignCast(raw));
+                return if (column < parts_.width) (if (parts_.left) |v| v[column] else .{}) else (if (parts_.right) |v| v[column - parts_.width] else .{});
+            }
+        };
+        var parts: Parts = .{ .left = left, .right = right, .width = left_width };
+        const Datum = @import("scalar.zig").Datum;
+        const keys = [_]Datum{ Datum.json(.{ .bool = left != null }), Datum.json(.{ .bool = right != null }) };
+        try self.appendBatch(.{ .reader = .{ .ptr = &parts, .read = Parts.cell, .count = 1, .width = left_width + right_width } }, .{ .rows = &.{&keys} }, &.{0});
     }
     fn flush(self: *Pipe) !void {
         const block = self.pending orelse return;
-        if (block.ordinals.items.len == 0) {
+        if (block.failed or block.ordinals.items.len == 0) {
             block.close();
             self.pending = null;
             return;
@@ -77,8 +131,10 @@ pub const Pipe = struct {
         self.terminal_error = self.terminal_error orelse failure;
         self.queue.close(self.manager.io);
     }
-    /// Borrowed payloads remain valid until the next block is consumed.
-    pub fn next(self: *Pipe, a: A) !?operators.Row {
+    /// A retained span survives producer and pipe teardown. Consumers release
+    /// the span explicitly; successive pulls never invalidate another lease.
+    pub fn nextBatch(self: *Pipe, maximum: usize) !?View {
+        if (maximum == 0) return error.InvalidSqlLimit;
         try self.manager.check();
         if (self.current) |block| if (self.index == block.ordinals.items.len) {
             block.close();
@@ -94,9 +150,17 @@ pub const Pipe = struct {
             self.index = 0;
         }
         const block = self.current.?;
-        const index = self.index;
-        self.index += 1;
-        return .{ .values = try block.values.row(a, index), .keys = try block.keys.row(a, index), .ordinal = block.ordinals.items[index] };
+        const begin = self.index;
+        const count = @min(maximum, block.ordinals.items.len - begin);
+        self.index += count;
+        _ = block.refs.fetchAdd(1, .monotonic);
+        return .{ .block = block, .begin = begin, .count = count };
+    }
+    /// Scalar callers materialize only at their expression/result boundary.
+    pub fn next(self: *Pipe, a: A) !?operators.Row {
+        const view = (try self.nextBatch(1)) orelse return null;
+        defer view.deinit();
+        return .{ .values = try view.values().row(a, 0), .keys = try view.keys().row(a, 0), .ordinal = view.ordinal(0) };
     }
     /// Aggregate APIs return caller-owned states that can outlive a block.
     pub fn nextOwned(self: *Pipe, a: A) !?operators.Row {
@@ -148,4 +212,34 @@ fn allocationScenario(a: A) !void {
 }
 test "SQL typed output pipes reclaim partial blocks across allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
+}
+
+fn leaseScenario(a: A) !void {
+    const Datum = @import("scalar.zig").Datum;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const pipe = try Pipe.create(&manager, 8192);
+    var owned = true;
+    defer if (owned) pipe.close();
+    const vectors = [_][]const Datum{ &.{ Datum.json(.{ .string = "owned batch payload" }), .{} }, &.{ Datum.json(.null), Datum.json(.{ .integer = 9007199254740993 }) } };
+    try pipe.appendBatch(.{ .vectors = .{ .values = &vectors, .count = 2 } }, .{ .vectors = .{ .values = &.{}, .count = 2 } }, &.{ 7, 11 });
+    pipe.finish(null);
+    const first = (try pipe.nextBatch(1)).?;
+    defer first.deinit();
+    const second = (try pipe.nextBatch(1)).?;
+    defer second.deinit();
+    pipe.close();
+    owned = false;
+    try std.testing.expectEqualStrings("owned batch payload", (try first.values().cell(a, 0, 0)).value.string);
+    try std.testing.expect(!(try first.values().cell(a, 0, 1)).sql_null);
+    try std.testing.expect((try second.values().cell(a, 0, 0)).sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.values().cell(a, 0, 1)).value.integer);
+    try std.testing.expectEqual(@as(u64, 11), second.ordinal(0));
+}
+test "SQL worker column leases survive pipe teardown and allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, leaseScenario, .{});
 }

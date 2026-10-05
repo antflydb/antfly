@@ -86,12 +86,12 @@ pub const Join = struct {
         while (try self.next()) |pair| {
             _ = arena.reset(.retain_capacity);
             const a = arena.allocator();
-            const cells = try a.alloc(Datum, evaluation.left_width + evaluation.right_width);
-            @memset(cells, .{});
-            if (pair.left) |values| @memcpy(cells[0..evaluation.left_width], values);
-            if (pair.right) |values| @memcpy(cells[evaluation.left_width..], values);
             if (pair.match) |index| {
                 if (evaluation.condition) |program| {
+                    const cells = try a.alloc(Datum, evaluation.left_width + evaluation.right_width);
+                    @memset(cells, .{});
+                    if (pair.left) |values| @memcpy(cells[0..evaluation.left_width], values);
+                    if (pair.right) |values| @memcpy(cells[evaluation.left_width..], values);
                     const logical = if (!evaluation.flipped) cells else blk: {
                         const reordered = try a.alloc(Datum, cells.len);
                         @memcpy(reordered[0..evaluation.right_width], cells[evaluation.left_width..]);
@@ -105,7 +105,7 @@ pub const Join = struct {
                 }
                 try self.accept(index);
             }
-            try file.append(.{ .values = cells, .keys = &.{ Datum.json(.{ .bool = pair.left != null }), Datum.json(.{ .bool = pair.right != null }) }, .ordinal = 0 });
+            try file.appendJoined(pair.left, pair.right, evaluation.left_width, evaluation.right_width);
         }
     }
     fn nextOutput(self: *Join) !?Pair {
@@ -180,6 +180,46 @@ pub const Join = struct {
             self.prepared[index] = null;
             // Fill the vacated lane before probing this partition. Build I/O
             // and hash admission overlap without changing residual ON handling.
+            try self.startBuilds();
+        }
+    }
+    /// Completed residual evaluation belongs to workers. Column leases bypass
+    /// scalar pair reconstruction and payload cloning in downstream batches.
+    /// Null means EOF or a scheduler fallback; next() handles either case.
+    pub fn nextTypedBatch(self: *Join, maximum: usize) !?@import("parallel_output.zig").Pipe.View {
+        if (!self.parallel_builds or self.evaluation == null) return null;
+        if (!self.finished) {
+            for (&self.build) |*file| if (file.*) |*open| try open.seal();
+            for (&self.probes) |*file| if (file.*) |*open| try open.seal();
+            self.finished = true;
+        }
+        while (true) {
+            if (self.active_join) |child| {
+                const pipe = child.output orelse return null;
+                if (try pipe.nextBatch(maximum)) |view| return view;
+                if (child.output_task) |*task| {
+                    const result = task.await(self.manager.io);
+                    child.output_task = null;
+                    _ = try result;
+                }
+                if (pipe.terminal_error) |err| return err;
+                self.parallel_partitions_completed += 1;
+                self.partitions_loaded += child.partitions_loaded;
+                self.repartitions += child.repartitions;
+                child.close();
+                self.active_join = null;
+            }
+            try self.startBuilds();
+            const index: usize = if (self.prepared[self.next_build_slot] != null) self.next_build_slot else 1 - self.next_build_slot;
+            const child = self.prepared[index] orelse return null;
+            self.next_build_slot = 1 - index;
+            if (self.preparing[index]) |*task| {
+                const result = task.await(self.manager.io);
+                self.preparing[index] = null;
+                _ = try result;
+            }
+            self.active_join = child;
+            self.prepared[index] = null;
             try self.startBuilds();
         }
     }
@@ -568,47 +608,70 @@ test "SQL complete parallel join partitions evaluate residuals and preserve both
         fn check(_: *anyopaque) !void {}
     };
     for ([_]bool{ false, true }) |flipped| {
-        var dummy: u8 = 0;
-        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
-        defer manager.deinit();
-        var compiled = try @import("compiler.zig").compileScalar(a, "l = r AND l <> 777", .{});
-        defer compiled.deinit();
-        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
-        defer condition.deinit();
-        const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, true, true);
-        defer join.close();
-        join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1, .flipped = flipped };
-        for (0..1000) |i| {
-            const key = Datum.json(.{ .integer = @intCast(i) });
-            try join.add(true, &.{key}, &.{key}, i);
+        for ([_]bool{ false, true }) |batches| {
+            var dummy: u8 = 0;
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+            defer manager.deinit();
+            var compiled = try @import("compiler.zig").compileScalar(a, "l = r AND l <> 777", .{});
+            defer compiled.deinit();
+            var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
+            defer condition.deinit();
+            const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, true, true);
+            defer join.close();
+            join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1, .flipped = flipped };
+            for (0..1000) |i| {
+                const key = Datum.json(.{ .integer = @intCast(i) });
+                try join.add(true, &.{key}, &.{key}, i);
+            }
+            for (500..1500) |i| {
+                const key = Datum.json(.{ .integer = @intCast(i) });
+                try join.add(false, &.{key}, &.{key}, i);
+            }
+            for (&join.build, &join.probes) |*build, *probe| {
+                if (build.*) |*file| try file.seal();
+                if (probe.*) |*file| try file.seal();
+            }
+            const written_before = manager.written_bytes;
+            var matches: usize = 0;
+            var lefts: usize = 0;
+            var rights: usize = 0;
+            if (batches) {
+                while (try join.nextTypedBatch(137)) |view| {
+                    defer view.deinit();
+                    for (0..view.count) |row| {
+                        const left = (try view.keys().cell(a, row, 0)).value.bool;
+                        const right = (try view.keys().cell(a, row, 1)).value.bool;
+                        if (left and right) {
+                            const l = try view.values().cell(a, row, 0);
+                            const r = try view.values().cell(a, row, 1);
+                            try std.testing.expectEqual(l.value.integer, r.value.integer);
+                            try std.testing.expect(l.value.integer != 777);
+                            matches += 1;
+                        } else if (left) {
+                            try std.testing.expect((try view.values().cell(a, row, 1)).sql_null);
+                            lefts += 1;
+                        } else {
+                            try std.testing.expect((try view.values().cell(a, row, 0)).sql_null);
+                            rights += 1;
+                        }
+                    }
+                }
+            } else while (try join.next()) |pair| {
+                // Complete partition jobs already evaluated ON and matched markers.
+                try std.testing.expect(pair.match == null);
+                if (pair.left != null and pair.right != null) {
+                    try std.testing.expectEqual(pair.left.?[0].value.integer, pair.right.?[0].value.integer);
+                    try std.testing.expect(pair.left.?[0].value.integer != 777);
+                    matches += 1;
+                } else if (pair.left != null) lefts += 1 else rights += 1;
+            }
+            try std.testing.expectEqual(@as(usize, 499), matches);
+            try std.testing.expectEqual(@as(usize, 501), lefts);
+            try std.testing.expectEqual(@as(usize, 501), rights);
+            try std.testing.expect(join.parallel_builds_started > 1);
+            try std.testing.expect(join.parallel_partitions_completed > 1);
+            try std.testing.expectEqual(written_before, manager.written_bytes);
         }
-        for (500..1500) |i| {
-            const key = Datum.json(.{ .integer = @intCast(i) });
-            try join.add(false, &.{key}, &.{key}, i);
-        }
-        for (&join.build, &join.probes) |*build, *probe| {
-            if (build.*) |*file| try file.seal();
-            if (probe.*) |*file| try file.seal();
-        }
-        const written_before = manager.written_bytes;
-        var matches: usize = 0;
-        var lefts: usize = 0;
-        var rights: usize = 0;
-        while (try join.next()) |pair| {
-            // Complete partition jobs already evaluated ON and matched markers.
-            try std.testing.expect(pair.match == null);
-            if (pair.left != null and pair.right != null) {
-                try std.testing.expectEqual(pair.left.?[0].value.integer, pair.right.?[0].value.integer);
-                try std.testing.expect(pair.left.?[0].value.integer != 777);
-                matches += 1;
-            } else if (pair.left != null) lefts += 1 else rights += 1;
-        }
-        try std.testing.expectEqual(@as(usize, 499), matches);
-        try std.testing.expectEqual(@as(usize, 501), lefts);
-        try std.testing.expectEqual(@as(usize, 501), rights);
-        try std.testing.expect(join.parallel_builds_started > 1);
-        try std.testing.expect(join.parallel_partitions_completed > 1);
-        try std.testing.expectEqual(written_before, manager.written_bytes);
     }
 }
 

@@ -181,6 +181,9 @@ pub const Cursor = struct {
     split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Ordered, disjoint ranges whose concatenation preserves source order.
     split_ordered: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
+    /// Provider estimate of retained metadata per ordered child. Planning
+    /// limits fan-out before cloning a large immutable inventory.
+    ordered_split_bytes: usize = 0,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
