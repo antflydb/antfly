@@ -180,6 +180,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data raft read safety barrier rejects pre-restart responses for both read paths",
         "data raft ticker advances consensus independently of control rounds",
         "local raft admission leaves global metadata refresh to control",
+        "restore publication recovers a cold owner through Raft admission",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
         "raft batch round trips guarded graph owner replay afterimages",
