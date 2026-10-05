@@ -398,3 +398,108 @@ test "native refinements benchmark borrowed operator batches" {
         std.debug.print("native_refinement {{\"case\":\"borrowed_join_batch\",\"rows\":{d},\"sample\":{d},\"rows_ns\":{d},\"batch_ns\":{d},\"rows_allocations\":{d},\"batch_allocations\":{d},\"rows_peak_bytes\":{d},\"batch_peak_bytes\":{d}}}\n", .{ count, sample, baseline.ns, refined.ns, baseline.allocations, refined.allocations, baseline.peak, refined.peak });
     };
 }
+
+fn sharedExpressions(fused: bool, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !struct { ns: i96, peak: usize, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 2 * 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    var checksum: i64 = 0;
+    const start = now();
+    for (0..256) |_| {
+        _ = arena.reset(.free_all);
+        const a = arena.allocator();
+        if (fused) {
+            const outputs = try @import("vector_eval.zig").evaluateColumnsMany(a, programs, page, columns, &.{});
+            for (outputs) |vector| for (vector.?) |value| {
+                if (!value.sql_null) checksum += value.value.integer;
+            };
+        } else {
+            for (programs) |program| {
+                const vector = (try @import("vector_eval.zig").evaluateColumns(a, program, page, columns, &.{})).?;
+                for (vector) |value| if (!value.sql_null) {
+                    checksum += value.value.integer;
+                };
+            }
+        }
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .checksum = checksum };
+}
+fn resultDelivery(blocks: bool, count: usize) !struct { ns: i96, peak: usize, written: u64, reads: u64, writes: u64, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    const a = budget.allocator();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows: ?disk.Rows = if (!blocks) try disk.Rows.init(a, &manager, 4) else null;
+    defer if (rows) |*owner| owner.deinit();
+    const cursor = if (blocks) try @import("result_cursor.zig").Cursor.create(a, &manager, 4) else null;
+    defer if (cursor) |owner| owner.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const start = now();
+    for (0..count) |i| {
+        const values = &.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = "shared result payload" }), Datum.json(.null), Datum{} };
+        if (cursor) |owner| try @import("result_cursor.zig").Cursor.append(owner, values) else try rows.?.append(.{ .values = values, .keys = &.{}, .ordinal = i });
+    }
+    var checksum: i64 = 0;
+    for (0..count) |i| {
+        _ = arena.reset(.free_all);
+        const alloc = arena.allocator();
+        const values = if (cursor) |owner| (try owner.next(alloc)).? else blk: {
+            const borrowed = (try rows.?.row(i)).values;
+            const owned = try alloc.alloc(Datum, borrowed.len);
+            for (borrowed, owned) |value, *out| out.* = try operators.cloneDatum(alloc, value);
+            break :blk owned;
+        };
+        checksum += values[0].value.integer;
+        try std.testing.expectEqualStrings("shared result payload", values[1].value.string);
+        try std.testing.expect(!values[2].sql_null and values[2].value == .null and values[3].sql_null);
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .written = manager.written_bytes, .reads = manager.read_calls, .writes = manager.write_calls, .checksum = checksum };
+}
+test "native pipeline refinements benchmark" {
+    const a = std.testing.allocator;
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    for ([_][]const u8{ "(n + 2) * 3", "((((n + 2) * 3 - 5) * 2 + 11) * 3 - 7) % 97" }, [_][]const u8{ "short", "shared_chain" }) |prefix, shape| {
+        var compiled: [3]@import("compiler.zig").CompiledScalar = undefined;
+        var programs: [3]scalar.Program = undefined;
+        for ([_][]const u8{ "+ 7", "- 7", "* 2" }, &compiled, &programs) |suffix, *expression_, *program| {
+            const sql = try std.fmt.allocPrint(a, "({s}) {s}", .{ prefix, suffix });
+            defer a.free(sql);
+            expression_.* = try @import("compiler.zig").compileScalar(a, sql, .{});
+            program.* = try scalar.bind(a, expression_.expression, &definitions, &.{}, .{});
+        }
+        defer {
+            for (&compiled, &programs) |*expression_, *program| {
+                program.deinit();
+                expression_.deinit();
+            }
+        }
+        const pointers = [_]*const scalar.Program{ &programs[0], &programs[1], &programs[2] };
+        const types = @import("../storage/rowsource/types.zig");
+        const refs = [_]types.RowRef{.{ .relational_key = "r" }} ** 512;
+        var values: [512]i64 = undefined;
+        var selection: [512]usize = undefined;
+        for (&values, &selection, 0..) |*value, *index, row| {
+            value.* = @intCast(row);
+            index.* = row;
+        }
+        const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &.{.{ .name = "n", .values = .{ .i64 = &values } }} }, .selection = &selection };
+        for (0..3) |sample| {
+            const first = try sharedExpressions(sample % 2 != 0, &pointers, page, &definitions);
+            const second = try sharedExpressions(sample % 2 == 0, &pointers, page, &definitions);
+            const separate = if (sample % 2 == 0) first else second;
+            const fused = if (sample % 2 == 0) second else first;
+            try std.testing.expectEqual(separate.checksum, fused.checksum);
+            std.debug.print("native_pipeline {{\"case\":\"shared_expression_dag\",\"shape\":\"{s}\",\"rows\":131072,\"sample\":{d},\"separate_ns\":{d},\"fused_ns\":{d},\"separate_peak_bytes\":{d},\"fused_peak_bytes\":{d}}}\n", .{ shape, sample, separate.ns, fused.ns, separate.peak, fused.peak });
+            if (!std.mem.eql(u8, shape, "short")) continue;
+            const before = try resultDelivery(false, 4096);
+            const after = try resultDelivery(true, 4096);
+            try std.testing.expectEqual(before.checksum, after.checksum);
+            std.debug.print("native_pipeline {{\"case\":\"blocking_result_delivery\",\"rows\":4096,\"sample\":{d},\"indexed_ns\":{d},\"block_ns\":{d},\"indexed_peak_bytes\":{d},\"block_peak_bytes\":{d},\"indexed_written_bytes\":{d},\"block_written_bytes\":{d},\"indexed_reads\":{d},\"block_reads\":{d},\"indexed_writes\":{d},\"block_writes\":{d}}}\n", .{ sample, before.ns, after.ns, before.peak, after.peak, before.written, after.written, before.reads, after.reads, before.writes, after.writes });
+        }
+    }
+}

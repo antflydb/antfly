@@ -21,6 +21,44 @@ const spill = @import("spill.zig");
 const Datum = scalar.Datum;
 const Allocator = std.mem.Allocator;
 pub const Grouped = struct {
+    const Reduction = struct {
+        child: Grouped,
+        exact: bool,
+        output: ?*@import("parallel_output.zig").Pipe = null,
+        task: ?@import("parallel_scheduler.zig").Task(anyerror!void) = null,
+        child_closed: bool = false,
+        fn run(self: *Reduction) anyerror!void {
+            defer {
+                self.child.deinit();
+                self.child_closed = true;
+            }
+            var failure: ?anyerror = null;
+            self.reduceInto(self.output.?) catch |err| {
+                failure = err;
+            };
+            self.output.?.finish(failure);
+        }
+        fn reduceInto(self: *Reduction, output: *@import("parallel_output.zig").Pipe) !void {
+            var arena = std.heap.ArenaAllocator.init(self.child.a);
+            defer arena.deinit();
+            while (true) {
+                _ = arena.reset(.retain_capacity);
+                const result = (try self.child.nextImpl(arena.allocator(), self.exact)) orelse break;
+                try output.append(.{ .keys = result.keys, .values = result.aggregates, .ordinal = result.ordinal });
+            }
+        }
+        fn close(self: *Reduction) void {
+            if (self.output) |pipe| pipe.stop();
+            if (self.task) |*task| {
+                task.cancel(self.child.sort.manager.io) catch {};
+                self.task = null;
+            }
+            const a = self.child.a;
+            if (self.output) |pipe| pipe.close();
+            if (!self.child_closed) self.child.deinit();
+            a.destroy(self);
+        }
+    };
     a: Allocator,
     sort: spill.Sort,
     specs: []const operators.AggregateSpec,
@@ -34,14 +72,24 @@ pub const Grouped = struct {
     local: ?*operators.Grouped = null,
     fallback: ?*Grouped = null,
     bytes: usize,
+    parallel: bool = true,
+    reductions: [2]?*Reduction = @splat(null),
+    next_lane: usize = 0,
+    reductions_started: usize = 0,
     pub fn init(a: Allocator, manager: *spill.Manager, specs: []const operators.AggregateSpec, key_count: usize, bytes: usize) !Grouped {
-        const orders = try a.alloc(operators.Order, key_count);
+        const backing = manager.allocator();
+        _ = a;
+        const orders = try backing.alloc(operators.Order, key_count);
         @memset(orders, .{});
-        return .{ .a = a, .sort = spill.Sort.init(a, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(a), .read_arena = std.heap.ArenaAllocator.init(a), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
+        return .{ .a = backing, .sort = spill.Sort.init(backing, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(backing), .read_arena = std.heap.ArenaAllocator.init(backing), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
             if (spec.distinct or !(spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer))) break false;
         } else true };
     }
     pub fn deinit(self: *Grouped) void {
+        for (&self.reductions) |*slot| if (slot.*) |job| {
+            job.close();
+            slot.* = null;
+        };
         for (&self.partitions) |*file| if (file.*) |*open| open.close();
         if (self.local) |local| local.deinit();
         if (self.fallback) |fallback| {
@@ -109,6 +157,62 @@ pub const Grouped = struct {
         }
         return true;
     }
+    fn startReductions(self: *Grouped, exact: bool) !void {
+        for (&self.reductions) |*slot| {
+            if (slot.* != null) continue;
+            while (self.partition_index < self.partitions.len) {
+                const index = self.partition_index;
+                self.partition_index += 1;
+                if (self.partitions[index] == null) continue;
+                try self.partitions[index].?.seal();
+                const job = try self.a.create(Reduction);
+                job.* = .{ .child = Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes / 2) catch |err| {
+                    self.a.destroy(job);
+                    return err;
+                }, .exact = exact };
+                errdefer job.close();
+                job.child.parallel = false;
+                job.child.partitioned = true;
+                job.child.sort.parallel_runs = false;
+                job.child.partitions[0] = self.partitions[index];
+                self.partitions[index] = null;
+                job.output = try @import("parallel_output.zig").Pipe.create(self.sort.manager, self.bytes / 128);
+                job.task = @import("parallel_scheduler.zig").global().submit(self.sort.manager.io, self.bytes / 2, Reduction.run, .{job});
+                if (job.task == null) {
+                    job.output.?.close();
+                    job.output = null;
+                } else self.reductions_started += 1;
+                slot.* = job;
+                break;
+            }
+        }
+    }
+    fn nextParallel(self: *Grouped, out: Allocator, exact: bool) !?operators.GroupResult {
+        while (true) {
+            try self.startReductions(exact);
+            const lane = if (self.reductions[self.next_lane] != null) self.next_lane else 1 - self.next_lane;
+            const job = self.reductions[lane] orelse return null;
+            if (job.exact != exact) return error.InvalidSqlBackendResponse;
+            if (job.output) |pipe| {
+                if (try pipe.nextOwned(out)) |row| {
+                    self.output_count += 1;
+                    return .{ .keys = row.keys, .aggregates = row.values, .ordinal = row.ordinal };
+                }
+                if (job.task) |*task| {
+                    const result = task.await(self.sort.manager.io);
+                    job.task = null;
+                    try result;
+                }
+                if (pipe.terminal_error) |err| return err;
+            } else if (try job.child.nextImpl(out, exact)) |result| {
+                self.output_count += 1;
+                return result;
+            }
+            job.close();
+            self.reductions[lane] = null;
+            self.next_lane = 1 - lane;
+        }
+    }
     fn nextPartition(self: *Grouped, out: Allocator, exact: bool) anyerror!?operators.GroupResult {
         while (true) {
             if (self.local) |local| {
@@ -149,6 +253,7 @@ pub const Grouped = struct {
                     errdefer self.a.destroy(fallback);
                     fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
                     fallback.partitioned = false;
+                    fallback.sort.parallel_runs = self.parallel;
                     errdefer fallback.deinit();
                     try self.local.?.exportPartial(fallback);
                     self.local.?.deinit();
@@ -179,7 +284,7 @@ pub const Grouped = struct {
         return self.nextImpl(out, true);
     }
     fn nextImpl(self: *Grouped, out: Allocator, exact: bool) anyerror!?operators.GroupResult {
-        if (self.partitioned) return self.nextPartition(out, exact);
+        if (self.partitioned) return if (self.parallel and self.bytes >= 512 * 1024) self.nextParallel(out, exact) else self.nextPartition(out, exact);
         _ = self.state_arena.reset(.free_all);
         const a = self.state_arena.allocator();
         var row = self.pending orelse (try self.sort.next(self.read_arena.allocator())) orelse return null;
@@ -351,4 +456,96 @@ test "SQL partitioned integer aggregation preserves invalid input errors" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     try std.testing.expectError(error.SqlTypeMismatch, group.next(arena.allocator()));
+}
+
+test "SQL full parallel partition reductions preserve exact states and close early" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |exact| {
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        {
+            var grouped = try Grouped.init(a, &manager, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, 1, 512 * 1024);
+            defer grouped.deinit();
+            for (0..4096) |i| {
+                const key = Datum.json(.{ .integer = @intCast(i % 128) });
+                try grouped.add(&.{key}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 3 }) }, i);
+            }
+            for (&grouped.partitions) |*file| if (file.*) |*open| try open.seal();
+            const written_before = manager.written_bytes;
+            var seen: [128]bool = @splat(false);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            while (true) {
+                _ = arena.reset(.retain_capacity);
+                const row = (try (if (exact) grouped.nextPartial(arena.allocator()) else grouped.next(arena.allocator()))) orelse break;
+                const index: usize = @intCast(row.keys[0].value.integer);
+                try std.testing.expect(!seen[index]);
+                seen[index] = true;
+                try std.testing.expectEqual(@as(u64, index), row.ordinal);
+                if (exact) {
+                    var sum = try operators.Aggregate.init(a, .sum, .integer);
+                    defer sum.deinit();
+                    try Grouped.merge(&sum, row.aggregates[7..][0..7]);
+                    try std.testing.expectEqual(@as(i64, 96), (try sum.finish()).value.integer);
+                } else {
+                    try std.testing.expectEqual(@as(i64, 32), row.aggregates[0].value.integer);
+                    try std.testing.expectEqual(@as(i64, 96), row.aggregates[1].value.integer);
+                }
+            }
+            for (seen) |present| try std.testing.expect(present);
+            try std.testing.expect(grouped.reductions_started > 1);
+            try std.testing.expectEqual(written_before, manager.written_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        // Closing after one output cancels/drains the other admitted reducer.
+        {
+            var grouped = try Grouped.init(a, &manager, &.{.{ .kind = .count }}, 1, 512 * 1024);
+            defer grouped.deinit();
+            for (0..512) |i| try grouped.add(&.{Datum.json(.{ .integer = @intCast(i) })}, &.{Datum.json(.{ .integer = 1 })}, i);
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            try std.testing.expect((try grouped.next(arena.allocator())) != null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+    }
+}
+
+test "SQL parallel aggregate keys remain owned after output blocks and workers close" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(a);
+    {
+        var grouped = try Grouped.init(a, &manager, &.{.{ .kind = .count }}, 1, 512 * 1024);
+        defer grouped.deinit();
+        for (0..512) |i| {
+            const name = try std.fmt.allocPrint(a, "group-{d:0>4}", .{i});
+            defer a.free(name);
+            try grouped.add(&.{Datum.json(.{ .string = name })}, &.{Datum.json(.{ .integer = 1 })}, i);
+        }
+        while (try grouped.next(output.allocator())) |row| {
+            try names.append(a, row.keys[0].value.string);
+            try std.testing.expectEqual(@as(i64, 1), row.aggregates[0].value.integer);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 512), names.items.len);
+    var seen: [512]bool = @splat(false);
+    for (names.items) |name| {
+        try std.testing.expect(std.mem.startsWith(u8, name, "group-"));
+        const index = try std.fmt.parseInt(usize, name[6..], 10);
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+    }
+    for (seen) |present| try std.testing.expect(present);
 }

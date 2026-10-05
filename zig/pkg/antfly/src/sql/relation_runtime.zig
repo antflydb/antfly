@@ -965,8 +965,21 @@ fn Engine(comptime Context: type) type {
                         try self.hash_join.?.addBatch(a, batch, keys_);
                         if (self.scan_filter) |filter| for (keys_) |key_values| try filter.add(key_values);
                     }
+                    if (self.scan_filter) |filter| {
+                        filter.sealed = true;
+                        const scan = self.left.?.node.operation.scan;
+                        const cursor = self.engine.cursors[scan.index];
+                        _ = try cursor.set_dynamic_filter.?(cursor.ptr, filter);
+                    }
                     if (!shared and self.hash_join.?.disk != null and self.engine.context.spill != null) {
                         const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, self.engine.context.limits.retained_bytes, self.engine.context.limits.scan_rows, self.hash_join.?.disk.?.size, kind == .left or kind == .full, kind == .right or kind == .full);
+                        if (!Adapter.hasPatterns(self.node, 0) and (join.condition == null or !@import("decision_eval.zig").hasExternal(&join.condition.?))) owner.evaluation = .{
+                            .condition = if (self.node.operation.join.condition) |*program| program else null,
+                            .parameters = self.engine.context.parameters,
+                            .left_width = self.left.?.node.columns.len,
+                            .right_width = self.right.?.node.columns.len,
+                            .flipped = self.flipped_join,
+                        };
                         var transferred = false;
                         errdefer if (!transferred) owner.close();
                         var index: usize = 0;

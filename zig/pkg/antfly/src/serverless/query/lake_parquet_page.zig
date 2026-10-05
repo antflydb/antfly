@@ -2141,6 +2141,9 @@ pub fn decodePlainFixedLenByteArrayDictionaryPageAlloc(
 /// Decode dictionary IDs without expanding/copying a byte payload per row.
 /// A page owns its dictionary so decoded-cache eviction cannot borrow a cursor.
 pub fn decodeByteDictionaryVectorAlloc(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+    return decodeByteDictionaryVector(a, header, dictionary, payload, optional, false);
+}
+pub fn decodeByteDictionaryVector(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool, borrow: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
     try header.validateDictionaryRequired();
     const count: usize = header.value_count;
     if (header.data_payload_offset > payload.len) return error.InvalidParquetPage;
@@ -2171,6 +2174,7 @@ pub fn decodeByteDictionaryVectorAlloc(a: Allocator, header: Header, dictionary:
             next += 1;
         }
     }
+    if (borrow) return .{ .values = .{ .values = dictionary, .indices = indices }, .nulls = nulls };
     const values = try a.alloc([]const u8, dictionary.len);
     errdefer a.free(values);
     var initialized: usize = 0;

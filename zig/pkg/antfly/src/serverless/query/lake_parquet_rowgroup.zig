@@ -38,6 +38,8 @@ pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8
 pub const MaterializationLimits = struct {
     page_encoding: ?parquet_page.Encoding = null,
     preserve_dictionary: bool = false,
+    /// Only immutable decoded-cache pages may borrow a separately pinned dictionary.
+    borrow_dictionary: bool = false,
     /// Legacy row scanners retain their approximate numeric contract. Native
     /// SQL and public typed lake rows explicitly select lossless decimal text.
     decimal_representation: enum { approximate_number, exact_string } = .approximate_number,
@@ -1526,6 +1528,7 @@ const DecodedColumn = union(enum) {
     bool: []bool,
     bytes: [][]u8,
     dictionary_bytes: rowsource.DictionaryBytes,
+    borrowed_dictionary_bytes: rowsource.DictionaryBytes,
 
     fn deinit(self: *DecodedColumn, alloc: Allocator) void {
         switch (self.*) {
@@ -1534,6 +1537,7 @@ const DecodedColumn = union(enum) {
             .bool => |values| alloc.free(values),
             .bytes => |values| parquet_page.freePlainByteArrays(alloc, values),
             .dictionary_bytes => |values| values.deinit(alloc),
+            .borrowed_dictionary_bytes => |values| alloc.free(values.indices),
         }
         self.* = undefined;
     }
@@ -2131,8 +2135,8 @@ fn buildPlainI64RowGroupBatchAlloc(
                         const parsed = try parquet_page.parsePageHeader(input.bytes);
                         const payload = try parquet_page.decodePagePayloadAlloc(alloc, parsed.header, compression, input.bytes[parsed.header_len..]);
                         defer payload.deinit(alloc);
-                        const decoded = try parquet_page.decodeByteDictionaryVectorAlloc(alloc, parsed.header, (try parquet_page.Dictionary.values(.bytes, input.dictionary)).?, payload.bytes, false);
-                        decoded_columns[idx] = .{ .dictionary_bytes = decoded.values };
+                        const decoded = try parquet_page.decodeByteDictionaryVector(alloc, parsed.header, (try parquet_page.Dictionary.values(.bytes, input.dictionary)).?, payload.bytes, false, limits.borrow_dictionary);
+                        decoded_columns[idx] = if (limits.borrow_dictionary) .{ .borrowed_dictionary_bytes = decoded.values } else .{ .dictionary_bytes = decoded.values };
                         null_bitmaps[idx] = decoded.nulls;
                     } else {
                         decoded_columns[idx] = .{ .bytes = try parquet_page.scanDictionaryByteArrayColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.bytes, input.dictionary)) };
@@ -2144,8 +2148,8 @@ fn buildPlainI64RowGroupBatchAlloc(
                         const parsed = try parquet_page.parsePageHeader(input.bytes);
                         const payload = try parquet_page.decodePagePayloadAlloc(alloc, parsed.header, compression, input.bytes[parsed.header_len..]);
                         defer payload.deinit(alloc);
-                        const decoded = try parquet_page.decodeByteDictionaryVectorAlloc(alloc, parsed.header, (try parquet_page.Dictionary.values(.bytes, input.dictionary)).?, payload.bytes, true);
-                        decoded_columns[idx] = .{ .dictionary_bytes = decoded.values };
+                        const decoded = try parquet_page.decodeByteDictionaryVector(alloc, parsed.header, (try parquet_page.Dictionary.values(.bytes, input.dictionary)).?, payload.bytes, true, limits.borrow_dictionary);
+                        decoded_columns[idx] = if (limits.borrow_dictionary) .{ .borrowed_dictionary_bytes = decoded.values } else .{ .dictionary_bytes = decoded.values };
                         null_bitmaps[idx] = decoded.nulls;
                     } else {
                         var decoded = try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.bytes, input.dictionary));
@@ -2183,7 +2187,7 @@ fn buildPlainI64RowGroupBatchAlloc(
                     .nulls = .{ .bytes = null_bitmaps[idx] },
                 };
             },
-            .dictionary_bytes => |values| blk: {
+            .dictionary_bytes, .borrowed_dictionary_bytes => |values| blk: {
                 if (values.indices.len != row_count) return error.ParquetRowGroupRowCountMismatch;
                 break :blk .{ .name = column_names[idx], .values = .{ .dictionary_bytes = values }, .nulls = .{ .bytes = null_bitmaps[idx] } };
             },
@@ -9483,9 +9487,14 @@ test "parquet page cursor reuses decoded dictionaries aligns nullable columns an
     defer reader.drain(true);
     cursor.shared_reader = &reader;
     var position: usize = 0;
+    var dictionary_address: usize = 0;
     while (true) {
         reader.drain(false);
         const batch = (try cursor.next()) orelse break;
+        const address = @intFromPtr(batch.columns[1].values.dictionary_bytes.values.ptr);
+        if (position == 0) dictionary_address = address;
+        try std.testing.expectEqual(dictionary_address, address);
+        try std.testing.expectEqual(address, @intFromPtr(cursor.columns[1].dictionary_lease.?.item.payload.dictionary.bytes.ptr));
         if (position == 0) try std.testing.expectEqual(amount_page_len + optional_page_len, reader.prefetch_bytes);
         for (0..batch.rowCount()) |index| {
             try std.testing.expectEqual(@as(u64, position), batch.row_refs[index].external.row_ordinal);

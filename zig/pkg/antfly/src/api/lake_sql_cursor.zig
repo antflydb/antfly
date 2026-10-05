@@ -992,6 +992,8 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     defer a.free(parts);
     defer for (parts) |part| part.close(part.ptr);
     try std.testing.expectEqual(@as(usize, 4), parts.len);
+    const parent_owner: *Owner = @ptrCast(@alignCast(parent.ptr));
+    try std.testing.expectEqual(@as(usize, 4), parent_owner.stream.stats.files_opened);
     var total: usize = 0;
     for (parts) |part| {
         var count: usize = 0;
@@ -1002,6 +1004,8 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
             count += page.selection.len;
             if (page.after == null) break;
         }
+        const child: *Owner = @ptrCast(@alignCast(part.ptr));
+        try std.testing.expectEqual(@as(usize, 0), child.stream.stats.files_opened);
         total += count;
     }
     try std.testing.expectEqual(values.len * 4, total);
@@ -1135,6 +1139,7 @@ test "lake SQL shared tasks cover single file row groups exactly once" {
     const owner: *Owner = @ptrCast(@alignCast(parent.ptr));
     const work = owner.stream.work.?;
     try std.testing.expect(work.units.len > parts.len);
+    try std.testing.expectEqual(@as(usize, 1), owner.stream.stats.files_opened);
     for (work.units[1..], work.units[0 .. work.units.len - 1]) |later, earlier| try std.testing.expect(later.bytes <= earlier.bytes);
     var row_count: usize = 0;
     for (parts) |part| while (true) {
@@ -1144,6 +1149,10 @@ test "lake SQL shared tasks cover single file row groups exactly once" {
         row_count += page.selection.len;
         if (page.after == null) break;
     };
+    for (parts) |part| {
+        const child: *Owner = @ptrCast(@alignCast(part.ptr));
+        try std.testing.expectEqual(@as(usize, 0), child.stream.stats.files_opened);
+    }
     try std.testing.expect(work.next.load(.monotonic) >= work.units.len);
     // Parent remains readable after children consume the queue.
     const parent_count = (try parent.count_rows.?(parent.ptr)).?;

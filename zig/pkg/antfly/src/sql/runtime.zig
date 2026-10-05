@@ -3199,6 +3199,12 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
 
 test "SQL joins consume native column batches without invoking the JSON cursor" {
     const Native = struct {
+        var installs: usize = 0;
+        fn install(_: *anyopaque, filter: *const @import("dynamic_filter.zig").Filter) !bool {
+            try std.testing.expect(filter.sealed);
+            installs += 1;
+            return true;
+        }
         fn rows(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
             return error.UnexpectedJsonCursor;
         }
@@ -3227,10 +3233,12 @@ test "SQL joins consume native column batches without invoking the JSON cursor" 
             for (owner.cursors) |*cursor| {
                 cursor.next = rows;
                 cursor.next_columns = columns;
+                cursor.set_dynamic_filter = install;
             }
             return statement;
         }
     };
+    Native.installs = 0;
     var fixture: TestBackend = .{ .row_count = 1537 };
     var backend = fixture.coordinated();
     var vtable = backend.vtable.*;
@@ -3243,6 +3251,7 @@ test "SQL joins consume native column batches without invoking the JSON cursor" 
     try std.testing.expectEqualStrings("1537", result.output.rows[0][0].string);
     try std.testing.expectEqualStrings("1180416", result.output.rows[0][1].string);
     try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+    try std.testing.expectEqual(@as(usize, 1), Native.installs);
     try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
 }
 

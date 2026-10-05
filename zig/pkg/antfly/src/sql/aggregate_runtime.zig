@@ -109,27 +109,58 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *opera
         input.* = try a.alloc(Datum, selection.items.len);
         @memset(input.*, .{});
     }
-    for (bound.input.projections[0..bound.group_count], keys) |optional, *key|
-        key.* = try columnValues(context, bound, a, accepted, &optional.?);
-    for (bound.inputs, bound.filters, 0..) |input, filter, k| {
-        const filters = if (filter) |slot| try columnValues(context, bound, a, accepted, &bound.input.projections[slot].?) else null;
+    // Keys and unfiltered inputs share one DAG and column normalization.
+    // Filtered inputs form separate cohorts below, preserving lazy errors.
+    var programs: std.ArrayList(*const scalar.Program) = .empty;
+    for (bound.input.projections[0..bound.group_count]) |*optional| try programs.append(a, &optional.*.?);
+    for (bound.inputs, bound.filters) |input, filter| if (filter == null) if (input) |slot| {
+        try programs.append(a, &bound.input.projections[slot].?);
+    };
+    const vectors = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+    for (programs.items, vectors) |program, *vector| if (vector.* == null) {
+        @constCast(vector).* = try columnValues(context, bound, a, accepted, program);
+    };
+    for (keys, vectors[0..keys.len]) |*key, vector| key.* = vector.?;
+    var unfiltered: usize = keys.len;
+    for (bound.inputs, bound.filters, 0..) |input, filter, k| if (filter == null) {
+        if (input != null) {
+            @memcpy(inputs[k], vectors[unfiltered].?);
+            unfiltered += 1;
+        } else @memset(inputs[k], Datum.json(.{ .integer = 1 }));
+    };
+    const completed = try a.alloc(bool, bound.inputs.len);
+    @memset(completed, false);
+    for (bound.filters, 0..) |filter, k| {
+        if (filter == null or completed[k]) continue;
+        const filter_program = &bound.input.projections[filter.?].?;
+        const filters = try columnValues(context, bound, a, accepted, filter_program);
         var filtered: std.ArrayList(usize) = .empty;
         var positions: std.ArrayList(usize) = .empty;
-        for (accepted.selection, 0..) |physical, index| {
-            if (filters) |values| {
-                if (values[index].sql_null) continue;
-                if (values[index].value != .bool) return error.SqlTypeMismatch;
-                if (!values[index].value.bool) continue;
-            }
+        for (accepted.selection, filters, 0..) |physical, value, index| {
+            if (value.sql_null) continue;
+            if (value.value != .bool) return error.SqlTypeMismatch;
+            if (!value.value.bool) continue;
             try filtered.append(a, physical);
             try positions.append(a, index);
         }
         var selected = accepted;
         selected.selection = filtered.items;
-        if (input) |slot| {
-            const values = try columnValues(context, bound, a, selected, &bound.input.projections[slot].?);
-            for (positions.items, values) |index, value| inputs[k][index] = value;
-        } else for (positions.items) |index| inputs[k][index] = Datum.json(.{ .integer = 1 });
+        var cohort: std.ArrayList(*const scalar.Program) = .empty;
+        var slots: std.ArrayList(usize) = .empty;
+        for (bound.inputs, bound.filters, 0..) |input, candidate, index| {
+            if (candidate == null or completed[index]) continue;
+            if (candidate.? != filter.? and !@import("typed_kernel.zig").sameProgram(filter_program, &bound.input.projections[candidate.?].?)) continue;
+            completed[index] = true;
+            if (input) |slot| {
+                try cohort.append(a, &bound.input.projections[slot].?);
+                try slots.append(a, index);
+            } else for (positions.items) |position| inputs[index][position] = Datum.json(.{ .integer = 1 });
+        }
+        const outputs = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, cohort.items, selected, bound.input.columns, context.parameters, context.backend.execution_io);
+        for (cohort.items, outputs, slots.items) |program, optional, slot| {
+            const values = optional orelse try columnValues(context, bound, a, selected, program);
+            for (positions.items, values) |index, value| inputs[slot][index] = value;
+        }
     }
     if (bound.group_count == 0) {
         const columns = try a.alloc([]const Datum, inputs.len);

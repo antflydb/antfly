@@ -298,8 +298,10 @@ pub const Stream = struct {
             owner.shared = backend.spill_manager;
             const manager = owner.shared orelse &owner.manager;
             errdefer if (owner.shared == null) owner.manager.deinit();
-            owner.rows = try @import("disk_rows.zig").Rows.init(self.budget.allocator(), manager, binding.columns.len);
-            errdefer owner.rows.deinit();
+            owner.a = self.budget.allocator();
+            owner.width = binding.columns.len;
+            owner.rows = try @import("spill.zig").Sequential.init(manager, @max(128, @min(32 * 1024, limits.retained_bytes / 64)));
+            errdefer owner.rows.close();
             owner.index = 0;
             owner.sorted = null;
             owner.sorted_rows = &.{};
@@ -415,7 +417,7 @@ pub const Stream = struct {
             out.* = try a.alloc(Json, row.values.len);
             bits.* = try a.alloc(bool, row.values.len);
             for (row.values, @constCast(out.*), @constCast(bits.*)) |value, *cell, *flag| {
-                cell.* = (try @import("operators.zig").cloneDatum(a, value)).value;
+                cell.* = if (spool.ownsRead()) value.value else (try @import("operators.zig").cloneDatum(a, value)).value;
                 flag.* = value.sql_null;
                 bytes +|= try @import("operators.zig").datumBytes(value);
             }
@@ -787,10 +789,10 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
         try std.testing.expect(stream.spool != null);
         if (std.mem.indexOf(u8, sql, "row_number()") != null) {
             try std.testing.expect(stream.spool.?.sorted == null);
-            try std.testing.expectEqual(expected, stream.spool.?.rows.len);
+            try std.testing.expectEqual(expected, @as(usize, @intCast(stream.spool.?.rows.size)));
         } else {
             try std.testing.expect(stream.spool.?.sorted != null);
-            try std.testing.expectEqual(@as(usize, 0), stream.spool.?.rows.len);
+            try std.testing.expectEqual(@as(usize, 0), @as(usize, @intCast(stream.spool.?.rows.size)));
         }
         const reads = fixture.calls;
         var seen: usize = 0;

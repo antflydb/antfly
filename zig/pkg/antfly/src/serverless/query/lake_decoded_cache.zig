@@ -7,6 +7,7 @@ const Budget = @import("../../sql/memory_budget.zig");
 const A = std.mem.Allocator;
 pub const Payload = union(enum) {
     footer: @import("lake_parquet_metadata.zig").ParsedFooter,
+    dictionary: @import("lake_parquet_page.zig").Dictionary,
     columns: []const @import("../../storage/rowsource/types.zig").ColumnVector,
 };
 pub const Item = struct {
@@ -15,12 +16,16 @@ pub const Item = struct {
     payload: Payload = undefined,
     refs: usize = 1,
     cached: bool = false,
+    /// A decoded page pins its immutable chunk dictionary in this cache.
+    dependency: ?*Item = null,
     touched: u64 = 0,
-    fn destroy(self: *Item) void {
+    fn destroy(self: *Item, cache: *Cache) void {
+        const parent = self.dependency;
         const a = self.budget.backing;
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         a.destroy(self);
+        if (parent) |item| cache.releaseLocked(item);
     }
 };
 pub const Lease = struct {
@@ -29,9 +34,7 @@ pub const Lease = struct {
     pub fn release(self: Lease) void {
         self.cache.lock();
         defer self.cache.mutex.unlock();
-        std.debug.assert(self.item.refs != 0);
-        self.item.refs -= 1;
-        if (self.item.refs == 0 and !self.item.cached) self.item.destroy();
+        self.cache.releaseLocked(self.item);
     }
 };
 pub const Cache = struct {
@@ -46,11 +49,29 @@ pub const Cache = struct {
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    fn releaseLocked(self: *Cache, item: *Item) void {
+        std.debug.assert(item.refs != 0);
+        item.refs -= 1;
+        if (item.refs == 0 and !item.cached) item.destroy(self);
+    }
+    pub fn depend(self: *Cache, page: Lease, dictionary: Lease) void {
+        std.debug.assert(page.cache == self and dictionary.cache == self);
+        self.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(page.item.dependency == null);
+        dictionary.item.refs += 1;
+        page.item.dependency = dictionary.item;
+    }
     pub fn deinit(self: *Cache) void {
-        var it = self.entries.valueIterator();
-        while (it.next()) |item| {
-            std.debug.assert(item.*.refs == 0);
-            item.*.destroy();
+        // Remove leaf pages first; their release makes dictionaries evictable.
+        while (self.entries.count() != 0) {
+            var it = self.entries.iterator();
+            const key = while (it.next()) |entry| {
+                if (entry.value_ptr.*.refs == 0) break entry.key_ptr.*;
+            } else unreachable; // All request leases must already be closed.
+            const removed = self.entries.fetchRemove(key).?;
+            removed.value.cached = false;
+            removed.value.destroy(self);
         }
         self.entries.deinit(self.a);
     }
@@ -91,7 +112,8 @@ pub const Cache = struct {
             }
             const removed = self.entries.fetchRemove(oldest orelse return).?;
             self.bytes -= removed.value.budget.live;
-            removed.value.destroy();
+            removed.value.cached = false;
+            removed.value.destroy(self);
         }
         self.entries.put(self.a, key, item) catch return;
         self.tick +%= 1;
@@ -122,4 +144,34 @@ test "external lake decoded leases preserve pinned buffers under bounded evictio
     cache.publish(@splat(2), replacement);
     replacement.release();
     try std.testing.expect(cache.lookup(@splat(1)) == null);
+}
+
+test "external lake page dependencies pin a single dictionary across eviction" {
+    var cache: Cache = .{ .a = std.testing.allocator, .max_entries = 2 };
+    defer cache.deinit();
+    const dictionary = try cache.create(8192);
+    const a = dictionary.item.arena.allocator();
+    const entries = try a.alloc([]u8, 1);
+    entries[0] = try a.dupe(u8, "shared dictionary");
+    dictionary.item.payload = .{ .dictionary = .{ .bytes = entries } };
+    cache.publish(@splat(1), dictionary);
+    const page = try cache.create(8192);
+    page.item.payload = .{ .columns = &.{} };
+    cache.depend(page, dictionary);
+    cache.publish(@splat(2), page);
+    dictionary.release();
+    const pinned = cache.lookup(@splat(2)).?;
+    page.release();
+    const extra = try cache.create(8192);
+    extra.item.payload = .{ .columns = &.{} };
+    cache.publish(@splat(3), extra);
+    try std.testing.expect(!extra.item.cached);
+    extra.release();
+    try std.testing.expectEqualStrings("shared dictionary", pinned.item.dependency.?.payload.dictionary.bytes[0]);
+    pinned.release();
+    const replacement = try cache.create(8192);
+    replacement.item.payload = .{ .columns = &.{} };
+    cache.publish(@splat(3), replacement);
+    replacement.release();
+    try std.testing.expect(cache.entries.count() <= 2);
 }

@@ -49,7 +49,21 @@ pub const Stats = struct {
 /// Coordinator-owned immutable work list; workers claim independent row
 /// groups. Large compressed groups start first to reduce straggler latency.
 pub const ScanWork = struct {
-    pub const Unit = struct { file: usize, ordinal: u32, bytes: u64 };
+    pub const FilePlan = struct {
+        discovered: parquet.DiscoveredObjectRangeRowGroupPlan,
+        columns: []const []const u8,
+        logical_names: []const []const u8,
+        predicates: []const Predicate,
+        fn deinit(self: *FilePlan, a: Allocator) void {
+            self.discovered.deinit(a);
+            for (self.columns) |name| a.free(name);
+            a.free(self.columns);
+            a.free(self.logical_names);
+            a.free(self.predicates);
+        }
+    };
+    pub const Unit = struct { file: usize, ordinal: u32, group_index: usize, bytes: u64 };
+    plans: []?FilePlan,
     units: []Unit,
     next: std.atomic.Value(usize) = .init(0),
     fn claim(self: *ScanWork) ?Unit {
@@ -71,6 +85,7 @@ pub const Stream = struct {
     work: ?*ScanWork = null,
     owns_work: bool = false,
     work_ordinal: ?u32 = null,
+    borrowed_plan: bool = false,
     partition_index: usize = 0,
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
@@ -245,6 +260,12 @@ pub const Stream = struct {
         if (self.work) |work| return @min(maximum, work.units.len);
         var units: std.ArrayList(ScanWork.Unit) = .empty;
         errdefer units.deinit(self.alloc);
+        const plans = try self.alloc.alloc(?ScanWork.FilePlan, self.source.inventory.files.len);
+        @memset(plans, null);
+        errdefer {
+            for (plans) |*plan| if (plan.*) |*owned| owned.deinit(self.alloc);
+            self.alloc.free(plans);
+        }
         defer self.clearFile();
         for (self.files) |index| {
             self.clearFile();
@@ -252,15 +273,20 @@ pub const Stream = struct {
             try self.loadFile(index);
             const plan = self.discovered orelse continue;
             if (self.source.prepared_deletes) |prepared| try prepared.bindFile(plan.inventory.files[0]);
-            for (plan.row_group_plan.row_groups) |input| {
+            for (plan.row_group_plan.row_groups, 0..) |input, group_index| {
                 const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
                 if (group.row_count == 0 or !groupMayMatch(group, self.groupPredicates())) continue;
-                try units.append(self.alloc, .{ .file = index, .ordinal = input.row_group_ordinal, .bytes = group.total_byte_len });
+                try units.append(self.alloc, .{ .file = index, .ordinal = input.row_group_ordinal, .group_index = group_index, .bytes = group.total_byte_len });
             }
+            plans[index] = .{ .discovered = plan, .columns = self.file_columns, .logical_names = self.file_logical_names, .predicates = self.file_predicates };
+            self.discovered = null;
+            self.file_columns = &.{};
+            self.file_logical_names = &.{};
+            self.file_predicates = &.{};
         }
         const work = try self.alloc.create(ScanWork);
         errdefer self.alloc.destroy(work);
-        work.* = .{ .units = try units.toOwnedSlice(self.alloc) };
+        work.* = .{ .units = try units.toOwnedSlice(self.alloc), .plans = plans };
         std.mem.sort(ScanWork.Unit, work.units, {}, struct {
             fn less(_: void, a: ScanWork.Unit, b: ScanWork.Unit) bool {
                 return if (a.bytes != b.bytes) a.bytes > b.bytes else if (a.file != b.file) a.file < b.file else a.ordinal < b.ordinal;
@@ -273,6 +299,8 @@ pub const Stream = struct {
     pub fn deinit(self: *Stream) void {
         self.clearFile();
         if (self.owns_work) if (self.work) |work| {
+            for (work.plans) |*plan| if (plan.*) |*owned| owned.deinit(self.alloc);
+            self.alloc.free(work.plans);
             self.alloc.free(work.units);
             self.alloc.destroy(work);
         };
@@ -293,14 +321,17 @@ pub const Stream = struct {
         self.page_cursor = null;
         if (self.deleted.len != 0) self.alloc.free(self.deleted);
         self.deleted = &.{};
-        if (self.discovered) |*plan| plan.deinit(self.alloc);
+        if (!self.borrowed_plan) {
+            if (self.discovered) |*plan| plan.deinit(self.alloc);
+            for (self.file_columns) |name| self.alloc.free(name);
+            self.alloc.free(self.file_columns);
+            self.alloc.free(self.file_logical_names);
+            self.alloc.free(self.file_predicates);
+        }
+        self.borrowed_plan = false;
         self.discovered = null;
-        for (self.file_columns) |name| self.alloc.free(name);
-        self.alloc.free(self.file_columns);
         self.file_columns = &.{};
-        self.alloc.free(self.file_logical_names);
         self.file_logical_names = &.{};
-        self.alloc.free(self.file_predicates);
         self.file_predicates = &.{};
         self.group_index = 0;
     }
@@ -324,12 +355,13 @@ pub const Stream = struct {
                 while (self.group_index < plan.row_group_plan.row_groups.len) {
                     const input = plan.row_group_plan.row_groups[self.group_index];
                     self.group_index += 1;
+                    if (self.work_ordinal != null) self.group_index = plan.row_group_plan.row_groups.len;
                     if (self.work_ordinal) |ordinal| {
                         if (input.row_group_ordinal != ordinal) continue;
                     } else if (self.partition_count > 1 and self.files.len == 1 and (self.group_index - 1) * self.partition_count / plan.row_group_plan.row_groups.len != self.partition_index) continue;
-                    const group = for (plan.inventory.files[0].row_groups) |candidate| {
-                        if (candidate.ordinal == input.row_group_ordinal) break candidate;
-                    } else return error.InvalidParquetRowGroupBatch;
+                    const groups = plan.inventory.files[0].row_groups;
+                    if (input.row_group_ordinal >= groups.len or groups[input.row_group_ordinal].ordinal != input.row_group_ordinal) return error.InvalidParquetRowGroupBatch;
+                    const group = groups[input.row_group_ordinal];
                     if (!groupMayMatch(group, self.groupPredicates())) {
                         self.stats.groups_pruned += 1;
                         continue;
@@ -381,10 +413,17 @@ pub const Stream = struct {
                 }
                 self.clearFile();
             }
-            const index = if (self.work != null and !self.owns_work) blk: {
+            const index = if (self.work != null and !self.owns_work) {
                 const unit = self.work.?.claim() orelse return null;
+                const plan = self.work.?.plans[unit.file].?;
                 self.work_ordinal = unit.ordinal;
-                break :blk unit.file;
+                self.discovered = plan.discovered;
+                self.file_columns = plan.columns;
+                self.file_logical_names = plan.logical_names;
+                self.file_predicates = plan.predicates;
+                self.borrowed_plan = true;
+                self.group_index = unit.group_index;
+                continue;
             } else blk: {
                 if (self.file_index == self.files.len) return null;
                 const index = self.files[self.file_index];

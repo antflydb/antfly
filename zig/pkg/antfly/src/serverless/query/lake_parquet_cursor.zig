@@ -40,6 +40,7 @@ pub const Cursor = struct {
         decoded: ?parquet.OwnedBatch = null,
         cached: ?@import("lake_decoded_cache.zig").Lease = null,
         dictionary: ?page.Dictionary = null,
+        dictionary_lease: ?@import("lake_decoded_cache.zig").Lease = null,
         first: u64 = 0,
         count: usize = 0,
         consumed: usize = 0,
@@ -63,7 +64,7 @@ pub const Cursor = struct {
             if (column.decoded) |*decoded| decoded.deinit(self.a);
             if (column.cached) |lease| lease.release();
             if (column.directory) |*directory| directory.deinit();
-            if (column.dictionary) |*dictionary| dictionary.deinit(self.a);
+            if (column.dictionary_lease) |lease| lease.release() else if (column.dictionary) |*dictionary| dictionary.deinit(self.a);
         }
         self.a.free(self.columns);
         self.output.deinit();
@@ -160,10 +161,27 @@ pub const Cursor = struct {
             switch (parsed.header.page_type) {
                 .dictionary_page => {
                     if (column.dictionary != null or column.first != 0) return error.InvalidParquetPage;
-                    var dictionary = try self.decodeDictionary(column.chunk, parsed.header, encoded[parsed.header_len..]);
-                    errdefer dictionary.deinit(self.a);
-                    if (dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
-                    column.dictionary = dictionary;
+                    if (self.shared_reader) |reader| {
+                        const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "chunk-dictionary-v1", .chunk = column.chunk }, .{});
+                        defer self.a.free(interpretation);
+                        const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset - len, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
+                        const lease = reader.cache.decoded.lookup(key) orelse blk: {
+                            const owned = try reader.cache.decoded.create(self.limits.max_decoded_bytes / share *| 4);
+                            errdefer owned.release();
+                            owned.item.payload = .{ .dictionary = try decodeDictionaryAlloc(owned.item.arena.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..]) };
+                            reader.cache.decoded.publish(key, owned);
+                            break :blk owned;
+                        };
+                        errdefer lease.release();
+                        if (lease.item.payload.dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+                        column.dictionary_lease = lease;
+                        column.dictionary = lease.item.payload.dictionary;
+                    } else {
+                        var dictionary = try decodeDictionaryAlloc(self.a, column.chunk, parsed.header, encoded[parsed.header_len..]);
+                        errdefer dictionary.deinit(self.a);
+                        if (dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+                        column.dictionary = dictionary;
+                    }
                     self.dictionary_decodes += 1;
                     continue;
                 },
@@ -185,6 +203,10 @@ pub const Cursor = struct {
                 const cache = &self.shared_reader.?.cache.decoded;
                 const lease = try cache.create(self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes);
                 errdefer lease.release();
+                if (column.dictionary_lease) |dictionary| {
+                    cache.depend(lease, dictionary);
+                    limits.borrow_dictionary = true;
+                }
                 const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(lease.item.arena.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
                 lease.item.payload = .{ .columns = decoded.columns };
                 cache.publish(key, lease);
@@ -217,18 +239,18 @@ pub const Cursor = struct {
             return parsed;
         }
     }
-    fn decodeDictionary(self: *Cursor, chunk: external.ColumnChunk, header_value: page.Header, encoded: []const u8) !page.Dictionary {
-        const payload = try page.decodePagePayloadAlloc(self.a, header_value, try parquet.compressionCodecForColumnChunk(chunk), encoded);
-        defer payload.deinit(self.a);
-        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32")) return .{ .i64 = try page.decodePlainI32DictionaryPageAsI64Alloc(self.a, header_value, payload.bytes) };
-        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int64") or chunk.physical_type.len == 0) return .{ .i64 = try page.decodePlainI64DictionaryPageAlloc(self.a, header_value, payload.bytes) };
-        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "float")) return .{ .f64 = try page.decodePlainF32DictionaryPageAsF64Alloc(self.a, header_value, payload.bytes) };
-        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "double")) return .{ .f64 = try page.decodePlainF64DictionaryPageAlloc(self.a, header_value, payload.bytes) };
+    fn decodeDictionaryAlloc(a: A, chunk: external.ColumnChunk, header_value: page.Header, encoded: []const u8) !page.Dictionary {
+        const payload = try page.decodePagePayloadAlloc(a, header_value, try parquet.compressionCodecForColumnChunk(chunk), encoded);
+        defer payload.deinit(a);
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32")) return .{ .i64 = try page.decodePlainI32DictionaryPageAsI64Alloc(a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int64") or chunk.physical_type.len == 0) return .{ .i64 = try page.decodePlainI64DictionaryPageAlloc(a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "float")) return .{ .f64 = try page.decodePlainF32DictionaryPageAsF64Alloc(a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "double")) return .{ .f64 = try page.decodePlainF64DictionaryPageAlloc(a, header_value, payload.bytes) };
         if (std.ascii.eqlIgnoreCase(chunk.physical_type, "fixed_len_byte_array")) {
             if (chunk.type_length <= 0) return error.UnsupportedParquetPage;
-            return .{ .bytes = try page.decodePlainFixedLenByteArrayDictionaryPageAlloc(self.a, header_value, payload.bytes, @intCast(chunk.type_length)) };
+            return .{ .bytes = try page.decodePlainFixedLenByteArrayDictionaryPageAlloc(a, header_value, payload.bytes, @intCast(chunk.type_length)) };
         }
-        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "byte_array")) return .{ .bytes = try page.decodePlainByteArrayDictionaryPageAlloc(self.a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "byte_array")) return .{ .bytes = try page.decodePlainByteArrayDictionaryPageAlloc(a, header_value, payload.bytes) };
         return error.UnsupportedParquetPage;
     }
     /// Inspect the next headers while this page is being consumed, then warm

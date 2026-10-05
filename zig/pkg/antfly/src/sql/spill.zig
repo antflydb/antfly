@@ -739,7 +739,7 @@ pub const Sequential = struct {
             }
         }
     }
-    pub fn read(self: *Sequential, a: Allocator, offset: u64) !Decoded {
+    pub fn readBorrowed(self: *Sequential, offset: u64) !Decoded {
         try self.seal();
         if (offset >= self.size) return error.InvalidSqlSpill;
         if (offset == 0 and self.read_first != 0) {
@@ -756,7 +756,7 @@ pub const Sequential = struct {
             // File records have the sentinel link's 0xff at this byte;
             // typed blocks use only 0/1. Both retain checksum validation.
             if (header[16] == 255) {
-                var record = try self.file.read(a, self.read_offset);
+                var record = try self.file.read(owned, self.read_offset);
                 if (record.next != none or record.matched) return error.InvalidSqlSpill;
                 self.read_offset = record.following;
                 self.read_first = offset + 1;
@@ -787,12 +787,20 @@ pub const Sequential = struct {
             self.read_offset += header.len + len;
         }
         if (offset < self.read_first or offset >= self.read_first + self.read_rows.len) return error.InvalidSqlSpill;
-        const row = self.read_rows[@intCast(offset - self.read_first)];
+        return .{ .row = self.read_rows[@intCast(offset - self.read_first)], .next = none, .matched = false, .following = offset + 1 };
+    }
+    /// Decode once per typed block; copy only at an ownership boundary.
+    /// Borrowed rows expire when a different block is loaded or the file closes.
+    pub fn read(self: *Sequential, a: Allocator, offset: u64) !Decoded {
+        const decoded = try self.readBorrowed(offset);
+        const row = decoded.row;
         const values = try a.alloc(Datum, row.values.len);
         const keys = try a.alloc(Datum, row.keys.len);
         for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
         for (row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
-        return .{ .row = .{ .values = values, .keys = keys, .ordinal = row.ordinal }, .next = none, .matched = false, .following = offset + 1 };
+        var result = decoded;
+        result.row = .{ .values = values, .keys = keys, .ordinal = row.ordinal };
+        return result;
     }
 };
 
@@ -818,6 +826,31 @@ pub const Sort = struct {
     parallel_runs: bool = true,
     pending_run: ?*RunJob = null,
     parallel_runs_started: usize = 0,
+    parallel_merges_started: usize = 0,
+    radix_runs: usize = 0,
+    const MergeJob = struct {
+        sort: Sort,
+        inputs: [8]?Sequential = @splat(null),
+        count: usize = 0,
+        task: ?@import("parallel_scheduler.zig").Task(anyerror!Sequential) = null,
+        fn run(self: *MergeJob) anyerror!Sequential {
+            var pointers: [8]*Sequential = undefined;
+            for (self.inputs[0..self.count], pointers[0..self.count]) |*file, *pointer| pointer.* = &file.*.?;
+            return self.sort.mergeMany(pointers[0..self.count]);
+        }
+        fn close(self: *MergeJob) void {
+            if (self.task) |*task| {
+                if (task.cancel(self.sort.manager.io)) |result| {
+                    var file = result;
+                    file.close();
+                } else |_| {}
+            }
+            for (self.inputs[0..self.count]) |*file| if (file.*) |*open| open.close();
+            const a = self.sort.a;
+            self.sort.deinit();
+            a.destroy(self);
+        }
+    };
     const RunJob = struct {
         sort: Sort,
         task: ?@import("parallel_scheduler.zig").Task(anyerror!Sequential) = null,
@@ -891,7 +924,50 @@ pub const Sort = struct {
         self.estimated += bytes;
         self.total += 1;
     }
+    fn radixRows(self: *Sort) !bool {
+        if (self.rows.items.len < 1024) return false;
+        const first = self.rows.items[0].normalized orelse return false;
+        if (!first.complete) return false;
+        for (self.rows.items) |row| {
+            const key = row.normalized orelse return false;
+            if (!key.complete or key.types != first.types or key.len != first.len) return false;
+        }
+        const scratch = try self.a.alloc(Row, self.rows.items.len);
+        defer self.a.free(scratch);
+        var source = self.rows.items;
+        var target = scratch;
+        // Stable LSD passes: ordinal is the final SQL tie breaker, followed
+        // by complete memcomparable bytes. Mixed/truncated keys use pdq.
+        var pass: usize = 8 + first.len;
+        while (pass != 0) {
+            pass -= 1;
+            var counts: [256]usize = @splat(0);
+            for (source) |row| counts[radixByte(row, pass, first.len)] += 1;
+            if (for (counts) |count| {
+                if (count == source.len) break true;
+            } else false) continue;
+            var offsets: [256]usize = undefined;
+            var offset: usize = 0;
+            for (counts, &offsets) |count, *start| {
+                start.* = offset;
+                offset += count;
+            }
+            for (source) |row| {
+                const byte = radixByte(row, pass, first.len);
+                target[offsets[byte]] = row;
+                offsets[byte] += 1;
+            }
+            std.mem.swap([]Row, &source, &target);
+        }
+        if (source.ptr != self.rows.items.ptr) @memcpy(self.rows.items, source);
+        self.radix_runs += 1;
+        return true;
+    }
+    fn radixByte(row: Row, pass: usize, length: usize) u8 {
+        return if (pass < length) row.normalized.?.bytes[pass] else @truncate(row.ordinal >> @as(u6, @intCast((7 - (pass - length)) * 8)));
+    }
     fn sortRows(self: *Sort) !void {
+        if (try self.radixRows()) return;
         const Comparator = struct {
             orders: []const operators.Order,
             err: ?anyerror = null,
@@ -1031,6 +1107,61 @@ pub const Sort = struct {
         self.manager.increment("merges", 1);
         return output;
     }
+    fn compactParallel(self: *Sort) !void {
+        if (!self.parallel_runs or self.memory_bytes < 512 * 1024) return;
+        while (true) {
+            var indices: [32]usize = undefined;
+            var count: usize = 0;
+            for (self.runs, 0..) |file, index| if (file != null) {
+                indices[count] = index;
+                count += 1;
+            };
+            if (count <= self.fanIn()) return;
+            var jobs: [2]?*MergeJob = @splat(null);
+            defer for (jobs) |job| if (job) |owner| owner.close();
+            var claimed: usize = 0;
+            for (&jobs) |*slot| {
+                var local = Sort.init(self.a, self.manager, self.orders, self.memory_bytes / 2);
+                local.max_row_bytes = self.max_row_bytes;
+                local.merge_fan_in = self.merge_fan_in;
+                local.parallel_runs = false;
+                const width = @min(local.fanIn(), count - claimed);
+                if (width < 2) {
+                    local.deinit();
+                    break;
+                }
+                const job = try self.a.create(MergeJob);
+                job.* = .{ .sort = local, .count = width };
+                slot.* = job;
+                for (0..width) |i| {
+                    const index = indices[claimed + i];
+                    job.inputs[i] = self.runs[index];
+                    self.runs[index] = null;
+                }
+                claimed += width;
+                job.task = @import("parallel_scheduler.zig").global().submit(self.manager.io, self.memory_bytes / 2, MergeJob.run, .{job});
+                if (job.task != null) self.parallel_merges_started += 1;
+            }
+            var failure: ?anyerror = null;
+            for (jobs) |job| if (job) |owner| {
+                const result = if (owner.task) |*task| task.await(self.manager.io) else owner.run();
+                owner.task = null;
+                var combined = result catch |err| {
+                    failure = failure orelse err;
+                    continue;
+                };
+                if (failure != null) {
+                    combined.close();
+                    continue;
+                }
+                const empty = for (self.runs, 0..) |file, index| {
+                    if (file == null) break index;
+                } else unreachable;
+                self.runs[empty] = combined;
+            };
+            if (failure) |err| return err;
+        }
+    }
     pub fn finish(self: *Sort) !void {
         if (self.finished) return;
         if (self.pending_run != null) {
@@ -1047,6 +1178,7 @@ pub const Sort = struct {
         }
         try self.flush();
         try self.collectRun();
+        try self.compactParallel();
         // Bound decoded heads and I/O buffers; stream the final merge instead
         // of writing and rereading another complete sorted run.
         const fan_in = self.fanIn();
@@ -1078,6 +1210,13 @@ pub const Sort = struct {
         self.finished = true;
     }
     pub fn next(self: *Sort, a: Allocator) !?Row {
+        return self.nextImpl(a, true);
+    }
+    /// Final delivery discards sort keys at the ownership boundary.
+    pub fn nextValues(self: *Sort, a: Allocator) !?Row {
+        return self.nextImpl(a, false);
+    }
+    fn nextImpl(self: *Sort, a: Allocator, retain_keys: bool) !?Row {
         try self.finish();
         if (self.output_count != 0) {
             var selected: ?usize = null;
@@ -1087,9 +1226,11 @@ pub const Sort = struct {
             const index = selected orelse return null;
             const head = self.heads[index].?;
             const values = try a.alloc(Datum, head.row.values.len);
-            const keys = try a.alloc(Datum, head.row.keys.len);
+            const keys: []Datum = if (retain_keys) try a.alloc(Datum, head.row.keys.len) else &.{};
             for (head.row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
-            for (head.row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
+            if (retain_keys) {
+                for (head.row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
+            }
             _ = self.head_arenas[index].reset(.retain_capacity);
             self.heads[index] = if (head.following < self.outputs[index].?.size) try self.readRun(&self.outputs[index].?, self.head_arenas[index].allocator(), head.following) else null;
             return .{ .values = values, .keys = keys, .ordinal = head.row.ordinal };
@@ -1098,9 +1239,11 @@ pub const Sort = struct {
             const row = self.rows.items[@intCast(self.offset)];
             self.offset += 1;
             const values = try a.alloc(Datum, row.values.len);
-            const keys = try a.alloc(Datum, row.keys.len);
+            const keys: []Datum = if (retain_keys) try a.alloc(Datum, row.keys.len) else &.{};
             for (row.values, values) |v, *out| out.* = try operators.cloneDatum(a, v);
-            for (row.keys, keys) |v, *out| out.* = try operators.cloneDatum(a, v);
+            if (retain_keys) {
+                for (row.keys, keys) |v, *out| out.* = try operators.cloneDatum(a, v);
+            }
             return .{ .values = values, .keys = keys, .ordinal = row.ordinal };
         }
         return null;
@@ -1386,4 +1529,71 @@ test "SQL parallel sort runs preserve stable order and join on early close" {
         }
         try std.testing.expectEqual(@as(usize, 0), budget.live);
     }
+}
+
+test "SQL radix sort preserves native key direction and ordinal ties" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    for ([_]bool{ false, true }) |descending| {
+        var sort = Sort.init(a, &manager, &.{.{ .descending = descending }}, 8 * 1024 * 1024);
+        defer sort.deinit();
+        sort.parallel_runs = false;
+        for (0..2048) |i| try sort.add(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @as(i64, @intCast((2047 - i) % 256)) - 128 })}, .ordinal = 2047 - i });
+        var previous: ?Row = null;
+        var prior = std.heap.ArenaAllocator.init(a);
+        defer prior.deinit();
+        var current = std.heap.ArenaAllocator.init(a);
+        defer current.deinit();
+        var count: usize = 0;
+        while (true) {
+            _ = current.reset(.retain_capacity);
+            const row = (try sort.next(current.allocator())) orelse break;
+            if (previous) |old| try std.testing.expect((try operators.compareRows(old, row, sort.orders)) == .lt);
+            _ = prior.reset(.retain_capacity);
+            previous = .{ .values = &.{}, .keys = try prior.allocator().dupe(Datum, row.keys), .ordinal = row.ordinal };
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 2048), count);
+        try std.testing.expectEqual(@as(usize, 1), sort.radix_runs);
+    }
+}
+
+test "SQL independent merge compaction jobs preserve sorted output and release files" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    {
+        var sort = Sort.init(a, &manager, &.{.{}}, 1024 * 1024);
+        defer sort.deinit();
+        sort.merge_fan_in = 2;
+        // Supply independent runs to ensure two merge lanes can be admitted.
+        for (0..8) |run| {
+            var file = try Sequential.init(&manager, 4096);
+            errdefer file.close();
+            for (0..128) |i| _ = try file.append(.{ .values = &.{}, .keys = &.{Datum.json(.{ .integer = @intCast(i * 8 + run) })}, .ordinal = i * 8 + run }, none);
+            try file.seal();
+            sort.runs[run] = file;
+        }
+        var count: usize = 0;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        while (true) {
+            _ = arena.reset(.retain_capacity);
+            const row = (try sort.next(arena.allocator())) orelse break;
+            try std.testing.expectEqual(@as(i64, @intCast(count)), row.keys[0].value.integer);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1024), count);
+        try std.testing.expect(sort.parallel_merges_started >= 2);
+    }
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
 }

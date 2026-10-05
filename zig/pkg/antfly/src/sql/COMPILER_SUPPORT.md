@@ -247,12 +247,21 @@ request; next-group evidence and next-file metadata use shared bounded
 scheduling and join before cursor teardown. Iceberg delete indexes are prepared
 once per pinned source and applied directly to column batches. Missing evolved
 optional equality-delete fields use SQL NULL; malformed delete files still fail.
-Native byte dictionaries retain compact indices through scanning and normalize
-only referenced dictionary values once per expression input. Declared SQL types
-use the same coercion rules as scalar evaluation.
+Native byte dictionaries retain compact indices through scanning. Decoded pages
+pin a single immutable chunk dictionary rather than copying it per page; cache
+accounting charges the dictionary once and eviction respects page dependencies.
+Eligible scalar programs execute a shared instruction DAG over contiguous
+integer, number, boolean and string vectors with separate SQL/JSON null state.
+Common subexpressions and column normalization are shared across projections,
+group keys and aggregate inputs with the same FILTER selection. Lazy programs
+keep scalar evaluation, and FILTER inputs evaluate only accepted rows. Declared
+SQL types, mixed numeric comparisons and exceptional arithmetic lanes retain
+the scalar coercion and error contracts.
 
 Eligible COUNT, integer SUM and boolean reductions split pinned lake scans into
-up to four contiguous file or row-group partitions. Workers own private readers
+up to four workers claiming compressed-size-ordered row-group tasks. File
+projection/schema plans are built once by the coordinator and borrowed by each
+task; a claim references its group directly. Workers own private readers
 and bounded local state; deterministic exact merging preserves first-occurrence
 group order. Memory pressure falls back to the original pinned serial spilling
 scan. Floating-point, DISTINCT and pattern reductions keep ordered execution.
@@ -260,11 +269,27 @@ All workers share process-wide scheduling admission. Speculative next-group
 warming reserves 4 MiB and releases admission at completion, independently of
 its cursor-owned join handle.
 
+Join dynamic filters are sealed and installed on eligible probe scans before
+probing or collecting spill partitions. Complete spill partition jobs evaluate
+ordinary ON residuals and matched markers inside the worker. Join and exact
+aggregate workers deliver bounded typed blocks through queues with backpressure;
+output does not add spill writes. Consumer close stops and joins producers, and
+terminal errors follow the successfully produced prefix. Providers requiring
+external decision evaluation or pattern-set cursor state retain the coordinated
+residual path.
+
 Sort spill uses bounded eight-way merging and releases sealed write buffers.
+Independent merge compactions share parallel scheduling admission. Complete
+homogeneous normalized keys use stable radix passes with original ordinals as
+tie breakers; mixed, nullable-layout and truncated keys retain exact comparison.
 Sequential sort, join and group runs pack homogeneous columns, null flags and
 ordinals into checksummed blocks, with optional Snappy compression. Wide rows
 and singleton blocks use compact record framing without additional staging
-copies. Random-access chains retain individually framed records.
+copies. Blocking result spools use the same sequential typed blocks without a
+row-offset directory. External sort delivery discards keys and transfers owned
+values directly into the result page. Pgwire reuses its DataRow buffer across a
+page and encodes primitive/JSON cells directly into it. HTTP/pgwire response
+limits remain enforced. Random-access chains retain individually framed records.
 Exact COUNT, integer SUM and boolean aggregates partition updates into bounded
 typed reducers; oversized partitions use sorted partial merging. Floating-point,
 distinct and pattern aggregates preserve their ordered merge paths. A final
@@ -275,7 +300,13 @@ The deterministic spill tests compare identical inputs and memory budgets:
 eight-way sorting and partitioned aggregation both write fewer bytes than their
 binary-merge and sorted-update counterparts. Current measurements are recorded
 in `bench/baselines/native-lake-batch-block-refinements.json`.
-These measure temporary I/O, not overall query speed. The independent PyArrow
+Shared-DAG and blocking result-delivery samples are recorded separately in
+`bench/baselines/native-lake-pipeline-refinements.json`. The result fixture writes
+417,792 bytes through indexed rows versus 197,824 bytes through typed blocks;
+read/write calls drop from 104 to 49. Its median elapsed time is about half.
+The longer shared expression chain reduces median elapsed time by about 26%;
+short-expression timings overlap and fused result workspace can be larger.
+These are local microbenchmarks, not overall query speed guarantees. The independent PyArrow
 end-to-end test covers compressed indexed pages, dictionary/plain encodings,
 nulls, SQL joins/groups/windows, HTTP, pgwire streaming and cold restart.
 
