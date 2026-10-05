@@ -180,7 +180,7 @@ Rules:
 - choice: 3 to 6 mutually exclusive options. score: 3 to 5 ordered levels.
 - noul: phrase the instruction as a statement to judge true or false.
 - Questions must be answerable from the state alone; do not state the answers anywhere.
-- The state is 80 to 350 words of JSON. Use realistic but fictional names and numbers."""
+- Keep the state compact: 40 to 140 words of JSON, a handful of fields, and at most 4 thread messages or log entries. Use realistic but fictional names and numbers."""
 
 
 def prompt_for(rng: random.Random) -> tuple[str, str]:
