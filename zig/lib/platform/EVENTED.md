@@ -86,3 +86,38 @@ storage/cache, so these numbers do not establish bare-metal Linux behavior.
 `fsync` testing does not establish power-loss recovery or macOS `F_FULLFSYNC`
 durability. Positional measurements do not measure complete Lite, LSM, text, or
 vector queries; fd-cache and mmap paths often bypass `std.Io` altogether.
+
+## Recorded results (2026-10-05)
+
+Seven samples per case on an Apple M4 Max running macOS 15.6.1, and on an ARM64
+Docker VM running Linux 7.0.14-linuxkit with an anonymous disk volume. The
+following values are median elapsed milliseconds; a ratio above 1 means Evented
+was slower. These results retain all raw samples and code revisions in
+[`evented-io-macos.json`](../../bench/baselines/evented-io-macos.json) and
+[`evented-io-linux.json`](../../bench/baselines/evented-io-linux.json).
+
+| Platform | Workload | Tasks | Threaded ms | Evented ms | Evented / Threaded |
+| --- | --- | ---: | ---: | ---: | ---: |
+| macos | cached_read | 1 | 9.363 | 9.796 | 1.05 |
+| macos | cached_read | 8 | 12.298 | 12.510 | 1.02 |
+| macos | cached_read | 32 | 15.197 | 15.211 | 1.00 |
+| macos | durable_write | 1 | 2.333 | 2.261 | 0.97 |
+| macos | durable_write | 8 | 3.116 | 3.235 | 1.04 |
+| macos | durable_write | 32 | 4.299 | 4.071 | 0.95 |
+| linux | cached_read | 1 | 8.561 | 12.145 | 1.42 |
+| linux | cached_read | 8 | 2.624 | 3.918 | 1.49 |
+| linux | cached_read | 32 | 2.959 | 4.226 | 1.43 |
+| linux | durable_write | 1 | 19.038 | 25.556 | 1.34 |
+| linux | durable_write | 8 | 8.011 | 9.490 | 1.18 |
+| linux | durable_write | 32 | 5.986 | 8.839 | 1.48 |
+
+The macOS file-operation differences are small enough that this run gives no
+clear reason to switch defaults. Linux Evented was 42–49% slower for cached reads
+and 18–48% slower for writes plus fsync in this VM.
+
+The actual macOS LMDB async-commit workload had median complete roundtrip times
+of 19.017 ms with Threaded and 19.539 ms with Evented. Its accumulated commit
+phase was 1.682 ms versus 2.137 ms (27% slower with Evented); the publication
+phase was 0.876 ms versus 1.005 ms (15% slower). These small, warm workloads show
+no measured advantage from broad Evented enablement. Cold storage, batched I/O,
+real query latency, memory cost, and recovery still need separate qualification.
