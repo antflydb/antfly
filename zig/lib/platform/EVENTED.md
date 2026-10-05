@@ -16,6 +16,8 @@ optimized builds. New fibers retain the upstream entry-message convention.
 The strict `zig build evented-enrichment-test` gate covers backend identity,
 group bookkeeping, sleeping tasks, immediate and delayed cancellation, repeated
 concurrent completion, positional file read/write, and file synchronization.
+The Linux compatibility backend acknowledges timer cancellation after completion
+so cancellation of an already-submitted timeout returns `error.Canceled`.
 Run it in both debug and ReleaseFast modes. Linux requires a sufficiently recent
 kernel and a sandbox that permits io_uring; initialization failures are failures
 in this gate. macOS requires libc. Intel macOS is cross-compiled but these

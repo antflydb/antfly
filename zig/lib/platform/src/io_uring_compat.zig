@@ -4964,6 +4964,9 @@ fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         .resv = 0,
     };
     ev.yield(null, .nothing);
+    // A timeout canceled after submission must acknowledge the request too.
+    // Otherwise its completion wakes the fiber but sleep incorrectly succeeds.
+    try cancel_region.await(.nothing);
     // Handles SUCCESS as well as clock not available and unexpected
     // errors. The user had a chance to check clock resolution before
     // getting here, which would have reported 0, making this a legal
