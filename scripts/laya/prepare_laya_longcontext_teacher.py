@@ -200,15 +200,17 @@ def teacher_prompt_ids(tok, record: dict) -> list[int]:
     )
 
 
+def snapshot_cache(cache):
+    """Each layer's cache class, state and meta state. Newer mlx-lm states
+    are not bare (keys, values) pairs, and some cache classes need meta state."""
+    return [(type(c), c.state, c.meta_state) for c in cache]
+
+
 def fork_cache(cache_mod, saved_state):
-    """A fresh KV cache holding `saved_state`; extending it leaves the saved
-    arrays untouched, so one prefix can branch many continuations."""
-    fresh = []
-    for k, v in saved_state:
-        c = cache_mod.KVCache()
-        c.state = (k, v)
-        fresh.append(c)
-    return fresh
+    """A fresh KV cache holding `saved_state` (from `snapshot_cache`);
+    extending it leaves the saved arrays untouched, so one prefix can branch
+    many continuations."""
+    return [cls.from_state(state, meta) for cls, state, meta in saved_state]
 
 
 def score_labels(
@@ -275,7 +277,7 @@ def score_group(
     if prefix:
         cache = cache_mod.make_prompt_cache(model)
         mx.eval(model(mx.array([all_ids[0][:prefix]]), cache=cache))
-        base = [c.state for c in cache]
+        base = snapshot_cache(cache)
     results = []
     for n, (record, ids) in enumerate(zip(group, all_ids)):
         cache = (
@@ -286,7 +288,7 @@ def score_group(
         logits = model(mx.array([ids[prefix:]]), cache=cache)
         mx.eval(logits)
         raw, norm, label_tokens = score_labels(
-            model, tok, mx, cache_mod, [c.state for c in cache], logits[0, -1], record
+            model, tok, mx, cache_mod, snapshot_cache(cache), logits[0, -1], record
         )
         results.append(
             (raw, norm, len(ids) - prefix + label_tokens + (prefix if n == 0 else 0))

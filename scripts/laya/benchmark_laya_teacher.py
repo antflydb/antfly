@@ -72,13 +72,14 @@ def ids_for(tok, r):
     )
 
 
+def snapshot(cache):
+    """Each layer's cache class and state; newer mlx-lm states are not bare
+    (keys, values) pairs, and some cache classes carry meta state."""
+    return [(type(x), x.state, x.meta_state) for x in cache]
+
+
 def fork(saved):
-    out = []
-    for k, v in saved:
-        c = cache_mod.KVCache()
-        c.state = (k, v)
-        out.append(c)
-    return out
+    return [cls.from_state(state, meta) for cls, state, meta in saved]
 
 
 def labels_from(model, tok, saved, last, r):
@@ -101,9 +102,9 @@ def per_question(model, tok, r):
     c = cache_mod.make_prompt_cache(model)
     lg = model(mx.array([ids]), cache=c)
     mx.eval(lg)
-    return labels_from(
-        model, tok, [x.state for x in c], lg[0, -1].astype(mx.float32), r
-    ), len(ids)
+    return labels_from(model, tok, snapshot(c), lg[0, -1].astype(mx.float32), r), len(
+        ids
+    )
 
 
 def shared(model, tok, case):
@@ -114,7 +115,7 @@ def shared(model, tok, case):
         p += 1
     c = cache_mod.make_prompt_cache(model)
     mx.eval(model(mx.array([all_ids[0][:p]]), cache=c))
-    base = [x.state for x in c]
+    base = snapshot(c)
     out, tokens = [], p
     for r, ids in zip(case, all_ids):
         branch = fork(base)
@@ -122,9 +123,7 @@ def shared(model, tok, case):
         mx.eval(lg)
         tokens += len(ids) - p
         out.append(
-            labels_from(
-                model, tok, [x.state for x in branch], lg[0, -1].astype(mx.float32), r
-            )
+            labels_from(model, tok, snapshot(branch), lg[0, -1].astype(mx.float32), r)
         )
     return out, tokens, p
 
@@ -195,9 +194,7 @@ def main():
             lg = model(mx.array([ids[p:]]), cache=c)
             mx.eval(lg)
             split.append(
-                labels_from(
-                    model, tok, [x.state for x in c], lg[0, -1].astype(mx.float32), r
-                )
+                labels_from(model, tok, snapshot(c), lg[0, -1].astype(mx.float32), r)
             )
 
     def sm(v):
