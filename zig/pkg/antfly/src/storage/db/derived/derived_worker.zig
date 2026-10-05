@@ -2420,7 +2420,7 @@ test "catchUpIndex enforces the unscaled work ceiling across Lite windows" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-vector-work-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
