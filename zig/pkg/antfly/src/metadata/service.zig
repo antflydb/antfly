@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const store_report_baseline = @import("store_report_baseline.zig");
@@ -15293,7 +15294,7 @@ fn collectLocalGroupStatusReport(
     defer db_mod.types.freeDBStats(alloc, stats);
 
     const now_realtime_ms = platform_clock.Clock.real().nowRealtimeMs();
-    const created_at_millis = (try db.getGroupCreatedAtMillis(alloc, group_id)) orelse now_realtime_ms;
+    const created_at_millis = (try server_group_metadata.getGroupCreatedAtMillis(db, alloc, group_id)) orelse now_realtime_ms;
     const readiness = if (replica_root_dir) |root_dir|
         try transition_state.readinessForLocalGroup(
             alloc,

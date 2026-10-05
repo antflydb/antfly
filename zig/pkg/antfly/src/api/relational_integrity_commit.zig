@@ -1824,7 +1824,7 @@ test "distributed txn preparation pins one routing view and releases it" {
         }
     };
     var fixture: Fixture = .{};
-    fixture.view = .{ .session = undefined, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .destroy = Fixture.destroy };
+    fixture.view = .{ .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .destroy = Fixture.destroy };
     var builder: Builder = .{ .alloc = std.testing.allocator, .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.original, .scan = undefined, .query = undefined, .acquire_join_view = Fixture.acquire } } };
     {
         defer builder.deinit();
