@@ -46,6 +46,17 @@ pub const Stats = struct {
     groups_pruned: usize = 0,
     rows_examined: u64 = 0,
 };
+/// Coordinator-owned immutable work list; workers claim independent row
+/// groups. Large compressed groups start first to reduce straggler latency.
+pub const ScanWork = struct {
+    pub const Unit = struct { file: usize, ordinal: u32, bytes: u64 };
+    units: []Unit,
+    next: std.atomic.Value(usize) = .init(0),
+    fn claim(self: *ScanWork) ?Unit {
+        const index = self.next.fetchAdd(1, .monotonic);
+        return if (index < self.units.len) self.units[index] else null;
+    }
+};
 pub const Stream = struct {
     alloc: Allocator,
     source: *serving.ServingSource,
@@ -57,6 +68,9 @@ pub const Stream = struct {
     stats: Stats = .{},
     files: []usize,
     file_index: usize = 0,
+    work: ?*ScanWork = null,
+    owns_work: bool = false,
+    work_ordinal: ?u32 = null,
     partition_index: usize = 0,
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
@@ -228,24 +242,40 @@ pub const Stream = struct {
     }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
-        // Resolve delete indexes on the coordinator, then share immutable
-        // membership sets. Footer preparation warms the shared parsed cache.
-        try self.loadFile(self.files[0]);
+        if (self.work) |work| return @min(maximum, work.units.len);
+        var units: std.ArrayList(ScanWork.Unit) = .empty;
+        errdefer units.deinit(self.alloc);
         defer self.clearFile();
-        if (self.source.prepared_deletes) |prepared| if (prepared.positions.count() != 0) {
-            // Prefix storage belongs to the snapshot arena. Prepare it before
-            // workers start so it never allocates through a shared owner arena.
-            try prepared.bindFile(self.discovered.?.inventory.files[0]);
-            for (self.files[1..]) |index| {
-                self.clearFile();
-                try self.loadFile(index);
-                try prepared.bindFile(self.discovered.?.inventory.files[0]);
+        for (self.files) |index| {
+            self.clearFile();
+            if (!self.fileMatches(self.source.inventory.files[index])) continue;
+            try self.loadFile(index);
+            const plan = self.discovered orelse continue;
+            if (self.source.prepared_deletes) |prepared| try prepared.bindFile(plan.inventory.files[0]);
+            for (plan.row_group_plan.row_groups) |input| {
+                const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
+                if (group.row_count == 0 or !groupMayMatch(group, self.groupPredicates())) continue;
+                try units.append(self.alloc, .{ .file = index, .ordinal = input.row_group_ordinal, .bytes = group.total_byte_len });
             }
-        };
-        return @min(maximum, if (self.files.len == 1) self.discovered.?.row_group_plan.row_groups.len else self.files.len);
+        }
+        const work = try self.alloc.create(ScanWork);
+        errdefer self.alloc.destroy(work);
+        work.* = .{ .units = try units.toOwnedSlice(self.alloc) };
+        std.mem.sort(ScanWork.Unit, work.units, {}, struct {
+            fn less(_: void, a: ScanWork.Unit, b: ScanWork.Unit) bool {
+                return if (a.bytes != b.bytes) a.bytes > b.bytes else if (a.file != b.file) a.file < b.file else a.ordinal < b.ordinal;
+            }
+        }.less);
+        self.work = work;
+        self.owns_work = true;
+        return @min(maximum, work.units.len);
     }
     pub fn deinit(self: *Stream) void {
         self.clearFile();
+        if (self.owns_work) if (self.work) |work| {
+            self.alloc.free(work.units);
+            self.alloc.destroy(work);
+        };
         self.alloc.free(self.files);
         self.mapped_columns.deinit(self.alloc);
         self.* = undefined;
@@ -294,7 +324,9 @@ pub const Stream = struct {
                 while (self.group_index < plan.row_group_plan.row_groups.len) {
                     const input = plan.row_group_plan.row_groups[self.group_index];
                     self.group_index += 1;
-                    if (self.partition_count > 1 and self.files.len == 1 and (self.group_index - 1) * self.partition_count / plan.row_group_plan.row_groups.len != self.partition_index) continue;
+                    if (self.work_ordinal) |ordinal| {
+                        if (input.row_group_ordinal != ordinal) continue;
+                    } else if (self.partition_count > 1 and self.files.len == 1 and (self.group_index - 1) * self.partition_count / plan.row_group_plan.row_groups.len != self.partition_index) continue;
                     const group = for (plan.inventory.files[0].row_groups) |candidate| {
                         if (candidate.ordinal == input.row_group_ordinal) break candidate;
                     } else return error.InvalidParquetRowGroupBatch;
@@ -349,10 +381,17 @@ pub const Stream = struct {
                 }
                 self.clearFile();
             }
-            if (self.file_index == self.files.len) return null;
-            const index = self.files[self.file_index];
-            self.file_index += 1;
-            if (self.partition_count > 1 and self.files.len > 1 and (self.file_index - 1) * self.partition_count / self.files.len != self.partition_index) continue;
+            const index = if (self.work != null and !self.owns_work) blk: {
+                const unit = self.work.?.claim() orelse return null;
+                self.work_ordinal = unit.ordinal;
+                break :blk unit.file;
+            } else blk: {
+                if (self.file_index == self.files.len) return null;
+                const index = self.files[self.file_index];
+                self.file_index += 1;
+                if (self.partition_count > 1 and self.files.len > 1 and (self.file_index - 1) * self.partition_count / self.files.len != self.partition_index) continue;
+                break :blk index;
+            };
             const file = self.source.inventory.files[index];
             if (!self.fileMatches(file)) {
                 self.stats.files_pruned += 1;

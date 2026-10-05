@@ -618,6 +618,20 @@ pub const HashJoin = struct {
         self.addInner(values, keys) catch |err| return if (err == error.OutOfMemory and self.budget.exhausted) error.SqlProgramLimitExceeded else err;
         self.row_count += 1;
     }
+    /// Gather each build row into reusable scratch and admit it directly into
+    /// retained typed state. Native payloads are copied exactly once.
+    pub fn addBatch(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !void {
+        if (batch.len() != keys.len) return error.InvalidSqlBackendResponse;
+        const values = try a.alloc(Datum, batch.width());
+        defer a.free(values);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        for (keys, 0..) |key, index| {
+            _ = scratch.reset(.retain_capacity);
+            for (values, 0..) |*value, column| value.* = try batch.cell(scratch.allocator(), index, column);
+            try self.add(values, key);
+        }
+    }
     fn addInner(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
         if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         if (self.entries.items.len >= self.limits.rows) return error.SqlProgramLimitExceeded;
@@ -655,20 +669,21 @@ pub const HashJoin = struct {
             hash.* = .init(0);
             probe_.* = .{ .owner = self, .keys = row, .cursor = null };
         }
+        const valid = try a.alloc(bool, keys.len);
+        defer a.free(valid);
+        for (keys, valid) |row, *accepted| accepted.* = for (row) |cell| {
+            if (cell.sql_null) break false;
+        } else true;
         const width = if (keys.len == 0) 0 else keys[0].len;
-        for (0..width) |column| for (keys, hashes) |row, *hash| {
+        for (0..width) |column| for (keys, hashes, valid) |row, *hash, accepted| {
             if (row.len != width) return error.InvalidSqlBackendResponse;
-            if (for (row) |cell| {
-                if (cell.sql_null) break true;
-            } else false) continue;
+            if (!accepted) continue;
             var bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &bytes, try scalar.semanticHash(row[column].value), .little);
             hash.update(&bytes);
         };
-        for (keys, hashes, probes) |row, *hash, *probe_| {
-            if (for (row) |cell| {
-                if (cell.sql_null) break true;
-            } else false) continue;
+        for (hashes, probes, valid) |*hash, *probe_, accepted| {
+            if (!accepted) continue;
             const value = hash.final();
             if (self.disk != null) {
                 const head = self.disk_heads[value & (self.disk_heads.len - 1)];
@@ -770,6 +785,15 @@ pub const Grouped = struct {
         const result = try self.resultAt(alloc, self.result_cursor);
         self.result_cursor += 1;
         return result;
+    }
+    pub fn nextPartialResult(self: *Grouped, a: Allocator) !?GroupResult {
+        if (self.external) |external| return external.nextPartial(a);
+        if (self.result_cursor == self.groups.items.len) return null;
+        const index = self.result_cursor;
+        self.result_cursor += 1;
+        const states = try a.alloc(Aggregate, self.specs.len);
+        for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
+        return .{ .keys = try self.key_columns.row(a, index), .aggregates = try @import("aggregate_partial.zig").encode(a, states), .ordinal = self.groups.items[index].ordinal };
     }
     pub fn create(alloc: Allocator, specs: []const AggregateSpec, limits: Limits) !*Grouped {
         if (limits.bytes < @sizeOf(Grouped) or specs.len > 256) return error.SqlProgramLimitExceeded;
@@ -882,13 +906,23 @@ pub const Grouped = struct {
         const index = self.last_group orelse return error.InvalidSqlBackendResponse;
         self.groups.items[index].ordinal = if (index >= prior_groups) ordinal else @min(self.groups.items[index].ordinal, ordinal);
     }
-    /// Merge exact local reducers in contiguous partition order. Ordinals are
-    /// translated by the preceding partition's accepted-row count, preserving
-    /// first-occurrence ordering without retaining input rows.
-    pub fn mergeExact(self: *Grouped, source: *const Grouped, ordinal_base: u64) !void {
-        if (self.failed or self.finished or source.external != null or self.specs.len != source.specs.len) return error.InvalidSqlBackendResponse;
+    /// Merge exact local reducers, including spilled states, without narrowing
+    /// partial sums. Worker-local ordinals occupy disjoint ranges; consumers
+    /// requiring source-order numeric semantics never use this reduction.
+    pub fn mergeExact(self: *Grouped, source: *Grouped, ordinal_base: u64) !void {
+        if (self.failed or self.finished or self.specs.len != source.specs.len) return error.InvalidSqlBackendResponse;
         var arena = std.heap.ArenaAllocator.init(self.backing);
         defer arena.deinit();
+        if (source.external != null) {
+            const prior_rows = self.rows_seen;
+            while (true) {
+                _ = arena.reset(.retain_capacity);
+                const partial = (try source.nextPartialResult(arena.allocator())) orelse break;
+                try self.importPartial(partial.keys, partial.aggregates, try std.math.add(u64, ordinal_base, partial.ordinal));
+            }
+            self.rows_seen = try std.math.add(u64, prior_rows, source.rows_seen);
+            return;
+        }
         const states = try self.backing.alloc(Aggregate, self.specs.len);
         defer self.backing.free(states);
         const empty = try self.backing.alloc(Datum, self.specs.len);
@@ -913,10 +947,13 @@ pub const Grouped = struct {
         self.rows_seen = std.math.add(u64, self.rows_seen, source.rows_seen) catch return error.SqlNumericOutOfRange;
     }
     pub fn importPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
-        if (cells.len != self.specs.len * 7 or self.external != null) return error.InvalidSqlSpill;
+        if (cells.len != self.specs.len * 7) return error.InvalidSqlSpill;
         const inputs = try self.backing.alloc(Datum, self.specs.len);
         defer self.backing.free(inputs);
         @memset(inputs, .{});
+        self.key_count = keys.len;
+        if (self.external == null and self.limits.spill != null and !try self.canRetain(keys, inputs)) try self.startSpill();
+        if (self.external) |external| return external.appendPartial(keys, cells, ordinal);
         try self.addOrdered(keys, inputs, ordinal);
         const index = self.last_group.?;
         for (self.state_columns, 0..) |*column, slot| {
@@ -1608,4 +1645,42 @@ test "SQL global batch reductions preserve scalar null counts booleans and exact
     try std.testing.expectEqualDeep(expected.aggregates, actual.aggregates);
     try std.testing.expectEqual(@as(u64, 0), batched.hash_probes);
     try std.testing.expectEqual(@as(u64, rows.len), batched.rows_seen);
+}
+
+test "SQL spilled worker partials preserve wide sums until final merge" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const specs = [_]AggregateSpec{.{ .kind = .sum, .input_type = .integer }};
+    const positive = try Grouped.create(a, &specs, .{ .bytes = 64 * 1024, .groups = 4096, .spill = &manager });
+    defer positive.deinit();
+    const negative = try Grouped.create(a, &specs, .{ .bytes = 64 * 1024, .groups = 4096, .spill = &manager });
+    defer negative.deinit();
+    const merged = try Grouped.create(a, &specs, .{ .bytes = 64 * 1024, .groups = 4096, .spill = &manager });
+    defer merged.deinit();
+    for (0..2) |_| for (0..1024) |key| {
+        const keys = [_]Datum{Datum.json(.{ .integer = @intCast(key) })};
+        try positive.add(&keys, &.{Datum.json(.{ .integer = std.math.maxInt(i64) })});
+        try negative.add(&keys, &.{Datum.json(.{ .integer = -std.math.maxInt(i64) })});
+    };
+    try std.testing.expect(positive.external != null and negative.external != null);
+    try merged.mergeExact(positive, 0);
+    try merged.mergeExact(negative, positive.rows_seen);
+    try std.testing.expectEqual(@as(u64, 4096), merged.rows_seen);
+    var seen: [1024]bool = @splat(false);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    while (true) {
+        _ = arena.reset(.retain_capacity);
+        const row = (try merged.nextResult(arena.allocator())) orelse break;
+        const key: usize = @intCast(row.keys[0].value.integer);
+        try std.testing.expect(!seen[key]);
+        seen[key] = true;
+        try std.testing.expectEqual(@as(i64, 0), row.aggregates[0].value.integer);
+    }
+    for (seen) |found| try std.testing.expect(found);
 }

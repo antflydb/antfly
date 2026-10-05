@@ -21,6 +21,11 @@ limit: usize,
 live: usize = 0,
 peak: usize = 0,
 exhausted: bool = false,
+mutex: std.atomic.Mutex = .unlocked,
+
+fn lock(self: *Budget) void {
+    while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+}
 
 pub fn allocator(self: *Budget) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -38,6 +43,8 @@ fn account(self: *Budget, old: usize, new: usize) void {
 }
 fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    self.lock();
+    defer self.mutex.unlock();
     if (!self.admit(len)) return null;
     const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
     self.account(0, len);
@@ -45,6 +52,8 @@ fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?
 }
 fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    self.lock();
+    defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return false;
     if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
     self.account(bytes.len, len);
@@ -52,6 +61,8 @@ fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize
 }
 fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    self.lock();
+    defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return null;
     const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse return null;
     self.account(bytes.len, len);
@@ -59,6 +70,8 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
 }
 fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
     const self: *Budget = @ptrCast(@alignCast(ptr));
+    self.lock();
+    defer self.mutex.unlock();
     self.backing.rawFree(bytes, alignment, ra);
     self.account(bytes.len, 0);
 }

@@ -115,6 +115,50 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             assert response.status_code in (404, 409, 503), response.text
             assert time.monotonic() < deadline, response.text
             time.sleep(0.1)
+        # Both independent empty-file layouts must remain valid attachments.
+        for row_group in (False, True):
+            empty_root = tmp_path / f"empty-{row_group}"
+            empty_objects = empty_root / "buckets" / "antfly" / "objects"
+            empty_objects.mkdir(parents=True)
+            empty_path = tmp_path / f"empty-{row_group}.parquet"
+            empty_schema = pa.schema([("amount", pa.int64())])
+            if row_group:
+                pq.write_table(pa.table({"amount": pa.array([], type=pa.int64())}), empty_path)
+            else:
+                with pq.ParquetWriter(empty_path, empty_schema):
+                    pass
+            empty = empty_path.read_bytes()
+            empty_envelope = (
+                b"AFOBJ001"
+                + struct.pack("<QI", len(empty), 0)
+                + hashlib.sha256(empty).hexdigest().encode()
+            )
+            (empty_objects / "part.parquet").write_bytes(empty_envelope + empty)
+            name = f"empty_lake_{int(row_group)}"
+            request("POST", f"/tables/{name}", {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external", "table_id": name,
+                        "format": "parquet", "uri": empty_root.as_uri(),
+                    },
+                },
+            })
+            deadline = time.monotonic() + 30
+            while True:
+                response = requests.post(
+                    server.api_url + "/sql",
+                    json={"statement": f"SELECT SUM(amount), COUNT(*) FROM {name}"},
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60,
+                )
+                if response.ok:
+                    assert response.json()["rows"] == [[None, "0"]]
+                    break
+                assert response.status_code in (404, 409, 503), response.text
+                assert time.monotonic() < deadline, response.text
+                time.sleep(0.1)
+            assert request("POST", "/sql", {"statement": f"SELECT amount FROM {name}"})["rows"] == []
         sql = "SELECT amount, label FROM lake_events WHERE amount >= 1197 ORDER BY amount DESC"
         expected = [["1199", "row-1199"], ["1198", "row-1198"], ["1197", None]]
         assert request("POST", "/sql", {"statement": sql})["rows"] == expected

@@ -59,16 +59,7 @@ pub const Grouped = struct {
         const a = arena.allocator();
         const values = try a.alloc(Datum, 1 + states.len * 7);
         values[0] = Datum.json(.{ .bool = true });
-        for (states, 0..) |state, i| {
-            const cells = values[1 + i * 7 ..][0..7];
-            cells[0] = Datum.json(.{ .integer = if (state.distinct) 0 else @intCast(state.count) });
-            cells[1] = Datum.json(.{ .number_string = try std.fmt.allocPrint(a, "{d}", .{state.integer_sum}) });
-            cells[2] = Datum.json(.{ .float = state.number_sum });
-            cells[3] = Datum.json(.{ .float = state.compensation });
-            cells[4] = Datum.json(.{ .float = state.mean });
-            cells[5] = Datum.json(.{ .bool = state.boolean });
-            cells[6] = if (state.selected) |selected| selected.row.values[0] else .{};
-        }
+        @memcpy(values[1..], try @import("aggregate_partial.zig").encode(a, states));
         try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
         for (states, 0..) |state, slot| if (state.distinct) {
             for (state.distinct_values.items) |entry| {
@@ -76,6 +67,14 @@ pub const Grouped = struct {
             }
             if (state.kind == .pattern_set and state.patterns.?.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
         };
+    }
+    pub fn appendPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
+        if (cells.len != self.specs.len * 7) return error.InvalidSqlSpill;
+        const values = try self.a.alloc(Datum, cells.len + 1);
+        defer self.a.free(values);
+        values[0] = Datum.json(.{ .bool = true });
+        @memcpy(values[1..], cells);
+        try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
     }
     pub fn add(self: *Grouped, keys: []const Datum, inputs: []const Datum, ordinal: u64) !void {
         const values = try self.a.alloc(Datum, inputs.len + 1);
@@ -110,10 +109,10 @@ pub const Grouped = struct {
         }
         return true;
     }
-    fn nextPartition(self: *Grouped, out: Allocator) anyerror!?operators.GroupResult {
+    fn nextPartition(self: *Grouped, out: Allocator, exact: bool) anyerror!?operators.GroupResult {
         while (true) {
             if (self.local) |local| {
-                if (try local.nextResult(out)) |result| {
+                if (try (if (exact) local.nextPartialResult(out) else local.nextResult(out))) |result| {
                     self.output_count += 1;
                     return result;
                 }
@@ -121,7 +120,7 @@ pub const Grouped = struct {
                 self.local = null;
             }
             if (self.fallback) |fallback| {
-                if (try fallback.next(out)) |result| {
+                if (try fallback.nextImpl(out, exact)) |result| {
                     self.output_count += 1;
                     return result;
                 }
@@ -174,7 +173,13 @@ pub const Grouped = struct {
         return true;
     }
     pub fn next(self: *Grouped, out: Allocator) !?operators.GroupResult {
-        if (self.partitioned) return self.nextPartition(out);
+        return self.nextImpl(out, false);
+    }
+    pub fn nextPartial(self: *Grouped, out: Allocator) !?operators.GroupResult {
+        return self.nextImpl(out, true);
+    }
+    fn nextImpl(self: *Grouped, out: Allocator, exact: bool) anyerror!?operators.GroupResult {
+        if (self.partitioned) return self.nextPartition(out, exact);
         _ = self.state_arena.reset(.free_all);
         const a = self.state_arena.allocator();
         var row = self.pending orelse (try self.sort.next(self.read_arena.allocator())) orelse return null;
@@ -245,8 +250,10 @@ pub const Grouped = struct {
         }
         const output_keys = try out.alloc(Datum, keys.len);
         for (keys, output_keys) |key, *copy| copy.* = try operators.cloneDatum(out, key);
-        const aggregates = try out.alloc(Datum, states.len);
-        for (states, aggregates, pattern_sets) |*state, *copy, set| copy.* = if (set) |patterns| .{ .patterns = &patterns.interface, .sql_null = false } else try operators.cloneDatum(out, try state.finish());
+        const aggregates = if (exact) try @import("aggregate_partial.zig").encode(out, states) else try out.alloc(Datum, states.len);
+        if (!exact) for (states, @constCast(aggregates), pattern_sets) |*state, *copy, set| {
+            copy.* = if (set) |patterns| .{ .patterns = &patterns.interface, .sql_null = false } else try operators.cloneDatum(out, try state.finish());
+        };
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };
     }

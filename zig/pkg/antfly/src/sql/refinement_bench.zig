@@ -330,3 +330,71 @@ test "native refinements benchmark" {
         std.debug.print("native_refinement {{\"case\":\"external_sort\",\"rows\":{d},\"unbuffered_ns\":{d},\"buffered_ns\":{d},\"unbuffered_first_row_ns\":{d},\"buffered_first_row_ns\":{d},\"unbuffered_peak_bytes\":{d},\"buffered_peak_bytes\":{d},\"spilled_bytes\":{d},\"unbuffered_reads\":{d},\"buffered_reads\":{d},\"unbuffered_writes\":{d},\"buffered_writes\":{d},\"unbuffered_allocations\":{d},\"buffered_allocations\":{d},\"unbuffered_reallocations\":{d},\"buffered_reallocations\":{d}}}\n", .{ count, unbuffered.ns, buffered.ns, unbuffered.first_ns, buffered.first_ns, unbuffered.peak, buffered.peak, buffered.written, unbuffered.reads, buffered.reads, unbuffered.writes, buffered.writes, unbuffered.allocations, buffered.allocations, unbuffered.reallocations, buffered.reallocations });
     }
 }
+
+fn nativeJoinBatch(batched: bool, count: usize) !struct { ns: i96, allocations: usize, peak: usize } {
+    var counted: CountingAllocator = .{};
+    var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 16 * 1024 * 1024 };
+    const a = budget.allocator();
+    var fixture = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer fixture.deinit();
+    const f = fixture.allocator();
+    const integers = try f.alloc(i64, count);
+    const strings = try f.alloc([]const u8, count);
+    const refs = try f.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
+    const selection = try f.alloc(usize, count);
+    const keys = try f.alloc([]const Datum, count);
+    const cells = try f.alloc(Datum, count);
+    for (integers, strings, refs, selection, keys, cells, 0..) |*integer, *string, *ref, *index, *key, *cell, i| {
+        integer.* = @intCast(i);
+        string.* = "wide repeated projected payload" ** 8;
+        ref.* = .{ .relational_key = "id" };
+        index.* = i;
+        cell.* = Datum.json(.{ .integer = @intCast(i) });
+        key.* = cells[i..][0..1];
+    }
+    const batch: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = &.{ .{ .name = "key", .values = .{ .i64 = integers } }, .{ .name = "payload", .values = .{ .bytes = strings } } } }, .selection = selection }, .definitions = &.{ .{ .name = "key", .type = .integer }, .{ .name = "payload", .type = .string } } } };
+    var elapsed: i96 = 0;
+    {
+        const join = try operators.HashJoin.create(a, .{ .bytes = 8 * 1024 * 1024, .rows = count });
+        defer join.deinit();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const started = now();
+        for (0..count / 1024) |group| {
+            _ = scratch.reset(.free_all);
+            var part = batch;
+            part.columns.page.selection = selection[group * 1024 ..][0..1024];
+            if (batched) {
+                try join.addBatch(scratch.allocator(), part, keys[group * 1024 ..][0..1024]);
+            } else {
+                const rows = try scratch.allocator().alloc([]const Datum, 1024);
+                for (rows, 0..) |*row, i| {
+                    const values = try part.row(scratch.allocator(), i);
+                    const owned = try scratch.allocator().alloc(Datum, values.len);
+                    for (values, owned) |value, *copy| copy.* = try operators.cloneDatum(scratch.allocator(), value);
+                    row.* = owned;
+                }
+                for (rows, keys[group * 1024 ..][0..1024]) |row, key| try join.add(row, key);
+            }
+        }
+        elapsed = now() - started;
+        _ = scratch.reset(.free_all);
+        var probe = try join.probe(keys[count - 1]);
+        const match = (try probe.next()).?;
+        const values = try match.materializeValues(scratch.allocator());
+        try std.testing.expectEqualStrings(strings[count - 1], values[1].value.string);
+        try std.testing.expect((try probe.next()) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    return .{ .ns = elapsed, .allocations = counted.allocations, .peak = budget.peak };
+}
+
+test "native refinements benchmark borrowed operator batches" {
+    for ([_]usize{ 8192, 32768 }) |count| for (0..3) |sample| {
+        const first = try nativeJoinBatch(sample % 2 != 0, count);
+        const second = try nativeJoinBatch(sample % 2 == 0, count);
+        const baseline = if (sample % 2 == 0) first else second;
+        const refined = if (sample % 2 == 0) second else first;
+        std.debug.print("native_refinement {{\"case\":\"borrowed_join_batch\",\"rows\":{d},\"sample\":{d},\"rows_ns\":{d},\"batch_ns\":{d},\"rows_allocations\":{d},\"batch_allocations\":{d},\"rows_peak_bytes\":{d},\"batch_peak_bytes\":{d}}}\n", .{ count, sample, baseline.ns, refined.ns, baseline.allocations, refined.allocations, baseline.peak, refined.peak });
+    };
+}

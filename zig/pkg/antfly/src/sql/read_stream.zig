@@ -197,6 +197,28 @@ test "SQL pull stream unwinds every allocation failure" {
 
 const Spool = @import("result_cursor.zig").Cursor;
 
+/// A stable owner for typed projected columns. HTTP/pgwire rows are gathered
+/// only for the delivery page; smaller fetch sizes do not clone an execution
+/// batch into a second pending row representation.
+const PendingColumns = struct {
+    backing: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    values: @import("typed_store.zig").Store,
+    exhausted: bool = false,
+    fn create(a: std.mem.Allocator) !*PendingColumns {
+        const self = try a.create(PendingColumns);
+        self.* = .{ .backing = a, .arena = .init(a), .values = undefined };
+        self.values = .init(self.arena.allocator());
+        return self;
+    }
+    fn deinit(self: *PendingColumns) void {
+        const a = self.backing;
+        self.values.deinit();
+        self.arena.deinit();
+        a.destroy(self);
+    }
+};
+
 pub const Stream = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
@@ -214,7 +236,7 @@ pub const Stream = struct {
     emitted: usize = 0,
     exhausted: bool = false,
     failed: bool = false,
-    pending_columns: ?Page = null,
+    pending_columns: ?*PendingColumns = null,
     pending_index: usize = 0,
 
     /// Caller retains the compiled plan and backend until close. A null result
@@ -351,7 +373,7 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
-        if (self.pending_columns) |*page| page.deinit();
+        if (self.pending_columns) |page| page.deinit();
         if (self.spool) |spool| spool.close();
         if (self.cursor) |cursor| cursor.close(cursor.ptr);
         if (self.after) |after| self.budget.allocator().free(after);
@@ -366,7 +388,7 @@ pub const Stream = struct {
         if (max_rows == 0 or max_rows > 4096) return error.InvalidSqlLimit;
         return self.pull(max_rows) catch |err| {
             self.failed = true;
-            if (self.pending_columns) |*page| page.deinit();
+            if (self.pending_columns) |page| page.deinit();
             self.pending_columns = null;
             if (self.spool) |spool| spool.close();
             self.spool = null;
@@ -418,21 +440,18 @@ pub const Stream = struct {
         }
         return values;
     }
-    fn executeColumns(self: *Stream, max_rows: u32) !Page {
-        var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
-        errdefer arena.deinit();
-        const out = arena.allocator();
-        var rows: std.ArrayList([]const Json) = .empty;
-        var flags: std.ArrayList([]const bool) = .empty;
+    fn executeColumns(self: *Stream, max_rows: u32) !*PendingColumns {
+        const pending = try PendingColumns.create(self.budget.allocator());
+        errdefer pending.deinit();
         var output_bytes: usize = 0;
-        while (!self.exhausted and rows.items.len < max_rows) {
+        while (!self.exhausted and pending.values.len < max_rows) {
             try self.context.checkpoint();
             self.pages += 1;
             if (self.pages > self.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
             defer scratch.deinit();
             const a = scratch.allocator();
-            const wanted: u32 = @intCast(@min(self.context.limits.execution_batch_rows, @min(self.remaining, max_rows - rows.items.len) +| self.skip));
+            const wanted: u32 = @intCast(@min(@min(self.context.limits.execution_batch_rows, @max(@as(usize, 1), self.context.limits.retained_bytes / (16 * 1024 + self.fields.len * @sizeOf(@import("scalar.zig").Datum) * 16))), @min(self.remaining, max_rows - pending.values.len) +| self.skip));
             const cursor = self.cursor.?;
             const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
             if (page.selection.len > wanted or page.selection.len > self.context.limits.scan_rows -| self.visited) return error.SqlProgramLimitExceeded;
@@ -453,34 +472,39 @@ pub const Stream = struct {
             }
             const selected: catalog.ColumnPage = .{ .batch = page.batch, .selection = selection.items };
             const projections = try a.alloc(?[]const @import("scalar.zig").Datum, self.fields.len);
-            for (projections, 0..) |*values, index| values.* = if (index < self.context.binding.scalars.projections.len) if (self.context.binding.scalars.projections[index]) |*program| try self.columnProgram(a, program, selected) else null else null;
+            @memset(projections, null);
+            var programs: std.ArrayList(*const @import("scalar.zig").Program) = .empty;
+            var slots: std.ArrayList(usize) = .empty;
+            for (self.context.binding.scalars.projections, 0..) |*optional, index| if (optional.*) |*program| {
+                try programs.append(a, program);
+                try slots.append(a, index);
+            };
+            const evaluated = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
+            for (evaluated, programs.items, slots.items) |values, program, index| projections[index] = values orelse try self.columnProgram(a, program, selected);
             for (0..selection.items.len) |index| {
-                const row = try out.alloc(Json, self.fields.len);
-                const nulls = try out.alloc(bool, self.fields.len);
-                for (self.fields, self.context.binding.columns, row, nulls, 0..) |field, column, *value, *is_null, ordinal| {
+                const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
+                for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
                     const cell = if (projections[ordinal]) |values| values[index] else blk: {
                         const raw = try selected.cell(a, index, field);
                         break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
                     };
-                    value.* = try describe.coerceAlloc(out, cell.value, column.type);
-                    value.* = (try @import("operators.zig").cloneDatum(out, .{ .value = value.*, .sql_null = cell.sql_null })).value;
-                    is_null.* = cell.sql_null;
-                    output_bytes +|= try @import("operators.zig").datumBytes(cell);
+                    value.* = .{ .value = try describe.coerceAlloc(a, cell.value, column.type), .sql_null = cell.sql_null };
+                    output_bytes +|= try @import("operators.zig").datumBytes(value.*);
                 }
-                try rows.append(out, row);
-                try flags.append(out, nulls);
+                _ = try pending.values.append(row);
                 self.remaining -= 1;
                 self.emitted += 1;
             }
             self.exhausted = self.remaining == 0 or page.after == null;
 
-            if (output_bytes >= self.context.limits.page_bytes) break;
+            if (output_bytes >= @min(self.context.limits.page_bytes, @max(@as(usize, 1024), self.context.limits.retained_bytes / 16))) break;
         }
         if (self.exhausted) {
             if (self.cursor) |cursor| cursor.close(cursor.ptr);
             self.cursor = null;
         }
-        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
+        pending.exhausted = self.exhausted;
+        return pending;
     }
     /// Evaluate native batches independently of HTTP/pgwire delivery sizes.
     /// The pending page owns projected values, so the scan can advance without
@@ -499,13 +523,14 @@ pub const Stream = struct {
                 // Execution may have reached EOF while delivery still has rows.
                 self.exhausted = false;
             }
-            const pending = &self.pending_columns.?;
-            while (self.pending_index < pending.output.rows.len and rows.items.len < max_rows) {
+            const pending = self.pending_columns.?;
+            while (self.pending_index < pending.values.len and rows.items.len < max_rows) {
                 const index = self.pending_index;
-                const row = try a.alloc(Json, pending.output.columns.len);
-                const nulls = try a.dupe(bool, pending.output.sql_nulls.?[index]);
-                for (pending.output.rows[index], nulls, row) |value, sql_null, *out| {
-                    const datum: @import("scalar.zig").Datum = .{ .value = value, .sql_null = sql_null };
+                const row = try a.alloc(Json, self.context.binding.columns.len);
+                const nulls = try a.alloc(bool, self.context.binding.columns.len);
+                for (row, nulls, 0..) |*out, *sql_null, column| {
+                    const datum = try pending.values.cell(a, index, column);
+                    sql_null.* = datum.sql_null;
                     out.* = (try @import("operators.zig").cloneDatum(a, datum)).value;
                     bytes +|= try @import("operators.zig").datumBytes(datum);
                 }
@@ -514,7 +539,7 @@ pub const Stream = struct {
                 self.pending_index += 1;
                 if (bytes >= self.context.limits.page_bytes) break;
             }
-            if (self.pending_index == pending.output.rows.len) {
+            if (self.pending_index == pending.values.len) {
                 self.exhausted = pending.exhausted;
                 pending.deinit();
                 self.pending_columns = null;

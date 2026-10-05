@@ -50,7 +50,61 @@ pub const Join = struct {
     partitions_loaded: usize = 0,
     filter: []u64,
     filtered_rows: usize = 0,
-    pub fn create(a: A, manager: *spill.Manager, bytes: usize, rows: usize, build_bytes: u64, outer_left: bool, outer_right: bool) !*Join {
+    parallel_builds: bool = false,
+    prepared: [2]?*Join = @splat(null),
+    preparing: [2]?@import("parallel_scheduler.zig").Task(anyerror!bool) = @splat(null),
+    active_join: ?*Join = null,
+    next_build_slot: usize = 0,
+    parallel_builds_started: usize = 0,
+    fn startBuilds(self: *Join) !void {
+        for (&self.prepared, &self.preparing) |*slot, *task| {
+            if (slot.* != null) continue;
+            while (self.partition < self.partitions) {
+                const index = self.partition;
+                self.partition += 1;
+                if (self.build[index] == null and self.probes[index] == null) continue;
+                const child = try Join.create(self.a, self.manager, self.limits.bytes, self.limits.rows, 0, self.outer_left, self.outer_right);
+                child.parallel_builds = false;
+                child.partitions = 0;
+                child.finished = true;
+                child.active = .{ .build = self.build[index], .probes = self.probes[index], .used_bits = self.partitions - 1 };
+                self.build[index] = null;
+                self.probes[index] = null;
+                slot.* = child;
+                task.* = @import("parallel_scheduler.zig").global().submit(self.manager.io, child.limits.bytes, Join.prepare, .{child});
+                if (task.* == null) _ = try child.prepare() else self.parallel_builds_started += 1;
+                break;
+            }
+        }
+    }
+    fn nextParallel(self: *Join) anyerror!?Pair {
+        while (true) {
+            if (self.active_join) |child| {
+                if (try child.next()) |pair| return pair;
+                self.partitions_loaded += child.partitions_loaded;
+                self.repartitions += child.repartitions;
+                child.close();
+                self.active_join = null;
+            }
+            try self.startBuilds();
+            const index: usize = if (self.prepared[self.next_build_slot] != null) self.next_build_slot else 1 - self.next_build_slot;
+            const child = self.prepared[index] orelse return null;
+            self.next_build_slot = 1 - index;
+            if (self.preparing[index]) |*task| {
+                const result = task.await(self.manager.io);
+                self.preparing[index] = null;
+                _ = try result;
+            }
+            self.active_join = child;
+            self.prepared[index] = null;
+            // Fill the vacated lane before probing this partition. Build I/O
+            // and hash admission overlap without changing residual ON handling.
+            try self.startBuilds();
+        }
+    }
+    pub fn create(backing: A, manager: *spill.Manager, bytes: usize, rows: usize, build_bytes: u64, outer_left: bool, outer_right: bool) !*Join {
+        _ = backing;
+        const a = manager.allocator();
         const self = try a.create(Join);
         errdefer a.destroy(self);
         const filter = try a.alloc(u64, @max(16, @min(8192, bytes / 128)));
@@ -58,10 +112,19 @@ pub const Join = struct {
         const target = @max(@as(usize, 1), bytes / 16);
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
-        self.* = .{ .a = a, .manager = manager, .limits = .{ .bytes = @max(8192, bytes / 2), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .filter = filter };
+        self.* = .{ .a = a, .manager = manager, .limits = .{ .bytes = @max(8192, bytes / 2), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 };
         return self;
     }
     pub fn close(self: *Join) void {
+        for (&self.preparing, &self.prepared) |*task, *child| {
+            if (task.*) |*active| {
+                _ = active.cancel(self.manager.io) catch false;
+                task.* = null;
+            }
+            if (child.*) |owner| owner.close();
+            child.* = null;
+        }
+        if (self.active_join) |owner| owner.close();
         if (self.hash) |hash| hash.deinit();
         for (&self.build, &self.probes) |*build, *probe| {
             if (build.*) |*file| file.close();
@@ -107,6 +170,7 @@ pub const Join = struct {
         _ = try slot.*.?.append(.{ .values = values, .keys = keys, .ordinal = ordinal }, spill.none);
     }
     pub fn accept(self: *Join, index: usize) !void {
+        if (self.active_join) |child| return child.accept(index);
         self.matched = true;
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
@@ -151,7 +215,7 @@ pub const Join = struct {
         self.repartitions += 1;
         return true;
     }
-    fn prepare(self: *Join) !bool {
+    fn prepare(self: *Join) anyerror!bool {
         while (self.hash == null) {
             try self.manager.check();
             if (self.active == null) {
@@ -192,12 +256,13 @@ pub const Join = struct {
         }
         return true;
     }
-    pub fn next(self: *Join) !?Pair {
+    pub fn next(self: *Join) anyerror!?Pair {
         if (!self.finished) {
             for (&self.build) |*file| if (file.*) |*open| try open.seal();
             for (&self.probes) |*file| if (file.*) |*open| try open.seal();
         }
         self.finished = true;
+        if (self.parallel_builds) return self.nextParallel();
         _ = self.candidate.reset(.free_all);
         while (try self.prepare()) {
             try self.manager.check();
@@ -234,38 +299,41 @@ test "SQL partitioned join retains one partition and preserves residual outer ma
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
-    var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
-    defer manager.deinit();
-    const join = try Join.create(std.testing.allocator, &manager, 64 * 1024, 10000, 200000, true, true);
-    defer join.close();
-    for (0..1000) |i| {
-        const key = Datum.json(.{ .integer = @intCast(i) });
-        try join.add(true, &.{key}, &.{key}, i);
-    }
-    for (500..1500) |i| {
-        const key = Datum.json(.{ .integer = @intCast(i) });
-        try join.add(false, &.{key}, &.{key}, i);
-    }
-    var matches: usize = 0;
-    var lefts: usize = 0;
-    var rights: usize = 0;
-    while (try join.next()) |pair| {
-        if (pair.match) |index| {
-            // One ON residual is rejected: both sides must remain unmatched.
-            if (pair.left.?[0].value.integer == 777) continue;
-            try join.accept(index);
-            matches += 1;
-        } else if (pair.left != null) {
-            lefts += 1;
-        } else {
-            rights += 1;
+    for ([_]usize{ 64 * 1024, 512 * 1024 }) |bytes| {
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        const join = try Join.create(std.testing.allocator, &manager, bytes, 10000, 200000, true, true);
+        defer join.close();
+        for (0..1000) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(true, &.{key}, &.{key}, i);
         }
+        for (500..1500) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(false, &.{key}, &.{key}, i);
+        }
+        var matches: usize = 0;
+        var lefts: usize = 0;
+        var rights: usize = 0;
+        while (try join.next()) |pair| {
+            if (pair.match) |index| {
+                // One ON residual is rejected: both sides must remain unmatched.
+                if (pair.left.?[0].value.integer == 777) continue;
+                try join.accept(index);
+                matches += 1;
+            } else if (pair.left != null) {
+                lefts += 1;
+            } else {
+                rights += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 499), matches);
+        try std.testing.expectEqual(@as(usize, 501), lefts);
+        try std.testing.expectEqual(@as(usize, 501), rights);
+        try std.testing.expect(join.partitions_loaded > 1);
+        if (bytes >= 512 * 1024) try std.testing.expect(join.parallel_builds_started > 0);
     }
-    try std.testing.expectEqual(@as(usize, 499), matches);
-    try std.testing.expectEqual(@as(usize, 501), lefts);
-    try std.testing.expectEqual(@as(usize, 501), rights);
-    try std.testing.expect(join.partitions_loaded > 1);
 }
 
 test "SQL partitioned join runtime filter preserves null and skew semantics" {

@@ -175,9 +175,9 @@ pub const Cursor = struct {
     next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
     /// Borrow immutable filter evidence before any pull; false declines it.
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
-    /// Split an unopened pinned scan into disjoint, ordered partitions. Child
-    /// cursors share the snapshot and are closed before their parent. Providers
-    /// decline when they cannot preserve contiguous source order.
+    /// Split an unopened pinned scan into disjoint work for exact associative
+    /// reducers. Providers may distribute row groups dynamically; child order
+    /// is not source order. Children share the snapshot and close before their parent.
     split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.

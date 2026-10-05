@@ -591,7 +591,7 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     for (got_row_groups) |group| {
         total_rows = std.math.add(u64, total_rows, group.row_count) catch return error.InvalidParquetMetadata;
     }
-    if (got_row_groups.len != 0 and total_rows != got_row_count) return error.InvalidParquetMetadata;
+    if (total_rows != got_row_count) return error.InvalidParquetMetadata;
     row_groups = null;
     const retained_columns: []SchemaColumn = schema_columns orelse &.{};
     schema_columns = null;

@@ -26,7 +26,8 @@ pub fn evaluateColumns(a: std.mem.Allocator, program: *const scalar.Program, pag
     return evaluateInput(a, program, ColumnInput{ .page = page, .columns = columns, .count = page.selection.len }, parameters);
 }
 pub fn evaluateColumnsScheduled(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, io: ?std.Io) !?[]const Datum {
-    if (io == null or page.selection.len < 1024) return evaluateColumns(a, program, page, columns, parameters);
+    const count = scheduledLanes(page.selection.len, program.instructions.len);
+    if (io == null or count == 1) return evaluateColumns(a, program, page, columns, parameters);
     const scheduling = @import("parallel_scheduler.zig");
     var allocator: scheduling.LockedAllocator = .{ .backing = a };
     const worker_alloc = allocator.allocator();
@@ -36,7 +37,6 @@ pub fn evaluateColumnsScheduled(a: std.mem.Allocator, program: *const scalar.Pro
         _ = active.cancel(io.?) catch {};
     };
     defer for (outputs) |output| if (output) |values| worker_alloc.free(values);
-    const count = @min(pending.len, (page.selection.len + 1023) / 1024);
     var failure: ?anyerror = null;
     for (0..count) |lane| {
         var part = page;
@@ -61,6 +61,111 @@ pub fn evaluateColumnsScheduled(a: std.mem.Allocator, program: *const scalar.Pro
     for (outputs[0..count], 0..) |output, lane| @memcpy(result[lane * page.selection.len / count .. (lane + 1) * page.selection.len / count], output.?);
     return result;
 }
+/// Parallel work must have multiple useful lanes and enough expression work
+/// to amortize task admission, joining and result assembly.
+fn scheduledLanes(rows: usize, instructions: usize) usize {
+    if (rows < 2048 or rows *| instructions < 8192) return 1;
+    return @min(@as(usize, 4), rows / 1024);
+}
+/// Fuse column normalization across a set of expressions. Unsupported/lazy
+/// programs decline before touching their inputs, preserving short-circuiting.
+pub fn evaluateColumnsMany(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) anyerror![]const ?[]const Datum {
+    const memo = try a.alloc(?[]const Datum, columns.len);
+    defer a.free(memo);
+    @memset(memo, null);
+    defer for (memo) |values| if (values) |vector| a.free(vector);
+    const outputs = try a.alloc(?[]const Datum, programs.len);
+    errdefer a.free(outputs);
+    @memset(outputs, null);
+    errdefer for (outputs) |values| if (values) |vector| a.free(vector);
+    const input = MemoInput{ .base = .{ .page = page, .columns = columns, .count = page.selection.len }, .memo = memo, .count = page.selection.len };
+    for (programs, outputs) |program, *output| output.* = try evaluateInput(a, program, input, parameters);
+    return outputs;
+}
+pub fn evaluateColumnsManyScheduled(a: std.mem.Allocator, programs: []const *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, io: ?std.Io) ![]const ?[]const Datum {
+    var work: usize = 0;
+    for (programs) |program| work +|= program.instructions.len;
+    const lanes = scheduledLanes(page.selection.len, work);
+    if (io == null or lanes == 1) return evaluateColumnsMany(a, programs, page, columns, parameters);
+    const scheduler = @import("parallel_scheduler.zig");
+    var locked: scheduler.LockedAllocator = .{ .backing = a };
+    const alloc = locked.allocator();
+    var tasks: [4]?scheduler.Task(anyerror![]const ?[]const Datum) = @splat(null);
+    var outputs: [4]?[]const ?[]const Datum = @splat(null);
+    defer for (&tasks) |*task| if (task.*) |*active| {
+        _ = active.cancel(io.?) catch &.{};
+    };
+    defer for (outputs) |output| if (output) |vectors| {
+        for (vectors) |vector| if (vector) |values| alloc.free(values);
+        alloc.free(vectors);
+    };
+    var failure: ?anyerror = null;
+    for (0..lanes) |lane| {
+        var part = page;
+        part.selection = page.selection[lane * page.selection.len / lanes .. (lane + 1) * page.selection.len / lanes];
+        tasks[lane] = scheduler.global().submit(io.?, (work +| columns.len +| 1) *| part.selection.len *| @sizeOf(Datum), evaluateColumnsMany, .{ alloc, programs, part, columns, parameters });
+        if (tasks[lane] == null) outputs[lane] = evaluateColumnsMany(alloc, programs, part, columns, parameters) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+    }
+    for (tasks[0..lanes], 0..) |*task, lane| if (task.*) |*active| {
+        const result = active.await(io.?);
+        task.* = null;
+        outputs[lane] = result catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+    };
+    if (failure) |err| return err;
+    const joined = try a.alloc(?[]const Datum, programs.len);
+    @memset(joined, null);
+    errdefer {
+        for (joined) |vector| if (vector) |values| a.free(values);
+        a.free(joined);
+    }
+    for (joined, 0..) |*vector, column| {
+        const supported = for (outputs[0..lanes]) |output| {
+            if (output.?[column] == null) break false;
+        } else true;
+        if (!supported) continue;
+        const values = try a.alloc(Datum, page.selection.len);
+        vector.* = values;
+        for (outputs[0..lanes], 0..) |output, lane| @memcpy(values[lane * page.selection.len / lanes .. (lane + 1) * page.selection.len / lanes], output.?[column].?);
+    }
+    return joined;
+}
+const MemoInput = struct {
+    base: ColumnInput,
+    memo: []?[]const Datum,
+    count: usize,
+    fn fillColumn(self: MemoInput, a: std.mem.Allocator, ordinal: u32, output: []Datum) !void {
+        if (ordinal >= self.memo.len) return error.InvalidSqlBackendResponse;
+        if (self.memo[ordinal] == null) {
+            const values = try a.alloc(Datum, self.count);
+            errdefer a.free(values);
+            try self.base.fillColumn(a, ordinal, values);
+            self.memo[ordinal] = values;
+        }
+        @memcpy(output, self.memo[ordinal].?);
+    }
+    fn cell(self: MemoInput, a: std.mem.Allocator, index: usize, ordinal: u32) !Datum {
+        return self.base.cell(a, index, ordinal);
+    }
+};
+pub fn evaluateBatch(a: std.mem.Allocator, program: *const scalar.Program, batch: @import("execution_batch.zig").Batch, parameters: []const std.json.Value) !?[]const Datum {
+    return evaluateInput(a, program, BatchInput{ .batch = batch, .count = batch.len() }, parameters);
+}
+const BatchInput = struct {
+    batch: @import("execution_batch.zig").Batch,
+    count: usize,
+    fn cell(self: BatchInput, a: std.mem.Allocator, index: usize, ordinal: u32) !Datum {
+        return self.batch.cell(a, index, ordinal);
+    }
+    fn fillColumn(self: BatchInput, a: std.mem.Allocator, ordinal: u32, output: []Datum) !void {
+        for (output, 0..) |*value, index| value.* = try self.cell(a, index, ordinal);
+    }
+};
 const RowInput = struct {
     rows: []const []const Datum,
     count: usize,
@@ -544,6 +649,12 @@ test "SQL shared scheduled column kernels match scalar values over permuted null
     complete.batch.row_refs = refs;
     const scheduled = (try evaluateColumnsScheduled(a, &program, complete, &definitions, &.{}, std.testing.io)).?;
     defer a.free(scheduled);
+    const fused = try evaluateColumnsManyScheduled(a, &.{ &program, &program }, complete, &definitions, &.{}, std.testing.io);
+    defer {
+        for (fused) |result| if (result) |vector| a.free(vector);
+        a.free(fused);
+    }
+    for (fused) |result| try std.testing.expectEqualDeep(scheduled, result.?);
     for (scheduled, selection) |actual, physical| {
         const source: Datum = if (nulls[physical] != 0) .{} else Datum.json(.{ .integer = values[physical] });
         const expected = try program.evaluate(a, &.{source}, &.{}, .{});
@@ -564,4 +675,28 @@ test "SQL dictionary kernels normalize selected values once and preserve missing
     try std.testing.expect(values[0].sql_null);
     try std.testing.expectEqual(@as(i64, 42), values[1].value.integer);
     try std.testing.expectEqual(@as(i64, 42), values[2].value.integer);
+}
+
+test "SQL adaptive scheduling keeps small lanes inline and fused columns lazy" {
+    try std.testing.expectEqual(@as(usize, 1), scheduledLanes(1024, 128));
+    try std.testing.expectEqual(@as(usize, 1), scheduledLanes(4096, 1));
+    try std.testing.expectEqual(@as(usize, 2), scheduledLanes(2048, 5));
+    try std.testing.expectEqual(@as(usize, 4), scheduledLanes(4096, 5));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    var first = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer first.deinit();
+    var second = try @import("compiler.zig").compileScalar(a, "CASE WHEN false THEN n / 0 ELSE 7 END", .{});
+    defer second.deinit();
+    var p1 = try scalar.bind(a, first.expression, &definitions, &.{}, .{});
+    defer p1.deinit();
+    var p2 = try scalar.bind(a, second.expression, &definitions, &.{}, .{});
+    defer p2.deinit();
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" } }, .columns = &.{.{ .name = "n", .values = .{ .i64 = &.{ 2, 5 } } }} }, .selection = &.{ 1, 0 } };
+    const outputs = try evaluateColumnsMany(a, &.{ &p1, &p2 }, page, &definitions, &.{});
+    try std.testing.expectEqual(@as(i64, 6), outputs[0].?[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 3), outputs[0].?[1].value.integer);
+    try std.testing.expect(outputs[1] == null);
 }

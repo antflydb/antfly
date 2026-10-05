@@ -65,7 +65,8 @@ Table creation can infer and persist columns/fingerprints from every Parquet
 footer or the selected Iceberg schema. Inference preserves requiredness and
 rejects incompatible or unsupported flat types; nested/binary schemas need a
 compatible source. SQL never changes catalog types while reading files. Empty
-Iceberg tables can serve zero rows. Optional missing Parquet columns are SQL NULL.
+Parquet files (including both independent PyArrow layouts) and Iceberg tables
+serve zero rows. Optional missing Parquet columns are SQL NULL.
 Iceberg projection resolves the selected schema's field IDs against each footer,
 so renames preserve values and reused names with new IDs yield NULL for absent
 optional fields. Row-group pruning uses the same mapping. Required missing IDs,
@@ -105,13 +106,31 @@ pages without retaining the entire response or rescanning sources. HTTP JSON
 response limits and bounded materialization for blocking external decision
 projections remain. These layers use the same native snapshot-bound providers. Execution batches
 remain independent of delivery page sizes. Eligible exact aggregates use up to
-four contiguous pinned file or row-group partitions, private worker readers and
-local typed states merged in source order. Floating-point, DISTINCT and pattern
-reductions retain ordered execution; exhausted local memory retries through the
-pinned serial spilling scan. Shared scheduling bounds all workers and releases
+four workers claiming pinned row-group tasks from a shared queue. Larger compressed
+groups start first; private readers share immutable metadata and decoded pages.
+Local typed states can spill and merge exact partial sums without rescanning
+input. Floating-point, DISTINCT and pattern reductions retain ordered execution.
+Shared scheduling bounds all workers and releases
 speculative warming admission on completion. Sequential sort/join/group spills
 use typed, checksummed column blocks where multiple rows fit, compact records
 for wide rows, and optional Snappy compression.
+
+Borrowed operator batches preserve physical scan vectors and selection masks
+through simple filters, projections and join admission. Probe payloads are
+gathered only for candidates or required outer rows; relational adapters expose
+columns to subsequent aggregation and projection without per-row JSON objects.
+Delivery retains typed projected columns until HTTP/pgwire needs a bounded row
+page. Lazy/provider and pattern-set plans keep their scalar/row semantics.
+
+Decoded cache identity describes the physical page interpretation, independently
+of projection width or scan memory policy. Each hit validates consumer admission,
+so bounded lookahead pages are reusable by foreground readers. Expression groups
+share lazy column normalization; batches use CPU tasks only with multiple useful
+lanes and enough work to amortize scheduling. Larger external sorts build one run
+in the background while ingesting the next; partitioned joins prepare independent
+builds ahead of probing. Small budgets retain inline paths. Parallel operators
+share synchronized statement allocation, disk quotas and task admission, and join
+workers before releasing their buffers or snapshots.
 
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 

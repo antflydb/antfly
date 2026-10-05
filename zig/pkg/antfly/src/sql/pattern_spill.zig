@@ -22,7 +22,7 @@ pub const Set = struct {
         }
         self.file = manager.pattern_file.?;
         self.interface = .{ .ptr = self, .count = 0, .next = next, .close = close };
-        try manager.patterns.append(manager.alloc, &self.interface);
+        try manager.registerPattern(&self.interface);
         return self;
     }
     pub fn append(self: *Set, value: scalar.Datum) !void {

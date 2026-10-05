@@ -1,6 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
-//! Disjoint pinned scans with exact local reducers and deterministic merging.
+//! Shared pinned scan work with exact local reducers and spillable partial states.
 const std = @import("std");
 const runtime = @import("runtime.zig");
 const catalog = @import("catalog.zig");
@@ -16,7 +16,7 @@ const Work = struct {
     pages: *std.atomic.Value(usize),
     fn run(self: Work) anyerror!*operators.Grouped {
         var context = self.context;
-        const local = operators.Grouped.create(context.alloc, self.bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / (4 * self.parts) }) catch return error.ParallelAggregateMemoryExceeded;
+        const local = operators.Grouped.create(context.alloc, self.bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / (4 * self.parts), .spill = context.spill }) catch return error.ParallelAggregateMemoryExceeded;
         errdefer local.deinit();
         if (self.bound.group_count == 0) local.ensureGlobalGroup() catch return error.ParallelAggregateMemoryExceeded;
         while (true) {
@@ -59,7 +59,7 @@ pub fn execute(context: runtime.Context, bound: *const binding.Bound, grouped: *
     if (bound.input.predicate) |program| if (!compatible(program)) return false;
     for (bound.input.projections) |program| if (program) |value| if (!compatible(value)) return false;
     var allocator: scheduling.LockedAllocator = .{ .backing = context.alloc };
-    const a = allocator.allocator();
+    const a = if (context.spill) |manager| manager.allocator() else allocator.allocator();
     const cursors = (scan.partitions(context, a, table, request, 4) catch |err| return switch (err) {
         error.OutOfMemory => false,
         else => err,

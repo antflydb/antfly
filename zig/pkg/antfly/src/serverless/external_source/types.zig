@@ -107,7 +107,6 @@ pub const RowGroup = struct {
     }
 
     pub fn validate(self: RowGroup, file_len: u64) !void {
-        if (self.row_count == 0) return error.InvalidExternalSourceInventory;
         if (self.total_byte_len != 0) {
             if (self.file_offset > file_len) return error.InvalidExternalSourceInventory;
             if (self.total_byte_len > file_len - self.file_offset) return error.InvalidExternalSourceInventory;

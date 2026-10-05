@@ -1831,7 +1831,7 @@ const PlainI64ModeRequest = union(enum) {
     from_inventory,
 };
 
-fn admitMaterialization(
+pub fn admitMaterialization(
     raw_row_count: u64,
     projected_column_count: usize,
     limits: MaterializationLimits,
@@ -2828,6 +2828,7 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
     for (inventory.files) |file| {
         if (!fileMayMatchPredicate(file, predicate)) continue;
         for (file.row_groups) |row_group| {
+            if (row_group.row_count == 0) continue;
             for (projected_columns) |column| {
                 const chunk = findColumnChunk(row_group, column) orelse return error.ParquetColumnNotFound;
                 try validatePlannedChunk(inventory.format, chunk, validation);
@@ -2844,6 +2845,7 @@ fn planObjectRangeRowGroupsForPredicateAlloc(
     for (inventory.files) |file| {
         if (!fileMayMatchPredicate(file, predicate)) continue;
         for (file.row_groups) |row_group| {
+            if (row_group.row_count == 0) continue;
             if (!rowGroupMayMatchPredicate(row_group, predicate)) continue;
             row_groups[out_idx] = .{
                 .file_id = file.file_id,

@@ -136,10 +136,17 @@ pub const Cursor = struct {
             if (len > self.limits.max_input_bytes / share or parsed.header.uncompressed_page_size +| dictionary_bytes > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
             var cache_key: ?[32]u8 = null;
             if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
-                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v1", .chunk = column.chunk, .limits = self.limits, .columns = self.columns.len }, .{});
+                // Resource policy is checked for each consumer, independently
+                // of the immutable physical interpretation of a page.
+                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v2", .chunk = column.chunk, .decimal_representation = "exact_string", .preserve_dictionary = true }, .{});
                 defer self.a.free(interpretation);
                 cache_key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
                 if (reader.cache.decoded.lookup(cache_key.?)) |lease| {
+                    errdefer lease.release();
+                    var admission = self.limits;
+                    admission.max_rows = @max(admission.max_rows, parsed.header.value_count);
+                    admission.max_struct_allocation_bytes /= share;
+                    _ = try parquet.admitMaterialization(parsed.header.value_count, 1, admission);
                     column.cached = lease;
                     column.offset += len;
                     column.count = parsed.header.value_count;

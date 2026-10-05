@@ -391,6 +391,7 @@ const Owner = struct {
             cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
             child.partition_source = source;
+            child.stream.work = self.stream.work;
             child.stream.partition_index = index;
             child.stream.partition_count = count;
             opened += 1;
@@ -974,7 +975,7 @@ test "lake SQL review evolved nullable equality column absent from older data" {
     try std.testing.expectEqual(@as(usize, 3), page.rows.len);
 }
 
-test "lake SQL ordered partitions and exact parallel reducers match serial groups" {
+test "lake SQL shared row group tasks and exact parallel reducers match serial groups" {
     const a = std.testing.allocator;
     const Cache = @import("../serverless/query/lake_serving_cache.zig").Cache;
     var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
@@ -991,6 +992,7 @@ test "lake SQL ordered partitions and exact parallel reducers match serial group
     defer a.free(parts);
     defer for (parts) |part| part.close(part.ptr);
     try std.testing.expectEqual(@as(usize, 4), parts.len);
+    var total: usize = 0;
     for (parts) |part| {
         var count: usize = 0;
         while (true) {
@@ -1000,8 +1002,9 @@ test "lake SQL ordered partitions and exact parallel reducers match serial group
             count += page.selection.len;
             if (page.after == null) break;
         }
-        try std.testing.expectEqual(values.len, count);
+        total += count;
     }
+    try std.testing.expectEqual(values.len * 4, total);
     const Backend = struct {
         lake: *TestLake,
         fn resolve(raw: *anyopaque, _: Allocator, _: @import("../sql/ast.zig").Name, _: catalog.Action) !catalog.Table {
@@ -1042,8 +1045,7 @@ test "lake SQL ordered partitions and exact parallel reducers match serial group
         try std.testing.expectEqualDeep(serial.output.rows, parallel.output.rows);
         try std.testing.expectEqualDeep(serial.output.sql_nulls, parallel.output.sql_nulls);
     }
-    // A high-cardinality local reducer can exceed its shard. The pinned
-    // parent must remain readable for the serial spilling fallback.
+    // High-cardinality local reducers spill and merge under shard budgets.
     var high = try compiler.compile(a, "SELECT amount, SUM(amount) FROM events GROUP BY amount ORDER BY amount LIMIT 3", .{});
     defer high.deinit();
     var backend = fixture.backend();
@@ -1053,4 +1055,97 @@ test "lake SQL ordered partitions and exact parallel reducers match serial group
     try std.testing.expectEqual(@as(usize, 3), small.output.rows.len);
     try std.testing.expectEqualStrings("0", small.output.rows[0][0].string);
     try std.testing.expectEqualStrings("8", small.output.rows[2][1].string);
+}
+
+test "lake SQL empty independent Parquet layouts retain schema and exhaust without partitions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        @embedFile("../serverless/query/testdata/pyarrow_empty_no_groups.parquet"),
+        @embedFile("../serverless/query/testdata/pyarrow_empty_row_group.parquet"),
+    }) |data| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populateData(a, 1, data);
+        defer lake.deinit(a);
+        var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+        defer cache.deinit();
+        try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+        const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+        defer parent.close(parent.ptr);
+        try std.testing.expect((try parent.split_scan.?(parent.ptr, a, 4)) == null);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const page = try parent.next_columns.?(parent.ptr, arena.allocator(), 1024);
+        try std.testing.expectEqual(@as(usize, 0), page.selection.len);
+        try std.testing.expect(page.after == null);
+        const count = try openPinned(a, lake.table, .{ .fields = &.{}, .limit = 1 }, .{}, &lake.source);
+        defer count.close(count.ptr);
+        try std.testing.expectEqual(@as(?u64, 0), try count.count_rows.?(count.ptr));
+    }
+}
+
+test "lake SQL decoded pages reuse semantic identity across budgets and projection widths" {
+    const a = std.testing.allocator;
+    const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{
+        .{ .column_id = "amount", .values = &.{ 1, 2, 3 }, .field_id = 1 },
+        .{ .column_id = "payload", .values = &.{ 4, 5, 6 }, .field_id = 2 },
+    });
+    defer a.free(data);
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 1, data);
+    defer lake.deinit(a);
+    lake.table.columns = &.{ .{ .name = "amount", .path = "amount", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .integer } };
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    for (0..4) |iteration| {
+        const cursor = try openPinned(a, lake.table, .{ .fields = if (iteration == 2) &.{ "amount", "payload" } else &.{"amount"}, .limit = 3 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        if (iteration == 0) {
+            owner.stream.limits.max_input_bytes = 2 * 1024 * 1024;
+            owner.stream.limits.max_decoded_bytes = 2 * 1024 * 1024;
+        }
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        if (iteration == 3) {
+            owner.stream.limits.max_decoded_bytes = 100;
+            try std.testing.expectError(error.ParquetRowGroupTooLarge, cursor.next_columns.?(cursor.ptr, arena.allocator(), 3));
+            continue;
+        }
+        const page = try cursor.next_columns.?(cursor.ptr, arena.allocator(), 3);
+        try std.testing.expectEqual(@as(usize, 3), page.selection.len);
+        try std.testing.expectEqual(@as(usize, if (iteration == 1) 0 else 1), owner.stream.page_cursor.?.pages_decoded);
+        try std.testing.expectEqual(@as(i64, 2), (try page.cell(arena.allocator(), 1, "amount")).value.integer);
+    }
+}
+
+test "lake SQL shared tasks cover single file row groups exactly once" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 1, @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"));
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
+    const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+    defer parent.close(parent.ptr);
+    const parts = (try parent.split_scan.?(parent.ptr, a, 4)).?;
+    defer a.free(parts);
+    defer for (parts) |part| part.close(part.ptr);
+    const owner: *Owner = @ptrCast(@alignCast(parent.ptr));
+    const work = owner.stream.work.?;
+    try std.testing.expect(work.units.len > parts.len);
+    for (work.units[1..], work.units[0 .. work.units.len - 1]) |later, earlier| try std.testing.expect(later.bytes <= earlier.bytes);
+    var row_count: usize = 0;
+    for (parts) |part| while (true) {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const page = try part.next_columns.?(part.ptr, arena.allocator(), 128);
+        row_count += page.selection.len;
+        if (page.after == null) break;
+    };
+    try std.testing.expect(work.next.load(.monotonic) >= work.units.len);
+    // Parent remains readable after children consume the queue.
+    const parent_count = (try parent.count_rows.?(parent.ptr)).?;
+    try std.testing.expectEqual(parent_count, row_count);
 }
