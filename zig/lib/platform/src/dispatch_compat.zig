@@ -74,6 +74,9 @@ backing_allocator: Allocator,
 main_fiber: Fiber,
 main_loop_stack: [*]align(builtin.target.stackAlignment()) u8,
 exit_semaphore: c.dispatch.semaphore_t,
+group_cleanup_mutex: ThreadMutex,
+group_cleanup_cond: c.pthread_cond_t,
+pending_group_cleanup: usize,
 
 use_sendfile: UseSendfile,
 use_fcopyfile: UseFcopyfile,
@@ -556,6 +559,9 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .queue = queue,
         .backing_allocator_needs_mutex = options.backing_allocator_needs_mutex,
         .backing_allocator_mutex = undefined,
+        .group_cleanup_mutex = .{},
+        .group_cleanup_cond = c.PTHREAD_COND_INITIALIZER,
+        .pending_group_cleanup = 0,
         .backing_allocator = backing_allocator,
         .main_fiber = .{
             .required_align = {},
@@ -594,6 +600,11 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
         .csprng_mutex = undefined,
         .csprng = .uninitialized,
     };
+    errdefer {
+        const result = c.pthread_cond_destroy(&ev.group_cleanup_cond);
+        assert(result == .SUCCESS);
+        ev.group_cleanup_mutex.deinit();
+    }
     ev.backing_allocator_mutex = .{};
     errdefer ev.backing_allocator_mutex.deinit();
     var initialized_futexes: usize = 0;
@@ -625,6 +636,17 @@ pub fn init(ev: *Evented, backing_allocator: Allocator, options: InitOptions) !v
 
 pub fn deinit(ev: *Evented) void {
     assert(Thread.current().currentFiber() == &ev.main_fiber);
+    // Group tokens can become empty before a completion callback returns.
+    // Drain cleanup before destroying any allocator or backend state.
+    ev.group_cleanup_mutex.lock();
+    while (ev.pending_group_cleanup != 0) {
+        const result = c.pthread_cond_wait(&ev.group_cleanup_cond, &ev.group_cleanup_mutex.raw);
+        assert(result == .SUCCESS);
+    }
+    ev.group_cleanup_mutex.unlock();
+    const result = c.pthread_cond_destroy(&ev.group_cleanup_cond);
+    assert(result == .SUCCESS);
+    ev.group_cleanup_mutex.deinit();
     ev.yield(.exit);
     ev.csprng_mutex.deinit();
     if (ev.dev_null_file) |file| fileClose(ev, &.{file}) else |_| {}
@@ -691,7 +713,7 @@ const SwitchMessage = struct {
         futex_wake: *Futex.Waker,
         sleep_wait: *SleepWaiter,
         after: c.dispatch.time_t,
-        destroy,
+        group_finish: *Fiber,
         finish: *Fiber,
         exit,
     };
@@ -753,9 +775,21 @@ const SwitchMessage = struct {
                 const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
                 when.after(ev.queue, fiber, &Fiber.@"resume");
             },
-            .destroy => {
-                const fiber: *Fiber = @alignCast(@fieldParentPtr("context", message.contexts.old));
+            .group_finish => |fiber| {
+                // The child stack is inactive. Free it before resuming a group
+                // awaiter, and keep teardown blocked until this callback is done.
+                const group = Group.AsyncClosure.fromFiber(fiber).group;
+                const awaiter = group.removeFiber(ev, fiber);
                 fiber.destroy(ev);
+                if (awaiter) |waiting| ev.queue.async(waiting, &Fiber.@"resume");
+                ev.group_cleanup_mutex.lock();
+                assert(ev.pending_group_cleanup != 0);
+                ev.pending_group_cleanup -= 1;
+                if (ev.pending_group_cleanup == 0) {
+                    const result = c.pthread_cond_signal(&ev.group_cleanup_cond);
+                    assert(result == .SUCCESS);
+                }
+                ev.group_cleanup_mutex.unlock();
             },
             .finish => |fiber| {
                 // Publish completion only after leaving the finished stack. An
@@ -986,6 +1020,7 @@ const Mutex = struct {
             waiter.cancelable.leave(waiter.sleeper.fiber) catch |err| switch (err) {
                 error.CancelRequested => {
                     waiter.node.next = &waiter.node;
+                    waiter.mutex.unlock();
                     return;
                 },
             };
@@ -1011,34 +1046,30 @@ const Mutex = struct {
 
         fn remove(context: ?*anyopaque) callconv(.c) void {
             const mutex: *Mutex = @ptrCast(@alignCast(context));
-            var state = @atomicLoad(State, &mutex.state, .monotonic);
-            while (!state.locked and state.num_waiters > 0) {
-                @branchHint(.likely);
-                state = @cmpxchgWeak(State, &mutex.state, state, .{
-                    .locked = true,
-                    .num_waiters = state.num_waiters - 1,
-                }, .acquire, .monotonic) orelse break;
-            } else return;
-            var num_removed: State.NumWaiters = 0;
-            while (mutex.waiters.popFirst()) |node| {
-                @branchHint(.likely);
+            // This callback and add/canceled run on the same serial queue.
+            // Reserve ownership only when a waiter is actually in the list.
+            while (mutex.waiters.first != null) {
+                var state = @atomicLoad(State, &mutex.state, .monotonic);
+                while (!state.locked and state.num_waiters > 0) {
+                    state = @cmpxchgWeak(State, &mutex.state, state, .{
+                        .locked = true,
+                        .num_waiters = state.num_waiters - 1,
+                    }, .acquire, .monotonic) orelse break;
+                } else return;
+                const node = mutex.waiters.popFirst().?;
                 const waiter: *Waiter = @fieldParentPtr("node", node);
                 node.* = undefined;
                 waiter.cancelable.leave(waiter.sleeper.fiber) catch |err| switch (err) {
                     error.CancelRequested => {
-                        num_removed += 1;
+                        // The cancellation callback will wake this task. It no
+                        // longer owns a list entry or a reservation on the lock.
                         node.next = node;
+                        mutex.unlock();
                         continue;
                     },
                 };
-                break;
-            }
-            if (num_removed > 0) {
-                @branchHint(.unlikely);
-                assert(@atomicRmw(State, &mutex.state, .Sub, .{
-                    .locked = false,
-                    .num_waiters = num_removed,
-                }, .monotonic).num_waiters >= num_removed);
+                waiter.wake();
+                return;
             }
         }
 
@@ -1486,8 +1517,7 @@ const Group = struct {
             const fiber = closure.fiber;
             message.handle(ev);
             closure.start(closure.contextPointer());
-            if (closure.group.removeFiber(ev, fiber)) |awaiter| ev.queue.async(awaiter, &Fiber.@"resume");
-            ev.yield(.destroy);
+            ev.yield(.{ .group_finish = fiber });
             unreachable; // switched to dead fiber
         }
     };
@@ -1551,6 +1581,9 @@ fn groupConcurrent(
         .start = start,
     };
     @memcpy(closure.contextPointer(), context);
+    ev.group_cleanup_mutex.lock();
+    ev.pending_group_cleanup += 1;
+    ev.group_cleanup_mutex.unlock();
     group.addFiber(ev, fiber);
     ev.queue.async(fiber, &Fiber.@"resume");
 }
