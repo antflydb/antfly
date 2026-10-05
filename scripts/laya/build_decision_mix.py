@@ -33,7 +33,7 @@ directly. A teacher can later replace or blend targets
 (prepare_laya_longcontext_teacher.py).
 
 Every file comes from a pinned revision and is checked against its SHA-256
-(sources marked None print their digest with --print-pins, to be pinned).
+(--print-pins prints the digests of the files as fetched).
 Licenses are all permissive; CC BY-SA sets are deliberately left out, and so
 are CLINC150 and SST-5, which Antenna holds out for evaluation. Texts that
 appear in any --exclude file (typed-decisions test, Banking77 test) are
@@ -73,23 +73,23 @@ HF = "https://huggingface.co/datasets"
 SOURCES: dict[str, tuple[str, str | None]] = {
     "goemotions": (
         f"{HF}/google-research-datasets/go_emotions/resolve/add492243ff905527e67aeb8b80c082af02207c3/simplified/train-00000-of-00001.parquet",
-        None,
+        "b7d74279616ae7c9b8374ab62ea9f9d6504d36a577bb17f745d720dc2b0d4e76",
     ),
     "civil0": (
         f"{HF}/google/civil_comments/resolve/f2970eb3a55777454c94069077cc8d9b5866312d/data/train-00000-of-00002.parquet",
-        None,
+        "c20f01c3aecbdd942886cacb0ee67e995df33bc712a622fde75927ed3d6ccefe",
     ),
     "wanli": (
         f"{HF}/alisawuffles/WANLI/resolve/61c95318fd71c55b6ba355d76253254615f387ec/train.jsonl",
-        None,
+        "85058cf017a911e89242dc29fa0a4ddaad3664cb923dc0a82145fdda14b694e5",
     ),
     "paws": (
         f"{HF}/google-research-datasets/paws/resolve/161ece9501cf0a11f3e48bd356eaa82de46d6a09/labeled_final/train-00000-of-00001.parquet",
-        None,
+        "8dc9ad3e5f30ad9a86b290fe236d528ef23a5751fec9a35d99cbacf68ba277cf",
     ),
     "sms": (
         "https://archive.ics.uci.edu/static/public/228/sms+spam+collection.zip",
-        None,
+        "1587ea43e58e82b14ff1f5425c88e17f8496bfcdb67a583dbff9eefaf9963ce3",
     ),
 }
 
