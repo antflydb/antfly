@@ -139,7 +139,7 @@ const Decision = struct {
     confidence_method: []const u8,
     expected_value: ?f32,
     true_probability: ?f32,
-    act_probability: f32,
+    act_probability: ?f32,
 };
 const Classification = struct { name: []const u8, label: []const u8, score: f32 };
 const Output = struct { id: ?[]const u8, classifications: []Classification, decisions: []Decision };

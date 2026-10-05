@@ -1904,7 +1904,7 @@ fn cudaProfileForArch(
     return switch (arch_config) {
         .clip, .clap => .clipclap,
         .bert => .bert_encoder,
-        .modern_bert => |cfg| if (cfg.laya != null and !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
+        .modern_bert => |cfg| if (cfg.laya != null and cfg.laya.?.format == .laya and !cfg.laya.?.packing.enabled() and cfg.laya.?.max_len <= 512 and cfg.num_attention_heads > 0 and cfg.hidden_size / cfg.num_attention_heads <= 128) .laya else null,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
         .florence => .florence2,

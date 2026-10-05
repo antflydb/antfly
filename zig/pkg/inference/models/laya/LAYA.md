@@ -972,6 +972,51 @@ What bears on Laya:
 - Antenna's step 8 (a schema-blind trunk with task branches) should expect
   the same accuracy loss unless one of those closes it.
 
+### Other decision models (research, 2026-10-04)
+
+Figures below are each project's own; none has been reproduced here except
+where noted.
+
+| Model | Base | Open | How options are scored | State shared across questions? |
+| --- | --- | --- | --- | --- |
+| [Cloudflare Clef / Clef-flash](https://blog.cloudflare.com/clef-decision-models/) | Qwen 27B / 9B, frozen, LoRA rank 256 | Apache 2.0 | a small transformer head that routes state evidence to each question and scores all options of all questions jointly | no isolation: questions attend to each other |
+| [Fastino GLiDE](https://fastino.ai/blog/introducing-glide-the-first-thinking-decision-model) | undisclosed | API only | a fast distribution first, then extra reasoning when the top answer is uncertain | undisclosed |
+| [Amazon Strands Decider 2B](https://www.beri.net/article/cloudflare-clef-amazon-strands-decider-open-weight-decision-models-vs-jev-benchmarks-pricing) | Qwen3.5-2B, LoRA rank 16 | Apache 2.0 | a pointer head of about 1M parameters | not stated |
+| [OpenDecider-nano](https://huggingface.co/manjunathshiva/opendecider-nano) | Ettin-encoder-400m (ModernBERT architecture), fully fine-tuned | Apache 2.0 (Ettin: MIT) | Laya's scheme: one `[MASK]` per option, an MLP per marker, softmax per question | no: question first, state re-encoded per question |
+
+- **Clef.** Clef-flash runs at a 38.8 ms median against Jev's 524 ms. It wins
+  on routing (Banking77 macro-F1 94.2 against 79.7) and loses on judgment
+  (When2Call 72.4 against 81.0). Hosted, it costs $0.09 (flash) and $0.24 per
+  million input tokens, against Jev's $0.042.
+- **GLiDE.** An independent test found a median of about 1 s and tails past
+  two minutes, and weaker calibration than Jev: at a 90% confidence cutoff
+  it answered 26% of decisions at 84.5% accuracy, against Jev's 70% at
+  95.9%.
+- **OpenDecider-nano** scores 0.796 on the full typed-decisions test split
+  (2,000 decisions), against 0.766 for Laya's typed-decisions checkpoint;
+  both were fine-tuned on its train split. Jev's 0.754 is zero-shot. Before
+  that fine-tune it was distilled on about 190,000 questions (public
+  classification, NLI, reading-comprehension and similar sets, plus
+  synthetic business cases). The targets were the averaged distributions of
+  Qwen3-235B and DeepSeek V4.1 Flash, each temperature-scaled on held-out
+  gold. It took under $30 of GPU time.
+
+**What this means for Laya.**
+- **Scale and calibrated teachers, not the base, separate OpenDecider from
+  Laya.** It is a 400M ModernBERT-family encoder with Laya's scorer and
+  Laya's unpacked layout. Its training set is about 100× our step-0 split,
+  and its targets are calibrated teacher distributions. That is the scale
+  hypothesis of [How Jev likely closes this gap](#how-jev-likely-closes-this-gap-research-2026-09-26),
+  shown for the unpacked layout. Whether scale also closes the packed gap
+  is untested; our 64k-row Open-Jev run used rule labels.
+- **Isolation is a product choice.** Clef scores questions jointly, so
+  `trunk_sees: "questions"` (0.554, packed cost) is a defensible mode.
+- **Decoders cost more.** Clef and Strands Decider show the decoder route
+  works, but at 2–6× Jev's price per token. An open decoder baseline already
+  exists (Strands Decider 2B), so building one is not a priority.
+- **Confidence-gated escalation** (GLiDE, Jeeves) fits Laya as a fast path in
+  front of a reasoning model, with a hard latency budget.
+
 ### Scaling packed training on Open-Jev (2026-09-27)
 
 This is the test of the scale hypothesis above. It trains the default,
@@ -2351,6 +2396,59 @@ example Qwen3.5-0.8B, as in `jevre`) at every length targeted here. At 8k it
 needs about half the per-token compute. At 32k, ModernBERT-large's ten global
 layers make their attention cost comparable to the decoder's. The decoder only
 pulls ahead well beyond 32k, where Laya's encoder was not pretrained anyway.
+
+### Priorities after the decision-model survey (2026-10-04)
+
+From [Other decision models](#other-decision-models-research-2026-10-04),
+in order:
+
+1. **Serve OpenDecider-nano.** Done: `laya.format: "opendecider"` with
+   `scripts/laya/prepare_opendecider.py`. It matches its PyTorch
+   implementation on the typed-decisions test split (see below).
+2. **Report on the community benchmark.** Done for every checkpoint so far
+   (below). Score new models on the full typed-decisions test split (2,000
+   decisions, `scripts/laya/typed_decisions_bench.py`), the split OpenDecider,
+   Laya and Jev report, alongside the 760-decision step-0 eval.
+3. **Teacher-distilled data at scale.** Build about 150,000–200,000
+   decisions labelled by calibrated teachers (step 2a's Qwen3-14B scorer).
+   Train unpacked first, to reproduce OpenDecider's result on our encoders,
+   then packed, to test whether scale closes the packed gap.
+4. **Question-aware trunk as a supported mode,** if scale does not close the
+   gap.
+5. **Confidence-gated escalation,** at the product level.
+
+### Community benchmark (2026-10-04)
+
+Every model on the full typed-decisions test split (2,000 decisions), scored
+against gold labels with `scripts/laya/typed_decisions_bench.py --gold`.
+States longer than a checkpoint's budget are cut (`--truncate-state`), as
+upstream does. Laya's 512 tokens cut 160 decisions; OpenDecider's 2,048 cut
+none. Step-0 fine-tunes use the documented recipe of [Base-size encoder](#base-size-encoder-step-2d-2026-10-03)
+unless noted.
+
+| Model | Accuracy | Choice | Score | Yes/no | ECE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OpenDecider-nano, served natively (Metal) | **0.796** | 0.762 | 0.769 | 0.867 | 0.164 |
+| Laya typed-decisions checkpoint (published, trained on the full train split) | 0.766 | 0.733 | 0.723 | 0.857 | |
+| Laya-large, step-0 fine-tune (seed 42) | 0.627 | 0.633 | 0.560 | 0.712 | 0.088 |
+| Antenna-base, step-0 fine-tune (3 seeds) | 0.533 (0.579 / 0.495 / 0.525) | | | | |
+| Antenna-base, frozen trunk + head (dec7) | 0.535 | 0.538 | 0.439 | 0.662 | 0.084 |
+| ModernBERT-base, step-0 fine-tune (3 seeds) | 0.472 (0.489 / 0.483 / 0.444) | | | | |
+| Released Laya-large, zero-shot | 0.361 | 0.288 | 0.323 | 0.487 | 0.175 |
+
+- **Parity.** Antfly's OpenDecider-nano matches the model's own PyTorch
+  implementation to 2.8e-6 in probability on every decision and reproduces its
+  published 0.796, 0.762, 0.769 and 0.867.
+- **Scoring.** The gold label and the argmax of the gold distribution
+  disagree on 31 decisions, so accuracy against gold labels (the Antz AI
+  harness, and every published number) differs slightly from `finetune eval
+  laya`'s, which scores the argmax.
+- **The gap is training data.** OpenDecider-nano and our step-0 fine-tunes
+  share the unpacked layout and scorer and have bases of similar size. It
+  leads Laya-large's step-0 fine-tune by 0.17 and Antenna-base by 0.26.
+  Laya's own checkpoint, trained on the full train split, sits in between.
+  That ranks priority 3, teacher-distilled data at scale, first among the
+  training work.
 
 Other open items:
 

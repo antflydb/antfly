@@ -10636,6 +10636,25 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             request.prefer_q8_over_dense_bf16
         else
             false;
+        // Slots that prefer MPS expand BF16 exactly to F32 once: MPS GEMM
+        // outruns the hand-written BF16 tiles on large encoder batches, at
+        // twice the weight memory. Any failure falls back to dense BF16.
+        if (prefer_f32_mps_fallback) f32_mps: {
+            const dense = std.heap.c_allocator.alloc(f32, expected_bytes) catch break :f32_mps;
+            defer std.heap.c_allocator.free(dense);
+            for (dense, 0..) |*value, i| {
+                const bits = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+                value.* = @bitCast(@as(u32, bits) << 16);
+            }
+            if (termite_metal_decode_runtime_prepare_linear(runtime, request.slot, dense.ptr, bias_base, request.in_dim, request.out_dim) != 0 or
+                termite_metal_decode_runtime_prefer_linear_mps(runtime, request.slot) != 0) break :f32_mps;
+            stats.decoder_runtime_prepare_linear_calls += 1;
+            self.raw_linear_slot_kinds[request.slot] = .dense;
+            self.raw_linear_slots_prepared[request.slot] = true;
+            self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+            self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+            return true;
+        }
         // Dense-BF16 slots stream below the quant kernels' efficiency and
         // dispatch off the planned encoder (a dense/MPS encoder break every
         // frame). Slots that opt in are staged to Q8_0 instead: half the
