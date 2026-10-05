@@ -39745,3 +39745,72 @@ test "metal_compute: embedding lookup reads a recycled activation table's curren
         }
     }
 }
+
+test "metal_compute: segment attention matches the host reference across ranges, windows and head sizes" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+    var prng = std.Random.DefaultPrng.init(7);
+    const random = prng.random();
+
+    // Three right-padded rows of 101 slots (70, 33 and 101 real tokens),
+    // so query blocks straddle rows and end partially; padding queries see
+    // their row. Then a tree-like row whose queries see two key ranges.
+    const seq = 101;
+    const lengths = [_]usize{ 70, 33, 101 };
+    const tokens = seq * lengths.len;
+    const ranges = try allocator.alloc(u32, tokens * 6);
+    defer allocator.free(ranges);
+    const positions = try allocator.alloc(i32, tokens);
+    defer allocator.free(positions);
+    @memset(ranges, 0);
+    for (lengths, 0..) |len, row| for (0..seq) |i| {
+        const at = row * seq + i;
+        ranges[at * 6 ..][0..2].* = .{ @intCast(row * seq), @intCast(row * seq + len) };
+        positions[at] = @intCast(i);
+    };
+    // Last row: queries past 50 also see keys 10..20 of the first row.
+    for (50..seq) |i| ranges[(2 * seq + i) * 6 ..][2..4].* = .{ 10, 20 };
+
+    for ([_][2]usize{ .{ 16, 64 }, .{ 8, 32 }, .{ 4, 16 } }) |shape| {
+        const heads = shape[0];
+        const head_dim = shape[1];
+        const hidden = heads * head_dim;
+        const values = try allocator.alloc(f32, 3 * tokens * hidden);
+        defer allocator.free(values);
+        for (values) |*value| value.* = random.floatNorm(f32);
+        const q = values[0 .. tokens * hidden];
+        const k = values[tokens * hidden ..][0 .. tokens * hidden];
+        const v = values[2 * tokens * hidden ..][0 .. tokens * hidden];
+        for ([_]u32{ std.math.maxInt(u32), 64, 5 }) |window| {
+            const request = ops.SegmentAttention{ .ranges = ranges, .query_positions = positions, .key_positions = positions, .window = window, .queries = tokens, .keys = tokens, .num_heads = heads, .head_dim = head_dim };
+            const want = try @import("inference_linalg").segmentAttentionHost(allocator, q, k, v, ranges, positions, positions, window, tokens, tokens, heads, head_dim);
+            defer allocator.free(want);
+            const shape_qkv = [_]i32{ @intCast(tokens), @intCast(hidden) };
+            const q_ct = try cb.fromFloat32Shape(q, &shape_qkv);
+            defer cb.free(q_ct);
+            const k_ct = try cb.fromFloat32Shape(k, &shape_qkv);
+            defer cb.free(k_ct);
+            const v_ct = try cb.fromFloat32Shape(v, &shape_qkv);
+            defer cb.free(v_ct);
+            const out_ct = try cb.segmentAttention(allocator, q_ct, k_ct, v_ct, &request);
+            defer cb.free(out_ct);
+            const got = try cb.toFloat32(out_ct, allocator);
+            defer allocator.free(got);
+            var worst: f32 = 0;
+            for (want, got) |a, b| worst = @max(worst, @abs(a - b));
+            std.testing.expect(worst < 2e-5) catch |err| {
+                std.debug.print("segment attention heads={d} head_dim={d} window={d}: max error {d}\n", .{ heads, head_dim, window, worst });
+                return err;
+            };
+        }
+    }
+}

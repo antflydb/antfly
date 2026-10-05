@@ -119,7 +119,15 @@ pub const Options = struct {
     /// When set, also report the fraction of `choice` decisions whose gold
     /// label is among this many highest probabilities (`Report.top_k_recall`).
     top_k_recall: ?usize = null,
+    /// When set, also write one JSON line per decision (`Prediction`) to this
+    /// new file, for paired comparisons between models.
+    predictions_file: ?[]const u8 = null,
+    /// Cut overlong states to fit instead of failing (`Config.truncate_state`).
+    truncate_state: bool = false,
 };
+
+/// One scored decision in `Options.predictions_file`.
+pub const Prediction = struct { id: []const u8, kind: model.QuestionType, labels: []const []const u8, probabilities: []const f32, target: []const f32 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -130,7 +138,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
         .metal => try factory.createMetalSession(gpa, options.model_dir),
     };
     defer session.close();
-    const cfg = factory.getLayaConfig(session) orelse return error.InvalidLayaConfig;
+    var cfg = factory.getLayaConfig(session) orelse return error.InvalidLayaConfig;
+    cfg.truncate_state = options.truncate_state;
     const tokenizer = try hf.HfTokenizer.loadFromBytes(gpa, try files.readFileFromDir(a, options.model_dir, "tokenizer.json"));
     const tok = tokenizer.tokenizer();
     defer tok.deinitTokenizer();
@@ -176,7 +185,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
         for (scored) |item| if (@backingInt(item.kind) == kind) try subset.append(a, item);
         if (subset.items.len > 0) by_kind[kind] = metrics(subset.items);
     }
-    _ = io;
+    if (options.predictions_file) |output| {
+        const file = try std.Io.Dir.cwd().createFile(io, output, .{ .exclusive = true });
+        defer file.close(io);
+        var buffer: [16384]u8 = undefined;
+        var w = file.writer(io, &buffer);
+        for (tasks.items, scored) |task, item| {
+            try std.json.Stringify.value(Prediction{ .id = task.question.name, .kind = item.kind, .labels = task.question.labels, .probabilities = item.probabilities, .target = item.target }, .{}, &w.interface);
+            try w.interface.writeByte('\n');
+        }
+        try w.interface.flush();
+    }
     return .{
         .model_dir = try gpa.dupe(u8, options.model_dir),
         .records_file = try gpa.dupe(u8, options.records_file),

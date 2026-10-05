@@ -23,9 +23,10 @@ pub fn enabled() bool {
 
 /// The fused path reads dense weights and scores with the upstream scorer. A
 /// checkpoint served with quantized linears (`laya.weight_quantization`) or
-/// a pointer head (`laya.decision_head`) runs the generic encoder instead.
+/// a pointer head (`laya.decision_head`) or another checkpoint format runs
+/// the generic encoder instead.
 pub fn enabledFor(laya: @import("../models/laya.zig").Config) bool {
-    return enabled() and laya.decision_head == .scorer and (laya.effectiveWeightQuantization() catch return false) == .none;
+    return enabled() and laya.decision_head == .scorer and laya.format == .laya and (laya.effectiveWeightQuantization() catch return false) == .none;
 }
 
 /// Conservative two-layer frame bound, including dense-attention scratch.
@@ -628,7 +629,7 @@ test "laya resident decision kernel calibration padding ties and nonfinite rejec
                 for (host[count..20]) |v| try std.testing.expectEqual(@as(f32, 0), v);
                 try std.testing.expectEqual(@as(f32, 0), host[25]);
                 try std.testing.expectApproxEqAbs(want.confidence, host[21], 2e-6);
-                try std.testing.expectApproxEqAbs(want.act_probability, host[24], 2e-6);
+                try std.testing.expectApproxEqAbs(want.act_probability.?, host[24], 2e-6);
                 if (want.expected_value) |v| try std.testing.expectApproxEqAbs(v, host[22], 2e-6);
                 if (want.true_probability) |v| try std.testing.expectApproxEqAbs(v, host[23], 2e-6);
                 if (variant == 0) try std.testing.expectEqual(@as(f32, 0), host[20]);
