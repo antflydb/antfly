@@ -244,6 +244,36 @@ invocation exits nonzero because it lacks interactive coverage; assess its
 `measurement_runs_valid` and `profile_regression_gates_passed` fields together
 with the interactive invocation's `passed` result.
 
+### Default Metal path on the typed-decisions benchmark
+
+The default path (without `ANTFLY_LAYA_METAL_RESIDENT`) scores the full
+typed-decisions test split (2,000 decisions, 578,470 tokens) on an Apple M4
+Max as follows. Each run was warm, 64 tasks per pipeline call
+(`finetune eval laya --chunk`).
+
+| Model | Before | Now | PyTorch on the same machine |
+| --- | ---: | ---: | ---: |
+| OpenDecider-nano | 184 s | 54.6 s | 55.9 s (length-sorted batches of 64); 64.4 s (batches of 16) |
+| OpenDecider-nano, one decision per call | 149 s | 57.9 s | 70.5 s (batch 1) |
+| Laya-large, step-0 fine-tune | 337 s | 85.1 s | |
+
+Probabilities match OpenDecider's PyTorch implementation to 1.3e-6, and the
+Laya checkpoint's earlier predictions to 1.7e-6. The ModernBERT encoder on
+Metal:
+- runs only the real tokens of a batch, with each row its own attention
+  segment, instead of padding every row to the longest;
+- runs global and sliding-window attention with a tiled kernel that skips
+  keys outside a row or its window
+  (`TERMITE_METAL_DISABLE_TILED_SEGMENT_ATTENTION=1` restores the scalar
+  kernel, `ANTFLY_MODERNBERT_SEGMENT_ATTENTION=0` the dense path);
+- runs its linears through MPS in F32, expanding BF16 weights
+  (`TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS=1` keeps the BF16 kernels, at
+  half the weight memory);
+- keeps its LayerNorm weights in fixed slots across requests.
+
+Laya also scores markers on the device, and groups inputs of similar length
+into the same call on every backend (`ANTFLY_LAYA_BUCKETING=0` disables it).
+
 ## Native finetuning
 
 `antfly inference finetune train laya <job.json>` trains the ModernBERT encoder,
