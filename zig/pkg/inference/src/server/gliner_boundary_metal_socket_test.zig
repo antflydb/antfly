@@ -281,7 +281,7 @@ test "gliner boundary socket pinned small Metal managed HTTP success atomic reco
         {
             const batch = try shared.requestBytes(a, name, case.schema, &.{
                 .{ .id = "valid-first", .content = case.text },
-                .{ .id = "rejected-second", .content = "x " ** 4097 },
+                .{ .id = "rejected-second", .content = z17RepeatString("x ", 4097) },
             });
             defer a.free(batch);
             const before_failure = metal_tensor.memoryStatsSnapshot();
@@ -371,7 +371,7 @@ const ConcurrentPost = struct {
         return future.await(self.driver_io);
     }
 
-    fn deinit(self: *ConcurrentPost) void {
+    pub fn deinit(self: *ConcurrentPost) void {
         self.cancelled.store(true, .release);
         if (self.future) |*future| {
             if (future.await(self.driver_io)) |value| {
@@ -496,4 +496,15 @@ test "gliner boundary socket pinned small Metal admits concurrent extracts and s
     _ = try idle(&node);
     try transport.finish();
     _ = try idle(&node);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

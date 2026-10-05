@@ -47,7 +47,7 @@ pub const Example = struct {
     fn tokenKind(self: Example, i: usize) ?Kind {
         const p = self.packed_row orelse return self.kind;
         const kind = p.row.kinds[i];
-        return if (kind == tree.trunk_kind) null else @enumFromInt(kind);
+        return if (kind == tree.trunk_kind) null else @fromBackingInt(@intCast(kind));
     }
 };
 pub const Question = struct { markers: []const i64, kind: Kind, target: []const f32 };
@@ -262,7 +262,7 @@ pub fn inputs(a: std.mem.Allocator, cb: *const ops.ComputeBackend, graph: *const
         for (0..l.sequence) |i| {
             // Padding repeats the row's last logical position; keys mask it.
             const kind = if (i < e.ids.len) e.tokenKind(i) else if (e.packed_row == null) e.kind else null;
-            kinds[row * l.sequence + i] = if (kind) |k| @intFromEnum(k) else 0;
+            kinds[row * l.sequence + i] = if (kind) |k| @backingInt(k) else 0;
             @memset(type_mask[(row * l.sequence + i) * cfg.hidden_size ..][0..cfg.hidden_size], if (kind != null) 1 else 0);
             positions[row * l.sequence + i] = if (i < e.ids.len) e.position(i) else @intCast(i);
         }

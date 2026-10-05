@@ -66,7 +66,7 @@ pub fn encode(
     alloc: std.mem.Allocator,
     state: State,
 ) !void {
-    try list.append(alloc, @intFromEnum(state.phase));
+    try list.append(alloc, @backingInt(state.phase));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.donor_group_id)));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.receiver_group_id)));
     const start_len: u32 = @intCast(state.receiver_base_range.start.len);
@@ -109,8 +109,8 @@ pub fn encode(
 pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
     if (data.len < 1 + 8 + 8 + 4 + 4) return error.InvalidMergeState;
     var pos: usize = 0;
-    if (data[pos] > @intFromEnum(Phase.rolled_back)) return error.InvalidMergeState;
-    const phase: Phase = @enumFromInt(data[pos]);
+    if (data[pos] > @backingInt(Phase.rolled_back)) return error.InvalidMergeState;
+    const phase: Phase = @fromBackingInt(data[pos]);
     pos += 1;
     const donor_group_id = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += 8;

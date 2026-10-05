@@ -424,7 +424,7 @@ pub const MemoryStore = struct {
         try self.users.append(self.alloc, try user.clone(self.alloc));
     }
 
-    fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
+    pub fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));
         var i: usize = 0;
         while (i < self.users.items.len) {
@@ -466,7 +466,7 @@ pub const MemoryStore = struct {
         try self.api_keys.append(self.alloc, try record.clone(self.alloc));
     }
 
-    fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
+    pub fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
         const self: *MemoryStore = @ptrCast(@alignCast(ptr));
         var i: usize = 0;
         while (i < self.api_keys.items.len) {

@@ -98,7 +98,7 @@ const TextReplayAccumulator = struct {
     document_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *TextReplayAccumulator) void {
+    pub fn deinit(self: *TextReplayAccumulator) void {
         var delete_it = self.pre_deletes.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pre_deletes.deinit(self.alloc);
@@ -220,7 +220,7 @@ const DenseReplayAccumulator = struct {
     dense_embedding_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *DenseReplayAccumulator) void {
+    pub fn deinit(self: *DenseReplayAccumulator) void {
         var delete_it = self.pre_deletes.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pre_deletes.deinit(self.alloc);
@@ -454,7 +454,7 @@ const SparseReplayAccumulator = struct {
     sparse_embedding_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *SparseReplayAccumulator) void {
+    pub fn deinit(self: *SparseReplayAccumulator) void {
         var delete_it = self.pre_deletes.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pre_deletes.deinit(self.alloc);
@@ -639,7 +639,7 @@ const GraphReplayAccumulator = struct {
     mutation_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *GraphReplayAccumulator) void {
+    pub fn deinit(self: *GraphReplayAccumulator) void {
         var delete_it = self.deleted_keys.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.deleted_keys.deinit(self.alloc);

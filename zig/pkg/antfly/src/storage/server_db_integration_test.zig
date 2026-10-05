@@ -214,7 +214,7 @@ test "relational replicated admission is identical across local memory envelopes
     const alloc = std.testing.allocator;
     for ([_]u64{ 256 * 1024, 4 * 1024 * 1024 }) |capacity| {
         var options = resource_manager_mod.Options{ .identity_allocator = alloc };
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = capacity };
+        options.budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = capacity };
         var resources = resource_manager_mod.ResourceManager.init(options);
         defer resources.deinit(alloc);
         var path_tmp = try TestDirectory.init("db");
@@ -284,7 +284,7 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
         break :blk key;
     };
     var record_value: [33]u8 = undefined;
-    record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    record_value[0] = @backingInt(transactions_mod.TxnStatus.committed);
     std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
     std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
     std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
@@ -854,7 +854,7 @@ test "db replicated transaction commits each raft receipt atomically" {
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
-    const txn_id: transactions_mod.TxnId = .{0x5a} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(0x5a);
     const participant = "table:receipts:group:7";
     const begin_entry: OrderedApplyReceipt = .{ .term = 3, .index = 11 };
     const prepare_entry: OrderedApplyReceipt = .{ .term = 3, .index = 12 };
@@ -1067,7 +1067,7 @@ test "db raced replicated transaction completion persists receipt and participan
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
-    const txn_id: transactions_mod.TxnId = .{0x6b} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(0x6b);
     const participant = "table:receipts:group:8";
     _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
@@ -1363,7 +1363,7 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
             break :blk_key key;
         };
         var record_value: [33]u8 = undefined;
-        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        record_value[0] = @backingInt(transactions_mod.TxnStatus.committed);
         std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
         std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
         std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
@@ -2658,7 +2658,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
             defer context.destroy();
         }
     };
-    if (!accepted_before_switch) try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &pinned.read.?, asset_key });
+    if (!accepted_before_switch) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &pinned.read.?, asset_key });
     const context = try planning.Context.create(alloc, &pinned.read.?, "doc", "relations", asset_key, "{}");
     defer context.destroy();
     const inherited = for (context.base.artifact_sources) |guard| {
@@ -2793,7 +2793,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
             try std.testing.expectEqualStrings(head, selected_context.base.artifact_sources[0].key);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned.read.?, plan.core.head_key, @as([]const u8, &head_raw) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned.read.?, plan.core.head_key, @as([]const u8, &head_raw) });
     const context = try planning.Context.createWithProof(alloc, &pinned.read.?, "doc", "relations", plan.core.head_key, &head_raw);
     defer context.destroy();
     try std.testing.expectEqual(@as(usize, 1), context.base.artifact_sources.len);
@@ -3082,7 +3082,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
                 try std.testing.expectEqualDeep(selector.publication_digest, result.receipt.publication_digest);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Verify.run, .{ &latest, command });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Verify.run, .{ &latest, command });
     }
     const validation = @import("db/artifact_producer_validation.zig");
     var clean_page = (try validation.prepareRaft(alloc, db.core.store)).?;
@@ -3421,7 +3421,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             try std.testing.expectEqual(publication.Rejection.baseline_pending, (try publication.rejected(&read, rejected)).?.reason);
             try std.testing.expectError(error.NotFound, read.get(vector_key));
         }
-        try std.testing.checkAllAllocationFailures(alloc, Harness.prepare, .{ command, catalog.catalogs });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.prepare, .{ command, catalog.catalogs });
         var prepared = try publication.prepareEffects(alloc, command, catalog.catalogs);
         defer prepared.deinit();
         try std.testing.expectEqual(@as(usize, 2), prepared.batch.documents.len);
@@ -3435,7 +3435,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             try std.testing.expectError(error.NotFound, read.get(one));
             try std.testing.expectEqualDeep(rows.manifest.?, try chunks.Manifest.decode(try read.get(manifest_key)));
         }
-        try std.testing.checkAllAllocationFailures(alloc, Harness.checkCapture, .{ &db, zero });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.checkCapture, .{ &db, zero });
         {
             var absent = try Harness.captureVector(alloc, &db, one);
             defer absent.deinit();
@@ -3529,14 +3529,14 @@ test "db ordered artifact inventory asset publication authenticates output and p
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-        try std.testing.checkAllAllocationFailures(alloc, Harness.checkCapture, .{&db});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.checkCapture, .{&db});
         for ([_][]const u8{ "first", "second" }, [_][]const u8{ first_key, second_key }, 0..) |name, key, ordinal| {
             var token = try Harness.capture(&db, name);
             defer token.deinit();
             const command = try token.command(&.{.{ .family = .document_artifact, .key = key, .value = name, .source_index = 0 }});
             var prepared = try asset.prepare(alloc, command, catalog.catalogs);
             defer prepared.deinit();
-            if (ordinal == 0) try std.testing.checkAllAllocationFailures(alloc, Harness.checkPrepare, .{ command, catalog.catalogs });
+            if (ordinal == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.checkPrepare, .{ command, catalog.catalogs });
             try std.testing.expectEqual(@as(usize, 1), prepared.batch.documents.len);
             try std.testing.expectEqual(@as(usize, 2), prepared.coverage[0].artifact_keys.len);
             const forged = try token.command(&.{.{ .family = .document_artifact, .key = if (ordinal == 0) second_key else first_key, .value = name, .source_index = 0 }});
@@ -3633,7 +3633,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
                 try guard.requireCurrent(&read);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Validate.run, .{ &db, saved.generation });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Validate.run, .{ &db, saved.generation });
         {
             var plan = try db.core.index_manager.acquireWritePlanSnapshot();
             defer plan.release();

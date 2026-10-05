@@ -33,12 +33,12 @@ pub fn encodeAlloc(alloc: Allocator, segment: algebraic_segment.Segment) ![]u8 {
 
     try out.appendSlice(alloc, magic);
     try appendU32(alloc, &out, version);
-    try out.append(alloc, @intFromEnum(segment.source.kind));
+    try out.append(alloc, @backingInt(segment.source.kind));
     try appendBytes(alloc, &out, segment.source.snapshot_id);
     try appendBytes(alloc, &out, segment.source.schema_fingerprint);
     try appendBytes(alloc, &out, segment.source.source_id);
 
-    try out.append(alloc, @intFromEnum(segment.aggregate.op));
+    try out.append(alloc, @backingInt(segment.aggregate.op));
     try appendBytes(alloc, &out, segment.aggregate.group_column);
     try appendBytes(alloc, &out, segment.aggregate.value_column);
     try appendU32(alloc, &out, @intCast(segment.aggregate.groups.len));
@@ -152,14 +152,14 @@ pub fn encodeExpressionAlloc(alloc: Allocator, materialization: algebraic_segmen
 
     try out.appendSlice(alloc, expression_magic);
     try appendU32(alloc, &out, version);
-    try out.append(alloc, @intFromEnum(materialization.source.kind));
+    try out.append(alloc, @backingInt(materialization.source.kind));
     try appendBytes(alloc, &out, materialization.source.snapshot_id);
     try appendBytes(alloc, &out, materialization.source.schema_fingerprint);
     try appendBytes(alloc, &out, materialization.source.source_id);
     try appendU32(alloc, &out, @intCast(materialization.expressions.len));
     for (materialization.expressions) |expression| {
         try appendBytes(alloc, &out, expression.name);
-        try out.append(alloc, @intFromEnum(expression.op));
+        try out.append(alloc, @backingInt(expression.op));
         try appendBytes(alloc, &out, expression.value_column);
         try encodeAggregateValue(alloc, &out, expression.op, expression.value);
     }
@@ -412,11 +412,11 @@ test "lake algebraic segment codec rejects forged fold counts before allocation"
     defer encoded.deinit(alloc);
     try encoded.appendSlice(alloc, magic);
     try appendU32(alloc, &encoded, version);
-    try encoded.append(alloc, @intFromEnum(algebraic_segment.SourceKind.serverless_fragment));
+    try encoded.append(alloc, @backingInt(algebraic_segment.SourceKind.serverless_fragment));
     try appendBytes(alloc, &encoded, "snapshot");
     try appendBytes(alloc, &encoded, "schema");
     try appendBytes(alloc, &encoded, "source");
-    try encoded.append(alloc, @intFromEnum(algebraic_segment.AggregateOp.count));
+    try encoded.append(alloc, @backingInt(algebraic_segment.AggregateOp.count));
     try appendBytes(alloc, &encoded, "group");
     try appendBytes(alloc, &encoded, "value");
     try appendU32(alloc, &encoded, std.math.maxInt(u32));
@@ -429,7 +429,7 @@ test "lake algebraic expression codec rejects forged counts before allocation" {
     defer encoded.deinit(alloc);
     try encoded.appendSlice(alloc, expression_magic);
     try appendU32(alloc, &encoded, version);
-    try encoded.append(alloc, @intFromEnum(algebraic_segment.SourceKind.external_iceberg));
+    try encoded.append(alloc, @backingInt(algebraic_segment.SourceKind.external_iceberg));
     try appendBytes(alloc, &encoded, "snapshot");
     try appendBytes(alloc, &encoded, "schema");
     try appendBytes(alloc, &encoded, "source");

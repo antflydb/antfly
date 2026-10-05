@@ -104,7 +104,7 @@ pub const CredentialSourceIdentity = struct {
     /// prevent ambiguous concatenations, and the presence mask distinguishes
     /// an omitted optional locator from an explicitly empty one.
     pub fn updateHash(self: CredentialSourceIdentity, hasher: anytype) void {
-        const kind = [_]u8{@intFromEnum(self.kind)};
+        const kind = [_]u8{@backingInt(self.kind)};
         hasher.update(&kind);
         hasher.update(&.{self.present_components});
         hasher.update(&.{@intFromBool(self.literal_digest != null)});

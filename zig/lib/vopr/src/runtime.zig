@@ -234,7 +234,7 @@ test "timer and scheduler capabilities preserve their boundary" {
             self.executed += 1;
             try sink.emitNamed(allocator, .state_change, "runtime.executed", @intCast(self.executed));
         }
-        fn quiescent(ptr: *anyopaque) bool {
+        pub fn quiescent(ptr: *anyopaque) bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.executed > 0;
         }

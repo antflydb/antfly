@@ -91,6 +91,7 @@ pub const CpuCapacity = struct {
 /// Affinity constrains CPU placement; cgroup quota constrains CPU time. Both
 /// apply, including ancestor limits visible inside the controller mount.
 pub fn cpuCapacity() CpuCapacity {
+    if (comptime builtin.os.tag == .freestanding) return .{ .millicpus = 1000 };
     const affinity = std.Thread.getCpuCount() catch 1;
     var capacity: CpuCapacity = .{ .millicpus = @as(u64, @intCast(affinity)) *| 1000, .source = .host };
     if (builtin.os.tag != .linux) return capacity;
@@ -822,7 +823,7 @@ test "CPU capacity preserves fractional quotas and checks visible ancestors" {
     try std.testing.expectEqual(@as(usize, 1), (CpuCapacity{ .millicpus = 500 }).parallelism());
     try std.testing.expectEqual(@as(usize, 2), (CpuCapacity{ .millicpus = 2500 }).parallelism());
     const Fixture = struct {
-        fn read(path: []const u8, _: []u8) ?[]const u8 {
+        pub fn read(path: []const u8, _: []u8) ?[]const u8 {
             const files = .{
                 .{ "/cpu/tenant/child/cpu.max", "max 100000" },
                 .{ "/cpu/tenant/disabled/cgroup.type", "domain\n" },

@@ -296,7 +296,7 @@ test "storage.hot_standby HA integrity mutations preserve binary keys and absent
     var parsed = try std.json.parseFromSlice(BatchMutationPayload, alloc, encoded, .{ .allocate = .alloc_always });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?u32, 7), parsed.value.request.relational_schema_version);
-    try std.testing.expectEqual([_]u8{255} ** 32, parsed.value.request.relational_integrity_generation_set.?);
+    try std.testing.expectEqual(@as([32]u8, @splat(255)), parsed.value.request.relational_integrity_generation_set.?);
     const operations = parsed.value.request.integrity;
     try std.testing.expectEqualSlices(u8, binary, operations[0].key);
     try std.testing.expect(operations[0].expected_value == null);

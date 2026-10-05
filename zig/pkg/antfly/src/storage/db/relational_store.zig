@@ -279,7 +279,7 @@ test "restore validation binds semantic hash and canonical nested JSON" {
 
     const wrong_hash = try alloc.dupe(u8, encoded);
     defer alloc.free(wrong_hash);
-    try row_codec.setOrdinalSemanticHash(wrong_hash, [_]u8{0x7c} ** std.crypto.hash.Blake3.digest_length);
+    try row_codec.setOrdinalSemanticHash(wrong_hash, @as([std.crypto.hash.Blake3.digest_length]u8, @splat(0x7c)));
     try std.testing.expectError(
         error.RelationalRowSemanticHashMismatch,
         validateCanonicalValueForSchemaAndLayout(alloc, wrong_hash, table_schema, &layout),

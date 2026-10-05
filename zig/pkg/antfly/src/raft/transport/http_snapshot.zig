@@ -336,7 +336,7 @@ pub const HttpSnapshotTransport = struct {
                 self.snapshot.metadata.term == key.snapshot_term;
         }
 
-        fn deinit(self: *QueuedSnapshot, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *QueuedSnapshot, alloc: std.mem.Allocator) void {
             self.snapshot.deinit(alloc);
             if (self.locator_snapshot_id) |value| alloc.free(value);
             if (self.locator_uri) |value| alloc.free(value);
@@ -1148,7 +1148,7 @@ pub const HttpSnapshotTransport = struct {
         upload_uri: []u8,
         capabilities_uri: []u8,
 
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
             alloc.free(self.upload_uri);
             alloc.free(self.capabilities_uri);
         }
@@ -1606,7 +1606,7 @@ pub const HttpSnapshotTransport = struct {
         fetch_uri: []u8,
         capabilities_uri: []u8,
 
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
             alloc.free(self.fetch_uri);
             alloc.free(self.capabilities_uri);
         }
@@ -3238,7 +3238,7 @@ test "http snapshot transport resolves upload uri when locator is absent" {
             };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.snapshot_id) |snapshot_id| std.testing.allocator.free(snapshot_id);
             self.* = undefined;
         }
@@ -3273,7 +3273,7 @@ test "http snapshot transport resolves upload uri when locator is absent" {
             };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.uri) |value| std.testing.allocator.free(value);
             if (self.group_id) |value| std.testing.allocator.free(value);
             if (self.from) |value| std.testing.allocator.free(value);

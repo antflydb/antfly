@@ -47,7 +47,7 @@ const LmdbBackend = @import("storage.zig").LmdbBackend;
 pub const AddTestsOptions = struct {
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     lmdb_backend: LmdbBackend,
     lmdb_evented_async_io: bool,
     standalone_runtime_build_options: *std.Build.Step.Options,
@@ -1931,7 +1931,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // unit lanes retain their tighter scheduler claim.
         .max_rss = @as(usize, switch (target.result.os.tag) {
             .macos => 13,
-            else => if (optimize == .Debug) 7 else 14,
+            else => if (optimize == .debug) 7 else 14,
         }) * 1024 * 1024 * 1024,
         .filters = &.{"secret backend"},
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
@@ -1988,7 +1988,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_lite_benchmark = b.addRunArtifact(lite_benchmark);
-    run_lite_benchmark.addArgs(&.{ "--test-filter", "lite throughput benchmark" });
+    run_lite_benchmark.addArgs(&.{ "--suite-filter", "lite throughput benchmark" });
     run_lite_benchmark.setEnvironmentVariable("ANTFLY_LITE_BENCH", "1");
     b.step("lite-native-benchmark", "Benchmark native Lite transaction, commit, and sorted read scaling").dependOn(&run_lite_benchmark.step);
 
@@ -3080,9 +3080,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vopr_benchmark_mod = b.createModule(.{
         .root_source_file = b.path("lib/vopr/src/benchmark_main.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
-    vopr_benchmark_mod.addImport("vopr", b.dependency("vopr", .{ .target = target, .optimize = .ReleaseSafe }).module("vopr"));
+    vopr_benchmark_mod.addImport("vopr", b.dependency("vopr", .{ .target = target, .optimize = .safe }).module("vopr"));
     const vopr_benchmark = b.addExecutable(.{ .name = "vopr-benchmark", .root_module = vopr_benchmark_mod });
     const vopr_benchmark_step = b.step("vopr-benchmark", "Run deterministic VOPR search-efficiency benchmarks");
     vopr_benchmark_step.dependOn(&b.addRunArtifact(vopr_benchmark).step);
@@ -3389,7 +3389,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_vopr_runtime_regressions = b.addRunArtifact(vopr_runtime_regression_tests);
-    if (b.args) |args| run_vopr_runtime_regressions.addArgs(args);
+    run_vopr_runtime_regressions.addPassthruArgs();
     b.step("vopr-runtime-regression-test", "Run VOPR runtime ownership, clock, snapshot, and replay regressions").dependOn(&run_vopr_runtime_regressions.step);
 
     const standby_production_vopr_tests = b.addTest(.{
@@ -4309,79 +4309,79 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const run_vopr_cli = b.addRunArtifact(vopr_cli);
     run_vopr_cli.addArg("run");
-    if (b.args) |args| run_vopr_cli.addArgs(args);
+    run_vopr_cli.addPassthruArgs();
     const vopr_run_step = b.step("vopr-run", "Run one deterministic generated VOPR history");
     vopr_run_step.dependOn(&run_vopr_cli.step);
 
     const replay_vopr_cli = b.addRunArtifact(vopr_cli);
     replay_vopr_cli.addArg("replay");
-    if (b.args) |args| replay_vopr_cli.addArgs(args);
+    replay_vopr_cli.addPassthruArgs();
     const vopr_replay_step = b.step("vopr-replay", "Replay one exact VOPR artifact");
     vopr_replay_step.dependOn(&replay_vopr_cli.step);
 
     const campaign_vopr_cli = b.addRunArtifact(vopr_cli);
     campaign_vopr_cli.addArg("campaign");
-    if (b.args) |args| campaign_vopr_cli.addArgs(args);
+    campaign_vopr_cli.addPassthruArgs();
     const vopr_campaign_step = b.step("vopr-campaign", "Run a bounded parallel VOPR campaign");
     vopr_campaign_step.dependOn(&campaign_vopr_cli.step);
 
     const reduce_vopr_cli = b.addRunArtifact(vopr_cli);
     reduce_vopr_cli.addArg("reduce");
-    if (b.args) |args| reduce_vopr_cli.addArgs(args);
+    reduce_vopr_cli.addPassthruArgs();
     const vopr_reduce_step = b.step("vopr-reduce", "Reduce a VOPR failure while preserving its fingerprint");
     vopr_reduce_step.dependOn(&reduce_vopr_cli.step);
 
     const promote_vopr_cli = b.addRunArtifact(vopr_cli);
     promote_vopr_cli.addArg("promote");
-    if (b.args) |args| promote_vopr_cli.addArgs(args);
+    promote_vopr_cli.addPassthruArgs();
     const vopr_promote_step = b.step("vopr-promote", "Promote a reviewed reduced VOPR failure fixture");
     vopr_promote_step.dependOn(&promote_vopr_cli.step);
 
     const tla_vopr_cli = b.addRunArtifact(vopr_cli);
     tla_vopr_cli.addArg("tla");
-    if (b.args) |args| tla_vopr_cli.addArgs(args);
+    tla_vopr_cli.addPassthruArgs();
     const vopr_tla_step = b.step("vopr-tla", "Exact-replay a VOPR artifact and export TLA+ Raft NDJSON");
     vopr_tla_step.dependOn(&tla_vopr_cli.step);
 
     const explain_vopr_cli = b.addRunArtifact(vopr_cli);
     explain_vopr_cli.addArg("explain");
-    if (b.args) |args| explain_vopr_cli.addArgs(args);
+    explain_vopr_cli.addPassthruArgs();
     const vopr_explain_step = b.step("vopr-explain", "Exact-replay a failing VOPR artifact and render its semantic causal slice");
     vopr_explain_step.dependOn(&explain_vopr_cli.step);
 
     const debug_vopr_cli = b.addRunArtifact(vopr_cli);
     debug_vopr_cli.addArg("debug");
-    if (b.args) |args| debug_vopr_cli.addArgs(args);
+    debug_vopr_cli.addPassthruArgs();
     const vopr_debug_step = b.step("vopr-debug", "Inspect a replay-validated VOPR artifact at a choice prefix");
     vopr_debug_step.dependOn(&debug_vopr_cli.step);
 
     const results_vopr_cli = b.addRunArtifact(vopr_cli);
     results_vopr_cli.addArg("results");
-    if (b.args) |args| results_vopr_cli.addArgs(args);
+    results_vopr_cli.addPassthruArgs();
     const vopr_results_step = b.step("vopr-results", "Render exact-replayed VOPR results as stable JSON and static HTML");
     vopr_results_step.dependOn(&results_vopr_cli.step);
 
     const events_vopr_cli = b.addRunArtifact(vopr_cli);
     events_vopr_cli.addArg("events");
-    if (b.args) |args| events_vopr_cli.addArgs(args);
+    events_vopr_cli.addPassthruArgs();
     const vopr_events_step = b.step("vopr-events", "Validate or run a saved event-set query over exact-replayed VOPR histories");
     vopr_events_step.dependOn(&events_vopr_cli.step);
 
     const recipe_vopr_cli = b.addRunArtifact(vopr_cli);
     recipe_vopr_cli.addArg("recipe");
-    if (b.args) |args| recipe_vopr_cli.addArgs(args);
+    recipe_vopr_cli.addPassthruArgs();
     const vopr_recipe_step = b.step("vopr-recipe", "Build a reduction, causal, counterfactual, query, and collector debug package");
     vopr_recipe_step.dependOn(&recipe_vopr_cli.step);
 
     const index_vopr_cli = b.addRunArtifact(vopr_cli);
     index_vopr_cli.addArg("index");
-    if (b.args) |args| index_vopr_cli.addArgs(args);
+    index_vopr_cli.addPassthruArgs();
     const vopr_index_step = b.step("vopr-index", "Update and query the deterministic local VOPR run/results index");
     vopr_index_step.dependOn(&index_vopr_cli.step);
 
     const corpus_merge_vopr_cli = b.addRunArtifact(vopr_cli);
     corpus_merge_vopr_cli.addArg("corpus-merge");
-    if (b.args) |args| corpus_merge_vopr_cli.addArgs(args);
+    corpus_merge_vopr_cli.addPassthruArgs();
     const vopr_corpus_merge_step = b.step("vopr-corpus-merge", "Exact-replay and deterministically merge local, CI, and nightly VOPR corpora");
     vopr_corpus_merge_step.dependOn(&corpus_merge_vopr_cli.step);
 
@@ -4771,7 +4771,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
     });
     const run_standalone_restore_tests = b.addRunArtifact(standalone_restore_tests);
-    run_standalone_restore_tests.addArgs(&.{ "--test-filter", "standalone shared" });
+    run_standalone_restore_tests.addArgs(&.{ "--suite-filter", "standalone shared" });
     b.step("antfly-standalone-staged-restore-test", "Run shared standalone restore authority and mixed import regressions").dependOn(&run_standalone_restore_tests.step);
 
     const raft_test_step = b.step("antfly-raft-test", "Run raft integration unit tests");
@@ -6411,11 +6411,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     unit_storage_sharded_test_step.dependOn(&run_unit_server_db_tests.step);
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
-    unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
+    unit_storage_shard_audit.addFileArg2(b.path("tools/audit_storage_test_shards.py"), .{ .make_absolute = true });
     unit_storage_shard_audit.addArg("--root");
-    unit_storage_shard_audit.addDirectoryArg(b.path("pkg/antfly/src/storage"));
+    unit_storage_shard_audit.addDirectoryArg2(b.path("pkg/antfly/src/storage"), .{ .make_absolute = true });
     unit_storage_shard_audit.addArg("--manifest");
-    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/test_manifest.zig"));
+    unit_storage_shard_audit.addFileArg2(b.path("pkg/antfly/src/storage/test_manifest.zig"), .{ .make_absolute = true });
     for (unit_storage_shard_filters) |shard_filters| {
         for (shard_filters) |shard_filter| {
             unit_storage_shard_audit.addArgs(&.{ "--filter", shard_filter });
@@ -6423,14 +6423,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     for (@import("storage_owner_tests.zig").test_sources) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
-        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
+        unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
     for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig", "server_query_visibility.zig", "server_document_child_range.zig", "server_group_metadata.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
-        unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
+        unit_storage_shard_audit.addFileArg2(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})), .{ .make_absolute = true });
     }
     unit_storage_shard_audit.addArg("--runtime-partition-source");
-    unit_storage_shard_audit.addFileArg(b.path("pkg/antfly/src/storage/db/db.zig"));
+    unit_storage_shard_audit.addFileArg2(b.path("pkg/antfly/src/storage/db/db.zig"), .{ .make_absolute = true });
     for (unit_storage_db_core_lane_filters) |lane_filter| {
         unit_storage_shard_audit.addArgs(&.{ "--runtime-partition-filter", lane_filter });
     }
@@ -6440,10 +6440,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     unit_storage_shard_audit_step.dependOn(&unit_storage_shard_audit.step);
     const embedded_source_boundary = b.addSystemCommand(&.{"python3"});
-    embedded_source_boundary.addFileArg(b.path("tools/audit_embedded_source_boundary.py"));
+    embedded_source_boundary.addFileArg2(b.path("tools/audit_embedded_source_boundary.py"), .{ .make_absolute = true });
     embedded_source_boundary.addArgs(&.{ "--entry", "embedded_root.zig", "--entry", "storage/db/db.zig", "--entry", "public_capi_root.zig" });
     const embedded_source_boundary_tests = b.addSystemCommand(&.{"python3"});
-    embedded_source_boundary_tests.addFileArg(b.path("tools/test_audit_embedded_source_boundary.py"));
+    embedded_source_boundary_tests.addFileArg2(b.path("tools/test_audit_embedded_source_boundary.py"), .{ .make_absolute = true });
     const embedded_source_boundary_step = b.step(
         "embedded-source-boundary-check",
         "Verify the authored local engine sources do not import server coordination",
@@ -6626,15 +6626,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     const compare_unit_storage_inventory = b.addSystemCommand(&.{"python3"});
     compare_unit_storage_inventory.setName("compare consolidated storage test inventory");
-    compare_unit_storage_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
+    compare_unit_storage_inventory.addFileArg2(b.path("tools/compare_test_inventories.py"), .{ .make_absolute = true });
     compare_unit_storage_inventory.addArg("--baseline");
     for (unit_storage_baseline_tests) |baseline_tests| {
-        compare_unit_storage_inventory.addArtifactArg(baseline_tests);
+        compare_unit_storage_inventory.addArtifactArg2(baseline_tests, .{ .make_absolute = true });
     }
     compare_unit_storage_inventory.addArg("--candidate");
-    compare_unit_storage_inventory.addArtifactArg(unit_storage_support_tests);
-    compare_unit_storage_inventory.addArtifactArg(unit_storage_engine_tests);
-    compare_unit_storage_inventory.addArtifactArg(unit_storage_db_core_tests);
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_support_tests, .{ .make_absolute = true });
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_engine_tests, .{ .make_absolute = true });
+    compare_unit_storage_inventory.addArtifactArg2(unit_storage_db_core_tests, .{ .make_absolute = true });
     compare_unit_storage_inventory.addArgs(&.{ "--label", "storage consolidation" });
     const unit_storage_inventory_step = b.step(
         "unit-storage-test-inventory",
@@ -6649,9 +6649,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         const run_db_core_partitioned_tests = b.addSystemCommand(&.{"python3"});
         run_db_core_partitioned_tests.step.dependOn(unit_storage_compile_step);
         run_db_core_partitioned_tests.setName("run test storage-db-core-tests partitioned");
-        run_db_core_partitioned_tests.addFileArg(b.path("tools/run_test_partitions.py"));
+        run_db_core_partitioned_tests.addFileArg2(b.path("tools/run_test_partitions.py"), .{ .make_absolute = true });
         run_db_core_partitioned_tests.addArg("--executable");
-        run_db_core_partitioned_tests.addArtifactArg(unit_storage_db_core_tests);
+        run_db_core_partitioned_tests.addArtifactArg2(unit_storage_db_core_tests, .{ .make_absolute = true });
         for (unit_storage_db_core_lane_filters) |lane_filter| {
             run_db_core_partitioned_tests.addArgs(&.{ "--partition-filter", lane_filter });
         }
@@ -6667,12 +6667,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         for (unit_storage_db_core_skip_filters) |filter| {
             run_db_core_partitioned_tests.addArgs(&.{ "--common-skip-filter", filter });
         }
-        if (b.args) |runtime_args| {
-            if (runtime_args.len != 0) {
-                run_db_core_partitioned_tests.addArg("--");
-                run_db_core_partitioned_tests.addArgs(runtime_args);
-            }
-        }
+        run_db_core_partitioned_tests.addArg("--");
+        run_db_core_partitioned_tests.addPassthruArgs();
         run_db_core_partitioned_tests.stdio = .inherit;
         @import("test_support.zig").configureTestRun(run_db_core_partitioned_tests);
         run_db_core_partitioned_tests.step.max_rss = 12 * 1024 * 1024 * 1024;
@@ -6870,11 +6866,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     }
     const compare_unit_metadata_inventory = b.addSystemCommand(&.{"python3"});
     compare_unit_metadata_inventory.setName("compare consolidated metadata test inventory");
-    compare_unit_metadata_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
+    compare_unit_metadata_inventory.addFileArg2(b.path("tools/compare_test_inventories.py"), .{ .make_absolute = true });
     compare_unit_metadata_inventory.addArg("--baseline");
-    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{ .make_absolute = true });
     compare_unit_metadata_inventory.addArg("--candidate");
-    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg2(tests, .{ .make_absolute = true });
     compare_unit_metadata_inventory.addArgs(&.{ "--label", "metadata consolidation" });
     const unit_metadata_inventory_step = b.step(
         "unit-metadata-test-inventory",
@@ -7042,7 +7038,7 @@ pub fn createPdfIntegration(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     fixture: std.Build.LazyPath,
     imports: AntflyRootImports,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 }) struct { run: *std.Build.Step.Run, qualification: *std.Build.Step.Run } {
     const target = options.imports.platform_target;
     const module = b.createModule(.{
@@ -7061,4 +7057,19 @@ pub fn createPdfIntegration(b: *std.Build, options: struct {
     const qualification = b.addRunArtifact(executable);
     qualification.addArg("--qualify-real");
     return .{ .run = run, .qualification = qualification };
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

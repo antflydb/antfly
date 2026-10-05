@@ -52,9 +52,9 @@ pub const Projector = struct {
 };
 
 pub const Runtime = struct {
-    models: [max_models]?Model = [_]?Model{null} ** max_models,
-    projectors: [max_projectors]?Projector = [_]?Projector{null} ** max_projectors,
-    tokenizers: [max_tokenizers]?*hf_tokenizer_mod.HfTokenizer = [_]?*hf_tokenizer_mod.HfTokenizer{null} ** max_tokenizers,
+    models: [max_models]?Model = @as([max_models]?Model, @splat(null)),
+    projectors: [max_projectors]?Projector = @as([max_projectors]?Projector, @splat(null)),
+    tokenizers: [max_tokenizers]?*hf_tokenizer_mod.HfTokenizer = @as([max_tokenizers]?*hf_tokenizer_mod.HfTokenizer, @splat(null)),
 
     pub fn storeModel(self: *Runtime, compute: wasm_compute.WasmCompute, config: ModelConfig) !u32 {
         for (&self.models, 1..) |*slot, handle| {

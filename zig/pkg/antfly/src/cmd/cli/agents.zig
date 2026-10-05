@@ -701,7 +701,7 @@ test "retrieval SSE requires a complete terminal done event" {
         "event: done\r\ndata: {}\r\n\r\n",
         "event: done\rdata: {}\r\r",
         "data: {}\nevent: done\n\n: heartbeat\n\n",
-        "event: done\ndata: " ++ ("x" ** 256) ++ "\n\n",
+        "event: done\ndata: " ++ (z17RepeatString("x", 256)) ++ "\n\n",
     }) |body| {
         try std.testing.expect(!isSseFailureResponse("text/event-stream", body));
         var detector = SseCompletionDetector{};
@@ -709,4 +709,15 @@ test "retrieval SSE requires a complete terminal done event" {
         detector.finish();
         try std.testing.expect(!detector.failed());
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

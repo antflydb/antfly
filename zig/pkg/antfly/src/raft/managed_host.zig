@@ -916,7 +916,7 @@ const DataApplyPreparedSnapshotSource = struct {
         self.prepared.cancel();
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.prepared.deinit();
         std.heap.page_allocator.destroy(self);
@@ -935,7 +935,7 @@ const PreparedHostDeps = struct {
     owned_data_state_machine: ?*state_machine.DataStateMachine = null,
     owned_routed_state_machine: ?*state_machine.RoutedStateMachine = null,
 
-    fn deinit(self: *PreparedHostDeps, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PreparedHostDeps, alloc: std.mem.Allocator) void {
         if (self.owned_backup_restore_bootstrapper) |bootstrapper| {
             bootstrapper.deinit(alloc);
             alloc.destroy(bootstrapper);
@@ -982,7 +982,7 @@ const ReplicaBackupRestoreBootstrapper = struct {
         };
     }
 
-    fn deinit(self: *ReplicaBackupRestoreBootstrapper, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ReplicaBackupRestoreBootstrapper, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         self.* = undefined;
     }

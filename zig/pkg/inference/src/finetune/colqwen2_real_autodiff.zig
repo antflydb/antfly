@@ -479,8 +479,8 @@ test "makeTrainerInput populates the expected fields" {
     const batch: u32 = 2;
     const seq_len: u32 = 4;
 
-    var input_ids = [_]i64{0} ** (2 * 4);
-    var mask = [_]f32{1.0} ** (2 * 4);
+    var input_ids = @as([(2 * 4)]i64, @splat(0));
+    var mask = @as([(2 * 4)]f32, @splat(1.0));
     var targets = [_]f32{ 0.5, -0.25 };
     // Stored as [batch, 1].
 

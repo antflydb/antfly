@@ -88,7 +88,7 @@ test "local runtime bundle unwinds stable allocations and preserves dependent co
         fn init(_: std.mem.Allocator, context: *Context) !@This() {
             return .{ .context = context };
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.context.value += 1;
         }
     };
@@ -111,7 +111,7 @@ test "local runtime bundle returns constructor errors without adopting context" 
         fn init(_: std.mem.Allocator, _: *Context) !@This() {
             return error.ConstructorFailed;
         }
-        fn deinit(_: *@This()) void {
+        pub fn deinit(_: *@This()) void {
             unreachable;
         }
     };
@@ -131,7 +131,7 @@ test "local owning runtime bundle retires resources exactly once after the runti
         fn init(_: std.mem.Allocator, context: *Context) !@This() {
             return .{ .context = context };
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.context.order.* = 1;
         }
     };
@@ -155,7 +155,7 @@ test "local owning runtime bundle leaves source resources with caller on constru
             if (refuse) return error.ConstructorFailed;
             return .{};
         }
-        fn deinit(_: *@This()) void {}
+        pub fn deinit(_: *@This()) void {}
     };
     const Check = struct {
         fn run(alloc: std.mem.Allocator) !void {

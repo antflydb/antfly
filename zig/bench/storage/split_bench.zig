@@ -36,7 +36,7 @@ const DurStats = struct {
         return @intCast(self.total / self.values.items.len);
     }
 
-    fn deinit(self: *DurStats, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DurStats, alloc: std.mem.Allocator) void {
         self.values.deinit(alloc);
         self.* = undefined;
     }
@@ -48,7 +48,7 @@ const Results = struct {
     baseline_copy_ns: DurStats = .{},
     streaming_copy_ns: DurStats = .{},
 
-    fn deinit(self: *Results, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Results, alloc: std.mem.Allocator) void {
         self.baseline_median_ns.deinit(alloc);
         self.native_median_ns.deinit(alloc);
         self.baseline_copy_ns.deinit(alloc);

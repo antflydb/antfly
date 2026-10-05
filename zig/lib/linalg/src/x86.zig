@@ -57,15 +57,15 @@ pub fn resolve(name: []const u8, has_avx2: bool) !Kernel {
 pub fn selected() Kernel {
     if (comptime !enabled) return .portable;
     const value = cached.load(.acquire);
-    if (value != 0) return @enumFromInt(value);
+    if (value != 0) return @fromBackingInt(@intCast(value));
     const name = if (builtin.link_libc) blk: {
         const raw = std.c.getenv("ANTFLY_INFERENCE_X86_KERNEL") orelse break :blk "auto";
         break :blk std.mem.span(raw);
     } else "auto";
     const result = resolve(name, available()) catch |err| std.debug.panic("ANTFLY_INFERENCE_X86_KERNEL={s}: {s}", .{ name, @errorName(err) });
     // Racing initializers derive the same immutable process policy.
-    _ = cached.cmpxchgStrong(0, @intFromEnum(result), .release, .monotonic);
-    return @enumFromInt(cached.load(.acquire));
+    _ = cached.cmpxchgStrong(0, @backingInt(result), .release, .monotonic);
+    return @fromBackingInt(@intCast(cached.load(.acquire)));
 }
 
 test "AVX2 requires all CPU features and OS vector state" {

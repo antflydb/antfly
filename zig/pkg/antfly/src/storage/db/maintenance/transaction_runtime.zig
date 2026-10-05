@@ -166,9 +166,9 @@ test "local transaction recovery preserves failed resolution and makes bounded p
     defer store.deinit();
     var manager = try transactions_mod.TxnManager.init(alloc, &store);
     defer manager.deinit();
-    const poison: transactions_mod.TxnId = .{1} ** 16;
-    const healthy: transactions_mod.TxnId = .{2} ** 16;
-    const pending: transactions_mod.TxnId = .{3} ** 16;
+    const poison: transactions_mod.TxnId = @splat(1);
+    const healthy: transactions_mod.TxnId = @splat(2);
+    const pending: transactions_mod.TxnId = @splat(3);
     for ([_]transactions_mod.TxnId{ poison, healthy }) |id| {
         try manager.initTransaction(id, 1_000);
         try manager.writeIntents(id, &.{.{ .key = &id, .value = "{}" }}, &.{});

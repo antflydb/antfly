@@ -21,7 +21,7 @@ pub fn create(options: struct {
     b: *std.Build,
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     owner: Owner,
     onnx_data: *std.Build.Module,
     jinja: *std.Build.Module,

@@ -5901,7 +5901,7 @@ projection completion. Do not label the remaining time CPU contention without
 measurements. A same-process alternating ReleaseFast kernel microbenchmark
 measured roughly 41.7--42.3 ns/vector for the array gate and 42.1--42.3 for the
 fused gate; this does not explain the large end-to-end regression. Reproduce:
-`zig build lib-vectorindex-test -Doptimize=ReleaseFast -- 'fused native candidate scoring microbenchmark'`.
+`zig build lib-vectorindex-test -Doptimize=fast -- 'fused native candidate scoring microbenchmark'`.
 
 All seven stopping checks/query failed on an unresolved frontier, with 2,649
 unresolved posting bounds and no incomplete routing directory. Code inspection
@@ -9749,7 +9749,7 @@ not total allocated disk or savings versus the existing AFPD-compressed WAL.
 Raw output: `.benchmark-results/pr593-posting-row-store-20260908/component-final.log`.
 Measured module SHA256:
 `dcb1e30537db469701cb00251f6eaceacd57184dcf302305bfc0cc448c224dd1`.
-Reproduce with `zig build lib-vectorindex-test -Doptimize=ReleaseFast --summary all -- 'posting row representation microbenchmark'`.
+Reproduce with `zig build lib-vectorindex-test -Doptimize=fast --summary all -- 'posting row representation microbenchmark'`.
 
 **Remaining integration before public qualification:** allocate immutable chunk
 identities through the durable index owner; stage/fsync chunks and commit row

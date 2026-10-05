@@ -1337,7 +1337,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
     defer source.close();
     for ([_]bool{ false, true }, 0..) |ha, attempt| {
         var gate: @import("../hot_standby/public_gate_state.zig").State = .{};
-        gate.role.store(@intFromEnum(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
+        gate.role.store(@backingInt(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
         const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/lag-{d}", .{ tmp.sub_path, attempt });
         const options: db_mod.OpenOptions = .{ .identity_namespace = .{ .table_id = 10, .shard_id = 11, .range_id = 11 }, .open_mode = .writer_no_replay, .start_optional_runtimes = false, .start_index_workers = false };
         var target = try db_mod.DB.open(alloc, path, options);

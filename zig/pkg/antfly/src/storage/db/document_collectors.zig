@@ -132,8 +132,9 @@ pub fn collectDocumentWritesProfiled(
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
     // Temporary descriptors cannot escape the synchronous read/apply below.
-    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
-    const descriptor_alloc = descriptor_buffer.get();
+    var descriptor_buffer_storage: [4096]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var descriptor_buffer: std.heap.BufferFirstAllocator = .init(&descriptor_buffer_storage, alloc);
+    const descriptor_alloc = descriptor_buffer.allocator();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
         pending.deinit(descriptor_alloc);
@@ -290,8 +291,9 @@ pub fn collectTextDocumentWritesForIndex(
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
     // Temporary descriptors cannot escape the synchronous read/apply below.
-    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
-    const descriptor_alloc = descriptor_buffer.get();
+    var descriptor_buffer_storage: [4096]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var descriptor_buffer: std.heap.BufferFirstAllocator = .init(&descriptor_buffer_storage, alloc);
+    const descriptor_alloc = descriptor_buffer.allocator();
     var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
     defer {
         pending.deinit(descriptor_alloc);
@@ -501,8 +503,9 @@ pub fn textualAssetFullTextProjectionAlloc(
     raw: []const u8,
 ) !?[]u8 {
     const name_body = internal_keys.assetArtifactNameBody(key) orelse return null;
-    var name_buffer = std.heap.stackFallback(256, alloc);
-    const name_alloc = name_buffer.get();
+    var name_buffer_storage: [256]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var name_buffer: std.heap.BufferFirstAllocator = .init(&name_buffer_storage, alloc);
+    const name_alloc = name_buffer.allocator();
     var name_scratch = std.ArrayListUnmanaged(u8).empty;
     defer name_scratch.deinit(name_alloc);
     const name = (try internal_keys.decodeBodyView(name_body)) orelse blk: {

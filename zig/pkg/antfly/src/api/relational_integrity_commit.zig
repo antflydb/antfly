@@ -851,7 +851,7 @@ const Builder = struct {
         }
     }
 
-    fn deinit(self: *Builder) void {
+    pub fn deinit(self: *Builder) void {
         if (self.read_view) |view| view.deinit();
         for (self.loaded.items) |table| {
             if (table.plan) |*plan| plan.deinit();
@@ -1174,7 +1174,8 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
         table.predicates = predicates.items;
         table.relational_repair = builder.repairing(table.table_name);
     }
-    return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc) };
+    const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
+    return .{ .arena = arena, .tables = owned_result_tables };
 }
 
 /// A session stage is one statement. Its read-your-writes view includes all
@@ -1570,7 +1571,8 @@ pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, me
         table_request.integrity_commands = commands.items;
         table_request.predicates = predicates.items;
     }
-    return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc) };
+    const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
+    return .{ .arena = arena, .tables = owned_result_tables };
 }
 
 pub fn prepareBackfill(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, table_name: []const u8, rows: []const BackfillRow, phase: BackfillPhase) !Prepared {
@@ -1682,7 +1684,10 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     // exact activation checkpoint/EOF CAS. Resolving external parents here
     // would unnecessarily require public routes inside a private empty restore
     // cohort and can prevent TRUNCATE from ever completing validation.
-    if (rows.len == 0) return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc) };
+    if (rows.len == 0) {
+        const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
+        return .{ .arena = arena, .tables = owned_result_tables };
+    }
     var plan = try builder.bindingPlanSelected(table, phase == .unique, phase == .foreign_key);
     defer plan.deinit();
     var selected_fields: std.ArrayList([]const u8) = .empty;
@@ -1731,7 +1736,8 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
         table_request.integrity_commands = if (validation_failure == null) commands.items else &.{};
         table_request.predicates = predicates.items;
     }
-    return .{ .arena = arena, .tables = try builder.output.toOwnedSlice(builder.alloc), .validation_failure = validation_failure, .backfill_partial = backfill_partial };
+    const owned_result_tables = try builder.output.toOwnedSlice(builder.alloc);
+    return .{ .arena = arena, .tables = owned_result_tables, .validation_failure = validation_failure, .backfill_partial = backfill_partial };
 }
 
 test "empty activation page validates source catalog without probing external parents" {
@@ -2052,7 +2058,7 @@ test "distributed txn global unique coverage checks every owner and rejects stal
                 .schema_version = @as(u32, if (self.stale) 2 else 1),
                 .schema_digest = self.digest,
                 .generation_set = self.generation_set,
-                .owner = [_]u8{1} ** 32,
+                .owner = @as([32]u8, @splat(1)),
                 .range_start = @as([]const u8, if (first) "" else "m"),
                 .range_end = @as([]const u8, if (first) "m" else ""),
                 .unique_covered = first or self.ready,

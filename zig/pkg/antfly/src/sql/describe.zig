@@ -1107,7 +1107,7 @@ test "SQL JSON literal coercion preserves exact number text and typed parameters
     try std.testing.expect((try bindLiteral(arena.allocator(), .null, .json)) == .null);
     const nested_null = try bindLiteral(arena.allocator(), .{ .string = "{\"n\":null}" }, .json);
     try std.testing.expect(nested_null.object.get("n").? == .null);
-    try std.testing.expectError(error.SqlProgramLimitExceeded, bindLiteral(arena.allocator(), .{ .string = "[" ** 65 ++ "0" ++ "]" ** 65 }, .json));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, bindLiteral(arena.allocator(), .{ .string = z17RepeatString("[", 65) ++ "0" ++ z17RepeatString("]", 65) }, .json));
 }
 
 test "SQL JSON literal coercion propagates allocation failure without rewriting errors" {
@@ -1173,4 +1173,15 @@ test "SQL timestamp coercion preserves signed epoch precision and canonical offs
         try std.testing.expectEqualStrings("1969-12-31T23:59:59.999999999Z", (try coerceAlloc(a, raw, .datetime)).string);
     }
     try std.testing.expectError(error.InvalidSqlDateTime, coerceAlloc(a, .{ .number_string = "170141183460469231731687303715884105727" }, .datetime));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

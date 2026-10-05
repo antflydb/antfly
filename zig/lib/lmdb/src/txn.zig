@@ -166,7 +166,7 @@ const WriteState = struct {
         return cloned;
     }
 
-    fn deinit(self: *WriteState) void {
+    pub fn deinit(self: *WriteState) void {
         const allocator = self.arena.allocator();
         var dirty_pages = self.dirty_pages.iterator();
         while (dirty_pages.next()) |entry| {
@@ -3276,7 +3276,7 @@ test "page-level delete updates parent branch separator key" {
 
     const page_size = 4096;
     var bytes: [page_size * 5]u8 = undefined;
-    const large_value = [_]u8{'p'} ** 1200;
+    const large_value = @as([1200]u8, @splat('p'));
     const empty_free_db = format.Db{
         .md_pad = page_size,
         .md_flags = format.DbFlags.integer_key,
@@ -3343,7 +3343,7 @@ test "commit serializes page-state branch updates" {
 
     const page_size = 4096;
     var bytes: [page_size * 5]u8 = undefined;
-    const large_value = [_]u8{'q'} ** 1200;
+    const large_value = @as([1200]u8, @splat('q'));
     const empty_free_db = format.Db{
         .md_pad = page_size,
         .md_flags = format.DbFlags.integer_key,
@@ -3977,7 +3977,7 @@ test "page-level delete borrows from left leaf sibling" {
 
     const page_size = 4096;
     var bytes: [page_size * 5]u8 = undefined;
-    const large_value = [_]u8{'x'} ** 700;
+    const large_value = @as([700]u8, @splat('x'));
     const empty_free_db = format.Db{
         .md_pad = page_size,
         .md_flags = format.DbFlags.integer_key,
@@ -4053,7 +4053,7 @@ test "page-level delete borrows from right leaf sibling" {
 
     const page_size = 4096;
     var bytes: [page_size * 5]u8 = undefined;
-    const large_value = [_]u8{'y'} ** 700;
+    const large_value = @as([700]u8, @splat('y'));
     const empty_free_db = format.Db{
         .md_pad = page_size,
         .md_flags = format.DbFlags.integer_key,
@@ -4129,8 +4129,8 @@ test "page-level delete preflights oversized sibling donations before mutation" 
         defer tmp.cleanup();
         const page_size = 4096;
         var bytes: [page_size * 5]u8 = undefined;
-        const large = [_]u8{'x'} ** 3900;
-        const small = [_]u8{'y'} ** 200;
+        const large = @as([3900]u8, @splat('x'));
+        const small = @as([200]u8, @splat('y'));
         const empty_free_db = format.Db{
             .md_pad = page_size,
             .md_flags = format.DbFlags.integer_key,
@@ -4332,8 +4332,8 @@ test "page-level put replaces with a new overflow-valued entry" {
     var path_buf: [256]u8 = undefined;
     const file_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/overflow_replace.mdb", .{tmp.sub_path});
 
-    const first_value = [_]u8{'r'} ** 9000;
-    const second_value = [_]u8{'s'} ** 9500;
+    const first_value = @as([9000]u8, @splat('r'));
+    const second_value = @as([9500]u8, @splat('s'));
 
     {
         const page_size = 4096;

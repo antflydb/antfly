@@ -420,7 +420,7 @@ pub const DenseCatchUpContentionStats = struct {
     finish_calls: AtomicU64 = .init(0),
     abort_calls: AtomicU64 = .init(0),
     active: AtomicU64 = .init(0),
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(types.DenseCatchUpStats.Phase.idle)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(types.DenseCatchUpStats.Phase.idle)),
     current_sequence: AtomicU64 = .init(0),
     current_target_sequence: AtomicU64 = .init(0),
     current_scanned_entries: AtomicU64 = .init(0),
@@ -454,7 +454,7 @@ pub const DenseCatchUpContentionStats = struct {
             .finish_calls = self.finish_calls.load(.monotonic),
             .abort_calls = self.abort_calls.load(.monotonic),
             .active = self.active.load(.monotonic) != 0,
-            .phase = @enumFromInt(self.phase.load(.monotonic)),
+            .phase = @fromBackingInt(@intCast(self.phase.load(.monotonic))),
             .current_sequence = self.current_sequence.load(.monotonic),
             .current_target_sequence = self.current_target_sequence.load(.monotonic),
             .current_scanned_entries = self.current_scanned_entries.load(.monotonic),
@@ -1654,7 +1654,7 @@ pub const GeneratedEmbeddingMemo = struct {
         source: []const u8,
     ) Key {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-        hasher.update(&.{@intFromEnum(kind)});
+        hasher.update(&.{@backingInt(kind)});
         var length_buf: [8]u8 = undefined;
         inline for (.{ embedding_name, producer_json, execution_json, source }) |part| {
             std.mem.writeInt(u64, &length_buf, part.len, .little);

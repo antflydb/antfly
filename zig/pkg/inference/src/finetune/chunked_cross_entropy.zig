@@ -261,7 +261,7 @@ const RefResult = struct {
     grad_w: []f32,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *RefResult) void {
+    pub fn deinit(self: *RefResult) void {
         self.allocator.free(self.grad_h);
         self.allocator.free(self.grad_w);
         self.* = undefined;

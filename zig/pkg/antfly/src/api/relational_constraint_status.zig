@@ -202,7 +202,7 @@ test "relational declarations status requires complete matching owner coverage" 
                 .schema_version = @as(u32, if (self.stale) 2 else 1),
                 .schema_digest = self.update.catalog.schema_digest,
                 .generation_set = activation.generationSet(self.update.catalog),
-                .owner = [_]u8{1} ** 32,
+                .owner = @as([32]u8, @splat(1)),
                 .range_start = key,
                 .range_end = if (first) "\x00" else "",
                 .unique_covered = true,

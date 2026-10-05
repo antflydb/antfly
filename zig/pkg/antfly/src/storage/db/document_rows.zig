@@ -307,6 +307,8 @@ pub const Session = struct {
         try self.store.scanDocumentRowsReadTxnWithContext(&self.txn, lower, self.upper, &context, Context.admit, Context.visit);
         try self.checkpoint();
         self.done = !context.more;
-        return .{ .arena = arena, .rows = try context.rows.toOwnedSlice(owned), .after = if (context.more) try owned.dupe(u8, self.after.items) else null };
+        const owned_result_rows = try context.rows.toOwnedSlice(owned);
+        const owned_result_after = if (context.more) try owned.dupe(u8, self.after.items) else null;
+        return .{ .arena = arena, .rows = owned_result_rows, .after = owned_result_after };
     }
 };

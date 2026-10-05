@@ -118,7 +118,7 @@ fn chainLabeledFilteredRun(
     const banner = addProgressBanner(b, b.fmt("{s}: {s}", .{ phase, filter }));
     if (previous) |step| banner.step.dependOn(step);
     const run = b.addRunArtifact(artifact);
-    run.addArgs(&.{ "--test-filter", filter });
+    run.addArgs(&.{ "--suite-filter", filter });
     run.step.dependOn(&banner.step);
     return &run.step;
 }
@@ -151,7 +151,7 @@ pub fn selectTestFilters(
 ) []const []const u8 {
     return build_test_filters.select(
         b.allocator,
-        b.args orelse &.{},
+        buildArguments(b) orelse &.{},
         default_filters,
     );
 }
@@ -207,7 +207,7 @@ pub fn assignDefaultAggregateMaxRssRecursive(
 ) void {
     const entry = visited.getOrPut(step) catch @panic("OOM");
     if (entry.found_existing) return;
-    if (step.max_rss == 0) switch (step.id) {
+    if (step.max_rss == 0) switch (step.tag) {
         .compile => step.max_rss = compile_max_rss,
         .run => step.max_rss = run_max_rss,
         else => {},
@@ -228,9 +228,10 @@ pub fn addRuntimeTestFilters(
     filters: []const []const u8,
 ) void {
     for (filters) |filter| {
-        run.addArgs(&.{ "--test-filter", filter });
+        run.addArgs(&.{ "--suite-filter", filter });
     }
-    build_test_filters.addRuntimeControls(run, b.args orelse &.{});
+    _ = b;
+    run.addPassthruArgs();
 }
 
 pub fn addRuntimeSkipTestFilters(run: *std.Build.Step.Run, filters: []const []const u8) void {
@@ -344,10 +345,10 @@ pub const OwnerTests = struct {
 pub fn addOwnerTestRuns(b: *std.Build, owner: *std.Build.Step, shards: []const OwnerTests, skips: []const []const u8) void {
     const selected = selectTestFilters(b, &.{});
     const audit = b.addSystemCommand(&.{"python3"});
-    audit.addFileArg(b.path("tools/audit_test_selection.py"));
+    audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
     for (selected) |filter| audit.addArgs(&.{ "--filter", filter });
     for (skips) |filter| audit.addArgs(&.{ "--skip-filter", filter });
-    const args = b.args orelse &.{};
+    const args = buildArguments(b) orelse &.{};
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--allow-empty-test-filter")) {
@@ -367,7 +368,7 @@ pub fn addOwnerTestRuns(b: *std.Build, owner: *std.Build.Step, shards: []const O
         for (shard.filters) |filter| inventory.addArgs(&.{ "--suite-filter", filter });
         addRuntimeSkipTestFilters(inventory, shard.skip_filters);
         audit.addArg("--inventory");
-        audit.addFileArg(inventory.captureStdErr(.{}));
+        audit.addFileArg2(inventory.captureStdErr(.{}), .{ .make_absolute = true });
         const run = addCuratedTestRunArtifact(b, shard.artifact, shard.filters);
         run.addArg("--allow-empty-test-filter");
         addRuntimeSkipTestFilters(run, skips);
@@ -375,6 +376,8 @@ pub fn addOwnerTestRuns(b: *std.Build, owner: *std.Build.Step, shards: []const O
         run.step.dependOn(previous);
         previous = &run.step;
     }
+    audit.addArg("--");
+    audit.addPassthruArgs();
     owner.dependOn(previous);
 }
 
@@ -413,4 +416,19 @@ pub fn addRequiredTestRunArtifact(b: *std.Build, artifact: *std.Build.Step.Compi
     const run = addFilteredTestRunArtifact(b, artifact);
     run.addArgs(&.{ "--require-no-skips", b.fmt("--timeout-ms={d}", .{timeout_ms}) });
     return run;
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

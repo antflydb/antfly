@@ -225,7 +225,7 @@ test "asset producer runtime floors the local extractor allocator ceiling at the
     defer client.deinit();
 
     const Local = struct {
-        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+        pub fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
             return error.TestUnexpectedResult;
         }
         fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
@@ -282,7 +282,7 @@ test "asset producer runtime resolves a plan for a tiny local extractor request"
     defer client.deinit();
 
     const Local = struct {
-        fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
+        pub fn extract(_: *anyopaque, _: Allocator, _: []const u8, _: extracting.Request) !extracting.Response {
             return error.TestUnexpectedResult;
         }
         fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
@@ -2575,7 +2575,7 @@ pub const Runtime = struct {
         return try alloc.dupe(u8, result.content);
     }
 
-    fn read(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    pub fn read(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         var cfg_parsed = try std.json.parseFromSlice(readers.Config, alloc, request.config_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
@@ -3122,7 +3122,7 @@ pub const Runtime = struct {
         return try transcribing.speakerAttributedTextAlloc(alloc, &result);
     }
 
-    fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+    pub fn extract(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         if (request.media.len > 0 and !request.inline_media_trusted) return error.UntrustedInlineMedia;
         for (request.media) |media| try validateEncodedMedia(media);
         var cfg = try extracting.parseConfigFromSlice(alloc, request.config_json);
@@ -3307,7 +3307,7 @@ const GeneratorProducerConfig = struct {
     tool_name: ?[]const u8 = null,
     tool_output: GeneratorToolOutput = .content,
 
-    fn deinit(self: *GeneratorProducerConfig, alloc: Allocator) void {
+    pub fn deinit(self: *GeneratorProducerConfig, alloc: Allocator) void {
         self.generator.deinit(alloc);
         self.parsed.deinit();
         self.* = undefined;
@@ -3812,7 +3812,7 @@ const ExtractorItemShape = struct {
     media_parts: usize = 0,
     prompt: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.prompt);
         self.* = undefined;
     }
@@ -4137,7 +4137,7 @@ test "asset producer runtime generator admission accounts for resident inline me
 }
 
 test "asset producer runtime media accounting follows attachment transport" {
-    var bytes = [_]u8{0} ** 24;
+    var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
@@ -4263,7 +4263,7 @@ test "asset producer runtime remote planning uses resolved framed transport" {
             defer runtime.deinit();
             const config = try std.fmt.allocPrint(alloc, "{{\"provider\":\"antfly\",\"model\":\"vision\",\"url\":\"{s}\"}}", .{server.baseUrl()});
             defer alloc.free(config);
-            var png = [_]u8{0} ** 24;
+            var png = @as([24]u8, @splat(0));
             @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
             std.mem.writeInt(u32, png[16..20], 2, .big);
             std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -4455,7 +4455,7 @@ fn extractorBatchEnd(
 }
 
 test "asset producer runtime extractor windows obey resolved item and encoded-byte ceilings" {
-    var bytes = [_]u8{0} ** 24;
+    var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
@@ -4549,7 +4549,7 @@ test "asset producer runtime extractor shape is allocation-failure safe" {
             defer shape.deinit(alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "asset producer runtime local reader chunks stop at source boundaries before the Florence cap" {
@@ -4560,7 +4560,7 @@ test "asset producer runtime local reader chunks stop at source boundaries befor
 }
 
 test "encoded reader chunks obey model item and byte limits" {
-    var bytes = [_]u8{0} ** 24;
+    var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
@@ -4645,7 +4645,7 @@ const ReaderSource = struct {
     images: []const []const u8,
     prompt: ?[]const u8 = null,
 
-    fn deinit(self: *ReaderSource, alloc: Allocator) void {
+    pub fn deinit(self: *ReaderSource, alloc: Allocator) void {
         for (self.images) |image| alloc.free(@constCast(image));
         alloc.free(self.images);
         if (self.prompt) |prompt| alloc.free(@constCast(prompt));
@@ -5224,7 +5224,7 @@ test "asset producer runtime typed extractor response parsing is allocation-fail
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 const extraction_v2_response_fixture =
@@ -5251,7 +5251,7 @@ fn exerciseSingleExtractionResponse(alloc: Allocator) !void {
 
 test "asset producer runtime single extractor response preserves v2 extensions and ownership" {
     try exerciseSingleExtractionResponse(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSingleExtractionResponse, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSingleExtractionResponse, .{});
 }
 
 test "asset producer runtime single extractor response rejects malformed envelopes and typed values" {
@@ -5455,7 +5455,7 @@ const AntflyGenerateBatchRequest = struct {
     metadata_or_json: []u8,
     envelope: ?httpx.attachment_envelope.EncodedSegments = null,
 
-    fn deinit(self: *AntflyGenerateBatchRequest, alloc: Allocator) void {
+    pub fn deinit(self: *AntflyGenerateBatchRequest, alloc: Allocator) void {
         if (self.envelope) |*envelope| envelope.deinit();
         alloc.free(self.metadata_or_json);
         self.* = undefined;
@@ -5744,7 +5744,7 @@ test "remote generator batch streams attachments into one exact JSON body" {
             try std.testing.expectEqualStrings("attachment:0", framed_content[1].object.get("data").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn normalizeAntflyInferenceBaseUrl(alloc: Allocator, raw: []const u8) ![]u8 {
@@ -6458,7 +6458,7 @@ test "owned asset producer foreground contract follows the selected route" {
             return error.TestUnexpectedResult;
         }
 
-        fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
+        pub fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
             return error.TestUnexpectedResult;
         }
 
@@ -6629,7 +6629,7 @@ test "asset producer runtime preserves remote reader identity and native executi
         .{server.baseUrl()},
     );
     defer alloc.free(cfg_json);
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -6797,7 +6797,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
             return error.TestUnexpectedResult;
         }
 
-        fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
+        pub fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.read_calls += 1;
             try std.testing.expectEqualStrings("local-reader", model);
@@ -6860,7 +6860,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
             return error.TestUnexpectedResult;
         }
 
-        fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
+        pub fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.read_calls += 1;
             try std.testing.expectEqualStrings("local-reader", model);
@@ -7067,7 +7067,7 @@ test "asset producer runtime batches local encoded media without base64 adaptati
             return error.TestUnexpectedResult;
         }
 
-        fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
+        pub fn readImages(_: *anyopaque, _: Allocator, _: []const u8, _: readers.Request) ![]readers.Result {
             return error.TestUnexpectedResult;
         }
 
@@ -7234,7 +7234,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
             return error.TestUnexpectedResult;
         }
 
-        fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
+        pub fn readImages(ptr: *anyopaque, a: Allocator, model: []const u8, request: readers.Request) ![]readers.Result {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("local-reader", model);
             try std.testing.expect(request.images.len > 0);
@@ -7333,7 +7333,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
             return error.TestUnexpectedResult;
         }
 
-        fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
+        pub fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.transcribe_calls.fetchAdd(1, .monotonic);
             try std.testing.expectEqualStrings("local-transcriber", model);
@@ -7427,7 +7427,7 @@ test "asset producer runtime routes antfly transcriber without url to local prov
             return error.TestUnexpectedResult;
         }
 
-        fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
+        pub fn transcribeAudio(ptr: *anyopaque, a: Allocator, model: []const u8, request: transcribing.Request) !transcribing.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.transcribe_calls += 1;
             try std.testing.expectEqualStrings("local-transcriber", model);
@@ -7501,7 +7501,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
             };
         }
 
-        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+        pub fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.extract_calls += 1;
             try std.testing.expectEqualStrings("local-extractor", model);
@@ -7596,7 +7596,7 @@ test "asset producer runtime batches compatible antfly extractor requests" {
             };
         }
 
-        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+        pub fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.extract_calls += 1;
             try std.testing.expectEqualStrings("local-extractor", model);
@@ -7704,7 +7704,7 @@ test "asset producer runtime never batches an extractor that advertises max_item
             };
         }
 
-        fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
+        pub fn extract(ptr: *anyopaque, a: Allocator, model: []const u8, request: extracting.Request) !extracting.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.extract_calls += 1;
             self.max_inputs_seen = @max(self.max_inputs_seen, request.inputs.len);

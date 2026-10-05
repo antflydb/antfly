@@ -65,7 +65,7 @@ pub const Plan = struct {
                 hash.update(&number);
                 hash.update(text);
             }
-            hash.update(&.{ @intFromEnum(column.column_type), @intFromBool(column.required), @intFromBool(column.allows_null), @intFromBool(column.is_json), @intFromEnum(column.json_kind) });
+            hash.update(&.{ @backingInt(column.column_type), @intFromBool(column.required), @intFromBool(column.allows_null), @intFromBool(column.is_json), @backingInt(column.json_kind) });
         }
         const layout = try codec.PhysicalLayout.init(alloc, .{ .version = 1, .storage_mode = .relational, .relational_columns = columns });
         var fingerprint: [32]u8 = undefined;

@@ -426,40 +426,40 @@ pub const BatchRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        inline for (std.meta.fields(@This())) |field| {
-            try jw.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "relational_integrity_generation_set") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
-                if (@field(self, field.name)) |digest| {
+        inline for (comptime std.meta.fieldNames(@This())) |reflected_name| {
+            try jw.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "relational_integrity_generation_set") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
+                if (@field(self, reflected_name)) |digest| {
                     try jw.beginArray();
                     for (digest) |byte| try jw.write(byte);
                     try jw.endArray();
                 } else try jw.write(null);
-            } else if (comptime std.mem.eql(u8, field.name, "merge_page")) {
+            } else if (comptime std.mem.eql(u8, reflected_name, "merge_page")) {
                 // The same bounded chunk encoding crosses HTTP, native replay
                 // and projection storage; never expand payload bytes to nodes.
                 try jw.write(self.merge_page);
-            } else if (comptime std.mem.eql(u8, field.name, "split_checkpoint") or
-                std.mem.eql(u8, field.name, "split_transition") or
-                std.mem.eql(u8, field.name, "merge_checkpoint") or
-                std.mem.eql(u8, field.name, "merge_artifacts"))
+            } else if (comptime std.mem.eql(u8, reflected_name, "split_checkpoint") or
+                std.mem.eql(u8, reflected_name, "split_transition") or
+                std.mem.eql(u8, reflected_name, "merge_checkpoint") or
+                std.mem.eql(u8, reflected_name, "merge_artifacts"))
             {
                 // Lifecycle ranges and physical artifacts are opaque bytes,
                 // including when replayed through the native HA envelope.
-                try @import("relational_integrity_json.zig").write(@field(self, field.name), jw);
-            } else if (comptime std.mem.eql(u8, field.name, "writes") or std.mem.eql(u8, field.name, "deletes")) {
+                try @import("relational_integrity_json.zig").write(@field(self, reflected_name), jw);
+            } else if (comptime std.mem.eql(u8, reflected_name, "writes") or std.mem.eql(u8, reflected_name, "deletes")) {
                 // Final transaction effects can contain binary private keys
                 // and values in live HA as well as staged restore. Preserve
                 // those bytes without expanding ordinary JSON primary rows.
                 try jw.beginArray();
-                for (@field(self, field.name)) |item| {
-                    const key = if (comptime std.mem.eql(u8, field.name, "writes")) item.key else item;
+                for (@field(self, reflected_name)) |item| {
+                    const key = if (comptime std.mem.eql(u8, reflected_name, "writes")) item.key else item;
                     if (std.mem.startsWith(u8, key, "\x00\x00__metadata__:"))
                         try @import("relational_integrity_json.zig").write(item, jw)
                     else
                         try jw.write(item);
                 }
                 try jw.endArray();
-            } else try jw.write(@field(self, field.name));
+            } else try jw.write(@field(self, reflected_name));
         }
         try jw.endObject();
     }
@@ -2059,19 +2059,19 @@ const hierarchy_children_rejected_fields = [_][]const u8{
 
 fn auditHierarchyChildrenSearchRequestFields() void {
     @setEvalBranchQuota(10_000);
-    inline for (@typeInfo(SearchRequest).@"struct".fields) |field| {
+    inline for (comptime std.meta.fieldNames(SearchRequest)) |reflected_name| {
         comptime var classifications: usize = 0;
         inline for (hierarchy_children_validated_fields) |name| {
-            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+            if (std.mem.eql(u8, reflected_name, name)) classifications += 1;
         }
         inline for (hierarchy_children_supported_internal_fields) |name| {
-            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+            if (std.mem.eql(u8, reflected_name, name)) classifications += 1;
         }
         inline for (hierarchy_children_rejected_fields) |name| {
-            if (std.mem.eql(u8, field.name, name)) classifications += 1;
+            if (std.mem.eql(u8, reflected_name, name)) classifications += 1;
         }
         if (classifications != 1) {
-            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ field.name);
+            @compileError("SearchRequest field must have exactly one hierarchy-children policy: " ++ reflected_name);
         }
     }
 }
@@ -2824,17 +2824,17 @@ pub const SearchResult = struct {
     /// string fields in the ownership contract without a second field list.
     pub fn setOwnedSortProfile(self: *SearchResult, profile: SortProfile) !void {
         var length: usize = 0;
-        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
-            if (field.type == []const u8) length = try std.math.add(usize, length, @field(profile, field.name).len);
+        inline for (@typeInfo(SortProfile).@"struct".field_names, @typeInfo(SortProfile).@"struct".field_types) |reflected_name, field_type| {
+            if (field_type == []const u8) length = try std.math.add(usize, length, @field(profile, reflected_name).len);
         }
         const storage = try self.alloc.alloc(u8, length);
         var owned = profile;
         var offset: usize = 0;
-        inline for (@typeInfo(SortProfile).@"struct".fields) |field| {
-            if (field.type == []const u8) {
-                const value = @field(profile, field.name);
+        inline for (@typeInfo(SortProfile).@"struct".field_names, @typeInfo(SortProfile).@"struct".field_types) |reflected_name, field_type| {
+            if (field_type == []const u8) {
+                const value = @field(profile, reflected_name);
                 @memcpy(storage[offset..][0..value.len], value);
-                @field(owned, field.name) = storage[offset..][0..value.len];
+                @field(owned, reflected_name) = storage[offset..][0..value.len];
                 offset += value.len;
             }
         }
@@ -3149,7 +3149,7 @@ pub const TTLCleanupStats = struct {
 
 pub fn InlineStatusText(comptime capacity: usize) type {
     return struct {
-        bytes: [capacity]u8 = [_]u8{0} ** capacity,
+        bytes: [capacity]u8 = @as([capacity]u8, @splat(0)),
         len: u16 = 0,
 
         pub fn init(value: []const u8) @This() {
@@ -4864,7 +4864,7 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
     dst.finish_calls += src.finish_calls;
     dst.abort_calls += src.abort_calls;
     dst.active = dst.active or src.active;
-    if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+    if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
     dst.current_sequence = @max(dst.current_sequence, src.current_sequence);
     dst.current_target_sequence = @max(dst.current_target_sequence, src.current_target_sequence);
     dst.current_scanned_entries += src.current_scanned_entries;
@@ -4895,7 +4895,7 @@ pub fn accumulateDenseCatchUpStats(dst: *DenseCatchUpStats, src: DenseCatchUpSta
 
 pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatchUpStats) void {
     dst.active = dst.active or src.active;
-    if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+    if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
     dst.wal_retention_known = dst.wal_retention_known or src.wal_retention_known;
     dst.wal_retained_segments += src.wal_retained_segments;
     dst.wal_retained_bytes += src.wal_retained_bytes;
@@ -5140,15 +5140,15 @@ pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
     }
     if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
     const defaults = BatchRequest{};
-    inline for (std.meta.fields(BatchRequest)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
-            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes") or std.mem.eql(u8, field.name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field.name, "merge_artifacts")) {
-                if (!req.graph_endpoint_cleanup_planned and @field(req, field.name).len != 0) return error.InvalidBatchRequest;
+    inline for (@typeInfo(BatchRequest).@"struct".field_names, @typeInfo(BatchRequest).@"struct".field_types) |field_name, field_type| {
+        if (comptime !std.mem.eql(u8, field_name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field_name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field_name, "timestamp_ns") and !std.mem.eql(u8, field_name, "sync_level")) {
+            if (comptime std.mem.eql(u8, field_name, "deletes") or std.mem.eql(u8, field_name, "graph_deletes") or std.mem.eql(u8, field_name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field_name, "merge_artifacts")) {
+                if (!req.graph_endpoint_cleanup_planned and @field(req, field_name).len != 0) return error.InvalidBatchRequest;
             } else {
-                const value = @field(req, field.name);
-                if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+                const value = @field(req, field_name);
+                if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                     if (value.len != 0) return error.InvalidBatchRequest;
-                } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(defaults, field_name))) return error.InvalidBatchRequest;
             }
         }
     }

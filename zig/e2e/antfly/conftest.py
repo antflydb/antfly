@@ -838,18 +838,24 @@ def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     return data[-limit:]
 
 
-def _write_remote_content_e2e_config(root: Path, *, pgwire_port: int | None = None) -> Path:
+def _write_remote_content_e2e_config(
+    root: Path, *, pgwire_port: int | None = None
+) -> Path:
     config_path = root / "antfly-e2e.json"
     config_path.write_text(
         json.dumps(
             {
                 "remote_content": {"security": {"block_private_ips": False}},
                 **(
-                    {"pgwire": {
-                        "enabled": True,
-                        "bind_host": "127.0.0.1",
-                        "bind_port": pgwire_port,
-                    }} if pgwire_port is not None else {}
+                    {
+                        "pgwire": {
+                            "enabled": True,
+                            "bind_host": "127.0.0.1",
+                            "bind_port": pgwire_port,
+                        }
+                    }
+                    if pgwire_port is not None
+                    else {}
                 ),
                 "connections": {
                     E2E_BACKUP_CONNECTION: {
@@ -1421,8 +1427,12 @@ class StandaloneAntflyServer:
             lambda: subprocess.Popen(
                 command,
                 env=(
-                    {**os.environ, "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD}
-                    if self.pgwire_port is not None else None
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.pgwire_port is not None
+                    else None
                 ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,

@@ -56,12 +56,12 @@ pub const Scope = struct {
         const bytes = try alloc.alloc(u8, header_len + self.child_table_name.len + self.constraint_name.len + checksum_len);
         @memcpy(bytes[0..4], magic);
         bytes[4] = 1;
-        bytes[5] = @intFromEnum(self.phase);
+        bytes[5] = @backingInt(self.phase);
         @memset(bytes[6..8], 0);
         std.mem.writeInt(u64, bytes[8..16], self.revision, .little);
         std.mem.writeInt(u64, bytes[16..24], self.child_table_id, .little);
-        @memcpy(bytes[24..40], if (self.active_generation) |generation| &generation else &([_]u8{0} ** 16));
-        @memcpy(bytes[40..56], if (self.staged_generation) |generation| &generation else &([_]u8{0} ** 16));
+        @memcpy(bytes[24..40], if (self.active_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
+        @memcpy(bytes[40..56], if (self.staged_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
         @memcpy(bytes[56..72], &self.plan_id);
         @memcpy(bytes[72..104], &self.decision_digest);
         std.mem.writeInt(u64, bytes[104..112], self.staged_child_table_id, .little);
@@ -166,8 +166,8 @@ pub fn transitionsDigest(transitions: []const Transition) !integrity.Digest {
         hash.update(&key);
         std.mem.writeInt(u64, &id, transition.child_table_id, .little);
         hash.update(&id);
-        hash.update(if (transition.expected_generation) |generation| &generation else &([_]u8{0} ** 16));
-        hash.update(if (transition.next_generation) |generation| &generation else &([_]u8{0} ** 16));
+        hash.update(if (transition.expected_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
+        hash.update(if (transition.next_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
     }
     var digest: integrity.Digest = undefined;
     hash.final(&digest);

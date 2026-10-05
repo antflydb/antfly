@@ -137,7 +137,7 @@ test "storage.hot_standby durable outbox storage releases partial pages on alloc
         .{ .key = key, .value = "pending" },
     }, &.{});
     const Check = struct {
-        fn read(allocator: Allocator, source: *docstore.DocStore) !void {
+        pub fn read(allocator: Allocator, source: *docstore.DocStore) !void {
             var page = try readPending(allocator, source);
             defer page.deinit(allocator);
         }

@@ -47,7 +47,7 @@ pub const Receipt = struct {
         std.mem.writeInt(u64, out[4..12], self.table_id, .little);
         std.mem.writeInt(u64, out[12..20], self.generation, .little);
         std.mem.writeInt(u64, out[20..28], self.catalog_epoch, .little);
-        out[28] = @intFromEnum(self.phase);
+        out[28] = @backingInt(self.phase);
         std.mem.writeInt(u64, out[32..40], self.applied_term, .little);
         std.mem.writeInt(u64, out[40..48], self.applied_index, .little);
         @memcpy(out[48..80], &self.bundle_digest);

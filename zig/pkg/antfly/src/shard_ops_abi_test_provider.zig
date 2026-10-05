@@ -52,8 +52,8 @@ fn operation(comptime name: []const u8) @FieldType(shard.ShardOperationAdapter.V
 }
 const vtable: shard.ShardOperationAdapter.VTable = blk: {
     var value: shard.ShardOperationAdapter.VTable = undefined;
-    for (std.meta.fields(shard.ShardOperationAdapter.VTable)) |field| {
-        @field(value, field.name) = if (std.mem.eql(u8, field.name, "topology_read")) topology else if (std.mem.eql(u8, field.name, "observe_split")) observeSplit else if (std.mem.eql(u8, field.name, "observe_merge")) observeMerge else operation(field.name);
+    for (std.meta.fieldNames(shard.ShardOperationAdapter.VTable)) |reflected_name| {
+        @field(value, reflected_name) = if (std.mem.eql(u8, reflected_name, "topology_read")) topology else if (std.mem.eql(u8, reflected_name, "observe_split")) observeSplit else if (std.mem.eql(u8, reflected_name, "observe_merge")) observeMerge else operation(reflected_name);
     }
     break :blk value;
 };

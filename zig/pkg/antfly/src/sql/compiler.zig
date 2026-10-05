@@ -305,7 +305,7 @@ const Parser = struct {
         return folded;
     }
 
-    fn name(self: *Parser) Error!ast.Name {
+    pub fn name(self: *Parser) Error!ast.Name {
         const first = try self.identifier();
         if (!self.take(.dot)) return .{ .table = first };
         const second = try self.identifier();
@@ -1417,7 +1417,7 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "unsupported SQL column type");
     }
 
-    fn createTable(self: *Parser) Error!ast.CreateTable {
+    pub fn createTable(self: *Parser) Error!ast.CreateTable {
         const if_not_exists = self.keyword(.@"if");
         if (if_not_exists) {
             try self.expectKeyword(.not);

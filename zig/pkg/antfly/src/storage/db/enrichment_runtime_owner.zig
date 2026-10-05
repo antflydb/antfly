@@ -178,7 +178,7 @@ test "enrichment owner restores running and pending demand and transfers paused 
         const Fake = struct {
             fixture: *Self,
             started: bool = false,
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 self.fixture.destroyed += 1;
             }
             fn isStarted(self: *@This()) bool {

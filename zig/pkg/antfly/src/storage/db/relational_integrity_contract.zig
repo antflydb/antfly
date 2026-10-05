@@ -109,7 +109,7 @@ pub const Address = struct {
     pub fn key(self: Address, kind: Kind) [key_len]u8 {
         var out: [key_len]u8 = undefined;
         @memcpy(out[0..namespace.len], namespace);
-        out[namespace.len] = @intFromEnum(kind);
+        out[namespace.len] = @backingInt(kind);
         @memcpy(out[namespace.len + 1 ..][0..32], &self.routing);
         @memcpy(out[namespace.len + 33 ..][0..16], &self.generation);
         @memcpy(out[namespace.len + 49 ..][0..32], &self.tuple_digest);
@@ -238,7 +238,7 @@ pub const Claim = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
         try out.appendSlice(alloc, "AFC1");
-        try out.appendSlice(alloc, &.{ @intFromEnum(self.state), @intFromEnum(self.action), @intFromBool(self.target_tuple != null), 0 });
+        try out.appendSlice(alloc, &.{ @backingInt(self.state), @backingInt(self.action), @intFromBool(self.target_tuple != null), 0 });
         var version: [4]u8 = undefined;
         std.mem.writeInt(u32, &version, self.schema_version, .little);
         try out.appendSlice(alloc, &version);
@@ -417,7 +417,7 @@ pub const Job = struct {
         errdefer out.deinit(alloc);
         try out.appendSlice(alloc, "AFJ1");
         try out.appendSlice(alloc, &self.action_id);
-        try out.appendSlice(alloc, &.{ @intFromEnum(self.phase), 0, 0, 0 });
+        try out.appendSlice(alloc, &.{ @backingInt(self.phase), 0, 0, 0 });
         var rows: [8]u8 = undefined;
         std.mem.writeInt(u64, &rows, self.rows_validated, .little);
         try out.appendSlice(alloc, &rows);

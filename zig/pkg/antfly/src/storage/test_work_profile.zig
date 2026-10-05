@@ -21,7 +21,7 @@ pub fn Profile(comptime Phase: type) type {
         const Self = @This();
         enabled: bool,
         last: u64,
-        elapsed: [@typeInfo(Phase).@"enum".fields.len]u64 = @splat(0),
+        elapsed: [@typeInfo(Phase).@"enum".field_names.len]u64 = @splat(0),
 
         pub fn init() Self {
             const enabled = platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE");
@@ -31,15 +31,15 @@ pub fn Profile(comptime Phase: type) type {
         pub fn mark(self: *Self, phase: Phase) void {
             if (!self.enabled) return;
             const now = platform.time.monotonicNs();
-            self.elapsed[@intFromEnum(phase)] += now -| self.last;
+            self.elapsed[@backingInt(phase)] += now -| self.last;
             self.last = now;
         }
 
         pub fn report(self: *const Self, label: []const u8) void {
             if (!self.enabled) return;
             std.debug.print("\nWORK {s}", .{label});
-            inline for (@typeInfo(Phase).@"enum".fields, 0..) |field, i|
-                std.debug.print(" {s}_ms={d}", .{ field.name, self.elapsed[i] / std.time.ns_per_ms });
+            inline for (@typeInfo(Phase).@"enum".field_names, 0..) |reflected_name, i|
+                std.debug.print(" {s}_ms={d}", .{ reflected_name, self.elapsed[i] / std.time.ns_per_ms });
             std.debug.print("\n", .{});
         }
     };

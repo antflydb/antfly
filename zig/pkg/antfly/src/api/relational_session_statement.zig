@@ -58,10 +58,10 @@ pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionComm
             .relational_schema_version = update.relational_schema_version,
             .schema_version = update.schema_version,
             .batch = .{ .writes = writes, .deletes = @constCast(update.deletes) },
-            .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len },
+            .predicates = .{ .items = @constCast(update.predicates), .capacity = update.predicates.len, .pointer_stability = .{} },
         }};
         var binding = [_]sessions.CatalogBinding{.{ .logical = label, .physical = update.table_name }};
-        const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &binding, .capacity = binding.len } };
+        const request: sessions.OwnedTransactionCommitRequest = .{ .tables = &entry, .catalog_bindings = .{ .items = &binding, .capacity = binding.len, .pointer_stability = .{} } };
         try candidate.mergeFrom(alloc, &request);
     }
 }

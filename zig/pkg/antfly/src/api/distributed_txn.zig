@@ -2009,7 +2009,7 @@ const ParticipantTxn = struct {
         return .{ .txn_id = txn_id, .restore_staging_scope = self.restore_staging_scope, .restore_staging_plan_id = self.restore_staging_plan_id };
     }
 
-    fn deinit(self: *ParticipantTxn, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ParticipantTxn, alloc: std.mem.Allocator) void {
         self.range_guards.deinit(alloc);
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
@@ -2887,7 +2887,7 @@ test "distributed txn prepare roundtrips activation checkpoint and schema fence"
             .restore_staging_scope = @splat(0xfe),
             .restore_staging_plan_id = @splat(0x81),
             .relational_schema_version = 7,
-            .relational_integrity_generation_set = [_]u8{9} ** 32,
+            .relational_integrity_generation_set = @as([32]u8, @splat(9)),
             .relational_repair = true,
             .relational_activation = .{ .routing_key = "\xff\x00", .expected = "\xfe\x00", .next = "\xfd\x00", .retry = true },
             .relational_retirement = .{ .routing_key = "\xff\x00", .expected = "\xfe\x00", .next = "\xfd\x00" },
@@ -3764,7 +3764,7 @@ fn implementationTests() type {
             var decoded = try parseTxnPrepareRequest(alloc, encoded);
             defer freeTxnPrepareRequest(alloc, &decoded);
             try std.testing.expectEqual(std.math.maxInt(u64), decoded.req.predicates[0].expected_version);
-            try std.testing.expectEqual([_]u8{11} ** 32, decoded.req.predicates[0].expected_content_digest.?);
+            try std.testing.expectEqual(@as([32]u8, @splat(11)), decoded.req.predicates[0].expected_content_digest.?);
             for ([_][]const u8{ "null", "[]", "[256]", "\"not-a-digest\"" }) |digest| {
                 const malformed = try std.fmt.allocPrint(alloc, "{{\"txn_id\":\"01010101010101010101010101010101\",\"writes\":[],\"deletes\":[],\"transforms\":[],\"predicates\":[{{\"key\":\"row\",\"expected_version\":1,\"expected_content_digest\":{s}}}]}}", .{digest});
                 defer alloc.free(malformed);
@@ -4094,9 +4094,9 @@ fn consumerTests() type {
                     defer alloc.free(encoded);
                     var decoded = try parseTxnAcknowledgeManyRequest(alloc, encoded);
                     defer freeTxnAcknowledgeManyRequest(alloc, &decoded);
-                    try std.testing.expectEqualSlices(u8, &([_]u8{1} ** 16), &decoded.txn_id);
-                    try std.testing.expectEqual([_]u8{2} ** 32, decoded.restore_staging_scope.?);
-                    try std.testing.expectEqual([_]u8{3} ** 16, decoded.restore_staging_plan_id.?);
+                    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(1))), &decoded.txn_id);
+                    try std.testing.expectEqual(@as([32]u8, @splat(2)), decoded.restore_staging_scope.?);
+                    try std.testing.expectEqual(@as([16]u8, @splat(3)), decoded.restore_staging_plan_id.?);
                     for (ids, decoded.participants) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
                 }
             };
@@ -5626,7 +5626,7 @@ fn consumerTests() type {
                 }) = .empty,
                 acknowledgements: std.ArrayListUnmanaged(u64) = .empty,
 
-                fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                     self.begins.deinit(alloc);
                     self.prepares.deinit(alloc);
                     self.resolves.deinit(alloc);
@@ -5670,7 +5670,7 @@ fn consumerTests() type {
                     if (req.req.integrity_commands.len != 0) {
                         try std.testing.expectEqual(@as(u64, 7002), group_id);
                         try std.testing.expectEqual(@as(?u32, 77), req.req.relational_schema_version);
-                        try std.testing.expectEqual(@as(?[32]u8, [_]u8{8} ** 32), req.req.relational_integrity_generation_set);
+                        try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(8))), req.req.relational_integrity_generation_set);
                         self.semantic_prepares += 1;
                     }
                     if (req.req.relational_activation) |checkpoint| {
@@ -5794,10 +5794,10 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 6), recorder.resolves.items.len);
 
             recorder.coordinator_group = 7001;
-            var routed_address = try @import("../storage/db/relational_integrity_contract.zig").Address.init([_]u8{1} ** 16, "tuple");
+            var routed_address = try @import("../storage/db/relational_integrity_contract.zig").Address.init(@as([16]u8, @splat(1)), "tuple");
             // This transport test deliberately supplies an explicit routing digest;
             // native address validation is separately tested at the storage boundary.
-            routed_address.routing = [_]u8{'z'} ** 32;
+            routed_address.routing = @as([32]u8, @splat('z'));
             const claim_outcome = try executeMultiTableCommit(
                 std.testing.allocator,
                 FakeCatalog.iface(),
@@ -5808,7 +5808,7 @@ fn consumerTests() type {
                 &.{.{
                     .table_name = "docs",
                     .relational_schema_version = 77,
-                    .relational_integrity_generation_set = [_]u8{8} ** 32,
+                    .relational_integrity_generation_set = @as([32]u8, @splat(8)),
                     .writes = &.{.{ .key = "doc:a", .value = "{}" }},
                     .integrity = &.{.{ .routing_key = "doc:z", .key = "\x00\x00claim", .kind = .guard, .expected_value = "live" }},
                     .integrity_commands = &.{.{ .address = routed_address, .operation = .{ .check_owner = .{ .parent_table = "docs", .parent_key = "doc:a" } } }},
@@ -6106,7 +6106,7 @@ fn consumerTests() type {
                 observed_status: db_mod.types.TxnStatus = .pending,
                 resolves: std.ArrayListUnmanaged(db_mod.types.TxnStatus) = .empty,
 
-                fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                     self.resolves.deinit(alloc);
                 }
 

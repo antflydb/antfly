@@ -1557,7 +1557,7 @@ const FastTermState = struct {
     block_cursor: ?inverted.PostingsIterator.BlockCursor = null,
     exhausted: bool = false,
 
-    fn deinit(self: *FastTermState) void {
+    pub fn deinit(self: *FastTermState) void {
         self.iter.deinit();
     }
 
@@ -1584,11 +1584,11 @@ const FastTopK = struct {
     worst_index: usize = 0,
     pruned: bool = false,
 
-    fn deinit(self: *FastTopK) void {
+    pub fn deinit(self: *FastTopK) void {
         self.hits.deinit(self.alloc);
     }
 
-    fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
+    pub fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
         if (!self.allows(doc_id)) return;
         self.total_count += 1;
         if (self.k == 0) return;
@@ -2558,7 +2558,7 @@ const OwnedFilter = struct {
     /// Allocated filter slice (for bool should), or empty.
     filter_slice: []query_mod.Filter,
 
-    fn deinit(self: *const OwnedFilter, alloc: Allocator) void {
+    pub fn deinit(self: *const OwnedFilter, alloc: Allocator) void {
         for (self.duped_terms) |dt| alloc.free(dt);
         if (self.duped_terms.len > 0) alloc.free(self.duped_terms);
         if (self.filter_slice.len > 0) alloc.free(self.filter_slice);

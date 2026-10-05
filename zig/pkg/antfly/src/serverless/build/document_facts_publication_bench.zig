@@ -308,7 +308,7 @@ const CountingStore = struct {
     fn selfFrom(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
     fn put(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8) !store_mod.ArtifactMetadata {
         return putUntil(ptr, alloc, bytes, .none);
     }

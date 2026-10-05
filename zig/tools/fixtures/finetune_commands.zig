@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
         for (run.argv.items) |arg| {
             if (arg != .artifact) continue;
             const source = arg.artifact.artifact.root_module.root_source_file orelse continue;
-            if (!std.mem.endsWith(u8, source.getPath(b), "/src/inference.zig")) continue;
+            if (!std.mem.endsWith(u8, sourcePath(b, source), "/src/inference.zig")) continue;
             inference_owner_found = true;
             for (@import("pkg/inference/build/finetune/tests.zig").inference_overlap_filters) |filter| {
                 var excluded = false;
@@ -77,14 +77,14 @@ pub fn build(b: *std.Build) void {
         while (imports.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key_ptr.*, "command_")) continue;
             const module = entry.value_ptr.*;
-            const path = module.root_source_file.?.getPath(b);
+            const path = sourcePath(b, module.root_source_file.?);
             const result = actual.getOrPut(path) catch @panic("OOM");
             if (result.found_existing) @panic("duplicate command in finetune aggregate");
             result.value_ptr.* = module;
         }
     }
     for (specs) |spec| {
-        const path = b.path(b.fmt("pkg/inference/{s}", .{spec.root_source_file})).getPath(b);
+        const path = sourcePath(b, b.path(b.fmt("pkg/inference/{s}", .{spec.root_source_file})));
         const module = actual.fetchRemove(path) orelse
             std.debug.panic("finetune aggregate does not compile {s}", .{spec.name});
         var expected = std.StringHashMap(void).init(b.allocator);
@@ -107,4 +107,13 @@ pub fn build(b: *std.Build) void {
     }
     if (actual.count() != 0 or specs.len == 0) @panic("unexpected finetune command coverage");
     std.debug.print("FINETUNE_GROUPS {d}\n", .{checks.step.dependencies.items.len});
+}
+
+fn sourcePath(b: *std.Build, path: std.Build.LazyPath) []const u8 {
+    return switch (path) {
+        .src_path => |source| source.owner.root.joinString(b.allocator, source.sub_path) catch @panic("OOM"),
+        .dependency => |dependency| dependency.dependency.builder.root.joinString(b.allocator, dependency.sub_path) catch @panic("OOM"),
+        .cwd_relative => |relative| relative,
+        else => @panic("fixture expected a source file path"),
+    };
 }

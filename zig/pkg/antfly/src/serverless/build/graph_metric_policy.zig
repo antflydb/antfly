@@ -239,7 +239,7 @@ pub fn materializationWorkItems(
 pub fn materializerFingerprint(limits: Limits) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hash(&hasher, materializer_epoch);
-    inline for (std.meta.fields(Limits)) |field| hash(&hasher, @field(limits, field.name));
+    inline for (comptime std.meta.fieldNames(Limits)) |reflected_name| hash(&hasher, @field(limits, reflected_name));
     const value = hasher.final() & std.math.maxInt(i64);
     return if (value == 0) 1 else value;
 }

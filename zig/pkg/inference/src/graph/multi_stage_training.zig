@@ -34,7 +34,7 @@ pub const Stage = struct {
     /// Global slots exposed after this stage; empty for the final stage.
     exposed: []usize,
 
-    fn deinit(self: *Stage, a: Allocator) void {
+    pub fn deinit(self: *Stage, a: Allocator) void {
         self.analysis.deinit(a);
         self.program.deinit();
         a.free(self.captures);

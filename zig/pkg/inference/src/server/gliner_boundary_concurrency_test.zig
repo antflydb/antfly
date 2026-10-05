@@ -107,7 +107,7 @@ const HeldColdRequest = struct {
         return future.await(self.driver_io);
     }
 
-    fn deinit(self: *HeldColdRequest) void {
+    pub fn deinit(self: *HeldColdRequest) void {
         self.cancelled.store(true, .release);
         self.release();
         if (self.future) |*future| {

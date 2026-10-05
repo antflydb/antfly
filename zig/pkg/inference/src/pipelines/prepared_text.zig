@@ -195,7 +195,7 @@ test "prepared text charges tokenizer scratch and denies growth before allocatio
         .check_live_memory = false,
     } };
     const tokenizer = Tokenizer{ .ptr = &probe, .vtable = &.{ .encode = Probe.encode, .decode = undefined, .encodeInto = undefined, .encodeForModel = undefined, .encodeGeneration = undefined, .specialTokens = undefined, .vocabSize = undefined, .deinit = undefined } };
-    const text = [_]u8{'a'} ** (16 * 1024);
+    const text = @as([(16 * 1024)]u8, @splat('a'));
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, PreparedTextBatch.init(std.testing.allocator, session, tokenizer, &.{&text}, 512, null));
     try std.testing.expectEqual(@as(usize, 0), probe.observed_peak);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());

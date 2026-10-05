@@ -102,8 +102,9 @@ pub fn applyInPlace(hidden: []f32, adapter_a: Matrix, adapter_b: Matrix, alpha: 
     const scale = effectiveScale(alpha, rank);
     if (scale == 0) return;
 
-    var low_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
-    const alloc = low_rank.get();
+    var low_rank_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+    var low_rank: std.heap.BufferFirstAllocator = .init(&low_rank_buffer, std.heap.page_allocator);
+    const alloc = low_rank.allocator();
     const tmp = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp);
     @memset(tmp, 0);
@@ -173,8 +174,9 @@ pub fn accumulateLinearLoRAGrads(
     const scale = effectiveScale(alpha, rank);
     if (scale == 0) return;
 
-    var low_rank = std.heap.stackFallback(4096, std.heap.page_allocator);
-    const alloc = low_rank.get();
+    var low_rank_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+    var low_rank: std.heap.BufferFirstAllocator = .init(&low_rank_buffer, std.heap.page_allocator);
+    const alloc = low_rank.allocator();
     const tmp_rank = alloc.alloc(f32, rank) catch return;
     defer alloc.free(tmp_rank);
     const back_rank = alloc.alloc(f32, rank) catch return;
@@ -254,8 +256,9 @@ pub fn accumulateLinearLoRAGradsBackend(
         if (scale == 0) break :gpu_path;
 
         // Allocate transposed weight buffers and temporary gradient buffers.
-        var sf = std.heap.stackFallback(8192, std.heap.page_allocator);
-        const alloc = sf.get();
+        var sf_buffer: [8192]u8 align(@alignOf(f32)) = undefined;
+        var sf: std.heap.BufferFirstAllocator = .init(&sf_buffer, std.heap.page_allocator);
+        const alloc = sf.allocator();
 
         const lora_a_t = alloc.alloc(f32, rank * in_features) catch break :gpu_path;
         defer alloc.free(lora_a_t);
@@ -422,8 +425,9 @@ pub fn doraMergeInto(view: DoRAView, out: []f32) void {
     std.debug.assert(out.len == in_features * out_features);
     std.debug.assert(view.magnitude.len == out_features);
 
-    var norms_buf = std.heap.stackFallback(4096, std.heap.page_allocator);
-    const alloc = norms_buf.get();
+    var norms_buf_buffer: [4096]u8 align(@alignOf(f32)) = undefined;
+    var norms_buf: std.heap.BufferFirstAllocator = .init(&norms_buf_buffer, std.heap.page_allocator);
+    const alloc = norms_buf.allocator();
     const col_norms = alloc.alloc(f32, out_features) catch return;
     defer alloc.free(col_norms);
     doraColumnNorms(view, col_norms);
@@ -492,8 +496,9 @@ pub fn accumulateDoRAGrads(
     if (rank == 0) return;
     const scale = effectiveScaleMode(view.alpha, rank, view.scaling);
 
-    var stack = std.heap.stackFallback(16 * 1024, std.heap.page_allocator);
-    const alloc = stack.get();
+    var stack_buffer: [16 * 1024]u8 align(@alignOf(f32)) = undefined;
+    var stack: std.heap.BufferFirstAllocator = .init(&stack_buffer, std.heap.page_allocator);
+    const alloc = stack.allocator();
     const v_col = alloc.alloc(f32, in_features) catch return;
     defer alloc.free(v_col);
     const dL_dv_col = alloc.alloc(f32, in_features) catch return;

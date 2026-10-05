@@ -46,8 +46,9 @@ pub const Scratch = struct {
 
     fn parse(self: *Scratch, raw: []const u8, field: []const u8) !?[]const u8 {
         const alloc = self.memory.allocator();
-        var stack = std.heap.stackFallback(512, alloc);
-        const scanning = stack.get();
+        var buffer: [512]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&buffer, alloc);
+        const scanning = stack.allocator();
         var scanner = std.json.Scanner.initCompleteInput(scanning, raw);
         defer scanner.deinit();
         if (try scanner.next() != .object_begin) return null;

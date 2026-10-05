@@ -1268,7 +1268,7 @@ pub const FusedTrainer = struct {
         // Read the whole file into memory and hand ownership to MMapReader.
         // MMapReader.fromBytes stores the slice and frees it in deinit(), so we
         // must NOT also free it ourselves.
-        const file_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .unlimited);
+        const file_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .unlimited);
         errdefer allocator.free(file_bytes);
 
         // fromBytes takes ownership of file_bytes (freed via deinit).
@@ -1296,7 +1296,7 @@ pub const FusedTrainer = struct {
     }
 
     fn loadCheckpointBinary(self: *FusedTrainer, allocator: std.mem.Allocator, path: []const u8) !void {
-        const data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .unlimited);
+        const data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .unlimited);
         defer allocator.free(data);
         var offset: usize = 0;
 
@@ -1423,7 +1423,7 @@ pub const FusedTrainer = struct {
     pub fn loadOptimizerState(self: *FusedTrainer, allocator: std.mem.Allocator, path: []const u8) !void {
         const safetensors = @import("../models/safetensors.zig");
 
-        const file_bytes = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .unlimited);
+        const file_bytes = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .unlimited);
         errdefer allocator.free(file_bytes);
 
         // fromBytes takes ownership of file_bytes (freed via deinit).

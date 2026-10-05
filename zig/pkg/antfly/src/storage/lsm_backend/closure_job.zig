@@ -80,14 +80,14 @@ test "closure frontier visits chained overlaps once in both directions" {
             try std.testing.expectEqual(@as(usize, 0), job.visits);
             const started = @import("antfly_platform").time.monotonicNs();
             var turns: usize = 0;
-            const credits: usize = if (@import("builtin").mode == .ReleaseFast) 2048 else 1;
+            const credits: usize = if (@import("builtin").mode == .fast) 2048 else 1;
             while (!try job.step(allocator, credits)) {
                 turns += 1;
                 if (turns > 16 * count) return error.FrontierDidNotConverge;
             }
             try std.testing.expectEqual(count, job.count);
             try std.testing.expect(job.visits < 8 * count + 256);
-            if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM frontier inputs={d} seed={d} visits={d} elapsed_ns={d}\n", .{ count, seed, job.visits, @import("antfly_platform").time.monotonicNs() - started });
+            if (@import("builtin").mode == .fast) std.debug.print("\nLSM frontier inputs={d} seed={d} visits={d} elapsed_ns={d}\n", .{ count, seed, job.visits, @import("antfly_platform").time.monotonicNs() - started });
         }
     }
 }

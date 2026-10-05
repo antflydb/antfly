@@ -71,7 +71,10 @@ fn netConnectIpPosix(
 
     const socket_fd = try openSocket(original_io, family, mode, protocol);
     var open = true;
-    errdefer if (open) original_io.vtable.netClose(original_io.userdata, (&socket_fd)[0..1]);
+    errdefer if (open) {
+        const socket: std.Io.net.Socket = .{ .handle = socket_fd, .address = undefined };
+        original_io.vtable.netClose(original_io.userdata, (&socket)[0..1]);
+    };
 
     try setDescriptorFlag(original_io, socket_fd, posix.F.SETFD, posix.FD_CLOEXEC);
     try setNonBlocking(original_io, socket_fd, true);
@@ -212,7 +215,7 @@ fn socketPendingError(
         switch (posix.errno(rc)) {
             .SUCCESS => {
                 if (value_len != @sizeOf(c_int) or socket_error < 0) return error.Unexpected;
-                return @enumFromInt(socket_error);
+                return @fromBackingInt(@intCast(socket_error));
             },
             .INTR => continue,
             else => return error.Unexpected,

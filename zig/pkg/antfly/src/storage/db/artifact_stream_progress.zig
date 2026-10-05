@@ -601,7 +601,7 @@ test "ordered artifact inventory document stream closure requires current output
                         defer closure.deinit();
                     }
                 };
-                try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan });
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan });
             }
             if (pass == 0) {
                 // Unrelated writes must not restart an owner-local stream.

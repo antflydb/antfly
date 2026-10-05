@@ -589,10 +589,10 @@ test "relationship predicates scan unused arrays without materializing them" {
 
 test "relationship predicates selected decoding respects graph memory admission" {
     const alloc = std.testing.allocator;
-    const raw = Filter{ .properties = &.{.{ .field = "/metadata/text", .op = .eq, .value_json = "\"" ++ ("a" ** 1024) ++ "\"" }} };
+    const raw = Filter{ .properties = &.{.{ .field = "/metadata/text", .op = .eq, .value_json = "\"" ++ (z17RepeatString("a", 1024)) ++ "\"" }} };
     const filter = try raw.prepare(alloc);
     defer filter.releasePrepared(alloc);
-    const metadata = "{\"text\":\"" ++ ("\\u0061" ** 1024) ++ "\"}";
+    const metadata = "{\"text\":\"" ++ (z17RepeatString("\\u0061", 1024)) ++ "\"}";
     var budget = work_budget.WorkBudget.initWithLimits(.{ .max_retained_state_bytes = 64 });
     try std.testing.expectError(error.GraphWorkBudgetExceeded, filter.matchesWithBudget(alloc, RegressionEdge{ .metadata = metadata }, &budget));
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
@@ -680,4 +680,15 @@ test "relationship predicates escaped oversized keys are controlled by graph bud
     try std.testing.expectError(error.GraphWorkBudgetExceeded, filter.matchesWithBudget(alloc, RegressionEdge{ .metadata = raw }, &small));
     try std.testing.expect(small.exhaustion() != null);
     try std.testing.expectEqual(@as(usize, 0), small.retained_state_bytes);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime count: usize) *const [bytes.len * count:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (count *| 16))));
+        var repeated: [bytes.len * count:0]u8 = undefined;
+        for (0..count) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * count] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

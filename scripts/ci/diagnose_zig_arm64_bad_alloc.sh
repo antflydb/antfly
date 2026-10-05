@@ -104,7 +104,7 @@ set +e
 "$repo_root/scripts/packaging/build_zig_release_archive.sh" \
   --version 0.2.0-rc.26 \
   --target aarch64-linux-musl \
-  --optimize ReleaseSmall \
+  --optimize small \
   --jobs 1 \
   --archive-name antfly_0.2.0-rc.26_Linux_arm64.tar.gz \
   --out-dir "$diagnostic_root/archive" \

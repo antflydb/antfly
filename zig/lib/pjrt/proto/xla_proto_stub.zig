@@ -217,7 +217,7 @@ fn writeInt32(alloc: Allocator, buf: *wire.Buf, field: u32, value: i32) !void {
 }
 
 fn writeEnum(alloc: Allocator, buf: *wire.Buf, field: u32, value: anytype) !void {
-    try writeInt32(alloc, buf, field, @intFromEnum(value));
+    try writeInt32(alloc, buf, field, @backingInt(value));
 }
 
 fn writePackedInt32s(alloc: Allocator, buf: *wire.Buf, field: u32, values: []const i32) !void {

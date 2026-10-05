@@ -58,7 +58,7 @@ const ApplyModel = struct {
     allocator: std.mem.Allocator,
     values: std.ArrayListUnmanaged(u64) = .empty,
 
-    fn deinit(self: *ApplyModel) void {
+    pub fn deinit(self: *ApplyModel) void {
         self.values.deinit(self.allocator);
     }
 
@@ -115,7 +115,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             durability_sound: bool = true,
             finished: bool = false,
 
-            fn deinit(self: *State) void {
+            pub fn deinit(self: *State) void {
                 if (self.receipt) |receipt| fencing.freeReceipt(self.allocator, receipt);
                 self.appended.deinit(self.allocator);
                 self.applied.deinit();
@@ -340,7 +340,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                     (assessment.former_last_lsn == assessment.fork_lsn and
                         assessment.fork_lsn >= assessment.retained_from_lsn and
                         !assessment.forced));
-                try events.emitNamed(allocator, .state_change, "storage.hot_standby.former_primary_assessed", @intFromEnum(assessment.action));
+                try events.emitNamed(allocator, .state_change, "storage.hot_standby.former_primary_assessed", @backingInt(assessment.action));
             } else return error.UnknownHaVoprTransition;
 
             state.durability_sound = state.durability_sound and try remoteApplyDecisionSound(state);
@@ -524,7 +524,7 @@ fn backupSlotSnapshot(state: anytype) BackupSlotSnapshot {
         .applied_lsn = slot.applied_lsn,
         .safe_read_lsn = slot.safe_read_lsn,
         .active = slot.active,
-        .lifecycle = @intFromEnum(slot.lifecycle),
+        .lifecycle = @backingInt(slot.lifecycle),
         .reseed_required = slot.reseed_required,
     };
 }

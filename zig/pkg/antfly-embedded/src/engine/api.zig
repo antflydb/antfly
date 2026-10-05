@@ -316,7 +316,7 @@ const OwnedLookupRequest = struct {
     fields: [][]const u8 = &.{},
     lookup_opts: embedded_db.types.LookupOptions = .{},
 
-    fn deinit(self: *OwnedLookupRequest, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedLookupRequest, alloc: Allocator) void {
         for (self.fields) |field| alloc.free(field);
         if (self.fields.len > 0) alloc.free(self.fields);
         self.* = undefined;
@@ -339,7 +339,7 @@ const OwnedScanRequest = struct {
     fields: [][]const u8 = &.{},
     scan_opts: embedded_db.types.ScanOptions = .{},
 
-    fn deinit(self: *OwnedScanRequest, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedScanRequest, alloc: Allocator) void {
         if (self.from.len > 0) alloc.free(self.from);
         if (self.to.len > 0) alloc.free(self.to);
         for (self.fields) |field| alloc.free(field);
@@ -1270,7 +1270,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
             .format_version = backup_codec.format_version,
             .flags = 0,
             .created_at_ns = 0,
-            .backup_id = [_]u8{0} ** 16,
+            .backup_id = @as([16]u8, @splat(0)),
             .table_count = 1,
             .shard_count = 1,
         });

@@ -229,7 +229,7 @@ test "required nullable fields require wire presence on every parser backend" {
         ),
     );
 
-    const automatic_input = missing ++ (" " ** 256);
+    const automatic_input = missing ++ @as([256]u8, @splat(' '));
     try std.testing.expectError(
         error.MissingField,
         antfly_json.parseFromSlice(types.Error, alloc, automatic_input, .{}),

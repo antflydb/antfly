@@ -202,7 +202,7 @@ pub fn decode(a: std.mem.Allocator, cfg: model.Config, q: Question, logits: []co
 /// (`probabilities`, which the result owns). Used both by `decode`, from a
 /// softmax, and by two-stage choice's merged distribution
 /// (`mergeTwoStage`), which never runs its own softmax over the full label set.
-fn finalize(q: Question, probabilities: []f32, act_probability: ?f32) Decision {
+pub fn finalize(q: Question, probabilities: []f32, act_probability: ?f32) Decision {
     var winner: usize = 0;
     var entropy: f32 = 0;
     var expected: f32 = 0;
@@ -657,7 +657,7 @@ fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@i
         @memcpy(ids[i * seq ..][0..prepared.ids.len], prepared.ids);
         @memset(mask[i * seq ..][0..prepared.ids.len], 1);
         @memcpy(markers[i * count ..][0..prepared.markers.len], prepared.markers);
-        kinds[i] = @intFromEnum(task.question.kind);
+        kinds[i] = @backingInt(task.question.kind);
     }
     var inputs: [4]Tensor = undefined;
     var initialized: usize = 0;
@@ -753,7 +753,7 @@ test "laya CUDA chunk planning uses padded shape retained memory and 128 task ce
     var session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.info, .backend = Probe.backend, .close = undefined, .runGeometry = Probe.geometry } };
     var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
     var markers = [_]i64{ 0, 1 };
-    var sequences = [_]Sequence{.{ .ids = ids[0..2], .markers = &markers }} ** 512;
+    var sequences = @as([512]Sequence, @splat(.{ .ids = ids[0..2], .markers = &markers }));
     try std.testing.expectEqual(@as(usize, 128), try selectChunk(session, &sequences, 1024));
     session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .backend_limit_bytes = 2 * 2 * 4096 }, .static_workspace_bytes = 0, .check_live_memory = false };
     sequences[2].ids = &ids;
@@ -797,7 +797,7 @@ test "laya decoding rejects nonfinite logits without leaking probabilities" {
 
 test "laya length buckets are stable and require meaningful padding savings" {
     const a = std.testing.allocator;
-    var ids = [_]i64{0} ** 149;
+    var ids = @as([149]i64, @splat(0));
     var markers = [_]i64{ 0, 1 };
     var sequences: [8]Sequence = undefined;
     for (&sequences, [_]usize{ 61, 100, 55, 79, 149, 80, 81, 143 }) |*sequence, len|

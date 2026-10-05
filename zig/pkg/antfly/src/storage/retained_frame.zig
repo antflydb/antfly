@@ -274,7 +274,7 @@ test "REF5 descriptor authenticates point chunks and exact effect offsets" {
     defer alloc.free(descriptor);
     const Holder = struct {
         bytes: []u8,
-        fn read(ptr: *anyopaque, _: u64, ordinal: u32, out: []u8) !usize {
+        pub fn read(ptr: *anyopaque, _: u64, ordinal: u32, out: []u8) !usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (ordinal != 0 or out.len != self.bytes.len) return error.RetainedEffectsCorrupt;
             @memcpy(out, self.bytes);

@@ -227,7 +227,7 @@ tested artifacts, hardware, and profiles.
 
 To reproduce the comparison, generate a reference with
 `scripts/laya/laya_export_reference.py`, then build `inference-test` with
-`-Dmetal=true -Dcuda=false -Donnx=false -Doptimize=ReleaseFast` and the `laya `
+`-Dmetal=true -Dcuda=false -Donnx=false -Doptimize=fast` and the `laya `
 test filter. Run each checkpoint precision separately:
 
 ```sh

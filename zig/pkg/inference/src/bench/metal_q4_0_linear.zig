@@ -56,7 +56,7 @@ const Mode = enum {
         return error.InvalidArgument;
     }
 
-    fn name(self: Mode) []const u8 {
+    pub fn name(self: Mode) []const u8 {
         return switch (self) {
             .linear => "linear",
             .q6_linear => "q6-linear",
@@ -98,7 +98,7 @@ const Q4MmvVariant = enum {
         return error.InvalidArgument;
     }
 
-    fn name(self: Q4MmvVariant) []const u8 {
+    pub fn name(self: Q4MmvVariant) []const u8 {
         return switch (self) {
             .nr4_nsg2 => "nr4-nsg2",
             .nr8_nsg2 => "nr8-nsg2",
@@ -369,7 +369,7 @@ const PreparedQuantSlot = struct {
     storage: *QuantizedStorage,
     bias: MetalTensor,
 
-    fn deinit(self: *PreparedQuantSlot, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PreparedQuantSlot, allocator: std.mem.Allocator) void {
         self.bias.deinit();
         allocator.destroy(self.storage);
         allocator.free(self.shape);
@@ -692,7 +692,7 @@ const QkvOutput = struct {
     k: MetalTensor,
     v: MetalTensor,
 
-    fn deinit(self: *QkvOutput) void {
+    pub fn deinit(self: *QkvOutput) void {
         self.v.deinit();
         self.k.deinit();
         self.q.deinit();
@@ -703,7 +703,7 @@ const PairOutput = struct {
     first: MetalTensor,
     second: MetalTensor,
 
-    fn deinit(self: *PairOutput) void {
+    pub fn deinit(self: *PairOutput) void {
         self.second.deinit();
         self.first.deinit();
     }
@@ -864,7 +864,7 @@ fn encodeFfnOutput(
         cfg.rows,
         cfg.in_dim,
         cfg.out_dim,
-        @intFromEnum(ops.DecoderRuntimeActivationKind.gelu_new),
+        @backingInt(ops.DecoderRuntimeActivationKind.gelu_new),
         0,
         1,
         none,
@@ -889,7 +889,7 @@ fn applyFfnOnce(
 ) !u64 {
     const start = nowNanos();
     try metal_runtime.beginFrame(runtime);
-    try metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(metal_runtime.ComputeSource.ffn), .ffn);
+    try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.ffn), .ffn);
     var produced: usize = 0;
     errdefer {
         _ = metal_runtime.endPlannedComputeScope(runtime) catch {};
@@ -911,7 +911,7 @@ fn applyFfnOutput(
     cfg: Config,
 ) !MetalTensor {
     try metal_runtime.beginFrame(runtime);
-    try metal_runtime.beginPlannedComputeScope(runtime, @intFromEnum(metal_runtime.ComputeSource.ffn), .ffn);
+    try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.ffn), .ffn);
     errdefer _ = metal_runtime.endPlannedComputeScope(runtime) catch {};
     var output = try encodeFfnOutput(runtime, input, cfg);
     errdefer output.deinit();

@@ -414,7 +414,7 @@ const FakeTableWriteSource = struct {
     commit_calls: usize = 0,
     commit_batch_calls: usize = 0,
 
-    fn deinit(self: *FakeTableWriteSource) void {
+    pub fn deinit(self: *FakeTableWriteSource) void {
         for (self.table_names.items) |name| self.alloc.free(name);
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.deletes.items) |key| self.alloc.free(key);
@@ -447,7 +447,7 @@ const FakeTableWriteSource = struct {
         .commit_batch = commitBatch,
     };
 
-    fn commitTransaction(
+    pub fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,

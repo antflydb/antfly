@@ -949,7 +949,7 @@ pub const GlinerPipeline = struct {
         ids: []i32,
         positions: []i64,
 
-        fn deinit(self: *PreparedGlinerSchema, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PreparedGlinerSchema, alloc: std.mem.Allocator) void {
             alloc.free(self.ids);
             alloc.free(self.positions);
         }
@@ -968,7 +968,7 @@ pub const GlinerPipeline = struct {
         actual_num_words: usize,
         num_spans: usize,
 
-        fn deinit(self: *PreparedGlinerInput, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PreparedGlinerInput, alloc: std.mem.Allocator) void {
             alloc.free(self.input_ids);
             alloc.free(self.attention_mask);
             alloc.free(self.words_mask);

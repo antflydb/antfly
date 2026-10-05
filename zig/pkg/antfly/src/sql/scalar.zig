@@ -156,13 +156,16 @@ pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar,
     binder.parameter_count = parameter_hints.len;
     const root = try binder.compile(expression, expected, 0);
     const output_type = binder.instructions.items[root].type;
+    const instructions = try binder.instructions.toOwnedSlice(binder.alloc);
+    const parameter_types = try binder.alloc.dupe(?ast.ColumnType, binder.parameters[0..binder.parameter_count]);
+    const required_columns = try binder.dependencies.toOwnedSlice(binder.alloc);
     return .{
         .arena = arena,
-        .instructions = try binder.instructions.toOwnedSlice(binder.alloc),
+        .instructions = instructions,
         .root = root,
         .output_type = output_type,
-        .parameter_types = try binder.alloc.dupe(?ast.ColumnType, binder.parameters[0..binder.parameter_count]),
-        .required_columns = try binder.dependencies.toOwnedSlice(binder.alloc),
+        .parameter_types = parameter_types,
+        .required_columns = required_columns,
         .settings = settings,
     };
 }
@@ -195,7 +198,7 @@ pub fn statementConstant(node: *const ast.Scalar) bool {
 }
 
 fn functionId(name: []const u8) !Function {
-    inline for (std.meta.fields(Function)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Function).@"enum".field_names, @typeInfo(Function).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     if (std.mem.eql(u8, name, "char_length") or std.mem.eql(u8, name, "character_length")) return .length;
     if (std.mem.eql(u8, name, "ceiling")) return .ceil;
     if (std.mem.eql(u8, name, "substr")) return .substring;

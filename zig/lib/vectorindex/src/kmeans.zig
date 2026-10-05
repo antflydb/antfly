@@ -309,7 +309,7 @@ fn assignMetal(
     context.assign(
         centroids,
         config.dims,
-        @intFromEnum(config.metric),
+        @backingInt(config.metric),
         assignments,
         distances,
     ) catch |err| {
@@ -415,7 +415,7 @@ fn recomputeCentroidsMetal(
     centroids: []f32,
     counts: []usize,
 ) !void {
-    try context.updateCentroids(old_centroids, centroids, counts, config.dims, @intFromEnum(config.metric));
+    try context.updateCentroids(old_centroids, centroids, counts, config.dims, @backingInt(config.metric));
     normalizeCentroidsForMetric(config, centroids);
 }
 

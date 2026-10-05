@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const prometheus = @import("../../../common/prometheus.zig");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 
 const invalid_utf8_warning_limit = 8;
 var invalid_utf8_repairs: @import("antfly_platform").atomic.Value(u64) = .init(0);

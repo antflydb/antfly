@@ -272,7 +272,7 @@ const Worker = struct {
     segments_u16: ?tokenizer_mod.hf.HfTokenizer.ParallelTokenSegmentsU16 = null,
     failure: ?anyerror = null,
 
-    fn deinit(self: *Worker) void {
+    pub fn deinit(self: *Worker) void {
         if (self.segments) |*segments| segments.deinit();
         self.segments = null;
         if (self.segments_u16) |*segments| segments.deinit();
@@ -550,7 +550,7 @@ const MappedCorpus = struct {
         return .{ .bytes = bytes, .fd = fd };
     }
 
-    fn deinit(self: *MappedCorpus) void {
+    pub fn deinit(self: *MappedCorpus) void {
         std.posix.munmap(self.bytes);
         _ = std.posix.system.close(self.fd);
         self.* = undefined;

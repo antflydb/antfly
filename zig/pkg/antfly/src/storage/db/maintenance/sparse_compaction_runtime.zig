@@ -275,7 +275,7 @@ const MandatoryApplyRetirement = struct {
         };
     }
 
-    fn deinit(self: *MandatoryApplyRetirement) void {
+    pub fn deinit(self: *MandatoryApplyRetirement) void {
         if (self.apply_lock_held) {
             self.apply_mutex.unlockExclusive();
             self.apply_lock_held = false;

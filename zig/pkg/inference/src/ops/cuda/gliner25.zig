@@ -1396,7 +1396,7 @@ test "CUDA boundary exact GELU matches pinned Torch within erf rounding error" {
     const values = [_]f32{ -6.0, -5.699999809265137, -5.5, -5.0, -4.5, -4.0, -3.0, -1.0, 0.0, 1.0, 3.0, 5.0 };
     const forward = [_]f32{ -0.0, -0.0, -1.6391277313232422e-07, -1.341104507446289e-06, -1.5288591384887695e-05, -0.0001266002655029297, -0.004049777984619141, -0.15865525603294373, 0.0, 0.8413447141647339, 2.995950222015381, 4.999999046325684 };
     const backward = [_]f32{ -3.6455301000160034e-08, -2.0029564495871455e-07, -5.625344670079357e-07, -7.165377155615715e-06, -6.852936348877847e-05, -0.0005036708316765726, -0.01194562017917633, -0.08331547677516937, 0.5, 1.0833154916763306, 1.0119456052780151, 1.000007152557373 };
-    const ones = [_]f32{1} ** values.len;
+    const ones = @as([values.len]f32, @splat(1));
     const input = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &values, .shape = &.{values.len} } }, .{});
     defer cb.free(input);
     const upstream = try cb.residentTrainingPrimitive(&.{ .upload_f32 = .{ .values = &ones, .shape = &.{values.len} } }, .{});

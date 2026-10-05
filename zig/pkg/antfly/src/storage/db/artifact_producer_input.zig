@@ -123,11 +123,11 @@ pub const Token = struct {
 /// fields cannot authorize a different generator definition. Consumer
 /// projections are independently derived from the certified catalog at apply.
 pub fn sameDefinition(a: requests.GeneratedEnrichmentRequest, b: requests.GeneratedEnrichmentRequest) bool {
-    inline for (std.meta.fields(requests.GeneratedEnrichmentRequest)) |field| {
-        if (comptime !definitionField(field.name)) continue;
-        const av = @field(a, field.name);
-        const bv = @field(b, field.name);
-        if (comptime @typeInfo(field.type) == .pointer) {
+    inline for (@typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_names, @typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !definitionField(reflected_name)) continue;
+        const av = @field(a, reflected_name);
+        const bv = @field(b, reflected_name);
+        if (comptime @typeInfo(field_type) == .pointer) {
             if (!std.mem.eql(u8, av, bv)) return false;
         } else if (!std.meta.eql(av, bv)) return false;
     }
@@ -144,11 +144,11 @@ fn definitionField(comptime name: []const u8) bool {
 pub fn definitionDigest(request: requests.GeneratedEnrichmentRequest) publication.Digest {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly:producer-definition:v1:");
-    inline for (std.meta.fields(requests.GeneratedEnrichmentRequest)) |field| {
-        if (comptime !definitionField(field.name)) continue;
-        hashDefinitionBytes(&hash, field.name);
-        const value = @field(request, field.name);
-        switch (@typeInfo(field.type)) {
+    inline for (@typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_names, @typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !definitionField(reflected_name)) continue;
+        hashDefinitionBytes(&hash, reflected_name);
+        const value = @field(request, reflected_name);
+        switch (@typeInfo(field_type)) {
             .pointer => hashDefinitionBytes(&hash, value),
             .@"enum" => hashDefinitionBytes(&hash, @tagName(value)),
             .bool => hash.update(&.{@intFromBool(value)}),
@@ -175,14 +175,14 @@ fn hashDefinitionBytes(hash: *std.crypto.hash.Blake3, value: []const u8) void {
 test "ordered artifact inventory producer definition identity binds every provider field" {
     const request: requests.GeneratedEnrichmentRequest = .{ .kind = .dense_embedding, .index_name = "index", .doc_key = "doc", .source_field = "body" };
     const expected = definitionDigest(request);
-    inline for (std.meta.fields(requests.GeneratedEnrichmentRequest)) |field| {
-        if (comptime !definitionField(field.name)) continue;
+    inline for (@typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_names, @typeInfo(requests.GeneratedEnrichmentRequest).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !definitionField(reflected_name)) continue;
         var changed = request;
-        switch (@typeInfo(field.type)) {
-            .pointer => @field(changed, field.name) = "\x00changed",
-            .@"enum" => @field(changed, field.name) = std.meta.tags(field.type)[(@as(usize, @intFromEnum(@field(request, field.name))) + 1) % std.meta.tags(field.type).len],
-            .bool => @field(changed, field.name) = !@field(request, field.name),
-            .int => @field(changed, field.name) += 1,
+        switch (@typeInfo(field_type)) {
+            .pointer => @field(changed, reflected_name) = "\x00changed",
+            .@"enum" => @field(changed, reflected_name) = std.meta.tags(field_type)[(@as(usize, @backingInt(@field(request, reflected_name))) + 1) % std.meta.tags(field_type).len],
+            .bool => @field(changed, reflected_name) = !@field(request, reflected_name),
+            .int => @field(changed, reflected_name) += 1,
             else => unreachable,
         }
         try std.testing.expect(!sameDefinition(request, changed));

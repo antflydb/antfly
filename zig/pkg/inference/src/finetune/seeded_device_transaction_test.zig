@@ -45,7 +45,7 @@ const Fake = struct {
     fn cb(self: *Fake) ops.ComputeBackend {
         return .{ .ptr = self, .vtable = &self.vtable };
     }
-    fn deinit(self: *Fake) void {
+    pub fn deinit(self: *Fake) void {
         std.debug.assert(self.live == 0);
     }
     fn from(raw: *anyopaque) *Fake {
@@ -205,7 +205,7 @@ const StateOwner = struct {
         }
         return owner;
     }
-    fn deinit(self: *StateOwner) void {
+    pub fn deinit(self: *StateOwner) void {
         for (self.slots[0..self.initialized]) |slot| for ([_]CT{ slot.weight, slot.grad_accum, slot.m, slot.v }) |tensor| self.cb.free(tensor);
         self.allocator.free(self.slots);
     }

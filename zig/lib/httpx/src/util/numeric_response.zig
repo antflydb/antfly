@@ -40,7 +40,7 @@ pub fn allocFrame(alloc: std.mem.Allocator, kind: Kind, rows: usize, columns: us
     if (kind == .scores and columns != 1) return error.InvalidNumericResponse;
     const frame = try alloc.alloc(u8, try frameSize(rows, columns));
     @memcpy(frame[0..4], "AFN1");
-    std.mem.writeInt(u32, frame[4..8], @intFromEnum(kind), .little);
+    std.mem.writeInt(u32, frame[4..8], @backingInt(kind), .little);
     std.mem.writeInt(u64, frame[8..16], rows, .little);
     std.mem.writeInt(u64, frame[16..24], columns, .little);
     return frame;
@@ -88,7 +88,7 @@ pub const View = struct {
 /// descriptors or result storage. The view borrows the HTTP response body.
 pub fn parse(frame: []const u8, kind: Kind, expected_rows: usize, expected_columns: ?usize) !View {
     if (frame.len < header_bytes or !std.mem.eql(u8, frame[0..4], "AFN1")) return error.InvalidNumericResponse;
-    if (std.mem.readInt(u32, frame[4..8], .little) != @intFromEnum(kind)) return error.InvalidNumericResponse;
+    if (std.mem.readInt(u32, frame[4..8], .little) != @backingInt(kind)) return error.InvalidNumericResponse;
     const rows = std.math.cast(usize, std.mem.readInt(u64, frame[8..16], .little)) orelse return error.InvalidNumericResponse;
     const columns = std.math.cast(usize, std.mem.readInt(u64, frame[16..24], .little)) orelse return error.InvalidNumericResponse;
     if (rows != expected_rows or (kind == .scores and columns != 1)) return error.InvalidNumericResponse;

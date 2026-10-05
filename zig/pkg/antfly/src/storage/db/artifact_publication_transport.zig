@@ -114,13 +114,13 @@ pub fn validateBatchRequest(request: anytype) !void {
     const control = request.artifact_publication_transport orelse return;
     try control.validate();
     const defaults: @TypeOf(request) = .{};
-    inline for (@typeInfo(@TypeOf(request)).@"struct".fields) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "artifact_publication_transport") and
-            !std.mem.eql(u8, field.name, "sync_level") and !std.mem.eql(u8, field.name, "timestamp"))
+    inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication_transport") and
+            !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                if (@field(request, field.name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(request, field.name), @field(defaults, field.name))) return error.InvalidBatchRequest;
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (@field(request, reflected_name).len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(@field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }
@@ -581,7 +581,7 @@ pub const RecoveryHint = struct {
         @memcpy(raw[28..60], &self.publication_digest);
         @memcpy(raw[60..92], &self.root);
         std.mem.writeInt(u64, raw[92..100], self.created_index, .little);
-        raw[100] = @intFromEnum(self.action);
+        raw[100] = @backingInt(self.action);
         @memcpy(raw[101..133], &self.observed_progress);
         return raw;
     }
@@ -865,7 +865,7 @@ test "artifact publication upload stages exact retries and atomically retires qu
         deny_payload_reads: bool = false,
         reads: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);
@@ -1023,7 +1023,7 @@ test "artifact publication upload prunes only by ordered age" {
     const Fake = struct {
         alloc: Allocator,
         map: std.StringHashMapUnmanaged([]u8) = .empty,
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);

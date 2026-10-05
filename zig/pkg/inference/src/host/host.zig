@@ -150,7 +150,7 @@ pub const ReadEncodedImagesHandler = struct {
         request: readers.EncodedRequest,
     ) anyerror![]readers.Result,
 
-    fn read(
+    pub fn read(
         self: @This(),
         alloc: std.mem.Allocator,
         model: []const u8,
@@ -169,7 +169,7 @@ pub const ReadRasterImagesHandler = struct {
         request: readers.RasterRequest,
     ) anyerror!readers.BatchResult,
 
-    fn read(
+    pub fn read(
         self: @This(),
         alloc: std.mem.Allocator,
         model: []const u8,
@@ -668,15 +668,15 @@ const ClassifyTextsRequest = struct {
 const ResolvedWarmModels = struct {
     items: []const inference.server.WarmModel,
 
-    fn deinit(self: *ResolvedWarmModels, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ResolvedWarmModels, alloc: std.mem.Allocator) void {
         if (self.items.len != 0) alloc.free(self.items);
         self.* = undefined;
     }
 };
 
 fn parseWarmModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(inference.server.WarmModelKind).@"enum".field_names, @typeInfo(inference.server.WarmModelKind).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, value, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }
@@ -968,7 +968,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             },
         };
         errdefer state.alloc.free(json);
-        if (context.operation == @intFromEnum(inference_bridge.ProviderOperation.model_capabilities)) {
+        if (context.operation == @backingInt(inference_bridge.ProviderOperation.model_capabilities)) {
             var capabilities = try std.json.parseFromSlice(inference_work.InferenceCapabilities, state.alloc, json, .{});
             defer capabilities.deinit();
             const constrained = worker_runtime.wire.constrainCapabilities(capabilities.value);
@@ -1002,7 +1002,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         fn update(raw: ?*anyopaque, progress: inference.execution_control.Progress) void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.view.update(
-                @intFromEnum(progress.phase),
+                @backingInt(progress.phase),
                 progress.completed,
                 progress.total,
                 progress.model,
@@ -1740,7 +1740,7 @@ test "standalone numeric result ABI retains native rows until response destructi
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = undefined,
-        .operation = @intFromEnum(inference_bridge.ProviderOperation.embed_dense_rasters),
+        .operation = @backingInt(inference_bridge.ProviderOperation.embed_dense_rasters),
         .request_json = inference_bridge.String.init("{}"),
         .deadline_ns = 0,
         .has_deadline = 0,
@@ -2344,7 +2344,7 @@ const LocalInferenceControlAdapter = struct {
         const sink = self.context.request.progress orelse return;
         const phase = std.enums.fromInt(
             execution_context.Phase,
-            @intFromEnum(progress.phase),
+            @backingInt(progress.phase),
         ) orelse return;
         sink.update(.{
             .phase = phase,
@@ -2690,7 +2690,7 @@ fn validateEncodedReadCapabilities(
 }
 
 test "encoded reader ABI enforces resolved model capabilities" {
-    var bytes = [_]u8{0} ** 24;
+    var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);

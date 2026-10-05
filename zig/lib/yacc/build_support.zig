@@ -18,7 +18,7 @@ pub fn addCompiler(
     b: *std.Build,
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Step.Compile {
     const yacc_mod = b.createModule(.{
         .root_source_file = root.path(b, "src/root.zig"),

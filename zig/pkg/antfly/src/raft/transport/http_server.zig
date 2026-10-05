@@ -920,7 +920,7 @@ test "http server dispatches live snapshot uploads to handler" {
             };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.data) |data| std.testing.allocator.free(data);
             self.* = undefined;
         }

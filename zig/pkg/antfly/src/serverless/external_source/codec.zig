@@ -64,7 +64,7 @@ fn encodeVersion(alloc: Allocator, inventory: external_source.Inventory, format_
 
     try out.appendSlice(alloc, magic);
     try appendU32(alloc, &out, format_version);
-    try out.append(alloc, @intFromEnum(inventory.format));
+    try out.append(alloc, @backingInt(inventory.format));
     try appendBytes(alloc, &out, inventory.source_id);
     try appendBytes(alloc, &out, inventory.source_uri);
     try appendBytes(alloc, &out, inventory.snapshot_id);
@@ -727,7 +727,7 @@ test "external source inventory codec rejects forged counts before allocation" {
     defer encoded.deinit(alloc);
     try encoded.appendSlice(alloc, magic);
     try appendU32(alloc, &encoded, version);
-    try encoded.append(alloc, @intFromEnum(external_source.Format.parquet));
+    try encoded.append(alloc, @backingInt(external_source.Format.parquet));
     try appendBytes(alloc, &encoded, "source");
     try appendBytes(alloc, &encoded, "s3://bucket/source");
     try appendBytes(alloc, &encoded, "snapshot");

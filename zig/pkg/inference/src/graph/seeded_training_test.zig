@@ -125,8 +125,8 @@ test "seeded training VJP preserves vector seeds and all shared output branches"
     }
     var result = try interpreter.execute(a, &gradients.graph, &cb, .{ .runtime_inputs = &inputs });
     defer result.deinit(&cb);
-    var expected_weight = [_]f32{0} ** 4;
-    var expected_bias = [_]f32{0} ** 2;
+    var expected_weight = @as([4]f32, @splat(0));
+    var expected_bias = @as([2]f32, @splat(0));
     for (0..2) |row| for (0..2) |column| {
         var value = input_values[2][column];
         for (0..2) |k| value += input_values[0][row * 2 + k] * input_values[1][column * 2 + k];
@@ -218,10 +218,10 @@ fn exerciseTape(a: std.mem.Allocator, mismatch: bool) !void {
     const cotangent = try cb.fromFloat32Shape(&.{ 2, -3 }, &.{2});
     defer cb.free(cotangent);
     const inputs = [_]interpreter.RuntimeInput{ .{ .node_id = x, .value = features }, .{ .node_id = w, .value = weight } };
-    const identity = training.StepIdentity{ .binding = [_]u8{19} ** 32, .optimizer_step = 7, .microbatch = 2 };
+    const identity = training.StepIdentity{ .binding = @as([32]u8, @splat(19)), .optimizer_step = 7, .microbatch = 2 };
     var tape = try session.forward(&cb, &inputs, identity, null);
     defer tape.deinit();
-    const decisions = [_]u8{23} ** 32;
+    const decisions = @as([32]u8, @splat(23));
     try tape.sealDecisions(decisions);
     try std.testing.expectError(error.TrainingDecisionsAlreadySealed, tape.sealDecisions(decisions));
     try std.testing.expectError(error.TrainingTapeStillLive, session.advanceParameterEpoch());

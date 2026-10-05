@@ -109,7 +109,7 @@ pub const Scenario = struct {
     };
 
     const mode_ids = ids: {
-        var values: [@typeInfo(Mode).@"enum".fields.len]vopr.id.StableId = undefined;
+        var values: [@typeInfo(Mode).@"enum".field_names.len]vopr.id.StableId = undefined;
         for (std.meta.tags(Mode), 0..) |mode, index|
             values[index] = vopr.id.stable(name, @tagName(mode));
         break :ids values;
@@ -172,7 +172,7 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             // A bounded history may stop with a request holding a provider
             // lease. Run its defers before destroying the registry and client.
             _ = self.vopr_io.cancelAndDrainTasksForTeardown(self.allocator, 100_000) catch |err|
@@ -307,7 +307,7 @@ pub const Scenario = struct {
                 self.content = try self.state.allocator.dupe(u8, result.content);
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 if (self.content) |value| self.state.allocator.free(value);
                 self.content = null;
             }
@@ -331,7 +331,7 @@ pub const Scenario = struct {
                 );
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 if (self.scores) |value| self.state.allocator.free(value);
                 self.scores = null;
             }
@@ -772,8 +772,8 @@ test "generation and reranking chain VOPR exact replays local and remote product
 }
 
 test "generation and reranking VOPR drains requests when the history budget expires" {
-    const mode_id = Scenario.mode_ids[@intFromEnum(Scenario.Mode.remote_composed)];
-    var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4745_4e52 + @as(u64, @intFromEnum(Scenario.Mode.remote_composed)));
+    const mode_id = Scenario.mode_ids[@backingInt(Scenario.Mode.remote_composed)];
+    var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4745_4e52 + @as(u64, @backingInt(Scenario.Mode.remote_composed)));
     var recorded = try vopr.runner.run(Scenario, std.testing.allocator, choices.source(), .{
         .system = "antfly",
         .transition_budget = 128,

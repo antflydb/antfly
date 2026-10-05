@@ -34,7 +34,7 @@ pub const Profile = enum(u16) {
     current = current_record_version,
 
     pub fn wireVersion(self: @This()) u16 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

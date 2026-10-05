@@ -85,7 +85,7 @@ fn exercise(alloc: std.mem.Allocator) !void {
     var scratch = Scratch.init(alloc, 3);
     defer scratch.deinit();
     const first = try scratch.key("a\x00b", false);
-    const huge = [_]u8{'z'} ** 8192;
+    const huge = @as([8192]u8, @splat('z'));
     const large = try scratch.key(&huge, true);
     const expected_large = try keys.relationalRowKeyAlloc(alloc, &huge);
     defer alloc.free(expected_large);
@@ -120,7 +120,7 @@ test "lookup scratch inline keys survive a failed spill without allocating" {
     var scratch = Scratch.init(failing.allocator(), 3);
     defer scratch.deinit();
     const first = try scratch.key("first", false);
-    const huge = [_]u8{'z'} ** 8192;
+    const huge = @as([8192]u8, @splat('z'));
     try std.testing.expectError(error.OutOfMemory, scratch.key(&huge, false));
     try std.testing.expectEqualSlices(u8, expected, first);
     _ = try scratch.key("after", false);

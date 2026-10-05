@@ -9,7 +9,7 @@ pub const scan_key = "\x00\x00__metadata__:artifact_footprint_scan_v1";
 pub const Family = enum(u2) { graph, vector, generated, resolution };
 pub const all: u8 = 15;
 pub fn bit(family: Family) u8 {
-    return @as(u8, 1) << @intFromEnum(family);
+    return @as(u8, 1) << @backingInt(family);
 }
 pub fn isKey(candidate: []const u8) bool {
     return std.mem.eql(u8, candidate, key) or std.mem.eql(u8, candidate, scan_key);

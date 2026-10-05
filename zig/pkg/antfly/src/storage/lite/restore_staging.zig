@@ -76,7 +76,7 @@ const PortableManifestMetadata = struct {
     schema_json: []const u8,
     indexes_json: []const u8,
 
-    fn deinit(self: *PortableManifestMetadata, allocator: Allocator) void {
+    pub fn deinit(self: *PortableManifestMetadata, allocator: Allocator) void {
         allocator.free(self.schema_json);
         allocator.free(self.indexes_json);
         self.* = undefined;
@@ -467,11 +467,11 @@ fn appendBinaryIndexCatalogFields(
 
 fn indexKindFromCatalogByte(value: u8) ?db_types.IndexKind {
     return switch (value) {
-        @intFromEnum(db_types.IndexKind.full_text) => .full_text,
-        @intFromEnum(db_types.IndexKind.dense_vector) => .dense_vector,
-        @intFromEnum(db_types.IndexKind.sparse_vector) => .sparse_vector,
-        @intFromEnum(db_types.IndexKind.graph) => .graph,
-        @intFromEnum(db_types.IndexKind.algebraic) => .algebraic,
+        @backingInt(db_types.IndexKind.full_text) => .full_text,
+        @backingInt(db_types.IndexKind.dense_vector) => .dense_vector,
+        @backingInt(db_types.IndexKind.sparse_vector) => .sparse_vector,
+        @backingInt(db_types.IndexKind.graph) => .graph,
+        @backingInt(db_types.IndexKind.algebraic) => .algebraic,
         else => null,
     };
 }
@@ -1059,7 +1059,7 @@ test "lite restore staging preflights afb before publishing staged files" {
         .format_version = backup_codec.format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
+        .backup_id = @as([16]u8, @splat(0)),
         .table_count = 1,
         .shard_count = 1,
     });

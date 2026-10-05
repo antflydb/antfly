@@ -226,7 +226,7 @@ const catalog_fingerprint_seed: u64 = 0x414e_5446_4c59_414f; // "ANTFLYAO"
 pub fn targetFingerprint(target: Target) u64 {
     var hasher = std.hash.Wyhash.init(catalog_fingerprint_seed ^ 0x5441_5247_4554_0001);
     catalogHashU8(&hasher, 1);
-    catalogHashU8(&hasher, @intFromEnum(target.backend));
+    catalogHashU8(&hasher, @backingInt(target.backend));
     catalogHashBytes(&hasher, target.architecture);
     catalogHashU64(&hasher, target.required_features);
     return hasher.final();
@@ -3056,7 +3056,7 @@ pub const first_decode_attention_1x_cuda_split4_hd512_schedule = cudaAttentionSc
 // qualified SM89 Gemma 4 F16 geometry: the runtime automatic selector engages
 // it by default at the 512-token KV crossover, with
 // ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK=0 as the rollback.
-pub const first_decode_attention_1x_cuda_score_prework_runtime_evidence_command = "zig build quant-kernel-cuda-paged-attention-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --head-dim all --kv-len 2003 --pattern all --key-format all --value-format all --page-order all --heads 8 --kv-heads 2 --iterations 100";
+pub const first_decode_attention_1x_cuda_score_prework_runtime_evidence_command = "zig build quant-kernel-cuda-paged-attention-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=fast -- --head-dim all --kv-len 2003 --pattern all --key-format all --value-format all --page-order all --heads 8 --kv-heads 2 --iterations 100";
 pub const first_decode_attention_1x_cuda_score_prework_promotion_evidence_command = "python3 scripts/gemma4/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.decode.score_prework --qualification-profile screening --prompt-fixture scripts/gemma4/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-score-prework-screening";
 pub const first_decode_attention_1x_cuda_score_prework_hd256_kernel_id = cuda_renderer.generated_attention_hd256_score_prework_kernel_id;
 pub const first_decode_attention_1x_cuda_score_prework_hd256_source_path = "src/ops/cuda/generated/attention_decode_score_prework_hd256.cu";
@@ -3073,7 +3073,7 @@ pub const first_decode_attention_1x_cuda_score_prework_hd512_schedule = cudaAtte
 // so the runtime automatic selector engages the flash route by default for the
 // qualified SM89 Gemma 4 F16 geometry, with
 // ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off as the rollback.
-pub const first_prefill_flash_cuda_runtime_evidence_command = "zig build quant-kernel-cuda-paged-prefill-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --json";
+pub const first_prefill_flash_cuda_runtime_evidence_command = "zig build quant-kernel-cuda-paged-prefill-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=fast -- --json";
 pub const first_prefill_flash_cuda_promotion_evidence_command = "python3 scripts/gemma4/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.prefill.flash_f16_sm89 --qualification-profile screening --prompt-fixture scripts/gemma4/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-flash-prefill-screening";
 pub const first_prefill_flash_cuda_hd256_kernel_id = cuda_renderer.generated_flash_prefill_hd256_kernel_id;
 pub const first_prefill_flash_cuda_hd256_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu";
@@ -6181,8 +6181,8 @@ pub fn artifactManifestJson(allocator: std.mem.Allocator) ![]u8 {
         registry_records[index] = artifactRegistryManifestRecord(artifact);
     }
     var records: [first_generated_matmul_artifacts.len]ArtifactManifestRecord = undefined;
-    var owned_route_commands = [_][]const u8{""} ** first_generated_matmul_artifacts.len;
-    var owned_blocker_check_commands = [_][]const u8{""} ** first_generated_matmul_artifacts.len;
+    var owned_route_commands = @as([first_generated_matmul_artifacts.len][]const u8, @splat(""));
+    var owned_blocker_check_commands = @as([first_generated_matmul_artifacts.len][]const u8, @splat(""));
     defer for (owned_route_commands) |command| {
         if (command.len != 0) allocator.free(command);
     };
@@ -7400,12 +7400,12 @@ fn plannedCountersKey(
     epilogue: Epilogue,
     dispatch: quant_matmul.DispatchKind,
 ) u64 {
-    var key: u64 = @intFromEnum(backend);
+    var key: u64 = @backingInt(backend);
     // Format is enum(u16) with an explicit tag at 254, so give it 16 bits.
-    key = (key << 16) | @intFromEnum(format);
-    key = (key << 8) | @intFromEnum(row_bucket);
-    key = (key << 8) | @intFromEnum(epilogue);
-    key = (key << 8) | @intFromEnum(dispatch);
+    key = (key << 16) | @backingInt(format);
+    key = (key << 8) | @backingInt(row_bucket);
+    key = (key << 8) | @backingInt(epilogue);
+    key = (key << 8) | @backingInt(dispatch);
     return key;
 }
 
@@ -7511,8 +7511,8 @@ pub fn countersForLowering(lowering: QuantKernelLowering) PlanCounters {
 }
 
 pub fn addCountersToStats(stats: anytype, counters: PlanCounters) void {
-    inline for (@typeInfo(PlanCounters).@"struct".fields) |field| {
-        @field(stats.*, field.name) += @intCast(@field(counters, field.name));
+    inline for (comptime std.meta.fieldNames(PlanCounters)) |reflected_name| {
+        @field(stats.*, reflected_name) += @intCast(@field(counters, reflected_name));
     }
 }
 
@@ -10485,11 +10485,11 @@ test "quant kernel compiler registry route summary is golden" {
     var by_backend = [_]PlanCounters{ .{}, .{} };
     for (first_registry.entries) |entry| {
         const counters = countersForLowering(entry);
-        const index = @intFromEnum(entry.backend);
+        const index = @backingInt(entry.backend);
         addCountersToStats(&by_backend[index], counters);
     }
 
-    const cuda = by_backend[@intFromEnum(@as(Backend, .cuda))];
+    const cuda = by_backend[@backingInt(@as(Backend, .cuda))];
     try std.testing.expectEqual(@as(usize, 1232), cuda.quant_kernel_planned_ops);
     try std.testing.expectEqual(@as(usize, 59), cuda.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(usize, 5), cuda.quant_kernel_generated_production);
@@ -10504,7 +10504,7 @@ test "quant kernel compiler registry route summary is golden" {
     try std.testing.expectEqual(@as(usize, 0), cuda.quant_kernel_fallback_tensor_core_repack_required);
     try std.testing.expectEqual(@as(usize, 1168), cuda.quant_kernel_fallback_unsupported);
 
-    const metal = by_backend[@intFromEnum(@as(Backend, .metal))];
+    const metal = by_backend[@backingInt(@as(Backend, .metal))];
     try std.testing.expectEqual(@as(usize, 1232), metal.quant_kernel_planned_ops);
     try std.testing.expectEqual(@as(usize, 105), metal.quant_kernel_handwritten_production);
     try std.testing.expectEqual(@as(usize, 7), metal.quant_kernel_generated_production);
@@ -13172,17 +13172,17 @@ test "quant kernel compiler Metal build check covers generated and promoted arti
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "\"500\",\n            \"--production-regression-check\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--production-regression-check"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "run_quant_kernel_metal_production_regression.has_side_effects = true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-runtime-route-all-evidence-{x}.json"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg(route_all_evidence_name)"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-production-regression-evidence-{x}.json"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg(production_regression_evidence_name)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-runtime-route-all-evidence.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg2(route_all_evidence_name,"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-production-regression-evidence.json"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputFileArg2(production_regression_evidence_name,"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-blocker-evidence-refresh"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--refresh-blocker-evidence"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "refresh_quant_kernel_metal_blocker_evidence.has_side_effects = true"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-blocker-evidence-{x}"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputDirectoryArg(blocker_evidence_dir_name)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "antfly-quant-metal-blocker-evidence"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "addOutputDirectoryArg2(blocker_evidence_dir_name,"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "--blocker-evidence-dir"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "addDirectoryArg(blocker_evidence_dir)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, contents, 2, "addDirectoryArg2(blocker_evidence_dir,"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "quant-kernel-metal-blocker-strict-check"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--confirm-cleared-blockers"));
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "--fail-on-cleared-blocker"));
@@ -13418,8 +13418,8 @@ test "quant kernel compiler adds every plan counter to runtime stats" {
     };
 
     var counters = PlanCounters{};
-    inline for (@typeInfo(PlanCounters).@"struct".fields, 1..) |field, value| {
-        @field(counters, field.name) = value;
+    inline for (@typeInfo(PlanCounters).@"struct".field_names, 1..) |reflected_name, value| {
+        @field(counters, reflected_name) = value;
     }
 
     var stats64 = Stats64{};
@@ -13427,9 +13427,9 @@ test "quant kernel compiler adds every plan counter to runtime stats" {
     var stats_usize = StatsUsize{};
     addCountersToStats(&stats_usize, counters);
 
-    inline for (@typeInfo(PlanCounters).@"struct".fields) |field| {
-        try std.testing.expectEqual(@as(u64, @intCast(@field(counters, field.name))), @field(stats64, field.name));
-        try std.testing.expectEqual(@field(counters, field.name), @field(stats_usize, field.name));
+    inline for (comptime std.meta.fieldNames(PlanCounters)) |reflected_name| {
+        try std.testing.expectEqual(@as(u64, @intCast(@field(counters, reflected_name))), @field(stats64, reflected_name));
+        try std.testing.expectEqual(@field(counters, reflected_name), @field(stats_usize, reflected_name));
     }
 }
 

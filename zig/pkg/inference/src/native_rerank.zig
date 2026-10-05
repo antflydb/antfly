@@ -32,7 +32,7 @@ const Options = struct {
     backend: native_backend_choice.Choice = .auto,
     qwen3vl_qualification_json: ?[]const u8 = null,
 
-    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.documents.deinit(allocator);
         self.image_paths.deinit(allocator);
     }

@@ -130,7 +130,7 @@ const OwnedBatch = struct {
         return owned;
     }
 
-    fn deinit(self: *OwnedBatch, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
         alloc.free(@constCast(self.batch.snapshot.table_id));
         alloc.free(@constCast(self.batch.snapshot.snapshot_id));
         for (self.batch.row_refs) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);

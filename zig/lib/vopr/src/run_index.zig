@@ -791,7 +791,7 @@ fn lessArtifact(_: void, lhs: Artifact, rhs: Artifact) bool {
     }
     const path_order = std.mem.order(u8, lhs.path, rhs.path);
     if (path_order != .eq) return path_order == .lt;
-    return @intFromEnum(lhs.kind) < @intFromEnum(rhs.kind);
+    return @backingInt(lhs.kind) < @backingInt(rhs.kind);
 }
 
 fn inferArtifactKind(path: []const u8) ArtifactKind {

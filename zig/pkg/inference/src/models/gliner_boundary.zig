@@ -138,11 +138,11 @@ pub const HeadConfig = struct {
     relation_biaffine_content: bool = false,
 
     pub fn validate(self: HeadConfig) !void {
-        inline for (@typeInfo(HeadConfig).@"struct".fields) |field| {
-            const value = @field(self, field.name);
-            if (field.type == f32 or field.type == f64) {
+        inline for (@typeInfo(HeadConfig).@"struct".field_names, @typeInfo(HeadConfig).@"struct".field_types) |reflected_name, field_type| {
+            const value = @field(self, reflected_name);
+            if (field_type == f32 or field_type == f64) {
                 if (!std.math.isFinite(value) or value < 0) return error.InvalidGlinerBoundaryConfig;
-            } else if (field.type == u32) {
+            } else if (field_type == u32) {
                 if (value > std.math.maxInt(i32)) return error.InvalidGlinerBoundaryConfig;
             }
         }
@@ -330,8 +330,8 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8, encoder_byte
     const model_name = obj.get("model_name") orelse return error.InvalidGlinerBoundaryConfig;
     if (model_name != .string) return error.InvalidGlinerBoundaryConfig;
     const backbone: Backbone = if (modern_encoder) .modern_bert else blk: {
-        inline for (std.meta.fields(Backbone)) |field| {
-            const candidate: Backbone = @enumFromInt(field.value);
+        inline for (@typeInfo(Backbone).@"enum".field_names, @typeInfo(Backbone).@"enum".field_values) |_, field_value| {
+            const candidate: Backbone = @fromBackingInt(field_value);
             if (candidate != .modern_bert and std.mem.eql(u8, model_name.string, candidate.modelName())) break :blk candidate;
         }
         return error.UnsupportedGlinerBoundaryEncoder;
@@ -356,23 +356,23 @@ pub fn parseHeadConfig(obj: std.json.ObjectMap) !HeadConfig {
     var iterator = obj.iterator();
     while (iterator.next()) |entry| {
         var known = false;
-        inline for (@typeInfo(HeadConfig).@"struct".fields) |field| {
-            if (std.mem.eql(u8, entry.key_ptr.*, field.name)) known = true;
+        inline for (comptime std.meta.fieldNames(HeadConfig)) |reflected_name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, reflected_name)) known = true;
         }
         if (!known) return error.UnsupportedGlinerBoundaryConfiguration;
     }
-    inline for (@typeInfo(HeadConfig).@"struct".fields) |field| {
-        if (obj.get(field.name)) |value| {
-            if (field.type == u32) {
-                @field(head, field.name) = try requiredU32(obj, field.name, true);
-            } else if (field.type == f32 or field.type == f64) {
-                @field(head, field.name) = try requiredFloat(field.type, obj, field.name);
-            } else if (field.type == bool) {
+    inline for (@typeInfo(HeadConfig).@"struct".field_names, @typeInfo(HeadConfig).@"struct".field_types) |reflected_name, field_type| {
+        if (obj.get(reflected_name)) |value| {
+            if (field_type == u32) {
+                @field(head, reflected_name) = try requiredU32(obj, reflected_name, true);
+            } else if (field_type == f32 or field_type == f64) {
+                @field(head, reflected_name) = try requiredFloat(field_type, obj, reflected_name);
+            } else if (field_type == bool) {
                 if (value != .bool) return error.InvalidGlinerBoundaryConfig;
-                @field(head, field.name) = value.bool;
+                @field(head, reflected_name) = value.bool;
             } else {
                 if (value != .string) return error.InvalidGlinerBoundaryConfig;
-                @field(head, field.name) = std.meta.stringToEnum(field.type, value.string) orelse
+                @field(head, reflected_name) = std.meta.stringToEnum(field_type, value.string) orelse
                     return error.UnsupportedGlinerBoundaryConfiguration;
             }
         }

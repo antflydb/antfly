@@ -142,7 +142,7 @@ const HostControl = struct {
         for (ranges, view.ranges) |*dst, src| dst.* = @intCast(src);
         return .{ .positions = positions, .ranges = ranges };
     }
-    fn deinit(self: *HostControl, a: Allocator) void {
+    pub fn deinit(self: *HostControl, a: Allocator) void {
         a.free(self.positions);
         a.free(self.ranges);
     }
@@ -231,7 +231,7 @@ test "plan admits an 8k global row within default limits, and enforces the bound
 
 test "validateControl rejects out-of-range bounds and wrong lengths" {
     const attrs = Attrs{ .batch = 1, .seq_len = 4, .num_heads = 1, .head_dim = 2, .dropout_probability = 0, .dropout_stream_id = 0 };
-    var words = [_]i32{0} ** (7 + 4 + 24);
+    var words = @as([(7 + 4 + 24)]i32, @splat(0));
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, words[0..1], .{}));
     words[7 + 4] = 5; // out of range: > seq_len
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionControl, validateControl(attrs, &words, .{}));
@@ -245,23 +245,23 @@ test "validateControl rejects out-of-range bounds and wrong lengths" {
 test "forward and backward reject a qkv or dout of the wrong length" {
     const a = std.testing.allocator;
     const attrs = Attrs{ .batch = 1, .seq_len = 4, .num_heads = 1, .head_dim = 2, .dropout_probability = 0, .dropout_stream_id = 0 };
-    var words = [_]i32{0} ** (7 + 4 + 24);
+    var words = @as([(7 + 4 + 24)]i32, @splat(0));
     for (0..4) |t| words[7 + 4 + t * 6 + 1] = 4;
-    const short = [_]f32{0} ** (3 * 4 * 2 - 1);
-    const long = [_]f32{0} ** (3 * 4 * 2 + 2);
-    const dout = [_]f32{0} ** (4 * 2);
+    const short = @as([(3 * 4 * 2 - 1)]f32, @splat(0));
+    const long = @as([(3 * 4 * 2 + 2)]f32, @splat(0));
+    const dout = @as([(4 * 2)]f32, @splat(0));
     for ([_][]const f32{ &short, &long }) |qkv| {
         try std.testing.expectError(error.InvalidSegmentTrainingAttentionShape, forward(a, attrs, qkv, &words, .{}));
         try std.testing.expectError(error.InvalidSegmentTrainingAttentionShape, backward(a, attrs, qkv, &words, &dout, .{}));
     }
-    const exact = [_]f32{0} ** (3 * 4 * 2);
+    const exact = @as([(3 * 4 * 2)]f32, @splat(0));
     a.free(try forward(a, attrs, &exact, &words, .{}));
     try std.testing.expectError(error.InvalidSegmentTrainingAttentionShape, backward(a, attrs, &exact, &words, dout[0..7], .{}));
 }
 
 test "validateControl decodes apply_dropout from word 6" {
     const attrs = Attrs{ .batch = 1, .seq_len = 4, .num_heads = 1, .head_dim = 2, .dropout_probability = 0.1, .dropout_stream_id = 0 };
-    var words = [_]i32{0} ** (7 + 4 + 24);
+    var words = @as([(7 + 4 + 24)]i32, @splat(0));
     const off = try validateControl(attrs, &words, .{});
     try std.testing.expect(!off.apply_dropout);
     words[6] = 1;

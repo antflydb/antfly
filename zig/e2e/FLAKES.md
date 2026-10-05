@@ -2032,8 +2032,8 @@ in `.worktrees/fix-metadata-backup-create-flake`:
 Build and correctness commands, from `zig/`:
 
 ```sh
-python3 tools/run_bounded_zig_build.py --zig zig -- build antfly -Doptimize=Debug -fincremental
-python3 tools/run_bounded_zig_build.py --zig zig -- build lib-metadata-test -Doptimize=Debug -- metadata.service.
+python3 tools/run_bounded_zig_build.py --zig zig -- build antfly -Doptimize=debug -fincremental
+python3 tools/run_bounded_zig_build.py --zig zig -- build lib-metadata-test -Doptimize=debug -- metadata.service.
 ```
 
 Final original-cadence soak, from the worktree root (the initial 30-run batch

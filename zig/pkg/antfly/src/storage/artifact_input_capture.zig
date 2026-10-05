@@ -238,7 +238,7 @@ test "ordered artifact inventory input capture requires same transaction authori
                 try self.values.put(owned_key, owned);
             }
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iter = self.values.iterator();
             while (iter.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);
