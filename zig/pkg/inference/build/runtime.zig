@@ -330,12 +330,14 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("antfly_image", image_mod);
     inference_chunker_mod.addImport("antfly_hash", hash_mod);
 
+    const c_bindings = createCBindings(b, target, backend, paths);
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
         .target = target,
         .optimize = optimize,
     });
     addInferenceRootImports(inference_mod, .{
+        .c_bindings = c_bindings,
         .build_info_mod = shared.build_info_mod,
         .identities = identities,
         .build_options_mod = build_options_mod,
@@ -368,8 +370,6 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_extracting", extracting_mod);
     inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
-    const c_bindings = createCBindings(b, target, backend, paths);
-    applyCBindings(inference_mod, c_bindings);
     inference_mod.link_libc = backend.link_libc;
 
     const inference_internal_mod = b.createModule(.{
@@ -508,6 +508,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
 }
 
 const InferenceRootImports = struct {
+    c_bindings: CBindings,
     build_info_mod: *std.Build.Module,
     identities: jit_identity.Modules,
     build_options_mod: *std.Build.Module,
@@ -537,6 +538,7 @@ const InferenceRootImports = struct {
 };
 
 pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRootImports) void {
+    applyCBindings(module, imports.c_bindings);
     module.addImport("build_info", imports.build_info_mod);
     imports.identities.addImports(module);
     module.addImport("build_options", imports.build_options_mod);

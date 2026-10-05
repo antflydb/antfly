@@ -368,5 +368,5 @@ test "threaded enrichment executor reports backend and activity" {
 }
 
 test "evented enrichment executor initializes when supported" {
-    try executor_mod.testEventedExecutor();
+    try executor_mod.testEventedExecutor(false);
 }

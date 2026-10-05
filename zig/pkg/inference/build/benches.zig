@@ -153,6 +153,7 @@ pub fn createBge(ctx: Context) CreateBgeResult {
         .optimize = ctx.optimize,
     });
     runtime_build.addInferenceRootImports(bge_m3_runtime_mod, .{
+        .c_bindings = ctx.graph.c_bindings,
         .build_info_mod = ctx.graph.build_info_mod,
         .identities = ctx.graph.identities,
         .build_options_mod = ctx.graph.build_options_mod,

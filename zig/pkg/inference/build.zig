@@ -1544,6 +1544,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
+    runtime_build.applyCBindings(wasm_compute_tests.root_module, runtime_graph.c_bindings);
     wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1601,6 +1602,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"projector"},
     });
+    runtime_build.applyCBindings(web_projector_tests.root_module, runtime_graph.c_bindings);
     web_projector_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     web_projector_tests.root_module.addImport("httpx", httpx_mod);
     web_projector_tests.root_module.addImport("inference_api", inference_api_mod);

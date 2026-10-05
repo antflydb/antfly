@@ -2,5 +2,5 @@
 // SPDX-License-Identifier: ELv2
 
 test "evented enrichment executor initializes when supported" {
-    try @import("enrichment_executor.zig").testEventedExecutor();
+    try @import("enrichment_executor.zig").testEventedExecutor(true);
 }

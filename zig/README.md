@@ -17,7 +17,9 @@ Run `zig build evented-enrichment-test` on native Linux to validate scheduling,
 cancellation, file I/O, and teardown. This gate requires working io_uring,
 including `SINGLE_ISSUER` (Linux 6.0+) and a seccomp policy allowing its syscalls;
 backend initialization reports unsupported kernels or denied syscalls as errors.
-On other operating systems the test checks the unsupported-backend result.
+The ordinary Raft suite skips this optional backend test when io_uring is
+denied or unavailable; the dedicated gate remains strict. On other operating
+systems the test checks the unsupported-backend result.
 
 `lib/platform/src/io_uring_compat.zig` is the MIT-licensed Zig 0.17.0
 `std/Io/Uring.zig` with the release vtable repaired: remove obsolete process-path

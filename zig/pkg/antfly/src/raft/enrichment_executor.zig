@@ -107,13 +107,18 @@ pub const EventedExecutor = if (!supports_evented_executor) struct {
     }
 };
 
-pub fn testEventedExecutor() !void {
+pub fn testEventedExecutor(require_available: bool) !void {
     if (!supports_evented_executor) {
         try std.testing.expectError(error.UnsupportedEventedBackend, EventedExecutor.init(std.testing.allocator));
         return;
     }
 
-    var executor = try EventedExecutor.init(std.testing.allocator);
+    var executor = EventedExecutor.init(std.testing.allocator) catch |err| switch (err) {
+        // Evented is optional in ordinary Raft tests. The dedicated gate must
+        // still fail if the kernel or sandbox cannot provide io_uring.
+        error.PermissionDenied, error.SystemOutdated => if (require_available) return err else return error.SkipZigTest,
+        else => return err,
+    };
     defer executor.deinit();
     const iface = executor.executor();
     try std.testing.expectEqual(ExecutorBackend.evented, iface.backend());
