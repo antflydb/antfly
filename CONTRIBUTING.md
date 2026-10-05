@@ -23,8 +23,8 @@ ts/
 py/packages/sdk/     Python SDK
 py/packages/embedded/  Python embedded binding (antfly-embedded)
 rs/
-  crates/pgaf/       PostgreSQL extension (Rust/pgrx)
-  crates/sdk/        Generated Rust SDK (shared types with pgaf)
+  crates/postgres/   PostgreSQL extension (Rust/pgrx)
+  crates/sdk/        Generated Rust SDK (shared types with antfly_postgres)
   crates/embedded/      Rust embedded binding (antfly-embedded)
   crates/embedded-sys/  Raw libantfly C ABI declarations (antfly-embedded-sys)
 configs/             Example configuration files
@@ -167,11 +167,11 @@ cd ts && pnpm run lint
 cd py && uv sync && uv run pytest
 ```
 
-### Rust (pgaf)
+### Rust (antfly-postgres)
 
 ```bash
-cd rs/crates/pgaf && make test       # Unit tests
-cd rs/crates/pgaf && make test-e2e   # E2E (requires running Antfly server)
+cd rs/crates/postgres && make test       # Unit tests
+cd rs/crates/postgres && make test-e2e   # E2E (requires running Antfly server)
 ```
 
 ## Code Generation

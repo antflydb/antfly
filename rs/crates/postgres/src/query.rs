@@ -15,19 +15,19 @@
 
 /// ParadeDB-style query builder functions for the @@@ operator.
 ///
-/// These functions live in the `pgaf` schema so users write:
-///   SELECT * FROM docs WHERE content @@@ pgaf.search('fix computer');
+/// These functions live in the `antfly_postgres` schema so users write:
+///   SELECT * FROM docs WHERE content @@@ antfly_postgres.search('fix computer');
 ///
 /// Each returns a JSON string that scan.rs detects and passes as a structured
 /// query body to Antfly's query API.
 #[pgrx::pg_schema]
-mod pgaf {
+mod antfly_postgres {
     use pgrx::prelude::*;
 
     /// Full-text search query builder.
     ///
     /// Usage:
-    ///   SELECT * FROM docs WHERE content @@@ pgaf.search(
+    ///   SELECT * FROM docs WHERE content @@@ antfly_postgres.search(
     ///       'fix computer',
     ///       filter_prefix => 'tenant:acme:'
     ///   );
@@ -52,7 +52,7 @@ mod pgaf {
     /// Semantic (vector) search query builder.
     ///
     /// Usage:
-    ///   SELECT * FROM docs WHERE content @@@ pgaf.semantic(
+    ///   SELECT * FROM docs WHERE content @@@ antfly_postgres.semantic(
     ///       'fix my broken computer',
     ///       indexes => ARRAY['embedding_idx']
     ///   );
@@ -75,7 +75,7 @@ mod pgaf {
     /// Hybrid search query builder (full-text + semantic via RRF).
     ///
     /// Usage:
-    ///   SELECT * FROM docs WHERE content @@@ pgaf.hybrid(
+    ///   SELECT * FROM docs WHERE content @@@ antfly_postgres.hybrid(
     ///       full_text => 'computer repair',
     ///       semantic => 'fix my broken computer',
     ///       indexes => ARRAY['embedding_idx']

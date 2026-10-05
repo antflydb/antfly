@@ -93,7 +93,7 @@ pub unsafe extern "C-unwind" fn amrescan(
 fn build_query_body(query: &str, limit: i64) -> serde_json::Value {
     if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(query) {
         if v.is_object() {
-            // Structured query from pgaf.search() / pgaf.semantic() / pgaf.hybrid()
+            // Structured query from antfly_postgres.search() / antfly_postgres.semantic() / antfly_postgres.hybrid()
             v["limit"] = serde_json::json!(limit);
             return v;
         }
@@ -112,7 +112,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
     direction: pg_sys::ScanDirection::Type,
 ) -> bool {
     if direction != pg_sys::ScanDirection::ForwardScanDirection {
-        pgrx::error!("pgaf: only forward scan is supported");
+        pgrx::error!("antfly_postgres: only forward scan is supported");
     }
 
     let state = unsafe { &mut *((*scan).opaque as *mut AntflyScanState) };
@@ -123,13 +123,13 @@ pub unsafe extern "C-unwind" fn amgettuple(
             let (url, collection) = unsafe { options::get_options((*scan).indexRelation) };
 
             let client = AntflyClient::new(&url).unwrap_or_else(|e| {
-                pgrx::error!("pgaf: failed to create client: {}", e);
+                pgrx::error!("antfly_postgres: failed to create client: {}", e);
             });
 
             let body = build_query_body(query, 10000);
 
             let hits = client.search_raw(&collection, &body).unwrap_or_else(|e| {
-                pgrx::error!("pgaf: search failed: {}", e);
+                pgrx::error!("antfly_postgres: search failed: {}", e);
             });
 
             for hit in hits {

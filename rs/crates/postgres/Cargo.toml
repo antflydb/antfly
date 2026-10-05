@@ -1,17 +1,21 @@
 [package]
-name = "pgaf"
+name = "antfly-postgres"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
+description = "PostgreSQL extension integrating Antfly search and indexes"
+repository = "https://github.com/antflydb/antfly"
+readme = "README.md"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgrx_embed)'] }
 
 [lib]
+name = "antfly_postgres"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "pgrx_embed_pgaf"
+name = "pgrx_embed_antfly_postgres"
 path = "./src/bin/pgrx_embed.rs"
 
 [features]

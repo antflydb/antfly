@@ -25,6 +25,13 @@ each contribution still need a separate review before representing a changed
 license boundary as cleared for release. The prospective contribution policy
 in `CONTRIBUTING.md` does not change past contributions.
 
+## Ownership confirmation (2026-10-05)
+
+The repository owner confirmed that Antfly owns the contributions covered by
+this relicensing work. This confirmation is separate from the historical
+Git author audit above and resolves the outstanding ownership confirmation
+recorded by that audit.
+
 ## Validation results
 
 The Apache-only source build runs in the Zig suite after pushes to `main`. Its local run

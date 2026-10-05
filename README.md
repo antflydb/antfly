@@ -108,11 +108,11 @@ Prefer not to run it yourself? [Antfly Cloud](https://antfly.io/cloud) is the ho
 | Python | `antfly-sdk` (import `antfly`) | [`py/packages/sdk`](py/packages/sdk) |
 | Rust | `antfly-sdk` | [`rs/crates/sdk`](rs/crates/sdk) |
 | React | `@antfly/components` | [`ts/packages/components`](ts/packages/components) |
-| PostgreSQL | `pgaf` extension | [`rs/crates/pgaf`](rs/crates/pgaf) |
+| PostgreSQL | `antfly_postgres` extension | [`rs/crates/postgres`](rs/crates/postgres) |
 
-### pgaf — PostgreSQL Extension
+### antfly-postgres — PostgreSQL Extension
 
-[pgaf](rs/crates/pgaf) brings Antfly search into Postgres. Create an index, use the `@@@` operator, and you're done:
+[antfly-postgres](rs/crates/postgres) brings Antfly search into Postgres. Create an index, use the `@@@` operator, and you're done:
 
 ```sql
 CREATE INDEX idx_content ON docs USING antfly (content)

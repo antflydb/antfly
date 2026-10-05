@@ -38,13 +38,13 @@ fn antfly_search(
     ),
 > {
     let client = AntflyClient::new(base_url).unwrap_or_else(|e| {
-        pgrx::error!("pgaf: failed to create client: {}", e);
+        pgrx::error!("antfly_postgres: failed to create client: {}", e);
     });
 
     let hits = client
         .search(collection, query, limit.map(|l| l as i64).or(Some(10)))
         .unwrap_or_else(|e| {
-            pgrx::error!("pgaf: search failed: {}", e);
+            pgrx::error!("antfly_postgres: search failed: {}", e);
         });
 
     let rows: Vec<_> = hits
@@ -59,8 +59,8 @@ fn antfly_search(
 #[pg_extern]
 fn antfly_status(base_url: &str) -> String {
     match AntflyClient::new(base_url) {
-        Ok(_client) => format!("pgaf: connected to {}", base_url),
-        Err(e) => format!("pgaf: error: {}", e),
+        Ok(_client) => format!("antfly_postgres: connected to {}", base_url),
+        Err(e) => format!("antfly_postgres: error: {}", e),
     }
 }
 
@@ -73,6 +73,6 @@ mod tests {
     fn test_antfly_status() {
         // Should return an error string for an unreachable server, not panic
         let result = crate::functions::antfly_status("http://127.0.0.1:19999");
-        assert!(result.starts_with("pgaf:"));
+        assert!(result.starts_with("antfly_postgres:"));
     }
 }

@@ -1,8 +1,8 @@
-# pgaf Custom Index Access Method
+# antfly_postgres Custom Index Access Method
 
 ## Context
 
-pgaf already has SQL functions (`antfly_search()`) and triggers (`antfly_sync_trigger()`) for integrating Antfly with PostgreSQL. The index AM is the third piece: it makes the PostgreSQL planner aware of Antfly so queries like `SELECT * FROM docs WHERE content @@@ 'fix my computer'` use the index automatically, without explicit `antfly_search()` calls.
+antfly_postgres already has SQL functions (`antfly_search()`) and triggers (`antfly_sync_trigger()`) for integrating Antfly with PostgreSQL. The index AM is the third piece: it makes the PostgreSQL planner aware of Antfly so queries like `SELECT * FROM docs WHERE content @@@ 'fix my computer'` use the index automatically, without explicit `antfly_search()` calls.
 
 This is a **remote index** (like ZomboDB → Elasticsearch). No index data is stored locally in PostgreSQL pages — all indexing and search is delegated to a remote Antfly server via HTTP.
 
@@ -97,7 +97,7 @@ No-op. Stale docs in Antfly are harmless — PostgreSQL's heap visibility checks
 cargo pgrx run
 
 # Then in psql:
-CREATE EXTENSION pgaf;
+CREATE EXTENSION antfly_postgres;
 CREATE TABLE docs (id serial PRIMARY KEY, content text);
 INSERT INTO docs (content) VALUES
   ('how to fix a broken computer'),

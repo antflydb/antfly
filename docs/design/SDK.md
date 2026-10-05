@@ -31,7 +31,7 @@ Antfly or inference source specs.
 - TypeScript SDK: `ts/packages/sdk`
 - Python SDK: `py/packages/sdk`
 - Rust SDK crate: `rs/crates/sdk`
-- Rust `pgaf` crate: `rs/crates/pgaf`
+- Rust `antfly-postgres` crate: `rs/crates/postgres`
 
 Shared repository scripts live in top-level `scripts/`. Zig-only build code stays
 under `zig/`.

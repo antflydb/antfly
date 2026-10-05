@@ -1,6 +1,9 @@
-# pgaf
+# antfly-postgres
 
 PostgreSQL extension for [Antfly](https://github.com/antflydb/antfly). Provides a custom index access method, search functions, and row sync triggers — so Antfly-powered search feels native to Postgres.
+
+The Cargo package is `antfly-postgres`; the Rust library, PostgreSQL extension,
+and SQL query-builder schema are named `antfly_postgres`.
 
 ## Features
 
@@ -56,7 +59,7 @@ cargo pgrx run
 Then in psql:
 
 ```sql
-CREATE EXTENSION pgaf;
+CREATE EXTENSION antfly_postgres;
 ```
 
 ## Usage
@@ -87,15 +90,15 @@ The `@@@` operator delegates search to Antfly. On `CREATE INDEX`, the table is a
 
 ### Query Builders
 
-pgaf provides ParadeDB-style query builder functions in the `pgaf` schema. These return JSON strings that the `@@@` operator sends as structured queries to Antfly.
+antfly_postgres provides ParadeDB-style query builder functions in the `antfly_postgres` schema. These return JSON strings that the `@@@` operator sends as structured queries to Antfly.
 
 **Full-text search:**
 
 ```sql
-SELECT * FROM docs WHERE content @@@ pgaf.search('fix computer');
+SELECT * FROM docs WHERE content @@@ antfly_postgres.search('fix computer');
 
 -- With filter prefix
-SELECT * FROM docs WHERE content @@@ pgaf.search(
+SELECT * FROM docs WHERE content @@@ antfly_postgres.search(
     'fix computer',
     filter_prefix => 'tenant:acme:'
 );
@@ -104,7 +107,7 @@ SELECT * FROM docs WHERE content @@@ pgaf.search(
 **Semantic (vector) search:**
 
 ```sql
-SELECT * FROM docs WHERE content @@@ pgaf.semantic(
+SELECT * FROM docs WHERE content @@@ antfly_postgres.semantic(
     'fix my broken computer',
     indexes => ARRAY['embedding_idx']
 );
@@ -113,7 +116,7 @@ SELECT * FROM docs WHERE content @@@ pgaf.semantic(
 **Hybrid search (full-text + semantic via RRF):**
 
 ```sql
-SELECT * FROM docs WHERE content @@@ pgaf.hybrid(
+SELECT * FROM docs WHERE content @@@ antfly_postgres.hybrid(
     full_text => 'computer repair',
     semantic => 'fix my broken computer',
     indexes => ARRAY['embedding_idx']
@@ -165,9 +168,9 @@ SELECT antfly_status('http://localhost:8080/db/v1/');
 
 ## Architecture
 
-pgaf depends on `antfly-sdk`, a sibling crate in the `rs/` workspace that
+`antfly-postgres` depends on `antfly-sdk`, a sibling crate in the `rs/` workspace that
 generates a typed Rust SDK from root `openapi.yaml` via [Progenitor](https://github.com/oxidecomputer/progenitor).
-pgaf uses the shared types (e.g. `QueryResponses`, `QueryHit`) for
+`antfly-postgres` uses the shared types (e.g. `QueryResponses`, `QueryHit`) for
 deserialization but keeps its own blocking HTTP client (Postgres extensions
 cannot run an async runtime).
 
@@ -175,10 +178,10 @@ cannot run an async runtime).
 rs/
 ├── Cargo.toml          # Workspace root
 └── crates/
-    ├── sdk/            # Generated async SDK (types shared with pgaf)
+    ├── sdk/            # Generated async SDK (types shared with antfly_postgres)
     │   ├── build.rs    # Progenitor codegen + OpenAPI preprocessing
     │   └── src/lib.rs
-    └── pgaf/           # This extension
+    └── postgres/           # This extension
 ```
 
 ## Project Structure
@@ -187,7 +190,7 @@ rs/
 src/
 ├── lib.rs            # Extension entry point + _PG_init
 ├── client.rs         # Antfly HTTP client (batch API, query API)
-├── query.rs          # ParadeDB-style query builders (pgaf.search, pgaf.semantic, pgaf.hybrid)
+├── query.rs          # ParadeDB-style query builders (antfly_postgres.search, antfly_postgres.semantic, antfly_postgres.hybrid)
 ├── functions.rs      # SQL functions (antfly_search, antfly_status)
 ├── e2e_tests.rs      # End-to-end tests (require running Antfly server)
 ├── triggers.rs       # Trigger function (antfly_sync_trigger)

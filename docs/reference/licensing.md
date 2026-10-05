@@ -88,12 +88,25 @@ Before the first release, the PyPI account owner must configure a pending
 trusted publisher for project `antfly-embedded`, repository
 `antflydb/antfly`, workflow `lite-release-publish.yml`, and GitHub environment
 `pypi`. A pending publisher does not reserve the name: the first successful
-upload creates the project. The crates.io owner can publish the tested
-`registry-claims/antfly-embedded` and `registry-claims/antfly-embedded-sys`
-version `0.0.0` placeholders, then grant the Antfly organization ownership
-before publishing the functional Rust crates.
-Registry ownership and trusted-publisher settings cannot be established by a
-source commit; verify them in the registries before promoting a release.
+upload creates the project.
+
+The crates.io names `antfly-sdk`, `antfly-embedded`, `antfly-embedded-sys`,
+and `antfly-postgres` were established with `0.0.0` claim packages on
+2026-10-05. These are setup versions with no runtime API; functional crates
+live under `rs/crates`. The PostgreSQL crate is `antfly-postgres`, while its
+Rust library, SQL extension and query-builder schema use `antfly_postgres`.
+Crates.io organization ownership uses the existing GitHub team
+`github:antflydb:engineering`, not a separate crates.io organization. All four
+crates were verified with both that team and `ajroetker` as owners. Keep a
+personal owner for ownership administration; team owners can publish and yank.
+See [registry claims](../../registry-claims/README.md) for verification commands.
+
+The four npm packages (`@antfly/embedded` and its Darwin ARM64, Linux ARM64,
+and Linux x64 platform packages) were established with nonfunctional `0.0.0`
+setup versions on 2026-10-05. All four trusted publishers are configured for
+`antflydb/antfly`, `lite-release-publish.yml`, environment `npm`.
+Registry ownership and trusted-publisher settings are external account state;
+verify them in the registries before promoting a release.
 
 ## Verification
 

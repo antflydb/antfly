@@ -756,6 +756,8 @@ impl Default for types::CreateGraphIndexRequest {
             sources: None,
             summarizer: None,
             template: None,
+            ttl: None,
+            ttl_duration: None,
             type_: types::CreateGraphIndexRequestType::Graph,
             version: 0,
         }

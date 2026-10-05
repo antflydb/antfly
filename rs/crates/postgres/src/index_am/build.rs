@@ -34,12 +34,12 @@ pub unsafe extern "C-unwind" fn ambuild(
     let (url, collection) = unsafe { options::get_options(index_relation) };
 
     let client = AntflyClient::new(&url).unwrap_or_else(|e| {
-        pgrx::error!("pgaf: failed to create Antfly client: {}", e);
+        pgrx::error!("antfly_postgres: failed to create Antfly client: {}", e);
     });
 
     // Ensure the table exists in Antfly before syncing documents.
     if let Err(e) = client.ensure_table(&collection) {
-        pgrx::warning!("pgaf: failed to create table in Antfly: {}", e);
+        pgrx::warning!("antfly_postgres: failed to create table in Antfly: {}", e);
     }
 
     let mut state = BuildState {
@@ -106,7 +106,7 @@ unsafe extern "C-unwind" fn build_callback(
             });
 
             if let Err(e) = state.client.sync_document(&state.collection, &doc_id, &doc) {
-                pgrx::warning!("pgaf: failed to sync document {}: {}", doc_id, e);
+                pgrx::warning!("antfly_postgres: failed to sync document {}: {}", doc_id, e);
             } else {
                 state.count += 1.0;
             }
@@ -143,7 +143,7 @@ pub unsafe extern "C-unwind" fn aminsert(
 
         if let Some(content) = text {
             let client = AntflyClient::new(&url).unwrap_or_else(|e| {
-                pgrx::error!("pgaf: failed to create client: {}", e);
+                pgrx::error!("antfly_postgres: failed to create client: {}", e);
             });
 
             let doc = serde_json::json!({
@@ -152,7 +152,7 @@ pub unsafe extern "C-unwind" fn aminsert(
             });
 
             if let Err(e) = client.sync_document(&collection, &doc_id, &doc) {
-                pgrx::warning!("pgaf: failed to sync document to antfly: {}", e);
+                pgrx::warning!("antfly_postgres: failed to sync document to antfly: {}", e);
             }
         }
 

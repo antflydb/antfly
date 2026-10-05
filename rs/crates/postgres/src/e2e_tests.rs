@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// End-to-end tests for pgaf.
+/// End-to-end tests for antfly_postgres.
 ///
 /// Tests that check `ANTFLY_TEST_URL` env var skip automatically when no
 /// server is available. The query builder tests run without a server.
@@ -114,7 +114,7 @@ mod tests {
 
     #[pg_test]
     fn test_query_builder_search_produces_json() {
-        let result = Spi::get_one::<String>("SELECT pgaf.search('hello world')")
+        let result = Spi::get_one::<String>("SELECT antfly_postgres.search('hello world')")
             .unwrap()
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -123,10 +123,11 @@ mod tests {
 
     #[pg_test]
     fn test_query_builder_semantic_produces_json() {
-        let result =
-            Spi::get_one::<String>("SELECT pgaf.semantic('hello world', ARRAY['emb_idx'])")
-                .unwrap()
-                .unwrap();
+        let result = Spi::get_one::<String>(
+            "SELECT antfly_postgres.semantic('hello world', ARRAY['emb_idx'])",
+        )
+        .unwrap()
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["semantic_search"], "hello world");
         assert_eq!(v["indexes"][0], "emb_idx");
@@ -135,7 +136,7 @@ mod tests {
     #[pg_test]
     fn test_query_builder_hybrid_produces_json() {
         let result = Spi::get_one::<String>(
-            "SELECT pgaf.hybrid(full_text => 'hello', semantic => 'world', indexes => ARRAY['idx'])",
+            "SELECT antfly_postgres.hybrid(full_text => 'hello', semantic => 'world', indexes => ARRAY['idx'])",
         )
         .unwrap()
         .unwrap();
@@ -147,10 +148,11 @@ mod tests {
 
     #[pg_test]
     fn test_query_builder_filter_prefix() {
-        let result =
-            Spi::get_one::<String>("SELECT pgaf.search('hello', filter_prefix => 'tenant:acme:')")
-                .unwrap()
-                .unwrap();
+        let result = Spi::get_one::<String>(
+            "SELECT antfly_postgres.search('hello', filter_prefix => 'tenant:acme:')",
+        )
+        .unwrap()
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(v["full_text_search"]["query"], "hello");
         assert_eq!(v["filter_prefix"], "tenant:acme:");

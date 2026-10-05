@@ -36,19 +36,19 @@ fn antfly_sync_trigger<'a>(
     let args = trigger.extra_args().unwrap_or_else(|_| vec![]);
 
     let base_url = args.first().unwrap_or_else(|| {
-        pgrx::error!("pgaf: antfly_sync_trigger requires base_url as first argument");
+        pgrx::error!("antfly_postgres: antfly_sync_trigger requires base_url as first argument");
     });
     let collection = args.get(1).unwrap_or_else(|| {
-        pgrx::error!("pgaf: antfly_sync_trigger requires collection as second argument");
+        pgrx::error!("antfly_postgres: antfly_sync_trigger requires collection as second argument");
     });
     let id_column = args.get(2).map(|s| s.as_str()).unwrap_or("id");
 
     let client = crate::client::AntflyClient::new(base_url).unwrap_or_else(|e| {
-        pgrx::error!("pgaf: failed to create client: {}", e);
+        pgrx::error!("antfly_postgres: failed to create client: {}", e);
     });
 
     let op = trigger.op().unwrap_or_else(|_| {
-        pgrx::error!("pgaf: could not determine trigger operation");
+        pgrx::error!("antfly_postgres: could not determine trigger operation");
     });
 
     // Handle DELETE: use OLD row
@@ -56,7 +56,7 @@ fn antfly_sync_trigger<'a>(
         if let Some(old) = trigger.old() {
             let doc_id = get_id_from_tuple(&old, id_column);
             if let Err(e) = client.delete_document(collection, &doc_id) {
-                pgrx::warning!("pgaf: failed to delete from antfly: {}", e);
+                pgrx::warning!("antfly_postgres: failed to delete from antfly: {}", e);
             }
         }
         return Ok(None);
@@ -68,7 +68,7 @@ fn antfly_sync_trigger<'a>(
         let doc = heap_tuple_to_json(&new);
 
         if let Err(e) = client.sync_document(collection, &doc_id, &doc) {
-            pgrx::warning!("pgaf: failed to sync to antfly: {}", e);
+            pgrx::warning!("antfly_postgres: failed to sync to antfly: {}", e);
         }
 
         return Ok(Some(new));
@@ -91,7 +91,7 @@ fn get_id_from_tuple(tuple: &PgHeapTuple<'_, impl WhoAllocated>, id_column: &str
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| {
                     pgrx::error!(
-                        "pgaf: could not read '{}' column as text or bigint",
+                        "antfly_postgres: could not read '{}' column as text or bigint",
                         id_column
                     );
                 })
