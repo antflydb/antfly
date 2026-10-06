@@ -1,6 +1,7 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
+import os
 import shutil
 import subprocess
 import tempfile
@@ -124,13 +125,16 @@ class PruneTests(unittest.TestCase):
                 "test",
                 "--cache-dir",
                 str(cache),
-                "--global-cache-dir",
-                str(project / "global"),
             ]
 
             def build():
                 result = subprocess.run(
-                    command, cwd=project, capture_output=True, text=True, check=False
+                    command,
+                    cwd=project,
+                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(project / "global")},
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
