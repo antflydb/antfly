@@ -5128,6 +5128,20 @@ pub fn runFromIterator(
     if (hot_standby_lease_watchdog) |*watchdog| watchdog.bindOwnedProcessBootID();
     defer if (hot_standby_lease_watchdog) |*watchdog| watchdog.deinit(alloc);
 
+    // Personal OAuth credentials stay outside replicated metadata. Enable only
+    // loopback standalone; multi-user/distributed serving needs its own boundary.
+    const chatgpt_manager = @import("antfly_local_sources").chatgpt_manager;
+    const chatgpt_root = try std.fs.path.join(alloc, &.{ resolved.auth_store_root_dir, "chatgpt" });
+    defer alloc.free(chatgpt_root);
+    var chatgpt: ?chatgpt_manager.Manager = if ((if (loaded_config) |cfg| cfg.connectors.allowsLocalChatGPT() else true) and (std.mem.eql(u8, public_listener.bind_host, "127.0.0.1") or std.mem.eql(u8, public_listener.bind_host, "::1") or std.mem.eql(u8, public_listener.bind_host, "localhost"))) try chatgpt_manager.Manager.init(alloc, setup_io.io(), chatgpt_root) else null;
+    defer if (chatgpt) |*manager| manager.deinit();
+    if (chatgpt) |*connections| if (user_manager) |*users| {
+        users.personal_grant_revoker = .{ .ptr = connections, .revoke_fn = chatgpt_manager.Manager.revokeDeletedUser };
+    };
+    defer if (user_manager) |*users| {
+        users.personal_grant_revoker = null;
+    };
+
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
@@ -5151,6 +5165,7 @@ pub fn runFromIterator(
             .hot_standby_remote_apply_mutations_enabled = hotStandbyRemoteApplyMutationsEnabled(hot_standby_sync_policy.policy),
             .hot_standby_catalog_create_enabled = hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0,
             .auth_enabled = auth_enabled,
+            .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,

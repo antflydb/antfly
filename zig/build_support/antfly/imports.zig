@@ -227,6 +227,7 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);
         mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_credentials", self.credentials);
         mod.addImport("httpx", self.httpx);
         mod.addImport("antfly-json", self.json);
         mod.addImport("antfly_metadata_openapi", self.metadata_openapi);

@@ -52,6 +52,7 @@ pub fn parseIndexConfigWithOptions(
 ) !db_types.IndexConfig {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
     defer parsed.deinit();
+    try rejectPersonalGenerator(parsed.value);
     const kind = try parseIndexKind(parsed.value);
     const config_json = try extractIndexConfigJsonWithOptions(alloc, index_name, parsed.value, options);
     errdefer alloc.free(config_json);
@@ -103,6 +104,9 @@ pub fn validateManagedEmbeddingRuntimeConfigJsonWithOptions(
     indexes_json: []const u8,
     options: managed_embedder.InitOptions,
 ) !void {
+    var personal_check = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer personal_check.deinit();
+    try rejectPersonalGenerator(personal_check.value);
     var managed = managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
         alloc,
         indexes_json,
@@ -451,4 +455,32 @@ test "table graph validation rejects runtime-invalid configs before catalog admi
             "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}",
         ),
     );
+}
+
+// An index/enrichment is durable unattended work. Personal inference grants
+// must never be serialized into catalog metadata, including nested chains.
+fn rejectPersonalGenerator(value: std.json.Value) !void {
+    return rejectPersonalGeneratorDepth(value, 0);
+}
+fn rejectPersonalGeneratorDepth(value: std.json.Value, depth: usize) !void {
+    if (depth > 64) return error.InvalidCreateTableRequest;
+    switch (value) {
+        .object => |object| {
+            if (object.get("provider")) |provider| {
+                if (provider == .string and std.mem.eql(u8, provider.string, "chatgpt")) return error.ChatGPTInteractiveOnly;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| try rejectPersonalGeneratorDepth(entry.value_ptr.*, depth + 1);
+        },
+        .array => |array| for (array.items) |item| try rejectPersonalGeneratorDepth(item, depth + 1),
+        else => {},
+    }
+}
+
+test "chatgpt personal grant is rejected in durable enrichment chains" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"_enrichments":{"summary":{"chain":[{"generator":{"provider":"chatgpt","model":"m","connection_id":"personal"}}]}}}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.ChatGPTInteractiveOnly, rejectPersonalGenerator(parsed.value));
 }

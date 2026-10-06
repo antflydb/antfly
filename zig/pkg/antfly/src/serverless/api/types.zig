@@ -653,6 +653,7 @@ pub const RuntimeStatusResult = struct {
     health: RuntimeHealth = .healthy,
     deployment_mode: RuntimeDeploymentMode = .serverless,
     index_capabilities: IndexRuntimeCapabilities = .{},
+    connectors: struct { chatgpt: struct { enabled: bool = false, reason: []const u8 = "local_runtime_required" } = .{} } = .{},
     role: RuntimeRole,
     combined_mode: bool = false,
     tick_interval_ms: u64,

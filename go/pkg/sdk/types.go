@@ -816,6 +816,7 @@ const (
 	GeneratorProviderAntfly    = oapi.GeneratorProviderAntfly
 	GeneratorProviderOllama    = oapi.GeneratorProviderOllama
 	GeneratorProviderOpenai    = oapi.GeneratorProviderOpenai
+	GeneratorProviderChatgpt   = oapi.GeneratorProviderChatgpt
 	GeneratorProviderGemini    = oapi.GeneratorProviderGemini
 	GeneratorProviderVertex    = oapi.GeneratorProviderVertex
 	RerankerProviderAntfly     = oapi.RerankerProviderAntfly

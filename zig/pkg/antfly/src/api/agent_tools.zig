@@ -51,6 +51,7 @@ pub const Conversation = struct {
             try self.reserve(call.id.len + call.name.len + call.arguments.len);
         }
         try self.reserve(result.content.len);
+        if (result.responses_output_json) |items| try self.reserve(items.len);
         if (result.google_parts_json) |parts| try self.reserve(parts.len);
         const calls = try self.alloc.alloc(generating.ToolCall, result.tool_calls.len);
         for (calls, result.tool_calls) |*copy, call| copy.* = .{
@@ -62,6 +63,7 @@ pub const Conversation = struct {
             .role = .assistant,
             .content = if (result.content.len > 0) .{ .text = try self.alloc.dupe(u8, result.content) } else null,
             .tool_calls = if (calls.len > 0) calls else null,
+            .responses_output_json = if (result.responses_output_json) |items| try self.alloc.dupe(u8, items) else null,
             .google_parts_json = if (result.google_parts_json) |parts| try self.alloc.dupe(u8, parts) else null,
         });
         return calls;
@@ -189,7 +191,7 @@ test "agent tools enable every real generator adapter and omit empty schemas" {
     defer arena.deinit();
     for (std.enums.values(generating.Provider)) |provider| {
         const chain = [_]generating.ChainLink{.{ .generator = .{ .provider = provider, .model = "m", .url = "" } }};
-        if (provider == .mock) {
+        if (!provider.supportsTools()) {
             try std.testing.expectError(error.UnsupportedAgentToolProvider, withTools(arena.allocator(), &chain, "[]"));
             continue;
         }

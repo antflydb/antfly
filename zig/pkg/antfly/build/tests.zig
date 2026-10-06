@@ -680,6 +680,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = generating_test_mod,
         .filters = &.{
+            "chatgpt",
             "generating backend",
             "generating backend factory executes fallback chain across providers",
             "asset producer runtime",
@@ -1036,6 +1037,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_client_pkg_mod,
         .filters = &.{
             "antfly client pkg compiles",
+            "personal connections",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",
@@ -1691,6 +1693,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
         "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",

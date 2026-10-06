@@ -738,3 +738,6 @@ pub const serverless_lake_host = @import("serverless/lake_host.zig");
 pub const sql_lake_cursor = @import("sql/lake_cursor.zig");
 pub const sql_lake_values = @import("sql/lake_values.zig");
 pub const serverless_query_lake_fixtures = @import("serverless/query/lake_fixtures.zig");
+
+pub const chatgpt_manager = @import("chatgpt/manager.zig");
+pub const chatgpt_responses = @import("chatgpt/responses.zig");

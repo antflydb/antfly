@@ -114,12 +114,15 @@ pub const Permission = struct {
 };
 
 pub const User = struct {
+    /// Persistent identity of this user creation, independent of credentials.
+    instance_id: [16]u8 = @splat(0),
     username: []u8,
     password_hash: []u8,
     metadata_json: []u8 = &.{},
 
     pub fn clone(self: User, alloc: Allocator) !User {
         return .{
+            .instance_id = self.instance_id,
             .username = try alloc.dupe(u8, self.username),
             .password_hash = try alloc.dupe(u8, self.password_hash),
             .metadata_json = if (self.metadata_json.len > 0) try alloc.dupe(u8, self.metadata_json) else &.{},
@@ -416,6 +419,7 @@ pub const MemoryStore = struct {
         _ = alloc;
         for (self.users.items) |*existing| {
             if (!std.mem.eql(u8, existing.username, user.username)) continue;
+            existing.instance_id = user.instance_id;
             self.alloc.free(existing.password_hash);
             existing.password_hash = try self.alloc.dupe(u8, user.password_hash);
             if (existing.metadata_json.len > 0) self.alloc.free(existing.metadata_json);
@@ -493,6 +497,10 @@ pub const UserManager = struct {
     enforcer: casbin.Enforcer,
     users: std.StringHashMapUnmanaged([]u8) = .{},
     user_metadata: std.StringHashMapUnmanaged([]u8) = .{},
+    user_instances: std.StringHashMapUnmanaged([16]u8) = .{},
+    /// Called before deletion while username reuse is fenced by mutation_mutex.
+    /// A bool result keeps errors inside their originating runtime archive.
+    personal_grant_revoker: ?struct { ptr: *anyopaque, revoke_fn: *const fn (*anyopaque, [16]u8) bool } = null,
     api_keys: std.StringHashMapUnmanaged(ApiKeyRecord) = .{},
     mutation_mutex: std.Io.Mutex = .init,
     // Local role-graph revision for statement admission. It is deliberately
@@ -558,7 +566,14 @@ pub const UserManager = struct {
             alloc.free(loaded);
         }
 
-        for (loaded) |user| {
+        for (loaded) |*user| {
+            // Upgrade old auth stores before admitting requests. Persisting the
+            // ID makes restart and portable seed restoration preserve identity.
+            if (std.mem.allEqual(u8, &user.instance_id, 0)) {
+                user.instance_id = try newUserInstance(io);
+                try store.saveUser(alloc, user);
+            }
+            try manager.putUserInstance(user.username, user.instance_id);
             try manager.users.put(alloc, try alloc.dupe(u8, user.username), try alloc.dupe(u8, user.password_hash));
             try manager.user_metadata.put(
                 alloc,
@@ -593,6 +608,9 @@ pub const UserManager = struct {
             self.alloc.free(entry.value_ptr.*);
         }
         self.user_metadata.deinit(self.alloc);
+        var instances_it = self.user_instances.keyIterator();
+        while (instances_it.next()) |key| self.alloc.free(key.*);
+        self.user_instances.deinit(self.alloc);
         var api_key_it = self.api_keys.iterator();
         while (api_key_it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -644,6 +662,7 @@ pub const UserManager = struct {
             const owned_username = try self.alloc.dupe(u8, username);
             errdefer self.alloc.free(owned_username);
             break :blk User{
+                .instance_id = try newUserInstance(io),
                 .username = owned_username,
                 .password_hash = password_hash,
                 .metadata_json = normalized_metadata,
@@ -653,6 +672,7 @@ pub const UserManager = struct {
 
         try self.store.saveUser(self.alloc, &stored);
         errdefer {
+            if (self.user_instances.fetchRemove(username)) |removed| self.alloc.free(removed.key);
             if (self.users.fetchRemove(username)) |removed| {
                 self.alloc.free(removed.key);
                 self.alloc.free(removed.value);
@@ -664,6 +684,7 @@ pub const UserManager = struct {
             _ = self.store.deleteUser(username) catch {};
         }
         try self.reachLifecycle(.{ .phase = .user_persisted, .username = username });
+        try self.putUserInstance(username, stored.instance_id);
         try self.users.put(self.alloc, try self.alloc.dupe(u8, stored.username), try self.alloc.dupe(u8, stored.password_hash));
         try self.user_metadata.put(self.alloc, try self.alloc.dupe(u8, stored.username), try self.alloc.dupe(u8, stored.metadata_json));
         try self.reachLifecycle(.{ .phase = .user_published, .username = username });
@@ -691,7 +712,41 @@ pub const UserManager = struct {
         return result;
     }
 
-    pub fn getUser(self: *const UserManager, username: []const u8) !User {
+    fn putUserInstance(self: *UserManager, username: []const u8, instance_id: [16]u8) !void {
+        const key = try self.alloc.dupe(u8, username);
+        errdefer self.alloc.free(key);
+        try self.user_instances.put(self.alloc, key, instance_id);
+    }
+
+    /// Scoped authority snapshot. Readers that need credentials and policies
+    /// together acquire once, copy while held, then release before verification.
+    pub const SnapshotLease = struct {
+        manager: *UserManager,
+        pub fn getUser(self: *const SnapshotLease, username: []const u8) !User {
+            return self.manager.cloneUserUnlocked(username);
+        }
+        pub fn release(self: *SnapshotLease) void {
+            var receiver = self.manager.io_borrow.receive() catch @panic("invalid UserManager executor");
+            self.manager.mutation_mutex.unlock(receiver.io());
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireSnapshotLease(self: *UserManager) !SnapshotLease {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        try self.mutation_mutex.lock(receiver.io());
+        return .{ .manager = self };
+    }
+
+    pub fn getUser(self: *UserManager, username: []const u8) !User {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        self.mutation_mutex.lockUncancelable(receiver.io());
+        var lease: SnapshotLease = .{ .manager = self };
+        defer lease.release();
+        return lease.getUser(username);
+    }
+
+    fn cloneUserUnlocked(self: *UserManager, username: []const u8) !User {
         const password_hash = self.users.get(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
         const owned_username = try self.alloc.dupe(u8, username);
@@ -699,21 +754,20 @@ pub const UserManager = struct {
         const owned_hash = try self.alloc.dupe(u8, password_hash);
         errdefer self.alloc.free(owned_hash);
         return .{
+            .instance_id = self.user_instances.get(username) orelse return error.UserNotFound,
             .username = owned_username,
             .password_hash = owned_hash,
             .metadata_json = try self.alloc.dupe(u8, metadata_json),
         };
     }
 
-    pub fn authenticateUser(self: *const UserManager, username: []const u8, password: []const u8) !User {
-        const password_hash = self.users.get(username) orelse return error.UserNotFound;
-        const metadata_json = self.user_metadata.get(username) orelse "{}";
-        try verifyPassword(password_hash, password);
-        return .{
-            .username = try self.alloc.dupe(u8, username),
-            .password_hash = try self.alloc.dupe(u8, password_hash),
-            .metadata_json = try self.alloc.dupe(u8, metadata_json),
-        };
+    pub fn authenticateUser(self: *UserManager, username: []const u8, password: []const u8) !User {
+        // Clone credentials and identity together under the mutation lock.
+        // Password verification cannot combine an old hash with a recreated ID.
+        var user = try self.getUser(username);
+        errdefer user.deinit(self.alloc);
+        try verifyPassword(user.password_hash, password);
+        return user;
     }
 
     pub fn updatePassword(self: *UserManager, username: []const u8, new_password: []const u8) !void {
@@ -726,6 +780,7 @@ pub const UserManager = struct {
         const new_hash = try hashPassword(self.alloc, io, new_password);
         errdefer self.alloc.free(new_hash);
         var stored = User{
+            .instance_id = self.user_instances.get(username) orelse return error.UserNotFound,
             .username = @constCast(username),
             .password_hash = new_hash,
             .metadata_json = @constCast(metadata_json),
@@ -742,7 +797,12 @@ pub const UserManager = struct {
         const io = receiver.io();
         self.mutation_mutex.lockUncancelable(io);
         defer self.mutation_mutex.unlock(io);
+        const instance_id = self.user_instances.get(username) orelse return error.UserNotFound;
+        if (self.personal_grant_revoker) |revoker| {
+            if (!revoker.revoke_fn(revoker.ptr, instance_id)) return error.PersonalGrantRevocationFailed;
+        }
         const removed = self.users.fetchRemove(username) orelse return error.UserNotFound;
+        if (self.user_instances.fetchRemove(username)) |instance| self.alloc.free(instance.key);
         defer {
             self.alloc.free(removed.key);
             self.alloc.free(removed.value);
@@ -1904,6 +1964,8 @@ test "usermgr create authenticate and persist users through store" {
 
     var authed = try manager.authenticateUser("alice", "secret");
     defer authed.deinit(alloc);
+    try std.testing.expectEqual(created.instance_id, authed.instance_id);
+    try std.testing.expect(!std.mem.allEqual(u8, &created.instance_id, 0));
     try std.testing.expectEqualStrings("alice", authed.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", authed.metadata_json);
     try std.testing.expectError(error.InvalidPassword, manager.authenticateUser("alice", "wrong"));
@@ -1916,6 +1978,7 @@ test "usermgr create authenticate and persist users through store" {
     defer reloaded.deinit();
     var loaded = try reloaded.getUser("alice");
     defer loaded.deinit(alloc);
+    try std.testing.expectEqual(created.instance_id, loaded.instance_id);
     try std.testing.expectEqualStrings("alice", loaded.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", loaded.metadata_json);
 }
@@ -2288,4 +2351,67 @@ test "system catalog key intersection narrows namespace grants and rejects dotte
     try std.testing.expectEqualStrings(exact, permissionIntersection(left, right).?.resource);
     try std.testing.expectEqual(PermissionType.read, permissionIntersection(right, left).?.permission_type);
     try std.testing.expect(permissionIntersection(left, .{ .resource_type = .table, .resource = @constCast("tenant.public.events"), .type = .read }) == null);
+}
+
+fn newUserInstance(io: std.Io) ![16]u8 {
+    var id: [16]u8 = undefined;
+    while (true) {
+        try io.randomSecure(&id);
+        if (!std.mem.allEqual(u8, &id, 0)) return id;
+    }
+}
+
+test "usermgr instance identity survives password changes and fences failed deletion" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var users = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer users.deinit();
+    var user = try users.createUser("alice", "first", &.{});
+    defer user.deinit(a);
+    try users.updatePassword("alice", "second");
+    var changed = try users.authenticateUser("alice", "second");
+    defer changed.deinit(a);
+    try std.testing.expectEqual(user.instance_id, changed.instance_id);
+    const Reject = struct {
+        fn revoke(_: *anyopaque, _: [16]u8) bool {
+            return false;
+        }
+    };
+    var marker: u8 = 0;
+    users.personal_grant_revoker = .{ .ptr = &marker, .revoke_fn = Reject.revoke };
+    try std.testing.expectError(error.PersonalGrantRevocationFailed, users.deleteUser("alice"));
+    try std.testing.expectError(error.UserExists, users.createUser("alice", "replacement", &.{}));
+    var still_authenticated = try users.authenticateUser("alice", "second");
+    defer still_authenticated.deinit(a);
+    try std.testing.expectEqual(user.instance_id, still_authenticated.instance_id);
+    users.personal_grant_revoker = null;
+    try users.deleteUser("alice");
+    var replacement = try users.createUser("alice", "replacement", &.{});
+    defer replacement.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, &user.instance_id, &replacement.instance_id));
+}
+
+test "usermgr upgrades legacy user identities durably before serving" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    const hash = try hashPassword(a, std.testing.io, "secret");
+    defer a.free(hash);
+    const legacy: User = .{ .username = @constCast("alice"), .password_hash = hash };
+    try store.iface().saveUser(a, &legacy);
+    var users = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer users.deinit();
+    var migrated = try users.getUser("alice");
+    defer migrated.deinit(a);
+    try std.testing.expect(!std.mem.allEqual(u8, &migrated.instance_id, 0));
+    var reopened = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer reopened.deinit();
+    var persisted = try reopened.authenticateUser("alice", "secret");
+    defer persisted.deinit(a);
+    try std.testing.expectEqual(migrated.instance_id, persisted.instance_id);
 }

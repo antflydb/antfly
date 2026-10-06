@@ -75,16 +75,22 @@ pub const ChatMessage = struct {
     tool_call_id: ?[]const u8 = null,
     /// Opaque Google response parts, replayed only by Google adapters.
     google_parts_json: ?[]const u8 = null,
+    /// Opaque Responses output items, replayed only by Responses adapters.
+    responses_output_json: ?[]const u8 = null,
 };
 
 pub const GenerateResult = struct {
     content: []const u8,
     tool_calls: []ToolCall = &.{},
     google_parts_json: ?[]const u8 = null,
+    /// Opaque Responses output items, replayed only by Responses adapters.
+    responses_output_json: ?[]const u8 = null,
+    usage: ?struct { input_tokens: u64, output_tokens: u64 } = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {
         self.allocator.free(self.content);
+        if (self.responses_output_json) |items| self.allocator.free(items);
         if (self.google_parts_json) |parts| self.allocator.free(parts);
         for (self.tool_calls) |*tool_call| tool_call.deinit(self.allocator);
         if (self.tool_calls.len > 0) self.allocator.free(self.tool_calls);
@@ -202,6 +208,7 @@ pub const Provider = enum {
     gemini,
     vertex,
     openai,
+    chatgpt,
     openrouter,
     ollama,
     antfly,
@@ -211,7 +218,7 @@ pub const Provider = enum {
     /// Adapter capability; the selected model must also support function calling.
     pub fn supportsTools(self: Provider) bool {
         return switch (self) {
-            .antfly, .openai, .openrouter, .ollama, .gemini, .vertex => true,
+            .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex => true,
             .mock, .apple => false,
         };
     }
@@ -247,7 +254,7 @@ pub fn defaultUrl(provider: Provider) []const u8 {
         .gemini => gemini_default_url,
         .vertex => vertex_default_url,
         // Antfly's empty URL selects embedded inference when available.
-        .antfly, .mock, .apple => "",
+        .antfly, .mock, .apple, .chatgpt => "",
     };
 }
 
@@ -268,6 +275,7 @@ pub const GeneratorConfig = struct {
     provider: Provider,
     model: []const u8,
     url: []const u8,
+    connection_id: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     capability_token: ?[]const u8 = null,
     capability_revision: ?[]const u8 = null,
@@ -291,6 +299,7 @@ pub const GeneratorConfig = struct {
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
             .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
+            .connection_id = if (self.connection_id) |id| try alloc.dupe(u8, id) else null,
             .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
             .capability_token = if (self.capability_token) |token| try alloc.dupe(u8, token) else null,
             .capability_revision = if (self.capability_revision) |revision| try alloc.dupe(u8, revision) else null,
@@ -313,6 +322,7 @@ pub const GeneratorConfig = struct {
     pub fn deinit(self: *GeneratorConfig, alloc: std.mem.Allocator) void {
         if (self.model.len > 0) alloc.free(self.model);
         if (self.url.len > 0) alloc.free(self.url);
+        if (self.connection_id) |id| alloc.free(id);
         if (self.api_key) |api_key| alloc.free(api_key);
         if (self.capability_token) |token| alloc.free(@constCast(token));
         if (self.capability_revision) |revision| alloc.free(@constCast(revision));
@@ -351,8 +361,18 @@ pub const GeneratorConfig = struct {
 
     pub fn validate(self: GeneratorConfig) !void {
         try self.provider.validate();
+        if (self.provider == .chatgpt) {
+            if (self.rate_limit != null) return error.ChatGPTUnsupportedRateLimit;
+            if ((self.connection_id orelse return error.InvalidGeneratorConfig).len == 0 or
+                self.url.len != 0 or self.api_key != null or self.capability_token != null or
+                self.project_id != null or self.credentials_path != null or self.location != null or
+                self.max_tokens != default_max_tokens or self.max_completion_tokens != null or
+                self.temperature != null or self.top_p != null or self.top_k != null or
+                self.frequency_penalty != null or self.presence_penalty != null)
+                return error.InvalidGeneratorConfig;
+        } else if (self.connection_id != null) return error.InvalidGeneratorConfig;
         if (self.model.len == 0 and self.provider != .mock and self.provider != .apple) return error.InvalidGeneratorConfig;
-        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini) return error.InvalidGeneratorConfig;
+        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt) return error.InvalidGeneratorConfig;
         if (self.provider == .apple) {
             if (self.model.len > 0 or self.url.len > 0 or self.api_key != null or
                 self.capability_token != null or self.capability_revision != null or self.project_id != null or
@@ -362,7 +382,7 @@ pub const GeneratorConfig = struct {
         }
         if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
         if (self.max_completion_tokens) |limit| if (limit <= 0) return error.InvalidGeneratorConfig;
-        if (self.provider != .openai and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
+        if (self.provider != .openai and self.provider != .chatgpt and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
         if (self.temperature) |value| if (value < 0 or value > 2) return error.InvalidGeneratorConfig;
         if (self.top_p) |value| if (value < 0 or value > 1) return error.InvalidGeneratorConfig;
         if (self.top_k) |value| if (value <= 0) return error.InvalidGeneratorConfig;
@@ -461,6 +481,7 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
     const provider = try providerFromOpenApi(generated.provider);
+    if (provider == .chatgpt and (generated.max_tokens != null or generated.max_completion_tokens != null or generated.api_url != null)) return error.InvalidGeneratorConfig;
     if (provider == .apple and generated.model != null) return error.UnsupportedAppleGenerationOptions;
     if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
     var cfg = GeneratorConfig{
@@ -473,6 +494,7 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
             try alloc.dupe(u8, api_url)
         else
             try alloc.dupe(u8, defaultUrl(provider)),
+        .connection_id = if (generated.connection_id) |id| try alloc.dupe(u8, id) else null,
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
         .location = if (generated.location) |location| try alloc.dupe(u8, location) else null,
@@ -498,17 +520,18 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
             .openai, .openrouter, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
-            .antfly, .apple => null,
+            .antfly, .chatgpt, .apple => null,
         },
         .api_url = switch (cfg.provider) {
             .antfly => if (cfg.url.len > 0) cfg.url else null,
             else => null,
         },
+        .connection_id = cfg.connection_id,
         .api_key = cfg.api_key,
         .project_id = cfg.project_id,
         .location = cfg.location,
         .credentials_path = cfg.credentials_path,
-        .max_tokens = if (cfg.max_completion_tokens == null) cfg.max_tokens else null,
+        .max_tokens = if (cfg.provider != .chatgpt and cfg.max_completion_tokens == null) cfg.max_tokens else null,
         .max_completion_tokens = cfg.max_completion_tokens,
         .reasoning_effort = cfg.reasoning_effort,
         .temperature = cfg.temperature,
@@ -574,7 +597,10 @@ pub fn resolveGeneratorOrChain(
     generator: ?GeneratorConfig,
     chain: []const ChainLink,
 ) ![]ChainLink {
-    if (chain.len > 0) return try cloneChainAlloc(alloc, chain);
+    if (chain.len > 0) {
+        for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
+        return try cloneChainAlloc(alloc, chain);
+    }
     if (generator) |cfg| {
         var out = try alloc.alloc(ChainLink, 1);
         errdefer alloc.free(out);
@@ -657,6 +683,7 @@ fn executeChainInternal(
     messages: []const ChatMessage,
 ) !GenerateResult {
     if (chain.len == 0) return error.EmptyGeneratorChain;
+    for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
 
     var last_err: anyerror = error.EmptyGeneratorChain;
     for (chain, 0..) |link, i| {
@@ -770,6 +797,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     if (std.mem.eql(u8, name, "gemini")) return .gemini;
     if (std.mem.eql(u8, name, "vertex")) return .vertex;
     if (std.mem.eql(u8, name, "openai")) return .openai;
+    if (std.mem.eql(u8, name, "chatgpt")) return .chatgpt;
     if (std.mem.eql(u8, name, "openrouter")) return .openrouter;
     if (std.mem.eql(u8, name, "ollama")) return .ollama;
     if (std.mem.eql(u8, name, "antfly")) return .antfly;
@@ -1121,6 +1149,21 @@ test "generator config rejects ambiguous and invalid OpenAI completion options" 
     try std.testing.expectError(error.UnexpectedToken, parseConfigFromSlice(alloc,
         \\{"provider":"openai","model":"m","url":"http://localhost","reasoning_effort":"bogus"}
     ));
+}
+
+test "chatgpt generation rejects credentials unsupported settings and billing fallback" {
+    const a = std.testing.allocator;
+    var config = try parseConfigFromSlice(a, "{\"provider\":\"chatgpt\",\"model\":\"model\",\"connection_id\":\"personal\"}");
+    defer config.deinit(a);
+    const public = openApiFromConfig(config);
+    try std.testing.expect(public.max_tokens == null and public.api_key == null and public.url == null);
+    try std.testing.expectEqualStrings("personal", public.connection_id.?);
+    for ([_][]const u8{ "\"api_key\":\"secret\"", "\"url\":\"https://example.com\"", "\"max_tokens\":256", "\"temperature\":0.7" }) |field| {
+        const raw = try std.fmt.allocPrint(a, "{{\"provider\":\"chatgpt\",\"model\":\"model\",\"connection_id\":\"personal\",{s}}}", .{field});
+        defer a.free(raw);
+        try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(a, raw));
+    }
+    try std.testing.expectError(error.ChatGPTBillingFallbackForbidden, resolveGeneratorOrChain(a, null, &.{ .{ .generator = config }, .{ .generator = GeneratorConfig.fromOpenAI(.{ .model = "paid" }) } }));
 }
 
 test "generator provider URL defaults survive parsing and round trip" {

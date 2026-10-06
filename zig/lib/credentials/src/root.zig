@@ -146,3 +146,5 @@ test "credential source identities preserve type locator and presence boundaries
 
 /// AWS discovery requires native synchronous HTTP and filesystem access.
 pub const aws = if (@import("builtin").os.tag == .freestanding) struct {} else @import("aws.zig");
+
+pub const cloud = @import("cloud.zig");

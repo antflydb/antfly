@@ -28,6 +28,13 @@ pub const PublicOperationPolicy = struct {
 /// that deliberately bypass foreground admission. A newly generated route
 /// therefore fails its contract test until its resource class is reviewed.
 pub const public_operation_policies = [_]PublicOperationPolicy{
+    // Personal account management uses the manager's bounded OAuth/catalog work;
+    // generation is admitted separately through the interactive query routes.
+    .{ .operation_id = "listChatGPTAccounts", .class = .none },
+    .{ .operation_id = "getChatGPTAttempt", .class = .none },
+    .{ .operation_id = "authorizeChatGPT", .class = .none },
+    .{ .operation_id = "disconnectChatGPT", .class = .none },
+    .{ .operation_id = "listChatGPTModels", .class = .none },
     .{ .operation_id = "administerSqlSettings", .class = .none },
     .{ .operation_id = "listDatabases", .class = .none },
     .{ .operation_id = "getDatabase", .class = .none },

@@ -9,6 +9,7 @@ pub const AppleGeneratorConfig = types.AppleGeneratorConfig;
 pub const BedrockGeneratorConfig = types.BedrockGeneratorConfig;
 pub const ChainCondition = types.ChainCondition;
 pub const ChainLink = types.ChainLink;
+pub const ChatGPTGeneratorConfig = types.ChatGPTGeneratorConfig;
 pub const ChatMessage = types.ChatMessage;
 pub const ChatMessageContent = types.ChatMessageContent;
 pub const ChatMessageRole = types.ChatMessageRole;
