@@ -3764,7 +3764,7 @@ pub const IndexManager = struct {
     }
 
     fn vectorBlockRootAlloc(self: *const IndexManager) ![]u8 {
-        return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
+        return try std.mem.join(self.alloc, "/", &.{ self.base_path, "vector-blocks" });
     }
 
     fn denseVectorArtifactNameCount(entry: *const DenseIndex) usize {
@@ -4628,7 +4628,7 @@ pub const IndexManager = struct {
         }
         const root = try self.vectorBlockRootAlloc();
         defer self.alloc.free(root);
-        const current_path = try std.fs.path.join(self.alloc, &.{ root, "CURRENT" });
+        const current_path = try std.mem.join(self.alloc, "/", &.{ root, "CURRENT" });
         defer self.alloc.free(current_path);
         const current_exists = blk: {
             _ = self.vector_block_storage.?.fileSize(current_path) catch |err| switch (err) {

@@ -157,7 +157,7 @@ fn interactive(alloc: std.mem.Allocator, io: std.Io, client: *client_mod.AntflyC
 
 test "SQL CLI parses scoped typed arguments and rejects ambiguous flags" {
     var argv = [_][*:0]const u8{ "--statement", "SELECT id FROM things WHERE id=$1", "--parameters", "[9007199254740993]", "--database", "tenant", "--namespace", "app", "--limit", "12" };
-    var args = std.process.Args.Iterator.init(.{ .vector = &argv });
+    var args = @import("antfly_platform").process.argsIterator(&argv);
     const options = try parse(&args);
     try std.testing.expectEqualStrings("tenant", options.database.?);
     try std.testing.expectEqual(@as(?i64, 12), options.limit);
@@ -165,7 +165,7 @@ test "SQL CLI parses scoped typed arguments and rejects ambiguous flags" {
     defer parameters.deinit();
     try std.testing.expectEqualStrings("9007199254740993", parameters.value[0].number_string);
     var interactive_argv = [_][*:0]const u8{"--interactive"};
-    var interactive_args = std.process.Args.Iterator.init(.{ .vector = &interactive_argv });
+    var interactive_args = @import("antfly_platform").process.argsIterator(&interactive_argv);
     try std.testing.expect((try parse(&interactive_args)).interactive);
 
     const Case = struct { args: []const [*:0]const u8, err: anyerror };
@@ -177,7 +177,7 @@ test "SQL CLI parses scoped typed arguments and rejects ambiguous flags" {
         .{ .args = &.{ "--statement", "SELECT", "--retry" }, .err = error.UnknownSqlOption },
         .{ .args = &.{ "--interactive", "--statement", "SELECT 1" }, .err = error.AmbiguousSqlMode },
     }) |case| {
-        var iterator = std.process.Args.Iterator.init(.{ .vector = case.args });
+        var iterator = @import("antfly_platform").process.argsIterator(case.args);
         try std.testing.expectError(case.err, parse(&iterator));
     }
 }
@@ -210,7 +210,7 @@ test "SQL CLI executes one generated-contract request without SQL substitution" 
     var client = try client_mod.AntflyClient.init(alloc, &http, server.baseUrl());
     defer client.deinit();
     var argv = [_][*:0]const u8{ "--statement", "SELECT id FROM things WHERE id=$1", "--parameters", "[9007199254740993]", "--database", "tenant", "--namespace", "app" };
-    var args = std.process.Args.Iterator.init(.{ .vector = &argv });
+    var args = @import("antfly_platform").process.argsIterator(&argv);
     try run(alloc, io, &client, &args);
     try serving.await(io);
     try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);

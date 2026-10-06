@@ -60,13 +60,13 @@ var retained_block_identity: @import("antfly_platform").atomic.Value(u64) = .ini
 pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
     defer alloc.free(name);
-    return try std.fs.path.join(alloc, &.{ root_dir, name });
+    return try joinStoragePath(alloc, &.{ root_dir, name });
 }
 
 pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "wal-{d}.afvw", .{generation});
     defer alloc.free(name);
-    return try std.fs.path.join(alloc, &.{ root_dir, name });
+    return try joinStoragePath(alloc, &.{ root_dir, name });
 }
 
 pub const RetainedBlock = struct {
@@ -1370,7 +1370,7 @@ pub const Store = struct {
         for (names) |name| {
             if (!isManagedArtifactName(name) or self.artifactNameIsLive(name)) continue;
             stats.observed_debt += 1;
-            const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+            const path = try joinStoragePath(self.alloc, &.{ self.root_dir, name });
             defer self.alloc.free(path);
             self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -1510,7 +1510,7 @@ pub const Store = struct {
         for (0..options.shard_count) |shard| {
             const name = try std.fmt.allocPrint(self.alloc, "spool-{d}.tmp", .{shard});
             defer self.alloc.free(name);
-            spool_paths[shard] = try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+            spool_paths[shard] = try joinStoragePath(self.alloc, &.{ self.root_dir, name });
             path_count += 1;
         }
 
@@ -1731,7 +1731,7 @@ pub const Store = struct {
     }
 
     fn currentPathAlloc(self: *const Store) ![]u8 {
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, current_name });
+        return try joinStoragePath(self.alloc, &.{ self.root_dir, current_name });
     }
 
     fn walPathAlloc(self: *const Store, generation: u64) ![]u8 {
@@ -2619,7 +2619,7 @@ pub const Opened = struct {
         for (0..destination_count) |shard| {
             const name = try std.fmt.allocPrint(self.store.alloc, "compact-{d}-{d}.tmp", .{ generation, shard });
             defer self.store.alloc.free(name);
-            spool_paths[shard] = try std.fs.path.join(self.store.alloc, &.{ self.store.root_dir, name });
+            spool_paths[shard] = try joinStoragePath(self.store.alloc, &.{ self.store.root_dir, name });
             path_count += 1;
         }
 
@@ -6733,4 +6733,13 @@ test "storage.vector_block_store adaptive read cost and available work gate help
     try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(1, 100000));
     try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(2, 8000));
     try std.testing.expectEqual(@as(usize, 8), adaptiveReadWorkers(30, 50000));
+}
+
+/// Index storage paths are virtual inside Lite files and always use '/'.
+/// std.fs.path.join would use '\\' on Windows; '/' also works for real
+/// Windows filesystem paths. Other targets keep std.fs.path.join, which also
+/// skips empty components and collapses a separator shared by adjacent parts.
+fn joinStoragePath(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    if (comptime builtin.os.tag == .windows) return std.mem.join(alloc, "/", parts);
+    return std.fs.path.join(alloc, parts);
 }

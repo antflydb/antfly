@@ -137,7 +137,7 @@ fn metadataLooksLikeGoRuntime(alloc: std.mem.Allocator, io: std.Io, metadata_pat
 }
 
 fn writeMarkerAtomically(alloc: std.mem.Allocator, io: std.Io, marker_path: []const u8) !void {
-    const pid = std.posix.system.getpid();
+    const pid: i64 = if (@import("builtin").os.tag == .windows) std.os.windows.GetCurrentProcessId() else std.posix.system.getpid();
     const counter = marker_tmp_counter.fetchAdd(1, .monotonic);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.{d}.{d}.tmp", .{ marker_path, pid, counter });
     defer alloc.free(tmp_path);

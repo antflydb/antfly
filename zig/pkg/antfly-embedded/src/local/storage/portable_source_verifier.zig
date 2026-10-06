@@ -258,7 +258,7 @@ fn initialize(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fil
     try index_writer.end();
     try index.setLength(io, @as(u64, state.blobs) * blob_record_size + @as(u64, state.objects) * object_record_size);
     try index.sync(io);
-    state.index_inode = (try index.stat(io)).inode;
+    state.index_inode = @bitCast((try index.stat(io)).inode);
     try readExact(io, file, &envelope, state.footer_offset);
     if (envelope[0] != @backingInt(codec.BlockType.footer_index) or envelope[1] != 0 or std.mem.readInt(u32, envelope[2..6], .little) != state.footer_size) return error.InvalidBundleFooter;
     var count: [4]u8 = undefined;
@@ -514,7 +514,7 @@ pub fn step(alloc: Allocator, io: std.Io, file: std.Io.File, root: []const u8, s
     const index_path = try std.fmt.allocPrint(alloc, "{s}/source.verify.index", .{root});
     defer alloc.free(index_path);
     const stat = try file.stat(io);
-    var state = (try load(alloc, io, cursor_path)) orelse State{ .scope = scope, .expected = expected, .inode = stat.inode, .size = stat.size, .mtime = stat.mtime.toNanoseconds(), .content = (try snapshot.Builder.init(expected.cut)).certificate };
+    var state = (try load(alloc, io, cursor_path)) orelse State{ .scope = scope, .expected = expected, .inode = @bitCast(stat.inode), .size = stat.size, .mtime = stat.mtime.toNanoseconds(), .content = (try snapshot.Builder.init(expected.cut)).certificate };
     if (state.version != 2 or !std.mem.eql(u8, &state.scope, &scope) or !state.expected.eql(expected) or state.inode != stat.inode or state.size != stat.size or state.mtime != stat.mtime.toNanoseconds()) return error.SourceFileChanged;
     if (state.ordinal > state.objects or state.footer_next > state.blobs or state.blob_offset > state.blob_size or state.chunk_remaining > bundle.native_chunk_target_bytes) return error.SourceSnapshotCorrupt;
     if (state.phase == .done) {

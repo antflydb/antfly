@@ -6000,7 +6000,7 @@ pub const NativeFile = struct {
         const tmp_path = try std.fs.path.join(self.allocator, &.{ std.fs.path.dirname(self.path) orelse ".", basename });
         errdefer self.allocator.free(tmp_path);
         errdefer deleteFilePath(io, tmp_path) catch {};
-        var compact_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        var compact_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         var compact_file_open = true;
         defer if (compact_file_open) compact_file.close(io);
         try compact_file.setLength(io, page_size);

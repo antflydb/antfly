@@ -409,7 +409,7 @@ test "table create sends the exact quickstart inline index through the HTTP clie
                 \\{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","embedder":{"provider":"antfly","model":"antflydb/clipclap"},"chunker":{"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}}
                 ,
             };
-            var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var args = @import("antfly_platform").process.argsIterator(argv[0..]);
             createTable(std.testing.allocator, test_io, c, &args) catch return;
             success.store(true, .release);
         }

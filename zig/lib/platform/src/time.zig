@@ -14,12 +14,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = @import("windows.zig");
 
 var freestanding_counter: u64 = 0;
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 
 pub fn sleepNs(ns: u64) void {
     if (comptime is_hostless) return;
+    if (comptime builtin.os.tag == .windows) return windows.sleepNs(ns);
 
     var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -67,6 +69,7 @@ pub fn monotonicNs() u64 {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
+    if (comptime builtin.os.tag == .windows) return windows.monotonicNs();
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
@@ -96,6 +99,7 @@ pub fn realtimeNs() u64 {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
+    if (comptime builtin.os.tag == .windows) return windows.realtimeNs();
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
@@ -127,7 +131,7 @@ test "thread CPU clock is monotonic where supported" {
 }
 
 pub fn residentBytes() usize {
-    if (comptime is_hostless) return 0;
+    if (comptime is_hostless or builtin.os.tag == .windows) return 0;
 
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     if (usage.maxrss <= 0) return 0;

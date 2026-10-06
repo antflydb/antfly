@@ -55,6 +55,8 @@ const RuntimeProcess = struct {
     environ_map: std.process.Environ.Map,
     argument_storage: [][:0]u8,
     argument_ptrs: [][*:0]const u8,
+    /// Windows `std.process.Args` is a WTF-16 command line rather than argv.
+    windows_command_line: if (builtin.os.tag == .windows) [:0]u16 else void,
     preopens: std.process.Preopens,
 
     fn init(context: *const bridge.Context) !RuntimeProcess {
@@ -87,10 +89,17 @@ const RuntimeProcess = struct {
         errdefer arena.deinit();
         const preopens = try std.process.Preopens.init(arena.allocator());
         const process_environ: std.process.Environ = switch (builtin.os.tag) {
-            .windows, .wasi => @compileError("partitioned Antfly runtime process ABI currently requires a POSIX host"),
+            .wasi => @compileError("partitioned Antfly runtime process ABI does not support WASI"),
+            // Runtime units share the host process, so the PEB environment is
+            // the same one the bridge context was built from.
+            .windows => .{ .block = .global },
             else => .{ .block = try environ_map.createPosixBlock(alloc, .{}) },
         };
         errdefer process_environ.block.deinit(alloc);
+        const windows_command_line = if (builtin.os.tag == .windows)
+            try platform.process.windowsCommandLine(alloc, argument_storage[0], argument_ptrs[1..])
+        else {};
+        errdefer if (builtin.os.tag == .windows) alloc.free(windows_command_line);
         const io_impl = std.Io.Threaded.init(alloc, .{ .environ = process_environ });
 
         return .{
@@ -101,6 +110,7 @@ const RuntimeProcess = struct {
             .environ_map = environ_map,
             .argument_storage = argument_storage,
             .argument_ptrs = argument_ptrs,
+            .windows_command_line = windows_command_line,
             .preopens = preopens,
         };
     }
@@ -113,12 +123,13 @@ const RuntimeProcess = struct {
         for (self.argument_storage) |argument| self.alloc.free(argument);
         self.alloc.free(self.argument_storage);
         self.alloc.free(self.argument_ptrs);
+        if (builtin.os.tag == .windows) self.alloc.free(self.windows_command_line);
         self.* = undefined;
     }
 
     fn processArgs(self: *const RuntimeProcess) std.process.Args {
         switch (builtin.os.tag) {
-            .windows => @compileError("partitioned Antfly runtime process ABI does not yet support Windows"),
+            .windows => return .{ .vector = self.windows_command_line },
             .wasi => @compileError("partitioned Antfly runtime process ABI does not support WASI"),
             else => return .{ .vector = self.argument_ptrs },
         }

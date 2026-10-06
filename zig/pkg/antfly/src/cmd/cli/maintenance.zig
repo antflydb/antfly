@@ -457,7 +457,7 @@ test "maintenance public routes send scoped API requests through the client" {
             }
         }
         fn client(test_io: std.Io, c: *client_mod.AntflyClient, case: Case, success: *bool) std.Io.Cancelable!void {
-            var args = std.process.Args.Iterator.init(.{ .vector = case.argv });
+            var args = @import("antfly_platform").process.argsIterator(case.argv);
             switch (case.resource) {
                 .index => @import("index.zig").run(std.testing.allocator, test_io, c, &args) catch return,
                 .artifact => @import("artifact.zig").run(std.testing.allocator, test_io, c, &args) catch return,

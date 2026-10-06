@@ -2012,7 +2012,7 @@ const LoopbackSupervisorChildRunner = struct {
             arg_z.* = (try alloc.dupeSentinel(u8, arg, 0)).ptr;
             initialized += 1;
         }
-        var args = std.process.Args.Iterator.init(.{ .vector = argv_z });
+        var args = @import("antfly_platform").process.argsIterator(argv_z);
         var cli = try parseCli(alloc, &args);
         defer cli.deinit(alloc);
         const db_path = cli.db_path orelse return error.InvalidArguments;
@@ -2119,12 +2119,12 @@ fn startInProcessServiceBuildForTest(
 }
 
 fn expectParseCliInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
-    var args = std.process.Args.Iterator.init(.{ .vector = argv });
+    var args = @import("antfly_platform").process.argsIterator(argv);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &args));
 }
 
 fn expectParseSupervisorInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
-    var args = std.process.Args.Iterator.init(.{ .vector = argv });
+    var args = @import("antfly_platform").process.argsIterator(argv);
     try std.testing.expectError(error.InvalidArguments, parseSupervisorCli(alloc, &args));
 }
 
@@ -2156,7 +2156,7 @@ test "graph metric maintenance command parses worker pool config" {
         "5",            "--max-pages",
         "2",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     var parsed = try parseCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -2188,7 +2188,7 @@ test "graph metric maintenance command parses service target config" {
         "--worker-ids", "worker-a,worker-b",
         "--max-pages",  "3",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     var parsed = try parseCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -3615,7 +3615,7 @@ test "graph metric maintenance command rejects duplicate worker pool ids" {
         "--owner-id",   "owner-a",
         "--worker-ids", "worker-a,worker-a",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &args));
 }
 
@@ -3628,7 +3628,7 @@ test "graph metric maintenance command rejects worker id lists for single-owner 
         "--owner-id",   "owner-a",
         "--worker-ids", "worker-a,worker-b",
     };
-    var coordinator_args = std.process.Args.Iterator.init(.{ .vector = coordinator_argv[0..] });
+    var coordinator_args = @import("antfly_platform").process.argsIterator(coordinator_argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &coordinator_args));
 
     const worker_argv = [_][*:0]const u8{
@@ -3638,7 +3638,7 @@ test "graph metric maintenance command rejects worker id lists for single-owner 
         "--owner-id",   "owner-a",
         "--worker-ids", "worker-a,worker-b",
     };
-    var worker_args = std.process.Args.Iterator.init(.{ .vector = worker_argv[0..] });
+    var worker_args = @import("antfly_platform").process.argsIterator(worker_argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &worker_args));
 }
 
@@ -3691,7 +3691,7 @@ test "graph metric maintenance supervisor parses config and defaults workers" {
         "--max-pages",
         "7",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     var parsed = try parseSupervisorCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -3726,7 +3726,7 @@ test "graph metric maintenance supervisor parses service target config" {
         "--max-pages",
         "5",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     var parsed = try parseSupervisorCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -3750,7 +3750,7 @@ test "graph metric maintenance supervisor rejects duplicate worker pool ids" {
         "--worker-ids",
         "worker-a,worker-b,worker-a",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseSupervisorCli(alloc, &args));
 }
 

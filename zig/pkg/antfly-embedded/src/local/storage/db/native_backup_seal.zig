@@ -187,7 +187,7 @@ pub fn finish(alloc: Allocator, io: std.Io, root: []const u8, fence: topology.Fe
         if (entry.kind != .file or files.items.len == max_files) return error.BackupSealInventoryTooLarge;
         try checkRelative(entry.path);
         const stat = try backup.statRegularFile(io, absolute);
-        try files.append(a, .{ .path = try a.dupe(u8, entry.path), .size = stat.size, .inode = stat.inode, .mtime_ns = stat.mtime.toNanoseconds() });
+        try files.append(a, .{ .path = try a.dupe(u8, entry.path), .size = stat.size, .inode = @bitCast(stat.inode), .mtime_ns = stat.mtime.toNanoseconds() });
     }
     std.mem.sort(File, files.items, {}, struct {
         fn less(_: void, x: File, y: File) bool {

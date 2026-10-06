@@ -344,7 +344,7 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 /// loaded from, independent of argv[0] -- which belongs to whatever process
 /// linked libantfly and is meaningless as a worker executable candidate.
 fn selfImagePathAlloc(alloc: std.mem.Allocator) ![]u8 {
-    if (comptime !builtin.link_libc) return error.Unsupported;
+    if (comptime !builtin.link_libc or builtin.os.tag == .windows) return error.Unsupported;
     var info: DlInfo = undefined;
     const anchor: *const anyopaque = @ptrCast(&selfImagePathAlloc);
     if (dladdr(anchor, &info) == 0) return error.Unsupported;

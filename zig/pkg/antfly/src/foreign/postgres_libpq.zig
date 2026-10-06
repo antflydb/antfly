@@ -3825,6 +3825,9 @@ fn spinOrYield() void {
 }
 
 pub fn registerDefaultExecutor(alloc: Allocator, registry: *foreign_source.Registry) !void {
+    // Experimental Windows builds do not load libpq; Postgres foreign
+    // sources report no executor rather than linking the POSIX poll path.
+    if (comptime builtin.os.tag == .windows) return;
     const executor = try alloc.create(LazyExecutor);
     errdefer alloc.destroy(executor);
     executor.* = .{

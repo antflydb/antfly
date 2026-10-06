@@ -169,7 +169,7 @@ pub const Socket = struct {
         return .{
             .handle = stream.socket.handle,
             .io = io,
-            .native_timeouts = isThreadedNetworkIo(io),
+            .native_timeouts = !is_windows and isThreadedNetworkIo(io),
         };
     }
 
@@ -228,7 +228,7 @@ pub const Socket = struct {
         return .{
             .handle = handle,
             .io = io,
-            .native_timeouts = isThreadedNetworkIo(io),
+            .native_timeouts = !is_windows and isThreadedNetworkIo(io),
         };
     }
 
@@ -549,6 +549,9 @@ pub const Socket = struct {
     /// handle belongs to the host backend. Reads and writes still use std.Io;
     /// virtual handles retain the logical Select-based timeout path.
     pub fn enableNativeTimeouts(self: *Self) void {
+        // Zig's Windows sockets are AFD handles, not Winsock SOCKETs, so
+        // ws2_32.setsockopt rejects them; keep the std.Io timeout path.
+        if (is_windows) return;
         self.native_timeouts = true;
         self.recv_timeout_ms = null;
         self.send_timeout_ms = null;

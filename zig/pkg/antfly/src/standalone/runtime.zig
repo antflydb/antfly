@@ -5585,7 +5585,7 @@ pub fn runLite(
         owned_extra_count += 1;
         try argv.append(init.gpa, owned_extra[i].ptr);
     }
-    var args = std.process.Args.Iterator.init(.{ .vector = argv.items });
+    var args = @import("antfly_platform").process.argsIterator(argv.items);
     try runFromIterator(init, "antfly standalone", &args);
 }
 
@@ -9132,7 +9132,7 @@ test "standalone continuous HA mutation guard follows role lifecycle" {
 
 test "standalone runtime parses experimental flag" {
     const argv = [_][*:0]const u8{"--experimental"};
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(parsed.experimental);
@@ -9605,7 +9605,7 @@ test "standalone runtime antfarm path guards keep api routes reserved" {
 
 test "parse cli accepts config path" {
     var argv = [_][*:0]const u8{ "--config", "antfly.json" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
@@ -9613,7 +9613,7 @@ test "parse cli accepts config path" {
 
 test "parse cli accepts secret store path" {
     var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
@@ -9621,7 +9621,7 @@ test "parse cli accepts secret store path" {
 
 test "parse cli accepts extension package store path" {
     var argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
@@ -9638,7 +9638,7 @@ test "parse cli accepts ARD identity flags" {
         "--ard-public-catalog",
         "true",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
@@ -9662,7 +9662,7 @@ test "parse cli accepts canonical host port and models dir flags" {
         "--data-dir",
         "/tmp/antfly-data",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
@@ -9683,7 +9683,7 @@ test "parse cli preserves registry variants and recognizes explicit preload back
         "--preload-model",
         "generator:metal:owner/model:Q4_K_M",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9727,7 +9727,7 @@ test "parse cli accepts HA primary runtime flags" {
         "--hot-standby-epoch",
         "4",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(hotStandbyPrimaryRequested(cfg));
@@ -9777,7 +9777,7 @@ test "parse cli accepts HA primary sync policy flags" {
         "--hot-standby-sync-failure",
         "fail-closed",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9819,7 +9819,7 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
         "--hot-standby-sync-standby",
         "standby-b",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9859,7 +9859,7 @@ test "parse cli accepts HA primary retention policy flags" {
         "--hot-standby-retention-max-retained-age-ns",
         "1000000",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9967,7 +9967,7 @@ test "parse cli accepts HA standby runtime flags" {
         "--hot-standby-epoch",
         "4",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try validateHotStandbyRole(cfg);
@@ -10099,12 +10099,12 @@ test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
 
     inline for (pairs) |pair| {
         var canonical_argv = [_][*:0]const u8{ pair.canonical, pair.value };
-        var canonical_iter = std.process.Args.Iterator.init(.{ .vector = canonical_argv[0..] });
+        var canonical_iter = @import("antfly_platform").process.argsIterator(canonical_argv[0..]);
         var canonical_cfg = try parseCli(std.testing.allocator, &canonical_iter);
         defer canonical_cfg.deinit(std.testing.allocator);
 
         var legacy_argv = [_][*:0]const u8{ pair.legacy, pair.value };
-        var legacy_iter = std.process.Args.Iterator.init(.{ .vector = legacy_argv[0..] });
+        var legacy_iter = @import("antfly_platform").process.argsIterator(legacy_argv[0..]);
         var legacy_cfg = try parseCli(std.testing.allocator, &legacy_iter);
         defer legacy_cfg.deinit(std.testing.allocator);
 
@@ -10114,12 +10114,12 @@ test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
     // hot_standby_sync_standby_names is list-appended rather than assigned, so it is
     // checked separately from the scalar/string table above.
     var canonical_sync_standby_argv = [_][*:0]const u8{ "--hot-standby-sync-standby", "standby-a" };
-    var canonical_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = canonical_sync_standby_argv[0..] });
+    var canonical_sync_standby_iter = @import("antfly_platform").process.argsIterator(canonical_sync_standby_argv[0..]);
     var canonical_sync_standby_cfg = try parseCli(std.testing.allocator, &canonical_sync_standby_iter);
     defer canonical_sync_standby_cfg.deinit(std.testing.allocator);
 
     var legacy_sync_standby_argv = [_][*:0]const u8{ "--ha-sync-standby", "standby-a" };
-    var legacy_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = legacy_sync_standby_argv[0..] });
+    var legacy_sync_standby_iter = @import("antfly_platform").process.argsIterator(legacy_sync_standby_argv[0..]);
     var legacy_sync_standby_cfg = try parseCli(std.testing.allocator, &legacy_sync_standby_iter);
     defer legacy_sync_standby_cfg.deinit(std.testing.allocator);
 
@@ -10944,7 +10944,7 @@ test "parse cli accepts inference budget overrides" {
         "--kernel-jit-mode",
         "required",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb);

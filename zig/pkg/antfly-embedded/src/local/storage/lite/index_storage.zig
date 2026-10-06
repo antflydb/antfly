@@ -444,7 +444,7 @@ const NativeAtomicWriteSink = struct {
         const parent = std.fs.path.dirname(self.storage.docs.file.path) orelse ".";
         const path = try std.fs.path.join(self.allocator, &.{ parent, basename });
         errdefer self.allocator.free(path);
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         self.file = file;
         self.tmp_path = path;
         // On POSIX the descriptor owns the staging file after unlink. Abort,

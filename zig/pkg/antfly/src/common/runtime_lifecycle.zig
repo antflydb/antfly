@@ -11,6 +11,7 @@
 //! executor lease.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
@@ -105,15 +106,30 @@ fn processSignalHandler(_: std.posix.SIG) callconv(.c) void {
     process_signal_requested.store(true, .release);
 }
 
+/// Windows counterpart to `processSignalHandler`: console control events
+/// (Ctrl+C, Ctrl+Break, close, logoff, shutdown) request process shutdown.
+const WindowsConsole = struct {
+    extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
+
+    fn handler(_: u32) callconv(.winapi) c_int {
+        process_signal_requested.store(true, .release);
+        return 1;
+    }
+};
+
 /// Process-wide SIGINT/SIGTERM bridge. The scope restores prior handlers and
 /// presents signal state as an owned cancellation source to each role instead
 /// of requiring role-local globals and handlers.
 pub const ProcessSignalScope = struct {
-    old_int: std.posix.Sigaction,
-    old_term: std.posix.Sigaction,
+    old_int: if (builtin.os.tag == .windows) void else std.posix.Sigaction,
+    old_term: if (builtin.os.tag == .windows) void else std.posix.Sigaction,
 
     pub fn install() ProcessSignalScope {
         process_signal_requested.store(false, .release);
+        if (comptime builtin.os.tag == .windows) {
+            _ = WindowsConsole.SetConsoleCtrlHandler(&WindowsConsole.handler, 1);
+            return .{ .old_int = {}, .old_term = {} };
+        }
         const action = std.posix.Sigaction{
             .handler = .{ .handler = processSignalHandler },
             .mask = std.posix.sigemptyset(),
@@ -135,6 +151,12 @@ pub const ProcessSignalScope = struct {
     }
 
     pub fn deinit(self: *ProcessSignalScope) void {
+        if (comptime builtin.os.tag == .windows) {
+            _ = WindowsConsole.SetConsoleCtrlHandler(&WindowsConsole.handler, 0);
+            process_signal_requested.store(false, .release);
+            self.* = undefined;
+            return;
+        }
         std.posix.sigaction(.INT, &self.old_int, null);
         std.posix.sigaction(.TERM, &self.old_term, null);
         process_signal_requested.store(false, .release);

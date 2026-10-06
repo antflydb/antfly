@@ -319,7 +319,7 @@ pub fn preparePublication(db: *DB, scope: ledger.Scope, cancellation: Cancellati
     const receipt_staging = try std.fmt.allocPrint(alloc, "{s}.staging", .{receipt_path});
     defer alloc.free(receipt_staging);
     const artifact_stat = try file.stat(io);
-    const publication: PublicationReceipt = .{ .certificate = result, .seal_digest = progress.local_seal_digest, .inode = artifact_stat.inode, .size = artifact_stat.size, .mtime_ns = artifact_stat.mtime.toNanoseconds() };
+    const publication: PublicationReceipt = .{ .certificate = result, .seal_digest = progress.local_seal_digest, .inode = @bitCast(artifact_stat.inode), .size = artifact_stat.size, .mtime_ns = artifact_stat.mtime.toNanoseconds() };
     _ = try backup.writeFileDurable(io, receipt_staging, &try publication.encode());
     try std.Io.Dir.rename(.cwd(), receipt_staging, .cwd(), receipt_path, io);
     try fs.syncDirPortable(io, root);

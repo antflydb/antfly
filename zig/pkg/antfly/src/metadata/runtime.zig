@@ -2027,7 +2027,7 @@ test "metadata runtime cli accepts secret and extension package store paths" {
         "--extension-package-store",
         "/opt/antfly/extensions",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
@@ -2037,17 +2037,17 @@ test "metadata runtime cli accepts secret and extension package store paths" {
 test "metadata runtime cli online merge defaults on and accepts explicit disable" {
     try std.testing.expect((CliConfig{}).online_merge_enabled);
     var argv = [_][*:0]const u8{ "--online-merge-enabled", "true" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.online_merge_enabled);
     var off = [_][*:0]const u8{"--online-merge-enabled=false"};
-    var off_iter = std.process.Args.Iterator.init(.{ .vector = off[0..] });
+    var off_iter = @import("antfly_platform").process.argsIterator(off[0..]);
     var off_cfg = try parseCli(std.testing.allocator, &off_iter);
     defer off_cfg.deinit(std.testing.allocator);
     try std.testing.expect(!off_cfg.online_merge_enabled);
     var invalid = [_][*:0]const u8{"--online-merge-enabled=maybe"};
-    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid[0..] });
+    var invalid_iter = @import("antfly_platform").process.argsIterator(invalid[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(std.testing.allocator, &invalid_iter));
 }
 
@@ -2058,7 +2058,7 @@ test "metadata runtime cli accepts layered secret store paths" {
         "--secret-store-path",
         "/run/antfly/system-secrets/secrets.json",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), cfg.secret_store_paths.items.len);
@@ -2070,7 +2070,7 @@ test "metadata runtime cli accepts auth flag" {
     var argv = [_][*:0]const u8{
         "--auth=true",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, cfg.auth_enabled.?);
@@ -2078,7 +2078,7 @@ test "metadata runtime cli accepts auth flag" {
 
 test "metadata runtime cli accepts experimental flag" {
     var argv = [_][*:0]const u8{"--experimental"};
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.experimental);

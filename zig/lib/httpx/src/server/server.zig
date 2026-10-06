@@ -2434,7 +2434,9 @@ pub const Server = struct {
             ctx.cancellation = &connection.h1_request_cancellation;
             var cancellation_registration: CancellationObserver.Registration = .{};
             var disconnect_probe_context: H1DisconnectProbeContext = undefined;
-            if (self.config.h1_disconnect_cancellation == .required) {
+            // Zig's Windows sockets are AFD handles that WSAPoll rejects, so
+            // the observer would fail after one request; skip it there.
+            if (self.config.h1_disconnect_cancellation == .required and builtin.os.tag != .windows) {
                 if (self.config.h1_disconnect_probe) |probe| {
                     disconnect_probe_context = .{
                         .probe = probe,

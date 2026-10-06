@@ -33,7 +33,7 @@ const isLiteLocalListenHost = lite_serve.isLiteLocalListenHost;
 test "lite serve parser preserves convenience flags and forwards standalone options" {
     {
         const argv = [_][*:0]const u8{"app.aflite"};
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         var opts = try parseServeOptions(std.testing.allocator, &args);
         defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
@@ -45,14 +45,14 @@ test "lite serve parser preserves convenience flags and forwards standalone opti
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--fsync=false" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         var opts = try parseServeOptions(std.testing.allocator, &args);
         defer opts.deinit(std.testing.allocator);
         try std.testing.expect(!opts.fsync);
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--addr", "127.0.0.1:9090" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         var opts = try parseServeOptions(std.testing.allocator, &args);
         defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
@@ -63,12 +63,12 @@ test "lite serve parser preserves convenience flags and forwards standalone opti
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--port", "9090" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try std.testing.expectError(error.InvalidArguments, parseServeOptions(std.testing.allocator, &args));
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--config", "production.json", "--admin-api-token", "secret" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         var opts = try parseServeOptions(std.testing.allocator, &args);
         defer opts.deinit(std.testing.allocator);
         try std.testing.expectEqualSlices([]const u8, &.{ "--config", "production.json", "--admin-api-token", "secret" }, opts.standalone_args.items);

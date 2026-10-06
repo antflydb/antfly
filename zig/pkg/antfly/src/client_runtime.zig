@@ -64,7 +64,7 @@ pub fn runFromIterator(
             if (std.mem.eql(u8, arg, "--database")) scope.database = args.next() orelse return error.InvalidArguments else if (std.mem.eql(u8, arg, "--namespace")) scope.namespace = args.next() orelse return error.InvalidArguments else try scoped_arguments.append(init.gpa, arg.ptr);
         }
         if (scope.database != null or scope.namespace != null) client.catalog_scope = .{ .database = scope.database orelse "default", .namespace = scope.namespace orelse "public" };
-        args.* = std.process.Args.Iterator.init(.{ .vector = scoped_arguments.items });
+        args.* = @import("antfly_platform").process.argsIterator(scoped_arguments.items);
     }
 
     if (std.mem.eql(u8, command, "table")) return cli.table.run(init.gpa, io, &client, args);
@@ -100,7 +100,7 @@ fn helpRequested(args: *std.process.Args.Iterator) bool {
 
 test "client runtime recognizes help without consuming arguments" {
     var argv = [_][*:0]const u8{ "--table", "docs", "--help" };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expect(helpRequested(&args));
     try std.testing.expectEqualStrings("--table", args.next().?);
 }

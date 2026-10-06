@@ -77,7 +77,11 @@ fn createPath(io: std.Io, path: []const u8) anyerror!void {
 }
 
 pub fn sync(io: std.Io, path: []const u8) anyerror!void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: Win32 cannot flush a directory handle.
+    // NTFS journals namespace metadata, so treat directory durability as
+    // provided once the files themselves are flushed.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
     var dir = try std.Io.Dir.cwd().openDir(io, if (path.len == 0) "." else path, .{ .iterate = true });
     defer dir.close(io);

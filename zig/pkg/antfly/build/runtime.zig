@@ -129,6 +129,11 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+    if (target.result.os.tag == .windows) {
+        // httpx sockets (Winsock) and TLS trust-store verification (CryptoAPI).
+        antfly_main_mod.linkSystemLibrary("ws2_32", .{});
+        antfly_main_mod.linkSystemLibrary("crypt32", .{});
+    }
 
     var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {

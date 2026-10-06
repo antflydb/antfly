@@ -2394,6 +2394,9 @@ else blk: {
 
             fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                // Experimental Windows: the fd sink is POSIX-only; buffer and
+                // publish through the vtable's sync + rename instead.
+                if (comptime builtin.os.tag == .windows) return try BufferedAtomicWriteSink.create(allocator, self.storage(), path);
                 return try NativeAtomicWriteSink.create(allocator, path, self.state);
             }
 
@@ -2701,6 +2704,9 @@ else blk: {
 
         fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            if (comptime builtin.os.tag == .windows) {
+                return try BufferedAtomicWriteSink.create(allocator, .{ .ptr = ptr, .vtable = &threaded_only_vtable }, path);
+            }
             return try NativeAtomicWriteSink.create(allocator, path, state);
         }
 

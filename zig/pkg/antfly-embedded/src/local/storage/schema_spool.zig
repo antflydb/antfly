@@ -54,7 +54,7 @@ pub const Spool = struct {
         const directory = platform.env.getenv("TMPDIR") orelse platform.env.getenv("TEMP") orelse "/tmp";
         const path = try std.fmt.allocPrint(self.alloc, "{s}/antfly-schema-{x}.tmp", .{ directory, random });
         errdefer self.alloc.free(path);
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         self.io_impl = impl;
         self.path = path;
         self.file = file;

@@ -137,7 +137,7 @@ pub const Manager = struct {
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);
         _ = try std.fmt.bufPrint(&self.directory_name, "antfly-sql-{s}", .{std.fmt.bytesToHex(random, .lower)});
-        try parent.createDir(self.io, &self.directory_name, .fromMode(0o700));
+        try parent.createDir(self.io, &self.directory_name, if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o700) else .default_dir);
         errdefer parent.deleteTree(self.io, &self.directory_name) catch {};
         self.dir = try parent.openDir(self.io, &self.directory_name, .{});
         self.parent = parent;
@@ -150,7 +150,7 @@ pub const Manager = struct {
         self.sequence += 1;
         var name: [24]u8 = undefined;
         const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
-        const file = try self.dir.?.createFile(self.io, text, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        const file = try self.dir.?.createFile(self.io, text, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         // Runs are accessed through open handles only. Unlink immediately so
         // process crashes cannot leave row payloads behind on supported hosts.
         errdefer file.close(self.io);

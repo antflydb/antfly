@@ -79,7 +79,11 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
 /// prove that it will not be produced. Callers must be able to handle artifacts
 /// created for a different deployment target without target-specific catches.
 pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: Win32 cannot flush a directory handle.
+    // NTFS journals namespace metadata, so treat directory durability as
+    // provided once the files themselves are flushed.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
     var dir = if (std.fs.path.isAbsolute(path))
@@ -91,7 +95,11 @@ pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
 }
 
 pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    if (builtin.os.tag == .windows) {
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+        return file.sync(std.Io.Threaded.global_single_threaded.io());
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableFileSyncUnsupported;
     while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
         .SUCCESS => return,
@@ -106,7 +114,9 @@ pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
 }
 
 pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: see syncDirPortable.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
     while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
         .SUCCESS => return,
@@ -126,7 +136,9 @@ pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
 /// to `fsync`. Reopening `.` through the held directory keeps resolution bound
 /// to the same directory while obtaining a sync-capable descriptor.
 pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) anyerror!void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: see syncDirPortable.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
     var sync_dir = try dir.openDir(io, ".", .{
@@ -149,10 +161,12 @@ fn syncDirectoryWithIo(io: anytype, dir: std.Io.Dir) !void {
 }
 
 pub fn syncFilePortable(io: anytype, path: []const u8) !void {
+    // Windows file flushes (NtFlushBuffersFile) require write access.
+    const options: std.Io.Dir.OpenFileOptions = if (builtin.os.tag == .windows) .{ .mode = .read_write } else .{};
     const file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(io, path, .{})
+        try std.Io.Dir.openFileAbsolute(io, path, options)
     else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+        try std.Io.Dir.cwd().openFile(io, path, options);
     defer file.close(io);
     try file.sync(io);
 }

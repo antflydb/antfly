@@ -178,6 +178,8 @@ const commands = [_]Command{
 };
 
 pub fn main(init: std.process.Init, args: []const []const u8) !void {
+    // Experimental Windows builds omit fine-tuning; the trainers assume POSIX.
+    if (comptime builtin.os.tag == .windows) return error.UnsupportedPlatform;
     if (args.len == 0 or isHelp(args[0])) {
         usage();
         return;

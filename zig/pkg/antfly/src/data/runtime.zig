@@ -38223,7 +38223,7 @@ fn consumerTests() type {
                 "--api-port",
                 "8080",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
@@ -38236,7 +38236,7 @@ fn consumerTests() type {
 
         test "data runtime cli accepts secret store path" {
             const argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
@@ -38244,7 +38244,7 @@ fn consumerTests() type {
 
         test "data runtime cli accepts extension package store path" {
             const argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
@@ -38260,7 +38260,7 @@ fn consumerTests() type {
                 "Tenant Antfly",
                 "--ard-public-catalog=true",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
@@ -38343,7 +38343,7 @@ fn consumerTests() type {
                 "--process-memory-budget-mb",
                 "0",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(usize, 1), parsed.metadata_apis.items.len);
@@ -38374,7 +38374,7 @@ fn consumerTests() type {
                 "--metadata-api",
                 "http://127.0.0.1:19002",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(usize, 2), parsed.metadata_apis.items.len);
@@ -38387,7 +38387,7 @@ fn consumerTests() type {
                 "--auth",
                 "true",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expectEqual(true, parsed.auth_enabled.?);
@@ -38395,7 +38395,7 @@ fn consumerTests() type {
 
         test "data runtime parses experimental flag" {
             const argv = [_][*:0]const u8{"--experimental"};
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expect(parsed.experimental);

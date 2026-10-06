@@ -153,7 +153,7 @@ pub const MmapRegion = struct {
         }
         if (size > max_bytes) return error.FileTooLarge;
 
-        const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+        const mapped = try mapReadOnly(fd, size);
         return .{ .data = mapped, .fd = fd };
     }
 
@@ -229,7 +229,7 @@ pub const MmapRegion = struct {
         if (self.discard_on_deinit and comptime supports_posix_file_advice) {
             advise(self.data.ptr, mapped_len, .dont_need);
         }
-        std.posix.munmap(self.data);
+        unmap(self.data);
         if (self.discard_on_deinit and comptime supports_posix_file_advice) {
             _ = c.posix_fadvise(
                 fd,
@@ -244,7 +244,7 @@ pub const MmapRegion = struct {
 };
 
 pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []const u8) !MmapRegion {
-    if (!comptime builtin.link_libc) return error.UnsupportedPlatform;
+    if (!comptime builtin.link_libc or builtin.os.tag == .windows) return error.UnsupportedPlatform;
     if (bytes.len == 0) return error.EmptyFile;
 
     const nonce = mmap_temp_counter.fetchAdd(1, .monotonic);
@@ -431,7 +431,7 @@ pub fn mmapFileWithIdentity(allocator: std.mem.Allocator, path: []const u8) !Mma
     const identity = try fileIdentityFromFd(allocator, fd);
     if (identity.size == 0) return error.EmptyFile;
     const size = std.math.cast(usize, identity.size) orelse return error.FileTooLarge;
-    const mapped = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+    const mapped = try mapReadOnly(fd, size);
     return .{
         .region = .{ .data = mapped, .fd = fd },
         .identity = identity,
@@ -658,6 +658,10 @@ pub fn renameNoReplace(allocator: std.mem.Allocator, old_path: []const u8, new_p
 }
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        const stat = handleFile(fd).stat(windowsIo()) catch return error.StatFailed;
+        return std.math.cast(usize, stat.size) orelse error.FileTooLarge;
+    }
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         while (true) {
@@ -689,7 +693,51 @@ fn statSize(stat: c.struct_stat) std.c.off_t {
 
 const Advice = enum { sequential, random, dont_need };
 
+fn windowsIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn handleFile(fd: std.posix.fd_t) std.Io.File {
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+const WindowsMapping = struct {
+    const HANDLE = std.os.windows.HANDLE;
+    const PAGE_READONLY: u32 = 0x02;
+    const FILE_MAP_READ: u32 = 0x0004;
+    extern "kernel32" fn CreateFileMappingW(file: HANDLE, attributes: ?*anyopaque, protect: u32, size_high: u32, size_low: u32, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn MapViewOfFile(mapping: HANDLE, access: u32, offset_high: u32, offset_low: u32, bytes: usize) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn UnmapViewOfFile(base: *const anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: HANDLE) callconv(.winapi) c_int;
+};
+
+/// Read-only shared mapping of `size` bytes from the start of `fd`.
+fn mapReadOnly(fd: std.posix.fd_t, size: usize) ![]align(std.heap.page_size_min) u8 {
+    if (comptime builtin.os.tag == .windows) {
+        const W = WindowsMapping;
+        const mapping = W.CreateFileMappingW(fd, null, W.PAGE_READONLY, 0, 0, null) orelse return error.MemoryMappingNotSupported;
+        // The view keeps the section object alive after its handle closes.
+        defer _ = W.CloseHandle(mapping);
+        const base = W.MapViewOfFile(mapping, W.FILE_MAP_READ, 0, 0, size) orelse return error.MemoryMappingNotSupported;
+        const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(base));
+        return bytes[0..size];
+    }
+    return std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .SHARED }, fd, 0);
+}
+
+fn unmap(data: []align(std.heap.page_size_min) u8) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = WindowsMapping.UnmapViewOfFile(data.ptr);
+        return;
+    }
+    std.posix.munmap(data);
+}
+
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
+    if (comptime builtin.os.tag == .windows) {
+        const file = try std.Io.Dir.cwd().openFile(windowsIo(), path_z, .{});
+        return file.handle;
+    }
     // std.posix.openatZ preserves actionable failures such as AccessDenied,
     // NotDir, and descriptor exhaustion while still retrying EINTR. Flattening
     // every failure to FileNotFound makes callers misreport operational faults
@@ -699,6 +747,7 @@ fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
 
 fn closeFd(fd: std.posix.fd_t) void {
     if (comptime builtin.os.tag == .freestanding) return;
+    if (comptime builtin.os.tag == .windows) return handleFile(fd).close(windowsIo());
     if (comptime builtin.link_libc) {
         _ = c.close(fd);
     } else {
@@ -707,6 +756,9 @@ fn closeFd(fd: std.posix.fd_t) void {
 }
 
 fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
+    if (comptime builtin.os.tag == .windows) {
+        return handleFile(fd).readPositional(windowsIo(), &.{buf}, offset) catch error.ReadFailed;
+    }
     // Prefer the raw Linux syscall even in libc-linked builds so the hot
     // prefetch/read path can distinguish and retry EINTR deterministically.
     if (builtin.os.tag == .linux) {

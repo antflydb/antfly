@@ -1436,7 +1436,7 @@ test "lite promote parser requires values and derives default backup id" {
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--location", "file:///tmp/backups" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("http://localhost:8080", opts.target);
@@ -1448,7 +1448,7 @@ test "lite promote parser requires values and derives default backup id" {
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--backup-id", "explicit-id", "--location", "s3://promotions/app", "--idempotency-key", "promote-app", "--no-wait" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("explicit-id", opts.backup_id);
@@ -1459,26 +1459,26 @@ test "lite promote parser requires values and derives default backup id" {
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try std.testing.expectError(error.MissingArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--location" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try std.testing.expectError(error.MissingArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--bogus" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try std.testing.expectError(error.UnknownArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 }
 
 test "lite read file parser accepts explicit readonly flag" {
     const argv = [_][*:0]const u8{ "--readonly", "--file", "query.json" };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectEqualStrings("query.json", parseReadFileFlag(&args));
 }
 
@@ -1512,7 +1512,7 @@ test "lite schema index and enrichment commands round trip catalogs" {
 
     {
         const argv = [_][*:0]const u8{path_z.ptr};
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try initLite(allocator, io, &args);
     }
 
@@ -1522,12 +1522,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
     try writeFileAtomically(allocator, io, schema_path, schema_json);
     {
         const argv = [_][*:0]const u8{ "set", path_z.ptr, "--file", schema_path_z.ptr };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try schemaCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "get", path_z.ptr };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try schemaCommand(allocator, io, &args);
     }
 
@@ -1536,12 +1536,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
     );
     {
         const argv = [_][*:0]const u8{ "create", path_z.ptr, "--file", index_path_z.ptr };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try indexCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "list", path_z.ptr };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try indexCommand(allocator, io, &args);
     }
 
@@ -1550,12 +1550,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
     );
     {
         const argv = [_][*:0]const u8{ "create", path_z.ptr, "--file", enrichment_path_z.ptr };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try enrichmentCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "list", path_z.ptr };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try enrichmentCommand(allocator, io, &args);
     }
 
@@ -1584,12 +1584,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
 
     {
         const argv = [_][*:0]const u8{ "drop", path_z.ptr, "--index", "cmd_ft_body" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try indexCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "drop", path_z.ptr, "--kind", "chunk", "--name", "cmd_body_chunks" };
-        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
         try enrichmentCommand(allocator, io, &args);
     }
 
@@ -1649,7 +1649,7 @@ test "lite query readonly runs while writer handle is open" {
     );
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--readonly", "--file", query_path_z.ptr };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try query(allocator, io, &args);
 }
 
@@ -1733,7 +1733,7 @@ test "lite backup command exports stable data while writer has open transaction"
     });
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try backup(allocator, io, &args);
 
     try writer.db.abortTransaction(txn_id, 0);
@@ -1789,7 +1789,7 @@ test "lite export subcommand dispatches portable backup alias" {
     }
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     var init: std.process.Init = undefined;
     init.gpa = allocator;
     init.io = io;
@@ -1916,7 +1916,7 @@ test "lite check returns an error for invalid aflite files after writing report"
     const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const argv = [_][*:0]const u8{path_z.ptr};
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.LiteCheckFailed, check(allocator, io, &args));
 }
 
@@ -2041,7 +2041,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
     const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
     const backup_argv = [_][*:0]const u8{ src_path_z.ptr, "--out", backup_path_z.ptr };
-    var backup_args = std.process.Args.Iterator.init(.{ .vector = backup_argv[0..] });
+    var backup_args = @import("antfly_platform").process.argsIterator(backup_argv[0..]);
     try backup(allocator, io, &backup_args);
     try std.testing.expect(pathExists(io, backup_path));
 
@@ -2565,7 +2565,7 @@ test "lite status rejects internal bridge aflite files" {
     }
 
     var argv = [_][*:0]const u8{path_z.ptr};
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.TruncatedNativeHeader, status(allocator, std.testing.io, &args));
 }
 
@@ -2847,7 +2847,7 @@ test "lite promote helper stages backup then submits normal restore request" {
     const location_z = try allocator.dupeSentinel(u8, location, 0);
     defer allocator.free(location_z);
     const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--connection", "local-reader", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
     var opts = try parsePromoteOptions(allocator, src_path, &args);
     defer opts.deinit(allocator);
 
