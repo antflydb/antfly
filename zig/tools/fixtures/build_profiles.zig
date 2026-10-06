@@ -42,6 +42,18 @@ pub const owner_probe_source =
     \\
 ;
 
+// Canonicalizing a resolved CPU expands its feature dependencies. Modules are
+// shared by many artifacts; their configured target remains fixed while probes
+// replace source bodies, so compute that projection once per module.
+var target_queries: std.AutoHashMapUnmanaged(*std.Build.Module, std.Target.Query) = .empty;
+
+fn targetQuery(module: *std.Build.Module) std.Target.Query {
+    const entry = target_queries.getOrPut(module.owner.allocator, module) catch @panic("OOM");
+    if (!entry.found_existing)
+        entry.value_ptr.* = std.Target.Query.fromTarget(&module.resolved_target.?.result);
+    return entry.value_ptr.*;
+}
+
 pub fn check(artifact: *std.Build.Step.Compile) void {
     var seen = std.AutoHashMap(*std.Build.Module, void).init(artifact.step.owner.allocator);
     inspect(artifact, artifact.root_module, &seen);
@@ -50,8 +62,8 @@ pub fn check(artifact: *std.Build.Step.Compile) void {
 fn inspect(artifact: *std.Build.Step.Compile, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
     const root = artifact.root_module;
-    if (module.resolved_target) |target| {
-        if (!std.Target.Query.fromTarget(&target.result).eql(std.Target.Query.fromTarget(&root.resolved_target.?.result)))
+    if (module.resolved_target != null) {
+        if (!targetQuery(module).eql(targetQuery(root)))
             std.debug.panic("{s}: runtime dependency has a different target", .{artifact.name});
     }
     if (module.optimize) |optimize| {

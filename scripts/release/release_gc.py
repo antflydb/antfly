@@ -48,6 +48,7 @@ DEFAULT_BUCKET = "antfly-releases"
 RELEASE_ROOT = "antfly/"
 CONTENT_ROOT = "antfly/artifacts/sha256/"
 CONTAINER_IDENTITY_ROOT = "antfly/container-identities/"
+PENDING_ROOT = "antfly/gc-pending/"
 LEDGER_NAME = "artifacts.json"
 SUPPORTED_LEDGER_SCHEMAS = {1, 2, 3, 4, 5}
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -80,6 +81,8 @@ class ObjectStore(Protocol):
     def list_objects(self, prefix: str) -> list[ObjectInfo]: ...
 
     def read_optional(self, key: str) -> StoredObject | None: ...
+
+    def write_if_absent(self, key: str, body: bytes) -> None: ...
 
     def delete_objects(self, keys: list[str]) -> None: ...
 
@@ -163,7 +166,7 @@ def release_prefix(tag: str) -> str:
 
 def load_releases(
     store: ObjectStore, objects: list[ObjectInfo]
-) -> tuple[dict[str, Release], set[str], set[str]]:
+) -> tuple[dict[str, Release], set[str], set[str], dict[str, frozenset[str]]]:
     by_key = {item.key: item for item in objects}
     release_keys: dict[str, set[str]] = {}
     for item in objects:
@@ -173,6 +176,7 @@ def load_releases(
             release_keys.setdefault(segment, set()).add(item.key)
 
     releases: dict[str, Release] = {}
+    unmanifested: dict[str, frozenset[str]] = {}
     all_content_keys = {
         item.key for item in objects if item.key.startswith(CONTENT_ROOT)
     }
@@ -183,7 +187,10 @@ def load_releases(
         ledger_key = f"{release_prefix(tag)}{LEDGER_NAME}"
         ledger_info = by_key.get(ledger_key)
         if ledger_info is None:
-            raise SystemExit(f"release {tag} has objects but no {LEDGER_NAME}")
+            # Old releases and interrupted uploads may have no commit marker.
+            # Keep their exact keys visible without inventing shared references.
+            unmanifested[tag] = frozenset(keys)
+            continue
         stored = store.read_optional(ledger_key)
         if stored is None:
             raise SystemExit(f"release ledger disappeared while planning: {ledger_key}")
@@ -238,7 +245,65 @@ def load_releases(
             content_keys=frozenset(content_keys),
             schema_version=schema,
         )
-    return releases, all_content_keys, all_container_keys
+    return releases, all_content_keys, all_container_keys, unmanifested
+
+
+def pending_document(key: str, document: dict[str, Any]) -> dict[str, Any]:
+    tag = document.get("tag")
+    digest = document.get("ledger_sha256")
+    match = TAG_PATTERN.fullmatch(tag) if isinstance(tag, str) else None
+    if (
+        document.get("schema_version") != 1
+        or match is None
+        or match.group("prerelease") is None
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+        or key != f"{PENDING_ROOT}{digest}.json"
+        or document.get("reason")
+        not in {
+            "explicit-dev-cleanup",
+            "nightly-retention-expired",
+            "prerelease-grace-expired",
+        }
+        or document.get("reason") == "explicit-dev-cleanup"
+        and match.group("pre_label") != "dev"
+    ):
+        raise SystemExit(f"invalid pending release cleanup: {key}")
+    return document
+
+
+def load_pending_cleanups(
+    store: ObjectStore,
+    objects: list[ObjectInfo],
+    releases: dict[str, Release],
+    unmanifested: dict[str, frozenset[str]],
+) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, str]]:
+    pending: dict[str, dict[str, Any]] = {}
+    completed: set[str] = set()
+    snapshots: dict[str, str] = {}
+    for item in objects:
+        if not item.key.startswith(PENDING_ROOT):
+            continue
+        stored = store.read_optional(item.key)
+        if stored is None:
+            raise SystemExit(f"pending release cleanup disappeared: {item.key}")
+        record = pending_document(
+            item.key, parse_document(stored, "pending release cleanup")
+        )
+        snapshots[item.key] = stored.etag
+        tag = record["tag"]
+        if tag in unmanifested:
+            raise SystemExit(f"pending cleanup release is missing its manifest: {tag}")
+        release = releases.get(tag)
+        if release is None:
+            # The version ledger is deleted only after its other objects; an
+            # interrupted final marker batch can safely finish on the next run.
+            completed.add(item.key)
+        elif release.ledger_sha256 != record["ledger_sha256"]:
+            raise SystemExit(f"pending cleanup release identity changed: {tag}")
+        else:
+            pending[tag] = record
+    return pending, completed, snapshots
 
 
 def load_completion_history(
@@ -330,6 +395,7 @@ def plan_gc(
     nightly_days: int | None = None,
     nightly_min_count: int | None = None,
     prerelease_grace_days: int | None = None,
+    delete_dev_releases: bool = False,
 ) -> dict[str, Any]:
     policy = policy or load_policy()
     nightly_retention = policy["channels"]["nightly"]["retention"]
@@ -353,7 +419,9 @@ def plan_gc(
         )
     now = utc(now or datetime.now(timezone.utc))
     objects = store.list_objects(RELEASE_ROOT)
-    releases, all_content_keys, all_container_keys = load_releases(store, objects)
+    releases, all_content_keys, all_container_keys, unmanifested = load_releases(
+        store, objects
+    )
     container_records = load_container_records(store, releases, all_container_keys)
     stable_completed_at = load_completion_history(
         store, objects, releases, container_records
@@ -361,12 +429,16 @@ def plan_gc(
     protected_tags, protected_ledgers, snapshots = load_protected_identities(
         store, policy
     )
-    missing_protected = sorted(protected_tags - releases.keys())
+    missing_protected = sorted(protected_tags - releases.keys() - unmanifested.keys())
     if missing_protected:
         raise SystemExit(
             "protected channel release is missing its immutable ledger: "
             + ", ".join(missing_protected)
         )
+    pending, completed_pending, pending_snapshots = load_pending_cleanups(
+        store, objects, releases, unmanifested
+    )
+    snapshots.update(pending_snapshots)
     known_ledgers = {release.ledger_sha256 for release in releases.values()}
     missing_ledgers = sorted(protected_ledgers - known_ledgers)
     if missing_ledgers:
@@ -380,6 +452,13 @@ def plan_gc(
             release
             for release in releases.values()
             if NIGHTLY_PATTERN.fullmatch(release.tag)
+            # Pending expirations cannot fill retention slots unless a channel
+            # currently protects them and postpones their deletion.
+            and (
+                release.tag not in pending
+                or release.tag in protected_tags
+                or release.ledger_sha256 in protected_ledgers
+            )
         ),
         key=lambda release: int(
             NIGHTLY_PATTERN.fullmatch(release.tag).group("sequence")
@@ -396,6 +475,15 @@ def plan_gc(
         assert match is not None
         if tag in protected_tags or release.ledger_sha256 in protected_ledgers:
             retained[tag] = "channel-current-or-pending"
+        elif tag in pending and (
+            not delete_dev_releases or match.group("pre_label") == "dev"
+        ):
+            expired[tag] = pending[tag]["reason"]
+        elif delete_dev_releases:
+            if match.group("pre_label") == "dev":
+                expired[tag] = "explicit-dev-cleanup"
+            else:
+                retained[tag] = "outside-dev-cleanup"
         elif match.group("prerelease") is None:
             retained[tag] = "stable"
         elif NIGHTLY_PATTERN.fullmatch(tag):
@@ -418,20 +506,64 @@ def plan_gc(
             else:
                 expired[tag] = "prerelease-grace-expired"
 
+    for tag in sorted(unmanifested):
+        match = TAG_PATTERN.fullmatch(tag)
+        assert match is not None
+        if tag in protected_tags:
+            retained[tag] = "channel-current-or-pending"
+        elif delete_dev_releases and match.group("pre_label") == "dev":
+            expired[tag] = "explicit-dev-cleanup"
+        else:
+            retained[tag] = "missing-artifact-manifest"
+
+    # A retained release without a manifest may reference any shared artifact
+    # or container digest. Its presence disables shared-object/image sweeping,
+    # while unrelated version prefixes can still be expired safely.
+    unknown_references = bool(unmanifested.keys() & retained.keys())
     retained_content = (
-        set().union(*(releases[tag].content_keys for tag in retained))
+        set().union(
+            *(releases[tag].content_keys for tag in retained if tag in releases)
+        )
         if retained
         else set()
     )
     expired_content = (
-        set().union(*(releases[tag].content_keys for tag in expired))
+        set().union(*(releases[tag].content_keys for tag in expired if tag in releases))
         if expired
         else set()
     )
     delete_keys = (
-        set().union(*(releases[tag].keys for tag in expired)) if expired else set()
+        set().union(
+            *(
+                releases[tag].keys if tag in releases else unmanifested[tag]
+                for tag in expired
+            )
+        )
+        if expired
+        else set()
     )
-    delete_keys.update((expired_content - retained_content) & all_content_keys)
+    pending_writes = {}
+    # Persist every expiration before deletion, including unblocked sweeps:
+    # payload/identity deletion can succeed before a manifest deletion fails.
+    for tag in sorted((expired.keys() & releases.keys()) - pending.keys()):
+        release = releases[tag]
+        key = f"{PENDING_ROOT}{release.ledger_sha256}.json"
+        pending_writes[key] = {
+            "schema_version": 1,
+            "tag": tag,
+            "ledger_sha256": release.ledger_sha256,
+            "reason": expired[tag],
+        }
+        snapshots[key] = None
+    if unknown_references:
+        # Keep the commit marker until its shared references can be collected.
+        # A later plan discovers these expired releases through their manifests,
+        # even after their other version-prefix objects have been removed.
+        delete_keys.difference_update(
+            f"{release_prefix(tag)}{LEDGER_NAME}" for tag in expired if tag in releases
+        )
+    else:
+        delete_keys.update((expired_content - retained_content) & all_content_keys)
 
     retained_container_digests = {
         str(container_records[tag]["container_digest"])
@@ -445,6 +577,8 @@ def plan_gc(
         if record is None:
             continue
         record_key = f"{CONTAINER_IDENTITY_ROOT}{record['ledger_sha256']}.json"
+        if unknown_references:
+            continue
         container_record_deletions.append(record_key)
         if record["container_digest"] in retained_container_digests:
             continue
@@ -458,6 +592,14 @@ def plan_gc(
         )
 
     delete_keys.update(container_record_deletions)
+    delete_keys.update(completed_pending)
+    if not unknown_references:
+        # Newly written markers also complete in the last deletion phase.
+        delete_keys.update(pending_writes)
+        delete_keys.update(
+            f"{PENDING_ROOT}{pending[tag]['ledger_sha256']}.json"
+            for tag in expired.keys() & pending.keys()
+        )
 
     plan = {
         "schema_version": 2,
@@ -467,6 +609,10 @@ def plan_gc(
             "nightly_min_count": nightly_min_count,
             "prerelease_grace_days": prerelease_grace_days,
             "stable": "forever",
+            "delete_dev_releases": delete_dev_releases,
+            "shared_sweep": "blocked-by-missing-manifest"
+            if unknown_references
+            else "enabled",
         },
         "protected_tags": sorted(protected_tags),
         "retained": retained,
@@ -476,6 +622,7 @@ def plan_gc(
         ),
         "container_record_deletions": sorted(container_record_deletions),
         "delete_keys": sorted(delete_keys),
+        "pending_writes": pending_writes,
         "snapshots": snapshots,
     }
     plan["approval_sha256"] = approval_sha256(plan)
@@ -491,6 +638,7 @@ APPROVAL_FIELDS = (
     "container_deletions",
     "container_record_deletions",
     "delete_keys",
+    "pending_writes",
 )
 
 
@@ -532,6 +680,7 @@ def load_plan(path: Path) -> dict[str, Any]:
         or not isinstance(plan.get("delete_keys"), list)
         or not isinstance(plan.get("container_deletions"), list)
         or not isinstance(plan.get("container_record_deletions"), list)
+        or not isinstance(plan.get("pending_writes"), dict)
         or not isinstance(plan.get("snapshots"), dict)
         or not isinstance(plan.get("approval_sha256"), str)
     ):
@@ -543,6 +692,7 @@ def load_plan(path: Path) -> dict[str, Any]:
         tag, separator, _name = remainder.partition("/")
         if not (
             key.startswith((CONTENT_ROOT, CONTAINER_IDENTITY_ROOT))
+            or re.fullmatch(rf"{re.escape(PENDING_ROOT)}[0-9a-f]{{64}}\.json", key)
             or separator
             and TAG_PATTERN.fullmatch(tag)
         ):
@@ -568,6 +718,12 @@ def load_plan(path: Path) -> dict[str, Any]:
             or item["record_key"] != f"{CONTAINER_IDENTITY_ROOT}{ledger}.json"
         ):
             raise SystemExit("release-GC plan contains a malformed container deletion")
+    for key, record in plan["pending_writes"].items():
+        if not isinstance(record, dict):
+            raise SystemExit("malformed pending release cleanup write")
+        pending_document(key, record)
+        if plan.get("expired", {}).get(record["tag"]) != record["reason"]:
+            raise SystemExit("pending cleanup write has no matching expiration")
     expected_record_keys = {item["record_key"] for item in plan["container_deletions"]}
     for key in plan["container_record_deletions"]:
         if (
@@ -639,20 +795,44 @@ class S3ObjectStore:
             raise
         return StoredObject(response["Body"].read(), str(response["ETag"]))
 
+    def write_if_absent(self, key: str, body: bytes) -> None:
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except self.client_error as exc:
+            if str(exc.response.get("Error", {}).get("Code")) not in {
+                "412",
+                "PreconditionFailed",
+            }:
+                raise
+            current = self.read_optional(key)
+            if current is None or current.body != body:
+                raise SystemExit(f"conflicting pending release cleanup: {key}") from exc
+
     def delete_objects(self, keys: list[str]) -> None:
         release_ledgers = []
+        pending_markers = []
         other_keys = []
         for key in keys:
             remainder = key.removeprefix(RELEASE_ROOT)
             tag, separator, name = remainder.partition("/")
-            if separator and TAG_PATTERN.fullmatch(tag) and name == LEDGER_NAME:
+            if key.startswith(PENDING_ROOT):
+                pending_markers.append(key)
+            elif separator and TAG_PATTERN.fullmatch(tag) and name == LEDGER_NAME:
                 release_ledgers.append(key)
             else:
                 other_keys.append(key)
         # The version ledger is the release prefix's commit marker. Delete it
-        # only after every other object so a failed batch remains discoverable
+        # only after every payload object so a failed batch remains discoverable
         # and a retry can finish the same plan safely.
-        for phase in (other_keys, release_ledgers):
+        # Pending intent outlives the ledger so a failed deletion cannot reset
+        # an explicit expiration to the normal retention policy.
+        for phase in (other_keys, release_ledgers, pending_markers):
             for offset in range(0, len(phase), 1000):
                 batch = phase[offset : offset + 1000]
                 response = self.client.delete_objects(
@@ -667,6 +847,14 @@ class S3ObjectStore:
                     raise SystemExit(f"object-storage deletion failed: {errors}")
 
 
+def apply_gc_plan(store: ObjectStore, plan: dict[str, Any]) -> None:
+    # Save durable, digest-bound intent before removing any release bytes.
+    for key, record in plan["pending_writes"].items():
+        body = (json.dumps(record, sort_keys=True) + "\n").encode()
+        store.write_if_absent(key, body)
+    store.delete_objects(plan["delete_keys"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--endpoint", required=True)
@@ -674,6 +862,11 @@ def main() -> int:
     parser.add_argument("--nightly-days", type=int)
     parser.add_argument("--nightly-min-count", type=int)
     parser.add_argument("--prerelease-grace-days", type=int)
+    parser.add_argument(
+        "--delete-dev-releases",
+        action="store_true",
+        help="Delete unprotected dev prereleases only, including manifest-free prefixes",
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--apply-plan", type=Path)
     parser.add_argument("--approved-plan", type=Path)
@@ -689,6 +882,8 @@ def main() -> int:
         parser.error(
             "--apply, --apply-plan, and --approved-plan are mutually exclusive"
         )
+    if args.apply_plan and args.delete_dev_releases:
+        parser.error("--delete-dev-releases cannot be combined with --apply-plan")
     if args.apply_plan and any(
         value is not None
         for value in (
@@ -706,6 +901,7 @@ def main() -> int:
             nightly_days=args.nightly_days,
             nightly_min_count=args.nightly_min_count,
             prerelease_grace_days=args.prerelease_grace_days,
+            delete_dev_releases=args.delete_dev_releases,
         )
     )
     if args.approved_plan:
@@ -726,7 +922,7 @@ def main() -> int:
         args.plan_out.parent.mkdir(parents=True, exist_ok=True)
         args.plan_out.write_text(rendered, encoding="utf-8")
     if applying:
-        store.delete_objects(plan["delete_keys"])
+        apply_gc_plan(store, plan)
         print(f"deleted {len(plan['delete_keys'])} release objects")
     else:
         print(f"dry run: {len(plan['delete_keys'])} release objects would be deleted")

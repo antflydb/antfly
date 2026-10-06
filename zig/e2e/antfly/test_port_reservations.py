@@ -224,19 +224,31 @@ def test_single_process_servers_release_requested_port_when_spawn_fails(
         contender.bind(("127.0.0.1", requested_port))
 
 
-@pytest.mark.parametrize("server_type", (PublicAntflyServer, StandaloneAntflyServer))
-def test_single_process_pause_retains_listener_port(server_type: type):
+@pytest.mark.parametrize(
+    ("server_type", "pgwire"),
+    (
+        (PublicAntflyServer, False),
+        (StandaloneAntflyServer, False),
+        (StandaloneAntflyServer, True),
+    ),
+)
+def test_single_process_pause_retains_listener_port(server_type: type, pgwire: bool):
     server = object.__new__(server_type)
     server.proc = None
     server.port_reservations = LoopbackPortReservations()
     server.port = server.port_reservations.reserve()
-    server.port_reservations.release(server.port)
+    if server_type is StandaloneAntflyServer:
+        server.pgwire_port = server.port_reservations.reserve() if pgwire else None
+    ports = (server.port, server.pgwire_port) if pgwire else (server.port,)
+    for port in ports:
+        server.port_reservations.release(port)
 
     try:
         server.pause()
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
-            with pytest.raises(OSError):
-                contender.bind(("127.0.0.1", server.port))
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as contender:
+                with pytest.raises(OSError):
+                    contender.bind(("127.0.0.1", port))
     finally:
         server.port_reservations.close()
 

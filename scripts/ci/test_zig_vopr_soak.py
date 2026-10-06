@@ -191,8 +191,9 @@ class SoakTests(unittest.TestCase):
                     root / "scripts/ci/zig_vopr_qualify.sh",
                 )
                 (root / "tools/run_bounded_zig_build.py").write_text(
-                    "import json, sys\n"
+                    "import json, sys, os\n"
                     "from pathlib import Path\n"
+                    "Path('cache-env.txt').write_text(os.environ['ZIG_GLOBAL_CACHE_DIR'])\n"
                     "Path('invocation.json').write_text(json.dumps(sys.argv[1:]))\n"
                     "sys.exit(37)\n"
                 )
@@ -243,14 +244,12 @@ class SoakTests(unittest.TestCase):
                 )
                 self.assertIn("-Doptimize=safe", args)
                 self.assertEqual(
-                    args[-4:],
-                    [
-                        "--cache-dir",
-                        "local-cache",
-                        "--global-cache-dir",
-                        "global-cache",
-                    ],
+                    args[-2:],
+                    ["--cache-dir", "local-cache"],
                 )
+
+                self.assertNotIn("--global-cache-dir", args)
+                self.assertEqual((root / "cache-env.txt").read_text(), "global-cache")
 
     def test_timeout_kills_and_reaps_a_child_that_ignores_termination(self):
         with tempfile.TemporaryDirectory() as root:

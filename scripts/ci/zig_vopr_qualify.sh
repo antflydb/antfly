@@ -25,12 +25,13 @@ fi
 
 : "${VOPR_LOCAL_CACHE_DIR:?}"
 : "${VOPR_GLOBAL_CACHE_DIR:?}"
+export ZIG_GLOBAL_CACHE_DIR="$VOPR_GLOBAL_CACHE_DIR"
 
 case "$1" in
   audit)
     exec python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build \
       vopr-determinism-audit -Doptimize=safe --summary all \
-      --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+      --cache-dir "$VOPR_LOCAL_CACHE_DIR"
     ;;
   runtime)
     : "${GITHUB_WORKSPACE:?}"
@@ -42,7 +43,7 @@ case "$1" in
       antfly-raft-transport-test standby-vopr-test vopr-runtime-test \
       restore-admission-vopr-test secrets-vopr-test \
       -Doptimize=safe --summary all \
-      --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+      --cache-dir "$VOPR_LOCAL_CACHE_DIR"
     ;;
   *)
     echo "usage: $0 audit|runtime" >&2

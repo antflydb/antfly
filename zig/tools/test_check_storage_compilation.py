@@ -142,11 +142,12 @@ class BuildFailureEvidence(unittest.TestCase):
         first_cache = None
         first_global = None
 
-        def fake_build(command, cwd, *, progress):
+        def fake_build(command, cwd, *, progress, env):
             nonlocal first_cache, first_global
             label, rebuilt = expected[len(seen)]
             local_cache = Path(command[command.index("--cache-dir") + 1])
-            global_cache = Path(command[command.index("--global-cache-dir") + 1])
+            self.assertNotIn("--global-cache-dir", command)
+            global_cache = Path(env["ZIG_GLOBAL_CACHE_DIR"])
             self.assertEqual(local_cache.parent, cwd.parent.parent)
             self.assertEqual(global_cache.parent, cwd.parent.parent)
             if first_cache is None:

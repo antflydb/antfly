@@ -206,7 +206,6 @@ fi
 zig_install_args=(
   --prefix "$prefix"
   --cache-dir "$local_cache"
-  --global-cache-dir "$cache_root/global"
 )
 
 run_zig_build_steps() {
@@ -228,7 +227,7 @@ run_zig_build_steps() {
     command+=("-j$jobs")
   fi
   command+=("${zig_build_options[@]}" "$@" "${zig_install_args[@]}")
-  "${command[@]}"
+  ZIG_GLOBAL_CACHE_DIR="$cache_root/global" "${command[@]}"
 }
 
 run_zig_build_steps_with_retry() {

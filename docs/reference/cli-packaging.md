@@ -116,15 +116,45 @@ Release-object retention is journal-aware. Stable releases are permanent;
 nightlies are retained for 30 days or for the newest 10 snapshots, whichever
 keeps more; and RC/alpha/beta artifacts remain until 90 days after the matching
 stable release's immutable completion receipt. Merely uploading stable bytes or
-creating a draft does not start that clock. Channel `current` and `pending`
-identities always override those windows. `Release object retention` emits a
-read-only plan every Monday. A manual dispatch with `apply=true`, protected by the
+creating a draft does not start that clock. Pending cleanup releases do not
+consume newest-nightly retention slots unless they are channel-protected.
+Channel `current` and `pending` identities always override those windows.
+`Release object retention` emits a read-only plan every Monday. A manual dispatch with `apply=true`, protected by the
 `release-promotion` environment, completes before the short release/GC lock is
 acquired. The apply phase recomputes the plan, verifies that no channel still
 reaches an expired container digest, removes its GAR and GHCR images, checks
 that channel journals and aliases did not change, and only then removes version
 objects, unshared content-addressed objects, and their R2 container-identity
 record. Compact completion receipts remain as permanent audit history.
+
+A release prefix without `artifacts.json` is retained and reported as
+`missing-artifact-manifest`. It does not stop retention of other version
+prefixes. Because its shared artifact and container references are unknown,
+shared-object and container sweeping remains disabled until the manifest is
+repaired or the prefix is explicitly removed. Expired releases retain their
+`artifacts.json` commit markers while this cleanup is blocked, so later runs can
+still discover and collect their shared artifacts and container identities;
+other expired version-prefix objects can be removed immediately. Before any R2
+deletion, apply persists a pending-cleanup record under `antfly/gc-pending/` for
+every expired manifested release, bound to its manifest digest, including when
+shared sweeping is enabled. Ordinary scheduled GC honors that expiration even
+if it was originally selected with the explicit dev-cleanup flag. Current and pending
+channel identities still take precedence. Cleanup records are removed after
+version manifests, so an interrupted deletion preserves the decision for a
+retry. Malformed
+existing manifests and missing manifests bound to a channel journal’s ledger
+digest still stop
+planning. Legacy aliases without a ledger digest protect their version prefixes
+even when the manifest is absent.
+
+For an explicit cleanup of dev releases, dispatch `Release object retention`
+with `delete_dev_releases=true`. This selects only unprotected dev prereleases,
+including legacy tags such as `v0.0.0-dev22`, and leaves other release tags out
+of the deletion set. Channel current and pending identities remain protected.
+Use `apply=false` to inspect the plan first; `apply=true` uses the same protected
+approval, fresh-plan comparison, and release-storage lock as ordinary retention.
+The CLI equivalent for planning is `release_gc.py --delete-dev-releases` with
+the usual endpoint and output arguments.
 
 For recovery, send the same repository dispatch with an existing release tag
 and the SHA-256 of its `artifacts.json` asset:
@@ -217,7 +247,8 @@ a repository-administrator GitHub token.
 
 Release retention plans are approval artifacts, not advisory previews. Their
 canonical SHA-256 covers policy, retained and expired identities, R2 keys,
-container digests, and per-ledger container records. Apply recomputes under the
+pending-cleanup record writes, container digests, and per-ledger container
+records. Apply recomputes under the
 release-storage lock and aborts unless that contract is unchanged. Container
 records are collected independently from their shared OCI digest, while a new
 release missing its required record is retained for repair.

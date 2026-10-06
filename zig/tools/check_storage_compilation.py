@@ -125,7 +125,12 @@ def write_report(path: Path, records: list[dict]) -> None:
 
 
 def measured_build(
-    command: list[str], cwd: Path, *, timeout_seconds: float = 1800, progress=None
+    command: list[str],
+    cwd: Path,
+    *,
+    timeout_seconds: float = 1800,
+    progress=None,
+    env=None,
 ) -> tuple[int, str, dict]:
     """Sample concurrent RSS; wait4 accounts CPU for the entire waited tree."""
     started = time.monotonic()
@@ -137,6 +142,7 @@ def measured_build(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env=env,
             stdout=output,
             stderr=subprocess.STDOUT,
             text=True,
@@ -351,8 +357,6 @@ def main() -> None:
                 "off",
                 "--cache-dir",
                 str(local_cache),
-                "--global-cache-dir",
-                str(global_cache),
             ]
             command = bounded_build_command(args.zig, arguments)
             record = {
@@ -370,7 +374,10 @@ def main() -> None:
 
             try:
                 returncode, output, measurements = measured_build(
-                    command, root / "zig", progress=progress
+                    command,
+                    root / "zig",
+                    progress=progress,
+                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
                 )
             except BaseException as err:
                 record.update(status="interrupted", error=type(err).__name__)

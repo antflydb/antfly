@@ -36,6 +36,15 @@ class CacheContractShardTests(unittest.TestCase):
         self.assertEqual(runtime | storage, discovered)
         self.assertIn(routing.HOST_GENERATOR, storage)
 
+    def test_runtime_ci_shards_cover_every_runtime_contract_once(self):
+        runtime = {case.id() for case in routing.cases(routing.select("runtime"))}
+        first = {case.id() for case in routing.cases(routing.select("runtime-1"))}
+        second = {case.id() for case in routing.cases(routing.select("runtime-2"))}
+        self.assertFalse(first & second)
+        self.assertEqual(first | second, runtime)
+        self.assertLessEqual(abs(len(first) - len(second)), 1)
+        self.assertNotIn(routing.HOST_GENERATOR, first | second)
+
 
 if __name__ == "__main__":
     unittest.main()

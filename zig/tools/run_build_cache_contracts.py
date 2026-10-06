@@ -59,7 +59,12 @@ def select(shard: str) -> unittest.TestSuite:
             raise RuntimeError(f"unassigned cache contract: {name}")
     if len(owners) != len(all_cases):
         raise RuntimeError("duplicate cache contract discovered")
-    selected = [case for case in all_cases if owners[case.id()] == shard]
+    owner = "runtime" if shard in {"runtime-1", "runtime-2"} else shard
+    selected = [case for case in all_cases if owners[case.id()] == owner]
+    if shard in {"runtime-1", "runtime-2"}:
+        # Interleave the ordered runtime contracts so expensive native builds
+        # and checkpoint fixtures are spread across both runners.
+        selected = selected[int(shard[-1]) - 1 :: 2]
     if not selected:
         raise RuntimeError(f"{shard}: no cache contracts selected")
     return unittest.TestSuite(selected)
@@ -67,7 +72,9 @@ def select(shard: str) -> unittest.TestSuite:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("shard", choices=("runtime", "storage"))
+    parser.add_argument(
+        "shard", choices=("runtime", "runtime-1", "runtime-2", "storage")
+    )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
     suite = select(args.shard)
