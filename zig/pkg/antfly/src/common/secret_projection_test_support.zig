@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const secrets = @import("secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 
 pub const Projection = struct {
     tmp: std.testing.TmpDir,

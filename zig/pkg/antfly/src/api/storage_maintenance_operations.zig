@@ -6,9 +6,9 @@
 //! Typed storage-maintenance operations shared by HTTP and in-process callers.
 
 const std = @import("std");
-const operation = @import("operation.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const maintenance = @import("../storage/maintenance.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const maintenance = @import("antfly_local_sources").storage_maintenance;
 
 pub const Error = operation.ApiError || error{
     MaintenanceBusy,

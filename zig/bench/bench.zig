@@ -410,7 +410,7 @@ pub fn main() !void {
 
     // --- BM25 Scorer benchmark ---
     {
-        var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+        var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
         const gpa = gpa_state.allocator();
 
         const scorer_doc_count: u32 = 10_000;

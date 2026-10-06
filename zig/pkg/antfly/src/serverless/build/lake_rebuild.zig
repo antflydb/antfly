@@ -20,14 +20,14 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const algebraic_segment = @import("../algebraic_segment/mod.zig");
+const algebraic_segment = @import("antfly_local_sources").serverless_algebraic_segment_mod;
 const artifact_store = @import("../artifacts/store.zig");
-const external_source = @import("../external_source/types.zig");
-const manifest_artifact = @import("../manifest/artifact_ref.zig");
-const manifest_base_source = @import("../manifest/base_source.zig");
-const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
-const source_binding = @import("../segment/source_binding.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const external_source = @import("antfly_local_sources").serverless_external_source_types;
+const manifest_artifact = @import("antfly_local_sources").serverless_manifest_artifact_ref;
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
+const sidecar_manifest = @import("antfly_local_sources").serverless_segment_sidecar_manifest;
+const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const lake_sidecar_algebraic = @import("lake_sidecar_algebraic.zig");
 const lake_sidecar_graph = @import("lake_sidecar_graph.zig");
 const graph_metric_config = @import("graph_metric_config.zig");
@@ -773,7 +773,7 @@ fn stampExternalGraphTopologyGenerations(
 fn graphMetricDeclarationAlloc(
     alloc: Allocator,
     graph_declaration: sidecar_manifest.DeclaredArtifact,
-    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    config: @import("antfly_local_sources").graph_graph.GraphMetricConfig,
     artifact: manifest_artifact.ArtifactRef,
 ) !sidecar_manifest.DeclaredArtifact {
     const name = try alloc.dupe(u8, artifact.name);
@@ -1448,7 +1448,7 @@ fn graphIndexConfigJsonAlloc(
 
 fn graphMetricBindingHashAlloc(
     alloc: Allocator,
-    config: @import("../../graph/graph.zig").GraphMetricConfig,
+    config: @import("antfly_local_sources").graph_graph.GraphMetricConfig,
     graph_artifact_id: []const u8,
 ) ![]u8 {
     return try std.fmt.allocPrint(

@@ -1,12 +1,12 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const describe = @import("describe.zig");
-const relation_binding = @import("relation_binding.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const describe = @import("antfly_local_sources").sql_describe;
+const relation_binding = @import("antfly_local_sources").sql_relation_binding;
 
 const Backend = struct {
     const Cursor = struct {
@@ -331,7 +331,7 @@ test "SQL joined FROM mutations choose hash keys and preserve CTE target identit
 
 test "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutation" {
     const alloc = std.testing.allocator;
-    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     const Fixture = struct {
         const Self = @This();

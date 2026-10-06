@@ -13,7 +13,7 @@
 // limitations.
 
 //! Server replica-catalog admission around local backup materialization.
-const engine = @import("../../storage/backup_restore.zig");
+const engine = @import("antfly_local_sources").storage_backup_restore;
 pub const PreparedRestore = engine.PreparedRestore;
 pub const RestoreAuthority = engine.RestoreAuthority;
 pub const RestoreOptions = engine.RestoreOptions;
@@ -33,8 +33,8 @@ pub const validateCommittedRestoreIdentity = engine.validateCommittedRestoreIden
 pub const validateCommittedRestoreIdentityWithIo = engine.validateCommittedRestoreIdentityWithIo;
 pub const validateImportedRestoreIdentity = engine.validateImportedRestoreIdentity;
 pub const validateImportedRestoreIdentityWithIo = engine.validateImportedRestoreIdentityWithIo;
-const backups_api = @import("../../api/local_backups.zig");
-const db_mod = @import("../../storage/db/selected_root.zig").db;
+const backups_api = @import("antfly_local_sources").api_local_backups;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 pub const publishedRestoreAlreadyApplied = engine.publishedRestoreAlreadyApplied;
 const std = @import("std");
 const writeFile = engine.test_support.writeFile;

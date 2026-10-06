@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const fixture_format = @import("storage/sim_fixture.zig");
+const fixture_format = @import("antfly_local_sources").storage_sim_fixture;
 
 const DestinationSpec = struct {
     root_dir: []const u8,
@@ -140,43 +140,43 @@ fn destinationSpec(mode: []const u8) !DestinationSpec {
     }
     if (std.mem.eql(u8, mode, "wal")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/wal_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures",
             .category = "replay",
         };
     }
     if (std.mem.eql(u8, mode, "wal_crash")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/wal_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures",
             .category = "crash",
         };
     }
     if (std.mem.eql(u8, mode, "persistent")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/persistent_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/persistent_sim_fixtures",
             .category = "replay",
         };
     }
     if (std.mem.eql(u8, mode, "persistent_crash")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/persistent_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/persistent_sim_fixtures",
             .category = "crash",
         };
     }
     if (std.mem.eql(u8, mode, "index_manager")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/db/catalog/index_manager_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/db/catalog/index_manager_sim_fixtures",
             .category = "replay",
         };
     }
     if (std.mem.eql(u8, mode, "index_manager_crash")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/db/catalog/index_manager_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/db/catalog/index_manager_sim_fixtures",
             .category = "crash",
         };
     }
     if (std.mem.eql(u8, mode, "db_split")) {
         return .{
-            .root_dir = "pkg/antfly/src/storage/db/db_sim_fixtures",
+            .root_dir = "pkg/antfly-embedded/src/local/storage/db/db_sim_fixtures",
             .category = "replay",
         };
     }
@@ -237,3 +237,6 @@ fn printUsage() void {
         .{},
     );
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

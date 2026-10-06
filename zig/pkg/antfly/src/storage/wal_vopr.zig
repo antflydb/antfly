@@ -11,8 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const wal_mod = @import("wal.zig");
-const storage_sim = @import("sim_runtime.zig");
+const wal_mod = @import("antfly_local_sources").storage_wal;
+const storage_sim = @import("antfly_local_sources").storage_sim_runtime;
 
 const Allocator = std.mem.Allocator;
 const WAL = wal_mod.WAL;

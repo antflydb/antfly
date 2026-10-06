@@ -3,19 +3,19 @@
 //! region; select the source with positional argument 7 (journal or primary). Indexing,
 //! OpenAI calls and document-body decoding are deliberately excluded.
 const std = @import("std");
-const worker = @import("storage/db/derived/derived_worker.zig");
-const journal = @import("storage/db/derived/change_journal.zig");
-const source = @import("storage/db/derived/replay_source.zig");
-const mem_backend = @import("storage/mem_backend.zig");
-const docstore = @import("storage/docstore.zig");
-const types = @import("storage/db/derived/derived_types.zig");
-const indexes = @import("storage/db/catalog/index_manager.zig");
-const resources = @import("storage/resource_manager.zig");
+const worker = @import("antfly_local_sources").storage_db_derived_derived_worker;
+const journal = @import("antfly_local_sources").storage_db_derived_change_journal;
+const source = @import("antfly_local_sources").storage_db_derived_replay_source;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const docstore = @import("antfly_local_sources").storage_docstore;
+const types = @import("antfly_local_sources").storage_db_derived_derived_types;
+const indexes = @import("antfly_local_sources").storage_db_catalog_index_manager;
+const resources = @import("antfly_local_sources").storage_resource_manager;
 const time = @import("antfly_platform").time;
 
 const Operation = enum { replay, enrichment, latest, ordinal, scalar_ordinal, scratch_trim };
 
-const Counter = @import("allocation_bench_support.zig").Counter;
+const Counter = @import("antfly_local_sources").allocation_bench_support.Counter;
 
 const Consumer = struct {
     count: usize = 0,
@@ -143,8 +143,8 @@ pub fn main(init: std.process.Init) !void {
 // Measures the production identity lookup helper with a validating borrowed
 // sorted-read callback. Backend I/O is excluded so key preparation is isolated.
 fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool, fixture: []const u8, scalar: bool) !void {
-    const identity = @import("storage/db/doc_identity.zig");
-    const internal = @import("storage/internal_keys.zig");
+    const identity = @import("antfly_local_sources").storage_db_doc_identity;
+    const internal = @import("antfly_local_sources").storage_internal_keys;
     const long = std.mem.eql(u8, fixture, "long");
     const missing = std.mem.eql(u8, fixture, "missing");
     if (!long and !missing and !std.mem.eql(u8, fixture, "short")) return error.InvalidOrdinalFixture;

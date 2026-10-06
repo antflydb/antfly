@@ -20,7 +20,7 @@ pub fn permanent(err: anyerror) bool {
     // deterministic row rejections, not repairable decoder/provider pressure.
     // In particular, restore must not retry forever or recompute a forged
     // stored-generated value to make it pass validation.
-    if (@import("../schema/relational_expression_errors.zig").isInvalidInput(err)) return true;
+    if (@import("antfly_local_sources").schema_relational_expression_errors.isInvalidInput(err)) return true;
     return switch (err) {
         error.BackupIntegrityFailure,
         error.BackupArtifactIntegrityMismatch,

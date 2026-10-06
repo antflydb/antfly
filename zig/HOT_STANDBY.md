@@ -131,13 +131,13 @@ copied wholesale for this non-Raft mode.
 
 The Zig tree already has several primitives that fit this design.
 
-The generic storage WAL in `pkg/antfly/src/storage/wal.zig` is append-only,
+The generic storage WAL in `pkg/antfly-embedded/src/local/storage/wal.zig` is append-only,
 LSN-ordered, CRC-protected, truncatable, and replayable. It intentionally stores
 opaque byte entries, so it can back storage persistence, consensus logs, or a
 replication stream.
 
 The LSM backend already persists mutable state through its own WAL path in
-`pkg/antfly/src/storage/lsm_backend.zig`. `appendWalForMutable` writes state
+`pkg/antfly-embedded/src/local/storage/lsm_backend.zig`. `appendWalForMutable` writes state
 records, and `replayWalIntoMutable` replays them at open time.
 
 The DB layer also has sequence-ordered derived/change journal machinery under
@@ -1248,7 +1248,7 @@ old phase ordering where one component depends on another.
 
 ### Local Replication Format
 
-`zig/pkg/antfly/src/storage/db/replication_record.zig` defines the
+`zig/pkg/antfly-embedded/src/local/storage/db/replication_record.zig` defines the
 `ReplicationRecord` envelope and binary codec described in
 [WAL Stream Shape](#wal-stream-shape). `compat.zig` hard-codes golden v1
 byte fixtures so header, endian, enum, CRC, or payload layout drift is caught

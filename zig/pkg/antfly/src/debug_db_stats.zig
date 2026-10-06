@@ -60,3 +60,6 @@ pub fn main() !void {
     defer db_mod.types.freeDBStats(alloc, stats);
     std.debug.print("stats doc_count={d} index_count={d}\n", .{ stats.doc_count, stats.index_count });
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

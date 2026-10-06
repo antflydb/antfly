@@ -3,9 +3,9 @@
 //! Authorized SQL catalog mutations use the same durable authority as REST.
 const std = @import("std");
 const server_mod = @import("http_server.zig");
-const catalog = @import("../sql/catalog.zig");
-const domain = @import("../system_catalog/domain.zig");
-const operation = @import("operation.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const operation = @import("antfly_local_sources").api_operation;
 const tables = @import("tables.zig");
 const restore_jobs = @import("restore_jobs.zig");
 
@@ -19,7 +19,7 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
     return .{ .database = database, .namespace = namespace, .table = table, .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table_id}), .schema_version = version, .state = .pending };
 }
 
-fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, ddl: @import("../sql/ast.zig").CatalogDdl) !catalog.DdlOutcome {
+fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) !catalog.DdlOutcome {
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -29,12 +29,12 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     if (snapshot.tables.len != 1) return error.InvalidSqlBackendResponse;
     const table = snapshot.tables[0] orelse return error.TableNotFound;
     const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(a, definition.schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed.deinit(a);
-    const native = try @import("../schema/mod.zig").deriveRuntimeTableSchema(a, parsed);
+    const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false });
-    if (!try @import("../sql/schema_ddl.zig").apply(a, &schema, ddl)) return .{};
+    if (!try @import("antfly_local_sources").sql_schema_ddl.apply(a, &schema, ddl)) return .{};
     _ = schema.object.swapRemove("version");
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
     const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);
@@ -479,23 +479,23 @@ fn activationPause(server: *server_mod.ApiHttpServer, context: operation.Request
 
 test "SQL catalog DDL schema validates through native public admission" {
     const alloc = std.testing.allocator;
-    var compiled = try @import("../sql/compiler.zig").compile(alloc, "CREATE TABLE items (id BIGINT NOT NULL DEFAULT 9007199254740993, label TEXT DEFAULT NULL, payload JSON DEFAULT NULL, created TIMESTAMPTZ DEFAULT '2026-09-21T00:00:00Z', enabled BOOLEAN DEFAULT TRUE, amount DOUBLE PRECISION DEFAULT 1.5)", .{});
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE TABLE items (id BIGINT NOT NULL DEFAULT 9007199254740993, label TEXT DEFAULT NULL, payload JSON DEFAULT NULL, created TIMESTAMPTZ DEFAULT '2026-09-21T00:00:00Z', enabled BOOLEAN DEFAULT TRUE, amount DOUBLE PRECISION DEFAULT 1.5)", .{});
     defer compiled.deinit();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const schema_json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+    const schema_json = try @import("antfly_local_sources").sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
     const value = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .parse_numbers = false });
     const body = try std.json.Stringify.valueAlloc(a, .{ .schema = value, .indexes = std.json.Value{ .object = .empty } }, .{});
     var request = try tables.parseStoredCreateTableRequest(alloc, body);
     defer request.deinit(alloc);
     try std.testing.expectEqualStrings("{}", request.indexes_json.?);
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, request.schema_json.?);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, request.schema_json.?);
     defer parsed.deinit(alloc);
-    const native = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
-    defer @import("../storage/schema.zig").freeSchema(alloc, native);
+    const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, native);
     try std.testing.expectEqual(@as(usize, 6), native.relational_columns.len);
-    try std.testing.expectEqual(@import("../storage/schema.zig").StorageMode.relational, native.storage_mode);
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_schema.StorageMode.relational, native.storage_mode);
     try std.testing.expect(parsed.column_defaults != null);
 }
 
@@ -528,14 +528,14 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run, .supports_query_definitions = true, .mutate_schema = Source.mutate } }, null, null);
     defer server.deinit();
     for ([_][]const u8{ "CREATE INDEX items_id ON items (id)", "ALTER TABLE items ADD COLUMN label TEXT", "CREATE INDEX expression_key ON items ((id + 1) DESC NULLS LAST) WHERE id > 0 AND id < 100" }) |sql| {
-        var compiled = try @import("../sql/compiler.zig").compile(alloc, sql, .{});
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
         defer compiled.deinit();
         try std.testing.expectEqual(catalog.MutationOutcome.committed, (try execute(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = compiled.statement.catalog_ddl })).mutation_outcome);
     }
     try std.testing.expectEqual(@as(usize, 3), source.updates);
     var result_arena = std.heap.ArenaAllocator.init(alloc);
     defer result_arena.deinit();
-    var unique = try @import("../sql/compiler.zig").compile(alloc, "CREATE UNIQUE INDEX unique_id ON items (id)", .{});
+    var unique = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE UNIQUE INDEX unique_id ON items (id)", .{});
     defer unique.deinit();
     const outcome = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = unique.statement.catalog_ddl });
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, outcome.mutation_outcome);
@@ -543,7 +543,7 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     try std.testing.expectEqual(@as(u32, 8), outcome.receipt.?.schema_version);
     try std.testing.expectEqualStrings("17", outcome.receipt.?.table_id);
     try std.testing.expectEqual(@as(usize, 4), source.updates);
-    var check = try @import("../sql/compiler.zig").compile(alloc, "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100)", .{});
+    var check = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100)", .{});
     defer check.deinit();
     const checked = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = check.statement.catalog_ddl });
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, checked.mutation_outcome);
@@ -688,7 +688,7 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     defer permission.deinit(alloc);
     var user = try manager.createUser("ddl_admin", "secret", &.{permission});
     defer user.deinit(alloc);
-    var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    var runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
     var source: Source = .{ .store = &store };
     var server = server_mod.ApiHttpServer.init(alloc, .{ .user_manager = &manager, .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run } }, null, null);
@@ -782,12 +782,12 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     const owner_path = try provisioner.groupDbPathFromReplicaRoot(alloc, replica_root, published_ranges[0].group_id);
     defer alloc.free(owner_path);
     {
-        var owner = try @import("../storage/db/selected_root.zig").db.DB.open(alloc, owner_path, .{});
+        var owner = try @import("antfly_local_sources").storage_db_selected_root.db.DB.open(alloc, owner_path, .{});
         defer owner.close();
         try owner.batch(.{ .writes = &.{.{ .key = "doc:1", .value = "{\"id\":\"550E8400E29B41D4A716446655440000\"}" }}, .sync_level = .write });
     }
     {
-        var owner = try @import("../storage/db/selected_root.zig").db.DB.open(alloc, owner_path, .{});
+        var owner = try @import("antfly_local_sources").storage_db_selected_root.db.DB.open(alloc, owner_path, .{});
         defer owner.close();
         const row = (try owner.get(alloc, "doc:1")) orelse return error.MissingSqlRow;
         defer alloc.free(row);

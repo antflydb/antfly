@@ -1808,6 +1808,90 @@ pub const CdcConnection = struct {
     }
 };
 
+pub const ChatGPTAccount = struct {
+    connection_id: []const u8,
+    email: []const u8,
+    label: []const u8,
+    connected: bool,
+    plan_enabled: bool,
+};
+
+pub const ChatGPTAccounts = struct {
+    accounts: []const ChatGPTAccount,
+};
+
+pub const ChatGPTAuthorize = struct {
+    connection_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "connection_id", "connection_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChatGPTBegin = struct {
+    attempt_id: []const u8,
+    authorization_url: []const u8,
+    expires_at: i64,
+};
+
+pub const ChatGPTDisconnect = struct {
+    revocation_confirmed: bool,
+};
+
+pub const ChatGPTOutcome = struct {
+    status: []const u8,
+    connection_id: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "connection_id", "connection_id", true },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Native cluster backups pin a common transaction cut across a dependency-complete table set. Restart-stable LSM seals are journaled before releasing write fences; artifact upload uses those immutable seals without holding the write pause. Native cohorts support at most 4096 tables and 4096 ranges and require the filesystem-managed LSM backend. Portable backups do not support coordinated UNIQUE/FK constraints or promise a common cross-table transaction cut.
 pub const ClusterBackupRequest = struct {
     /// Unique identifier for this backup. Used to reference the backup for restore operations. Choose a meaningful name that includes date/version information.
@@ -2399,6 +2483,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -2410,6 +2495,7 @@ pub const ClusterStatus = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -2438,6 +2524,10 @@ pub const ClusterStatus = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -2468,6 +2558,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -2480,6 +2571,7 @@ pub const ClusterTopology = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -2509,6 +2601,10 @@ pub const ClusterTopology = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -2795,6 +2891,11 @@ pub const ConnectionStatus = enum {
 
 pub const ConnectionsResponse = struct {
     connections: []const Connection,
+};
+
+/// Effective integration availability for this deployment; independent of login providers and individual grants.
+pub const ConnectorCapabilities = struct {
+    chatgpt: std.json.Value,
 };
 
 pub const CreateTableRequest = struct {

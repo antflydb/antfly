@@ -11,12 +11,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const db_types = @import("../storage/db/types.zig");
-const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const text_merge_runtime = @import("../storage/db/maintenance/text_merge_runtime.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const db_types = @import("antfly_local_sources").storage_db_types;
+const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const text_merge_runtime = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 pub const Fixture = struct {
     allocator: std.mem.Allocator,
@@ -1291,7 +1291,7 @@ test "DB index request races VOPR exact replays delete materialize and capture h
     // Zig's debug allocator captures native stack traces by default, which is
     // not defined while executing on a switched fiber stack. Retain allocator
     // safety and leak checking while disabling only that host-only diagnostic.
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const allocator = alloc_state.allocator();
 

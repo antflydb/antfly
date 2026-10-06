@@ -18,6 +18,7 @@ const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const google_auth = @import("antfly_google").auth;
 const scraping = @import("antfly_scraping");
+pub const apple_native = @import("antfly_apple_native");
 
 const Allocator = std.mem.Allocator;
 const vertex_auth_scope = "https://www.googleapis.com/auth/cloud-platform";
@@ -32,12 +33,14 @@ pub const Provider = enum {
     antfly,
     openai,
     vertex,
+    apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.write(switch (self) {
             .antfly => "antfly",
             .openai => "openai",
             .vertex => "vertex",
+            .apple => "apple",
         });
     }
 
@@ -49,6 +52,7 @@ pub const Provider = enum {
         if (std.mem.eql(u8, raw, "antfly")) return .antfly;
         if (std.mem.eql(u8, raw, "openai")) return .openai;
         if (std.mem.eql(u8, raw, "vertex")) return .vertex;
+        if (std.mem.eql(u8, raw, "apple")) return .apple;
         return error.UnexpectedToken;
     }
 };
@@ -82,6 +86,18 @@ pub const Config = struct {
     timestamps: ?bool = null,
     /// Ask the provider for speaker labels where it supports them.
     diarization: ?bool = null,
+    /// Explicitly permit Speech asset preparation. Disabled by default.
+    download_assets: bool = false,
+
+    pub fn validate(self: Config) !void {
+        if (self.provider != .apple) return;
+        if (self.model != null) return error.InvalidAppleTranscribingConfig;
+        if (self.api_key != null or self.bearer_token != null or self.capability_token != null or self.capability_revision != null or
+            self.base_url != null or self.url != null or self.api_url != null or self.project_id != null or self.location != null or self.credentials_path != null or
+            self.framed_attachments or self.use_enhanced != null or self.enable_automatic_punctuation != null or (self.diarization orelse false))
+            return error.UnsupportedAppleTranscriptionOptions;
+        if (self.max_download_bytes) |limit| if (limit > default_max_download_bytes) return error.AppleNativeInputTooLarge;
+    }
 
     pub fn resolvedUrl(self: Config) ?[]const u8 {
         return self.url orelse self.api_url;
@@ -98,9 +114,13 @@ pub const default_max_download_bytes: usize = 128 << 20;
 /// Zero is treated as unset. The schema's minimum is one byte and a ceiling
 /// of zero rejects every recording, so it is always a client that filled in
 /// a field it meant to leave out rather than an operator asking for it.
-fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
+pub fn effectiveMaxDownloadBytes(max_download_bytes: ?usize) usize {
     const configured = if (max_download_bytes) |value| (if (value == 0) null else value) else null;
-    return .{ .max_download_size_bytes = configured orelse default_max_download_bytes };
+    return configured orelse default_max_download_bytes;
+}
+
+fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
+    return .{ .max_download_size_bytes = effectiveMaxDownloadBytes(max_download_bytes) };
 }
 
 threadlocal var active_runtime: ?*const Runtime = null;
@@ -220,6 +240,7 @@ pub const Registry = struct {
     }
 
     pub fn registerConfig(self: *Registry, name: []const u8, cfg: Config) !void {
+        try cfg.validate();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);
         const owned = try cloneConfig(self.allocator, cfg);
@@ -353,6 +374,39 @@ pub fn deinitResponse(alloc: Allocator, response: *Response) void {
     response.* = undefined;
 }
 
+fn cloneResponse(alloc: Allocator, value: Response) !Response {
+    var result = value;
+    result.text = null;
+    result.language = null;
+    result.segments = null;
+    result.speakers = null;
+    errdefer deinitResponse(alloc, &result);
+    result.text = try dupOpt(alloc, value.text);
+    result.language = try dupOpt(alloc, value.language);
+    if (value.segments) |segments| {
+        const owned = try alloc.alloc(Segment, segments.len);
+        for (owned) |*segment| segment.* = .{};
+        result.segments = owned;
+        for (segments, owned) |source, *target| {
+            target.start_ms = source.start_ms;
+            target.end_ms = source.end_ms;
+            target.text = try dupOpt(alloc, source.text);
+            target.speaker = try dupOpt(alloc, source.speaker);
+            if (source.words) |words| {
+                const copied = try alloc.alloc(WordTimestamp, words.len);
+                for (copied) |*word| word.* = .{};
+                target.words = copied;
+                for (words, copied) |word, *copy| {
+                    copy.start_ms = word.start_ms;
+                    copy.end_ms = word.end_ms;
+                    copy.word = try dupOpt(alloc, word.word);
+                }
+            }
+        }
+    }
+    return result;
+}
+
 fn deinitConfigValue(alloc: Allocator, cfg: Config) void {
     var owned = cfg;
     deinitConfig(alloc, &owned);
@@ -396,11 +450,143 @@ fn initTranscriber(alloc: Allocator, http: *httpx.Client, cfg: Config) !Transcri
 }
 
 fn initTranscriberWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
+    try cfg.validate();
     return switch (cfg.provider) {
         .antfly => try AntflyTranscriberState.init(alloc, http, cfg, options),
         .openai => try OpenAiTranscriberState.init(alloc, http, cfg),
         .vertex => try VertexTranscriberState.init(alloc, http, cfg),
+        .apple => try AppleTranscriberState.init(alloc, http, cfg, options),
     };
+}
+
+const AppleTranscriberState = struct {
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: RemoteOptions,
+
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Transcriber {
+        const state = try alloc.create(@This());
+        errdefer alloc.destroy(state);
+        state.* = .{ .alloc = alloc, .http = http, .cfg = try cloneConfig(alloc, cfg), .options = options };
+        return .{ .ptr = state, .vtable = &.{ .transcribe = transcribe, .deinit = deinit } };
+    }
+    fn deinit(ptr: *anyopaque) void {
+        const state: *@This() = @ptrCast(@alignCast(ptr));
+        deinitConfig(state.alloc, &state.cfg);
+        state.alloc.destroy(state);
+    }
+    fn transcribe(ptr: *anyopaque, alloc: Allocator, request: Request) !Response {
+        const state: *@This() = @ptrCast(@alignCast(ptr));
+        try apple_native.checkAvailable();
+        if (state.options.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const started = apple_native.time.monotonicNs();
+        if (request.diarization orelse false) return error.UnsupportedAppleTranscriptionOptions;
+        const json_request = try std.json.Stringify.valueAlloc(alloc, .{
+            .language = request.language orelse state.cfg.language_code orelse "en-US",
+            .timestamps = request.timestamps orelse state.cfg.timestamps orelse true,
+            .download_assets = state.cfg.download_assets,
+        }, .{});
+        defer alloc.free(json_request);
+        const security = remoteFetchSecurity(state.cfg.max_download_bytes);
+        const credentials: ?scraping.S3CredentialsConfig = if (request.s3_credentials) |value| .{
+            .endpoint = if (value.endpoint) |field| @constCast(field) else null,
+            .use_ssl = value.use_ssl,
+            .access_key_id = if (value.access_key_id) |field| @constCast(field) else null,
+            .secret_access_key = if (value.secret_access_key) |field| @constCast(field) else null,
+            .session_token = if (value.session_token) |field| @constCast(field) else null,
+        } else null;
+        var content = scraping.downloadContentAllocWithContext(alloc, .{
+            .io = state.http.io,
+            .timeout_ms = state.options.timeout_ms,
+            .cancellation = if (state.options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+        }, request.url, &security, if (credentials) |*value| value else null) catch |err| {
+            if (err == error.Canceled) return error.Cancelled;
+            return err;
+        };
+        defer content.deinit(alloc);
+        const remaining_ms = if (state.options.timeout_ms) |ms| blk: {
+            if (ms == 0) break :blk ms;
+            const deadline = started +| (ms *| std.time.ns_per_ms);
+            const now = apple_native.time.monotonicNs();
+            if (now >= deadline) return error.Timeout;
+            break :blk @max(1, (deadline - now) / std.time.ns_per_ms);
+        } else null;
+        const response_json = try apple_native.invoke(alloc, .transcribe, json_request, content.data, state.cfg.max_response_bytes orelse (8 * 1024 * 1024), .{
+            .timeout_ms = remaining_ms,
+            .cancellation = state.options.cancellation,
+        });
+        defer alloc.free(response_json);
+        var parsed = try std.json.parseFromSlice(Response, alloc, response_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return cloneResponse(alloc, parsed.value);
+    }
+};
+
+test "Apple transcription validates native options and owns cloned timestamps" {
+    try (Config{ .provider = .apple }).validate();
+    try std.testing.expectError(error.UnsupportedAppleTranscriptionOptions, (Config{ .provider = .apple, .diarization = true }).validate());
+    try std.testing.expectError(error.InvalidAppleTranscribingConfig, (Config{ .provider = .apple, .model = "whisper-1" }).validate());
+    try std.testing.expectError(error.InvalidAppleTranscribingConfig, (Config{ .provider = .apple, .model = "speech-transcriber" }).validate());
+    try std.testing.expectError(error.InvalidAppleTranscribingConfig, (Config{ .provider = .apple, .model = "" }).validate());
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var response = try cloneResponse(alloc, .{
+                .text = "hello",
+                .language = "en-US",
+                .duration_ms = 100,
+                .segments = &.{.{ .text = "hello", .start_ms = 0, .end_ms = 100, .words = &.{.{ .word = "hello", .start_ms = 0, .end_ms = 100 }} }},
+            });
+            defer deinitResponse(alloc, &response);
+            try std.testing.expectEqualStrings("hello", response.segments.?[0].words.?[0].word.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "Apple transcription recognizes a recording with phrase and word timestamps" {
+    if (!apple_native.enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const fixture = @embedFile("testdata/apple-speech.wav");
+    const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(fixture.len));
+    defer alloc.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, fixture);
+    const uri = try std.fmt.allocPrint(alloc, "data:audio/wav;base64,{s}", .{encoded});
+    defer alloc.free(uri);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{});
+    defer client.deinit();
+    var response = try transcribeWithConfig(alloc, &client, .{ .provider = .apple, .language_code = "en-US" }, .{
+        .url = uri,
+        .timestamps = true,
+    }, .{ .timeout_ms = 60_000 });
+    defer deinitResponse(alloc, &response);
+    try std.testing.expectEqualStrings("The quick brown fox jumps over the lazy dog.", response.text.?);
+    try std.testing.expect(response.duration_ms.? > 2000 and response.duration_ms.? < 3000);
+    try std.testing.expect(response.segments.?.len > 0);
+    for (response.segments.?) |segment| {
+        try std.testing.expect(segment.start_ms.? >= 0 and segment.end_ms.? <= response.duration_ms.?);
+        const words = segment.words.?;
+        try std.testing.expect(words.len > 0);
+        for (words) |word| try std.testing.expect(word.start_ms.? >= segment.start_ms.? and word.end_ms.? <= segment.end_ms.?);
+    }
+    try std.testing.expectError(error.UnsupportedAppleSpeechLocale, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .language_code = "xx-XX" }, .{ .url = uri }, .{}));
+    try std.testing.expectError(error.ResponseTooLarge, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .max_response_bytes = 16 }, .{ .url = uri }, .{}));
+    // Keep the recording compact while representing more than an hour of
+    // audio: the PCM fixture has 39,946 frames, or 3,994.6 seconds at 10 Hz.
+    const long_fixture = try alloc.dupe(u8, fixture);
+    defer alloc.free(long_fixture);
+    std.mem.writeInt(u32, long_fixture[24..28], 10, .little);
+    std.mem.writeInt(u32, long_fixture[28..32], 20, .little);
+    _ = std.base64.standard.Encoder.encode(encoded, long_fixture);
+    const long_uri = try std.fmt.allocPrint(alloc, "data:audio/wav;base64,{s}", .{encoded});
+    defer alloc.free(long_uri);
+    try std.testing.expectError(error.AppleSpeechDurationExceeded, transcribeWithConfig(alloc, &client, .{ .provider = .apple }, .{ .url = long_uri }, .{ .timeout_ms = 60_000 }));
+    const cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Cancelled, transcribeWithConfig(alloc, &client, .{ .provider = .apple }, .{ .url = uri }, .{
+        .cancellation = httpx.CancellationToken.fromAtomic(&cancelled),
+    }));
 }
 
 pub fn transcribeWithConfig(

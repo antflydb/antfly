@@ -18,7 +18,7 @@
 //! protect serving-critical pruning and routing data.
 
 const std = @import("std");
-const artifact_ref = @import("../manifest/artifact_ref.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const CacheClass = enum {
     row_fragment_data,

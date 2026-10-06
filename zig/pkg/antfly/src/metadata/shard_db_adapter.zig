@@ -15,12 +15,12 @@
 const std = @import("std");
 const storage_source_options = @import("storage_source_options");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("api.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
 
 pub const IndexActivationTarget = struct {
     metadata_group_id: u64,

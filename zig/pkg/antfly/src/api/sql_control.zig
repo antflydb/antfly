@@ -1,6 +1,6 @@
 // Copyright 2026 Antfly, Inc. Licensed under the Elastic License 2.0.
 const std = @import("std");
-const compiler = @import("../sql/compiler.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
 const cache = @import("../sql/plan_cache.zig");
 
 // Classification is bounded, schema independent, and uses the same grammar as

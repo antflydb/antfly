@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const bench = @import("serverless/query/lake_parquet_rowgroup.zig").RefinementBenchmark;
+const bench = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup.RefinementBenchmark;
 test "native dictionary refinement benchmark" {
     _ = try bench.dictionary(std.testing.io, 512, false);
     _ = try bench.dictionary(std.testing.io, 512, true);

@@ -15,8 +15,8 @@
 const std = @import("std");
 const ant_json = @import("antfly-json");
 const platform = @import("antfly_platform");
-const common_config = @import("../common/config.zig");
-const group_ids = @import("../common/group_ids.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const raft_engine = @import("raft_engine");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_http_client = @import("../metadata/http_client.zig");
@@ -38,7 +38,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const routes = @import("http_routes.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const internal_keys = @import("../storage/internal_keys.zig");
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_catalog = @import("table_catalog.zig");
 const ProvisionedGroupStorage = @import("provisioned_storage.zig").ProvisionedGroupStorage;
@@ -53,7 +53,7 @@ const query_openapi = @import("antfly_query_openapi");
 const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const AgentStatus = metadata_openapi.AgentStatus;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 
 fn resolveTestTable(svc: *metadata_service.MetadataService, name: []const u8) !system_catalog.ResolvedTable {
     const alloc = std.testing.allocator;
@@ -3460,7 +3460,7 @@ test "hosted relational parent placement opens a real Raft owner" {
         if (observed) |value| {
             var response = value;
             defer response.deinit(alloc);
-            const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const Identity = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
             var identity = try std.json.parseFromSlice(Identity, alloc, response.json, .{ .ignore_unknown_fields = true });
             defer identity.deinit();
             try std.testing.expectEqual(parent_table_id, identity.value.namespace.table_id);

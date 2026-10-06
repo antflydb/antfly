@@ -27,10 +27,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const backend_erased = @import("backend_erased.zig");
-const backend_scan = @import("backend_scan.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const backend_scan = @import("antfly_local_sources").storage_backend_scan;
 const platform_time = @import("antfly_platform").time;
-const docstore = @import("docstore.zig");
+const docstore = @import("antfly_local_sources").storage_docstore;
 const DocStore = docstore.DocStore;
 const ByteRange = docstore.ByteRange;
 

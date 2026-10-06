@@ -6,6 +6,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const filters = @import("build_test_filters.zig").select(b.allocator, buildArguments(b) orelse &.{}, &.{"fixture"});
+    const error_logs = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/local/test_error_logs.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const provider = b.addLibrary(.{
         .name = "fixture-provider",
         .root_module = b.createModule(.{
@@ -21,12 +26,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    consumer_module.addImport("antfly_test_error_logs", error_logs);
     consumer_module.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{} });
     const consumer = linked.add(b, .{
         .name = "fixture-consumer",
         .root_module = consumer_module,
         .filters = filters,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     consumer.executable.root_module.linkLibrary(provider);
     const implementation = b.addTest(.{
@@ -38,13 +44,14 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
         .filters = filters,
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
+    implementation.root_module.addImport("antfly_test_error_logs", error_logs);
     const compile_step = b.step("compile", "Compile and link without foreign execution");
     compile_step.dependOn(&consumer.executable.step);
     const run_step = b.step("test", "Run the audited pair");
     run_step.dependOn(&linked.runPair(b, consumer, implementation).step);
-    const support = @import("pkg/antfly/build/test_support.zig");
+    const support = @import("build_support/antfly/test_support.zig");
     var owners: [2]support.OwnerTests = undefined;
     for ([_][]const u8{ "a", "b" }, &owners) |name, *owner| {
         owner.* = .{
@@ -55,11 +62,12 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                 }),
-                .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
             }),
             .filters = &.{"owned"},
         };
     }
+    for (owners) |owner| owner.artifact.root_module.addImport("antfly_test_error_logs", error_logs);
     if (b.option(bool, "duplicate-owner", "Deliberately overlap owner inventories") orelse false) owners[1] = owners[0];
     support.addOwnerTestRuns(b, b.step("owner", "Run stable owner shards"), &owners, &.{});
     const concurrent = b.step("concurrency", "Verify test execution overlaps and is never cached");
@@ -67,7 +75,7 @@ pub fn build(b: *std.Build) void {
         const child = b.addSystemCommand(&.{"python3"});
         child.addFileArg2(b.path("barrier.py"), .{ .make_absolute = true });
         child.addArg(label);
-        @import("pkg/antfly/build/test_support.zig").configureTestRun(child);
+        @import("build_support/antfly/test_support.zig").configureTestRun(child);
         concurrent.dependOn(&child.step);
     }
 }

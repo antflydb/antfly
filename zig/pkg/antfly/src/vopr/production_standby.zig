@@ -8,15 +8,15 @@ const std = @import("std");
 const runtime = @import("../data/runtime.zig");
 const admin_api = @import("../admin/mod.zig");
 const hot_standby = @import("../storage/hot_standby/mod.zig");
-const storage_io = @import("../storage/lsm_backend/storage_io.zig");
-const wal = @import("../storage/wal.zig");
-const http = @import("../common/http/http_common.zig");
+const storage_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+const wal = @import("antfly_local_sources").storage_wal;
+const http = @import("antfly_local_sources").common_http_http_common;
 const catalog = @import("../api/table_catalog.zig");
 const api = @import("../api/http_server.zig");
 const metadata_api = @import("../metadata/api.zig");
 const table_manager = @import("../metadata/table_manager.zig");
 const api_client = @import("../api/http_client.zig");
-const background = @import("../storage/background_runtime.zig");
+const background = @import("antfly_local_sources").storage_background_runtime;
 
 pub const Owners = struct {
     pub const token = "vopr-standby-scaling-admin";
@@ -269,8 +269,8 @@ test "production standby owners cancel after promotion and drain all borrowed ta
 
 fn testProductionOwners(cancel_after_promotion: bool) !void {
     const vopr = @import("vopr");
-    var allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer std.debug.assert(allocator.deinit() == .ok);
+    var allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator.deinit() == 0);
     const alloc = allocator.allocator();
     var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) namespace for unused ancillary API stores; modeled replication uses VoprIo
     defer tmp.cleanup();

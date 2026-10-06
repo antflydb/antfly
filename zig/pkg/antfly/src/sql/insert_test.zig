@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
 
 const Fixture = struct {
     calls: usize = 0,
@@ -229,7 +229,7 @@ test "SQL INSERT SELECT source failures and row quotas occur before mutation" {
 test "SQL original prepared CTE INSERT captures source before one target mutation" {
     // sql-0005: execute the body of the exact original PREPARE statement.
     const alloc = std.testing.allocator;
-    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer corpus.deinit();
     const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0005")) break entry.object.get("sql").?.string;

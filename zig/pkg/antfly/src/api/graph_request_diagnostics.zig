@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const graph_query = @import("graph_query_diagnostic.zig");
-const distinct_budget = @import("../graph/distinct_budget_diagnostic.zig");
-const path_weight = @import("../graph/path_weight_diagnostic.zig");
-const work_budget = @import("../graph/work_budget_diagnostic.zig");
+const distinct_budget = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
+const path_weight = @import("antfly_local_sources").graph_path_weight_diagnostic;
+const work_budget = @import("antfly_local_sources").graph_work_budget_diagnostic;
 
 /// Owns every diagnostic that can be produced while executing one public
 /// graph request. Keeping this value on the request stack prevents payloads

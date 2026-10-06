@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: ELv2
 
 const std = @import("std");
-const AntflyRootImports = @import("imports.zig").AntflyRootImports;
+const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 const runtime = @import("runtime.zig");
 
 /// These sources require separately linked owner suites, not source shards.
@@ -70,7 +70,7 @@ pub fn add(
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
-                .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
@@ -98,13 +98,13 @@ pub fn add(
     var physical_imports = imports;
     physical_imports.boundary_profile = .owner;
     physical_imports.configureStorage(b, physical_module, true);
-    @import("storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
+    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
     physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
         .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

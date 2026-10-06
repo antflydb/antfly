@@ -45,6 +45,7 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useMemo, useReducer, useRef, useState } from "react";
+import { chatGPTErrorMessage, useChatGPT } from "@/components/chatgpt-provider";
 import {
   formatGeneratorSummary,
   GENERATOR_DEFAULT_CONFIG,
@@ -177,6 +178,7 @@ function formatAnswer(text: string): React.ReactNode {
 const RagPlaygroundPage: React.FC = () => {
   const { apiUrl } = useApiConfig();
   const { dashboardGenerator } = useGeneratorPreference();
+  const chatgpt = useChatGPT();
   const { selectedTable, selectedIndex } = useTable();
 
   // Config state
@@ -186,6 +188,8 @@ const RagPlaygroundPage: React.FC = () => {
   const [steps, setSteps] = useState<StepsConfig>(DEFAULT_STEPS);
   const [settingsOpen, setSettingsOpen] = useState(true);
   const effectiveGenerator = generatorOverride ?? dashboardGenerator ?? null;
+  const effectiveGeneratorModel =
+    effectiveGenerator && "model" in effectiveGenerator ? effectiveGenerator.model : undefined;
   const { label: inheritedGeneratorLabel, description: inheritedGeneratorDescription } =
     getInheritedGeneratorLabels(dashboardGenerator);
 
@@ -286,11 +290,11 @@ const RagPlaygroundPage: React.FC = () => {
         data: {
           answer: accumulatedAnswerRef.current,
           provider: effectiveGenerator?.provider,
-          model: effectiveGenerator?.model,
+          model: effectiveGeneratorModel,
         } as GenerationStepData,
       });
     },
-    [effectiveGenerator?.model, effectiveGenerator?.provider]
+    [effectiveGeneratorModel, effectiveGenerator?.provider]
   );
 
   const handleFollowUpQuestion = useCallback((q: string) => {
@@ -333,7 +337,7 @@ const RagPlaygroundPage: React.FC = () => {
       data: {
         answer: accumulatedAnswerRef.current,
         provider: effectiveGenerator?.provider,
-        model: effectiveGenerator?.model,
+        model: effectiveGeneratorModel,
       } as GenerationStepData,
     });
     if (accumulatedFollowupsRef.current.length > 0) {
@@ -344,12 +348,13 @@ const RagPlaygroundPage: React.FC = () => {
       });
     }
     dispatchPipeline({ type: "COMPLETE" });
-  }, [effectiveGenerator?.model, effectiveGenerator?.provider]);
+  }, [effectiveGeneratorModel, effectiveGenerator?.provider]);
 
   const handleError = useCallback((e: string) => {
-    setError(e);
+    const message = e.includes("ChatGPT") ? chatGPTErrorMessage(new Error(e)) : e;
+    setError(message);
     setIsLoading(false);
-    dispatchPipeline({ type: "ERROR", error: e });
+    dispatchPipeline({ type: "ERROR", error: message });
   }, []);
 
   // --- Derived data from pipeline state for stats badges ---
@@ -411,7 +416,11 @@ const RagPlaygroundPage: React.FC = () => {
         )}
 
         {/* Streaming answer via AnswerResults */}
-        {effectiveGenerator ? (
+        {effectiveGenerator?.provider === "chatgpt" && !chatgpt.supported ? (
+          <p role="alert" className="p-6 text-sm text-muted-foreground">
+            {chatgpt.unavailableMessage}
+          </p>
+        ) : effectiveGenerator ? (
           <AnswerResults
             id="rag-answer"
             searchBoxId="rag-query"
@@ -557,6 +566,8 @@ const RagPlaygroundPage: React.FC = () => {
       searchData,
       confidenceData,
       effectiveGenerator,
+      chatgpt.supported,
+      chatgpt.unavailableMessage,
       steps,
       limit,
       selectedIndex,
@@ -687,6 +698,7 @@ const RagPlaygroundPage: React.FC = () => {
                     <div className="space-y-4">
                       <Label className="text-sm font-medium">Generator</Label>
                       <GeneratorSelector
+                        allowPersonalConnections
                         value={generatorOverride}
                         onChange={setGeneratorOverride}
                         defaultConfig={GENERATOR_DEFAULT_CONFIG}

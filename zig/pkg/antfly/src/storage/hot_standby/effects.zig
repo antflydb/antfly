@@ -19,14 +19,14 @@
 //! payloads instead of becoming the HA record header itself.
 
 const std = @import("std");
-const codecs = @import("../db/replication_effects.zig");
+const codecs = @import("antfly_local_sources").storage_db_replication_effects;
 const Allocator = std.mem.Allocator;
-const change_journal = @import("../db/derived/change_journal.zig");
+const change_journal = @import("antfly_local_sources").storage_db_derived_change_journal;
 pub const primary_effect = codecs.primary_effect;
-const db_types = @import("../db/types.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
 const primary_mod = @import("primary.zig");
-const replication_record = @import("../db/replication_record.zig");
-const schema_mod = @import("../schema.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
+const schema_mod = @import("antfly_local_sources").storage_schema;
 
 var test_path_counter: u64 = 0;
 
@@ -326,7 +326,7 @@ test "storage.hot_standby effects appends schema metadata payload as HA metadata
     try std.testing.expectEqualStrings("{\"version\":7}", decoded.public_schema_json.?);
     try std.testing.expect(decoded.published_child == null);
 
-    const published_fence: @import("../db/relational_integrity_topology_contract.zig").Fence = .{
+    const published_fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence = .{
         .role = .child_generation_source,
         .transition_id = 11,
         .attempt = 1,

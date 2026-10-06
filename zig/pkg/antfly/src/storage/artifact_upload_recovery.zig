@@ -2,8 +2,8 @@
 //! External publication scheduling. Storage provides bounded durable facts;
 //! this owner chooses retry cadence and fairness and retains admission state.
 const std = @import("std");
-const publication = @import("db/artifact_publication.zig");
-const transport = @import("db/artifact_publication_transport.zig");
+const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
 
 pub const Scheduler = struct {
     pub const poll_interval_ns: u64 = 5 * std.time.ns_per_s;

@@ -1252,6 +1252,61 @@ components:
       schema:
         type: string
   schemas:
+    ChatGPTAuthorize:
+      type: object
+      properties:
+        connection_id:
+          type: string
+    ChatGPTBegin:
+      type: object
+      required: [attempt_id, authorization_url, expires_at]
+      properties:
+        attempt_id:
+          type: string
+        authorization_url:
+          type: string
+        expires_at:
+          type: integer
+          format: int64
+    ChatGPTOutcome:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [pending, exchanging, connected, declined, expired, error]
+        connection_id:
+          type: string
+        error:
+          type: string
+    ChatGPTAccount:
+      type: object
+      required: [connection_id, email, label, connected, plan_enabled]
+      properties:
+        connection_id:
+          type: string
+        email:
+          type: string
+        label:
+          type: string
+        connected:
+          type: boolean
+        plan_enabled:
+          type: boolean
+    ChatGPTAccounts:
+      type: object
+      required: [accounts]
+      properties:
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatGPTAccount"
+    ChatGPTDisconnect:
+      type: object
+      required: [revocation_confirmed]
+      properties:
+        revocation_confirmed:
+          type: boolean
     SQLColumnType:
       type: string
       description: Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
@@ -2569,6 +2624,23 @@ components:
       type: string
       enum: [available, upgrade_pending, unsupported]
       description: Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+    ConnectorCapabilities:
+      type: object
+      additionalProperties: false
+      required: [chatgpt]
+      description: Effective integration availability for this deployment; independent of login providers and individual grants.
+      properties:
+        chatgpt:
+          type: object
+          additionalProperties: false
+          required: [enabled]
+          properties:
+            enabled:
+              type: boolean
+              x-omitzero: false
+            reason:
+              type: string
+              enum: [operator_disabled, local_runtime_required]
     ClusterStatus:
       type: object
       required:
@@ -2588,6 +2660,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        connectors:
+          $ref: "#/components/schemas/ConnectorCapabilities"
         index_capabilities:
           $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
@@ -2616,6 +2690,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        connectors:
+          $ref: "#/components/schemas/ConnectorCapabilities"
         index_capabilities:
           $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
@@ -11687,6 +11763,110 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /connections/chatgpt/authorize:
+    post:
+      operationId: authorizeChatGPT
+      summary: authorizeChatGPT
+      tags: [personal_connections]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatGPTAuthorize"
+      responses:
+        "200":
+          description: Personal ChatGPT connection result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatGPTBegin"
+        "403":
+          description: Personal connections unavailable to this caller or deployment
+        "404":
+          description: Connection or attempt not found
+  /connections/chatgpt/attempts/{attempt_id}:
+    get:
+      operationId: getChatGPTAttempt
+      summary: getChatGPTAttempt
+      tags: [personal_connections]
+      parameters:
+        - name: attempt_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Personal ChatGPT connection result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatGPTOutcome"
+        "403":
+          description: Personal connections unavailable to this caller or deployment
+        "404":
+          description: Connection or attempt not found
+  /connections/chatgpt/accounts:
+    get:
+      operationId: listChatGPTAccounts
+      summary: listChatGPTAccounts
+      tags: [personal_connections]
+      responses:
+        "200":
+          description: Personal ChatGPT connection result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatGPTAccounts"
+        "403":
+          description: Personal connections unavailable to this caller or deployment
+        "404":
+          description: Connection or attempt not found
+  /connections/{connection_id}/chatgpt/models:
+    get:
+      operationId: listChatGPTModels
+      summary: listChatGPTModels
+      tags: [personal_connections]
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Personal ChatGPT connection result
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "403":
+          description: Personal connections unavailable to this caller or deployment
+        "404":
+          description: Connection or attempt not found
+  /connections/{connection_id}/chatgpt/disconnect:
+    post:
+      operationId: disconnectChatGPT
+      summary: disconnectChatGPT
+      tags: [personal_connections]
+      parameters:
+        - name: connection_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Personal ChatGPT connection result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatGPTDisconnect"
+        "403":
+          description: Personal connections unavailable to this caller or deployment
+        "404":
+          description: Connection or attempt not found
   /connections:
     get:
       summary: List configured external connections

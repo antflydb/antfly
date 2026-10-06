@@ -18,23 +18,23 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const tables_api = @import("tables.zig");
-const runtime_status = @import("runtime_status.zig");
-const coverage_policy_mod = @import("coverage_policy.zig");
-const json_helpers = @import("json_helpers.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const document_content_hash = @import("../storage/db/document_content_hash.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
+const coverage_policy_mod = @import("antfly_local_sources").api_coverage_policy;
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const document_content_hash = @import("antfly_local_sources").storage_db_document_content_hash;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const chunking_openapi = @import("antfly_chunking_openapi");
 const chunking_api_openapi = @import("antfly_chunking_api_openapi");
-const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
-const query_contract = @import("query_contract.zig");
+const enrichment_config_validation = @import("antfly_local_sources").storage_db_enrichment_config_validation;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const public_index_contract = @import("public_index_contract.zig");
-const index_repair_status = @import("../common/index_repair_status.zig");
-const credential_safety = @import("../common/credential_safety.zig");
-const table_index_config = @import("table_index_config.zig");
+const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
+const credential_safety = @import("antfly_local_sources").common_credential_safety;
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 
 pub fn encodeGraphMetricStatusResponse(
     alloc: std.mem.Allocator,
@@ -333,7 +333,7 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
     return try collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, .{});
 }
 
-pub const collectArtifactEnrichmentsFromTableIndexesJsonWithOptions = @import("local_indexes.zig").collectArtifactEnrichmentsFromTableIndexesJsonWithOptions;
+pub const collectArtifactEnrichmentsFromTableIndexesJsonWithOptions = @import("antfly_local_sources").api_local_indexes.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions;
 
 pub fn encodeArtifactEnrichmentList(
     alloc: std.mem.Allocator,
@@ -426,9 +426,9 @@ pub fn validateArtifactEnrichmentsForIndexRequestJson(
     try validateArtifactEnrichmentConfigDefinitions(alloc, enrichments);
 }
 
-pub const validateArtifactEnrichmentConfigs = @import("local_indexes.zig").validateArtifactEnrichmentConfigs;
+pub const validateArtifactEnrichmentConfigs = @import("antfly_local_sources").api_local_indexes.validateArtifactEnrichmentConfigs;
 
-const validateArtifactEnrichmentConfigDefinitions = @import("local_indexes.zig").validateArtifactEnrichmentConfigDefinitions;
+const validateArtifactEnrichmentConfigDefinitions = @import("antfly_local_sources").api_local_indexes.validateArtifactEnrichmentConfigDefinitions;
 
 fn validateArtifactIndexReferences(
     alloc: std.mem.Allocator,
@@ -649,7 +649,7 @@ fn artifactConfigExistsForKinds(
     return false;
 }
 
-pub const sortArtifactEnrichmentsByDependency = @import("local_indexes.zig").sortArtifactEnrichmentsByDependency;
+pub const sortArtifactEnrichmentsByDependency = @import("antfly_local_sources").api_local_indexes.sortArtifactEnrichmentsByDependency;
 
 pub fn collectArtifactEnrichmentsFromValue(
     alloc: std.mem.Allocator,
@@ -659,17 +659,17 @@ pub fn collectArtifactEnrichmentsFromValue(
     return try collectArtifactEnrichmentsFromValueWithOptions(alloc, value, .{}, out);
 }
 
-pub const collectArtifactEnrichmentsFromValueWithOptions = @import("local_indexes.zig").collectArtifactEnrichmentsFromValueWithOptions;
+pub const collectArtifactEnrichmentsFromValueWithOptions = @import("antfly_local_sources").api_local_indexes.collectArtifactEnrichmentsFromValueWithOptions;
 
-const findArtifactEnrichmentConfig = @import("local_indexes.zig").findArtifactEnrichmentConfig;
+const findArtifactEnrichmentConfig = @import("antfly_local_sources").api_local_indexes.findArtifactEnrichmentConfig;
 
-const artifactEnrichmentConfigsEqual = @import("local_indexes.zig").artifactEnrichmentConfigsEqual;
+const artifactEnrichmentConfigsEqual = @import("antfly_local_sources").api_local_indexes.artifactEnrichmentConfigsEqual;
 
-const neighborContextConfigsEqual = @import("local_indexes.zig").neighborContextConfigsEqual;
+const neighborContextConfigsEqual = @import("antfly_local_sources").api_local_indexes.neighborContextConfigsEqual;
 
-const artifactEnrichmentLessThan = @import("local_indexes.zig").artifactEnrichmentLessThan;
+const artifactEnrichmentLessThan = @import("antfly_local_sources").api_local_indexes.artifactEnrichmentLessThan;
 
-const artifactEnrichmentKindRank = @import("local_indexes.zig").artifactEnrichmentKindRank;
+const artifactEnrichmentKindRank = @import("antfly_local_sources").api_local_indexes.artifactEnrichmentKindRank;
 
 pub fn encodeIndexList(
     alloc: std.mem.Allocator,
@@ -941,9 +941,9 @@ pub fn equivalentIndexConfigJson(
 
 const ApiIndexType = public_index_contract.Kind;
 
-const indexesJsonSource = @import("local_indexes.zig").indexesJsonSource;
+const indexesJsonSource = @import("antfly_local_sources").api_local_indexes.indexesJsonSource;
 
-pub const isReservedIndexMetadataEntry = @import("local_indexes.zig").isReservedIndexMetadataEntry;
+pub const isReservedIndexMetadataEntry = @import("antfly_local_sources").api_local_indexes.isReservedIndexMetadataEntry;
 
 pub fn expectedTableGroupIds(
     alloc: std.mem.Allocator,

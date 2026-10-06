@@ -19,11 +19,20 @@ const rules = @import("unit_test_ownership_rules.zig").rules;
 /// Give the aggregate its own selections. Focused targets keep their original
 /// run nodes, arguments, and transitive prerequisites. Compiler artifacts are
 /// shared; cloning a run never creates another compiler invocation.
+const ConsumerOwner = *const fn (*Step.Compile) *Step.Compile;
+fn identity(artifact: *Step.Compile) *Step.Compile {
+    return artifact;
+}
+
 pub fn apply(b: *std.Build, aggregate: *Step) *Step {
+    return applyWithSourceOwners(b, aggregate, identity);
+}
+
+pub fn applyWithSourceOwners(b: *std.Build, aggregate: *Step, consumer_owner: ConsumerOwner) *Step {
     const before = privateTopLevel(b, "unit ownership baseline");
     before.dependencies.appendSlice(b.allocator, aggregate.dependencies.items) catch @panic("OOM");
     var copies = std.AutoHashMap(*Step, *Step).init(b.allocator);
-    for (aggregate.dependencies.items) |*dependency| dependency.* = copySelected(b, dependency.*, &copies);
+    for (aggregate.dependencies.items) |*dependency| dependency.* = copySelected(b, dependency.*, &copies, consumer_owner);
     return before;
 }
 
@@ -82,7 +91,7 @@ test "ownership anchors respect runtime scope and exact filter identity" {
     try std.testing.expect(matchesSelection(&.{}, &.{}, "all"));
 }
 
-fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, *Step)) *Step {
+fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, *Step), consumer_owner: ConsumerOwner) *Step {
     if (copies.get(original)) |copy| return copy;
     // Compilation/code generation is shared with focused targets.
     if (original.tag != .run and original.tag != .top_level) return original;
@@ -95,13 +104,14 @@ fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, 
         for (run.argv.items) |arg| {
             if (arg != .artifact) continue;
             const object = inventory.testObject(arg.artifact.artifact) orelse continue;
-            const source = object.root_module.root_source_file orelse continue;
+            const consumer = consumer_owner(object);
+            const source = consumer.root_module.root_source_file orelse continue;
             const path = switch (source) {
                 .src_path => |p| p.sub_path,
                 else => continue,
             };
             for (rules) |rule| {
-                if (std.mem.eql(u8, path, rule.source) and std.mem.eql(u8, object.name, rule.artifact) and matchesSelection(run.argv.items, object.filters, rule.selection)) {
+                if (std.mem.eql(u8, path, rule.source) and std.mem.eql(u8, consumer.name, rule.artifact) and matchesSelection(run.argv.items, object.filters, rule.selection)) {
                     skips = rule.skip;
                     break;
                 }
@@ -112,7 +122,7 @@ fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, 
     var dependencies = std.array_list.Managed(*Step).init(b.allocator);
     var changed = skips.len != 0;
     for (original.dependencies.items) |dependency| {
-        const copy = copySelected(b, dependency, copies);
+        const copy = copySelected(b, dependency, copies, consumer_owner);
         changed = changed or copy != dependency;
         dependencies.append(copy) catch @panic("OOM");
     }

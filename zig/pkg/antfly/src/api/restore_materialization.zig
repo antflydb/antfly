@@ -16,9 +16,9 @@
 //! catalog files are needed to decode rows; fresh targets rebuild projections.
 const std = @import("std");
 const backups = @import("backups.zig");
-const native = @import("../storage/db/native_backup.zig");
+const native = @import("antfly_local_sources").storage_db_native_backup;
 const fs = @import("antfly_runtime_fs").fs_paths;
-const staging = @import("../storage/db/restore_staging_contract.zig");
+const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const chunk_bytes = 8 * 1024 * 1024;
 
@@ -31,7 +31,7 @@ const Checkpoint = struct {
     hash_tail: [64]u8 = @splat(0),
     hash_tail_len: u8 = 0,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("../storage/db/relational_integrity_json.zig").write(self, jw);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
     }
     fn hash(self: Checkpoint) !Sha {
         if (self.version != 1 or self.hash_tail_len >= 64 or self.offset % 64 != self.hash_tail_len) return error.InvalidRestoreSourceCheckpoint;
@@ -78,7 +78,7 @@ pub fn step(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocat
 
 /// Portable uses the identical durable SHA prefix as native objects, followed
 /// by an atomic logical-object/row cursor inside a disposable LSM decoder.
-pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !bool {
+pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.BackupLocation, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, byte_budget: usize) !bool {
     if (byte_budget == 0 or byte_budget > chunk_bytes or source.format != .portable or !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
     if ((source.cohort_seal == null) == (source.rewrite == null)) return error.RestoreSourceProofMissing;
     try cancellation.check();
@@ -132,7 +132,7 @@ pub fn stepPortableWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *b
 
 /// Shared bounded logical import after either repository checksum verification
 /// or the peer transport's exact immutable certificate verification.
-pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
+pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.Io.File, source: @import("../metadata/restore_staging.zig").SourceArtifact, scope: staging.Scope, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange, root: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !bool {
     try cancellation.check();
     if (source.format != .portable or (source.cohort_seal == null) == (source.rewrite == null) or
         !std.mem.eql(u8, &try source.digest(alloc), &scope.source_descriptor_digest)) return error.RestoreSourceProofMissing;
@@ -142,13 +142,13 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
     // returning. This private decoder does not serve reads or acknowledge user
     // writes: commit-time full durability would sync the very same WAL twice
     // per page, burning the slice budget on redundant disk barriers.
-    var options = @import("../storage/db/config.zig").portable_decoder_lsm_options_default;
-    options.read_runtime = @import("../storage/lsm_backend/storage_io.zig").ReadRuntime.init(io);
-    var backend = try @import("../storage/lsm_backend.zig").Backend.open(alloc, files, options);
+    var options = @import("antfly_local_sources").storage_db_config.portable_decoder_lsm_options_default;
+    options.read_runtime = @import("antfly_local_sources").storage_lsm_backend_storage_io.ReadRuntime.init(io);
+    var backend = try @import("antfly_local_sources").storage_lsm_backend.Backend.open(alloc, files, options);
     defer backend.close();
-    var store = try @import("../storage/docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
+    var store = try @import("antfly_local_sources").storage_docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
     defer store.close();
-    const portable = @import("../storage/portable_backup.zig");
+    const portable = @import("antfly_local_sources").storage_portable_backup;
     // A page may only advance a manifest/layout phase, without importing a
     // row. Amortize decoder opens and coordinator RPCs across a bounded burst
     // of these durable steps. A decoder reopen and coordinator RPC cost more
@@ -173,8 +173,8 @@ pub fn stepPortableDecoder(alloc: std.mem.Allocator, io: std.Io, artifact: std.I
 /// disposable decoder reconstructs it from the target owner's authenticated
 /// immutable plan/bootstrap. Persist before decoder publication; a replay may
 /// confirm the same range but must never replace a different bound range.
-pub fn bindPortableDecoderRange(alloc: std.mem.Allocator, store: *@import("../storage/docstore.zig").DocStore, owner_range: @import("../storage/docstore.zig").ByteRange) !void {
-    const range_state = @import("../storage/db/range_state.zig");
+pub fn bindPortableDecoderRange(alloc: std.mem.Allocator, store: *@import("antfly_local_sources").storage_docstore.DocStore, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange) !void {
+    const range_state = @import("antfly_local_sources").storage_db_range_state;
     if (owner_range.end.len != 0 and std.mem.order(u8, owner_range.start, owner_range.end) != .lt) return error.RestoreStagingScopeChanged;
     const encoded = try range_state.encodeRangeAlloc(alloc, owner_range);
     defer alloc.free(encoded);
@@ -241,7 +241,7 @@ pub fn stepWithBudget(alloc: std.mem.Allocator, io: std.Io, location: *backups.B
             else => return err,
         };
         defer alloc.free(receipt);
-        _ = try @import("../storage/db/native_backup_seal.zig").exportedBytes(alloc, io, root, seal);
+        _ = try @import("antfly_local_sources").storage_db_native_backup_seal.exportedBytes(alloc, io, root, seal);
     }
     // Physical LSM checkpoints are independently readable. Logical backups
     // use the shared portable/logical importer, not an invented physical codec.

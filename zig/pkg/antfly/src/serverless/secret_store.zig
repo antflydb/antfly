@@ -4,7 +4,7 @@
 //! Independent secret namespace; never nested under a table manifest/lifetime.
 const std = @import("std");
 const collection = @import("../common/secret_collection.zig");
-const objects = @import("../storage/object_storage.zig");
+const objects = @import("antfly_local_sources").storage_object_storage;
 
 pub const Store = collection.Store(Backend);
 

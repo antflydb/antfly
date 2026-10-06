@@ -7,7 +7,7 @@
 const std = @import("std");
 const cleanup = @import("seed_prefix_cleanup.zig");
 const namespace_control = @import("seed_namespace_control.zig");
-const object_storage = @import("../object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 
 const location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds/";
 const object_prefix = "orgs/org-a/instances/instance-a/ha-seeds/";

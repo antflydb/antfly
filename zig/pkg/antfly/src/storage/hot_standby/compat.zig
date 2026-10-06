@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const backup_manifest = @import("backup_manifest.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 
 const v1_payload = "v1-fixture";
 

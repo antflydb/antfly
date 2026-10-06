@@ -45,8 +45,8 @@ const api_tables = @import("tables.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const indexes_api = @import("indexes.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const docstore_mod = @import("../storage/docstore.zig");
-const transactions_mod = @import("../storage/transactions.zig");
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
 const distributed_txn = @import("distributed_txn.zig");
 const transactions_api = @import("transactions.zig");
 

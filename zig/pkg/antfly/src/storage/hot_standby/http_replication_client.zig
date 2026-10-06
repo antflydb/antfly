@@ -20,12 +20,12 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const internal_api = @import("../../internal/mod.zig");
 const routes = @import("../../raft/transport/routes.zig");
 const http_internal = @import("http_internal.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const standby_mod = @import("standby.zig");
 const validation = @import("validation.zig");
 

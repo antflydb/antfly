@@ -50,8 +50,8 @@ const InventoryPublication = struct {
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
 const tables_api = @import("../../api/tables.zig");
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
-const coverage_policy = @import("../../api/coverage_policy.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
 const shared_vector = @import("antfly_vector").vector;
 
 const PublicationPlanPurpose = enum {

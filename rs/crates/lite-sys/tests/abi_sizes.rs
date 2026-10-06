@@ -90,7 +90,7 @@ fn inference_options_field_offsets_match_header_order() {
 /// No library-reported size function exists for `antfly_inference_pull_progress`
 /// (it is a callback-only struct, not an options struct with its own `_size`
 /// accessor), so this pins the field offsets the crate compiles against
-/// directly: a reordering in `zig/pkg/antfly/include/antfly.h` without a
+/// directly: a reordering in `zig/pkg/antfly-embedded/include/antfly.h` without a
 /// matching Rust update would otherwise pass silently (the pull tests in
 /// `antfly-lite` exercise the values, not the raw layout).
 #[test]

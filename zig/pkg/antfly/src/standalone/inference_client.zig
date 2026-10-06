@@ -17,13 +17,13 @@
 //! ABI descriptors, stable status, and `FailureIdentity` cross the link edge.
 
 const std = @import("std");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const inference_types = @import("antfly_inference_types");
-const template = @import("../template.zig");
+const template = @import("antfly_local_sources").template;
 const readers = @import("antfly_readers");
 const transcribing = @import("antfly_transcribing");
 const extracting = @import("antfly_extracting");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 const bridge = @import("antfly_inference_bridge");
 const failure_identity = @import("runtime_failure_identity");
 

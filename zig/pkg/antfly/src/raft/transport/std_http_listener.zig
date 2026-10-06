@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const listener = @import("../../common/http/std_http_listener.zig");
+const listener = @import("antfly_local_sources").common_http_std_http_listener;
 
 pub const StdHttpListener = listener.StdHttpListener;
 pub const StdHttpListenerConfig = listener.StdHttpListenerConfig;

@@ -52,6 +52,8 @@ class TranscriberEnrichmentConfig:
                 Default: False.
             max_download_bytes (int | Unset): Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which
                 covers a one hour voice memo or podcast.
+            download_assets (bool | Unset): For Apple transcription, explicitly permit preparing and installing the selected
+                on-device Speech assets. Default: False.
     """
 
     provider: STTProvider
@@ -66,6 +68,7 @@ class TranscriberEnrichmentConfig:
     timestamps: bool | Unset = True
     diarization: bool | Unset = False
     max_download_bytes: int | Unset = UNSET
+    download_assets: bool | Unset = False
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +95,8 @@ class TranscriberEnrichmentConfig:
         diarization = self.diarization
 
         max_download_bytes = self.max_download_bytes
+
+        download_assets = self.download_assets
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -122,6 +127,8 @@ class TranscriberEnrichmentConfig:
             field_dict["diarization"] = diarization
         if max_download_bytes is not UNSET:
             field_dict["max_download_bytes"] = max_download_bytes
+        if download_assets is not UNSET:
+            field_dict["download_assets"] = download_assets
 
         return field_dict
 
@@ -152,6 +159,8 @@ class TranscriberEnrichmentConfig:
 
         max_download_bytes = d.pop("max_download_bytes", UNSET)
 
+        download_assets = d.pop("download_assets", UNSET)
+
         transcriber_enrichment_config = cls(
             provider=provider,
             model=model,
@@ -165,6 +174,7 @@ class TranscriberEnrichmentConfig:
             timestamps=timestamps,
             diarization=diarization,
             max_download_bytes=max_download_bytes,
+            download_assets=download_assets,
         )
 
         transcriber_enrichment_config.additional_properties = d

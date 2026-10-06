@@ -363,7 +363,7 @@ ANTFLY_LIBRARY=/nonexistent pnpm run test         # exercises the clean-skip pat
 ```
 
 `test/conformance.test.ts` runs every case under
-`zig/pkg/antfly/capi-conformance/cases/*.json` through this public API,
+`zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API,
 mirroring `go/pkg/lite/conformance_cgo_test.go`'s semantics, including the
 `storage`-typed opens and the `import_backup`/`restore_open` cross-storage
 cases. `test/storage.test.ts` adds coverage beyond conformance: restoring a

@@ -17,7 +17,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const wal_mod = @import("wal.zig");
+const wal_mod = @import("antfly_local_sources").storage_wal;
 const wire = @import("kernel_wal_wire.zig");
 
 const alloc = std.heap.c_allocator;

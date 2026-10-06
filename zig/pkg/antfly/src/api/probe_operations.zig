@@ -7,7 +7,7 @@
 //! transport concerns; readiness evaluation is supplied explicitly.
 
 const std = @import("std");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 
 pub const Status = enum {
     ok,

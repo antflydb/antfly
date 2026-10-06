@@ -17,9 +17,9 @@
 //! and reuse checks all enforce exactly the same bounded contract.
 
 const std = @import("std");
-const graph_mod = @import("../../graph/graph.zig");
-const metric_cost = @import("../../graph/metric_cost.zig");
-const bounded_decode = @import("../bounded_decode.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const metric_cost = @import("antfly_local_sources").graph_metric_cost;
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 
 /// Increment whenever an implementation change can alter admission or output
 /// without changing the user-visible metric configuration.

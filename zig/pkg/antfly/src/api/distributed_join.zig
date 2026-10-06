@@ -17,13 +17,13 @@ const join_planning = @import("join_planning.zig");
 const RouteBudget = @import("table_router.zig").RouteBudget;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const platform_sync = @import("antfly_platform").sync;
-const table_reads = @import("table_read_source.zig");
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const foreign_mod = @import("../foreign/mod.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
-const docstore_mod = @import("../storage/docstore.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const metadata_server_openapi = @import("antfly_metadata_server_openapi");
@@ -33,11 +33,11 @@ const tables_api = @import("tables.zig");
 const platform_time = @import("antfly_platform").time;
 const table_catalog = @import("table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const raft_mod = @import("../raft/mod.zig");
 const public_table_http = @import("public_table_http.zig");
 const join_model = @import("join_model.zig");
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 const unmatched_right_join_group_chunk_limit: u32 = 128;
 
 /// Preserve ownership and transport failures as typed coordinator outcomes.
@@ -536,7 +536,7 @@ fn supportedBoundJoinFromWire(alloc: std.mem.Allocator, wire: BoundJoinClause) !
     return result;
 }
 
-pub fn parseBoundJoinRequestWithSecrets(alloc: std.mem.Allocator, body: []const u8, secrets: ?*@import("../common/secrets.zig").FileStore) !?ParsedSupportedJoinRequest {
+pub fn parseBoundJoinRequestWithSecrets(alloc: std.mem.Allocator, body: []const u8, secrets: ?*@import("antfly_local_sources").common_secrets.FileStore) !?ParsedSupportedJoinRequest {
     const parsed = try std.json.parseFromSlice(struct { join: ?BoundJoinClause = null }, alloc, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const wire = parsed.value.join orelse return null;
@@ -4645,7 +4645,7 @@ pub fn parseSupportedJoinRequest(
 pub fn parseSupportedJoinRequestWithSecrets(
     alloc: std.mem.Allocator,
     body: []const u8,
-    secret_store: ?*@import("../common/secrets.zig").FileStore,
+    secret_store: ?*@import("antfly_local_sources").common_secrets.FileStore,
 ) !?ParsedSupportedJoinRequest {
     var parsed_request = metadata_server_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();
@@ -4681,7 +4681,7 @@ pub fn supportedJoinRequestFromOpenApi(
     if ((join.right_table == null) == (join.right_target == null) or join.on.left_field.len == 0 or join.on.right_field.len == 0) {
         return error.InvalidQueryRequest;
     }
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const target: catalog.Target = if (join.right_target) |target| .{
         .database = target.database orelse catalog.default_database_name,
         .namespace = target.namespace orelse catalog.default_namespace_name,

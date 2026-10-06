@@ -139,7 +139,7 @@ const DbRuntimeHandle = struct {
 };
 
 test "open db runtime factory starts real db enrichment runtime handles" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
     const Resolver = struct {
         root: []const u8,
@@ -206,8 +206,8 @@ test "open db runtime factory overrides enrichment owner id when configured" {
 }
 
 test "open db runtime factory preserves lease fencing across owner takeover" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
-    const db_types = @import("../storage/db/types.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
+    const db_types = @import("antfly_local_sources").storage_db_types;
 
     const Resolver = struct {
         root: []const u8,

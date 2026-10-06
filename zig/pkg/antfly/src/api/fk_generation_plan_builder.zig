@@ -5,11 +5,11 @@
 //! the metadata transaction; child fence receipts attest the proposed AIC.
 const std = @import("std");
 const server_mod = @import("http_server.zig");
-const operation = @import("operation.zig");
-const records = @import("../common/topology_records.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const records = @import("antfly_local_sources").common_topology_records;
 const metadata = @import("../metadata/table_manager.zig");
 const publication = @import("../metadata/fk_generation_publication.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
 const tables = @import("tables.zig");
 
 /// The returned publication plan belongs to the caller's request arena, not
@@ -50,7 +50,7 @@ pub fn ownerFences(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
             .cancellation = context.cancellation,
         }, .read_index)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
-        const Native = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+        const Native = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
         const native = try std.json.parseFromSliceLeaky(Native, alloc, response.json, .{ .ignore_unknown_fields = true });
         if (native.namespace.table_id != table.table_id or
             native.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or
@@ -77,7 +77,7 @@ fn childCatalogB64(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
     if ((std.fmt.parseInt(u64, observed.table_id, 10) catch return error.InvalidIntegrityCatalog) != table.table_id or
         observed.schema_version != try tables.schemaVersion(table.schema_json)) return error.CatalogGenerationChanged;
     const size = std.base64.standard.Decoder.calcSizeForSlice(observed.catalog) catch return error.InvalidIntegrityCatalog;
-    if (size == 0 or size > @import("../storage/db/relational_integrity_catalog.zig").max_catalog_bytes) return error.InvalidIntegrityCatalog;
+    if (size == 0 or size > @import("antfly_local_sources").storage_db_relational_integrity_catalog.max_catalog_bytes) return error.InvalidIntegrityCatalog;
     return alloc.dupe(u8, observed.catalog);
 }
 

@@ -12,8 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const docstore = @import("docstore.zig");
-const shard = @import("shard.zig");
+const docstore = @import("antfly_local_sources").storage_docstore;
+const shard = @import("antfly_local_sources").storage_shard;
 
 pub const platform_time = @import("antfly_platform").time;
 pub const DocStore = docstore.DocStore;

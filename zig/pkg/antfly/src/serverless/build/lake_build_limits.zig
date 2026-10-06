@@ -15,7 +15,7 @@
 //! Total-work admission for lake sidecar builds and their replay buffers.
 
 const std = @import("std");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const Limits = struct {
     max_batches: usize = 100_000,

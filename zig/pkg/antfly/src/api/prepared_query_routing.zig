@@ -16,7 +16,7 @@
 //! normally. New peers require a matching catalog fence before consuming it;
 //! the operation layer still validates that fence against local storage.
 const std = @import("std");
-const types = @import("../storage/db/types.zig");
+const types = @import("antfly_local_sources").storage_db_types;
 const metadata = @import("../metadata/api.zig");
 pub const header_name = "x-antfly-prepared-query-routing";
 pub const Envelope = struct {

@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const lifecycle = @import("../storage/db/generation_lifecycle.zig");
+const lifecycle = @import("antfly_local_sources").storage_db_generation_lifecycle;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "generation-lifecycle";

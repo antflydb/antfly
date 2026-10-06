@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const domain = @import("domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const helpers = @import("../api/http_route_helpers.zig");
 
 pub const Route = struct {

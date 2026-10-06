@@ -16,7 +16,7 @@ Constructors return artifacts and runs; entrypoints publish target names and con
 aggregates. Native and WASM configurations remain separate. Runtime archive boundaries, link order, and
 test selections belong to their owners; moving a definition does not change them.
 
-The unified browser runtime in `pkg/antfly/build/wasm.zig` owns a fixed WASM32
+The unified browser runtime in `pkg/antfly-embedded/build/wasm.zig` owns a fixed WASM32
 ReleaseSafe configuration, including HTTPX, JSON, OpenAPI, and storage modules.
 Native optimization, target, and storage flags do not configure those modules.
 Native and WASM OpenAPI modules use one wiring constructor with separate module

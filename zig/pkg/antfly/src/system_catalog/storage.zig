@@ -16,10 +16,10 @@
 //! routing resolves a qualified name with point reads. Derived indexes are rebuilt
 //! from authoritative records at projection initialization and snapshot install.
 const std = @import("std");
-const docstore = @import("../storage/docstore.zig");
-const domain = @import("domain.zig");
-const settings = @import("settings.zig");
-const policies = @import("policies.zig");
+const docstore = @import("antfly_local_sources").storage_docstore;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const settings = @import("antfly_local_sources").system_catalog_settings;
+const policies = @import("antfly_local_sources").system_catalog_policies;
 
 pub const Meta = domain.Meta;
 

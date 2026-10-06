@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const object_storage = @import("../object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const seed_namespace_control = @import("seed_namespace_control.zig");
 const validation = @import("validation.zig");
 

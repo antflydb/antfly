@@ -8,7 +8,7 @@ const std = @import("std");
 const auth = @import("fk_initial_retirement_auth.zig");
 const contract = @import("fk_initial_retirement_contract.zig");
 const retirement = @import("fk_initial_retirement.zig");
-const incarnation = @import("incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 
 pub const CanceledPublication = struct {
     child_table_id: u64,
@@ -80,7 +80,7 @@ pub fn validate(
 }
 
 test "retirement ACK validates exact canceled work and current physical-root signature" {
-    const root_identity = @import("../storage/db/root_signing_identity.zig");
+    const root_identity = @import("antfly_local_sources").storage_db_root_signing_identity;
     const seed: [32]u8 = @splat(7);
     const key_pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
     const root: root_identity.State = .{

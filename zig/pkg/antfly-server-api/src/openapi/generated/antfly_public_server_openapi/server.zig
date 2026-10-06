@@ -325,6 +325,26 @@ pub const ListConnectionsParams = struct {
     refresh: ?[]const u8 = null,
 };
 
+/// getChatGPTAttempt
+pub const GetChatGPTAttemptPathParams = struct {
+    attempt_id: []const u8,
+};
+
+/// Parse the JSON request body for authorizeChatGPT.
+pub fn parseAuthorizeChatGPTBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ChatGPTAuthorize) {
+    return std.json.parseFromSlice(types.ChatGPTAuthorize, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// disconnectChatGPT
+pub const DisconnectChatGPTPathParams = struct {
+    connection_id: []const u8,
+};
+
+/// listChatGPTModels
+pub const ListChatGPTModelsPathParams = struct {
+    connection_id: []const u8,
+};
+
 /// Invoke an Antfly-compatible inference connection
 pub const InvokeInferenceConnectionPathParams = struct {
     connection_id: []const u8,
@@ -1551,6 +1571,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections/chatgpt/accounts", .operation_id = "listChatGPTAccounts", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections/chatgpt/attempts/{attempt_id}", .operation_id = "getChatGPTAttempt", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/connections/chatgpt/authorize", .operation_id = "authorizeChatGPT", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/connections/{connection_id}/chatgpt/disconnect", .operation_id = "disconnectChatGPT", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections/{connection_id}/chatgpt/models", .operation_id = "listChatGPTModels", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/databases", .operation_id = "listDatabases", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}", .operation_id = "getDatabase", .request_body = .none, .streaming_response = false },
@@ -1717,6 +1742,11 @@ pub const routes = [_]Route{
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
+//   fn listChatGPTAccounts(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getChatGPTAttempt(self: *Impl, ctx: *httpx.Context, attempt_id: []const u8) !httpx.Response
+//   fn authorizeChatGPT(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn disconnectChatGPT(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
+//   fn listChatGPTModels(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
 //   fn invokeInferenceConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response
 //   fn listDatabases(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response

@@ -14,11 +14,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const bounded_decode = @import("../bounded_decode.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 const catalog_types = @import("../catalog/types.zig");
-const manifest_base_source = @import("base_source.zig");
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const manifest_types = @import("types.zig");
-const artifact_ref = @import("artifact_ref.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";

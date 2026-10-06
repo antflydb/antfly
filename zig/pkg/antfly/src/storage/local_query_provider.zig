@@ -22,11 +22,11 @@ const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const query_api = @import("../api/query.zig");
+const query_api = @import("antfly_local_sources").api_query;
 const local_query = @import("antfly_source_root").antfly_sources.local_query;
 const distributed_graph = @import("../api/distributed_graph.zig");
 const aggregation_plan = @import("../api/aggregation_plan.zig");
-const local_query_contract = @import("../api/local_query_contract.zig");
+const local_query_contract = @import("antfly_local_sources").api_local_query_contract;
 
 pub fn execute(
     request: *const abi.LocalQueryRequest,
@@ -80,7 +80,7 @@ fn executeSearch(
     } catch |err| return fail(err, parseOperation(request.dialect), out_failure);
     defer owned.deinit(alloc);
 
-    @import("local_query_controls.zig").applyExecutionOptions(&owned.req, request.execution_options);
+    @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
     if (request.has_execution_deadline != 0) {
         owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed_deadline|
             @min(parsed_deadline, request.execution_deadline_ns)
@@ -88,7 +88,7 @@ fn executeSearch(
             request.execution_deadline_ns;
     }
     owned.req.cancellation = requestCancellationToken(request);
-    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
+    @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
     // The owner has already established read safety. Keep aggregation's page
@@ -126,7 +126,7 @@ fn executeSearch(
         held.release();
         lease = null;
     }
-    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err|
+    @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
     var response = query_api.encodeQueryResponses(
@@ -136,7 +136,7 @@ fn executeSearch(
         meta,
         result,
     ) catch |err| return fail(err, encodeOperation(request.dialect), out_failure);
-    @import("../api/local_query_contract.zig").checkQueryDeadline(owned.req) catch |err| {
+    @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err| {
         response.deinit(alloc);
         return fail(err, executeOperation(request.dialect), out_failure);
     };

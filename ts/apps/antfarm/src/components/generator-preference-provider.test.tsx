@@ -9,7 +9,13 @@ function Consumer() {
 
   return (
     <>
-      <div data-testid="generator">{dashboardGenerator ? dashboardGenerator.model : "none"}</div>
+      <div data-testid="generator">
+        {dashboardGenerator
+          ? "model" in dashboardGenerator
+            ? dashboardGenerator.model
+            : dashboardGenerator.provider
+          : "none"}
+      </div>
       <button
         type="button"
         onClick={() =>
@@ -33,6 +39,19 @@ function renderWithProvider(children: ReactNode) {
 const originalLocalStorageDescriptor = Object.getOwnPropertyDescriptor(window, "localStorage");
 
 describe("GeneratorPreferenceProvider", () => {
+  it("restores an Apple preference without a model", () => {
+    window.localStorage.setItem(
+      "antfarm-dashboard-generator",
+      JSON.stringify({ provider: "apple", max_tokens: 256 })
+    );
+    try {
+      renderWithProvider(<Consumer />);
+      expect(screen.getByTestId("generator").textContent).toBe("apple");
+    } finally {
+      window.localStorage.removeItem("antfarm-dashboard-generator");
+    }
+  });
+
   afterEach(() => {
     cleanup();
     if (originalLocalStorageDescriptor) {
@@ -70,4 +89,34 @@ describe("GeneratorPreferenceProvider", () => {
     ).not.toThrow();
     expect(screen.getByTestId("generator").textContent).toBe("gpt-4.1");
   });
+});
+
+function ConfigurationConsumer() {
+  const { dashboardGenerator } = useGeneratorPreference();
+  return <pre data-testid="configuration">{JSON.stringify(dashboardGenerator)}</pre>;
+}
+it("loads only an opaque connection and model for a stored personal plan", () => {
+  const raw = JSON.stringify({
+    provider: "chatgpt",
+    model: "catalog-slug",
+    connection_id: "one",
+    api_key: "should-not-survive",
+    refresh_token: "should-not-survive",
+  });
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: { getItem: () => raw },
+  });
+  try {
+    renderWithProvider(<ConfigurationConsumer />);
+    expect(JSON.parse(screen.getByTestId("configuration").textContent || "null")).toEqual({
+      provider: "chatgpt",
+      model: "catalog-slug",
+      connection_id: "one",
+    });
+  } finally {
+    cleanup();
+    if (originalLocalStorageDescriptor)
+      Object.defineProperty(window, "localStorage", originalLocalStorageDescriptor);
+  }
 });

@@ -10888,6 +10888,8 @@ pub const TranscriberEnrichmentConfig = struct {
     diarization: ?bool = null,
     /// Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast.
     max_download_bytes: ?i64 = null,
+    /// For Apple transcription, explicitly permit preparing and installing the selected on-device Speech assets.
+    download_assets: ?bool = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -10903,6 +10905,7 @@ pub const TranscriberEnrichmentConfig = struct {
         .{ "timestamps", "timestamps", true },
         .{ "diarization", "diarization", true },
         .{ "max_download_bytes", "max_download_bytes", true },
+        .{ "download_assets", "download_assets", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -10959,6 +10962,10 @@ pub const TranscriberEnrichmentConfig = struct {
         }
         if (self.max_download_bytes) |value| {
             try jw.objectField("max_download_bytes");
+            try jw.write(value);
+        }
+        if (self.download_assets) |value| {
+            try jw.objectField("download_assets");
             try jw.write(value);
         }
         try jw.endObject();

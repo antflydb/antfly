@@ -21,6 +21,7 @@ components:
         - openai
         - vertex
         - antfly
+        - apple
       description: "The STT provider to use."
 
     # Audio Formats
@@ -287,6 +288,22 @@ components:
         voice: nova
 
     # STT Configuration Union
+    AppleSTTConfig:
+      type: object
+      description: "On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported."
+      properties:
+        language_code:
+          type: string
+          default: en-US
+          description: "Supported Speech locale; Apple transcription does not infer a language."
+        timestamps:
+          type: boolean
+          default: true
+        download_assets:
+          type: boolean
+          default: false
+          description: "Explicitly permit preparing and installing the selected Speech assets."
+
     STTConfig:
       description: |-
         Unified configuration for an STT provider.
@@ -309,6 +326,7 @@ components:
             - $ref: '#/components/schemas/OpenAISTTConfig'
             - $ref: '#/components/schemas/VertexSTTConfig'
             - $ref: '#/components/schemas/AntflySTTConfig'
+            - $ref: '#/components/schemas/AppleSTTConfig'
         - properties:
             provider:
               $ref: '#/components/schemas/STTProvider'

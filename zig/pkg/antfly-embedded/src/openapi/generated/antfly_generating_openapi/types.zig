@@ -144,6 +144,45 @@ pub const AnthropicGeneratorConfig = struct {
     }
 };
 
+/// On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported.
+pub const AppleGeneratorConfig = struct {
+    provider: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
+    temperature: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", true },
+        .{ "max_tokens", "max_tokens", true },
+        .{ "temperature", "temperature", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Configuration for the AWS Bedrock generative AI provider.
 pub const BedrockGeneratorConfig = struct {
     /// The Bedrock model ID to use.
@@ -272,6 +311,46 @@ pub const ChainLink = struct {
             try jw.objectField("condition");
             try jw.write(value);
         }
+        try jw.endObject();
+    }
+};
+
+/// Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime.
+pub const ChatGPTGeneratorConfig = struct {
+    provider: []const u8,
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    model: []const u8,
+    /// Opaque personal registration owned by the authenticated caller.
+    connection_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "model", "model", false },
+        .{ "connection_id", "connection_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("connection_id");
+        try jw.write(self.connection_id);
         try jw.endObject();
     }
 };
@@ -558,10 +637,11 @@ pub const GeneratorConfig = struct {
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    /// Opaque personal registration owned by the authenticated caller.
+    connection_id: ?[]const u8 = null,
     /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
     max_completion_tokens: ?i64 = null,
-    /// Optional reasoning effort. Supported values depend on the selected OpenAI model.
-    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
@@ -583,8 +663,9 @@ pub const GeneratorConfig = struct {
         .{ "credentials_path", "credentials_path", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
-        .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "connection_id", "connection_id", true },
+        .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
         .{ "rate_limit", "rate_limit", false },
@@ -652,12 +733,16 @@ pub const GeneratorConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
-        if (self.max_completion_tokens) |value| {
-            try jw.objectField("max_completion_tokens");
-            try jw.write(value);
-        }
         if (self.reasoning_effort) |value| {
             try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        if (self.max_completion_tokens) |value| {
+            try jw.objectField("max_completion_tokens");
             try jw.write(value);
         }
         if (self.frequency_penalty) |value| {
@@ -685,8 +770,10 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    chatgpt,
     openrouter,
     antfly,
+    apple,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -694,8 +781,10 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .chatgpt => "chatgpt",
             .openrouter => "openrouter",
             .antfly => "antfly",
+            .apple => "apple",
         };
         try jw.write(s);
     }
@@ -710,8 +799,10 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "chatgpt", .chatgpt },
             .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
+            .{ "apple", .apple },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

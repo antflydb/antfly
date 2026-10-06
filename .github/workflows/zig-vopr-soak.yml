@@ -184,9 +184,10 @@ jobs:
         if: steps.runner_cache.outputs.cache-hit != 'true'
         working-directory: zig
         run: |
+          export ZIG_GLOBAL_CACHE_DIR="$VOPR_GLOBAL_CACHE_DIR"
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
             python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=safe --summary all \
-            --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
+            --cache-dir "$VOPR_LOCAL_CACHE_DIR"
       - name: Retain runner build disk measurements
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

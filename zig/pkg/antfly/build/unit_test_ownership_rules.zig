@@ -3,13 +3,15 @@
 
 // Aggregate-only exclusions. The inventory audit compares the selected union
 // before/after these rules and rejects both lost coverage and repeated names.
-// Namespace rules end in `.test.` so anonymous reachability tests are retained.
+// Implementation rules use `.test.` where possible to retain reachability
+// anchors; whole module families stay with their explicit collection owner.
 pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     .{
         .source = "pkg/antfly/src/root.zig",
         .artifact = "test",
         .selection = "compiled CHECK",
         .skip = &.{
+            "api.runtime_status.consumerTests.Suite.test.",
             "api.http_server.test.authoritative catalog mutation boundaries reject orphaned semantic producers",
             "api.indexes.consumerTests.Suite.test.actionable repair remains visible while retained generation stays queryable",
             "api.indexes.consumerTests.Suite.test.complete partial embeddings coverage is ready after active generation proof",
@@ -118,6 +120,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "query parser accepts direct graph metric reads",
         .skip = &.{
+            "api.runtime_status.consumerTests.Suite.test.",
             "api.openapi_contract.test.client openapi module resolves shared refs through owner modules",
             "api.openapi_contract.test.metadata openapi module generates extractor surface for routed endpoints",
             "api.query.consumerTests.Suite.test.",
@@ -129,12 +132,22 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     .{
         .source = "pkg/antfly/src/api_http_runtime_test_root.zig",
         .artifact = "test",
-        .selection = "backup heartbeat ",
+        .selection = "storage-kernel query request preserves final projection while raw retrieval defers it",
         .skip = &.{
+            "api.sql_catalog.test.SQL catalog ALTER submits native schema CAS without client generations",
+            "api.sql_catalog.test.SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
+            "api.sql_catalog.test.SQL catalog DDL schema validates through native public admission",
+            "api.sql_session_overlay.test.SQL session overlay merges pages and suppresses replaced and deleted rows",
+            "api.sql_session_overlay.test.SQL session overlay preserves JSON null independently of SQL NULL",
+            "api.sql_execution.test.",
+            "api.sql_pgwire.test.",
+            "api.sql_schema_cache.test.",
+            "api.sql_session.test.",
+            "api.transactions.test.SQL",
             "metadata.http_server.test.",
             "sql.ddl_runtime.test.",
             "metadata.storage.raft_apply_store.test.",
-            // The generating lane owns conversation and backend contracts,
+            // The explicit generating server owner owns conversation contracts,
             // even when this HTTP root imports them through agent tools.
             "api.agent_tools.test.agent conversation",
             "generating.mod.test.generating backend",
@@ -177,12 +190,15 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "api-table-write-implementation-tests",
         .selection = "provisioned table write source drop table",
         .skip = &.{
+            // Status contracts belong to derived coverage; scheduler contracts belong to DB core.
+            "api.runtime_status.consumerTests.Suite.test.",
+            "storage.db.index_repair_scheduler.test.",
             "api.table_reads.implementationTests.Suite.test.",
             "metadata.table_provisioner.implementationTests.Suite.test.",
             "storage.db.db.test.",
             "storage.db.db.DB.test.",
             "storage.db.generation_lifecycle.test.",
-            "storage.local_write.test.",
+            "storage.write.test.",
         },
     },
     .{
@@ -220,6 +236,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "data-runtime-implementation-tests",
         .selection = "data ownership fallback requires a single store across all roles",
         .skip = &.{
+            "data.raft_batch.test.",
             "raft.hosted_shard_ops.test.",
             "storage.db.db.test.",
             "storage.db.enrichment.enrichment_runtime.test.",
@@ -272,7 +289,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/introducer.zig",
+        .source = "pkg/antfly-embedded/src/local/introducer.zig",
         .artifact = "test",
         .selection = "all",
         .skip = &.{
@@ -284,6 +301,11 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "lake",
         .skip = &.{
+            // Sidecar terminology does not make engine or segment contracts Lake-owned.
+            "segment.test.",
+            "sparse.sparse.test.",
+            "storage.db.",
+            "storage.hbc_adapter.test.",
             "serverless.build.builder.test.",
             "serverless.build.external_publication_metadata.test.",
             "serverless.build.external_source_publish.test.",
@@ -291,6 +313,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "serverless.manifest.codec.test.",
             "storage.resource_manager.test.",
             "storage.rowsource.external.test.",
+            "storage.rowsource.identity.test.",
+            "sql.disk_rows.test.",
         },
     },
     .{
@@ -451,7 +475,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "dedupeSearchHitsById uses ordinals when hit page is complete",
         .skip = &.{
-            "storage.document_mutation_revision.test.document mutation revision capture owns allocation failures and coalesces owners",
+            "storage.document_mutation_revision.test.",
             "storage.db.db.test.",
             "storage.db.query.graph_exec.test.",
             "storage.db.query.result_shape.test.",
@@ -483,7 +507,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/root.zig",
+        .source = "pkg/antfly/src/generating_test_root.zig",
         .artifact = "test",
         .selection = "generating backend",
         .skip = &.{
@@ -510,19 +534,9 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
     },
     .{
         .source = "pkg/antfly/src/root.zig",
-        .artifact = "test",
-        .selection = "public openapi contract module is generated and wired",
+        .artifact = "public-api-parity",
+        .selection = "SQL API cross-table MERGE retains both source and target range proofs",
         .skip = &.{
-            "api.sql_catalog.test.SQL catalog ALTER submits native schema CAS without client generations",
-            "api.sql_catalog.test.SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
-            "api.sql_catalog.test.SQL catalog DDL schema validates through native public admission",
-            "api.sql_session_overlay.test.SQL session overlay merges pages and suppresses replaced and deleted rows",
-            "api.sql_session_overlay.test.SQL session overlay preserves JSON null independently of SQL NULL",
-            "api.sql_execution.test.",
-            "api.sql_pgwire.test.",
-            "api.sql_schema_cache.test.",
-            "api.sql_session.test.",
-            "api.transactions.test.SQL",
             "api.httpx_handler.test.httpx SQL",
             "api.httpx_handler.test.httpx FK source control rejects missing service token in legacy internal mode",
             "api.httpx_handler.test.httpx hidden handoff receipt rejects public caller even in legacy internal mode",
@@ -551,6 +565,8 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "raft.",
         .skip = &.{
+            // The explicit transport owner includes its reachability contracts.
+            "raft.transport.",
             "raft.storage.file_snapshot_store.test.file snapshot maintenance uses borrowed scheduling for deadlines wakeups and shutdown",
             "raft.shard_ops.test.",
             "raft.storage.backup_restore.test.",

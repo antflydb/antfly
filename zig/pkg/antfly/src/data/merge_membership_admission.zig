@@ -9,8 +9,8 @@
 const std = @import("std");
 const raft = @import("raft_engine").core;
 const batch = @import("raft_batch.zig");
-const source = @import("../storage/db/online_source_contract.zig");
-const types = @import("../storage/db/types.zig");
+const source = @import("antfly_local_sources").storage_db_online_source_contract;
+const types = @import("antfly_local_sources").storage_db_types;
 
 pub const Receiver = struct {
     transition_id: u64,

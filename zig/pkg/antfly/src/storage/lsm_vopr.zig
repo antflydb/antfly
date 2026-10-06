@@ -7,10 +7,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const backend_types = @import("backend_types.zig");
-const mem_backend_mod = @import("mem_backend.zig");
-const lsm_backend_mod = @import("lsm_backend/mod.zig");
-const storage_sim = @import("sim_runtime.zig");
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const mem_backend_mod = @import("antfly_local_sources").storage_mem_backend;
+const lsm_backend_mod = @import("antfly_local_sources").storage_lsm_backend_mod;
+const storage_sim = @import("antfly_local_sources").storage_sim_runtime;
 
 const namespaces = [_]backend_types.Namespace{
     .{},

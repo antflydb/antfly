@@ -52,6 +52,13 @@ class SelectionAuditTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_zig017_suite_filters_validate_the_runtime_selection(self):
+        result = self.run_cli("--suite-filter", "lease")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.run_cli("--suite-filter", "missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("test filter matched no declared tests", result.stdout)
+
     def test_runtime_unknown_controls_are_rejected(self):
         result = self.run_cli("--test-filte", "route")
         self.assertNotEqual(result.returncode, 0)

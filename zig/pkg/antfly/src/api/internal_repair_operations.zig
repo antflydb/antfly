@@ -6,7 +6,7 @@
 //! Transport-neutral operations used by internal repair coordination.
 
 const std = @import("std");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const repair_jobs = @import("repair_jobs.zig");
 
 pub const Error = operation.ApiError;

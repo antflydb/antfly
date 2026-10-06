@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const transactions_mod = @import("../storage/transactions.zig");
-const tracing = @import("../tracing/antfly_trace_writer.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const tracing = @import("antfly_local_sources").tracing_antfly_trace_writer;
 const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const http_client_mod = @import("http_client.zig");
@@ -24,19 +24,19 @@ const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
-const table_writes = @import("table_write_source.zig");
-const contract = @import("distributed_txn_contract.zig");
-const integrity_wire = @import("relational_integrity_wire.zig");
-const integrity_activation = @import("../storage/db/relational_integrity_activation_contract.zig");
-const integrity_retirement = @import("../storage/db/relational_integrity_retirement_contract.zig");
+const table_writes = @import("antfly_local_sources").api_table_write_source;
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const integrity_wire = @import("antfly_local_sources").api_relational_integrity_wire;
+const integrity_activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+const integrity_retirement = @import("antfly_local_sources").storage_db_relational_integrity_retirement_contract;
 
-pub const table_participant_prefix = @import("local_transaction_contract.zig").table_participant_prefix;
+pub const table_participant_prefix = @import("antfly_local_sources").api_local_transaction_contract.table_participant_prefix;
 
-const table_participant_v2_prefix = @import("local_transaction_contract.zig").table_participant_v2_prefix;
+const table_participant_v2_prefix = @import("antfly_local_sources").api_local_transaction_contract.table_participant_v2_prefix;
 
-const table_participant_v3_prefix = @import("local_transaction_contract.zig").table_participant_v3_prefix;
+const table_participant_v3_prefix = @import("antfly_local_sources").api_local_transaction_contract.table_participant_v3_prefix;
 
-pub const group_participant_marker = @import("local_transaction_contract.zig").group_participant_marker;
+pub const group_participant_marker = @import("antfly_local_sources").api_local_transaction_contract.group_participant_marker;
 
 pub const TxnBeginRequest = struct {
     txn_id: db_mod.types.TxnId,
@@ -51,7 +51,7 @@ pub const TxnBeginRequest = struct {
 test "distributed txn range guard wire preserves absent and exact counters" {
     const Harness = struct {
         fn run(alloc: std.mem.Allocator) !void {
-            const tracking = @import("../storage/range_protection.zig");
+            const tracking = @import("antfly_local_sources").storage_range_protection;
             var index_id: [tracking.index_id_bytes]u8 = @splat(0);
             index_id[7] = 9;
             const proofs = [_]tracking.Proof{
@@ -75,12 +75,12 @@ test "distributed txn range guard wire preserves absent and exact counters" {
                 freeTxnPrepareRequest(alloc, &unexpected);
                 return error.TestExpectedError;
             } else |err| if (err != error.InvalidTxnRequest) return err;
-            const batch_bytes = try @import("batch.zig").encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
+            const batch_bytes = try @import("antfly_local_sources").api_batch.encodeBatchRequest(alloc, .{ .transaction = .{ .prepare = .{ .txn_id = @splat(1), .topology_epoch = 3 } }, .range_guards = &proofs });
             defer alloc.free(batch_bytes);
-            var batch = try @import("batch.zig").parseInternalBatchRequest(alloc, batch_bytes);
+            var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, batch_bytes);
             defer batch.deinit(alloc);
             try std.testing.expectEqualDeep(&proofs, batch.req.range_guards);
-            if (@import("batch.zig").parseBatchRequest(alloc, batch_bytes)) |value| {
+            if (@import("antfly_local_sources").api_batch.parseBatchRequest(alloc, batch_bytes)) |value| {
                 var unexpected = value;
                 unexpected.deinit(alloc);
                 return error.TestExpectedError;
@@ -92,7 +92,7 @@ test "distributed txn range guard wire preserves absent and exact counters" {
 
 pub const TxnPrepareRequest = struct {
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
-    range_guards_owner: ?std.json.Parsed([]const @import("../storage/range_protection.zig").Proof) = null,
+    range_guards_owner: ?std.json.Parsed([]const @import("antfly_local_sources").storage_range_protection.Proof) = null,
     txn_id: db_mod.types.TxnId,
     topology_epoch: u64 = 0,
     req: db_mod.types.TransactionIntentRequest,
@@ -100,7 +100,7 @@ pub const TxnPrepareRequest = struct {
     integrity_commands_owner: ?std.json.Parsed([]const integrity_wire.Command) = null,
     relational_activation_owner: ?std.json.Parsed(integrity_activation.Command) = null,
     relational_retirement_owner: ?std.json.Parsed(integrity_retirement.Command) = null,
-    relational_index_maintenance_owner: ?std.json.Parsed(@import("../storage/db/relational_index_maintenance_contract.zig").Command) = null,
+    relational_index_maintenance_owner: ?std.json.Parsed(@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command) = null,
 };
 
 pub const TxnResolveRequest = struct {
@@ -191,14 +191,14 @@ pub fn resolveGroupLocalWithRequest(writes: table_writes.TableWriteSource, alloc
     return writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation);
 }
 
-pub const TableCommitRequest = @import("local_transaction_contract.zig").TableCommitRequest;
+pub const TableCommitRequest = @import("antfly_local_sources").api_local_transaction_contract.TableCommitRequest;
 
-pub const CommitConflict = @import("local_transaction_contract.zig").CommitConflict;
+pub const CommitConflict = @import("antfly_local_sources").api_local_transaction_contract.CommitConflict;
 
 pub const ParticipantPhase = contract.ParticipantPhase;
-pub const CommitOutcome = @import("local_transaction_contract.zig").CommitOutcome;
+pub const CommitOutcome = @import("antfly_local_sources").api_local_transaction_contract.CommitOutcome;
 
-pub const PreDecisionContext = @import("local_transaction_contract.zig").PreDecisionContext;
+pub const PreDecisionContext = @import("antfly_local_sources").api_local_transaction_contract.PreDecisionContext;
 
 pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
 
@@ -1354,7 +1354,7 @@ fn executeMultiTableCommitOnce(
         defer routing.deinit(alloc);
         const topology_epoch = routing.topology_epoch;
 
-        try @import("range_read_guards.zig").validate(table.range_guards);
+        try @import("antfly_local_sources").api_range_read_guards.validate(table.range_guards);
         for (table.range_guards) |owner| {
             const fence = owner.fence;
             if (routing.snapshot.status.metadata_group_id != fence.metadata_group_id or
@@ -1985,7 +1985,7 @@ const ParticipantTxn = struct {
     row_policy_database: []const u8 = "",
     row_policy_admitted_at_seconds: i64 = 0,
     route_fence: ?@import("../metadata/api.zig").CatalogRouteFence = null,
-    range_guards: std.ArrayListUnmanaged(@import("../storage/range_protection.zig").Proof) = .empty,
+    range_guards: std.ArrayListUnmanaged(@import("antfly_local_sources").storage_range_protection.Proof) = .empty,
     schema_version: ?u32 = null,
     table_name: []const u8,
     group_id: u64,
@@ -2003,7 +2003,7 @@ const ParticipantTxn = struct {
     integrity_commands: std.ArrayListUnmanaged(integrity_wire.Command) = .empty,
     relational_activation: ?integrity_activation.Command = null,
     relational_retirement: ?integrity_retirement.Command = null,
-    relational_index_maintenance: ?@import("../storage/db/relational_index_maintenance_contract.zig").Command = null,
+    relational_index_maintenance: ?@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command = null,
 
     fn statusRequest(self: ParticipantTxn, txn_id: db_mod.types.TxnId) TxnStatusRequest {
         return .{ .txn_id = txn_id, .restore_staging_scope = self.restore_staging_scope, .restore_staging_plan_id = self.restore_staging_plan_id };
@@ -2305,13 +2305,13 @@ fn ensureParticipantTxn(
     return &grouped.items[grouped.items.len - 1];
 }
 
-pub const participantIdForGroup = @import("local_transaction_contract.zig").participantIdForGroup;
+pub const participantIdForGroup = @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroup;
 
-pub const ParticipantRef = @import("local_transaction_contract.zig").ParticipantRef;
+pub const ParticipantRef = @import("antfly_local_sources").api_local_transaction_contract.ParticipantRef;
 
-pub const participantIdForGroupScoped = @import("local_transaction_contract.zig").participantIdForGroupScoped;
+pub const participantIdForGroupScoped = @import("antfly_local_sources").api_local_transaction_contract.participantIdForGroupScoped;
 
-pub const parseParticipantRef = @import("local_transaction_contract.zig").parseParticipantRef;
+pub const parseParticipantRef = @import("antfly_local_sources").api_local_transaction_contract.parseParticipantRef;
 
 pub fn resolveParticipant(
     alloc: std.mem.Allocator,
@@ -2396,7 +2396,7 @@ pub fn encodeTxnPrepareRequest(alloc: std.mem.Allocator, req: TxnPrepareRequest)
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     const guarded = req.req.range_guards.len != 0;
-    const row_semantics = @import("batch.zig").requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
+    const row_semantics = @import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.req.writes, req.req.predicates);
     if (row_semantics) try out.appendSlice(alloc, "[\"row-semantics-prepare-v1\",") else if (guarded) try out.appendSlice(alloc, "[\"range-prepare-v1\",");
     try out.appendSlice(alloc, "{\"txn_id\":\"");
     try out.appendSlice(alloc, &txn_hex);
@@ -2555,7 +2555,7 @@ pub fn encodeTxnResolveRequest(alloc: std.mem.Allocator, req: TxnResolveRequest)
     return try out.toOwnedSlice(alloc);
 }
 
-const validateRestorePlan = @import("local_transaction_contract.zig").validateRestorePlan;
+const validateRestorePlan = @import("antfly_local_sources").api_local_transaction_contract.validateRestorePlan;
 
 fn appendRestorePlan(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), plan_id: ?[16]u8) !void {
     if (plan_id) |id| {
@@ -2717,14 +2717,14 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     errdefer integrity_wire.free(alloc, integrity);
     var integrity_commands_owner = if (obj.get("integrity_commands")) |value| try integrity_wire.parseCommands(alloc, value) else null;
     errdefer if (integrity_commands_owner) |*owner| owner.deinit();
-    var range_guards_owner = if (obj.get("range_guards")) |value| try std.json.parseFromValue([]const @import("../storage/range_protection.zig").Proof, alloc, value, .{ .allocate = .alloc_always }) else null;
+    var range_guards_owner = if (obj.get("range_guards")) |value| try std.json.parseFromValue([]const @import("antfly_local_sources").storage_range_protection.Proof, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (range_guards_owner) |*owner| owner.deinit();
-    if (range_guards_owner) |owner| if (owner.value.len > @import("range_read_guards.zig").max_proofs) return error.InvalidTxnRequest;
+    if (range_guards_owner) |owner| if (owner.value.len > @import("antfly_local_sources").api_range_read_guards.max_proofs) return error.InvalidTxnRequest;
     var relational_activation_owner = if (obj.get("relational_activation")) |value| try std.json.parseFromValue(integrity_activation.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (relational_activation_owner) |*owner| owner.deinit();
     var relational_retirement_owner = if (obj.get("relational_retirement")) |value| try std.json.parseFromValue(integrity_retirement.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (relational_retirement_owner) |*owner| owner.deinit();
-    var relational_index_maintenance_owner = if (obj.get("relational_index_maintenance")) |value| try std.json.parseFromValue(@import("../storage/db/relational_index_maintenance_contract.zig").Command, alloc, value, .{ .allocate = .alloc_always }) else null;
+    var relational_index_maintenance_owner = if (obj.get("relational_index_maintenance")) |value| try std.json.parseFromValue(@import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command, alloc, value, .{ .allocate = .alloc_always }) else null;
     errdefer if (relational_index_maintenance_owner) |*owner| owner.deinit();
     const relational_schema_version: ?u32 = if (obj.get("relational_schema_version")) |_| blk: {
         const version = try optionalU64(obj, "relational_schema_version");
@@ -2747,7 +2747,7 @@ pub fn parseTxnPrepareRequest(alloc: std.mem.Allocator, body: []const u8) !TxnPr
     const has_guards = range_guards_owner != null and range_guards_owner.?.value.len != 0;
     if (has_guards and !wrapped) return error.InvalidTxnRequest;
     if (wrapped and !row_semantics and !has_guards) return error.InvalidTxnRequest;
-    if (@import("batch.zig").requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
+    if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(writes, predicates) and !row_semantics) return error.InvalidTxnRequest;
     return .{
         .route_fence = if (route_fence) |fence| fence.value else null,
         .txn_id = txn_id,
@@ -2845,7 +2845,7 @@ test "distributed txn prepare preserves JSON null provenance and rejects invalid
 
 test "distributed txn index maintenance prepare roundtrips owned exact observation" {
     const alloc = std.testing.allocator;
-    const command = @import("../storage/db/relational_index_maintenance_contract.zig").Command{
+    const command = @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Command{
         .action = .repair,
         .table_id = 7,
         .owner_group_id = 11,
@@ -2969,7 +2969,7 @@ test "distributed txn restore plan identity survives begin resolve and private b
     unscoped.restore_staging_plan_id = @splat(0);
     try std.testing.expectError(error.InvalidTxnRequest, encodeTxnBeginRequest(alloc, unscoped));
 
-    const batch = @import("batch.zig");
+    const batch = @import("antfly_local_sources").api_batch;
     const mutation: db_mod.types.BatchRequest = .{ .restore_staging_scope = scope, .restore_staging_plan_id = plan, .transaction = .{ .resolve = .{ .txn_id = begin.txn_id, .status = .committed, .commit_version = 2 } } };
     const bytes = try batch.encodeBatchRequest(alloc, mutation);
     defer alloc.free(bytes);
@@ -5794,7 +5794,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 6), recorder.resolves.items.len);
 
             recorder.coordinator_group = 7001;
-            var routed_address = try @import("../storage/db/relational_integrity_contract.zig").Address.init(@as([16]u8, @splat(1)), "tuple");
+            var routed_address = try @import("antfly_local_sources").storage_db_relational_integrity_contract.Address.init(@as([16]u8, @splat(1)), "tuple");
             // This transport test deliberately supplies an explicit routing digest;
             // native address validation is separately tested at the storage boundary.
             routed_address.routing = @as([32]u8, @splat('z'));
@@ -5826,7 +5826,7 @@ fn consumerTests() type {
             defer routing.deinit(std.testing.allocator);
             const manager = @import("../metadata/table_manager.zig");
             const owner = routing.ranges[1].*;
-            var observation: @import("range_read_guards.zig").OwnerRangeProof = .{
+            var observation: @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof = .{
                 .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 9, .table_id = 7, .topology_epoch = routing.topology_epoch, .route = .{ .group_id = 7002, .range_id = manager.rangeDocIdentityRangeId(owner), .identity_namespace = .{ .table_id = 7, .shard_id = manager.rangeDocIdentityShardId(owner), .range_id = manager.rangeDocIdentityRangeId(owner) } } },
                 .proofs = &.{.{ .bucket = 100, .generation = 9007199254740993 }},
             };

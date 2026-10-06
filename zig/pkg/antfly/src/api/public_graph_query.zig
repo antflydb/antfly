@@ -16,11 +16,11 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const graph_mod = @import("../graph/graph.zig");
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_query_mod = @import("../graph/query.zig");
-const query_contract = @import("query_contract.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 
 pub fn rejectInternalDocIdentityFields(alloc: std.mem.Allocator, body: []const u8) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;

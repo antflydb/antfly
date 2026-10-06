@@ -50,7 +50,7 @@ export function storageKind(storage: Storage | undefined): number {
   }
 }
 
-// --- Struct types (must match zig/pkg/antfly/include/antfly.h exactly) ----
+// --- Struct types (must match zig/pkg/antfly-embedded/include/antfly.h exactly) ----
 
 export const AntflySlice = koffi.struct("antfly_slice", {
   ptr: "const uint8_t *",

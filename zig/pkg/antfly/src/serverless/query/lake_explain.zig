@@ -19,17 +19,17 @@
 //! advice from the serving observation stream.
 
 const std = @import("std");
-const artifact_ref = @import("../manifest/artifact_ref.zig");
-const base_source = @import("../manifest/base_source.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const lake_promotion = @import("../build/lake_promotion.zig");
-const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
+const sidecar_manifest = @import("antfly_local_sources").serverless_segment_sidecar_manifest;
 const lake_cache = @import("lake_cache.zig");
-const lake_rows = @import("lake_rows.zig");
-const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
-const lake_range_io = @import("lake_range_io.zig");
-const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
-const source_binding = @import("../segment/source_binding.zig");
+const lake_rows = @import("antfly_local_sources").serverless_query_lake_rows;
+const lake_parquet_rowgroup = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
+const lake_range_io = @import("antfly_local_sources").serverless_query_lake_range_io;
+const lake_sidecar_selection = @import("antfly_local_sources").serverless_query_lake_sidecar_selection;
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
+const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
 
 pub const Operation = enum {
     scan,

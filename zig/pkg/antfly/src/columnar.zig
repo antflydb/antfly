@@ -36,7 +36,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const snappy = @import("encoding/snappy.zig");
+const snappy = @import("antfly_local_sources").encoding_snappy;
 
 const columnar_magic: [4]u8 = "COLS".*;
 const columnar_version: u8 = 1;
@@ -467,3 +467,6 @@ test "columnar cross-chunk boundary" {
     // Out of range → null
     try std.testing.expect(try reader.readField(5, "id") == null);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

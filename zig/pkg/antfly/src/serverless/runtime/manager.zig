@@ -22,7 +22,7 @@ const build_mod = @import("../build/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const enrichment_mod = @import("../enrichment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
-const managed_embedder = @import("../../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const runtime_lifecycle = @import("../../common/runtime_lifecycle.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 

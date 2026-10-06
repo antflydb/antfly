@@ -9,7 +9,7 @@ const std = @import("std");
 const transactions = @import("transactions.zig");
 const record = @import("sql_connection_record.zig");
 const prepared = @import("sql_prepared.zig");
-const settings = @import("../sql/setting_catalog.zig");
+const settings = @import("antfly_local_sources").sql_setting_catalog;
 
 const directory_key = "\x00sql-connection-directory-v1";
 pub const max_connections = 128;
@@ -370,7 +370,7 @@ fn mutateTxn(store: *transactions.DurableSessionStore, txn: anytype, alloc: std.
 
 test "HTTP connection DISCARD fences only its prepared resources and active owner" {
     const alloc = std.testing.allocator;
-    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-test" });
     defer native.deinit();
@@ -431,7 +431,7 @@ test "HTTP connection DISCARD fences only its prepared resources and active owne
 
 test "HTTP connection recovers a durable pre-response BEGIN fence without an escaped transaction" {
     const alloc = std.testing.allocator;
-    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-begin-recovery-test" });
     defer native.deinit();
@@ -462,7 +462,7 @@ test "HTTP connection recovers a durable pre-response BEGIN fence without an esc
 
 test "HTTP connection keeps a referenced durable transaction through session GC" {
     const alloc = std.testing.allocator;
-    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-gc-test" });
     defer native.deinit();
@@ -496,7 +496,7 @@ test "HTTP connection keeps a referenced durable transaction through session GC"
 
 test "HTTP connection reconciles a durable aborted coordinator decision" {
     const alloc = std.testing.allocator;
-    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-abort-recovery-test" });
     defer native.deinit();
@@ -554,7 +554,7 @@ test "HTTP connection reconciles a durable aborted coordinator decision" {
 
 test "HTTP connection publishes only committed nonlocal settings on terminal proof" {
     const alloc = std.testing.allocator;
-    var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+    var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
     defer backend.close();
     var native = try backend.runtimeStore(alloc, .{ .name = "sql-connection-settings-test" });
     defer native.deinit();

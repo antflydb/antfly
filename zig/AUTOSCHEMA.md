@@ -49,7 +49,7 @@ AutoSchemaKG's results that matter for Antfly:
 ## Non-Goals
 
 - No new node model. `GraphNodeModel` stays `{document, external}`
-  (`pkg/antfly/src/storage/db/catalog/index_manager.zig`); entities, events,
+  (`pkg/antfly-embedded/src/local/storage/db/catalog/index_manager.zig`); entities, events,
   and concepts are ordinary documents in dedicated tables.
 - No new artifact format. All stages emit the existing `extraction_graph`
   shape consumed by `runtimeGraphWritesFromArtifactValueAlloc`.

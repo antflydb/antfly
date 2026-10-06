@@ -6,8 +6,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const persistent = @import("persistent.zig");
-const fixture = @import("persistent_sim_fixture.zig");
+const persistent = @import("antfly_local_sources").storage_persistent;
+const fixture = @import("antfly_local_sources").storage_persistent_sim_fixture;
 
 const segment_base = vopr.id.stable("transition", "storage.persistent.index_segment");
 const reopen_id = vopr.id.stable("transition", "storage.persistent.reopen");

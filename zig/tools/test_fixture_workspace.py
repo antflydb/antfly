@@ -37,7 +37,7 @@ class FixtureWorkspaceTests(unittest.TestCase):
                     f"-femit-bin={binary}",
                     "--dep",
                     "antfly_platform",
-                    f"-Mroot={zig_root / 'pkg/antfly/src/common/test_directory.zig'}",
+                    f"-Mroot={zig_root / 'pkg/antfly-embedded/src/local/common/test_directory.zig'}",
                     f"-Mantfly_platform={zig_root / 'lib/platform/src/root.zig'}",
                 ],
                 cwd=temporary,

@@ -383,46 +383,11 @@ fn writeRestoreResponse(
     return restorePhaseResult(job.phase);
 }
 
-pub fn waitForRestoreJob(
-    client: *antfly_client.AntflyClient,
-    io: std.Io,
-    job_id: []const u8,
-    timeout_ms: u64,
-) !antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob) {
-    const started_ns = platform_time.monotonicNs();
-    const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-    var poll_state = RestorePollState{};
-    while (true) {
-        var response = try client.getRestoreJobResponse(job_id);
-        const disposition = poll_state.observe(response.status_code, response.data != null);
-        if (response.data) |*data| {
-            std.debug.assert(disposition == .use_data);
-            if (isTerminalRestorePhase(data.value.phase)) return response;
-        } else if (disposition == .invalid) {
-            cli.expectHttpSuccess(response);
-            response.deinit();
-            return error.InvalidRestoreResponse;
-        } else {
-            // Followers can lag the replicated catalog, and load balancers or
-            // upstreams can fail transiently while the restore remains live.
-        }
-        response.deinit();
-        const elapsed_ns = platform_time.monotonicNs() -| started_ns;
-        if (elapsed_ns >= timeout_ns) return error.RestoreWaitTimeout;
-        const poll_ns = restore_poll_interval_ms * std.time.ns_per_ms;
-        const delay_ns = @min(poll_ns, timeout_ns - elapsed_ns);
-        io.sleep(std.Io.Duration.fromNanoseconds(@intCast(delay_ns)), .awake) catch return error.RestoreWaitInterrupted;
-    }
-}
+pub const waitForRestoreJob = @import("antfly_local_sources").cmd_cli_backup_wait.waitForRestoreJob;
 
-pub fn isTerminalRestorePhase(phase: []const u8) bool {
-    return std.mem.eql(u8, phase, "succeeded") or std.mem.eql(u8, phase, "failed") or std.mem.eql(u8, phase, "cancelled");
-}
+pub const isTerminalRestorePhase = @import("antfly_local_sources").cmd_cli_backup_wait.isTerminalRestorePhase;
 
-pub fn restorePhaseResult(phase: []const u8) !void {
-    if (std.mem.eql(u8, phase, "failed")) return error.RestoreJobFailed;
-    if (std.mem.eql(u8, phase, "cancelled")) return error.RestoreJobCancelled;
-}
+pub const restorePhaseResult = @import("antfly_local_sources").cmd_cli_backup_wait.restorePhaseResult;
 
 pub fn prepareInputRestorePlan(
     allocator: std.mem.Allocator,

@@ -4,7 +4,7 @@
 //! Compiled independently so the consumer cannot share this archive's Zig
 //! error numbering or std.Io implementation.
 const std = @import("std");
-const secrets = @import("common/secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 const error_abi = @import("antfly_runtime_abi").error_abi;
 
 // Tests execute serially. Inject inside the owning archive so the consumer
@@ -72,8 +72,8 @@ export fn secret_store_abi_destroy(store: *secrets.FileStore) callconv(.c) void 
     allocator.destroy(store);
 }
 
-const secret_contract = @import("common/secret_contract.zig");
-const secret_record = @import("common/secret_record.zig");
+const secret_contract = @import("antfly_local_sources").common_secret_contract;
+const secret_record = @import("antfly_local_sources").common_secret_record;
 const FoundationFixture = struct {
     var context: u8 = 0;
     fn resolve(_: *anyopaque, alloc: std.mem.Allocator, scope: []const u8, _: []const u8, _: secret_contract.ReadOptions) !secret_contract.Lookup {
@@ -111,3 +111,6 @@ export fn secret_foundation_abi_handles(source: *secret_contract.Source, writer:
     writer.* = .{ .ptr = &FoundationFixture.context, .vtable = &.{ .put = FoundationFixture.put, .remove_override = FoundationFixture.remove } };
     keys.* = .{ .ptr = &FoundationFixture.context, .vtable = &.{ .wrap = FoundationFixture.wrap, .unwrap = FoundationFixture.unwrap } };
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

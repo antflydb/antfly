@@ -5966,20 +5966,22 @@ pub const ModelManager = struct {
         _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
-    pub fn attachIo(self: *ModelManager, io: std.Io) void {
+    pub fn attachIo(self: *ModelManager, io: std.Io) std.Io.ConcurrentError!void {
         self.lockLoadedModels();
+        defer self.unlockLoadedModels();
         self.session_manager.io = io;
         var it = self.loaded.iterator();
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
         const start_eviction_loop = self.keep_alive_ms > 0 and
             !self.eviction_loop_started;
         if (start_eviction_loop) {
+            // This loop only ends on cancellation. async may execute inline
+            // when the CPU-bound worker limit is zero or exhausted, hanging
+            // startup. concurrent must either spawn it or report failure.
+            try self.eviction_group.concurrent(io, evictionLoop, .{ self, io });
             self.eviction_loop_started = true;
             self.eviction_io = io;
         }
-        self.unlockLoadedModels();
-        if (start_eviction_loop)
-            self.eviction_group.async(io, evictionLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *ModelManager) void {
@@ -9479,16 +9481,53 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     defer reloaded.release();
     // A late attachment must not move an existing Group to a different Io.
     const owned_io = manager.load_io.?;
-    manager.attachIo(std.testing.io);
+    try manager.attachIo(std.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
 }
 
+test "model eviction attachment returns with zero async workers and cancels on teardown" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer io_impl.deinit();
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureModelCache(1, 0);
+    try manager.attachIo(io_impl.io());
+    try std.testing.expect(manager.eviction_loop_started);
+    try std.testing.expectEqual(io_impl.io().userdata, manager.eviction_io.?.userdata);
+    // Reattachment must not schedule a second infinite task on the one-worker lane.
+    try manager.attachIo(io_impl.io());
+}
+
+test "model eviction attachment failure leaves maintenance retryable" {
+    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer unavailable_io.deinit();
+    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer available_io.deinit();
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureModelCache(1, 0);
+    try std.testing.expectError(error.ConcurrencyUnavailable, manager.attachIo(unavailable_io.io()));
+    try std.testing.expect(!manager.eviction_loop_started);
+    try std.testing.expect(manager.eviction_io == null);
+    try manager.attachIo(available_io.io());
+    try std.testing.expect(manager.eviction_loop_started);
+}
+
 test "cold load coordination reuses an attached runtime without a fallback" {
     var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
     defer manager.deinit();
-    manager.attachIo(std.testing.io);
+    try manager.attachIo(std.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);

@@ -14,24 +14,24 @@
 
 //! Public typed rows share SQL's authorized external binding and cursor.
 const std = @import("std");
-const catalog = @import("../sql/catalog.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
 const Adapter = @import("sql_execution.zig").Adapter;
 const helpers = @import("http_route_helpers.zig");
 
-pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../system_catalog/domain.zig").Target, expected_id: u64, request: helpers.OwnedScanKeysRequest) !?[]u8 {
+pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("antfly_local_sources").system_catalog_domain.Target, expected_id: u64, request: helpers.OwnedScanKeysRequest) !?[]u8 {
     if (!adapter.server.source.vtable.supports_query_definitions) return null;
-    var budget: @import("../sql/memory_budget.zig") = .{ .backing = alloc, .limit = 64 * 1024 * 1024 };
+    var budget: @import("antfly_local_sources").sql_memory_budget = .{ .backing = alloc, .limit = 64 * 1024 * 1024 };
     const scan_alloc = budget.allocator();
     var arena = std.heap.ArenaAllocator.init(scan_alloc);
     defer arena.deinit();
     const a = arena.allocator();
     const definition_bytes = try adapter.server.source.systemCatalog(a, adapter.context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true } });
-    const resolved = try std.json.parseFromSliceLeaky(@import("../system_catalog/domain.zig").ResolvedMany, a, definition_bytes, .{ .allocate = .alloc_always });
+    const resolved = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").system_catalog_domain.ResolvedMany, a, definition_bytes, .{ .allocate = .alloc_always });
     if (resolved.tables.len != 1) return error.InvalidSqlBackendResponse;
     const current = resolved.tables[0] orelse return error.TableNotFound;
     if (current.table_id != expected_id) return error.CatalogGenerationChanged;
     const definition = current.query_definition orelse return error.InvalidSqlBackendResponse;
-    const external = try @import("../serverless/external_source/schema_binding.zig").externalBindingFromSchemaJsonAlloc(a, definition.schema_json);
+    const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, definition.schema_json);
     if (external == null) return null;
     adapter.revision = resolved.revision;
     const backend = adapter.backend();
@@ -108,7 +108,7 @@ fn normalizeConditions(a: std.mem.Allocator, table: catalog.Table, input: []cons
         const kind = (try table.column(condition.column)).type;
         var value = condition.value orelse .null;
         if (value == .string and kind == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
-        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null else try @import("lake_values.zig").comparisonValue(a, value, kind);
+        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null else try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, value, kind);
     }
     return result;
 }
@@ -119,18 +119,18 @@ fn matchesNormalized(a: std.mem.Allocator, row: catalog.Row, table: catalog.Tabl
     for (conditions) |condition| {
         const stored = try row.cell(condition.column);
         const kind = (try table.column(condition.column)).type;
-        const cell: @import("../sql/scalar.zig").Datum = .{ .value = try @import("lake_values.zig").comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
+        const cell: @import("antfly_local_sources").sql_scalar.Datum = .{ .value = try @import("antfly_local_sources").sql_lake_values.comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
         const operand = condition.value orelse .null;
         const match = switch (condition.op) {
             .is_null => cell.sql_null,
             .is_not_null => !cell.sql_null,
             .is_distinct, .is_not_distinct => blk: {
-                const distinct = if (cell.sql_null or operand == .null) cell.sql_null != (operand == .null) else (try @import("../sql/scalar.zig").compare(cell.value, operand)) != .eq;
+                const distinct = if (cell.sql_null or operand == .null) cell.sql_null != (operand == .null) else (try @import("antfly_local_sources").sql_scalar.compare(cell.value, operand)) != .eq;
                 break :blk if (condition.op == .is_distinct) distinct else !distinct;
             },
             else => blk: {
                 if (cell.sql_null or operand == .null) break :blk false;
-                const order = try @import("../sql/scalar.zig").compare(cell.value, operand);
+                const order = try @import("antfly_local_sources").sql_scalar.compare(cell.value, operand);
                 break :blk switch (condition.op) {
                     .eq => order == .eq,
                     .ne => order != .eq,

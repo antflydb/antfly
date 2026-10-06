@@ -26,12 +26,12 @@ const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const generating = @import("antfly_generating");
 const platform_time = @import("antfly_platform").time;
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const query_builder_agent = @import("query_builder_agent.zig");
-const json_helpers = @import("json_helpers.zig");
-const wildcard_mod = @import("../search/wildcard.zig");
-const graph_query_mod = @import("../graph/query.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const wildcard_mod = @import("antfly_local_sources").search_wildcard;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -11867,7 +11867,7 @@ test "retrieval graph navigation terminal answer preserves embedded JSON provide
     const alloc = std.testing.allocator;
     var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
     defer client.deinit();
-    var factory = @import("../generating/mod.zig").BackendFactory.initWithOptions(alloc, &client, .{
+    var factory = @import("antfly_local_sources").generating_mod.BackendFactory.initWithOptions(alloc, &client, .{
         .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
         .request_context = .{ .io = std.testing.io, .deadline_ns = null },
     });

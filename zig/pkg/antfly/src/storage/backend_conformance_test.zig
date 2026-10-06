@@ -13,10 +13,10 @@
 // limitations.
 
 const std = @import("std");
-const backend_erased = @import("backend_erased.zig");
-const backend_types = @import("backend_types.zig");
-const mem_backend = @import("mem_backend.zig");
-const lsm_backend = @import("lsm_backend/mod.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 
 fn expectNamespaceStoreConformance(
     runtime: *backend_erased.NamespaceStore,

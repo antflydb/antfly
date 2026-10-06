@@ -14,8 +14,8 @@
 
 //! Shared mapping for in-process reads and the compiled local-query provider.
 
-const db_query_search = @import("../storage/db/query/control_contract.zig");
-const query_api = @import("query_contract.zig");
+const db_query_search = @import("antfly_local_sources").storage_db_query_control_contract;
+const query_api = @import("antfly_local_sources").api_query_contract;
 
 pub fn fromStorage(profile: db_query_search.DenseSearchProfile) query_api.QueryResponseMeta.DenseSearchProfile {
     return .{

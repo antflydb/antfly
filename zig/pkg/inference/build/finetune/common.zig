@@ -423,15 +423,7 @@ fn configureMetal(
 }
 
 fn addMacosSdkPaths(ctx: Context, module: *std.Build.Module) void {
-    if (ctx.target.result.os.tag != .macos) return;
-    const sdk_root = ctx.b.graph.environ_map.get("SDK_PATH") orelse sdk: {
-        // xcrun observes the selected Xcode installation outside configure inputs.
-        ctx.b.graph.poisonCache();
-        break :sdk std.zig.system.darwin.getSdk(ctx.b.allocator, ctx.b.graph.io, &ctx.target.result) orelse return;
-    };
-    module.addSystemIncludePath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/usr/include", .{sdk_root})));
-    module.addLibraryPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/usr/lib", .{sdk_root})));
-    module.addFrameworkPath(ctx.b.graph.cwdRelativePath(ctx.b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
+    @import("antfly_platform").addMacosSdkPaths(ctx.b, module, ctx.target);
 }
 
 pub fn fromWorkflow(ctx: @import("../context.zig").Context) Context {

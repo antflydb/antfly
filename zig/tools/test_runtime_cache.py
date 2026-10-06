@@ -1497,7 +1497,9 @@ class RuntimeCacheTest(unittest.TestCase):
 
     def test_host_generator_cache_contracts(self):
         names = ("openapi-zig", "antfly-quant-kernel-codegen", "protoc-zig", "yacc-zig")
-        self.build("cache-host-tools")
+        # A private cold compiler cache also builds the configurer and four
+        # LLVM host executables. Keep warm cache checks at the normal deadline.
+        self.build("cache-host-tools", timeout=600)
         for settings in (
             ("-Doptimize=fast",),
             ("-Doptimize=safe", "-Dcuda-artifacts=portable", "-Dwebgpu=true"),
@@ -1529,7 +1531,7 @@ class RuntimeCacheTest(unittest.TestCase):
 
     def test_sql_and_snowball_generation_contracts(self):
         sql = self.own("zig/lib/sql/grammar/generated/root.zig")
-        snowball_root = "zig/pkg/antfly/src/search/snowball/generated"
+        snowball_root = "zig/pkg/antfly-embedded/src/local/search/snowball/generated"
         for path in (self.root / snowball_root).glob("*.zig"):
             self.own(f"{snowball_root}/{path.name}")
         snowball = self.root / snowball_root / "german_stemmer.zig"
@@ -1655,6 +1657,125 @@ class RuntimeCacheTest(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "requires a POSIX xcrun fixture")
 class MacosSdkCacheTest(unittest.TestCase):
+    @unittest.skipUnless(
+        os.name == "posix" and os.uname().sysname == "Darwin",
+        "requires a native macOS SDK",
+    )
+    def test_explicit_sdk_controls_compilation_and_translation_headers(self):
+        actual = Path(
+            subprocess.check_output(
+                ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True
+            ).strip()
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "sdk"
+            # Overlay one real SDK header. The active Xcode SDK lacks this
+            # marker, so either owner falling back to discovery fails the test.
+            for source, destination, excluded in (
+                (actual, sdk, {"usr"}),
+                (actual / "usr", sdk / "usr", {"include"}),
+                (actual / "usr/include", sdk / "usr/include", {"sys"}),
+                (actual / "usr/include/sys", sdk / "usr/include/sys", {"types.h"}),
+            ):
+                destination.mkdir(parents=True, exist_ok=True)
+                for child in source.iterdir():
+                    if child.name not in excluded:
+                        (destination / child.name).symlink_to(
+                            child, target_is_directory=child.is_dir()
+                        )
+            (sdk / "usr/include/sys/types.h").write_text(
+                (actual / "usr/include/sys/types.h").read_text()
+                + "\n#define ANTFLY_SDK_SELECTION_MARKER 982\n"
+            )
+            shutil.copyfile(
+                ZIG_ROOT / "lib/platform/build_support.zig", root / "support.zig"
+            )
+            manifest = (ZIG_ROOT / "build.zig.zon").read_text()
+            dependency = re.search(
+                r"\.translate_c = (\.\{.*?\n        \}),", manifest, re.S
+            ).group(1)
+            (root / "build.zig.zon").write_text(
+                '.{ .name = .antfly_zig, .version = "0.0.1", .fingerprint = 0xaf6720431d9566e1, '
+                + ".dependencies = .{ .translate_c = "
+                + dependency
+                + " }, "
+                + '.paths = .{"build.zig", "build.zig.zon"} }'
+            )
+            (root / "sdk.h").write_text("#include <sys/types.h>\n")
+            (root / "sdk.c").write_text(
+                '#include "sdk.h"\nint sdk_marker(void) { return ANTFLY_SDK_SELECTION_MARKER; }\n'
+            )
+            (root / "probe.zig").write_text(
+                'const std = @import("std");\nextern "c" fn sdk_marker() c_int;\n'
+                'test "both owners use the selected SDK" {\n'
+                "    try std.testing.expectEqual(@as(c_int, 982), sdk_marker());\n"
+                '    try std.testing.expectEqual(@as(c_int, 982), @import("bindings").ANTFLY_SDK_SELECTION_MARKER);\n}\n'
+            )
+            (root / "build.zig").write_text("""const std = @import("std");
+const support = @import("support.zig");
+pub fn build(b: *std.Build) void {
+    defer support.finalizeMacosSdk(b);
+    const target = b.standardTargetOptions(.{});
+    const translated = @import("translate_c").Translator.init(b.dependency("translate_c", .{}), .{
+        .c_source_file = b.path("sdk.h"), .target = target, .optimize = .debug,
+        .libc_file = support.macosSdkLibCFile(b, target),
+    });
+    const mod = b.createModule(.{ .root_source_file = b.path("probe.zig"), .target = target, .optimize = .debug, .link_libc = true });
+    support.addMacosSdkPaths(b, mod, target);
+    mod.addCSourceFile(.{ .file = b.path("sdk.c") });
+    mod.addImport("bindings", translated.mod);
+    b.default_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+}
+""")
+            env = dict(os.environ)
+            env.pop("SDK_PATH", None)
+            result = subprocess.run(
+                [
+                    "zig",
+                    "build",
+                    f"-Dmacos-sdk={sdk}",
+                    "--cache-poison=disallowed",
+                    "--summary",
+                    "all",
+                ],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=180,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(
+        os.name == "posix" and os.uname().sysname == "Darwin",
+        "requires a native macOS SDK",
+    )
+    def test_standalone_inference_explicit_sdk_does_not_poison_configuration(self):
+        sdk = subprocess.check_output(
+            ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True
+        ).strip()
+        env = dict(os.environ)
+        env.pop("SDK_PATH", None)
+        with tempfile.TemporaryDirectory() as cache:
+            result = subprocess.run(
+                [
+                    "zig",
+                    "build",
+                    "--help",
+                    f"-Dmacos-sdk={sdk}",
+                    "--cache-poison=disallowed",
+                    "--cache-dir",
+                    cache,
+                ],
+                cwd=ZIG_ROOT / "pkg/inference",
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=240,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_sdk_discovery_tracks_selection_and_explicit_override(self):
         # Isolate the shared helper: another owner poisoning the graph must not
         # accidentally make this check pass.
@@ -1710,11 +1831,76 @@ pub fn build(b: *std.Build) void {
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=120,
+                    timeout=240,
                 )
                 output = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 0, output)
                 self.assertIn(f"SDK_INCLUDE {path}/usr/include", output)
+
+    def test_explicit_sdk_reuses_pure_configuration_and_tracks_directory_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copyfile(
+                ZIG_ROOT / "lib/platform/build_support.zig",
+                root / "platform_build_support.zig",
+            )
+            (root / "build.zig").write_text(
+                """const std = @import("std");
+const support = @import("platform_build_support.zig");
+pub fn build(b: *std.Build) void {
+    std.debug.print("SDK_CONFIGURED\\n", .{});
+    const target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const module = b.createModule(.{ .target = target });
+    support.addMacosSdkPaths(b, module, target);
+    support.addMacosSdkPaths(b, module, target);
+    const run = b.addSystemCommand(&.{"/bin/echo", "SDK_INCLUDE"});
+    run.addDirectoryArg(module.include_dirs.items[0].path_system);
+    b.default_step.dependOn(&run.step);
+}
+"""
+            )
+            sdk = root / "explicit-sdk"
+            (sdk / "usr/include").mkdir(parents=True)
+            env = dict(os.environ)
+            # CLI selection wins over an environment override.
+            env["SDK_PATH"] = (
+                subprocess.check_output(
+                    ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True
+                ).strip()
+                if os.uname().sysname == "Darwin"
+                else str(root / "unused-sdk")
+            )
+            command = [
+                "zig",
+                "build",
+                f"-Dmacos-sdk={sdk}",
+                "--cache-poison=disallowed",
+                "--summary",
+                "all",
+                "--color",
+                "off",
+            ]
+
+            def build():
+                result = subprocess.run(
+                    command,
+                    cwd=root,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=240,
+                )
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 0, output)
+                self.assertIn(f"SDK_INCLUDE {sdk}/usr/include", output)
+                return output
+
+            self.assertIn("SDK_CONFIGURED", build())
+            self.assertNotIn("SDK_CONFIGURED", build())
+            # In-place SDK replacement must invalidate configuration too.
+            before = sdk.stat()
+            os.utime(sdk, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+            self.assertIn("SDK_CONFIGURED", build())
 
 
 if __name__ == "__main__":

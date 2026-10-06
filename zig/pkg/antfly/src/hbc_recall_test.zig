@@ -15,8 +15,8 @@
 const std = @import("std");
 const proto = @import("antfly_vector").proto;
 const vec = @import("antfly_vector").vector;
-const hbc = @import("storage/hbc_adapter.zig");
-const lsm_backend = @import("storage/lsm_backend/mod.zig");
+const hbc = @import("antfly_local_sources").storage_hbc_adapter;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 
 const OwnedVectorSet = struct {
     dims: usize,
@@ -440,3 +440,6 @@ fn betterTruthCandidate(candidate_distance: f32, candidate_offset: usize, curren
     if (candidate_distance != current_distance) return candidate_distance < current_distance;
     return candidate_offset < current_offset;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

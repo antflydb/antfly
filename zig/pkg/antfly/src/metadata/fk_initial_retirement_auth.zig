@@ -6,7 +6,7 @@
 //! compare the registered root/key/reporter, then verify this signature.
 const std = @import("std");
 const contract = @import("fk_initial_retirement_contract.zig");
-const root_signing_identity = @import("../storage/db/root_signing_identity.zig");
+const root_signing_identity = @import("antfly_local_sources").storage_db_root_signing_identity;
 
 const domain = "antfly/initial-fk-retirement-ack/v1\x00";
 pub const message_len = domain.len + contract.receipt_encoded_len;

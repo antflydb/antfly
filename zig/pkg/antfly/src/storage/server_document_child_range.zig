@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const types = @import("db/types.zig");
+const types = @import("antfly_local_sources").storage_db_types;
 
 /// Server placement policy for a committed manifest. Live routing validation
 /// remains in the delivery callback, after the local apply fence is released.

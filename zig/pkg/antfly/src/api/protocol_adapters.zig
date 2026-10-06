@@ -329,7 +329,7 @@ pub const McpRequest = struct {
     session_id: ?[]const u8 = null,
     last_event_id: ?[]const u8 = null,
     body: []const u8 = "",
-    context: @import("operation.zig").RequestContext = .{},
+    context: @import("antfly_local_sources").api_operation.RequestContext = .{},
 };
 
 pub fn executeMcpRequest(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype) !contextual_operations.OwnedResponse {
@@ -348,7 +348,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         spec: McpToolSpec,
-        operation_context: @import("operation.zig").RequestContext,
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -599,7 +599,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         permissions: ?[]const usermgr.Permission,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
-        operation_context: @import("operation.zig").RequestContext = .{},
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext = .{},
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -744,7 +744,7 @@ fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype)
 /// effective table permission again immediately before dispatch so denied MCP
 /// calls cannot reach an extension, router, or metadata mutation path.
 fn mcpTableNameAlloc(alloc: std.mem.Allocator, args: std.json.Value, argument: []const u8) ![]u8 {
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const table = jsonStringArg(args, argument) orelse return error.InvalidCatalogName;
     var target = try catalog.Target.literal(table);
     if (jsonValueArg(args, "database") != null) target.database = jsonStringArg(args, "database") orelse return error.InvalidCatalogName;
@@ -1141,7 +1141,7 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value, context: @import("operation.zig").RequestContext) !mcp.CallToolResult {
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value, context: @import("antfly_local_sources").api_operation.RequestContext) !mcp.CallToolResult {
     try context.ensureActive();
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
@@ -1203,7 +1203,7 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         installed: *const extension_domain.InstalledExtension,
         expected_storage_name: ?[]const u8,
         binding_failed: bool = false,
-        operation_context: @import("operation.zig").RequestContext = .{},
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext = .{},
 
         fn noteBindingFailure(ctx: *@This(), err: anyerror) void {
             switch (err) {
@@ -1461,7 +1461,7 @@ pub fn executeA2aRequestWithContext(
     body: []const u8,
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
-    context: @import("operation.zig").RequestContext,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
 ) !contextual_operations.OwnedResponse {
     try context.ensureActive();
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
@@ -1527,7 +1527,7 @@ fn buildA2aDispatcher(
     authorization: ?[]const u8,
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
-    operation_context: @import("operation.zig").RequestContext,
+    operation_context: @import("antfly_local_sources").api_operation.RequestContext,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval, research };
@@ -1537,7 +1537,7 @@ fn buildA2aDispatcher(
         query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
         authenticated_identity: @TypeOf(authenticated_identity),
         kind: HandlerKind,
-        operation_context: @import("operation.zig").RequestContext,
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
             return .{

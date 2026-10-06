@@ -13,6 +13,8 @@ const dirname =
 // to point Antfarm at a different Antfly backend (e.g. one preloaded with
 // fixture data on a non-default port).
 const apiProxyTarget = process.env.ANTFARM_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
+const apiProxyHostname = new URL(apiProxyTarget).hostname;
+const localApiProxy = ["127.0.0.1", "localhost", "[::1]"].includes(apiProxyHostname);
 
 // More info at: https://storybook.js.org/docs/next/writing-tests/integrations/vitest-addon
 export default defineConfig({
@@ -24,7 +26,10 @@ export default defineConfig({
     proxy: {
       "/db": {
         target: apiProxyTarget,
-        changeOrigin: true,
+        // Local personal connections compare the browser Origin with Host.
+        // Preserve both through the dev proxy; remote virtual hosts still need
+        // the target hostname. The backend retains its origin checks.
+        changeOrigin: !localApiProxy,
       },
       "/auth": {
         target: apiProxyTarget,

@@ -1,10 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const catalog = @import("catalog.zig");
-const ast = @import("ast.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
 const Backend = struct {
     fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
         return error.UnexpectedBackendCall;
@@ -294,7 +294,7 @@ test "SQL membership bounded hash projections share one capture instead of per r
     var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM outer_rows o WHERE o.x+1 IN (SELECT i.x+1 FROM inner_rows i)", .{});
     defer compiled.deinit();
     {
-        var description = try @import("describe.zig").describe(std.testing.allocator, fixture.backend(), &compiled, &.{});
+        var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, fixture.backend(), &compiled, &.{});
         defer description.deinit();
         const join = description.binding.relation.?.root.operation.join;
         try std.testing.expectEqual(@as(usize, 1), join.left_keys.len);
@@ -585,7 +585,7 @@ test "SQL correlated scalar parameter constraints propagate through join and res
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT $1 FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2 AS x) o WHERE o.x=1", .{});
     defer compiled.deinit();
-    var description = try @import("describe.zig").describe(std.testing.allocator, backend.backend(), &compiled, &.{});
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
     defer description.deinit();
     try std.testing.expectEqualSlices(?ast.ColumnType, &.{ .integer, .integer }, description.binding.parameter_types);
     var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{ .{ .integer = 7 }, .{ .integer = 1 } }, .{});

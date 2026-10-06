@@ -5,7 +5,7 @@
 //! transaction ID: DISCARD ALL owns a connection's idle resources, while an
 //! in-flight or uncertain transaction keeps the connection fenced.
 const std = @import("std");
-const settings = @import("../sql/setting_catalog.zig");
+const settings = @import("antfly_local_sources").sql_setting_catalog;
 
 pub const prefix = "\x00sql-connection-v1/";
 pub const max_record_bytes = 128 << 10;

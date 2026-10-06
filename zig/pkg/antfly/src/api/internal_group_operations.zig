@@ -16,19 +16,19 @@
 
 const std = @import("std");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const batch_api = @import("batch.zig");
+const batch_api = @import("antfly_local_sources").api_batch;
 const distributed_txn = @import("distributed_txn.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const internal_keys = @import("../storage/internal_keys.zig");
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const raft_mod = @import("../raft/mod.zig");
-const table_reads = @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
-const query_api = @import("query.zig");
-const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
+const query_api = @import("antfly_local_sources").api_query;
+const runtime_preflight = @import("antfly_local_sources").storage_db_runtime_preflight;
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -155,7 +155,7 @@ pub const RoutedRaftBatchWriter = struct {
             operation.RequestContext,
         ) anyerror!?void,
     };
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
     pub fn write(self: @This(), alloc: std.mem.Allocator, authority: RoutedBatchAuthority, group_id: u64, table_name: []const u8, input: db_mod.types.BatchRequest, forwarding: internal_batch_forwarding.Context, request: operation.RequestContext) !?void {
         // The data runtime supplies this callback to the separately compiled
@@ -550,7 +550,7 @@ pub const Operations = struct {
             try validatePrivateMergeSourceRollback(group_id, input);
             break :rollback .relational_topology;
         } else if (input.online_source) |control| source: {
-            @import("../storage/db/online_source_contract.zig").validateRequest(input) catch return error.InvalidArgument;
+            @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(input) catch return error.InvalidArgument;
             if (control.scope().fence.owner_group_id != group_id) return error.InvalidArgument;
             // Source retention uses the same private exact-owner authority as
             // topology lifecycle commands; it never grants public row writes.
@@ -1059,7 +1059,7 @@ pub const Operations = struct {
             var probe = std.json.parseFromSlice(Probe, alloc, input.options.relational_topology_json, .{ .ignore_unknown_fields = true }) catch return error.InvalidArgument;
             defer probe.deinit();
             if (probe.value.mode) |mode| if (std.mem.eql(u8, mode, "online_source_status")) {
-                const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("../storage/db/online_source_contract.zig").Scope };
+                const StatusRequest = struct { mode: enum { online_source_status }, scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope };
                 var scoped = std.json.parseFromSlice(StatusRequest, alloc, input.options.relational_topology_json, .{}) catch return error.InvalidArgument;
                 defer scoped.deinit();
                 scoped.value.scope.validate() catch return error.InvalidArgument;
@@ -1518,8 +1518,8 @@ fn consumerTests() type {
                 source.failure = @field(errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
-                source.failure = @field(@import("../schema/relational_expression_errors.zig").Error, field);
+            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+                source.failure = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
                 try std.testing.expectError(source.failure, operations.txnPrepare(std.testing.allocator, .{}, 7, "rows", .{ .txn_id = @splat(7), .req = .{} }));
             }
         }
@@ -2331,7 +2331,7 @@ fn consumerTests() type {
                     return null;
                 }
 
-                fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?@import("query.zig").QueryResponse {
+                fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?@import("antfly_local_sources").api_query.QueryResponse {
                     return null;
                 }
 

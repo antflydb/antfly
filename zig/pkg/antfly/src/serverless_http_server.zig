@@ -18,7 +18,7 @@ const http_common = @import("raft/transport/http_common.zig");
 const serverless_http_routes = @import("serverless/api/http_routes.zig");
 const serverless_http_types = @import("serverless/api/http_types.zig");
 
-const secrets = @import("common/secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 pub const ServerlessHttpServerConfig = struct {
     secret_store: ?*secrets.FileStore = null,
     // Explicit credential required even on otherwise unauthenticated serverless
@@ -177,7 +177,7 @@ pub const ServerlessHttpServer = struct {
         }
         const key = path["/secrets/".len..];
         if (req.method == .PUT) {
-            if (req.body.len > 6 * @import("common/secret_contract.zig").max_value_bytes + 1024) return error.InvalidRequest;
+            if (req.body.len > 6 * @import("antfly_local_sources").common_secret_contract.max_value_bytes + 1024) return error.InvalidRequest;
             var parsed = std.json.parseFromSlice(struct { value: []const u8 }, self.alloc, req.body, .{}) catch return error.InvalidRequest;
             defer parsed.deinit();
             var result = try store.put(self.alloc, key, parsed.value.value);
@@ -217,7 +217,7 @@ pub const ServerlessHttpServer = struct {
             else => return try ctx.status(405).text("method not allowed"),
         };
         const body = (try ctx.body()) orelse "";
-        const context = try (@import("api/operation.zig").RequestContext{ .deadline_ns = ctx.application_deadline_ns, .deadline_io = if (ctx.application_deadline_io) |clock_io| @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io) else null }).platformDeadline();
+        const context = try (@import("antfly_local_sources").api_operation.RequestContext{ .deadline_ns = ctx.application_deadline_ns, .deadline_io = if (ctx.application_deadline_io) |clock_io| @import("antfly_runtime_abi").io_abi.Borrow.init(&clock_io) else null }).platformDeadline();
         var response = try self.handler.handle(.{
             .method = method,
             .path = ctx.request.uri.path,
@@ -525,3 +525,6 @@ test "native serverless adapter lends request cancellation to the handler" {
 
     try std.testing.expectError(error.Canceled, server.handleHttpx(&ctx));
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

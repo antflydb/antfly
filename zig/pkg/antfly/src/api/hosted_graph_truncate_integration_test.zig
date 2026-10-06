@@ -61,8 +61,8 @@ fn assertGraphEdgesRetired(alloc: std.mem.Allocator, io: std.Io, transport: http
     try awaitGraphTarget(alloc, io, transport, headers, base, false);
 }
 
-fn readPausedGraphSeal(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, receipt: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !@import("../storage/db/graph_retirement_seal.zig").Receipt {
-    const seal = @import("../storage/db/graph_retirement_seal.zig");
+fn readPausedGraphSeal(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, receipt: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !@import("antfly_local_sources").storage_db_graph_retirement_seal.Receipt {
+    const seal = @import("antfly_local_sources").storage_db_graph_retirement_seal;
     var accepted = try std.json.parseFromSlice(std.json.Value, alloc, receipt.body, .{});
     defer accepted.deinit();
     const text = (try field(try field(accepted.value, "ddl_receipt"), "restore_job_id")).string;
@@ -254,7 +254,7 @@ fn awaitGraphTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.Requ
     const deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
     var published = false;
     while (platform.time.monotonicNs() < deadline) {
-        const context: @import("operation.zig").RequestContext = .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) };
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) };
         if (try source.getRestoreStaging(alloc, plan_id, context)) |encoded| {
             defer alloc.free(encoded);
             var staged = try std.json.parseFromSlice(staging.Job, alloc, encoded, .{ .ignore_unknown_fields = true });
@@ -326,7 +326,7 @@ fn awaitGraphTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.Requ
         }
         try io.sleep(.fromMilliseconds(20), .awake);
     }
-    const diagnostic_context: @import("operation.zig").RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_s };
+    const diagnostic_context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_s };
     const diagnostic = source.getRestoreStaging(alloc, plan_id, diagnostic_context) catch |err| blk: {
         std.log.warn("graph truncate staging diagnostic unavailable err={s}", .{@errorName(err)});
         break :blk null;
@@ -366,7 +366,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, met
     const job_text = (try field(try field(accepted.value, "ddl_receipt"), "restore_job_id")).string;
     const plan_id = try staging.idForAttempt(try std.fmt.parseUnsigned(u64, job_text, 10), 1);
     const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
-    const context: @import("operation.zig").RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s };
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s };
     const encoded = (try source.getRestoreStaging(alloc, plan_id, context)) orelse return error.GraphTruncatePlanMismatch;
     defer alloc.free(encoded);
     var staged = try std.json.parseFromSlice(staging.Job, alloc, encoded, .{ .ignore_unknown_fields = true });
@@ -388,7 +388,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, met
             return error.GraphTruncatePlanMismatch;
         const range = target.ranges[0];
         const mapped = (try staging.mappedEmptyGenerationHandoffForGroup(alloc, staged.value.plan, staged.value.plan_digest, range.group_id)) orelse return error.GraphTruncatePlanMismatch;
-        var first: ?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt = null;
+        var first: ?@import("antfly_local_sources").storage_db_restore_staging_contract.GenerationAdmissionReceipt = null;
         for (0..2) |_| {
             const observed = blk: while (platform.time.monotonicNs() < deadline) {
                 for (drivers) |driver| try driver.checkFailure();
@@ -418,7 +418,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, met
             } else return error.GenerationHandoffInstallRoutingTimeout;
             var response = observed;
             defer response.deinit(alloc);
-            var parsed = try std.json.parseFromSlice(?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt, alloc, response.json, .{});
+            var parsed = try std.json.parseFromSlice(?@import("antfly_local_sources").storage_db_restore_staging_contract.GenerationAdmissionReceipt, alloc, response.json, .{});
             defer parsed.deinit();
             const installed = parsed.value orelse return error.GenerationHandoffInstallMissing;
             if (installed.applied_term == 0 or installed.applied_index == 0 or

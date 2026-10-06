@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const metadata_incarnation = @import("incarnation.zig");
+const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
 
 /// Every metadata voter must advertise at least this version before a forced
 /// reallocation request can be admitted. Older reconcilers do not understand

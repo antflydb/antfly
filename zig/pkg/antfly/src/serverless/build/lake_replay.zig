@@ -19,8 +19,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const rowsource = @import("../../storage/rowsource/types.zig");
-const source_binding = @import("../segment/source_binding.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
+const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
 const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const Buffer = struct {

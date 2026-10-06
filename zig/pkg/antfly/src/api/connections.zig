@@ -25,13 +25,13 @@ const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
-const common_config = @import("../common/config.zig");
-const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const metadata_api = @import("../metadata/api.zig");
-const bedrock = @import("antfly_inference_bedrock");
+const aws = @import("antfly_credentials").aws;
 const list_models = @import("antfly_inference_list_models");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const inference_connection_abi = @import("../inference_connection_abi.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const inference_connection_abi = @import("antfly_local_sources").inference_connection_abi;
 const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 const backups_api = @import("backups.zig");
@@ -1470,7 +1470,7 @@ fn probeS3Buckets(
     network_io: ?std.Io,
     filesystem_io: ?std.Io,
 ) !void {
-    var dynamic_credentials: ?bedrock.Credentials = null;
+    var dynamic_credentials: ?aws.Credentials = null;
     defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
 
     if (cfg.credentials.source != .static) {
@@ -1483,9 +1483,9 @@ fn probeS3Buckets(
             .request_ms = timeout_ms,
         } });
         defer http.deinit();
-        var credential_cache: bedrock.CredentialCache = .{};
+        var credential_cache: aws.CredentialCache = .{};
         defer credential_cache.deinit(arena);
-        const source: bedrock.CredentialSource = switch (cfg.credentials.source) {
+        const source: aws.CredentialSource = switch (cfg.credentials.source) {
             .default => .default,
             .static => unreachable,
             .profile => .{ .profile = .{

@@ -172,3 +172,6 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     var canceled: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, adapter.topologyRead(std.testing.allocator, 17, "rows", request, .fromAtomic(&canceled)));
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

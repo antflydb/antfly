@@ -26,8 +26,8 @@
 //! superseded; its late checkpoint is discarded.
 
 const std = @import("std");
-const docstore_mod = @import("../storage/docstore.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const platform_time = @import("antfly_platform").time;
 const research_agent = @import("research_agent.zig");
 const agent_tools = @import("agent_tools.zig");

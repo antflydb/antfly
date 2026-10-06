@@ -113,7 +113,12 @@ def write_report(path: Path, records: list[dict]) -> None:
 
 
 def measured_build(
-    command: list[str], cwd: Path, *, timeout_seconds: float = 1800, progress=None
+    command: list[str],
+    cwd: Path,
+    *,
+    timeout_seconds: float = 1800,
+    progress=None,
+    env=None,
 ) -> tuple[int, str, dict]:
     """Sample concurrent RSS; wait4 accounts CPU for the entire waited tree."""
     started = time.monotonic()
@@ -125,6 +130,7 @@ def measured_build(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env=env,
             stdout=output,
             stderr=subprocess.STDOUT,
             text=True,
@@ -214,6 +220,16 @@ def own(root: Path, relative: str) -> Path:
     return path
 
 
+def source_owner_path(relative: str) -> str:
+    embedded = {
+        "storage/db/db.zig",
+        "storage/query.zig",
+        "storage/kernel_owner_abi.zig",
+    }
+    owner = "antfly-embedded/src/local" if relative in embedded else "antfly/src"
+    return f"zig/pkg/{owner}/{relative}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--zig", default="zig")
@@ -266,7 +282,7 @@ def main() -> None:
             ),
             (
                 "physical local query",
-                "storage/local_query.zig",
+                "storage/query.zig",
                 {"antfly-storage-kernel"},
                 (ARCHIVES - {"antfly-storage-kernel"})
                 | {
@@ -307,7 +323,7 @@ def main() -> None:
         # Establish the overlay layout before the baseline. A mutation changes
         # file contents only, not symlink resolution or compiler source paths.
         for _, relative, _, _ in cases:
-            own(root, f"zig/pkg/antfly/src/{relative}")
+            own(root, source_owner_path(relative))
         local_cache = work / "cache"
         global_cache = work / "global-cache"
         global_cache.mkdir()
@@ -329,8 +345,6 @@ def main() -> None:
                 "off",
                 "--cache-dir",
                 str(local_cache),
-                "--global-cache-dir",
-                str(global_cache),
             ]
             command = bounded_build_command(args.zig, arguments)
             record = {
@@ -348,7 +362,10 @@ def main() -> None:
 
             try:
                 returncode, output, measurements = measured_build(
-                    command, root / "zig", progress=progress
+                    command,
+                    root / "zig",
+                    progress=progress,
+                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
                 )
             except BaseException as err:
                 record.update(status="interrupted", error=type(err).__name__)
@@ -422,7 +439,7 @@ def main() -> None:
                 1 << 30
             ):
                 restart_cache(label)
-            path = own(root, f"zig/pkg/antfly/src/{relative}")
+            path = own(root, source_owner_path(relative))
             # Keep earlier edits in this private overlay. Restoring one would
             # itself invalidate Zig's most recent manifest and confound the
             # next case, even if it restores bytes from the cold build.

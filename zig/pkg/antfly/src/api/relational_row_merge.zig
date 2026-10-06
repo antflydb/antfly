@@ -4,7 +4,7 @@
 //! primary-range concatenation is never valid for a secondary ordered index.
 //! Keeps only the best K rows, plus one incoming line. No retained cursors.
 const std = @import("std");
-const cursor = @import("../storage/db/relational_row_cursor.zig");
+const cursor = @import("antfly_local_sources").storage_db_relational_row_cursor;
 const Allocator = std.mem.Allocator;
 const max_bytes = 16 * 1024 * 1024;
 
@@ -15,7 +15,7 @@ pub fn isIndexQuery(alloc: Allocator, json: []const u8) !bool {
     return parsed.value.index != null;
 }
 
-pub fn isIndexScan(alloc: Allocator, opts: @import("../storage/db/types.zig").ScanOptions) !bool {
+pub fn isIndexScan(alloc: Allocator, opts: @import("antfly_local_sources").storage_db_types.ScanOptions) !bool {
     if (opts.relational_query) |query| return query.index != null;
     return isIndexQuery(alloc, opts.relational_query_json);
 }

@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const auth = @import("usermgr/user_manager.zig");
+const auth = @import("antfly_local_sources").usermgr_user_manager;
 const casbin = @import("antfly_casbin");
 const alloc = std.heap.c_allocator;
 const Owner = struct {
@@ -52,3 +52,6 @@ export fn usermgr_abi_destroy(manager: *auth.UserManager) callconv(.c) void {
     owner.users.deinit();
     alloc.destroy(owner);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

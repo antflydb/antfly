@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const derived_log = @import("db/derived/derived_log.zig");
+const derived_log = @import("antfly_local_sources").storage_db_derived_derived_log;
 
 pub const platform_time = @import("antfly_platform").time;
 pub const DerivedLog = derived_log.DerivedLog;

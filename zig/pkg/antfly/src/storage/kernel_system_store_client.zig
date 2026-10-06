@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
-const backend = @import("backend_erased.zig");
+const backend = @import("antfly_local_sources").storage_backend_erased;
 const error_identity = @import("kernel_error_identity");
 
 pub fn nativeHandle(store: *const backend.Store) !*anyopaque {

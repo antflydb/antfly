@@ -1,11 +1,11 @@
 # Query String Language
 
 This document describes the Lucene-style query string syntax supported by
-[query_string.zig](pkg/antfly/src/search/query_string.zig).
+[query_string.zig](pkg/antfly-embedded/src/local/search/query_string.zig).
 
 The parser produces the internal `Filter` AST, which is then converted into the
 typed DB full-text query model by
-[public_query_string.zig](pkg/antfly/src/api/public_query_string.zig).
+[public_query_string.zig](pkg/antfly-embedded/src/local/api/public_query_string.zig).
 
 The design goal is a focused, typed subset:
 
@@ -157,7 +157,7 @@ shapes roughly as follows:
 
 Current API usage is primarily through query-string input fields that eventually
 flow into the parser helper in
-[query_contract.zig](pkg/antfly/src/api/query_contract.zig).
+[query_contract.zig](pkg/antfly-embedded/src/local/api/query_contract.zig).
 
 Supported behavior at that layer:
 

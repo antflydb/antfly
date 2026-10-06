@@ -4,7 +4,7 @@
 //! root can attest the local replica generation that produced a response.
 const std = @import("std");
 const enrollment = @import("store_root_enrollment.zig");
-const signing = @import("../storage/db/root_signing_identity.zig");
+const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
 
 pub const Attestation = struct {
     identity: enrollment.Identity,

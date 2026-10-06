@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const table_catalog_api = @import("../api/table_catalog.zig");
 const table_router_api = @import("../api/table_router.zig");
 const platform_clock = @import("antfly_platform").clock;
@@ -29,10 +29,10 @@ const metadata_table_manager = @import("table_manager.zig");
 const metadata_transition_state = @import("transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("../api/tables.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const backend_types = @import("../storage/backend_types.zig");
-const secrets = @import("../common/secrets.zig");
-const pattern_filter = @import("../search/pattern_filter.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const secrets = @import("antfly_local_sources").common_secrets;
+const pattern_filter = @import("antfly_local_sources").search_pattern_filter;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const Allocator = std.mem.Allocator;

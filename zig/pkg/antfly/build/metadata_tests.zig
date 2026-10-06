@@ -13,9 +13,9 @@
 // limitations.
 
 const std = @import("std");
-const chainLabeledFilteredTests = @import("test_support.zig").chainLabeledFilteredTests;
-const selectTestFilters = @import("test_support.zig").selectTestFilters;
-const addFilteredTestRunArtifact = @import("test_support.zig").addFilteredTestRunArtifact;
+const chainLabeledFilteredTests = @import("../../../build_support/antfly/test_support.zig").chainLabeledFilteredTests;
+const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
+const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 
 pub const AddTestsOptions = struct {
     target: std.Build.ResolvedTarget,
@@ -42,19 +42,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const backup_cohort_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "backup cohort", "metadata module compiles", "metadata storage module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-metadata-backup-cohort-test", "Run durable backup cohort admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, backup_cohort_tests).step);
     const restore_staging_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "relational integrity restore staging", "restore staging authority", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-metadata-restore-staging-test", "Run atomic hidden restore target publication contracts").dependOn(&addFilteredTestRunArtifact(b, restore_staging_tests).step);
     const relational_topology_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "relational integrity metadata topology", "relational topology admission", "metadata raft apply store transition codec", "initializes one durable snapshotted cluster incarnation", "metadata incarnation rejects unsupported", "fences transition identity and active removal", "metadata reconciler publishes table contracts", "atomically fences table replacement during a range transition", "metadata.table storage extension", "standalone metadata", "metadata table topology protocol", "store-root enrollment status is an admin-bound read", "metadata lifecycle reconciles hidden generation", "metadata module compiles", "metadata storage module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-metadata-relational-topology-test", "Run distributed integrity topology capability and admission contracts").dependOn(&addFilteredTestRunArtifact(b, relational_topology_tests).step);
     const store_root_signing_tests = b.addTest(.{
@@ -66,7 +66,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "store-root enrollment status is a body-bound admin read and preserves absent identity",
             "metadata server can expose admin listener endpoints",
         },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-metadata-store-root-signing-test", "Run v18 store-root signing decoder, registration, and readiness admission contracts").dependOn(&addFilteredTestRunArtifact(b, store_root_signing_tests).step);
 
@@ -77,7 +77,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "table workflow can drive placement intents through the real metadata control loop",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -90,7 +90,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_metadata_vopr_http_integration_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -116,7 +116,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_metadata_vopr_virtual_transport_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -137,7 +137,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_metadata_vopr_virtual_smoke_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -153,7 +153,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_metadata_vopr_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -165,7 +165,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &.{"metadata VOPR trace exactly replays 100 consecutive times"},
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -180,13 +180,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // ReleaseSafe compiles measured 16.55 GB for DataServer and 16.15 GB for
     // metadata public-data tests; reserve the same 18 GiB as full-cluster
     // histories. Keep Linux's separately measured 7 GiB reservation.
-    const production_vopr_compile_max_rss = @import("test_support.zig").productionVoprCompileMaxRss(target);
+    const production_vopr_compile_max_rss = @import("../../../build_support/antfly/test_support.zig").productionVoprCompileMaxRss(target);
     const lib_metadata_vopr_data_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .max_rss = production_vopr_compile_max_rss,
         .filters = &.{"metadata VOPR distributed data survives split partition node restart and modeled storage crash"},
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -201,7 +201,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = selectTestFilters(b, &lib_metadata_vopr_chaos_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -278,7 +278,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "metadata VOPR http cluster forwards public merge flow from a non-host node after public create",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
         // This broad macOS ReleaseFast simulation root has measured above

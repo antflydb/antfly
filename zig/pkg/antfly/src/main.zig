@@ -272,6 +272,7 @@ fn printUsage(argv0: []const u8) void {
         \\  backup         Backup tables
         \\  restore        Restore tables from backup, including Lite *.aflite input
         \\  storage        Manage table storage (migrate)
+        \\  connections    Manage provider connections (login, list, models, logout)
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI
@@ -312,3 +313,6 @@ test "cloud shim propagates child exit code" {
     const code = try runAntflyCloudArgv(std.testing.io, &.{ "/bin/sh", "-c", "exit 23" });
     try std.testing.expectEqual(@as(u8, 23), code);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

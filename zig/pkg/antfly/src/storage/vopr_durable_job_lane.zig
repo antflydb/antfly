@@ -11,8 +11,8 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const background_runtime = @import("background_runtime.zig");
-const lsm_background = @import("lsm_backend/background.zig");
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const lsm_background = @import("antfly_local_sources").storage_lsm_backend_background;
 
 pub const Lane = struct {
     allocator: std.mem.Allocator,

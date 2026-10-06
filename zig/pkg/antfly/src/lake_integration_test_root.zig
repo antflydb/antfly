@@ -16,8 +16,8 @@ test {
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/lake_schema_detection.zig");
     _ = @import("api/lake_table_reads.zig");
-    _ = @import("serverless/query/lake_schema.zig");
-    _ = @import("schema/mod.zig");
-    _ = @import("serverless/query/lake_read_context.zig");
-    _ = @import("serverless/query/lake_serving_cache.zig");
+    _ = @import("antfly_local_sources").serverless_query_lake_schema;
+    _ = @import("antfly_local_sources").schema_mod;
+    _ = @import("antfly_local_sources").serverless_query_lake_read_context;
+    _ = @import("antfly_local_sources").serverless_query_lake_serving_cache;
 }

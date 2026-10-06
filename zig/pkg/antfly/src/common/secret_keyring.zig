@@ -3,8 +3,8 @@
 //! Mounted bootstrap keyring. Reloaded per operation so atomic file replacement
 //! can rotate the active wrapping key while retaining previous decrypt keys.
 const std = @import("std");
-const record = @import("secret_record.zig");
-const contract = @import("secret_contract.zig");
+const record = @import("antfly_local_sources").common_secret_record;
+const contract = @import("antfly_local_sources").common_secret_contract;
 const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
 pub const Keyring = struct {

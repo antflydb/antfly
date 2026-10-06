@@ -3,7 +3,7 @@ const std = @import("std");
 const publication = @import("../fk_generation_publication.zig");
 const tables = @import("../table_manager.zig");
 const planner_mod = @import("../placement_planner.zig");
-const system_catalog = @import("../../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 
 pub fn run(comptime Store: type) !void {
     const alloc = std.testing.allocator;
@@ -30,7 +30,7 @@ pub fn run(comptime Store: type) !void {
         defer alloc.free(root);
         var store = try Store.init(alloc, .{ .root_dir = root });
         defer store.deinit();
-        const group = @import("../../common/group_ids.zig").main_metadata_group_id;
+        const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
         try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "11111111111111111111111111111111".* });
         const logical_schema =
             \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer"}},"additionalProperties":false}}}}

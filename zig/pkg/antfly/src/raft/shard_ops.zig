@@ -60,7 +60,7 @@ pub const ShardOperationAdapter = struct {
         rollback_merge: *const fn (ptr: *anyopaque, context_id: u64, op: RollbackMerge) anyerror!void,
     };
 
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
     pub fn topologyRead(self: ShardOperationAdapter, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: TopologyReadRequest, cancellation: @import("antfly_cancellation").CancellationToken) ![]u8 {
         const callback = self.vtable.topology_read orelse return error.UnsupportedOperation;

@@ -29,6 +29,7 @@ export function DashboardGeneratorControl() {
           </p>
         </div>
         <GeneratorSelector
+          allowPersonalConnections
           value={dashboardGenerator}
           onChange={setDashboardGenerator}
           defaultLabel="Server default"

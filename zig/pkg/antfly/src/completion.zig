@@ -37,6 +37,7 @@ const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait"
 const standby_subcommands = [_][]const u8{ "status", "slot", "seed", "fence", "promote", "rejoin", "follow", "switchover", "stream", "commit", "artifact" };
 const artifact_subcommands = [_][]const u8{ "list", "get", "put", "delete", "reprocess", "job", "maintenance" };
 const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
+const connections_subcommands = [_][]const u8{ "login", "list", "models", "logout" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
 const inference_subcommands = [_][]const u8{
     "run",          "embed",            "classify",  "generate",
@@ -85,6 +86,7 @@ pub const commands = [_]Command{
     .{ .name = "backup", .description = "Back up tables", .route = .cli },
     .{ .name = "restore", .description = "Restore tables", .route = .cli },
     .{ .name = "storage", .description = "Manage table storage", .route = .storage, .subcommands = &.{"migrate"} },
+    .{ .name = "connections", .description = "Manage provider connections", .route = .cli, .subcommands = &connections_subcommands },
     .{ .name = "auth", .description = "Manage users and authorization", .route = .cli, .subcommands = &auth_subcommands },
     .{ .name = "internal", .description = "Run internal cluster commands", .route = .cli, .subcommands = &internal_subcommands },
     .{ .name = "cloud", .description = "Delegate to the Antfly Cloud CLI", .route = .cloud },
@@ -312,3 +314,6 @@ test "zsh completion hides the deprecated ha alias" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "'ha:") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "ha) subcommands=(") == null);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

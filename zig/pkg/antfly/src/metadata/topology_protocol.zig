@@ -134,11 +134,7 @@ pub const DropResult = struct {
 
 /// Borrowed storage-cleanup view of a committed drop. Keeping ownership out of
 /// the callback ABI lets request handlers retain and free the routed result.
-pub const DropCleanupContract = struct {
-    table_id: u64,
-    expected_transition_generation: u64,
-    group_ids: []const u64,
-};
+pub const DropCleanupContract = @import("antfly_local_sources").api_table_drop_contract.DropCleanupContract;
 
 pub const range_membership_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 
@@ -211,7 +207,7 @@ test "range membership is order independent and table scoped" {
 /// protocol. Terms are deliberately excluded: elections do not undo activation.
 pub const Activation = struct {
     version: u16,
-    incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     member_count: u32,
     membership_fingerprint: @import("reallocation_request.zig").MembershipFingerprint,
 

@@ -16,7 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vector_types = @import("types.zig");
 const shared_vector = @import("antfly_vector").vector;
-const bounded_decode = @import("../bounded_decode.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 
 pub const DecodeLimits = bounded_decode.Limits;
 

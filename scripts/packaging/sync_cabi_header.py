@@ -9,7 +9,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CANONICAL_HEADER = REPO_ROOT / "zig" / "pkg" / "antfly" / "include" / "antfly.h"
+CANONICAL_HEADER = (
+    REPO_ROOT / "zig" / "pkg" / "antfly-embedded" / "include" / "antfly.h"
+)
 GO_HEADER = REPO_ROOT / "go" / "pkg" / "lite" / "include" / "antfly.h"
 
 

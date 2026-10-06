@@ -19,10 +19,10 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
-const coverage_policy = @import("coverage_policy.zig");
-const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
+const enrichment_config_validation = @import("antfly_local_sources").storage_db_enrichment_config_validation;
 const public_index_contract = @import("public_index_contract.zig");
-const table_index_config = @import("table_index_config.zig");
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -96,8 +96,8 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
-    const storage_settings: ?@import("../common/table_storage.zig").Settings = if (raw_root.get("storage")) |value|
-        try @import("../common/table_storage.zig").Settings.parse(value)
+    const storage_settings: ?@import("antfly_local_sources").common_table_storage.Settings = if (raw_root.get("storage")) |value|
+        try @import("antfly_local_sources").common_table_storage.Settings.parse(value)
     else
         null;
 
@@ -116,7 +116,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
-        try @import("../schema/relational_index_namespace.zig").validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
+        try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
         return fallback;
     };
     defer parsed.deinit();
@@ -126,7 +126,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     errdefer req.deinit(alloc);
 
     if (parsed.value.tablespace_name) |name| {
-        try @import("../system_catalog/domain.zig").validateName(name);
+        try @import("antfly_local_sources").system_catalog_domain.validateName(name);
         req.tablespace_name = try alloc.dupe(u8, name);
     }
     if (parsed.value.num_shards) |num_shards| {
@@ -155,7 +155,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
-            const validated_schema = @import("../schema/table_schema_impl.zig").parseCreateSchemaRequest(alloc, raw_schema) catch |err| switch (err) {
+            const validated_schema = @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, raw_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
@@ -170,7 +170,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         req.replication_sources_json = try stringifyJsonAlloc(alloc, replication_sources);
     }
 
-    try @import("../schema/relational_index_namespace.zig").validate(alloc, req.schema_json orelse "", req.indexes_json.?);
+    try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, req.schema_json orelse "", req.indexes_json.?);
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
@@ -292,7 +292,7 @@ test "table storage creation intent survives public and internal forwarding" {
         if (index == 0) {
             try std.testing.expect(request.storage == null);
         } else {
-            const expected: @import("../common/table_storage.zig").DenseEmbeddings = if (index == 3) .vector_store else .primary_lsm;
+            const expected: @import("antfly_local_sources").common_table_storage.DenseEmbeddings = if (index == 3) .vector_store else .primary_lsm;
             try std.testing.expectEqual(expected, request.storage.?.dense_embeddings);
         }
         const public = try encodeCreateTableRequest(alloc, request);

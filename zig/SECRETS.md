@@ -687,7 +687,7 @@ Still needed:
 
 ## Current Implementation
 
-The core store lives in `zig/pkg/antfly/src/common/secrets.zig`.
+The core store lives in `zig/pkg/antfly-embedded/src/local/common/secrets.zig`.
 
 `FileStore` owns:
 

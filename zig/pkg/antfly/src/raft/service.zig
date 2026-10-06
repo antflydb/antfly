@@ -16,7 +16,7 @@ const std = @import("std");
 const raft_engine = @import("raft_engine");
 const data = @import("../data/domain.zig");
 const metadata = @import("../metadata/domain.zig");
-const db_types = @import("../storage/db/types.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
 const catalog = @import("storage/catalog.zig");
 const host_mod = @import("host.zig");
 const managed_host = @import("managed_host.zig");
@@ -26,7 +26,7 @@ const raft_state_machine = @import("state_machine/mod.zig");
 const shard_ops = @import("shard_ops.zig");
 const transition_runtime = @import("transition_runtime.zig");
 const transition_service = @import("transition_service.zig");
-const resource_manager = @import("../storage/resource_manager.zig");
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
 
 pub const ManagedServiceConfig = struct {
     max_inbound_messages: usize = host_mod.default_max_inbound_messages_per_round,

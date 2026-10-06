@@ -13,17 +13,20 @@
 // limitations.
 
 test {
-    _ = @import("storage/lite/backend.zig");
-    _ = @import("storage/lite/conformance_test.zig");
-    _ = @import("storage/lite/docstore.zig");
-    _ = @import("storage/lite/index_storage.zig");
-    _ = @import("storage/lite/native.zig");
-    _ = @import("storage/lite/benchmark.zig");
-    _ = @import("storage/lite/snapshot_test.zig");
-    _ = @import("storage/lite/secret_store.zig");
-    _ = @import("storage/lite/paths.zig");
-    _ = @import("storage/lite/restore_staging.zig");
+    _ = @import("antfly_local_sources").storage_lite_backend;
+    _ = @import("antfly_local_sources").storage_lite_conformance_test;
+    _ = @import("antfly_local_sources").storage_lite_docstore;
+    _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_lite_benchmark;
+    _ = @import("antfly_local_sources").storage_lite_snapshot_test;
+    _ = @import("antfly_local_sources").storage_lite_secret_store;
+    _ = @import("antfly_local_sources").storage_lite_paths;
+    _ = @import("antfly_local_sources").storage_lite_restore_staging;
 }
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

@@ -16,8 +16,11 @@ const std = @import("std");
 const lmdb = @import("lmdb");
 const lmdb_engine = @import("lmdb_engine");
 
+const async_runtime = if (lmdb_engine.env.uses_evented_async_runtime) "evented" else "threaded";
+
 const Config = struct {
     samples: usize = 1,
+    kv_only: bool = false,
     cycles: usize = 8,
     keys: usize = 512,
     dups: usize = 32,
@@ -112,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     try stdout_writer.interface.print(
-        "LMDB benchmark backend={s} samples={d} cycles={d} keys={d} dups={d} named_keys={d} write_map={} map_async={} fixed_map={} commit_backend={s}\n",
+        "LMDB benchmark backend={s} samples={d} cycles={d} keys={d} dups={d} named_keys={d} write_map={} map_async={} fixed_map={} commit_backend={s} async_runtime={s}\n",
         .{
             @tagName(lmdb_engine.selected_backend),
             cfg.samples,
@@ -124,6 +127,7 @@ pub fn main(init: std.process.Init) !void {
             cfg.map_async,
             cfg.fixed_map,
             @tagName(cfg.commit_backend),
+            async_runtime,
         },
     );
 
@@ -153,6 +157,8 @@ pub fn main(init: std.process.Init) !void {
         summary.kv_data_sync.add(kv.data_sync_ns);
         summary.kv_meta_write.add(kv.meta_write_ns);
         summary.kv_meta_sync.add(kv.meta_sync_ns);
+
+        if (cfg.kv_only) continue;
 
         const dupsort = try runNamedDupsort(cfg);
         try printResult(&stdout_writer.interface, dupsort);
@@ -185,10 +191,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (cfg.samples > 1) {
         try printSummary(&stdout_writer.interface, "kv_roundtrip", summary.kv_total);
-        try printSummary(&stdout_writer.interface, "range_scan_warm", summary.range_warm_total);
-        try printSummary(&stdout_writer.interface, "range_scan_reopen", summary.range_reopen_total);
-        try printSummary(&stdout_writer.interface, "named_dupsort", summary.dupsort_total);
-        try printSummary(&stdout_writer.interface, "nested_reopen", summary.nested_total);
+        if (!cfg.kv_only) {
+            try printSummary(&stdout_writer.interface, "range_scan_warm", summary.range_warm_total);
+            try printSummary(&stdout_writer.interface, "range_scan_reopen", summary.range_reopen_total);
+            try printSummary(&stdout_writer.interface, "named_dupsort", summary.dupsort_total);
+            try printSummary(&stdout_writer.interface, "nested_reopen", summary.nested_total);
+        }
         try printPhaseSummary(&stdout_writer.interface, "kv_roundtrip", "write_open", summary.kv_write_open);
         try printPhaseSummary(&stdout_writer.interface, "kv_roundtrip", "put_loop", summary.kv_put_loop);
         try printPhaseSummary(&stdout_writer.interface, "kv_roundtrip", "commit", summary.kv_commit);
@@ -199,12 +207,14 @@ pub fn main(init: std.process.Init) !void {
         try printPhaseSummary(&stdout_writer.interface, "kv_roundtrip", "data_sync", summary.kv_data_sync);
         try printPhaseSummary(&stdout_writer.interface, "kv_roundtrip", "meta_write", summary.kv_meta_write);
         try printPhaseSummary(&stdout_writer.interface, "kv_roundtrip", "meta_sync", summary.kv_meta_sync);
-        try printPhaseSummary(&stdout_writer.interface, "range_scan_warm", "read_open", summary.range_warm_open);
-        try printPhaseSummary(&stdout_writer.interface, "range_scan_warm", "seek", summary.range_warm_seek);
-        try printPhaseSummary(&stdout_writer.interface, "range_scan_warm", "scan_loop", summary.range_warm_scan_loop);
-        try printPhaseSummary(&stdout_writer.interface, "range_scan_reopen", "read_open", summary.range_reopen_open);
-        try printPhaseSummary(&stdout_writer.interface, "range_scan_reopen", "seek", summary.range_reopen_seek);
-        try printPhaseSummary(&stdout_writer.interface, "range_scan_reopen", "scan_loop", summary.range_reopen_scan_loop);
+        if (!cfg.kv_only) {
+            try printPhaseSummary(&stdout_writer.interface, "range_scan_warm", "read_open", summary.range_warm_open);
+            try printPhaseSummary(&stdout_writer.interface, "range_scan_warm", "seek", summary.range_warm_seek);
+            try printPhaseSummary(&stdout_writer.interface, "range_scan_warm", "scan_loop", summary.range_warm_scan_loop);
+            try printPhaseSummary(&stdout_writer.interface, "range_scan_reopen", "read_open", summary.range_reopen_open);
+            try printPhaseSummary(&stdout_writer.interface, "range_scan_reopen", "seek", summary.range_reopen_seek);
+            try printPhaseSummary(&stdout_writer.interface, "range_scan_reopen", "scan_loop", summary.range_reopen_scan_loop);
+        }
     }
     try stdout_writer.flush();
 }
@@ -213,29 +223,29 @@ fn printResult(writer: anytype, result: WorkloadResult) !void {
     const secs = @as(f64, @floatFromInt(result.ns)) / 1e9;
     const ops_per_sec = @as(f64, @floatFromInt(result.ops)) / secs;
     try writer.print(
-        "{{\"backend\":\"{s}\",\"workload\":\"{s}\",\"ops\":{d},\"ns\":{d},\"ops_per_sec\":{d:.2}}}\n",
-        .{ @tagName(lmdb_engine.selected_backend), result.name, result.ops, result.ns, ops_per_sec },
+        "{{\"backend\":\"{s}\",\"async_runtime\":\"{s}\",\"workload\":\"{s}\",\"ops\":{d},\"ns\":{d},\"ops_per_sec\":{d:.2}}}\n",
+        .{ @tagName(lmdb_engine.selected_backend), async_runtime, result.name, result.ops, result.ns, ops_per_sec },
     );
 }
 
 fn printPhaseResult(writer: anytype, workload: []const u8, phase: []const u8, ns: u64) !void {
     try writer.print(
-        "{{\"backend\":\"{s}\",\"workload\":\"{s}\",\"phase\":\"{s}\",\"ns\":{d}}}\n",
-        .{ @tagName(lmdb_engine.selected_backend), workload, phase, ns },
+        "{{\"backend\":\"{s}\",\"async_runtime\":\"{s}\",\"workload\":\"{s}\",\"phase\":\"{s}\",\"ns\":{d}}}\n",
+        .{ @tagName(lmdb_engine.selected_backend), async_runtime, workload, phase, ns },
     );
 }
 
 fn printSummary(writer: anytype, workload: []const u8, stats: NsStats) !void {
     try writer.print(
-        "{{\"backend\":\"{s}\",\"workload\":\"{s}\",\"summary\":true,\"samples\":{d},\"avg_ns\":{d},\"min_ns\":{d},\"max_ns\":{d}}}\n",
-        .{ @tagName(lmdb_engine.selected_backend), workload, stats.count, stats.avg(), stats.min, stats.max },
+        "{{\"backend\":\"{s}\",\"async_runtime\":\"{s}\",\"workload\":\"{s}\",\"summary\":true,\"samples\":{d},\"avg_ns\":{d},\"min_ns\":{d},\"max_ns\":{d}}}\n",
+        .{ @tagName(lmdb_engine.selected_backend), async_runtime, workload, stats.count, stats.avg(), stats.min, stats.max },
     );
 }
 
 fn printPhaseSummary(writer: anytype, workload: []const u8, phase: []const u8, stats: NsStats) !void {
     try writer.print(
-        "{{\"backend\":\"{s}\",\"workload\":\"{s}\",\"phase\":\"{s}\",\"summary\":true,\"samples\":{d},\"avg_ns\":{d},\"min_ns\":{d},\"max_ns\":{d}}}\n",
-        .{ @tagName(lmdb_engine.selected_backend), workload, phase, stats.count, stats.avg(), stats.min, stats.max },
+        "{{\"backend\":\"{s}\",\"async_runtime\":\"{s}\",\"workload\":\"{s}\",\"phase\":\"{s}\",\"summary\":true,\"samples\":{d},\"avg_ns\":{d},\"min_ns\":{d},\"max_ns\":{d}}}\n",
+        .{ @tagName(lmdb_engine.selected_backend), async_runtime, workload, phase, stats.count, stats.avg(), stats.min, stats.max },
     );
 }
 
@@ -248,6 +258,8 @@ fn parseArgs(alloc: std.mem.Allocator, proc_args: std.process.Args) !Config {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--samples")) {
             cfg.samples = try parseNextUsize(&args, arg);
+        } else if (std.mem.eql(u8, arg, "--kv-only")) {
+            cfg.kv_only = true;
         } else if (std.mem.eql(u8, arg, "--cycles")) {
             cfg.cycles = try parseNextUsize(&args, arg);
         } else if (std.mem.eql(u8, arg, "--keys")) {

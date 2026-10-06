@@ -14,11 +14,11 @@
 
 //! Standalone compiler/admission microbenchmark, not a storage throughput test.
 const std = @import("std");
-const compiler = @import("compiler.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
 const lexer = @import("sql_parser").lexer;
-const describe = @import("describe.zig");
-const catalog = @import("catalog.zig");
-const ast = @import("ast.zig");
+const describe = @import("antfly_local_sources").sql_describe;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
 
 const ShapeBackend = struct {
     fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {

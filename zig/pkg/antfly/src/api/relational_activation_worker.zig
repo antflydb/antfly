@@ -16,14 +16,14 @@
 //! routed claims/references, and the owner-bound continuation share ONE durable
 //! transaction. Concurrent supervisors may race safely on the progress CAS.
 const std = @import("std");
-const reads = @import("table_read_source.zig");
-const writes = @import("table_write_source.zig");
-const planner = @import("relational_integrity_commit.zig");
-const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
-const records = @import("../common/topology_records.zig");
-const contract = @import("distributed_txn_contract.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const writes = @import("antfly_local_sources").api_table_write_source;
+const planner = @import("antfly_local_sources").api_relational_integrity_commit;
+const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+const records = @import("antfly_local_sources").common_topology_records;
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
 const Allocator = std.mem.Allocator;
-const RequestContext = @import("operation.zig").RequestContext;
+const RequestContext = @import("antfly_local_sources").api_operation.RequestContext;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const time = @import("antfly_platform").time;
 
@@ -194,7 +194,7 @@ fn recordFailure(alloc: Allocator, reader: reads.TableReadSource, writer: writes
     for (requests) |*request| {
         request.integrity_commands = &.{};
         if (std.mem.eql(u8, request.table_name, table)) {
-            const guards = try owned.alloc(@import("../storage/db/types.zig").TransactionVersionPredicate, rows.len);
+            const guards = try owned.alloc(@import("antfly_local_sources").storage_db_types.TransactionVersionPredicate, rows.len);
             for (guards, rows) |*guard, row| guard.* = .{ .key = row.key, .expected_version = row.version, .expected_content_digest = row.expected_content_digest orelse return error.MissingPrimaryObservation };
             request.predicates = guards;
             request.relational_schema_version = progress.schema_version;
@@ -218,8 +218,8 @@ fn recordFailure(alloc: Allocator, reader: reads.TableReadSource, writer: writes
 
 test "distributed txn activation failure publication atomically guards child and missing parent" {
     const alloc = std.testing.allocator;
-    const integrity = @import("../storage/db/relational_integrity_contract.zig");
-    const types = @import("../storage/db/types.zig");
+    const integrity = @import("antfly_local_sources").storage_db_relational_integrity_contract;
+    const types = @import("antfly_local_sources").storage_db_types;
     const address = try integrity.Address.init(@splat(1), "parent tuple");
     const progress: activation.Progress = .{ .generation_set = @splat(2), .owner = @splat(3), .schema_version = 7, .phase = .foreign_key };
     const expected = try progress.encode(alloc);
@@ -274,10 +274,10 @@ test "distributed txn activation failure publication atomically guards child and
 
 test "distributed txn activation worker adapts pages and atomically publishes native claims and failure state" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const types = @import("../storage/db/types.zig");
-    const integrity = @import("../storage/db/relational_integrity_contract.zig");
-    const catalog = @import("../storage/db/relational_integrity_catalog.zig");
-    const tuples = @import("../storage/db/relational_index_keys.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
+    const integrity = @import("antfly_local_sources").storage_db_relational_integrity_contract;
+    const catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
+    const tuples = @import("antfly_local_sources").storage_db_relational_index_keys;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     inline for (.{ 0, 1, 2, 3, 4 }) |scenario| {
@@ -328,7 +328,7 @@ test "distributed txn activation worker adapts pages and atomically publishes na
             fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: read_gate.ReadConsistency) !?reads.ScanResponse {
                 return error.UnexpectedCall;
             }
-            fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: read_gate.ReadConsistency) !?@import("query_response.zig").QueryResponse {
+            fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: read_gate.ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
                 return error.UnexpectedCall;
             }
             fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: types.BatchRequest) !?void {
@@ -448,7 +448,7 @@ test "distributed txn activation admission reaches singleton in bounded reductio
 
 test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and correction then resumes coverage" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const types = @import("../storage/db/types.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
     const gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     const initial =
@@ -458,7 +458,7 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
         \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["a","b"]}],"relational_indexes":[{"name":"by_a","keys":[{"column":"a"}]},{"name":"by_b","keys":[{"column":"b"}]}],"foreign_keys":[{"name":"fk","child_columns":["x","y"],"parent_table":"rows","parent_columns":["a","b"],"match":"partial"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true},"x":{"type":"integer","nullable":true},"y":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
     for ([_]bool{ false, true }) |remove| {
-        var directory = try @import("../common/test_directory.zig").TestDirectory.init("partial-diagnostic-repair");
+        var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("partial-diagnostic-repair");
         defer directory.cleanup();
         const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 500, .shard_id = 501 }, .primary_backend = .{ .lsm = .{} } };
         var db = try db_mod.DB.open(alloc, directory.path(), options);
@@ -485,7 +485,7 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 var result = try self.db.scan(allocator, from, to, opts);
                 defer result.deinit(allocator);
-                return .{ .ndjson = try @import("local_query_contract.zig").encodeStorageKernelScanNdjson(allocator, result, opts.include_documents) };
+                return .{ .ndjson = try @import("antfly_local_sources").api_local_query_contract.encodeStorageKernelScanNdjson(allocator, result, opts.include_documents) };
             }
             fn commit(ptr: *anyopaque, _: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, _: CancellationToken) !?contract.CommitOutcome {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -550,7 +550,7 @@ test "distributed txn MATCH PARTIAL diagnostic admits guarded deletion and corre
 
 test "distributed txn CHECK activation shares durable repair retry and physical source guards" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const types = @import("../storage/db/types.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     const initial =
@@ -682,7 +682,7 @@ test "distributed txn CHECK activation shares durable repair retry and physical 
 }
 
 test "distributed txn CHECK coverage identity is typed order independent and layout independent" {
-    const schema_api = @import("../schema/mod.zig");
+    const schema_api = @import("antfly_local_sources").schema_mod;
     const alloc = std.testing.allocator;
     const first =
         \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":0},{"name":"bounded","column":"id","op":"lt","value":10}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}

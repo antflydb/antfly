@@ -5,14 +5,14 @@
 //! observations grant no mutation authority. The caller authorizes the entire
 //! selected cohort before building and atomically persists plan plus job.
 const std = @import("std");
-const records = @import("../common/topology_records.zig");
+const records = @import("antfly_local_sources").common_topology_records;
 const tables_api = @import("tables.zig");
 const metadata = @import("../metadata/table_manager.zig");
 const stages = @import("../metadata/restore_staging.zig");
-const source = @import("../storage/db/online_source_contract.zig");
-const wire = @import("../storage/db/online_merge_io_contract.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
-const schema = @import("../schema/mod.zig");
+const source = @import("antfly_local_sources").storage_db_online_source_contract;
+const wire = @import("antfly_local_sources").storage_db_online_merge_io_contract;
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+const schema = @import("antfly_local_sources").schema_mod;
 
 pub fn requested(raw: []const u8) !bool {
     if (raw.len == 0) return false;
@@ -96,7 +96,7 @@ fn identity(id: stages.Id, original: u64, ordinal: u64, domain: []const u8) u64 
     hash.update(&numbers);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
-    return @import("../common/group_ids.zig").dataGroupIdFromHash(std.mem.readInt(u64, digest[0..8], .little));
+    return @import("antfly_local_sources").common_group_ids.dataGroupIdFromHash(std.mem.readInt(u64, digest[0..8], .little));
 }
 
 const SourceSchemas = struct {
@@ -105,7 +105,7 @@ const SourceSchemas = struct {
     bytes: usize = 0,
 
     fn add(self: *@This(), alloc: std.mem.Allocator, json: []const u8) !void {
-        const limits = @import("../storage/db/relational_rewrite_contract.zig");
+        const limits = @import("antfly_local_sources").storage_db_relational_rewrite_contract;
         if (json.len == 0 or json.len > limits.max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
         // Owners commonly expose the same complete archive. Deduplicate bytes
         // before compiling/parsing so fanout does not retain a schema parse per
@@ -134,7 +134,7 @@ pub fn build(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.
     return buildWithPolicies(alloc, id, selected, all_ranges, table_name, proposed, observer, .{});
 }
 
-pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("../storage/db/relational_row_transform.zig").Policies) !stages.Plan {
+pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []const records.TableRecord, all_ranges: []const records.RangeRecord, table_name: []const u8, proposed: []const u8, observer: anytype, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies) !stages.Plan {
     // Source ownership must stay fixed throughout the rewrite cohort. Check
     // every member before issuing any source reads or admitting a durable job.
     for (selected) |table| if (table.storage_migration != null) return error.TableTransitionActive;
@@ -201,7 +201,7 @@ pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []co
             try scope.validate();
             fence.* = scope.fence;
             const summary = facts.generation_handoff orelse return error.RestoreSourceProofMissing;
-            if (summary.admissions.len > @import("../storage/portable_backup.zig").max_source_generation_admissions)
+            if (summary.admissions.len > @import("antfly_local_sources").storage_portable_backup.max_source_generation_admissions)
                 return error.TransactionTooLarge;
             handoff_entries += summary.admissions.len;
             if (handoff_entries > 4096) return error.TransactionTooLarge;
@@ -209,7 +209,7 @@ pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []co
                 return error.TableTransitionActive;
             // The observer owns its decoded RPC response. Retain only a
             // bounded independent proof projection in the admitted plan.
-            const entries = try alloc.dupe(@import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry, summary.admissions);
+            const entries = try alloc.dupe(@import("antfly_local_sources").storage_portable_backup.SourceGenerationAdmissionSummaryEntry, summary.admissions);
             for (entries) |*entry| {
                 entry.child_table_name = try alloc.dupe(u8, entry.child_table_name);
                 entry.constraint_name = try alloc.dupe(u8, entry.constraint_name);
@@ -218,12 +218,12 @@ pub fn buildWithPolicies(alloc: std.mem.Allocator, id: stages.Id, selected: []co
         }
         const source_schemas = source_manifest.definitions.items;
         schema_bytes +|= source_manifest.bytes +| table.schema_json.len +| table.read_schema_json.len +| table.indexes_json.len;
-        if (schema_bytes > @import("../storage/db/relational_rewrite_contract.zig").max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
-        const target_policies: @import("../storage/db/relational_row_transform.zig").Policies = if (std.mem.eql(u8, before.name, table_name)) policies else .{};
+        if (schema_bytes > @import("antfly_local_sources").storage_db_relational_rewrite_contract.max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
+        const target_policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies = if (std.mem.eql(u8, before.name, table_name)) policies else .{};
         var programs = if (document)
-            try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.initDocumentPreservationWithRead(alloc, active, read)
+            try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.initDocumentPreservationWithRead(alloc, active, read)
         else
-            try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.init(alloc, source_schemas, table.schema_json, target_policies);
+            try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.init(alloc, source_schemas, table.schema_json, target_policies);
         defer programs.deinit();
         table.table_id = table_id;
         table.min_ranges = @intCast(ranges.len);
@@ -273,7 +273,7 @@ test "distributed txn rewrite admission closes current and historical dependenci
         tables: []const records.TableRecord,
         alloc: std.mem.Allocator,
         one_schema: [1][]const u8 = undefined,
-        entries: [1]@import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry = undefined,
+        entries: [1]@import("antfly_local_sources").storage_portable_backup.SourceGenerationAdmissionSummaryEntry = undefined,
         fn readFacts(self: *@This(), name: []const u8, request: wire.Request) !wire.AdmissionFacts {
             try request.validate();
             self.calls += 1;
@@ -285,7 +285,7 @@ test "distributed txn rewrite admission closes current and historical dependenci
                 self.entries[0] = .{ .child_table_id = before.table_id, .child_table_name = before.name, .constraint_name = "fk", .active_generation = try stages.plannedForeignGeneration(self.alloc, .{ .source_table_id = before.table_id, .table = before, .ranges = &.{} }, "fk"), .source_scope_digest = @splat(3) };
                 break :entries self.entries[0..];
             } else self.entries[0..0];
-            return .{ .namespace = request.scope.fence.namespace, .eligible = self.eligible, .source_schemas = &self.one_schema, .generation_handoff = .{ .namespace = request.scope.fence.namespace, .admissions = admissions, .admissions_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, admissions), .retired_digest = @splat(7), .retired_count = 0, .intent = null, .seal = null }, .catalog_digest = @splat(5), .next_topology_epoch = 1, .next_consumer_epoch = 1, .donor_term = 1, .next_copy_sequence = 1 };
+            return .{ .namespace = request.scope.fence.namespace, .eligible = self.eligible, .source_schemas = &self.one_schema, .generation_handoff = .{ .namespace = request.scope.fence.namespace, .admissions = admissions, .admissions_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(request.scope.fence.namespace, admissions), .retired_digest = @splat(7), .retired_count = 0, .intent = null, .seal = null }, .catalog_digest = @splat(5), .next_topology_epoch = 1, .next_consumer_epoch = 1, .donor_term = 1, .next_copy_sequence = 1 };
         }
         pub fn releaseFacts(self: *@This(), _: wire.AdmissionFacts) void {
             self.released += 1;
@@ -301,7 +301,7 @@ test "distributed txn rewrite admission closes current and historical dependenci
     const with_defaults = try buildWithPolicies(alloc, plan.id, cohort, &ranges, "parents", proposed_with_defaults, &observer, .{ .default_columns = &.{"x"} });
     for (with_defaults.targets) |target| {
         try std.testing.expectEqual(target.source_table_id == 10, target.rewrite.?.default_columns.len != 0);
-        var bound = try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.initIntent(alloc, target.rewrite.?);
+        var bound = try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.initIntent(alloc, target.rewrite.?);
         defer bound.deinit();
     }
     const migrating = try alloc.dupe(records.TableRecord, cohort);
@@ -397,11 +397,11 @@ test "distributed txn rewrite admission binds bounded immutable historical schem
     const conflicting = try std.mem.replaceOwned(u8, alloc, historical, "\"integer\"", "\"string\"");
     try std.testing.expectError(error.RestoreStagingScopeChanged, unioned.add(alloc, conflicting));
     const target = try std.mem.replaceOwned(u8, alloc, definition, "\"version\":2", "\"version\":3");
-    var programs = try @import("../storage/db/relational_rewrite_program.zig").ProgramSet.init(alloc, unioned.definitions.items, target, .{});
+    var programs = try @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet.init(alloc, unioned.definitions.items, target, .{});
     defer programs.deinit();
     try std.testing.expectEqual(@as(usize, 2), programs.programs.len);
-    const oversized = try alloc.alloc(u8, @import("../storage/db/relational_rewrite_contract.zig").max_schema_bytes + 1);
+    const oversized = try alloc.alloc(u8, @import("antfly_local_sources").storage_db_relational_rewrite_contract.max_schema_bytes + 1);
     try std.testing.expectError(error.RelationalRewriteBudgetExceeded, unioned.add(alloc, oversized));
-    unioned.bytes = @import("../storage/db/relational_rewrite_contract.zig").max_schema_bytes;
+    unioned.bytes = @import("antfly_local_sources").storage_db_relational_rewrite_contract.max_schema_bytes;
     try std.testing.expectError(error.RelationalRewriteBudgetExceeded, unioned.add(alloc, target));
 }

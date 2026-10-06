@@ -18,19 +18,19 @@
 const std = @import("std");
 const metadata = @import("../metadata/table_manager.zig");
 const staging = @import("../metadata/restore_staging.zig");
-const backup = @import("backup_contract.zig");
-const group_ids = @import("../common/group_ids.zig");
+const backup = @import("antfly_local_sources").api_backup_contract;
+const group_ids = @import("antfly_local_sources").common_group_ids;
 
 pub const SourceTable = struct {
     source_table_id: u64,
     manifest: *const backup.TableBackupManifest,
-    catalog_binding: ?@import("../system_catalog/domain.zig").Resource = null,
+    catalog_binding: ?@import("antfly_local_sources").system_catalog_domain.Resource = null,
     existing_name: ?[]const u8 = null,
     destination_name: ?[]const u8 = null,
     /// Exact primary identities from the authenticated cohort, in manifest
     /// shard order. They are not inferred from potentially historical group IDs.
-    namespaces: []const @import("../storage/db/doc_identity.zig").Namespace = &.{},
-    seals: []const @import("../storage/db/native_backup_seal.zig").Handle = &.{},
+    namespaces: []const @import("antfly_local_sources").storage_db_doc_identity.Namespace = &.{},
+    seals: []const @import("antfly_local_sources").storage_db_native_backup_seal.Handle = &.{},
 };
 pub const Selection = struct { plan: ?staging.Plan, skipped: []const []const u8 };
 
@@ -46,7 +46,7 @@ pub fn validateSelection(arena: std.mem.Allocator, sources: []const SourceTable)
     }
     for (sources) |source| for ([_][]const u8{ source.manifest.schema_json, source.manifest.read_schema_json }) |json| {
         if (json.len == 0) continue;
-        var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(arena, json);
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(arena, json);
         defer schema.deinit(arena);
         if (schema.foreign_keys) |fks| for (fks.value) |fk| {
             if (!names.contains(fk.parent_table)) return error.RestoreDependencyMissing;
@@ -56,12 +56,12 @@ pub fn validateSelection(arena: std.mem.Allocator, sources: []const SourceTable)
 
 /// Verify the aggregate's common-cut proof against one already authenticated
 /// table manifest. A native file checksum alone does not prove a shared cut.
-pub fn cohortSource(arena: std.mem.Allocator, proof: @import("../metadata/backup_cohort.zig").Job, manifest: *const backup.TableBackupManifest) !SourceTable {
+pub fn cohortSource(arena: std.mem.Allocator, proof: @import("antfly_local_sources").metadata_backup_cohort.Job, manifest: *const backup.TableBackupManifest) !SourceTable {
     try proof.validate();
     if (!std.mem.eql(u8, @tagName(proof.artifact_format), @tagName(manifest.format))) return error.BackupIntegrityFailure;
     if (proof.state.phase != .publishing or proof.state.cursor != 0 or proof.seals.len != proof.state.owners.len or manifest.table_id == 0) return error.BackupIntegrityFailure;
     var owners: std.AutoHashMapUnmanaged(u64, usize) = .empty;
-    var seals: std.AutoHashMapUnmanaged(u64, @import("../storage/db/native_backup_seal.zig").Handle) = .empty;
+    var seals: std.AutoHashMapUnmanaged(u64, @import("antfly_local_sources").storage_db_native_backup_seal.Handle) = .empty;
     for (proof.state.owners, 0..) |owner, index| {
         const slot = try owners.getOrPut(arena, owner.fence.owner_group_id);
         if (slot.found_existing) return error.BackupIntegrityFailure;
@@ -80,9 +80,9 @@ pub fn cohortSource(arena: std.mem.Allocator, proof: @import("../metadata/backup
     } else return error.BackupIntegrityFailure;
     if (selected.table_id != manifest.table_id) return error.BackupIntegrityFailure;
     const declaration = selected.manifest_definition orelse return error.BackupIntegrityFailure;
-    if (!std.mem.eql(u8, &declaration, &@import("../metadata/backup_cohort.zig").manifestDefinition(manifest.table_name, manifest.description, manifest.schema_json, manifest.read_schema_json, manifest.indexes_json, manifest.replication_sources_json))) return error.BackupIntegrityFailure;
-    const namespaces = try arena.alloc(@import("../storage/db/doc_identity.zig").Namespace, manifest.shards.len);
-    const handles = try arena.alloc(@import("../storage/db/native_backup_seal.zig").Handle, manifest.shards.len);
+    if (!std.mem.eql(u8, &declaration, &@import("antfly_local_sources").metadata_backup_cohort.manifestDefinition(manifest.table_name, manifest.description, manifest.schema_json, manifest.read_schema_json, manifest.indexes_json, manifest.replication_sources_json))) return error.BackupIntegrityFailure;
+    const namespaces = try arena.alloc(@import("antfly_local_sources").storage_db_doc_identity.Namespace, manifest.shards.len);
+    const handles = try arena.alloc(@import("antfly_local_sources").storage_db_native_backup_seal.Handle, manifest.shards.len);
     var matched: usize = 0;
     for (proof.state.owners) |owner| if (std.mem.eql(u8, owner.table_name, manifest.table_name)) {
         matched += 1;
@@ -127,7 +127,7 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
     for (sources) |source| {
         const manifest = source.manifest;
         if (source.source_table_id == 0 or manifest.shards.len == 0 or manifest.shards.len > 4096) return error.InvalidRestoreStaging;
-        try @import("../schema/restore_migration.zig").validate(arena, manifest.schema_json, manifest.read_schema_json);
+        try @import("antfly_local_sources").schema_restore_migration.validate(arena, manifest.schema_json, manifest.read_schema_json);
         const existing: ?metadata.TableRecord = for (current_tables) |table| {
             if (std.mem.eql(u8, table.name, source.existing_name orelse manifest.table_name)) break table;
         } else null;
@@ -158,7 +158,7 @@ pub fn buildPlan(arena: std.mem.Allocator, id: staging.Id, cohort_digest: stagin
         }
         metadata.sortKeyspaceRanges(metadata.RangeRecord, ranges);
         if (manifest.format == .portable) {
-            var source_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(arena, manifest.schema_json);
+            var source_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(arena, manifest.schema_json);
             defer source_schema.deinit(arena);
             if ((source.seals.len != 0 or source_schema.storage_mode == .relational) and
                 (manifest.shards.len == 0 or manifest.shards[0].accepted_generation_summary_digest == null))
@@ -226,7 +226,7 @@ test "restore staging driver shares stable identities and existing destination m
     try std.testing.expectEqualStrings("copy", copied.plan.?.targets[0].table.name);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expect(copied.plan.?.targets[0].replace == null);
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const qualified = try catalog.restoreStorageNameAlloc(a, "table:" ++ z17RepeatString("a", 32), .{
         .database = z17RepeatString("d", 128),
         .namespace = z17RepeatString("n", 128),
@@ -241,7 +241,7 @@ test "restore staging driver shares stable identities and existing destination m
     }}, &.{}, &.{}, "fail_if_exists");
     const long_plan = long_copy.plan.?;
     const long_target = long_plan.targets[0];
-    const bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap = .{
+    const bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap = .{
         .scope = .{
             .plan_id = id,
             .plan_digest = try long_plan.digest(a),
@@ -289,8 +289,8 @@ test "restore staging cohort proof binds every source identity and durable seal"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const cohort = @import("../metadata/backup_cohort.zig");
-    const fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence = .{ .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 301, .role = .backup_snapshot, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
+    const cohort = @import("antfly_local_sources").metadata_backup_cohort;
+    const fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence = .{ .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 301, .role = .backup_snapshot, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
     const owner: cohort.Owner = .{ .table_name = "docs", .range_start = "", .range_end = "", .fence = fence, .artifact_id = "artifact", .capture_node_id = 44 };
     const receipt: cohort.SealReceipt = .{ .source_node_id = 44, .handle = .{ .fence = fence, .digest = @splat(2) } };
     var proof: cohort.Job = .{ .id = 7, .revision = 9, .attempt_id = "attempt", .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive", .tables = &.{.{ .table_id = 9, .name = "docs", .definition = @splat(1), .manifest_definition = cohort.manifestDefinition("docs", "", "{}", "", "{}", "[]") }}, .state = .{ .phase = .publishing, .metadata_digest = @splat(3), .owners = &.{owner} }, .seals = &.{receipt} };
@@ -305,7 +305,7 @@ test "restore staging cohort proof binds every source identity and durable seal"
     const missing_admissions = try cohortSource(a, proof, &manifest);
     try std.testing.expectError(error.RestoreSourceProofMissing, buildPlan(a, try staging.idForAttempt(11, 1), @splat(9), &.{missing_admissions}, &.{}, &.{}, "fail_if_exists"));
     const portable_shards = try a.dupe(@typeInfo(@TypeOf(manifest.shards)).pointer.child, manifest.shards);
-    portable_shards[0].accepted_generation_summary_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(fence.namespace, &.{});
+    portable_shards[0].accepted_generation_summary_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(fence.namespace, &.{});
     manifest.shards = portable_shards;
     const portable_source = try cohortSource(a, proof, &manifest);
     const portable_selected = try buildPlan(a, try staging.idForAttempt(11, 1), @splat(9), &.{portable_source}, &.{}, &.{}, "fail_if_exists");

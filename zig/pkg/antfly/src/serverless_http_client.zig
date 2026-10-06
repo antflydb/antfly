@@ -18,7 +18,7 @@ const transport_routes = @import("raft/transport/routes.zig");
 const http_common = @import("raft/transport/http_common.zig");
 const public_test_helpers = @import("public_test_helpers.zig");
 const serverless = @import("serverless/mod.zig");
-const managed_embedder = @import("inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 
 pub const EnsureNamespaceResult = serverless.EnsureNamespaceResult;
 pub const EnsureTableResult = serverless.EnsureTableResult;
@@ -2071,3 +2071,6 @@ fn cleanupTmp(path: [*:0]const u8) void {
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

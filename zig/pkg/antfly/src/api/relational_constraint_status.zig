@@ -18,12 +18,12 @@ const std = @import("std");
 const wire = @import("antfly_metadata_openapi").types;
 const tables = @import("tables.zig");
 const metadata = @import("../metadata/table_manager.zig");
-const schema = @import("../schema/mod.zig");
-const reads = @import("table_read_source.zig");
-const operation = @import("operation.zig");
-const catalog_mod = @import("../storage/db/relational_integrity_catalog.zig");
-const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
-const types = @import("../storage/db/types.zig");
+const schema = @import("antfly_local_sources").schema_mod;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const operation = @import("antfly_local_sources").api_operation;
+const catalog_mod = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
+const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+const types = @import("antfly_local_sources").storage_db_types;
 
 pub fn collect(alloc: std.mem.Allocator, source: anytype, reader: reads.TableReadSource, name: []const u8, request: operation.RequestContext) ![]u8 {
     try request.ensureActive();

@@ -132,7 +132,7 @@ See: [Faceted Search (Wikipedia)](https://en.wikipedia.org/wiki/Faceted_search)
 
 **BM25** is the ranking function used for scoring documents based on term frequency and document length. BM25 improves on TF-IDF by accounting for term saturation and document length normalization.
 
-Antfly's full-text index (`zig/pkg/antfly/src/search`) is implemented natively in Zig as a Lucene-style segment index, using an FST-based term dictionary and roaring-bitmap posting lists to provide BM25 ranking, language-aware [tokenization](#tokenizers), [faceted search](#facetting), and highlighting.
+Antfly's full-text index (`zig/pkg/antfly-embedded/src/local/search`) is implemented natively in Zig as a Lucene-style segment index, using an FST-based term dictionary and roaring-bitmap posting lists to provide BM25 ranking, language-aware [tokenization](#tokenizers), [faceted search](#facetting), and highlighting.
 
 See: [Introduction to Information Retrieval](https://nlp.stanford.edu/IR-book/) | [Okapi BM25 (Wikipedia)](https://en.wikipedia.org/wiki/Okapi_BM25) | [BM25 Paper](https://www.staff.city.ac.uk/~sbrp622/papers/foundations_bm25_review.pdf)
 
@@ -210,7 +210,7 @@ A stateless way to sync sorted records from an external source. Antfly's linear 
 
 ### LSM & SSTables
 
-Antfly's native storage engine (`zig/pkg/antfly/src/storage/lsm`) is a Zig LSM-tree implementation. Each [shard](#sharding) has its own storage instance.
+Antfly's native storage engine (`zig/pkg/antfly-embedded/src/local/storage/lsm`) is a Zig LSM-tree implementation. Each [shard](#sharding) has its own storage instance.
 
 **SSTables (Sorted String Tables)** are the immutable, sorted files that form the LSM engine's on-disk storage format. SSTables enable efficient range scans and merging. The LSM-tree architecture writes data to memory first, then flushes to SSTables, and periodically compacts them for efficiency.
 

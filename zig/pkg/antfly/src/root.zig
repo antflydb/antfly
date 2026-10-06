@@ -15,12 +15,12 @@
 pub const build_options = @import("build_options");
 
 // Encoding & data structures
-pub const roaring = @import("encoding/roaring.zig");
+pub const roaring = @import("antfly_local_sources").encoding_roaring;
 pub const fst = @import("antfly_fst");
-pub const snappy = @import("encoding/snappy.zig");
-pub const streamvbyte = @import("encoding/streamvbyte.zig");
-pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
-pub const chunked_coder = @import("encoding/chunked_coder.zig");
+pub const snappy = @import("antfly_local_sources").encoding_snappy;
+pub const streamvbyte = @import("antfly_local_sources").encoding_streamvbyte;
+pub const simd_bitpack = @import("antfly_local_sources").encoding_simd_bitpack;
+pub const chunked_coder = @import("antfly_local_sources").encoding_chunked_coder;
 
 // Vector math & quantization
 pub const vector = @import("antfly_vector").vector;
@@ -31,54 +31,54 @@ pub const vectorindex = @import("antfly_vectorindex");
 pub const casbin = @import("antfly_casbin");
 
 // Index sections
-pub const inverted = @import("section/inverted.zig");
-pub const vector_section = @import("section/vector_section.zig");
-pub const doc_values = @import("section/doc_values.zig");
-pub const typed_doc_values = @import("section/typed_doc_values.zig");
-pub const nested = @import("section/nested.zig");
-pub const synonyms = @import("section/synonyms.zig");
+pub const inverted = @import("antfly_local_sources").section_inverted;
+pub const vector_section = @import("antfly_local_sources").section_vector_section;
+pub const doc_values = @import("antfly_local_sources").section_doc_values;
+pub const typed_doc_values = @import("antfly_local_sources").section_typed_doc_values;
+pub const nested = @import("antfly_local_sources").section_nested;
+pub const synonyms = @import("antfly_local_sources").section_synonyms;
 
 // Segment container
-pub const segment = @import("segment.zig");
+pub const segment = @import("antfly_local_sources").segment;
 
 // Columnar stored fields
 pub const columnar = @import("columnar.zig");
 
 // Index manager
-pub const index = @import("index.zig");
-pub const introducer = @import("introducer.zig");
-pub const merger = @import("merger.zig");
+pub const index = @import("antfly_local_sources").index;
+pub const introducer = @import("antfly_local_sources").introducer;
+pub const merger = @import("antfly_local_sources").merger;
 
 // Search & query
-pub const scorer = @import("search/scorer.zig");
-pub const query = @import("search/query.zig");
-pub const collector = @import("search/collector.zig");
-pub const aggregation = @import("search/aggregation.zig");
-pub const geo = @import("search/geo.zig");
-pub const analysis = @import("search/analysis.zig");
-pub const stopwords = @import("search/stopwords.zig");
-pub const stemmers = @import("search/stemmers.zig");
-pub const stemmers_validation = @import("search/stemmers_validation_test.zig");
-pub const search = @import("search/search.zig");
-pub const highlight = @import("search/highlight.zig");
-pub const levenshtein = @import("search/levenshtein.zig");
-pub const fusion = @import("search/fusion.zig");
-pub const regex = @import("search/regex.zig");
-pub const query_string = @import("search/query_string.zig");
+pub const scorer = @import("antfly_local_sources").search_scorer;
+pub const query = @import("antfly_local_sources").search_query;
+pub const collector = @import("antfly_local_sources").search_collector;
+pub const aggregation = @import("antfly_local_sources").search_aggregation;
+pub const geo = @import("antfly_local_sources").search_geo;
+pub const analysis = @import("antfly_local_sources").search_analysis;
+pub const stopwords = @import("antfly_local_sources").search_stopwords;
+pub const stemmers = @import("antfly_local_sources").search_stemmers;
+pub const stemmers_validation = @import("antfly_local_sources").search_stemmers_validation_test;
+pub const search = @import("antfly_local_sources").search_search;
+pub const highlight = @import("antfly_local_sources").search_highlight;
+pub const levenshtein = @import("antfly_local_sources").search_levenshtein;
+pub const fusion = @import("antfly_local_sources").search_fusion;
+pub const regex = @import("antfly_local_sources").search_regex;
+pub const query_string = @import("antfly_local_sources").search_query_string;
 
 // Graph
-pub const graph = @import("graph/graph.zig");
-pub const traversal = @import("graph/traversal.zig");
-pub const paths = @import("graph/paths.zig");
-pub const graph_query = @import("graph/query.zig");
-pub const graph_pattern = @import("graph/pattern.zig");
+pub const graph = @import("antfly_local_sources").graph_graph;
+pub const traversal = @import("antfly_local_sources").graph_traversal;
+pub const paths = @import("antfly_local_sources").graph_paths;
+pub const graph_query = @import("antfly_local_sources").graph_query;
+pub const graph_pattern = @import("antfly_local_sources").graph_pattern;
 
 // Sparse embeddings
-pub const sparse = @import("sparse/sparse.zig");
+pub const sparse = @import("antfly_local_sources").sparse_sparse;
 
 // Inference clients (Antfly, OpenAI/Ollama)
-pub const inference = @import("inference/mod.zig");
-pub const table_schema = @import("schema/mod.zig");
+pub const inference = @import("antfly_local_sources").inference_mod;
+pub const table_schema = @import("antfly_local_sources").schema_mod;
 pub const capi_dependencies = @import("capi_dependencies.zig");
 pub const image = @import("antfly_image");
 pub const font = @import("antfly_font");
@@ -148,7 +148,7 @@ pub const metadata_table_workflow = @import("metadata/table_workflow.zig");
 pub const metadata_replication_backfill = @import("metadata/replication_backfill.zig");
 pub const metadata_placement_planner = @import("metadata/placement_planner.zig");
 pub const data = @import("data/mod.zig");
-pub const vector_migration = @import("common/vector_migration.zig");
+pub const vector_migration = @import("antfly_local_sources").common_vector_migration;
 pub const vector_migration_offline = @import("storage/vector_migration_offline.zig");
 pub const migration_files = @import("common/migration_files.zig");
 pub const standalone = @import("standalone/mod.zig");
@@ -156,65 +156,65 @@ pub const inference_runtime = @import("inference_runtime/runtime.zig");
 pub const usermgr = @import("usermgr/mod.zig");
 
 // Template rendering (handlebars)
-pub const template = @import("template.zig");
+pub const template = @import("antfly_local_sources").template;
 pub const bloom = @import("bloom");
 pub const jsonschema = @import("antfly_jsonschema");
 pub const common = @import("common/mod.zig");
 pub const foreign = @import("foreign/mod.zig");
 pub const embeddings = @import("antfly_embeddings");
 pub const generating = @import("antfly_generating");
-pub const generating_runtime = @import("generating/mod.zig");
+pub const generating_runtime = @import("antfly_local_sources").generating_mod;
 pub const reranking = @import("antfly_reranking");
 pub const reranking_runtime = @import("reranking/mod.zig");
 pub const transcribing = @import("antfly_transcribing");
 pub const readers = @import("antfly_readers");
 pub const extracting = @import("antfly_extracting");
 pub const synthesizing = @import("antfly_synthesizing");
-pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
+pub const asset_producer_runtime = @import("antfly_local_sources").asset_producer_runtime;
 
 // Storage backends
 pub const platform_clock = @import("antfly_platform").clock;
 pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
-pub const storage_backend = @import("storage/backend_types.zig");
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-pub const storage_maintenance = @import("storage/maintenance.zig");
-pub const storage_backend_scan = @import("storage/backend_scan.zig");
-pub const storage_sim_runtime = @import("storage/sim_runtime.zig");
-pub const object_storage = @import("storage/object_storage.zig");
-pub const host_environment = @import("storage/host_environment.zig");
-pub const lite = @import("storage/lite/mod.zig");
+pub const storage_backend = @import("antfly_local_sources").storage_backend_types;
+pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
+pub const storage_maintenance = @import("antfly_local_sources").storage_maintenance;
+pub const storage_backend_scan = @import("antfly_local_sources").storage_backend_scan;
+pub const storage_sim_runtime = @import("antfly_local_sources").storage_sim_runtime;
+pub const object_storage = @import("antfly_local_sources").storage_object_storage;
+pub const host_environment = @import("antfly_local_sources").storage_host_environment;
+pub const lite = @import("antfly_local_sources").storage_lite_mod;
 pub const lite_backend = lite.backend;
 pub const lite_native = lite.native;
 pub const storage_lsm = @import("storage/lsm/mod.zig");
-pub const mem_backend = @import("storage/mem_backend.zig");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 pub const backend_conformance_test = @import("storage/backend_conformance_test.zig");
 pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
 pub const lsm_vopr = @import("storage/lsm_vopr.zig");
-pub const hbc = @import("storage/hbc_adapter.zig");
-pub const posting_segment_store = @import("storage/posting_segment_store.zig");
-pub const vector_block_store = @import("storage/vector_block_store.zig");
+pub const hbc = @import("antfly_local_sources").storage_hbc_adapter;
+pub const posting_segment_store = @import("antfly_local_sources").storage_posting_segment_store;
+pub const vector_block_store = @import("antfly_local_sources").storage_vector_block_store;
 pub const hot_standby = @import("storage/hot_standby/mod.zig");
 pub const standby_vopr = @import("storage/hot_standby/vopr.zig");
-pub const wal = @import("storage/wal.zig");
+pub const wal = @import("antfly_local_sources").storage_wal;
 pub const wal_vopr = @import("storage/wal_vopr.zig");
-pub const persistent = @import("storage/persistent.zig");
+pub const persistent = @import("antfly_local_sources").storage_persistent;
 pub const persistent_vopr = @import("storage/persistent_vopr.zig");
-pub const docstore = @import("storage/docstore.zig");
-pub const resource_manager = @import("storage/resource_manager.zig");
-pub const backup_codec = @import("storage/backup_codec.zig");
-pub const backup_bundle = @import("storage/backup_bundle.zig");
-pub const backup_bundle_io = @import("storage/backup_bundle_io.zig");
+pub const docstore = @import("antfly_local_sources").storage_docstore;
+pub const resource_manager = @import("antfly_local_sources").storage_resource_manager;
+pub const backup_codec = @import("antfly_local_sources").storage_backup_codec;
+pub const backup_bundle = @import("antfly_local_sources").storage_backup_bundle;
+pub const backup_bundle_io = @import("antfly_local_sources").storage_backup_bundle_io;
 pub const backup_repository = @import("storage/backup_repository.zig");
-pub const portable_backup = @import("storage/portable_backup.zig");
-pub const internal_keys = @import("storage/internal_keys.zig");
-pub const shard = @import("storage/shard.zig");
+pub const portable_backup = @import("antfly_local_sources").storage_portable_backup;
+pub const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+pub const shard = @import("antfly_local_sources").storage_shard;
 pub const enrichment = @import("storage/enrichment.zig");
-pub const ttl = @import("storage/ttl.zig");
-pub const transactions = @import("storage/transactions.zig");
+pub const ttl = @import("antfly_local_sources").storage_ttl;
+pub const transactions = @import("antfly_local_sources").storage_transactions;
 pub const transaction_vopr = @import("storage/transaction_vopr.zig");
-pub const schema = @import("storage/schema.zig");
+pub const schema = @import("antfly_local_sources").storage_schema;
 pub const db = @import("antfly_source_root").antfly_sources.selected_db;
 pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
@@ -285,7 +285,7 @@ test {
     _ = fusion;
     _ = regex;
     _ = query_string;
-    _ = @import("search/pattern_filter.zig");
+    _ = @import("antfly_local_sources").search_pattern_filter;
     _ = @import("hbc_recall_test.zig");
 
     // Graph
@@ -301,7 +301,7 @@ test {
     // Inference
     _ = inference;
     _ = table_schema;
-    _ = @import("chunking/mod.zig");
+    _ = @import("antfly_local_sources").chunking_mod;
     _ = pdf;
 
     // Serverless
@@ -436,5 +436,8 @@ test {
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test "online graph snapshot native receiver module" {
-    _ = @import("storage/db/online_graph_receiver_test.zig");
+    _ = @import("antfly_local_sources").storage_db_online_graph_receiver_test;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

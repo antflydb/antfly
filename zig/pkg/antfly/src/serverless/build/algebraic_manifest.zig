@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const manifest_artifact = @import("../manifest/artifact_ref.zig");
+const manifest_artifact = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const PublishedArtifact = struct {
     artifact_id: []const u8,

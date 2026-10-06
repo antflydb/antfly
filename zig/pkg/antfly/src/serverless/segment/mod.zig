@@ -14,8 +14,8 @@
 
 pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
-pub const source_binding = @import("source_binding.zig");
-pub const sidecar_manifest = @import("sidecar_manifest.zig");
+pub const source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
+pub const sidecar_manifest = @import("antfly_local_sources").serverless_segment_sidecar_manifest;
 
 pub const Entry = types.Entry;
 pub const SidecarKind = source_binding.SidecarKind;

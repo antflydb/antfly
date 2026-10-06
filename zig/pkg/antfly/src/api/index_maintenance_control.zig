@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: ELv2
 //! Shared control-plane lifetime for graph metric and relational maintenance.
 //! Resource adapters retain their own generation proofs and durable executors.
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 
 pub const Control = struct {
     request: operation.RequestContext,

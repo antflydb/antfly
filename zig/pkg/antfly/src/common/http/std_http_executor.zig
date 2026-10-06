@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const common = @import("http_common.zig");
-const std_http_listener = @import("std_http_listener.zig");
-const threaded_connect_io = @import("../threaded_connect_io.zig");
+const common = @import("antfly_local_sources").common_http_http_common;
+const std_http_listener = @import("antfly_local_sources").common_http_std_http_listener;
+const threaded_connect_io = @import("antfly_local_sources").common_threaded_connect_io;
 
 const cancellation_poll_interval_ms: i64 = 25;
 

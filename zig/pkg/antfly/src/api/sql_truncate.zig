@@ -4,24 +4,24 @@
 //! delete batch, source artifact, or retained tail is involved.
 const std = @import("std");
 const server_mod = @import("http_server.zig");
-const catalog = @import("../sql/catalog.zig");
-const ast = @import("../sql/ast.zig");
-const domain = @import("../system_catalog/domain.zig");
-const records = @import("../common/topology_records.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const records = @import("antfly_local_sources").common_topology_records;
 const metadata = @import("../metadata/table_manager.zig");
 const stages = @import("../metadata/restore_staging.zig");
 const jobs = @import("restore_jobs.zig");
-const operation = @import("operation.zig");
-const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const integrity_catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
 
 /// Predict the fresh child identities with the exact owner compiler, before
 /// the hidden generation exists. This is not a hash of a policy name: the
 /// generation allocation order, typed declaration fingerprint, and table
 /// incarnation must match the owner-side catalog byte-for-byte.
 fn plannedIntegrityCatalog(alloc: std.mem.Allocator, table_id: u64, schema_json: []const u8) !integrity_catalog.Update {
-    const schema_api = @import("../schema/mod.zig");
-    const native_schema = @import("../storage/schema.zig");
-    const declarations = @import("../schema/relational_declarations.zig");
+    const schema_api = @import("antfly_local_sources").schema_mod;
+    const native_schema = @import("antfly_local_sources").storage_schema;
+    const declarations = @import("antfly_local_sources").schema_relational_declarations;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     if (parsed.storage_mode != .relational) return error.RelationalTableRequired;
@@ -36,7 +36,7 @@ fn plannedIntegrityCatalog(alloc: std.mem.Allocator, table_id: u64, schema_json:
     return integrity_catalog.prepare(alloc, null, try integrity_catalog.incarnationFromTableId(table_id), runtime.version, digest, definitions);
 }
 
-fn currentIntegrityCatalog(alloc: std.mem.Allocator, source: @import("table_read_source.zig").TableReadSource, table: records.TableRecord) !integrity_catalog.Catalog {
+fn currentIntegrityCatalog(alloc: std.mem.Allocator, source: @import("antfly_local_sources").api_table_read_source.TableReadSource, table: records.TableRecord) !integrity_catalog.Catalog {
     var response = (try source.integrityCatalog(alloc, table.name)) orelse return error.IntegrityCatalogUnavailable;
     defer response.deinit(alloc);
     const Envelope = struct { catalog: []const u8, schema_version: u32, table_id: []const u8 };
@@ -81,7 +81,7 @@ fn buildExternalParents(
     const reads = server.table_reads orelse return error.UnsupportedSqlExecution;
     var drafts: std.ArrayList(ExternalParentDraft) = .empty;
     for (selected, planned) |child, replacement| {
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, @import("tables.zig").effectiveSchemaJson(child.schema_json));
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, @import("tables.zig").effectiveSchemaJson(child.schema_json));
         defer parsed.deinit(alloc);
         if (parsed.storage_mode != .relational) continue;
         const definitions = try parsed.relationalForeignKeyDefinitions(alloc);
@@ -136,12 +136,12 @@ fn buildExternalParents(
         if (ranges_list.items.len == 0 or total_ranges > 4096) return error.SqlProgramLimitExceeded;
         metadata.sortKeyspaceRanges(records.RangeRecord, ranges_list.items);
         const ranges = try ranges_list.toOwnedSlice(alloc);
-        const fences = try alloc.alloc(@import("../storage/db/relational_integrity_topology_contract.zig").Fence, ranges.len);
+        const fences = try alloc.alloc(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, ranges.len);
         for (ranges, fences) |range, *fence| {
             try context.ensureActive();
             var response = (try reads.lookup(alloc, draft.table.name, range.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableNotFound;
             defer response.deinit(alloc);
-            const Native = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+            const Native = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
             const native = try std.json.parseFromSliceLeaky(Native, alloc, response.json, .{ .ignore_unknown_fields = true });
             if (native.namespace.table_id != draft.table.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(range) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(range)) return error.TableGenerationChanged;
             try native.requireGenerationHandoffReceipts();
@@ -186,7 +186,7 @@ fn selectInternal(alloc: std.mem.Allocator, tables: []const records.TableRecord,
             if (definition.len == 0) continue;
             _ = schema_scratch.reset(.retain_capacity);
             const temporary = schema_scratch.allocator();
-            var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(temporary, definition);
+            var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(temporary, definition);
             defer schema.deinit(temporary);
             if (schema.foreign_keys) |foreign_keys| for (foreign_keys.value) |fk| {
                 const parent = names.get(fk.parent_table) orelse return error.ForeignKeyParentTableNotFound;
@@ -247,7 +247,7 @@ fn generation(id: stages.Id, original: u64, ordinal: u64, label: []const u8) u64
     hash.update(&numbers);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
-    return @import("../common/group_ids.zig").dataGroupIdFromHash(std.mem.readInt(u64, digest[0..8], .little));
+    return @import("antfly_local_sources").common_group_ids.dataGroupIdFromHash(std.mem.readInt(u64, digest[0..8], .little));
 }
 
 fn freeReceipt(alloc: std.mem.Allocator, receipt: catalog.DdlReceipt) void {
@@ -336,7 +336,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         if (old_ranges.items.len == 0 or total_ranges > 4096) return error.SqlProgramLimitExceeded;
         metadata.sortKeyspaceRanges(records.RangeRecord, old_ranges.items);
         const ranges = try a.alloc(records.RangeRecord, old_ranges.items.len);
-        const fences = try a.alloc(@import("../storage/db/relational_integrity_topology_contract.zig").Fence, ranges.len);
+        const fences = try a.alloc(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, ranges.len);
         const handoffs = try a.alloc(stages.GenerationHandoffRange, ranges.len);
         var table = before;
         table.table_id = generation(id, before.table_id, 0, "table");
@@ -347,7 +347,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             range.* = .{ .table_id = table.table_id, .group_id = group, .range_id = group, .doc_identity_shard_id = group, .doc_identity_range_id = group, .start_key = old.start_key, .end_key = old.end_key };
             var response = (try (server.table_reads orelse return error.UnsupportedSqlExecution).lookup(a, before.name, old.start_key, .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableNotFound;
             defer response.deinit(a);
-            const Native = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+            const Native = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
             const native = try std.json.parseFromSliceLeaky(Native, a, response.json, .{ .ignore_unknown_fields = true });
             if (native.namespace.table_id != before.table_id or native.namespace.shard_id != metadata.rangeDocIdentityShardId(old) or native.namespace.range_id != metadata.rangeDocIdentityRangeId(old)) return error.TableGenerationChanged;
             try native.requireGenerationHandoffReceipts();
@@ -358,7 +358,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             // cutover, catching any intervening FK admission or retirement.
             var summary_response = (try (server.table_reads orelse return error.UnsupportedSqlExecution).lookup(a, before.name, old.start_key, .{ .relational_topology_json = "{\"mode\":\"generation_handoff_summary\"}", .execution_deadline_ns = (try context.platformDeadline()).deadline_ns, .cancellation = context.cancellation }, .read_index)) orelse return error.TableGenerationChanged;
             defer summary_response.deinit(a);
-            const summary = try std.json.parseFromSliceLeaky(@import("../storage/db/empty_generation_handoff.zig").Summary, a, summary_response.json, .{ .allocate = .alloc_always });
+            const summary = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_empty_generation_handoff.Summary, a, summary_response.json, .{ .allocate = .alloc_always });
             if (!summary.namespace.eql(native.namespace) or summary.intent != null or summary.seal != null) return error.TableGenerationChanged;
             handoff.* = .{
                 .source_group_id = old.group_id,
@@ -390,7 +390,7 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const primary_target = for (planned) |target| {
         if (target.source_table_id == resolved.tables[0].?.table_id) break target.table;
     } else return error.InvalidRestoreStaging;
-    var primary_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(a, @import("tables.zig").effectiveSchemaJson(primary_target.schema_json));
+    var primary_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, @import("tables.zig").effectiveSchemaJson(primary_target.schema_json));
     defer primary_schema.deinit(a);
     const receipt = try pendingReceipt(alloc, targets[0], resolved.tables[0].?.table_id, primary_schema.version, job_id);
     errdefer freeReceipt(alloc, receipt);

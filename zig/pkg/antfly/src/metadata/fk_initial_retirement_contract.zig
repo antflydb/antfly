@@ -7,7 +7,7 @@
 //! may attest completion. Metadata accepts that attestation only from the
 //! currently registered physical store root.
 const std = @import("std");
-const incarnation = @import("incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 const retirement = @import("fk_initial_retirement.zig");
 
 pub const ticket_encoded_len = 256;

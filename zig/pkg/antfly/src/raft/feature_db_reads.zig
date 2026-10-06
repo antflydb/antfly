@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const db_query_search = @import("../storage/db/query/search_exec.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const db_query_search = @import("antfly_local_sources").storage_db_query_search_exec;
 const feature_reads = @import("feature_reads.zig");
 const read_gate = @import("read_gate.zig");
 

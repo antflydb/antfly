@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const common = @import("../../common/http/http_common.zig");
+const common = @import("antfly_local_sources").common_http_http_common;
 
 pub const RequestCancellation = common.RequestCancellation;
 pub const RequestDeliveryTracker = common.RequestDeliveryTracker;

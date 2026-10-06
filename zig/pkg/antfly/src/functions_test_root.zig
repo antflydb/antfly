@@ -1,19 +1,19 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-pub const lsm_backend = @import("storage/lsm_backend.zig");
+pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
-    _ = @import("functions/decisions.zig");
-    _ = @import("functions/expressions.zig");
-    _ = @import("functions/runtime.zig");
-    _ = @import("functions/query_eval.zig");
-    _ = @import("asset_producer_runtime.zig");
+    _ = @import("antfly_local_sources").functions_decisions;
+    _ = @import("antfly_local_sources").functions_expressions;
+    _ = @import("antfly_local_sources").functions_runtime;
+    _ = @import("antfly_local_sources").functions_query_eval;
+    _ = @import("antfly_local_sources").asset_producer_runtime;
 }
 
 test "decision functions public DSL preserves evaluation inputs and rejects conflicting stages" {
     const std = @import("std");
-    const query = @import("api/query_contract.zig");
+    const query = @import("antfly_local_sources").api_query_contract;
     const a = std.testing.allocator;
     var parsed = try query.parseQueryRequest(a, null, "docs",
         \\{"fields":[],"limit":2,"evaluate":{"scope":"candidates","candidate_count":20,"compute":{"null_value":{"literal":null},"p":{"call":"ai_probability","input":{"field":"private_body"},"statement":"Refund?","decider":"local"}}}}
@@ -39,8 +39,8 @@ test "decision functions public DSL preserves evaluation inputs and rejects conf
 
 test "decision functions worker transport fetches hidden inputs independently of final projection" {
     const std = @import("std");
-    const query = @import("api/query_contract.zig");
-    const wire = @import("api/local_query_contract.zig");
+    const query = @import("antfly_local_sources").api_query_contract;
+    const wire = @import("antfly_local_sources").api_local_query_contract;
     const a = std.testing.allocator;
     for ([_][]const u8{ "[]", "[\"id\"]", "[\"nested.value\"]" }) |fields| {
         const body = try std.fmt.allocPrint(a, "{{\"fields\":{s},\"evaluate\":{{\"scope\":\"candidates\",\"candidate_count\":20,\"compute\":{{\"p\":{{\"call\":\"ai_probability\",\"input\":{{\"field\":\"body\"}},\"statement\":\"Refund?\",\"decider\":\"local\"}}}}}}}}", .{fields});
@@ -63,7 +63,7 @@ test "decision functions worker transport fetches hidden inputs independently of
         try std.testing.expect(!original.req.include_all_fields);
         // Exercise both response encoders: workers retain the input document,
         // while the coordinator emits only the original caller projection.
-        const types = @import("storage/db/types.zig");
+        const types = @import("antfly_local_sources").storage_db_types;
         var hits = [_]types.SearchHit{.{
             .id = @constCast("doc"),
             .stored_data = @constCast("{\"id\":\"doc\",\"body\":\"refund\",\"nested\":{\"value\":\"kept\"}}"),
@@ -97,7 +97,7 @@ test "decision functions worker transport fetches hidden inputs independently of
 
 test "decision functions graph evaluation separates collection and output windows" {
     const std = @import("std");
-    const query = @import("api/query_contract.zig");
+    const query = @import("antfly_local_sources").api_query_contract;
     const a = std.testing.allocator;
     var request = try query.parseQueryRequest(a, null, "docs",
         \\{"limit":1,"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"matches","max_rows":8,"compute":{"x":{"literal":1}}}}
@@ -112,7 +112,7 @@ test "decision functions graph evaluation separates collection and output window
 
 test "decision functions graph dependency views keep the original prefix" {
     const std = @import("std");
-    const types = @import("storage/db/types.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var bindings = [_]types.GraphPatternBinding{
@@ -135,7 +135,7 @@ test "decision functions graph dependency views keep the original prefix" {
 
 test "decision functions vector candidate evaluation supports final offset paging" {
     const std = @import("std");
-    const query = @import("api/query_contract.zig");
+    const query = @import("antfly_local_sources").api_query_contract;
     const a = std.testing.allocator;
     var request = try query.parseQueryRequest(a, null, "docs",
         \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"evaluate":{"scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
@@ -150,7 +150,7 @@ test "decision functions vector candidate evaluation supports final offset pagin
 
 test "decision functions graph evaluation preserves vector hit offset restrictions" {
     const std = @import("std");
-    const query = @import("api/query_contract.zig");
+    const query = @import("antfly_local_sources").api_query_contract;
     try std.testing.expectError(error.UnsupportedQueryRequest, query.parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
     ));

@@ -18,26 +18,26 @@ const server_query_visibility = @import("../storage/server_query_visibility.zig"
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
-const local_write_contract = @import("local_write_contract.zig");
-const physical_local_write = @import("local_table_writes.zig").physical_local_write;
+const local_write_contract = @import("antfly_local_sources").api_local_write_contract;
+const physical_local_write = @import("antfly_local_sources").api_local_table_writes.physical_local_write;
 
-const local_write_test_hooks = @import("local_write_test_hooks.zig");
+const local_write_test_hooks = @import("antfly_local_sources").api_local_write_test_hooks;
 const builtin = @import("builtin");
-const replication_ingress = @import("../storage/db/replication_ingress.zig");
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const std = @import("std");
 const storage_source_options = @import("storage_source_options");
-const control_only_storage_sources = @import("local_table_writes.zig").control_only_storage_sources;
+const control_only_storage_sources = @import("antfly_local_sources").api_local_table_writes.control_only_storage_sources;
 
-const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const platform = @import("antfly_platform");
 const platform_sync = @import("antfly_platform").sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
-const common_secrets = @import("../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const backups_api = @import("backups.zig");
-const batch_api = @import("batch.zig");
+const batch_api = @import("antfly_local_sources").api_batch;
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -49,29 +49,29 @@ const raft_mod = @import("../raft/mod.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
-const db_mod = @import("local_table_writes.zig").db_mod;
+const db_mod = @import("antfly_local_sources").api_local_table_writes.db_mod;
 
-const internal_keys = @import("../storage/internal_keys.zig");
-const transactions_mod = @import("../storage/transactions.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
-const graph_mod = @import("../graph/graph.zig");
-const range_state_mod = @import("../storage/db/range_state.zig");
-const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
-const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
-const backend_types = @import("../storage/backend_types.zig");
-const hbc_mod = @import("../storage/hbc_adapter.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const portable_backup = @import("../storage/portable_backup.zig");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const range_state_mod = @import("antfly_local_sources").storage_db_range_state;
+const index_manager_mod = @import("antfly_local_sources").storage_db_catalog_index_manager;
+const change_journal_mod = @import("antfly_local_sources").storage_db_derived_change_journal;
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const hbc_mod = @import("antfly_local_sources").storage_hbc_adapter;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const portable_backup = @import("antfly_local_sources").storage_portable_backup;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const hot_standby_primary_mod = @import("../storage/hot_standby/primary.zig");
 const replication_mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 const hot_standby_public_gate_state_mod = @import("../storage/hot_standby/public_gate_state.zig");
-const storage_schema = @import("../storage/schema.zig");
+const storage_schema = @import("antfly_local_sources").storage_schema;
 const table_catalog = @import("table_catalog.zig");
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
-const table_write_source = @import("table_write_source.zig");
+const table_write_source = @import("antfly_local_sources").api_table_write_source;
 
 // ProvisionSummary.indexes_pending is the coarse maintenance retry debt,
 // not a public index count. A busy owner has not proved its catalog complete
@@ -96,15 +96,15 @@ test "owner catalog busy without index debt keeps provisioning retry until full 
 const http_routes = @import("http_routes.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
-const table_index_config = @import("table_index_config.zig");
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
-const coverage_policy_mod = @import("coverage_policy.zig");
-const query_api = @import("query.zig");
+const coverage_policy_mod = @import("antfly_local_sources").api_coverage_policy;
+const query_api = @import("antfly_local_sources").api_query;
 const public_table_http = @import("public_table_http.zig");
-const runtime_status = @import("runtime_status.zig");
-const stored_destination_authorization = @import("stored_destination_authorization.zig");
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 
 fn resolveCatalogGroupsEventually(
     alloc: std.mem.Allocator,
@@ -166,7 +166,7 @@ fn resolveCatalogRouteEventuallyUntil(
     };
 }
 
-const nativeSnapshotAttemptTokenAlloc = @import("local_table_writes.zig").nativeSnapshotAttemptTokenAlloc;
+const nativeSnapshotAttemptTokenAlloc = @import("antfly_local_sources").api_local_table_writes.nativeSnapshotAttemptTokenAlloc;
 
 const native_snapshot_attempt_marker_suffix = physical_local_write.native_snapshot_attempt_marker_suffix;
 const native_snapshot_attempt_marker_directory = physical_local_write.native_snapshot_attempt_marker_directory;
@@ -175,9 +175,9 @@ const native_snapshot_attempt_reclaim_limit = physical_local_write.native_snapsh
 const native_snapshot_attempt_scan_limit = physical_local_write.native_snapshot_attempt_scan_limit;
 const create_structural_publication_retry_limit: usize = 3;
 
-const createNativeSnapshotAttemptMarker = @import("local_table_writes.zig").createNativeSnapshotAttemptMarker;
+const createNativeSnapshotAttemptMarker = @import("antfly_local_sources").api_local_table_writes.createNativeSnapshotAttemptMarker;
 
-const reclaimStaleNativeSnapshotAttempts = @import("local_table_writes.zig").reclaimStaleNativeSnapshotAttempts;
+const reclaimStaleNativeSnapshotAttempts = @import("antfly_local_sources").api_local_table_writes.reclaimStaleNativeSnapshotAttempts;
 
 pub const LsmOwnerMetricStats = struct {
     table_name: []u8,
@@ -428,12 +428,12 @@ fn pinWriteCacheLsmOwnerEntriesBestEffort(
     return .{ .cache = cache, .storage = storage, .count = entry_count };
 }
 
-const GraphMetricGroupActionRequest = @import("local_write_contract.zig").GraphMetricGroupActionRequest;
-const graph_metric_group_action_operation = @import("local_write_contract.zig").graph_metric_group_action_operation;
-const graphMetricGroupActionBodyAlloc = @import("local_write_contract.zig").graphMetricGroupActionBodyAlloc;
-const applyGraphMetricActionToDb = @import("local_table_writes.zig").applyGraphMetricActionToDb;
+const GraphMetricGroupActionRequest = @import("antfly_local_sources").api_local_write_contract.GraphMetricGroupActionRequest;
+const graph_metric_group_action_operation = @import("antfly_local_sources").api_local_write_contract.graph_metric_group_action_operation;
+const graphMetricGroupActionBodyAlloc = @import("antfly_local_sources").api_local_write_contract.graphMetricGroupActionBodyAlloc;
+const applyGraphMetricActionToDb = @import("antfly_local_sources").api_local_table_writes.applyGraphMetricActionToDb;
 
-const runGraphMetricMaintenanceOrActionJsonAlloc = @import("local_table_writes.zig").runGraphMetricMaintenanceOrActionJsonAlloc;
+const runGraphMetricMaintenanceOrActionJsonAlloc = @import("antfly_local_sources").api_local_table_writes.runGraphMetricMaintenanceOrActionJsonAlloc;
 
 fn parseGraphMetricGroupActionStatusAlloc(
     alloc: std.mem.Allocator,
@@ -475,19 +475,19 @@ const http_server = @import("http_server.zig");
 const http_client = @import("http_client.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const asset_producer_runtime = @import("../asset_producer_runtime.zig");
-const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
-const document_extraction_mod = @import("../storage/db/enrichment/document_extraction.zig");
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const asset_producer_runtime = @import("antfly_local_sources").asset_producer_runtime;
+const asset_producer_mod = @import("antfly_local_sources").storage_db_enrichment_asset_producer;
+const document_extraction_mod = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
 const platform_time = @import("antfly_platform").time;
-const Io = @import("local_table_writes.zig").Io;
+const Io = @import("antfly_local_sources").api_local_table_writes.Io;
 
-const txn_id_nonce = @import("local_table_writes.zig").txn_id_nonce;
+const txn_id_nonce = @import("antfly_local_sources").api_local_table_writes.txn_id_nonce;
 
 const local_schema_json_key = physical_local_write.local_schema_json_key;
 const max_cached_write_tables = 64;
@@ -626,7 +626,7 @@ fn repairRestoredDbRuntimeStateUntilCompleteWithIo(
     });
 }
 
-const repairNativeRestoreProjectionsUntilCompleteWithIo = @import("local_table_writes.zig").repairNativeRestoreProjectionsUntilCompleteWithIo;
+const repairNativeRestoreProjectionsUntilCompleteWithIo = @import("antfly_local_sources").api_local_table_writes.repairNativeRestoreProjectionsUntilCompleteWithIo;
 
 const TestStartupCatchUpReplayPassHook = struct {
     ptr: *anyopaque,
@@ -1382,7 +1382,7 @@ pub const InitialChildRetirementObservation = struct {
     /// placement. It survives process restart and protects an AICH that has
     /// not yet been provisioned or is temporarily unreadable.
     initial_fk_root_generation: u64 = 0,
-    record: ?@import("../storage/db/relational_initial_child_publication.zig").Record = null,
+    record: ?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record = null,
 };
 
 pub const InitialChildRetirementReader = struct {
@@ -1424,7 +1424,7 @@ fn requireInitialChildRetirementRecordForPurpose(
 }
 
 fn testPrivateInitialChildRetirementProof() !void {
-    const Record = @import("../storage/db/relational_initial_child_publication.zig").Record;
+    const Record = @import("antfly_local_sources").storage_db_relational_initial_child_publication.Record;
     var record: Record = .{
         .phase = .hidden,
         .plan_id = @splat(1),
@@ -5120,7 +5120,7 @@ const TestEmbeddingRequest = struct {
     input: std.json.Value,
 };
 
-pub const TableWriteSource = @import("local_table_writes.zig").TableWriteSource;
+pub const TableWriteSource = @import("antfly_local_sources").api_local_table_writes.TableWriteSource;
 
 pub const DropCleanupContract = metadata_topology_protocol.DropCleanupContract;
 
@@ -5179,7 +5179,7 @@ const LegacyTableWriteSource = struct {
             table_name: []const u8,
             plan: backups_api.TableBackupPlan,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
-        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) anyerror!?[]u8 = null,
+        backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("antfly_local_sources").storage_db_native_backup_seal.Request, control: backups_api.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table_to_location: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -5446,11 +5446,11 @@ const LegacyTableWriteSource = struct {
         return try self.vtable.batch(self.ptr, alloc, table_name, req);
     }
 
-    pub fn topologyControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, command: @import("../storage/db/relational_integrity_topology.zig").Command) !void {
+    pub fn topologyControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, command: @import("antfly_local_sources").storage_db_relational_integrity_topology.Command) !void {
         _ = (try self.batch(alloc, table_name, .{ .relational_topology = command })) orelse return error.TableNotFound;
     }
 
-    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+    pub fn backupPinControl(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("antfly_local_sources").storage_db_native_backup_seal.Request, control: backups_api.BackupOperationControl) !?[]u8 {
         try control.ensureActive();
         const callback = self.vtable.backup_pin_control orelse return error.UnsupportedOperation;
         return callback(self.ptr, alloc, table_name, group_id, request, control);
@@ -5942,7 +5942,7 @@ pub const RaftBatcher = struct {
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
     pub const VTable = struct {
         batch_group: *const fn (
@@ -6148,7 +6148,7 @@ pub const RaftBatcher = struct {
     }
 };
 
-const ensurePreDecisionContextActive = @import("local_table_writes.zig").ensurePreDecisionContextActive;
+const ensurePreDecisionContextActive = @import("antfly_local_sources").api_local_table_writes.ensurePreDecisionContextActive;
 
 const DocumentChildRangeDispatchContext = struct {
     source: TableWriteSource,
@@ -6175,7 +6175,7 @@ const DocumentChildRangeDispatchContext = struct {
     }
 };
 
-pub const BoundTableWriteSource = @import("local_table_writes.zig").BoundTableWriteSource;
+pub const BoundTableWriteSource = @import("antfly_local_sources").api_local_table_writes.BoundTableWriteSource;
 
 pub const ProvisionedTableWriteSource = struct {
     pub const DroppedTableRecoveryStatus = struct {
@@ -6980,7 +6980,7 @@ pub const ProvisionedTableWriteSource = struct {
     storage_snapshot_source: ?storage_snapshot_source.Source = null,
     storage_maintenance_source: ?storage_maintenance_source.Source = null,
     seed_create_table_writers: bool = true,
-    group_visible_root_generation: ?@import("local_query_contract.zig").GroupVisibleRootGenerationSource = null,
+    group_visible_root_generation: ?@import("antfly_local_sources").api_local_query_contract.GroupVisibleRootGenerationSource = null,
     // Hosted control-plane owners capture a catalog target and route one exact
     // immutable activation to each resident group owner. Resident and
     // standalone owners leave this null and perform the bounded local DB step.
@@ -7474,7 +7474,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     pub fn withRestoreAccess(
         self: *ProvisionedTableWriteSource,
-        node_config: ?*const @import("../common/config.zig").Config,
+        node_config: ?*const @import("antfly_local_sources").common_config.Config,
         network_io: ?std.Io,
         filesystem_io: ?std.Io,
     ) *ProvisionedTableWriteSource {
@@ -13670,23 +13670,23 @@ pub const ProvisionedTableWriteSource = struct {
         );
     }
 
-    pub fn primeRestoreStagingWriter(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope) !void {
+    pub fn primeRestoreStagingWriter(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("antfly_local_sources").storage_db_restore_staging.Scope) !void {
         return self.primeRestoreStagingWriterMode(alloc, group_id, table, byte_range, scope, .none);
     }
 
     /// Authenticated HA may replay the final receipt after a restart. Verify
     /// its immutable terminal descriptor without reopening the reservation.
-    pub fn primeHotStandbyRestoreOwner(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope) !void {
+    pub fn primeHotStandbyRestoreOwner(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("antfly_local_sources").storage_db_restore_staging.Scope) !void {
         return self.primeRestoreStagingWriterMode(alloc, group_id, table, byte_range, scope, .hot_standby_replay);
     }
 
     /// Metadata has committed canceling this exact immutable plan. Recover an
     /// unacknowledged native cancellation without reopening its reservation.
-    pub fn primeRestoreStagingWriterForCancellation(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope) !void {
+    pub fn primeRestoreStagingWriterForCancellation(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("antfly_local_sources").storage_db_restore_staging.Scope) !void {
         return self.primeRestoreStagingWriterMode(alloc, group_id, table, byte_range, scope, .cancel_recovery);
     }
 
-    fn verifyRestoreReservation(db: *db_mod.DB, alloc: std.mem.Allocator, scope: @import("../storage/db/restore_staging.zig").Scope, terminal_admission: RestoreTerminalAdmission) !void {
+    fn verifyRestoreReservation(db: *db_mod.DB, alloc: std.mem.Allocator, scope: @import("antfly_local_sources").storage_db_restore_staging.Scope, terminal_admission: RestoreTerminalAdmission) !void {
         if (terminal_admission != .none) {
             if (try db.restoreStagingStatus(alloc)) |value| {
                 var status = value;
@@ -13698,7 +13698,7 @@ pub const ProvisionedTableWriteSource = struct {
         try db.reserveRestoreStagingScoped(alloc, scope);
     }
 
-    fn primeRestoreStagingWriterMode(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("../storage/db/restore_staging.zig").Scope, terminal_admission: RestoreTerminalAdmission) !void {
+    fn primeRestoreStagingWriterMode(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table: metadata_table_manager.TableRecord, byte_range: db_mod.types.ByteRange, scope: @import("antfly_local_sources").storage_db_restore_staging.Scope, terminal_admission: RestoreTerminalAdmission) !void {
         if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         try scope.validate();
         if (scope.target_namespace.table_id != table.table_id) return error.RestoreStagingScopeChanged;
@@ -14967,7 +14967,7 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 
-    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !@import("../storage/posting_refresh_progress.zig").Progress {
+    pub fn runDensePostingMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !@import("antfly_local_sources").storage_posting_refresh_progress.Progress {
         if (comptime control_only_storage_sources) {
             const maintenance_source = self.storage_maintenance_source orelse return .{};
             return try maintenance_source.runDensePostingRound();
@@ -14979,7 +14979,7 @@ pub const ProvisionedTableWriteSource = struct {
             for (leases.items) |*lease| lease.deinit(lease_alloc);
             leases.deinit(lease_alloc);
         }
-        var total: @import("../storage/posting_refresh_progress.zig").Progress = .{};
+        var total: @import("antfly_local_sources").storage_posting_refresh_progress.Progress = .{};
         {
             defer self.local_db_mutex.unlock();
             const cache = self.write_cache orelse return .{};
@@ -21467,7 +21467,7 @@ pub const ProvisionedTableWriteSource = struct {
         return try self.batchWithVisibilityCancellation(alloc, table_name, req, .none);
     }
 
-    fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("operation.zig").RequestContext) !void {
+    fn activateRangeTracking(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         const batcher = self.raft_batcher;
@@ -21510,7 +21510,7 @@ pub const ProvisionedTableWriteSource = struct {
         // Capability activation is an explicit owner-routed command, never an
         // empty ordinary batch whose grouping could silently discard it.
         if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
-        try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+        try @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(req);
         const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else if (req.relational_generation_gc) |page| page.owner_group_id else null;
         if (control_group) |group_id| {
             try enforceReplicationWriteGateOptional(self.replication_write_gate);
@@ -21633,7 +21633,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.endRestoreLifecycleActivity(table_name);
     }
 
-    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("antfly_local_sources").storage_db_native_backup_seal.Request, control: backups_api.BackupOperationControl) !?[]u8 {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try control.ensureActive();
         if (comptime control_only_storage_sources) {
@@ -21715,12 +21715,12 @@ pub const ProvisionedTableWriteSource = struct {
                     true,
                 );
                 defer cached.deinit(alloc);
-                return try exportPortableBackupShardWithSeal(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
+                return try exportPortableBackupShardWithSeal(alloc, cached.db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
             }
 
             var db = try openManagedDbForTableGroupWithRuntimeAndHotStandbyWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.replication_write_gate, self.hot_standby_async_mirror);
             defer db.close();
-            return try exportPortableBackupShardWithSeal(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("backup_contract.zig").sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
+            return try exportPortableBackupShardWithSeal(alloc, &db, plan.backup_root, plan.backup_id, group_id, plan.io, try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(plan.sealed_handles, group_id), plan.cancellation);
         }
 
         if (self.write_cache) |cache| {
@@ -23071,7 +23071,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     /// HA replay may reach an unpublished owner without any public routing
     /// entry. Its checksummed bootstrap survives cache eviction and restart.
-    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging.zig").OwnerBootstrap) {
+    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("antfly_local_sources").storage_db_restore_staging.OwnerBootstrap) {
         if (comptime control_only_storage_sources) return error.StorageKernelOwnerUnavailable;
         var resident: ?ProvisionedTableWriteCache.CachedDb = null;
         lockAtomic(&self.local_db_mutex);
@@ -23556,7 +23556,7 @@ pub const ProvisionedTableWriteSource = struct {
         return txnStatusGroupLocalOrdinary(ptr, alloc, group_id, table_name, txn_id);
     }
 
-    fn txnStatusGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("operation.zig").RequestContext) !?db_mod.types.TxnStatus {
+    fn txnStatusGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !?db_mod.types.TxnStatus {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
         return owner.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, context);
@@ -24917,7 +24917,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
-    group_visible_root_generation: ?@import("local_query_contract.zig").GroupVisibleRootGenerationSource = null,
+    group_visible_root_generation: ?@import("antfly_local_sources").api_local_query_contract.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     internal_service_secret: ?[]const u8 = null,
@@ -25945,7 +25945,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (req.activate_range_tracking) return error.SqlRangeTrackingRequired;
-        try @import("../storage/db/online_source_contract.zig").validateRequest(req);
+        try @import("antfly_local_sources").storage_db_online_source_contract.validateRequest(req);
         const control_group: ?u64 = if (req.online_source) |command| command.scope().fence.owner_group_id else if (req.relational_topology) |command| command.fence.owner_group_id else if (req.relational_generation_gc) |page| page.owner_group_id else null;
         if (control_group) |group_id| {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.GroupLeaderUnavailable;
@@ -26204,7 +26204,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         );
     }
 
-    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) !?[]u8 {
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("antfly_local_sources").storage_db_native_backup_seal.Request, control: backups_api.BackupOperationControl) !?[]u8 {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var route: table_router.GroupRoute = if (control.owner_local_only) .local else if (control.capture_node_id) |node_id|
             try self.exactBackupNodeRoute(alloc, group_id, node_id)
@@ -26260,7 +26260,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !backups_api.ShardSnapshot {
         try control.ensureActive();
         const group_id = range.group_id;
-        var exact_route: ?table_router.GroupRoute = if (try @import("backup_contract.zig").sealedHandleForGroup(control.sealed_handles, group_id)) |sealed|
+        var exact_route: ?table_router.GroupRoute = if (try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(control.sealed_handles, group_id)) |sealed|
             try self.exactBackupNodeRoute(alloc, group_id, sealed.source_node_id)
         else
             null;
@@ -26314,7 +26314,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         fence: backups_api.TableBackupFence,
         control: backups_api.BackupOperationControl,
     ) !backups_api.ShardSnapshot {
-        if (try @import("backup_contract.zig").sealedHandleForGroup(control.sealed_handles, range.group_id)) |sealed| {
+        if (try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(control.sealed_handles, range.group_id)) |sealed| {
             var route = try self.exactBackupNodeRoute(alloc, range.group_id, sealed.source_node_id);
             defer route.deinit(alloc);
             return self.fetchHostedBackupRangeFromRoute(alloc, route, range, table_name, body, fence, control);
@@ -26363,7 +26363,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 alloc.free(exact);
             }
             for (group_ids, exact) |group_id, *route| {
-                const receipt = (try @import("backup_contract.zig").sealedHandleForGroup(control.sealed_handles, group_id)) orelse return error.BackupCohortChanged;
+                const receipt = (try @import("antfly_local_sources").api_backup_contract.sealedHandleForGroup(control.sealed_handles, group_id)) orelse return error.BackupCohortChanged;
                 route.* = try self.exactBackupNodeRoute(alloc, group_id, receipt.source_node_id);
                 ready += 1;
             }
@@ -26732,7 +26732,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return txnStatusGroupLocalOrdinary(ptr, alloc, group_id, table_name, txn_id);
     }
 
-    fn txnStatusGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("operation.zig").RequestContext) !?db_mod.types.TxnStatus {
+    fn txnStatusGroupLocalWithRequest(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: distributed_txn.TxnStatusRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !?db_mod.types.TxnStatus {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const owner = self.groupLocalWriteSource() orelse return error.StorageKernelOwnerUnavailable;
         return owner.txnStatusGroupLocalWithRequest(alloc, group_id, table_name, req, context);
@@ -27676,15 +27676,15 @@ const applyReplicatedTransactionMutationInternal = @import("../storage/server_tr
 
 const batchWritesAsTransactionWrites = physical_local_write.batchWritesAsTransactionWrites;
 
-const parseIndexKind = @import("local_table_writes.zig").parseIndexKind;
+const parseIndexKind = @import("antfly_local_sources").api_local_table_writes.parseIndexKind;
 
-const parseIndexConfig = @import("local_table_writes.zig").parseIndexConfig;
+const parseIndexConfig = @import("antfly_local_sources").api_local_table_writes.parseIndexConfig;
 
 const parseIndexConfigWithOptions = table_index_config.parseIndexConfigWithOptions;
 pub const validateIndexConfig = table_index_config.validateIndexConfig;
 pub const validateIndexConfigWithOptions = table_index_config.validateIndexConfigWithOptions;
 pub const validateGraphIndexesJson = table_index_config.validateGraphIndexesJson;
-const extractIndexConfigJson = @import("local_table_writes.zig").extractIndexConfigJson;
+const extractIndexConfigJson = @import("antfly_local_sources").api_local_table_writes.extractIndexConfigJson;
 
 const extractIndexConfigJsonWithOptions = table_index_config.extractIndexConfigJsonWithOptions;
 pub const normalizeManagedEmbeddingIndexDimensionJsonWithOptions = table_index_config.normalizeManagedEmbeddingIndexDimensionJsonWithOptions;
@@ -27696,9 +27696,9 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
-const nextTxnTimestamp = @import("local_table_writes.zig").nextTxnTimestamp;
+const nextTxnTimestamp = @import("antfly_local_sources").api_local_table_writes.nextTxnTimestamp;
 
-const nextTxnId = @import("local_table_writes.zig").nextTxnId;
+const nextTxnId = @import("antfly_local_sources").api_local_table_writes.nextTxnId;
 
 fn commitStatelessBatchWithRetries(
     source: anytype,
@@ -27766,7 +27766,7 @@ fn statelessBatchRetryDelayNs(attempt: u8) u64 {
     return stateless_batch_retry_base_ns << @intCast(attempt);
 }
 
-const boundConflict = @import("local_table_writes.zig").boundConflict;
+const boundConflict = @import("antfly_local_sources").api_local_table_writes.boundConflict;
 
 fn openManagedDbForTable(
     alloc: std.mem.Allocator,
@@ -28143,7 +28143,7 @@ fn putArtifactEnrichmentInDb(
     _ = try db.upsertEnrichment(parsed.value);
 }
 
-const deleteArtifactEnrichmentFromDbByName = @import("local_table_writes.zig").deleteArtifactEnrichmentFromDbByName;
+const deleteArtifactEnrichmentFromDbByName = @import("antfly_local_sources").api_local_table_writes.deleteArtifactEnrichmentFromDbByName;
 
 fn recordLocalIndexCreateRepairDebt(
     alloc: std.mem.Allocator,
@@ -28897,7 +28897,7 @@ fn seedManagedIndexReplayFromStoredDocsIfNeeded(
     return true;
 }
 
-pub const corruptEmbeddingArtifactInDb = @import("local_table_writes.zig").corruptEmbeddingArtifactInDb;
+pub const corruptEmbeddingArtifactInDb = @import("antfly_local_sources").api_local_table_writes.corruptEmbeddingArtifactInDb;
 
 fn snapshotLocalTableRuntimeStatusesUncached(
     alloc: std.mem.Allocator,
@@ -31669,7 +31669,7 @@ fn lockAtomic(mutex: anytype) void {
     platform_sync.lockYielding(atomic_mutex);
 }
 
-const loadLocalTableSchemaJson = @import("local_table_writes.zig").loadLocalTableSchemaJson;
+const loadLocalTableSchemaJson = @import("antfly_local_sources").api_local_table_writes.loadLocalTableSchemaJson;
 
 fn validateTableWritesAgainstLocalSchema(
     alloc: std.mem.Allocator,
@@ -31690,7 +31690,7 @@ const freeOwnedBatchWrites = physical_local_write.freeOwnedBatchWrites;
 
 const SchemaValidationWriteState = physical_local_write.SchemaValidationWriteState;
 
-const portableBackupShardRelPath = @import("local_table_writes.zig").portableBackupShardRelPath;
+const portableBackupShardRelPath = @import("antfly_local_sources").api_local_table_writes.portableBackupShardRelPath;
 
 const exportPortableBackupShard = physical_local_write.exportPortableBackupShard;
 
@@ -31699,7 +31699,7 @@ const exportPortableBackupShard = physical_local_write.exportPortableBackupShard
 /// in distributed control; the storage unit owns DB snapshot/export work.
 const NativeBackupShardSnapshot = physical_local_write.NativeBackupShardSnapshot;
 
-const deleteLocalNativeSnapshot = @import("local_table_writes.zig").deleteLocalNativeSnapshot;
+const deleteLocalNativeSnapshot = @import("antfly_local_sources").api_local_table_writes.deleteLocalNativeSnapshot;
 
 const prepareNativeBackupShardSnapshot = physical_local_write.prepareNativeBackupShardSnapshot;
 
@@ -31709,10 +31709,10 @@ pub const backupStorageKernelOwnerDb = physical_local_write.backupStorageKernelO
 
 pub const freeStorageKernelBackupShards = local_write_contract.freeStorageKernelBackupShards;
 
-const exportPortableBackupFile = @import("local_table_writes.zig").exportPortableBackupFile;
+const exportPortableBackupFile = @import("antfly_local_sources").api_local_table_writes.exportPortableBackupFile;
 
 const exportPortableBackupFileWithIo = physical_local_write.exportPortableBackupFileWithIo;
-const exportPortableBackupFileWithSource = @import("local_table_writes.zig").exportPortableBackupFileWithSource;
+const exportPortableBackupFileWithSource = @import("antfly_local_sources").api_local_table_writes.exportPortableBackupFileWithSource;
 
 fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -31736,16 +31736,16 @@ fn importPortableBackupFileWithIo(alloc: std.mem.Allocator, store: *db_mod.docst
     return importPortableBackupFileWithOptions(alloc, store, path, io, .{});
 }
 
-const importPortableBackupFileWithOptions = @import("local_table_writes.zig").importPortableBackupFileWithOptions;
+const importPortableBackupFileWithOptions = @import("antfly_local_sources").api_local_table_writes.importPortableBackupFileWithOptions;
 
 const freeBackupShards = local_write_contract.freeBackupShards;
 
 pub fn cloneAcceptedGenerationSummary(
     alloc: std.mem.Allocator,
-    entries: []const @import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry,
-) ![]const @import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry {
+    entries: []const @import("antfly_local_sources").api_backup_contract.SourceGenerationAdmissionSummaryEntry,
+) ![]const @import("antfly_local_sources").api_backup_contract.SourceGenerationAdmissionSummaryEntry {
     if (entries.len == 0) return &.{};
-    const out = try alloc.alloc(@import("backup_contract.zig").SourceGenerationAdmissionSummaryEntry, entries.len);
+    const out = try alloc.alloc(@import("antfly_local_sources").api_backup_contract.SourceGenerationAdmissionSummaryEntry, entries.len);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |entry| {
@@ -31810,19 +31810,19 @@ fn cloneShardSnapshots(
 
 const resolveWritesForSchemaValidation = physical_local_write.resolveWritesForSchemaValidation;
 
-const transactionWritesToBatchWrites = @import("local_table_writes.zig").transactionWritesToBatchWrites;
+const transactionWritesToBatchWrites = @import("antfly_local_sources").api_local_table_writes.transactionWritesToBatchWrites;
 
-const transactionWritesAsBatchWrites = @import("local_table_writes.zig").transactionWritesAsBatchWrites;
+const transactionWritesAsBatchWrites = @import("antfly_local_sources").api_local_table_writes.transactionWritesAsBatchWrites;
 
-const validateTableBatchAgainstLocalSchema = @import("local_table_writes.zig").validateTableBatchAgainstLocalSchema;
+const validateTableBatchAgainstLocalSchema = @import("antfly_local_sources").api_local_table_writes.validateTableBatchAgainstLocalSchema;
 
-pub const transactionUsesDurableContract = @import("local_table_writes.zig").transactionUsesDurableContract;
+pub const transactionUsesDurableContract = @import("antfly_local_sources").api_local_table_writes.transactionUsesDurableContract;
 
 pub const batchUsesDurableTransactionContract = physical_local_write.batchUsesDurableTransactionContract;
 
-const validateTransactionAgainstLocalSchema = @import("local_table_writes.zig").validateTransactionAgainstLocalSchema;
+const validateTransactionAgainstLocalSchema = @import("antfly_local_sources").api_local_table_writes.validateTransactionAgainstLocalSchema;
 
-pub const applyLocalTableSchemaJson = @import("local_table_writes.zig").applyLocalTableSchemaJson;
+pub const applyLocalTableSchemaJson = @import("antfly_local_sources").api_local_table_writes.applyLocalTableSchemaJson;
 
 pub const configureStorageKernelOwnerDb = physical_local_write.configureStorageKernelOwnerDb;
 
@@ -33527,7 +33527,7 @@ fn consumerTests() type {
             for ([_]@import("../storage/server_transaction_recovery.zig").Config{ provisioned.serverTransactionRecoveryConfig(), hosted.serverTransactionRecoveryConfig() }) |config| {
                 vopr_io.realtime_ns = now_ns;
                 try std.testing.expect(config.enabled);
-                var backend = @import("../storage/mem_backend.zig").Backend.init(alloc, .{});
+                var backend = @import("antfly_local_sources").storage_mem_backend.Backend.init(alloc, .{});
                 defer backend.close();
                 var store = try backend.runtimeStore(alloc, .{ .name = "recovery-clock" });
                 defer store.deinit();
@@ -37115,7 +37115,7 @@ fn consumerTests() type {
                 fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
                     return error.UnexpectedBatch;
                 }
-                fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) !?@import("table_write_source.zig").LocalStructuralReconcileResult {
+                fn reconcile(_: *anyopaque, _: u64, _: []const u8, _: ?[]const u8, _: bool) !?@import("antfly_local_sources").api_table_write_source.LocalStructuralReconcileResult {
                     return .{ .state = .complete };
                 }
             };
@@ -39668,7 +39668,7 @@ fn consumerTests() type {
                 routed_requests: usize = 0,
                 legacy_requests: usize = 0,
                 saw_route_fence: bool = false,
-                expected_topology: ?@import("../storage/db/relational_integrity_topology_contract.zig").Command = null,
+                expected_topology: ?@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Command = null,
 
                 fn iface(self: *@This()) http_common.RequestExecutor {
                     return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -39761,7 +39761,7 @@ fn consumerTests() type {
             // complete binary fence is the authority at the routed receiver.
             // Exercise the actual hosted remote dispatch for backup freeze and
             // both successful and canceled cleanup paths.
-            const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+            const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
             const fence: topology.Fence = .{
                 .transition_id = std.math.maxInt(u64),
                 .attempt = 1,
@@ -39971,9 +39971,9 @@ fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
         test "writer cache distinguishes borrowed publisher callbacks and synchronization" {
-            const contract = @import("../storage/db/replication_contract.zig");
-            const outbox = @import("../storage/db/durable_outbox.zig");
-            const Namespace = @import("../storage/db/doc_identity_namespace.zig").Namespace;
+            const contract = @import("antfly_local_sources").storage_db_replication_contract;
+            const outbox = @import("antfly_local_sources").storage_db_durable_outbox;
+            const Namespace = @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace;
             const Stub = struct {
                 fn next(_: *anyopaque) u64 {
                     return 0;
@@ -40038,7 +40038,7 @@ fn implementationTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table);
                     try std.testing.expect(req.activate_range_tracking);
-                    try @import("../storage/range_protection.zig").validateRequest(req);
+                    try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
                     self.calls += 1;
                     self.group_id = fence.route.group_id;
                 }
@@ -40047,7 +40047,7 @@ fn implementationTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table);
                     try std.testing.expect(req.activate_range_tracking);
-                    try @import("../storage/range_protection.zig").validateRequest(req);
+                    try @import("antfly_local_sources").storage_range_protection.validateRequest(req);
                     self.local_calls += 1;
                     self.group_id = group_id;
                     return {};
@@ -40102,7 +40102,7 @@ fn implementationTests() type {
             const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "hidden", .schema_json = "", .indexes_json = "{\"text\":{\"type\":\"full_text\"},\"enrichments\":[{\"name\":\"disabled_provider\",\"kind\":\"embedding\",\"field\":\"text\",\"expected_dims\":384}]}" };
             const encoded_schema = try storage_schema.serializeSchema(alloc, .{});
             defer alloc.free(encoded_schema);
-            const scope: @import("../storage/db/restore_staging.zig").Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = namespace, .target_schema_digest = @import("../storage/db/restore_staging.zig").digest(encoded_schema) };
+            const scope: @import("antfly_local_sources").storage_db_restore_staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = namespace, .target_schema_digest = @import("antfly_local_sources").storage_db_restore_staging.digest(encoded_schema) };
             try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
             try source.primeRestoreStagingWriter(alloc, 7001, table, .{ .start = "a", .end = "z" }, scope);
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, root, 7001);
@@ -40156,13 +40156,13 @@ fn implementationTests() type {
             const previous = "{\"version\":0,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"text\"]}}}}}}";
             const active = "{\"version\":1,\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"x-antfly-types\":[\"keyword\"]}}}}}}";
             const table: metadata_table_manager.TableRecord = .{ .table_id = 99, .name = "migrating", .schema_json = active, .read_schema_json = previous, .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"full_text_index_v1\":{\"type\":\"full_text\"}}" };
-            var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, active);
+            var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, active);
             defer parsed.deinit(alloc);
-            const schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
+            const schema = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(alloc, parsed);
             defer storage_schema.freeSchema(alloc, schema);
             const encoded = try storage_schema.serializeSchema(alloc, schema);
             defer alloc.free(encoded);
-            const staging = @import("../storage/db/restore_staging.zig");
+            const staging = @import("antfly_local_sources").storage_db_restore_staging;
             const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 1, .range_id = 1 }, .target_namespace = .{ .table_id = 99, .shard_id = 7001, .range_id = 7001 }, .target_schema_digest = staging.digest(encoded) };
             const input_path = try std.fs.path.join(alloc, &.{ root, "input" });
             defer alloc.free(input_path);
@@ -54739,8 +54739,8 @@ fn implementationTests() type {
         }
 
         test "provisioned table read source survives many external write-sync batches before first profiled dense query" {
-            var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-            defer std.debug.assert(allocator_state.deinit() == .ok);
+            var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+            defer std.debug.assert(allocator_state.deinit() == 0);
             const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
             const total_docs: usize = 50_000;
             const batch_size: usize = 250;
@@ -62394,7 +62394,7 @@ comptime {
     }
 }
 
-pub fn reclaimBackupPinAtGroup(alloc: std.mem.Allocator, runtime: ?*db_mod.background_runtime.BackendRuntime, replica_root: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal.zig").Request, control: backups_api.BackupOperationControl) ![]u8 {
+pub fn reclaimBackupPinAtGroup(alloc: std.mem.Allocator, runtime: ?*db_mod.background_runtime.BackendRuntime, replica_root: []const u8, group_id: u64, request: @import("antfly_local_sources").storage_db_native_backup_seal.Request, control: backups_api.BackupOperationControl) ![]u8 {
     try control.ensureActive();
     const fence = switch (request) {
         .seal => return error.InvalidBackupFence,
@@ -62405,12 +62405,12 @@ pub fn reclaimBackupPinAtGroup(alloc: std.mem.Allocator, runtime: ?*db_mod.backg
     const io = (runtime orelse return error.BackendRuntimeIoUnavailable).filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root, group_id);
     defer alloc.free(path);
-    try @import("../storage/db/native_backup_seal.zig").reclaim(alloc, io, path, request, control.token());
+    try @import("antfly_local_sources").storage_db_native_backup_seal.reclaim(alloc, io, path, request, control.token());
     return try alloc.dupe(u8, "{}");
 }
 
-pub const executeBackupPinControl = @import("../storage/db/backup_pin_control.zig").execute;
+pub const executeBackupPinControl = @import("antfly_local_sources").storage_db_backup_pin_control.execute;
 
 pub const RestoreTerminalAdmission = local_write_contract.RestoreTerminalAdmission;
 
-pub const exportPortableBackupShardWithSeal = @import("local_table_writes.zig").exportPortableBackupShardWithSeal;
+pub const exportPortableBackupShardWithSeal = @import("antfly_local_sources").api_local_table_writes.exportPortableBackupShardWithSeal;

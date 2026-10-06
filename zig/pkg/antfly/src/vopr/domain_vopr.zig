@@ -9,11 +9,11 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const backend_erased = @import("../storage/backend_erased.zig");
-const mem_backend = @import("../storage/mem_backend.zig");
-const transactions = @import("../storage/transactions.zig");
-const tracing = @import("../tracing/antfly_trace_writer.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const transactions = @import("antfly_local_sources").storage_transactions;
+const tracing = @import("antfly_local_sources").tracing_antfly_trace_writer;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
 const backup_manifest = @import("../storage/hot_standby/backup_manifest.zig");
 

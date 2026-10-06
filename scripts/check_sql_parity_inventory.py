@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "zig/pkg/antfly/src/sql/fixtures"
+FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
 INVENTORY_HASH = "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173"
 SOURCE_HASH = "52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6"
 SOURCE_COMMIT = "79644dfa1605e8da0f486d021d1c1393577d6265"

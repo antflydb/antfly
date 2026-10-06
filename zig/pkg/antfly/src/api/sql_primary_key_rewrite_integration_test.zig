@@ -133,7 +133,7 @@ fn waitForDonorRoute(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_r
                     if (observed) |value_response| {
                         var response = value_response;
                         defer response.deinit(alloc);
-                        const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace };
+                        const Identity = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace };
                         var identity = try std.json.parseFromSlice(Identity, alloc, response.json, .{ .ignore_unknown_fields = true });
                         defer identity.deinit();
                         if (identity.value.namespace.table_id == table_id and identity.value.namespace.shard_id == metadata_table_manager.rangeDocIdentityShardId(range) and identity.value.namespace.range_id == metadata_table_manager.rangeDocIdentityRangeId(range)) return;

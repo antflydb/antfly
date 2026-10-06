@@ -15,7 +15,7 @@
 
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Elastic-2.0
-"""Audit the local engine's authored production imports, before its package move.
+"""Audit the local engine's authored production imports and resolved owners.
 
 The default check follows authored relative imports. Build targets additionally
 pass their actual named module tables, resolving each import in its source owner.
@@ -36,7 +36,7 @@ LITERALS = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|(?m:^[ \t]*\\\\[^\n]*)'
 )
 IMPORT = re.compile(r'@import\s*\(\s*"([^"\n]+)"\s*\)')
-FORBIDDEN = ("raft/", "data/", "standalone/", "cmd/", "storage/hot_standby/")
+FORBIDDEN = ("raft/", "data/", "standalone/", "storage/hot_standby/")
 SERVER_METADATA = {
     "api.zig",
     "server.zig",
@@ -384,6 +384,7 @@ def audit_modules(
     """Resolve source imports against the actual target's Build.Module table."""
     project = project.resolve()
     source_root = project / "pkg/antfly/src"
+    local_root = project / "pkg/antfly-embedded/src/local"
     external_modules = external_modules or set()
     unknown = external_modules.difference(modules)
     if unknown:
@@ -400,16 +401,14 @@ def audit_modules(
         if (module, path) in visited:
             continue
         visited.add((module, path))
-        if path.is_relative_to(source_root) and server_source(
-            path.relative_to(source_root).as_posix()
-        ):
+        if path.is_relative_to(source_root):
             raise ValueError(
                 "embedded module imports server coordination: "
                 + " -> ".join(chain + [str(path)])
             )
-        if path.is_relative_to(source_root):
+        if path.is_relative_to(local_root):
             check_replication_contract(
-                path.relative_to(source_root).as_posix(), path.read_text()
+                path.relative_to(local_root).as_posix(), path.read_text()
             )
         # Exempt only dependency-owned modules declared by the build, never
         # Antfly-generated sources merely because their cache is external.
@@ -467,7 +466,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "pkg/antfly/src",
+        default=Path(__file__).resolve().parents[1] / "pkg/antfly-embedded/src/local",
     )
     parser.add_argument("--entry", action="append")
     parser.add_argument("--json", type=Path)

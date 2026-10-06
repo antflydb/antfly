@@ -17,15 +17,16 @@ behavior changes belong to #893.
 - `zig/pkg/antfly-server-api` owns generated server routers and extractors;
   shared generated types live in embedded. Authored schemas stay in
   `specs/openapi`, with the generator importing shared type modules.
-- Local API helpers and catalog/index reconciliation contracts remain under
-  `zig/pkg/antfly` until the local database owner can move as a complete unit.
-  Server replica catalogs, provisioning summaries, and coordination remain
-  with the server.
+- Local DB, API helpers, catalog/index reconciliation and portable lake execution
+  live under `zig/pkg/antfly-embedded/src/local`. Native embedded lake querying
+  includes Parquet/Iceberg readers and shared SQL cursors; server credential
+  resolution and distributed publication are adapters. Server replica catalogs,
+  provisioning DTOs and coordination remain with `zig/pkg/antfly`.
 
 ## Database and hot standby contracts
 
-`storage/db` owns apply receipts, durable outbox storage, replication policy
-values, effect codecs, and publication sequencing. Borrowed publisher and
+`storage/db` owns apply receipts, durable outbox storage, adapter-declared local
+commit requirements, effect codecs, and publication sequencing. Borrowed publisher and
 write-gate interfaces keep concrete hot standby runtimes outside DB production code.
 `storage/hot_standby` supplies the primary, standby, fencing, policy/metrics,
 and synchronous wait adapters. These interfaces preserve durable frame formats
@@ -100,12 +101,13 @@ dependency-owned modules using their owning builder, and the audit retains
 their declared imports back into Antfly sources.
 
 `python3 zig/tools/check_embedded_isolated_build.py` stages the working source
-inputs with server coordination and private C API implementations replaced
-by unconditional compile-time traps, then compiles the
-public C API and complete WASM artifact and checks their module graphs. It runs
+inputs with the entire server package omitted, then builds the native lake
+suite, file CLI, public C API and complete WASM artifact and checks their module
+graphs. It runs
 in `zig-full / x86_64` on main merges/full validation, not as a new per-PR gate.
-The traps satisfy Zig’s cache scans of dormant test imports; any live server
-import fails compilation and the module audit independently rejects its owner.
+No server stubs or copied implementations satisfy dormant imports. A live
+server import fails compilation and the module audit independently rejects its
+owner. Authored roots unused by the selected products remain lazy build inputs.
 
 Local index reconciliation has its own result summary; server provisioning
 keeps group/root counts separately. Local range observation limits and catalog
@@ -222,18 +224,50 @@ The authored and resolved native/WASM boundary checks cover these owners. Their
 existing ELv2 headers are preserved until the licensing PR applies the Apache
 classification to the full embedded source closure.
 
-## Remaining separation
+## Physical separation
 
-The physical DB and its complete local source closure must still move into
-`antfly-embedded`. This physical move is deferred to keep this refactor from
-widening its merge-conflict surface. The local source owner now uses shared APIs directly rather
-than server facades. Public C API and private server operation ownership are now separate. Keep
-the isolated native/WASM checks passing throughout the physical package move.
-The licensing PR applies Apache classification to the local source closure;
-this structural PR preserves existing source licenses.
+The DB and its complete local dependency closure now live under
+`zig/pkg/antfly-embedded/src/local`. The logical `storage/db/` paths above refer
+to that owner. The execution resources, mutation families, retained reads, and
+maintenance owners extracted in #969 move together with their local consumers.
+Server upload recovery scheduling, TTL routing, query visibility routing,
+child-range destination selection, and group metadata remain under
+`zig/pkg/antfly/src/storage` and consume local contracts through the private
+source catalog. Public C API and private server operation ownership are separate.
+
+The isolated product build omits the entire server package and builds Lite,
+the public C API, native lake tests, and WASM. The licensing PR still applies Apache classification
+to the local source closure; this structural PR preserves existing licenses.
 
 ## Review and merge order
 
-Merge this refactor into main first. The licensing PR applies its Apache
-boundary, packaging, and release changes on top. Its source moves and DB
-refactors should then disappear from its diff against main.
+The local-contract extraction (#969) is merged into main. Merge the physical
+separation (#953) next, before the licensing PR (#893), which applies its Apache
+boundary, packaging, and release changes on top. The source moves and DB
+refactors should then disappear from the licensing PR's diff against main.
+
+### Native lake capability and Zig 0.17 reconciliation
+
+The source split intentionally includes local lake analytics. The authoritative
+ownership and current API limitations are recorded in
+[embedded source ownership](../design/embedded-source-ownership.md). Portable
+Parquet/Iceberg execution and SQL cursors share one embedded owner with server
+consumers; node credential resolution and distributed publication are adapters.
+Provisioning DTOs stay server-owned. The independent `embedded-lake-test` target
+exercises this capability without the server source tree. Zig 0.17 migration
+changes must apply to the extracted build composition, source-owner partition
+collection, native C API, file CLI and browser build, not just server targets.
+
+### Public lake composition and shared AWS authentication
+
+Native package composition now uses the same dependency owner as C API and
+reader tests. The public-package consumer target opens a host-resolved source,
+scans through the SQL cursor and compiles SQL; it is part of isolated product
+validation and the ordinary unit aggregate. The public package is also audited
+by the native source-boundary check.
+
+Generic AWS credential sources, discovery, deadline propagation and cache leases
+live in `lib/credentials/src/aws.zig`. Lake, backups and Bedrock use that shared
+owner. Native credential regressions run in the unit aggregate. Existing source
+licenses remain preserved, including the explicit ELv2 exception for the extracted
+AWS implementation; #893 must include it in the Apache license audit.

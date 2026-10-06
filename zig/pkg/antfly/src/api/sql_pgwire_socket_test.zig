@@ -2,8 +2,8 @@
 // Actual TCP clients driving the native adapter supplied by the storage fixture.
 const std = @import("std");
 const http = @import("http_server.zig");
-const admission = @import("../common/request_admission.zig").RequestAdmission;
-const resources = @import("../storage/resource_manager.zig");
+const admission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
+const resources = @import("antfly_local_sources").storage_resource_manager;
 const io = std.testing.io;
 const alloc = std.testing.allocator;
 

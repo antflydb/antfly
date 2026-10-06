@@ -68,6 +68,8 @@ def write_release_archive(
     (stage / "include" / "antfly.h").write_text("/* antfly header */\n")
     lib_name = "libantfly.dylib" if os_name == "Darwin" else "libantfly.so"
     (stage / "lib" / lib_name).write_text("antfly library\n")
+    if os_name == "Darwin":
+        (stage / "lib" / "libantfly-apple.dylib").write_bytes(b"apple bridge")
     (stage / "share" / "antfly" / "asset.txt").write_text("asset\n")
     for shell in ("bash", "zsh", "fish"):
         (stage / "completions" / f"antfly.{shell}").write_text(f"{shell} completion\n")
@@ -716,75 +718,116 @@ class CAbiPackagingTests(unittest.TestCase):
             self.assertEqual(len(log.read_text().splitlines()), 1)
 
     def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            repo = root / "repo"
-            extracted = root / "extracted"
-            out = root / "out"
-            archive_dir = root / "archives"
-            archive_dir.mkdir()
+        for platform in [
+            next(p for p in package_cli_release.PLATFORMS if p.release_os == "Darwin"),
+            package_cli_release.PLATFORMS[1],
+        ]:
+            with self.subTest(platform=platform.key):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    repo = root / "repo"
+                    extracted = root / "extracted"
+                    out = root / "out"
+                    archive_dir = root / "archives"
+                    archive_dir.mkdir()
 
-            platform = package_cli_release.PLATFORMS[1]
-            write_release_archive(
-                archive_dir,
-                "1.2.3",
-                platform.release_os,
-                platform.release_arch,
-                platform.release_variant,
-            )
+                    write_release_archive(
+                        archive_dir,
+                        "1.2.3",
+                        platform.release_os,
+                        platform.release_arch,
+                        platform.release_variant,
+                    )
 
-            package_dir = repo / "ts" / "packages" / platform.npm_package_dir
-            package_dir.mkdir(parents=True)
-            (package_dir / "package.json").write_text(
-                json.dumps(
-                    {
-                        "name": f"@antfly/{platform.npm_package_dir}",
-                        "version": "0.0.0",
-                        "files": ["bin", "include", "lib", "share", "README.md"],
-                        "libc": [platform.npm_libc],
-                    }
-                )
-                + "\n"
-            )
-            (repo / "zig" / "pkg" / "antfly" / "antfarm").mkdir(parents=True)
-            (repo / "zig" / "pkg" / "antfly" / "antfarm" / "index.html").write_text(
-                "antfarm\n"
-            )
-            (repo / "py" / "packages" / "cli" / "src" / "antfly_cli").mkdir(
-                parents=True
-            )
-            (
-                repo / "py" / "packages" / "cli" / "src" / "antfly_cli" / "__init__.py"
-            ).write_text("def main(): return 0\n")
-            (repo / "py" / "packages" / "cli" / "pyproject.toml").write_text(
-                '[project]\nname = "antfly-cli"\nrequires-python = ">=3.11"\n'
-            )
+                    package_dir = repo / "ts" / "packages" / platform.npm_package_dir
+                    package_dir.mkdir(parents=True)
+                    (package_dir / "package.json").write_text(
+                        json.dumps(
+                            {
+                                "name": f"@antfly/{platform.npm_package_dir}",
+                                "version": "0.0.0",
+                                "files": [
+                                    "bin",
+                                    "include",
+                                    "lib",
+                                    "share",
+                                    "README.md",
+                                ],
+                                "libc": (
+                                    [platform.npm_libc] if platform.npm_libc else None
+                                ),
+                            }
+                        )
+                        + "\n"
+                    )
+                    (repo / "zig" / "pkg" / "antfly" / "antfarm").mkdir(parents=True)
+                    (
+                        repo / "zig" / "pkg" / "antfly" / "antfarm" / "index.html"
+                    ).write_text("antfarm\n")
+                    (repo / "py" / "packages" / "cli" / "src" / "antfly_cli").mkdir(
+                        parents=True
+                    )
+                    (
+                        repo
+                        / "py"
+                        / "packages"
+                        / "cli"
+                        / "src"
+                        / "antfly_cli"
+                        / "__init__.py"
+                    ).write_text("def main(): return 0\n")
+                    (repo / "py" / "packages" / "cli" / "pyproject.toml").write_text(
+                        '[project]\nname = "antfly-cli"\nrequires-python = ">=3.11"\n'
+                    )
 
-            package_cli_release.extract_archive(
-                archive_dir, "1.2.3", platform, extracted
-            )
-            package_cli_release.copy_antfarm(repo, extracted)
-            package_cli_release.populate_npm_package(repo, platform, extracted)
+                    package_cli_release.extract_archive(
+                        archive_dir, "1.2.3", platform, extracted
+                    )
+                    package_cli_release.copy_antfarm(repo, extracted)
+                    package_cli_release.populate_npm_package(repo, platform, extracted)
 
-            npm_package = repo / "ts" / "packages" / platform.npm_package_dir
-            self.assertEqual(
-                (npm_package / "include" / "antfly.h").read_text(),
-                "/* antfly header */\n",
-            )
-            self.assertEqual(
-                (npm_package / "lib" / "libantfly.so").read_text(), "antfly library\n"
-            )
+                    npm_package = repo / "ts" / "packages" / platform.npm_package_dir
+                    self.assertEqual(
+                        (npm_package / "include" / "antfly.h").read_text(),
+                        "/* antfly header */\n",
+                    )
+                    self.assertEqual(
+                        (
+                            npm_package
+                            / "lib"
+                            / package_cli_release.lite_library_name(platform)
+                        ).read_text(),
+                        "antfly library\n",
+                    )
 
-            wheel = package_cli_release.package_python_wheel(
-                repo, out, "1.2.3", platform, extracted
-            )
-            with zipfile.ZipFile(wheel) as zf:
-                names = set(zf.namelist())
-                metadata = zf.read("antfly_cli-1.2.3.dist-info/METADATA").decode()
-            self.assertIn("antfly_cli/include/antfly.h", names)
-            self.assertIn("antfly_cli/lib/libantfly.so", names)
-            self.assertIn("antfly_cli/share/antfly/asset.txt", names)
-            self.assertIn("Requires-Python: >=3.11", metadata)
+                    if platform.release_os == "Darwin":
+                        self.assertEqual(
+                            (
+                                npm_package / "lib" / "libantfly-apple.dylib"
+                            ).read_bytes(),
+                            b"apple bridge",
+                        )
+
+                    wheel = package_cli_release.package_python_wheel(
+                        repo, out, "1.2.3", platform, extracted
+                    )
+                    with zipfile.ZipFile(wheel) as zf:
+                        names = set(zf.namelist())
+                        metadata = zf.read(
+                            "antfly_cli-1.2.3.dist-info/METADATA"
+                        ).decode()
+                        if platform.release_os == "Darwin":
+                            self.assertEqual(
+                                zf.read("antfly_cli/lib/libantfly-apple.dylib"),
+                                b"apple bridge",
+                            )
+                    self.assertIn("antfly_cli/include/antfly.h", names)
+                    self.assertIn(
+                        f"antfly_cli/lib/{package_cli_release.lite_library_name(platform)}",
+                        names,
+                    )
+                    self.assertIn("antfly_cli/share/antfly/asset.txt", names)
+                    self.assertIn("Requires-Python: >=3.11", metadata)
 
     def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

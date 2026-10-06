@@ -8,7 +8,7 @@ const reconciler = @import("metadata/reconciler.zig");
 const state = @import("metadata/state.zig");
 const runtime = @import("metadata/runtime.zig");
 const authority = @import("metadata/authority.zig");
-const incarnation = @import("metadata/incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 const reconcile_lease = @import("metadata/reconcile_lease.zig");
 const store_observer = @import("metadata/store_observer.zig");
 const server = @import("metadata/server.zig");
@@ -30,3 +30,6 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

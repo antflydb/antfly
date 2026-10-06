@@ -11,8 +11,9 @@ import {
 } from "@antfly/design-system";
 import type { GeneratorConfig, GeneratorProvider } from "@antfly/sdk";
 import { generatorProviders } from "@antfly/sdk";
-import { useId, useMemo } from "react";
+import { useEffect, useId, useMemo } from "react";
 import { Combobox } from "@/components/Combobox";
+import { useChatGPT } from "@/components/chatgpt-provider";
 import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import { cn } from "@/lib/utils";
 
@@ -27,9 +28,11 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "Antfly (Local)",
+  apple: "Apple (On Device)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
   openai: "OpenAI",
+  chatgpt: "ChatGPT plan",
   openrouter: "OpenRouter",
   vertex: "Google Cloud Vertex AI",
 };
@@ -43,6 +46,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "apple",
   "gemini",
   "vertex",
   "openai",
@@ -52,9 +56,10 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
 ];
 
 export function formatGeneratorSummary(
-  config: Pick<GeneratorConfig, "provider" | "model"> | null | undefined,
+  config: { provider: string; model?: string } | null | undefined,
   defaultLabel = "Server default"
 ): string {
+  if (config?.provider === "apple") return GENERATOR_PROVIDER_LABELS.apple!;
   if (!config?.provider || !config?.model) {
     return defaultLabel;
   }
@@ -90,6 +95,7 @@ interface GeneratorSelectorProps {
   defaultLabel?: string;
   defaultDescription?: string;
   customLabel?: string;
+  allowPersonalConnections?: boolean;
   showTemperature?: boolean;
   temperatureDisabled?: boolean;
   temperatureHelpText?: string;
@@ -104,12 +110,28 @@ export function GeneratorSelector({
   defaultLabel = "Server default",
   defaultDescription = "Omit the generator override and let the backend choose the configured default.",
   customLabel = "Custom override",
+  allowPersonalConnections = false,
   showTemperature = true,
   temperatureDisabled = false,
   temperatureHelpText,
   providers = generatorProviders,
   className,
 }: GeneratorSelectorProps) {
+  const chatgpt = useChatGPT();
+  const accounts = chatgpt.accounts.filter((account) => account.connected && account.plan_enabled);
+  const connectionId = value?.provider === "chatgpt" ? value.connection_id : undefined;
+  useEffect(() => {
+    // Account discovery marks the current API/auth scope ready. Waiting for it
+    // also retries a persisted selection when the provider replaces that scope.
+    if (chatgpt.supported && connectionId) void chatgpt.loadModels(connectionId);
+  }, [connectionId, chatgpt.loadModels, chatgpt.supported]);
+  const availableProviders = providers.filter(
+    (provider) =>
+      provider !== "chatgpt" ||
+      (allowPersonalConnections &&
+        chatgpt.supported &&
+        (accounts.length > 0 || value?.provider === "chatgpt"))
+  );
   const mode = value ? "custom" : "default";
   const id = useId();
   const defaultId = `${id}-generator-mode-default`;
@@ -125,12 +147,17 @@ export function GeneratorSelector({
   );
   const modelOptions = useMemo(() => {
     if (!value) return [];
+    if (value.provider === "chatgpt")
+      return (chatgpt.models[value.connection_id ?? ""] ?? []).map((model) => ({
+        value: model.slug,
+        label: model.display_name,
+      }));
     const live = liveGenerators[value.provider] ?? [];
     const names = live.length > 0 ? live : [GENERATOR_PROVIDER_DEFAULTS[value.provider]];
     return names
       .filter((name): name is string => Boolean(name))
       .map((name) => ({ value: name, label: name }));
-  }, [liveGenerators, value]);
+  }, [liveGenerators, value, chatgpt.models]);
 
   const handleModeChange = (nextMode: string) => {
     if (nextMode === "default") {
@@ -145,12 +172,41 @@ export function GeneratorSelector({
       return;
     }
     const nextProvider = provider as GeneratorProvider;
+    if (nextProvider === "chatgpt") {
+      const id = accounts[0]?.connection_id;
+      if (!id) return;
+      onChange({
+        provider: "chatgpt",
+        connection_id: id,
+        model: chatgpt.models[id]?.[0]?.slug ?? "",
+      });
+      return;
+    }
+    if (value.provider === "chatgpt") {
+      onChange({
+        provider: nextProvider,
+        model: liveGenerators[nextProvider]?.[0] ?? GENERATOR_PROVIDER_DEFAULTS[nextProvider] ?? "",
+        temperature: defaultConfig.temperature,
+      } as GeneratorConfig);
+      return;
+    }
     const liveDefault = liveGenerators[nextProvider]?.[0];
+    if (nextProvider === "apple") {
+      onChange({
+        provider: "apple",
+        max_tokens: value.max_tokens ?? 256,
+        ...(value.temperature !== undefined && { temperature: value.temperature }),
+      });
+      return;
+    }
     onChange({
       ...value,
       provider: nextProvider,
-      model: liveDefault || GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
-    });
+      model:
+        liveDefault ||
+        GENERATOR_PROVIDER_DEFAULTS[nextProvider] ||
+        ("model" in value ? value.model : undefined),
+    } as GeneratorConfig);
   };
 
   return (
@@ -184,11 +240,38 @@ export function GeneratorSelector({
         </label>
       </RadioGroup>
 
+      {value?.provider === "chatgpt" && (
+        <div className="text-xs space-y-1">
+          {chatgpt.unavailableMessage && <p role="alert">{chatgpt.unavailableMessage}</p>}
+          <p>
+            Using ChatGPT plan ·{" "}
+            <a
+              href="https://chatgpt.com/settings/usage"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline"
+            >
+              Manage usage
+            </a>
+          </p>
+          {chatgpt.error && (
+            <p role="alert" className="text-destructive">
+              {chatgpt.error}
+            </p>
+          )}
+          {!value.model && <p>Select an available model to continue.</p>}
+          {!accounts.some((account) => account.connection_id === value.connection_id) && (
+            <p>Reconnect this account on the Connections page.</p>
+          )}
+        </div>
+      )}
       {value && (
         <div
           className={cn(
             "grid gap-4",
-            showTemperature ? "grid-cols-1 lg:grid-cols-3" : "grid-cols-1 lg:grid-cols-2"
+            showTemperature && value.provider !== "apple"
+              ? "grid-cols-1 lg:grid-cols-3"
+              : "grid-cols-1 lg:grid-cols-2"
           )}
         >
           <div className="space-y-2">
@@ -198,7 +281,7 @@ export function GeneratorSelector({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {providers.map((provider) => (
+                {availableProviders.map((provider) => (
                   <SelectItem key={provider} value={provider}>
                     {GENERATOR_PROVIDER_LABELS[provider] || provider}
                   </SelectItem>
@@ -206,19 +289,47 @@ export function GeneratorSelector({
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Model</Label>
-            <Combobox
-              options={modelOptions}
-              value={value.model}
-              onChange={(model) => onChange({ ...value, model })}
-              placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
-              searchPlaceholder="Search or type a model..."
-              emptyText="Type a model name."
-              allowCustomValue
-            />
-          </div>
-          {showTemperature && (
+          {value.provider === "chatgpt" && (
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">ChatGPT account</Label>
+              <Select
+                value={value.connection_id}
+                onValueChange={(id) =>
+                  onChange({
+                    provider: "chatgpt",
+                    connection_id: id,
+                    model: chatgpt.models[id]?.[0]?.slug ?? "",
+                  })
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Choose an account" />
+                </SelectTrigger>
+                <SelectContent>
+                  {accounts.map((account) => (
+                    <SelectItem key={account.connection_id} value={account.connection_id}>
+                      {account.email || "ChatGPT account"} · {account.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+          {value.provider !== "apple" && (
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">Model</Label>
+              <Combobox
+                options={modelOptions}
+                value={"model" in value ? value.model : undefined}
+                onChange={(model) => onChange({ ...value, model })}
+                placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
+                searchPlaceholder="Search or type a model..."
+                emptyText="Type a model name."
+                allowCustomValue={value.provider !== "chatgpt"}
+              />
+            </div>
+          )}
+          {showTemperature && value.provider !== "chatgpt" && (
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">Temperature</Label>
               <Input

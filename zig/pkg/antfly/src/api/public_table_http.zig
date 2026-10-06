@@ -17,20 +17,20 @@ const ant_json = @import("antfly-json");
 const builtin = @import("builtin");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const backups_api = @import("backups.zig");
-const batch_api = @import("batch.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_query_mod = @import("../graph/query.zig");
-const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
+const batch_api = @import("antfly_local_sources").api_batch;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
+const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
+const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
-const common_secrets = @import("../common/secrets.zig");
-const common_config = @import("../common/config.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const common_config = @import("antfly_local_sources").common_config;
 const http_route_helpers = @import("http_route_helpers.zig");
-const query_contract = @import("query_contract.zig");
-const operation = @import("operation.zig");
+const query_contract = @import("antfly_local_sources").api_query_contract;
+const operation = @import("antfly_local_sources").api_operation;
 const reranking_contract = @import("antfly_reranking");
 
 threadlocal var last_batch_failure_name: ?[]const u8 = null;
@@ -511,7 +511,7 @@ pub const TableApi = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             index_name: []const u8,
-            action: @import("../storage/db/relational_index_maintenance_contract.zig").Action,
+            action: @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Action,
             body: []const u8,
             request: operation.RequestContext,
         ) ExecuteIndexMaintenanceError![]u8 = null,
@@ -2473,7 +2473,7 @@ pub fn handleTableDeleteIndex(
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}"), .json = true };
 }
 
-pub fn handleTableIndexMaintenance(alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("../storage/db/relational_index_maintenance_contract.zig").Action, body: []const u8, api: TableApi) !OwnedResponse {
+pub fn handleTableIndexMaintenance(alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, action: @import("antfly_local_sources").storage_db_relational_index_maintenance_contract.Action, body: []const u8, api: TableApi) !OwnedResponse {
     try api.ensureActive();
     const callback = api.vtable.execute_table_index_maintenance orelse return .{ .status = 405, .body = try alloc.dupe(u8, "index maintenance is not supported") };
     const response = callback(api.ptr, alloc, table_name, index_name, action, body, api.request) catch |err| switch (err) {
@@ -4285,7 +4285,7 @@ test "public table query handler preserves structured filter and hierarchy diagn
 test "public table query handler preserves retryable failure status" {
     // Corrupt persistent storage is intentionally logged at error severity;
     // the strict CI runner requires tests to declare those exercised paths.
-    @import("../test_error_logs.zig").expectErrorLogs(2);
+    @import("antfly_test_error_logs").expectErrorLogs(2);
 
     const Backend = struct {
         err: TableApi.ExecuteQueryError,

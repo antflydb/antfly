@@ -16,9 +16,9 @@
 //! primary bytes (including intents and retained effects) are authoritative.
 //! Local sidecar pins and derived projections are deliberately not included.
 const std = @import("std");
-const core = @import("../../storage/db/core.zig");
+const core = @import("antfly_local_sources").storage_db_core;
 const fs = @import("antfly_runtime_fs").fs_paths;
-const Cancellation = @import("../../storage/db/types.zig").CancellationToken;
+const Cancellation = @import("antfly_local_sources").storage_db_types.CancellationToken;
 const Sha = std.crypto.hash.sha2.Sha256;
 pub const max_files = 1_000_000;
 pub const header_size = 80;
@@ -221,7 +221,7 @@ pub fn extract(alloc: std.mem.Allocator, io: std.Io, raw: []const u8, root: []co
 }
 
 test "relational index system native Raft snapshot preserves exact typed primary and later writes are excluded" {
-    const db_mod = @import("../../storage/db/mod.zig");
+    const db_mod = @import("antfly_local_sources").storage_db_mod;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -236,13 +236,13 @@ test "relational index system native Raft snapshot preserves exact typed primary
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"}},"additionalProperties":false}}}}
     );
     const owner_identity = try source.relationalTopologyIdentity();
-    const scope: @import("../../storage/db/online_source_contract.zig").Scope = .{
+    const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .admission_epoch = owner_identity.next_epoch, .transition_id = 55, .attempt = 1, .peer_group_id = 23, .owner_group_id = 22, .role = .merge_source, .namespace = owner_identity.namespace, .catalog_digest = owner_identity.catalog_digest },
         .receiver_namespace = .{ .table_id = 21, .shard_id = 23, .range_id = 23 },
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 2, .sequence = 1 },
     };
-    const pin_mod = @import("../../storage/db/source_pin.zig");
+    const pin_mod = @import("antfly_local_sources").storage_db_source_pin;
     pin_mod.test_failure = .after_prepare;
     defer pin_mod.test_failure = .none;
     try std.testing.expectError(error.InjectedSourcePinFailure, @import("../../storage/server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 2, .index = 1 }));

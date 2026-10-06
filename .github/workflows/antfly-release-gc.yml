@@ -14,11 +14,18 @@ on:
         default: false
         type: boolean
 
+      delete_dev_releases:
+        description: "Delete unprotected dev prereleases only (includes legacy dev tags)"
+        required: true
+        default: false
+        type: boolean
+
 permissions:
   contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  DELETE_DEV_RELEASES: ${{ github.event_name == 'workflow_dispatch' && inputs.delete_dev_releases || false }}
 
 jobs:
   plan:
@@ -58,7 +65,11 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         run: |
-          python scripts/release/release_gc.py \
+          retention_args=()
+          if [[ "$DELETE_DEV_RELEASES" == "true" ]]; then
+            retention_args+=(--delete-dev-releases)
+          fi
+          python scripts/release/release_gc.py "${retention_args[@]}" \
             --endpoint "$AWS_ENDPOINT_URL" \
             --plan-out dist/release-gc/plan.json
           approval_sha256="$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['approval_sha256'])" dist/release-gc/plan.json)"
@@ -136,7 +147,11 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.AWS_ENDPOINT_URL }}
         run: |
-          python scripts/release/release_gc.py \
+          retention_args=()
+          if [[ "$DELETE_DEV_RELEASES" == "true" ]]; then
+            retention_args+=(--delete-dev-releases)
+          fi
+          python scripts/release/release_gc.py "${retention_args[@]}" \
             --endpoint "$AWS_ENDPOINT_URL" \
             --approved-plan dist/release-gc/approved/plan.json \
             --plan-out dist/release-gc/apply-plan.json

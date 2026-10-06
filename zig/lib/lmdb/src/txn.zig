@@ -1303,10 +1303,10 @@ test "read-only transaction snapshots active meta" {
             .inactive = null,
         },
         .data_path = @constCast("/tmp/fake.mdb"),
-        .opts = .{},
+        .opts = .{ .no_lock = true },
     };
 
-    var txn = try Transaction.begin(&fake_env, .{});
+    var txn = try Transaction.begin(&fake_env, .{ .read_only = true });
     try std.testing.expectEqual(@as(format.Txnid, 9), (try txn.meta()).mm_txnid);
     txn.abort();
     try std.testing.expectError(error.TransactionClosed, txn.meta());

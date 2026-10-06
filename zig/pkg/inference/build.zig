@@ -67,15 +67,7 @@ fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    if (target.result.os.tag != .macos) return;
-    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
-        // xcrun observes the selected Xcode installation outside configure inputs.
-        b.graph.poisonCache();
-        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
-    };
-    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
-    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
+    @import("antfly_platform").addMacosSdkPaths(b, module, target);
 }
 
 fn addRootedLibraryPaths(b: *std.Build, module: *std.Build.Module, root: []const u8) void {
@@ -147,6 +139,7 @@ fn configureNativeTool(
 }
 
 pub fn build(b: *std.Build) void {
+    defer @import("antfly_platform").finalizeMacosSdk(b);
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's

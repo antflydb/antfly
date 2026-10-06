@@ -23,7 +23,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const slot_store = @import("slot_store.zig");
 const standby_mod = @import("standby.zig");
 

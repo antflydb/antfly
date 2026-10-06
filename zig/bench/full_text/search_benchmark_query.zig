@@ -18,7 +18,7 @@ const common = @import("search_benchmark_common.zig");
 
 pub fn main(init: std.process.Init) !void {
     // Match the allocator used by production-oriented binaries. Focused tests
-    // still use std.testing.allocator/DebugAllocator for leak detection.
+    // still use std.testing.allocator/SafeAllocator for leak detection.
     const alloc = std.heap.c_allocator;
 
     const args = try common.parseArgs(init.minimal.args);

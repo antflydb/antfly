@@ -45,6 +45,7 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { Source, Sources, SourcesContent, SourcesTrigger } from "@/components/ai-elements/sources";
 import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
+import { chatGPTErrorMessage, useChatGPT } from "@/components/chatgpt-provider";
 import { getChatRequestGenerator } from "@/components/playground/chat-generator";
 import {
   GENERATOR_DEFAULT_CONFIG,
@@ -109,6 +110,7 @@ const aiRenderers = createAIElementsRenderers({
 const ChatPlaygroundPage: React.FC = () => {
   const { apiUrl } = useApiConfig();
   const { dashboardGenerator } = useGeneratorPreference();
+  const chatgpt = useChatGPT();
   const { selectedTable, chatIndexes } = useTable();
 
   // Config state
@@ -206,6 +208,7 @@ const ChatPlaygroundPage: React.FC = () => {
                     <div className="space-y-4">
                       <Label className="text-sm font-medium">Generator</Label>
                       <GeneratorSelector
+                        allowPersonalConnections
                         value={generatorOverride}
                         onChange={setGeneratorOverride}
                         defaultConfig={GENERATOR_DEFAULT_CONFIG}
@@ -420,7 +423,11 @@ const ChatPlaygroundPage: React.FC = () => {
               <CardTitle className="text-lg">Chat</CardTitle>
             </CardHeader>
             <CardContent className="flex-1 overflow-hidden flex flex-col p-0">
-              {requestGenerator ? (
+              {requestGenerator?.provider === "chatgpt" && !chatgpt.supported ? (
+                <p role="alert" className="p-6 text-sm text-muted-foreground">
+                  {chatgpt.unavailableMessage}
+                </p>
+              ) : requestGenerator ? (
                 <ChatBar
                   key={chatKey}
                   id="chat-playground"
@@ -505,7 +512,7 @@ const ChatPlaygroundPage: React.FC = () => {
                   )}
                   renderError={(error) => (
                     <div className="mb-3 mx-1 p-3 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
-                      {error}
+                      {error.includes("ChatGPT") ? chatGPTErrorMessage(new Error(error)) : error}
                     </div>
                   )}
                 />

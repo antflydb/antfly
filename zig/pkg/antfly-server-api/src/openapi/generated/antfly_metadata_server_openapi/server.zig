@@ -82,6 +82,26 @@ pub const ListConnectionsParams = struct {
     refresh: ?[]const u8 = null,
 };
 
+/// getChatGPTAttempt
+pub const GetChatGPTAttemptPathParams = struct {
+    attempt_id: []const u8,
+};
+
+/// Parse the JSON request body for authorizeChatGPT.
+pub fn parseAuthorizeChatGPTBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.ChatGPTAuthorize) {
+    return std.json.parseFromSlice(types.ChatGPTAuthorize, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// disconnectChatGPT
+pub const DisconnectChatGPTPathParams = struct {
+    connection_id: []const u8,
+};
+
+/// listChatGPTModels
+pub const ListChatGPTModelsPathParams = struct {
+    connection_id: []const u8,
+};
+
 /// Invoke an Antfly-compatible inference connection
 pub const InvokeInferenceConnectionPathParams = struct {
     connection_id: []const u8,
@@ -1284,6 +1304,11 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/cluster", .operation_id = "getCluster", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/connections", .operation_id = "listConnections", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections/chatgpt/accounts", .operation_id = "listChatGPTAccounts", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections/chatgpt/attempts/{attempt_id}", .operation_id = "getChatGPTAttempt", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/connections/chatgpt/authorize", .operation_id = "authorizeChatGPT", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/connections/{connection_id}/chatgpt/disconnect", .operation_id = "disconnectChatGPT", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/connections/{connection_id}/chatgpt/models", .operation_id = "listChatGPTModels", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/connections/{connection_id}/inference/{operation}", .operation_id = "invokeInferenceConnection", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/databases", .operation_id = "listDatabases", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}", .operation_id = "getDatabase", .request_body = .none, .streaming_response = false },
@@ -1435,6 +1460,11 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "multiBatchWrite")) @compileError("ServerRouter: Impl missing required method 'multiBatchWrite'");
         if (!@hasDecl(Impl, "getCluster")) @compileError("ServerRouter: Impl missing required method 'getCluster'");
         if (!@hasDecl(Impl, "listConnections")) @compileError("ServerRouter: Impl missing required method 'listConnections'");
+        if (!@hasDecl(Impl, "listChatGPTAccounts")) @compileError("ServerRouter: Impl missing required method 'listChatGPTAccounts'");
+        if (!@hasDecl(Impl, "getChatGPTAttempt")) @compileError("ServerRouter: Impl missing required method 'getChatGPTAttempt'");
+        if (!@hasDecl(Impl, "authorizeChatGPT")) @compileError("ServerRouter: Impl missing required method 'authorizeChatGPT'");
+        if (!@hasDecl(Impl, "disconnectChatGPT")) @compileError("ServerRouter: Impl missing required method 'disconnectChatGPT'");
+        if (!@hasDecl(Impl, "listChatGPTModels")) @compileError("ServerRouter: Impl missing required method 'listChatGPTModels'");
         if (!@hasDecl(Impl, "invokeInferenceConnection")) @compileError("ServerRouter: Impl missing required method 'invokeInferenceConnection'");
         if (!@hasDecl(Impl, "listDatabases")) @compileError("ServerRouter: Impl missing required method 'listDatabases'");
         if (!@hasDecl(Impl, "getDatabase")) @compileError("ServerRouter: Impl missing required method 'getDatabase'");
@@ -1584,6 +1614,11 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/batch", httpx.Handler.bind(self.impl, multiBatchWrite));
             try server.get("/cluster", httpx.Handler.bind(self.impl, getCluster));
             try server.get("/connections", httpx.Handler.bind(self.impl, listConnections));
+            try server.get("/connections/chatgpt/accounts", httpx.Handler.bind(self.impl, listChatGPTAccounts));
+            try server.get("/connections/chatgpt/attempts/:attempt_id", httpx.Handler.bind(self.impl, getChatGPTAttempt));
+            try server.post("/connections/chatgpt/authorize", httpx.Handler.bind(self.impl, authorizeChatGPT));
+            try server.post("/connections/:connection_id/chatgpt/disconnect", httpx.Handler.bind(self.impl, disconnectChatGPT));
+            try server.get("/connections/:connection_id/chatgpt/models", httpx.Handler.bind(self.impl, listChatGPTModels));
             try server.post("/connections/:connection_id/inference/:operation", httpx.Handler.bind(self.impl, invokeInferenceConnection));
             try server.get("/databases", httpx.Handler.bind(self.impl, listDatabases));
             try server.get("/databases/:databaseName", httpx.Handler.bind(self.impl, getDatabase));
@@ -1796,6 +1831,39 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .refresh = try ctx.queryDecoded("refresh"),
             };
             return impl.listConnections(ctx, query_params);
+        }
+
+        /// listChatGPTAccounts
+        /// GET /connections/chatgpt/accounts
+        fn listChatGPTAccounts(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listChatGPTAccounts(ctx);
+        }
+
+        /// getChatGPTAttempt
+        /// GET /connections/chatgpt/attempts/{attempt_id}
+        fn getChatGPTAttempt(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const attempt_id = ctx.param("attempt_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: attempt_id" });
+            return impl.getChatGPTAttempt(ctx, attempt_id);
+        }
+
+        /// authorizeChatGPT
+        /// POST /connections/chatgpt/authorize
+        fn authorizeChatGPT(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.authorizeChatGPT(ctx);
+        }
+
+        /// disconnectChatGPT
+        /// POST /connections/{connection_id}/chatgpt/disconnect
+        fn disconnectChatGPT(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
+            return impl.disconnectChatGPT(ctx, connection_id);
+        }
+
+        /// listChatGPTModels
+        /// GET /connections/{connection_id}/chatgpt/models
+        fn listChatGPTModels(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const connection_id = ctx.param("connection_id") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: connection_id" });
+            return impl.listChatGPTModels(ctx, connection_id);
         }
 
         /// Invoke an Antfly-compatible inference connection
@@ -2815,6 +2883,11 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn multiBatchWrite(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getCluster(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listConnections(self: *Impl, ctx: *httpx.Context, params: ListConnectionsParams) !httpx.Response
+//   fn listChatGPTAccounts(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getChatGPTAttempt(self: *Impl, ctx: *httpx.Context, attempt_id: []const u8) !httpx.Response
+//   fn authorizeChatGPT(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn disconnectChatGPT(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
+//   fn listChatGPTModels(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response
 //   fn invokeInferenceConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8, operation: []const u8) !httpx.Response
 //   fn listDatabases(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn getDatabase(self: *Impl, ctx: *httpx.Context, database_name: []const u8) !httpx.Response

@@ -25,7 +25,7 @@ const bootstrap = @import("bootstrap.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
 const rejoin = @import("rejoin.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 

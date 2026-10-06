@@ -3,10 +3,10 @@
 const std = @import("std");
 const rpc = @import("retained_read_rpc.zig");
 const registry = @import("../storage/retained_read_registry.zig");
-const reads = @import("table_read_source.zig");
-const types = @import("../storage/db/types.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const types = @import("antfly_local_sources").storage_db_types;
 const metadata = @import("../metadata/api.zig");
-const http = @import("../common/http/http_common.zig");
+const http = @import("antfly_local_sources").common_http_http_common;
 const time = @import("antfly_platform").time;
 
 /// Owns endpoint and catalog capability bytes. Executor must be a stable
@@ -114,7 +114,7 @@ pub const Client = struct {
         defer response.deinit(self.alloc);
     }
 
-    fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+    fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms });
         defer response.deinit(self.alloc);
@@ -187,20 +187,20 @@ pub const Client = struct {
         self.destroy();
     }
 
-    fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+    fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .range_proofs, .schema_version = self.schema_version, .token = self.token });
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, self.alloc, response.body, .{});
         defer parsed.deinit();
         const proofs = parsed.value.range_proofs;
-        if (proofs.len == 0 or proofs.len > @import("range_read_guards.zig").max_proofs) return error.InvalidRetainedReadResponse;
+        if (proofs.len == 0 or proofs.len > @import("antfly_local_sources").api_range_read_guards.max_proofs) return error.InvalidRetainedReadResponse;
         for (proofs, 0..) |proof, i| {
-            const tracking = @import("../storage/range_protection.zig");
+            const tracking = @import("antfly_local_sources").storage_range_protection;
             tracking.validateProof(proof) catch return error.InvalidRetainedReadResponse;
             if (i != 0 and !tracking.proofLess(proofs[i - 1], proof)) return error.InvalidRetainedReadResponse;
         }
-        return alloc.dupe(@import("../storage/range_protection.zig").Proof, proofs);
+        return alloc.dupe(@import("antfly_local_sources").storage_range_protection.Proof, proofs);
     }
 
     fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
@@ -294,8 +294,8 @@ fn consumerTests() type {
                     try std.testing.expect(opts.include_range_proofs);
                     return .{ .ptr = raw, .vtable = &.{ .next = next, .close = close, .normalize = normalizeWrites, .range_proofs = proofRows } };
                 }
-                fn proofRows(_: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
-                    return alloc.dupe(@import("../storage/range_protection.zig").Proof, &.{ .{ .bucket = 0, .generation = null }, .{ .bucket = 256, .generation = std.math.maxInt(u64) } });
+                fn proofRows(_: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
+                    return alloc.dupe(@import("antfly_local_sources").storage_range_protection.Proof, &.{ .{ .bucket = 0, .generation = null }, .{ .bucket = 256, .generation = std.math.maxInt(u64) } });
                 }
                 fn normalizeWrites(_: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
                     const result = try alloc.alloc(types.BatchWrite, writes.len);

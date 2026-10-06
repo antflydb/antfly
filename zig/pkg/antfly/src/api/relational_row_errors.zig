@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 //! Allowlisted row execution failures shared by local and remote owner paths.
-pub const Error = @import("../schema/relational_expression_errors.zig").Error || error{
+pub const Error = @import("antfly_local_sources").schema_relational_expression_errors.Error || error{
     RelationalIndexNotReady,
     PartialIndexPredicateNotImplied,
     InvalidRelationalIndexBound,

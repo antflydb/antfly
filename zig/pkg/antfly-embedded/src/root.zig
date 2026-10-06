@@ -148,3 +148,5 @@ test "pkg antfly embedded exposes Lite handle-level snapshot helper" {
     defer result.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, result.value, "embedded package handle snapshot") != null);
 }
+
+pub const lake = embedded.lake;

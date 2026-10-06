@@ -18,9 +18,9 @@
 //! imports one bounded logical page. A partial archive is never a decoder.
 const std = @import("std");
 const contract = @import("restore_owner_contract.zig");
-const staging = @import("../storage/db/restore_staging_contract.zig");
-const transfer = @import("../storage/db/source_artifact_transfer.zig");
-const native = @import("../storage/db/native_backup.zig");
+const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
+const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
+const native = @import("antfly_local_sources").storage_db_native_backup;
 const fs = @import("antfly_runtime_fs").fs_paths;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 pub const Result = struct { complete: bool, next_offset: u64 };
@@ -61,7 +61,7 @@ fn save(alloc: std.mem.Allocator, io: std.Io, root: []const u8, receipt: Receipt
     try fs.syncDirPortable(io, root);
 }
 
-pub fn step(alloc: std.mem.Allocator, io: std.Io, source: contract.Source, scope: staging.Scope, owner_range: @import("../storage/docstore.zig").ByteRange, root: []const u8, chunk: ?transfer.ReadResponse, cancellation: Cancellation, byte_budget: usize) !Result {
+pub fn step(alloc: std.mem.Allocator, io: std.Io, source: contract.Source, scope: staging.Scope, owner_range: @import("antfly_local_sources").storage_docstore.ByteRange, root: []const u8, chunk: ?transfer.ReadResponse, cancellation: Cancellation, byte_budget: usize) !Result {
     try cancellation.check();
     const descriptor = source.peer_descriptor orelse return error.RestoreSourceProofMissing;
     try contract.validatePeerSource(source, scope, descriptor);
@@ -109,7 +109,7 @@ pub fn step(alloc: std.mem.Allocator, io: std.Io, source: contract.Source, scope
     }
     if (receipt.next != receipt.total) return .{ .complete = false, .next_offset = receipt.next };
     if (size != receipt.total) return error.InvalidRestoreSourceCheckpoint;
-    const verified = try @import("../storage/portable_source_verifier.zig").step(alloc, io, artifact, root, scope.digest(), descriptor.certificate, cancellation, .{ .bytes = @min(byte_budget, transfer.max_chunk_bytes) });
+    const verified = try @import("antfly_local_sources").storage_portable_source_verifier.step(alloc, io, artifact, root, scope.digest(), descriptor.certificate, cancellation, .{ .bytes = @min(byte_budget, transfer.max_chunk_bytes) });
     if (!verified.complete) return .{ .complete = false, .next_offset = receipt.next };
     return .{ .complete = try @import("restore_materialization.zig").stepPortableDecoder(alloc, io, artifact, source.artifact, scope, owner_range, root, cancellation), .next_offset = receipt.next };
 }

@@ -16,8 +16,8 @@
 //! per-entry rejection receipts share durable entry-identity retention.
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
-const source = @import("../../storage/db/online_source_contract.zig");
-const topology = @import("../../storage/db/relational_integrity_topology_contract.zig");
+const source = @import("antfly_local_sources").storage_db_online_source_contract;
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
 pub const Rejection = @import("../../storage/data_raft_projection_wire.zig").TopologyRejection;
 pub const Guard = struct {
     index: u64,

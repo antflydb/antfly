@@ -14,10 +14,10 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const config_mod = @import("config.zig");
+const config_mod = @import("antfly_local_sources").common_config;
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
-const secrets = @import("secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 const synthesizing = @import("antfly_synthesizing");
 
 pub const ActiveRuntime = struct {
@@ -211,7 +211,7 @@ test "audio runtime activates configured transcribing and synthesizing providers
     defer io.deinit();
 
     var cfg = config_mod.Config{
-        .registry = @import("provider_registry.zig").Registry.init(alloc),
+        .registry = @import("antfly_local_sources").common_provider_registry.Registry.init(alloc),
         .transcribers = transcribing.Registry.init(alloc),
         .readers = readers.Registry.init(alloc),
         .text_to_speech = synthesizing.Registry.init(alloc),
@@ -252,7 +252,7 @@ test "audio runtime rolls back globals when a later provider fails to load" {
     defer io.deinit();
 
     var cfg = config_mod.Config{
-        .registry = @import("provider_registry.zig").Registry.init(alloc),
+        .registry = @import("antfly_local_sources").common_provider_registry.Registry.init(alloc),
         .transcribers = transcribing.Registry.init(alloc),
         .readers = readers.Registry.init(alloc),
         .text_to_speech = synthesizing.Registry.init(alloc),
@@ -408,7 +408,7 @@ fn NativeCredentialProvider(comptime lib: type, comptime Adapter: type, comptime
 test "audio runtime native credentials resolve after attachment and rotate" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const contract = @import("secret_contract.zig");
+    const contract = @import("antfly_local_sources").common_secret_contract;
     const Fake = struct {
         revision: u64 = 1,
         calls: usize = 0,
@@ -452,7 +452,7 @@ test "audio runtime native credentials resolve after attachment and rotate" {
     });
     defer store.deinit();
     var cfg = config_mod.Config{
-        .registry = @import("provider_registry.zig").Registry.init(alloc),
+        .registry = @import("antfly_local_sources").common_provider_registry.Registry.init(alloc),
         .transcribers = transcribing.Registry.init(alloc),
         .readers = readers.Registry.init(alloc),
         .text_to_speech = synthesizing.Registry.init(alloc),

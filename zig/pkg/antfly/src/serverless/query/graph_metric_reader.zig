@@ -19,12 +19,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const metric_segment = @import("../graph_metric_segment/mod.zig");
-const graph_mod = @import("../../graph/graph.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
 const graph_metric_config = @import("../build/graph_metric_config.zig");
 const lake_graph_metric = @import("../build/lake_graph_metric.zig");
 const graph_metric_policy = @import("../build/graph_metric_policy.zig");
 const runtime_mod = @import("runtime.zig");
-const operation = @import("../../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const routing_cache = @import("graph_metric_routing_cache.zig");
@@ -80,7 +80,7 @@ pub const Score = struct {
     }
 };
 
-pub const PublicScore = @import("../../storage/db/types.zig").GraphMetricScore;
+pub const PublicScore = @import("antfly_local_sources").storage_db_types.GraphMetricScore;
 
 pub const Result = struct {
     scores: []Score,
@@ -461,7 +461,7 @@ fn scoreColumnsWithScopeAlloc(
         logical_refs[i] = ref;
         const existing = for (physical_refs[0..physical_count], physical_configs[0..physical_count], 0..) |prior, prior_config, p| {
             if (lake_graph_metric.sameComputation(config, prior_config) and
-                (std.mem.eql(u8, ref.name, prior.name) or @import("../manifest/artifact_ref.zig").areGraphArtifactAliases(ref, prior))) break p;
+                (std.mem.eql(u8, ref.name, prior.name) or @import("antfly_local_sources").serverless_manifest_artifact_ref.areGraphArtifactAliases(ref, prior))) break p;
         } else null;
         mapping[i] = existing orelse physical_count;
         if (existing == null) {

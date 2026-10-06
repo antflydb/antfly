@@ -6,8 +6,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const manager = @import("db/catalog/index_manager.zig");
-const fixture = @import("db/catalog/index_manager_sim_fixture.zig");
+const manager = @import("antfly_local_sources").storage_db_catalog_index_manager;
+const fixture = @import("antfly_local_sources").storage_db_catalog_index_manager_sim_fixture;
 
 const add_base = vopr.id.stable("transition", "storage.index_manager.add_doc");
 const reopen_id = vopr.id.stable("transition", "storage.index_manager.reopen");
