@@ -109,3 +109,12 @@ pooling tests, 98 resource/transaction tests and the filesystem fixture, with
 69/69 build steps succeeding and no leaks. The toolchain file records the pinned Nix compiler's
 actual store path, glibc interpreter and SHA-256. These targeted proofs do not
 claim mutating COMMIT can finish immediately at a full storage/transport ceiling.
+
+[`nix-unstripped-build-attempt`](nix-unstripped-build-attempt/attempt.json)
+retains the incomplete baseline build with the pinned Nix glibc compiler. CLI,
+API and distributed compilation completed but exceeded their original compiler
+claims; storage's sampled peak crossed 20 GiB. I issued `docker stop` and the
+attempt exited 137 before a final storage peak was measured. This is an
+intentional termination, not a passing qualification or a measured final storage
+peak. Both replacement Linux binaries use stripped ReleaseSafe with unchanged
+runtime/container/workload gates.

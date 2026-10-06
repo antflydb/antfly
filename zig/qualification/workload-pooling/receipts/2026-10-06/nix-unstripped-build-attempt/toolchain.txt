@@ -1,0 +1,4 @@
+0.17.0
+/opt/zig-nix/bin/zig: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /nix/store/hx9wvdx2l59iahwf9nmrx7rwkm6cymgs-glibc-2.44-25/lib/ld-linux-aarch64.so.1, for GNU/Linux 3.10.0, stripped
+/nix/store/ms802lv410k52rd15fxpg4qllfw57baw-zig-0.17.0
+4818e9e28e752456421034db9229035c165c0e3392bf534421016e79de33d022  /opt/zig-nix/bin/zig
