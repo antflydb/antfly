@@ -2102,7 +2102,7 @@ fn expectWalCrashOutcome(
 }
 
 fn replayWalFixtureFile(allocator: Allocator, name: []const u8) !void {
-    const path = try std.fmt.allocPrint(allocator, "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures/{s}", .{name});
+    const path = try std.fmt.allocPrint(allocator, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/{s}", .{name});
     defer allocator.free(path);
 
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
@@ -2126,7 +2126,7 @@ fn replayWalFixtureFile(allocator: Allocator, name: []const u8) !void {
 }
 
 fn replayModeledWalFixtureFile(allocator: Allocator, name: []const u8) !void {
-    const path = try std.fmt.allocPrint(allocator, "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures/{s}", .{name});
+    const path = try std.fmt.allocPrint(allocator, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/{s}", .{name});
     defer allocator.free(path);
 
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
@@ -2161,7 +2161,7 @@ fn replayModeledWalFixtureFile(allocator: Allocator, name: []const u8) !void {
 }
 
 fn runWalReplayFixtures(allocator: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -2194,7 +2194,7 @@ fn runWalReplayFixtures(allocator: Allocator) !void {
 }
 
 fn runModeledWalReplayFixtures(allocator: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures/replay", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/replay", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -2227,7 +2227,7 @@ fn runModeledWalReplayFixtures(allocator: Allocator) !void {
 }
 
 fn runModeledWalCrashFixtures(allocator: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/local/storage/wal_sim_fixtures/crash", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/crash", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };

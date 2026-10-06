@@ -470,9 +470,7 @@ class ImportGraphTest(unittest.TestCase):
         self.assertEqual(0.5, stats["shared_fraction_of_smaller_graph"])
 
     def test_aggregate_overlap_counts_duplicate_instances_and_groups(self):
-        storage = self.write(
-            "zig/pkg/antfly-embedded/src/local/storage/db.zig", "one\ntwo\n"
-        )
+        storage = self.write("zig/pkg/antfly-embedded/src/storage/db.zig", "one\ntwo\n")
         httpx = self.write("zig/lib/httpx/src/httpx.zig", "one\n")
         unique = self.write("zig/pkg/antfly/src/unique.zig", "one\n")
         reports = [
@@ -500,10 +498,10 @@ class ImportGraphTest(unittest.TestCase):
         groups = {row["name"]: row for row in stats["groups"]}
         self.assertEqual(
             2,
-            groups["zig/pkg/antfly-embedded/src/local/storage"]["duplicate_instances"],
+            groups["zig/pkg/antfly-embedded/src/storage"]["duplicate_instances"],
         )
         self.assertEqual(
-            4, groups["zig/pkg/antfly-embedded/src/local/storage"]["duplicate_lines"]
+            4, groups["zig/pkg/antfly-embedded/src/storage"]["duplicate_lines"]
         )
         self.assertEqual(1, groups["zig/lib/httpx"]["duplicate_instances"])
 

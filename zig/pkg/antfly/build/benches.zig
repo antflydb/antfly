@@ -77,7 +77,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
         }),
     });
     system_catalog_bench.root_module.addImport("system_catalog", b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/system_catalog/domain.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/domain.zig"),
         .target = target,
         .optimize = .fast,
     }));
@@ -527,7 +527,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
             "text score query exposes score top k sort profile",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });

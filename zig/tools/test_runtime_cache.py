@@ -1538,7 +1538,7 @@ class RuntimeCacheTest(unittest.TestCase):
 
     def test_sql_and_snowball_generation_contracts(self):
         sql = self.own("zig/lib/sql/grammar/generated/root.zig")
-        snowball_root = "zig/pkg/antfly-embedded/src/local/search/snowball/generated"
+        snowball_root = "zig/pkg/antfly-embedded/src/search/snowball/generated"
         for path in (self.root / snowball_root).glob("*.zig"):
             self.own(f"{snowball_root}/{path.name}")
         snowball = self.root / snowball_root / "german_stemmer.zig"

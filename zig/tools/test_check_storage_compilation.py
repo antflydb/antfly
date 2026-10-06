@@ -37,7 +37,7 @@ SPEC.loader.exec_module(measurement)
 
 class LiteralSourceOwnership(unittest.TestCase):
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
-        local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/local"
+        local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"
         self.assertEqual(catalog.read_text(), measurement.control_catalog_contents())
         for relative in ("storage/db/db.zig", "storage/query.zig", "storage/write.zig"):
@@ -48,9 +48,7 @@ class LiteralSourceOwnership(unittest.TestCase):
 
     def test_control_roots_have_no_physical_implementation_import_path(self):
         source = measurement.ZIG_ROOT / "pkg/antfly/src"
-        physical_db = (
-            measurement.ZIG_ROOT / "pkg/antfly-embedded/src/local/storage/db/db.zig"
-        )
+        physical_db = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/storage/db/db.zig"
         self.assertTrue(physical_db.is_file())
         roots = [
             *(

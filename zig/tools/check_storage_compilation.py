@@ -95,7 +95,7 @@ def control_catalog_contents() -> str:
     Named source capabilities are rebound by the consumer profile. Whether a
     helper's tests require a physical owner is a separate partitioning decision.
     """
-    local = ZIG_ROOT / "pkg/antfly-embedded/src/local"
+    local = ZIG_ROOT / "pkg/antfly-embedded/src"
     physical = {
         local / path
         for path in ("storage/db/db.zig", "storage/query.zig", "storage/write.zig")
@@ -296,7 +296,7 @@ def source_owner_path(relative: str) -> str:
         "storage/query.zig",
         "storage/kernel_owner_abi.zig",
     }
-    owner = "antfly-embedded/src/local" if relative in embedded else "antfly/src"
+    owner = "antfly-embedded/src" if relative in embedded else "antfly/src"
     return f"zig/pkg/{owner}/{relative}"
 
 
@@ -308,9 +308,9 @@ def main() -> None:
     parser.add_argument("--write-control-catalog", action="store_true")
     args = parser.parse_args()
     if args.write_control_catalog:
-        (
-            ZIG_ROOT / "pkg/antfly-embedded/src/local/source_catalog_control.zig"
-        ).write_text(control_catalog_contents())
+        (ZIG_ROOT / "pkg/antfly-embedded/src/source_catalog_control.zig").write_text(
+            control_catalog_contents()
+        )
         return
     records = []
     if args.jobs <= 0:

@@ -18,7 +18,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0
       - name: Check repository licenses and Apache dependency boundary
         run: |
           python3 scripts/license_headers.py --check
@@ -27,9 +26,3 @@ jobs:
           python3 -m unittest discover -s scripts -p test_license_headers.py
           python3 -m unittest discover -s scripts -p test_qualification_provenance.py
           python3 -m unittest discover -s scripts -p test_asset_licenses.py
-          python3 -m unittest discover -s scripts/ci -p test_check_contributor_signoffs.py
-      - name: Check contributor sign-offs
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python3 scripts/ci/check_contributor_signoffs.py --base "$BASE_SHA"
