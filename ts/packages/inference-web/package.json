@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs",
+    "test": "pnpm run build && node --test test/*.test.mjs",
     "build": "tsc -p tsconfig.build.json",
     "prepack": "pnpm run build",
     "test:browser": "pnpm run build && node --test --test-concurrency=1 test/browser/*.test.mjs"

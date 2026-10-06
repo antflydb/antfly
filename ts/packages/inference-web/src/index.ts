@@ -55,7 +55,10 @@ type Gpu = {
   onFatalError?: (error: Error) => void;
 };
 async function moduleAt(base: string, name: string): Promise<any> {
-  return import(/* @vite-ignore */ new URL(name, base).href);
+  return import(
+    /* @vite-ignore */ /* webpackIgnore: true */ /* turbopackIgnore: true */ new URL(name, base)
+      .href
+  );
 }
 export async function detectCapabilities() {
   const gpu = (
@@ -240,8 +243,16 @@ export class InferenceClient {
       options.onProgress?.({ stage: "complete", loaded: 1, total: 1 });
       return { ...result, backend };
     } catch (error) {
-      // A trap can leave allocator/backend state invalid. Never reuse it.
-      if (generation === this.generation) this.stop();
+      // Request validation errors leave the loaded model usable. Traps and
+      // worker failures can leave runtime state invalid and require a reload.
+      const failure = error as Error & { fatal?: boolean };
+      if (
+        generation === this.generation &&
+        (failure?.fatal === true ||
+          failure instanceof WebAssembly.RuntimeError ||
+          failure?.cause instanceof WebAssembly.RuntimeError)
+      )
+        this.stop();
       throw error;
     } finally {
       options.signal?.removeEventListener("abort", abort);
@@ -262,4 +273,4 @@ export class InferenceClient {
   }
 }
 
-export { clearModelCache, downloadCatalogModel } from "./model-cache.ts";
+export { clearModelCache, downloadCatalogModel } from "./model-cache.js";

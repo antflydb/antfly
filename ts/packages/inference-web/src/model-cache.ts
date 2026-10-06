@@ -1,5 +1,5 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
-import type { CatalogFile, CatalogModel, Progress } from "./index";
+import type { CatalogFile, CatalogModel, Progress } from "./index.js";
 
 const DIRECTORY = "antfly-inference-models-v1";
 const DATABASE = "antfly-inference-catalog-v1";

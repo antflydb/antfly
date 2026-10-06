@@ -1275,9 +1275,8 @@ pub const WasmCompute = struct {
                             const w_gpu_buf = try self.gpu_weights.ensureResident(w);
                             var out_gpu = gpuSgemmTransBQuant(rows, out_dim, in_dim, inp_gpu.id, w_gpu_buf, out, k);
                             defer out_gpu.deinit();
-                            var bias_gpu = GpuInputTensor.fromBuf(b);
-                            defer bias_gpu.deinit();
-                            var biased_gpu = gpuBinaryBroadcast(out_gpu.id, bias_gpu.id, out.len, b.len, out, .add);
+                            const bias_gpu = try self.gpu_weights.ensureResident(b);
+                            var biased_gpu = gpuBinaryBroadcast(out_gpu.id, bias_gpu, out.len, b.len, out, .add);
                             return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, biased_gpu.detach(), true), rows, out_dim));
                         },
                         else => {
@@ -1711,11 +1710,16 @@ pub const WasmCompute = struct {
     fn modernGpuOp(self: *WasmCompute, input: *WasmBuf, indices: wasm_extern.GpuBufferId, len: usize, mode: u32, dim: usize, stride: usize, offset: usize, seq: usize, theta: f32) !CT {
         if (!build_options.enable_webgpu) return error.WebGpuUnavailable;
         const out = try self.allocator.alloc(f32, len);
+        var out_owned = true;
+        errdefer if (out_owned) self.allocator.free(out);
         var inp = GpuInputTensor.fromBuf(input);
         defer inp.deinit();
         var result = GpuTensor.create(len * 4);
+        errdefer if (result.id != 0) result.deinit();
         wasm_extern.gpu_modern_op(inp.id, indices, result.id, @intCast(len), mode, @intCast(dim), @intCast(stride), @intCast(offset), @intCast(seq), theta);
         const buf = WasmBuf.fromSliceWithGpu(self.allocator, out, true, result.detach(), true);
+        out_owned = false;
+        errdefer buf.deinit();
         if (mode == 3 or mode == 4) return fromBuf(try setBufShape2D(buf, len / dim, dim));
         return fromBuf(try copyBufShape(buf, input));
     }
@@ -1724,6 +1728,8 @@ pub const WasmCompute = struct {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         if (!build_options.enable_webgpu or !self.use_gpu or !self.resident_dense_gpu or seq > WEBGPU_ATTN_MAX_SEQ) return null;
         const out = try self.allocator.alloc(f32, batch * seq * heads * dim);
+        var out_owned = true;
+        errdefer if (out_owned) self.allocator.free(out);
         var q_gpu = GpuInputTensor.fromBuf(toBuf(q));
         defer q_gpu.deinit();
         var k_gpu = GpuInputTensor.fromBuf(toBuf(k));
@@ -1731,7 +1737,11 @@ pub const WasmCompute = struct {
         var v_gpu = GpuInputTensor.fromBuf(toBuf(v));
         defer v_gpu.deinit();
         var result = gpuAttention(batch, seq, heads, dim, 1 / @sqrt(@as(f32, @floatFromInt(dim))), q_gpu.id, k_gpu.id, v_gpu.id, mask, out, half + 1);
-        return fromBuf(try setBufShape2D(WasmBuf.fromSliceWithGpu(self.allocator, out, true, result.detach(), true), batch * seq, heads * dim));
+        errdefer if (result.id != 0) result.deinit();
+        const buf = WasmBuf.fromSliceWithGpu(self.allocator, out, true, result.detach(), true);
+        out_owned = false;
+        errdefer buf.deinit();
+        return fromBuf(try setBufShape2D(buf, batch * seq, heads * dim));
     }
 
     fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {

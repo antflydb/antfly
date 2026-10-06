@@ -9,9 +9,12 @@ The playground UI and model catalog live in Colony at
 
 From `ts/`, run `pnpm --filter @antfly/inference-web build`, `typecheck`, and
 `test`. The package emits ESM JavaScript and declarations into `dist/`.
-The existing npm workflow accepts `ts/antfly/inference-web/v*` after its npm
-trusted publisher is configured. No package or runtime release is implied by
-this source change.
+The existing npm workflow accepts `ts/antfly/inference-web/v*` after an
+`@antfly/inference-web` package has been published once and its trusted publisher
+is configured for `.github/workflows/ts-npm-publish.yml` (environment `npm`)
+with direct publish permission. An npm maintainer must bootstrap that first
+release; a tag alone cannot create a trusted publisher for a package that does
+not yet exist. No package or runtime release is implied by this source change.
 
 The client and runtime assets must come from the same revision. Build both
 artifacts serially, from `zig/` with the repository's pinned Zig toolchain:

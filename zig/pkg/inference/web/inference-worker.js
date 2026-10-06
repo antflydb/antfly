@@ -623,6 +623,9 @@ self.onmessage = async (e) => {
             gpu_matmul_transb_iq3_xxs_mmv: () => {},
             gpu_matmul_transb_iq3_s_mmv: () => {},
             gpu_attention: () => {},
+            gpu_attention_local: () => {},
+            gpu_matmul_transb_f16: () => {},
+            gpu_modern_op: () => {},
             gpu_deberta_disentangled_attention: () => {},
             gpu_causal_attention: () => {},
             gpu_gqa_causal_attention: () => {},
@@ -2127,6 +2130,6 @@ self.onmessage = async (e) => {
       }
     }
   } catch (err) {
-    self.postMessage({ type: 'error', id, message: err.message });
+    self.postMessage({ type: 'error', id, message: err.message, fatal: err instanceof WebAssembly.RuntimeError || err?.cause instanceof WebAssembly.RuntimeError });
   }
 };

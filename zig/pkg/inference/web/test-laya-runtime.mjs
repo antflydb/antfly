@@ -56,6 +56,21 @@ test('tiny Laya WASM: packed layouts, pointer, two-stage, Q8 and OpenDecider', {
       assert(geometry.encoded_tokens > 0);
       const output = session.run(layaRequest).value;
       assert.deepEqual(output.data[0].decisions.map(d => d.type), ['choice', 'score', 'boolean']);
+      if (precision === 'fp32' && Object.keys(extra).length === 0) {
+        // Stable numerical regression baseline for the deterministic tiny
+        // checkpoint. Released-model oracle tests run separately when present.
+        const expected = [
+          { label: 'fetch', probabilities: [0.33324423, 0.33341044, 0.33334532], act: 0.53863657 },
+          { label: 'high', probabilities: [0.33296826, 0.33311945, 0.33391225], act: 0.54081124 },
+          { label: 'true', probabilities: [0.49963111, 0.50036889], act: 0.53691679 },
+        ];
+        for (const [i, decision] of output.data[0].decisions.entries()) {
+          assert.equal(decision.label, expected[i].label);
+          for (const [j, probability] of decision.probabilities.entries())
+            assert(Math.abs(probability.probability - expected[i].probabilities[j]) < 1e-5);
+          assert(Math.abs(decision.act_probability - expected[i].act) < 1e-5);
+        }
+      }
       assert.deepEqual(session.run(layaRequest).value, output, JSON.stringify(extra));
       for (const d of output.data[0].decisions) {
         assert(Math.abs(d.probabilities.reduce((sum, p) => sum + p.probability, 0) - 1) < 1e-5);

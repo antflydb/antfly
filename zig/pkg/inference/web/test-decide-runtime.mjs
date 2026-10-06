@@ -33,6 +33,11 @@ test('Decide WASM rejects wrong geometry, tensor shapes, duplicates and incomple
   try {
     assert.throws(() => create({ ...encoder, hidden_size: 768 }), /UnsupportedGlinerDecideConfig/);
     session.handle = create();
+    const unsupportedNormalizer = new TextEncoder().encode(JSON.stringify({
+      model: { type: 'Unigram', unk_id: 0, vocab: [['<unk>', 0]] },
+      normalizer: { type: 'Precompiled', precompiled_charsmap: '' },
+    }));
+    assert.throws(() => session.check(session.bytes(unsupportedNormalizer, (p, n) => instance.exports.extraction_tokenizer(session.handle, p, n))), /UnsupportedTokenizerNormalizer/);
     assert.throws(() => weight('classifier.0.weight', [2048, 768]), /InvalidGlinerTensorShape/);
     assert.throws(() => weight('unrecognized.weight', [1]), /UnexpectedGlinerTensor/);
     weight('classifier.2.bias', [1]);

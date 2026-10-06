@@ -8,9 +8,9 @@ export function layaFixture(extra = {}, precision = 'fp32') {
     const data = new Float32Array(shape.reduce((a, b) => a * b, 1));
     for (let i = 0; i < data.length; i++) {
       seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-      data[i] = norm ? 1 : name.endsWith('bias') ? 0 : ((seed / 2 ** 32) - .5) * .15;
+      data[i] = norm ? 1 : ((seed / 2 ** 32) - .5) * .15;
     }
-    let stored = precision === 'fp16' && !norm && !name.endsWith('bias') ? new Float16Array(data) : data;
+    let stored = precision === 'fp16' && !norm ? new Float16Array(data) : data;
     if (precision === 'bf16' && !norm && !name.endsWith('bias')) {
       stored = new Uint16Array(data.length);
       const bits = new Uint32Array(data.buffer);

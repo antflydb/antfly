@@ -128,7 +128,7 @@ pub fn tokenizer(handle: u32, json: []const u8) !void {
     const model = try get(handle);
     if (model.ready or model.tokenizer != null) return error.InvalidLoadState;
     if (json.len > 32 * 1024 * 1024) return error.TokenizerLimitExceeded;
-    model.tokenizer = try HfTokenizer.loadFromBytes(model.budget.allocator(), json);
+    model.tokenizer = try HfTokenizer.loadFromBytesWithOptions(model.budget.allocator(), json, .{ .strict_unigram_normalizer = true });
     model.tokenizer_digest = bundle.Digest.of(json);
 }
 

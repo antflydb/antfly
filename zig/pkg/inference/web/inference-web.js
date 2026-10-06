@@ -213,8 +213,8 @@ export class InferenceWeb {
     this._worker = new Worker(workerUrl, { type: 'module' });
 
     this._worker.onmessage = (e) => this._onWorkerMessage(e);
-    this._worker.onerror = (event) => this._rejectPending(new Error(event.message || 'Inference worker failed'));
-    this._worker.onmessageerror = () => this._rejectPending(new Error('Invalid inference worker message'));
+    this._worker.onerror = (event) => this._rejectPending(Object.assign(new Error(event.message || 'Inference worker failed'), { fatal: true }));
+    this._worker.onmessageerror = () => this._rejectPending(Object.assign(new Error('Invalid inference worker message'), { fatal: true }));
 
     // Resolve wasm candidates to absolute URLs for the worker's fetch() fallback chain.
     const absWasmUrls = wasmCandidates.map((candidate) =>
@@ -253,7 +253,7 @@ export class InferenceWeb {
       const pending = this._pendingCalls.get(id);
       if (pending) {
         this._pendingCalls.delete(id);
-        pending.reject(new Error(e.data.message));
+        pending.reject(Object.assign(new Error(e.data.message), { fatal: e.data.fatal === true }));
       }
       return;
     }
@@ -3825,6 +3825,10 @@ function _gpuStubs() {
     gpu_reduce_mean: () => {},
     gpu_broadcast_in_dim: () => {},
     gpu_attention: () => {},
+    gpu_attention_local: () => {},
+    gpu_matmul_transb_f16: () => {},
+    gpu_modern_op: () => {},
+    gpu_deberta_disentangled_attention: () => {},
     gpu_causal_attention: () => {},
     gpu_gqa_causal_attention: () => {},
     gpu_gqa_cached_attention: () => {},
