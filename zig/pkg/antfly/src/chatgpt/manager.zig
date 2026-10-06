@@ -35,7 +35,7 @@ const Record = struct {
     scope: []const u8,
     expires_at: i64,
 };
-const State = struct { version: u32 = 1, host_id: []const u8, accounts: []Record = &.{} };
+const State = struct { version: u32 = 2, host_id: []const u8, accounts: []Record = &.{} };
 // Every successful save must remain readable, including after a restart.
 const max_store_bytes = 1024 * 1024;
 const Token = struct { access_token: []const u8, refresh_token: ?[]const u8 = null, id_token: ?[]const u8 = null, scope: ?[]const u8 = null, expires_in: i64, token_type: []const u8 };
@@ -95,6 +95,7 @@ const Attempt = struct {
         return ctx.text(if (self.outcome.status == .connected) "ChatGPT connection saved. Return to Antfarm." else "ChatGPT connection was not enabled. Return to Antfarm.");
     }
     fn complete(self: *Attempt, ctx: *httpx.Context) !void {
+        try self.manager.checkOwner(self.owner);
         if (self.selected_pin) |pin| try pin.check(self.selected_id.?);
         if (ctx.query("error")) |err| {
             self.outcome = .{ .status = if (std.mem.eql(u8, err, "access_denied")) .declined else .@"error" };
@@ -166,6 +167,7 @@ pub const Manager = struct {
     process_lock: std.Io.File,
     attempts: std.ArrayList(*Attempt) = .empty,
     sessions: std.ArrayList(*Session) = .empty,
+    revoked_owners: std.StringHashMapUnmanaged(void) = .{},
     // Transport override exists only in test builds. Production origins are pinned
     // and cannot be supplied through configuration or a management request.
     test_auth_origin: if (@import("builtin").is_test) ?[]const u8 else void = if (@import("builtin").is_test) null else {},
@@ -198,8 +200,18 @@ pub const Manager = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var saved = try manager.load(arena.allocator());
-        scrub(saved.value);
-        saved.deinit();
+        defer {
+            scrub(saved.value);
+            saved.deinit();
+        }
+        // Username-based grants cannot be safely attributed to a user creation.
+        // Retain the host identity, but require explicit consent under v2 owners.
+        if (saved.value.version == 1) {
+            scrub(saved.value);
+            saved.value.accounts = &.{};
+            saved.value.version = 2;
+            try manager.save(saved.value);
+        }
         return manager;
     }
     pub fn deinit(self: *Manager) void {
@@ -216,6 +228,9 @@ pub const Manager = struct {
             self.alloc.destroy(s);
         }
         self.sessions.deinit(self.alloc);
+        var revoked = self.revoked_owners.keyIterator();
+        while (revoked.next()) |owner| self.alloc.free(owner.*);
+        self.revoked_owners.deinit(self.alloc);
         self.attempts.deinit(self.alloc);
         self.process_lock.unlock(self.io);
         self.process_lock.close(self.io);
@@ -260,7 +275,7 @@ pub const Manager = struct {
             scrub(result.value);
             result.deinit();
         }
-        if (result.value.version != 1 or !std.mem.startsWith(u8, result.value.host_id, "urn:uuid:") or result.value.accounts.len > 128) return error.InvalidCredentialStore;
+        if ((result.value.version != 1 and result.value.version != 2) or !std.mem.startsWith(u8, result.value.host_id, "urn:uuid:") or result.value.accounts.len > 128) return error.InvalidCredentialStore;
         for (result.value.accounts, 0..) |account, i| {
             if (account.connection_id.len == 0 or account.owner.len == 0 or account.subject.len == 0 or account.client_id.len == 0 or std.mem.eql(u8, account.client_id, "dynamic_agent_client")) return error.InvalidCredentialStore;
             for (result.value.accounts[0..i]) |previous| if (std.mem.eql(u8, previous.connection_id, account.connection_id)) return error.InvalidCredentialStore;
@@ -323,6 +338,7 @@ pub const Manager = struct {
         self.reap();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        try self.checkOwner(owner);
         if (self.attempts.items.len >= 64) return error.CapacityExhausted;
         const attempt = try self.alloc.create(Attempt);
         errdefer self.alloc.destroy(attempt);
@@ -417,6 +433,7 @@ pub const Manager = struct {
     pub fn pinWithContext(self: *Manager, owner: []const u8, id: []const u8, context: RequestContext) !Pin {
         try self.lockWithContext(context);
         defer self.mutex.unlock(self.io);
+        try self.checkOwner(owner);
         var state = try self.load(self.alloc);
         defer {
             scrub(state.value);
@@ -436,6 +453,7 @@ pub const Manager = struct {
     pub fn leaseBoundWithContext(self: *Manager, a: std.mem.Allocator, owner: []const u8, id: []const u8, expected: ?Pin, context: RequestContext) !Lease {
         try self.lockWithContext(context);
         defer self.mutex.unlock(self.io);
+        try self.checkOwner(owner);
         if (expected) |binding| try binding.check(id);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
@@ -483,6 +501,52 @@ pub const Manager = struct {
         try context.check();
         const s = try self.session(id);
         return .{ .alloc = a, .access_token = try a.dupe(u8, rec.access_token), .session = s, .epoch = s.epoch.load(.acquire) };
+    }
+    fn checkOwner(self: *Manager, owner: []const u8) !void {
+        if (self.revoked_owners.contains(owner)) return error.ChatGPTReconnectRequired;
+    }
+    /// User deletion must complete local revocation before username reuse.
+    /// Fence request-start identities too: an already authenticated request
+    /// cannot begin another sign-in after the deletion guard has run.
+    pub fn removeOwner(self: *Manager, owner: []const u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.revoked_owners.contains(owner)) {
+            const owned = try self.alloc.dupe(u8, owner);
+            errdefer self.alloc.free(owned);
+            try self.revoked_owners.put(self.alloc, owned, {});
+        }
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var saved = try self.load(a);
+        defer {
+            scrub(saved.value);
+            saved.deinit();
+        }
+        var retained: std.ArrayList(Record) = .empty;
+        for (saved.value.accounts) |record| {
+            if (std.mem.eql(u8, record.owner, owner)) {
+                for (self.sessions.items) |current| if (std.mem.eql(u8, current.id, record.connection_id)) {
+                    _ = current.epoch.fetchAdd(1, .acq_rel);
+                };
+                scrubRecord(record);
+            } else try retained.append(a, record);
+        }
+        for (self.attempts.items) |attempt| {
+            if (attempt.outcome.status != .pending or !std.mem.eql(u8, attempt.owner, owner)) continue;
+            attempt.outcome = .{ .status = .declined };
+            std.crypto.secureZero(u8, @constCast(attempt.verifier));
+        }
+        saved.value.accounts = retained.items;
+        try self.save(saved.value);
+    }
+    pub fn revokeDeletedUser(raw: *anyopaque, instance_id: [16]u8) bool {
+        const self: *Manager = @ptrCast(@alignCast(raw));
+        const owner = userOwner(self.alloc, instance_id) catch return false;
+        defer self.alloc.free(owner);
+        self.removeOwner(owner) catch return false;
+        return true;
     }
     pub fn disconnect(self: *Manager, owner: []const u8, id: []const u8) !bool {
         self.mutex.lockUncancelable(self.io);
@@ -982,4 +1046,126 @@ test "chatgpt manager rejects oversized updates without replacing durable creden
         try std.testing.expectEqualStrings("refresh", account.refresh_token);
         try std.testing.expectEqualStrings("identity", account.id_token);
     }
+}
+
+/// Namespaces distinguish authenticated users from the auth-disabled local owner.
+pub fn userOwner(a: std.mem.Allocator, instance_id: [16]u8) ![]u8 {
+    if (std.mem.allEqual(u8, &instance_id, 0)) return error.Forbidden;
+    const hex = std.fmt.bytesToHex(instance_id, .lower);
+    return std.fmt.allocPrint(a, "user:{s}", .{hex});
+}
+
+test "chatgpt user deletion cancels grants and signins before username recreation" {
+    const usermgr = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var store = usermgr.MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var users = try usermgr.UserManager.init(a, store.iface(), try usermgr.initDefaultEnforcer(a, policies.iface()));
+    defer users.deinit();
+    var first = try users.createUser("alice", "first-password", &.{});
+    defer first.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var instance = try Manager.init(a, io, root);
+    var closed = false;
+    defer if (!closed) instance.deinit();
+    users.personal_grant_revoker = .{ .ptr = &instance, .revoke_fn = Manager.revokeDeletedUser };
+    defer users.personal_grant_revoker = null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const local = arena.allocator();
+    const owner = try userOwner(local, first.instance_id);
+    var saved = try instance.load(local);
+    defer saved.deinit();
+    try instance.save(.{ .host_id = saved.value.host_id, .accounts = @constCast(&[_]Record{
+        .{ .connection_id = "one", .owner = owner, .subject = "old-chatgpt-user", .email = "old@example.com", .client_id = "issued-client", .access_token = "old-access", .refresh_token = "refresh", .id_token = "", .scope = protocol.scopes, .expires_at = now(io) + 3600 },
+        .{ .connection_id = "other", .owner = "other-owner", .subject = "other", .email = "other@example.com", .client_id = "other-client", .access_token = "other-access", .refresh_token = "", .id_token = "", .scope = protocol.scopes, .expires_at = now(io) + 3600 },
+    }) });
+    var lease = try instance.lease(a, owner, "one");
+    defer lease.deinit();
+    const pin = try instance.pin(owner, "one");
+    const selected = try instance.begin(local, owner, "one");
+    const pending = try instance.begin(local, owner, null);
+    const unrelated = try instance.begin(local, "other-owner", null);
+    const callback_uri = instance.attempts.items[0].callback_uri;
+    try users.deleteUser("alice");
+    try std.testing.expect(lease.cancelled());
+    try std.testing.expectError(error.ChatGPTReconnectRequired, pin.check("one"));
+    try std.testing.expectEqual(Status.declined, (try instance.outcome(local, owner, selected.attempt_id)).status);
+    try std.testing.expectEqual(Status.declined, (try instance.outcome(local, owner, pending.attempt_id)).status);
+    try std.testing.expectEqual(Status.pending, (try instance.outcome(local, "other-owner", unrelated.attempt_id)).status);
+    try std.testing.expectError(error.ChatGPTReconnectRequired, instance.begin(local, owner, null));
+    try std.testing.expectError(error.ChatGPTReconnectRequired, instance.lease(a, owner, "one"));
+    var http = instance.client(local);
+    defer http.deinit();
+    const late_url = try std.fmt.allocPrint(local, "{s}?state={s}&code=late&client_id=issued-client", .{ callback_uri, selected.attempt_id });
+    var response = try http.get(late_url, .{ .timeout_ms = 5000 });
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    var replacement = try users.createUser("alice", "replacement-password", &.{});
+    defer replacement.deinit(a);
+    var authenticated = try users.authenticateUser("alice", "replacement-password");
+    defer authenticated.deinit(a);
+    const new_owner = try userOwner(local, authenticated.instance_id);
+    try std.testing.expect(!std.mem.eql(u8, owner, new_owner));
+    try std.testing.expectEqual(@as(usize, 0), (try instance.summaries(local, new_owner)).len);
+    try std.testing.expectError(error.NotFound, instance.lease(a, new_owner, "one"));
+    _ = try instance.begin(local, new_owner, null);
+    var retained = try instance.load(local);
+    defer {
+        scrub(retained.value);
+        retained.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), retained.value.accounts.len);
+    try std.testing.expectEqualStrings("other-access", retained.value.accounts[0].access_token);
+    // The anonymous owner namespace cannot collide with a database username.
+    var named_local = try users.createUser("local-owner", "password", &.{});
+    defer named_local.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, "local:", try userOwner(local, named_local.instance_id)));
+    users.personal_grant_revoker = null;
+    instance.deinit();
+    closed = true;
+    var reopened = try Manager.init(a, io, root);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(usize, 0), (try reopened.summaries(local, owner)).len);
+    try std.testing.expectEqual(@as(usize, 0), (try reopened.summaries(local, new_owner)).len);
+    try std.testing.expectError(error.NotFound, reopened.lease(a, new_owner, "one"));
+    var other = try reopened.lease(a, "other-owner", "other");
+    defer other.deinit();
+    try std.testing.expectEqualStrings("other-access", other.access_token);
+}
+
+test "chatgpt legacy username grants require consent after ownership migration" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var instance = try Manager.init(a, io, root);
+    var closed = false;
+    defer if (!closed) instance.deinit();
+    var saved = try instance.load(a);
+    defer saved.deinit();
+    const host = try a.dupe(u8, saved.value.host_id);
+    defer a.free(host);
+    try instance.save(.{ .version = 1, .host_id = host, .accounts = @constCast(&[_]Record{
+        .{ .connection_id = "one", .owner = "alice", .subject = "old", .email = "old@example.com", .client_id = "issued-client", .access_token = "old-access", .refresh_token = "refresh", .id_token = "", .scope = protocol.scopes, .expires_at = now(io) + 3600 },
+    }) });
+    instance.deinit();
+    closed = true;
+    var reopened = try Manager.init(a, io, root);
+    defer reopened.deinit();
+    var migrated = try reopened.load(a);
+    defer migrated.deinit();
+    try std.testing.expectEqual(@as(u32, 2), migrated.value.version);
+    try std.testing.expectEqual(@as(usize, 0), migrated.value.accounts.len);
+    try std.testing.expectEqualStrings(host, migrated.value.host_id);
+    try std.testing.expectError(error.NotFound, reopened.lease(a, "alice", "one"));
 }

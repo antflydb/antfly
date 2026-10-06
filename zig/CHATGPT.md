@@ -307,10 +307,19 @@ bounded request history for tool continuation and never enter browser storage.
 
 The standalone runtime enables personal connections only when its public listener
 binds to `127.0.0.1`, `::1`, or `localhost`. Serve the bundled Antfarm from that same
-origin. Basic-auth users own separate registrations; when database auth is
+origin. Basic-auth users own separate registrations by persistent user-creation
+ID, rather than username. That ID survives password changes, restart and auth
+seed restoration; recreating a username creates a new ID. When database auth is
 disabled there is one local owner. API keys, internal service identities, remote
 origins and replicated provider configuration cannot consume a personal grant.
 Existing database authorization still applies to every retrieval operation.
+User deletion first removes that ID's local registrations, invalidates active
+leases and declines pending sign-ins while username reuse is fenced. Requests
+carrying the deleted identity cannot begin another sign-in. A local revocation
+failure blocks deletion. Other users' registrations remain intact.
+The anonymous local owner uses a separate namespace. Registry version 2 drops
+legacy username-bound grants and requires reconnecting because their original
+user creation cannot be recovered safely; the host identity is preserved.
 Antfarm's development proxy preserves the browser Host for loopback API targets,
 so its same-origin requests pass the runtime checks without rewriting Origin.
 
@@ -447,3 +456,10 @@ parts, and preservation of refusal content and message phase in follow-up input.
 The latest regressions verify proxy headers using the actual Vite configuration
 and preserve credential bytes and restart behavior after oversized updates.
 All 221 runtime/generation tests and 166 Antfarm tests pass; Antfarm builds successfully.
+
+Ownership regressions cover deletion, username recreation, active lease and pin
+cancellation, selected and unselected pending callbacks, stale request fencing,
+restart and preservation of other owners' grants. Auth tests verify durable user
+IDs, password changes, legacy-user migration, failed deletion guards and auth
+seed restoration. All 223 runtime/generation tests and 18 user-manager tests
+pass, including the user-manager archive boundary check.

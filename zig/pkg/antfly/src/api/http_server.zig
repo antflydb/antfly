@@ -1940,6 +1940,8 @@ pub const TableVisibility = enum {
 
 pub const AuthenticatedIdentity = struct {
     const CatalogAlias = struct { logical: []u8, physical: []u8 };
+    /// Present only for a locally authenticated database user.
+    user_instance_id: ?[16]u8 = null,
     username: []u8,
     /// Borrowed from the serving ApiHttpServer. Target-table operations
     /// intersect the request's admitted permission snapshot with this live
@@ -7537,6 +7539,7 @@ pub const ApiHttpServer = struct {
             defer self.alloc.free(credential_principal);
             var identity = try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
             identity.live_user_manager = manager;
+            identity.user_instance_id = user.instance_id;
             return identity;
         }
 

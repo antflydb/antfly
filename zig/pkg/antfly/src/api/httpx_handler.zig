@@ -4018,15 +4018,16 @@ pub const AntflyApiHandler = struct {
         }
         if (identity) |authenticated| {
             if (authenticated.is_internal_service or !std.mem.startsWith(u8, authenticated.credential_principal, "basic:")) return error.Forbidden;
-            return authenticated.username;
+            return @import("../chatgpt/manager.zig").userOwner(ctx.allocator, authenticated.user_instance_id orelse return error.Forbidden);
         }
-        return "local-owner";
+        return ctx.allocator.dupe(u8, "local:");
     }
     pub fn authorizeChatGPT(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var identity: ?AuthenticatedIdentity = null;
         defer if (identity) |*id| id.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const owner = self.personalOwner(ctx, identity) catch return jsonErrorResponse(ctx, 403, "Personal connections require a trusted local runtime.");
+        defer ctx.allocator.free(owner);
         const body = (try ctx.body()) orelse "{}";
         var parsed = std.json.parseFromSlice(struct { connection_id: ?[]const u8 = null }, ctx.allocator, body, .{}) catch return jsonErrorResponse(ctx, 400, "Invalid connection request.");
         defer parsed.deinit();
@@ -4040,6 +4041,7 @@ pub const AntflyApiHandler = struct {
         defer if (identity) |*id| id.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const owner = self.personalOwner(ctx, identity) catch return jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
         const outcome = self.api_server.cfg.chatgpt.?.outcome(ctx.allocator, owner, attempt_id) catch |err| return chatGPTFailure(ctx, err);
         defer if (outcome.connection_id) |id| ctx.allocator.free(id);
         return ctx.json(outcome);
@@ -4049,6 +4051,7 @@ pub const AntflyApiHandler = struct {
         defer if (identity) |*id| id.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const owner = self.personalOwner(ctx, identity) catch return jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
         const accounts = self.api_server.cfg.chatgpt.?.summaries(ctx.allocator, owner) catch |err| return chatGPTFailure(ctx, err);
         defer {
             for (accounts) |account| {
@@ -4065,6 +4068,7 @@ pub const AntflyApiHandler = struct {
         defer if (identity) |*id| id.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const owner = self.personalOwner(ctx, identity) catch return jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
         const body = self.api_server.cfg.chatgpt.?.models(ctx.allocator, owner, connection_id) catch |err| return chatGPTFailure(ctx, err);
         defer ctx.allocator.free(body);
         return jsonResponse(ctx, 200, body);
@@ -4074,6 +4078,7 @@ pub const AntflyApiHandler = struct {
         defer if (identity) |*id| id.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const owner = self.personalOwner(ctx, identity) catch return jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
         const confirmed = self.api_server.cfg.chatgpt.?.disconnect(owner, connection_id) catch |err| return chatGPTFailure(ctx, err);
         return ctx.json(.{ .revocation_confirmed = confirmed });
     }
@@ -6125,9 +6130,11 @@ pub const AntflyApiHandler = struct {
 
         const RetrievalQueryRunner = AgentQueryRunner;
         const RetrievalGenerationRunner = AgentGenerationRunner;
+        const personal_owner = self.personalOwner(ctx, authenticated_identity) catch null;
+        defer if (personal_owner) |owner| ctx.allocator.free(owner);
         var generation_runner = RetrievalGenerationRunner{
             .chatgpt = self.api_server.cfg.chatgpt,
-            .personal_owner = self.personalOwner(ctx, authenticated_identity) catch null,
+            .personal_owner = personal_owner,
             .antfly_provider = self.api_server.antfly_provider,
             .secret_store = self.api_server.cfg.secret_store,
             .io = self.api_server.inferenceIo(),
