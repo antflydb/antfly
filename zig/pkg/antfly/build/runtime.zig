@@ -157,7 +157,9 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .api_kernel => role_imports.configureApi(role_mod, link_libc),
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
-        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .enrichment_compute, true, role_imports.boundary_profile);
+        // Compute owns document/media processing, not a physical storage handle.
+        // Only the storage kernel may declare physical DB source inputs.
+        role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel, true, role_imports.boundary_profile);
         if (unit == .inference) {
             const native_exports = b.createModule(.{
                 .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
