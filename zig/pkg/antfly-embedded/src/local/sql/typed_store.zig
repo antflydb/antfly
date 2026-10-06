@@ -7,6 +7,19 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const A = std.mem.Allocator;
+/// Conservative physical payload estimate before cardinality is known.
+/// Allocation admission still accounts for actual vector/hash capacity growth.
+pub fn retainedCellBytes(value: Datum) !usize {
+    return 1 +| (if (value.patterns != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
+        .integer, .float => @as(usize, 8),
+        .bool => @as(usize, 1),
+        .string, .number_string => |text| @sizeOf([]const u8) +| text.len +| 32,
+        else => try @import("operators.zig").datumBytes(value),
+    };
+}
+pub fn columnMetadataBytes(width: usize) usize {
+    return width *| @sizeOf(Column);
+}
 const Dictionary = struct {
     values: std.ArrayList([]const u8) = .empty,
     indices: std.ArrayList(u32) = .empty,
@@ -181,6 +194,132 @@ const Column = struct {
         };
         return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row] };
     }
+    fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
+        if (batch != .dictionary or self.patterns.items.len != 0) return false;
+        const source = batch.dictionary;
+        for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
+        const remap = try a.alloc(u32, source.values.len);
+        defer a.free(remap);
+        @memset(remap, std.math.maxInt(u32));
+        for (source.indices) |id| {
+            remap[id] = 0;
+        }
+        var tag: ?std.meta.Tag(std.json.Value) = null;
+        var referenced: usize = 0;
+        for (source.values, remap) |value, id| {
+            if (id == std.math.maxInt(u32)) continue;
+            if (value.patterns != null) return false;
+            if (value.sql_null) continue;
+            const actual = std.meta.activeTag(value.value);
+            if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
+            if (tag != null and tag.? != actual) return false;
+            tag = actual;
+            referenced += 1;
+        }
+        if (tag == null) return false;
+        // Preserve encoding only when it saves numeric storage. Parquet may
+        // dictionary-encode unique IDs; importing that representation must not
+        // override the retained store's flat/high-cardinality policy.
+        const flat_numeric = switch (self.values) {
+            .unknown => tag.? == .integer or tag.? == .float,
+            inline .integers, .numbers => |v| !v.encoded,
+            else => false,
+        };
+        if (flat_numeric and referenced > source.indices.len / 2) return false;
+        if (self.values != .unknown) {
+            const compatible = switch (self.values) {
+                .integers => |v| tag.? == .integer and (v.encoded or !v.sampled),
+                .numbers => |v| tag.? == .float and (v.encoded or !v.sampled),
+                .strings => |v| tag.? == .string and v.flat == null,
+                .decimals => |v| tag.? == .number_string and v.flat == null,
+                else => false,
+            };
+            if (!compatible) return false;
+        } else {
+            self.values = switch (tag.?) {
+                .integer => .{ .integers = .empty },
+                .float => .{ .numbers = .empty },
+                .string => .{ .strings = .empty },
+                .number_string => .{ .decimals = .empty },
+                else => unreachable,
+            };
+            switch (self.values) {
+                inline .integers, .numbers => |*v| try v.resize(a, begin),
+                .strings, .decimals => |*v| try v.resizeNulls(a, begin),
+                else => unreachable,
+            }
+        }
+        switch (self.values) {
+            inline .integers, .numbers => |*v| {
+                if (!v.encoded) {
+                    for (v.flat.items) |value| try v.encodeOne(a, value);
+                    v.flat.clearAndFree(a);
+                    v.encoded = true;
+                    v.sampled = true;
+                }
+                for (source.values, remap) |value, *id| {
+                    if (id.* == std.math.maxInt(u32)) continue;
+                    id.* = 0;
+                    if (value.sql_null) continue;
+                    const number = if (@TypeOf(v.*) == Numeric(i64)) value.value.integer else value.value.float;
+                    const entry = try v.lookup.getOrPut(a, @as(u64, @bitCast(number)));
+                    if (!entry.found_existing) {
+                        entry.value_ptr.* = std.math.cast(u32, v.values.items.len) orelse return error.SqlProgramLimitExceeded;
+                        try v.values.append(a, number);
+                    }
+                    id.* = entry.value_ptr.*;
+                }
+                try v.indices.ensureUnusedCapacity(a, source.indices.len);
+                for (source.indices) |id| v.indices.appendAssumeCapacity(remap[id]);
+                if (v.values.items.len >= 512 and v.values.items.len > v.indices.items.len / 2) {
+                    var flat: @TypeOf(v.flat) = .empty;
+                    errdefer flat.deinit(a);
+                    try flat.ensureTotalCapacity(a, v.indices.items.len);
+                    for (v.indices.items) |id| flat.appendAssumeCapacity(v.values.items[id]);
+                    v.values.clearAndFree(a);
+                    v.indices.clearAndFree(a);
+                    v.lookup.clearAndFree(a);
+                    v.flat = flat;
+                    v.encoded = false;
+                }
+            },
+            .strings, .decimals => |*v| {
+                for (source.values, remap) |value, *id| {
+                    if (id.* == std.math.maxInt(u32)) continue;
+                    id.* = 0;
+                    if (value.sql_null) continue;
+                    const text = if (value.value == .string) value.value.string else value.value.number_string;
+                    if (v.lookup.get(text)) |prior| {
+                        id.* = prior;
+                        continue;
+                    }
+                    const bytes = try owned.dupe(u8, text);
+                    id.* = std.math.cast(u32, v.values.items.len) orelse return error.SqlProgramLimitExceeded;
+                    try v.values.append(a, bytes);
+                    try v.lookup.put(a, bytes, id.*);
+                }
+                try v.indices.ensureUnusedCapacity(a, source.indices.len);
+                for (source.indices) |id| v.indices.appendAssumeCapacity(remap[id]);
+                if (v.values.items.len >= 512 and v.values.items.len > v.indices.items.len / 2) {
+                    var flat: std.ArrayList([]const u8) = .empty;
+                    errdefer flat.deinit(a);
+                    try flat.ensureTotalCapacity(a, v.indices.items.len);
+                    for (v.indices.items) |id| flat.appendAssumeCapacity(if (v.values.items.len == 0) &.{} else v.values.items[id]);
+                    v.values.clearAndFree(a);
+                    v.indices.clearAndFree(a);
+                    v.lookup.clearAndFree(a);
+                    v.flat = flat;
+                }
+            },
+            else => unreachable,
+        }
+        for (source.indices, 0..) |id, offset| {
+            const row = begin + offset;
+            if (row % 64 == 0) try self.nulls.append(a, 0);
+            if (source.values[id].sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
+        }
+        return true;
+    }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
         if (row % 64 == 0) try self.nulls.append(a, 0);
         if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
@@ -279,8 +418,46 @@ pub const Store = struct {
         };
         return if (stored.isNull(row_index)) 0 else @as(u64, id) + 1;
     }
+    pub fn dictionaryBatch(self: *const Store, a: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").Batch {
+        if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
+        const stored = self.columns[column];
+        if (stored.patterns.items.len != 0) return null;
+        switch (stored.values) {
+            inline .integers, .numbers => |v| if (!v.encoded) return null,
+            .strings, .decimals => |v| if (v.flat != null) return null,
+            else => return null,
+        }
+        // Export only referenced entries. A small delivery slice must not
+        // retain or reconstruct a relation's entire dictionary.
+        const values = try a.alloc(Datum, count + 1);
+        errdefer a.free(values);
+        values[0] = .{};
+        const indices = try a.alloc(u32, count);
+        errdefer a.free(indices);
+        var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+        defer ids.deinit(a);
+        var used: usize = 1;
+        for (indices, 0..) |*id, offset| {
+            const physical = (try self.dictionaryId(begin + offset, column)).?;
+            if (physical == 0) {
+                id.* = 0;
+                continue;
+            }
+            const entry = try ids.getOrPut(a, physical);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = @intCast(used);
+                values[used] = try stored.cell(a, begin + offset);
+                used += 1;
+            }
+            id.* = entry.value_ptr.*;
+        }
+        return .{ .dictionary = .{ .values = try a.realloc(values, used), .indices = indices } };
+    }
     pub fn appendBytes(self: *const Store, values: []const Datum) !usize {
-        var bytes: usize = 0;
+        // Estimate retained column storage, not a reconstructed Datum row.
+        // Callers reserve growth headroom separately; the allocator remains
+        // the authority for actual admission, including representation changes.
+        var bytes: usize = if (self.initialized) 0 else columnMetadataBytes(values.len);
         for (values, 0..) |value, index| {
             var repeated = false;
             if (!value.sql_null and index < self.columns.len) {
@@ -288,7 +465,8 @@ pub const Store = struct {
                 if (column.values == .strings and value.value == .string) repeated = column.values.strings.lookup.contains(value.value.string);
                 if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.lookup.contains(value.value.number_string);
             }
-            bytes +|= if (repeated) @sizeOf(Datum) else try @import("operators.zig").datumBytes(value);
+            bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
+            if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
         }
         return bytes;
     }
@@ -304,11 +482,19 @@ pub const Store = struct {
         }
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
-        for (self.columns, 0..) |*column, ordinal| for (0..batch.len()) |index| {
-            _ = scratch.reset(.retain_capacity);
-            const value = try batch.cell(scratch.allocator(), index, ordinal);
-            try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
-        };
+        for (self.columns, 0..) |*column, ordinal| {
+            _ = scratch.reset(.free_all);
+            if (try batch.dictionaryColumn(scratch.allocator(), ordinal)) |encoded| {
+                if (encoded.len() != batch.len()) return error.InvalidSqlBackendResponse;
+                if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded)) continue;
+            }
+            _ = scratch.reset(.free_all);
+            for (0..batch.len()) |index| {
+                _ = scratch.reset(.retain_capacity);
+                const value = try batch.cell(scratch.allocator(), index, ordinal);
+                try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
+            }
+        }
         self.len += batch.len();
     }
     pub fn append(self: *Store, values: []const Datum) !usize {
@@ -483,4 +669,40 @@ test "SQL retained numeric dictionaries preserve exact values nulls and allocati
     // depend on whether the backing allocator happens to grow in place.
     var fixed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(fixed.allocator(), numericRetentionScenario, .{});
+}
+
+fn dictionaryHandoffScenario(a: A) !void {
+    const Batch = @import("execution_batch.zig").Batch;
+    var store = Store.init(a);
+    defer store.deinit();
+    _ = try store.append(&.{.{}});
+    const source: Batch = .{ .dictionary = .{ .values = &.{ .{}, Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .string = "unused incompatible entry" }), Datum.json(.{ .integer = -7 }) }, .indices = &.{ 1, 0, 3, 1, 3, 0 } } };
+    try store.appendBatch(source);
+    try std.testing.expect(store.columns[0].values.integers.encoded);
+    for (0..source.len()) |index| try std.testing.expectEqualDeep(try source.cell(a, index, 0), try store.cell(a, index + 1, 0));
+    const exported = (try store.dictionaryBatch(a, 0, 1, source.len())).?;
+    defer a.free(exported.dictionary.values);
+    defer a.free(exported.dictionary.indices);
+    try std.testing.expectEqual(@as(usize, 3), exported.dictionary.values.len);
+    var target = Store.init(a);
+    defer target.deinit();
+    try target.appendBatch(exported);
+    for (0..source.len()) |index| try std.testing.expectEqualDeep(try source.cell(a, index, 0), try target.cell(a, index, 0));
+    try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
+    var unique = Store.init(a);
+    defer unique.deinit();
+    var unique_values: [64]Datum = undefined;
+    var unique_indices: [64]u32 = undefined;
+    for (&unique_values, &unique_indices, 0..) |*value, *id, index| {
+        value.* = Datum.json(.{ .integer = @intCast(index) });
+        id.* = @intCast(index);
+    }
+    try unique.appendBatch(.{ .dictionary = .{ .values = &unique_values, .indices = &unique_indices } });
+    try std.testing.expect(!unique.columns[0].values.integers.encoded);
+    try std.testing.expectEqual(@as(i64, 63), (try unique.cell(a, 63, 0)).value.integer);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, target.appendBatch(.{ .dictionary = .{ .values = &.{Datum.json(.{ .integer = 1 })}, .indices = &.{9} } }));
+}
+test "SQL dictionary handoff remaps referenced entries preserves NULL prefixes and unwinds failures" {
+    try dictionaryHandoffScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dictionaryHandoffScenario, .{});
 }

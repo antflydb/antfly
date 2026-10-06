@@ -60,7 +60,12 @@ lease; uncached pages borrow their cursor's dictionary. SQL kernels, Iceberg equ
 public row reads, and sidecar builders accept these representations. Predicate
 and dynamic-filter evaluation reuse dictionary results within each physical page.
 Supported single-input SQL expressions evaluate only referenced dictionary entries
-and retain an encoded intermediate; high-cardinality, lazy and external-function
+and retain an encoded intermediate. Projections over the same input share the
+selected-entry gather and typed expression graph. Direct projections, selected
+scans, mapped batches, and retained stores export compact referenced dictionaries;
+column stores remap each referenced entry once instead of hashing every row.
+Dictionary import validates IDs before mutation, preserves prior NULL rows, and
+returns to flat storage when cardinality grows; high-cardinality, lazy and external-function
 expressions use the existing typed/scalar fallbacks. SQL scan predicates use the
 same dictionary kernels. Retained integer and float columns sample cardinality
 without allocating; repeated values use dictionaries and a later high-cardinality
@@ -73,7 +78,12 @@ Spilled joins admit borrowed blocks into typed hash state and reuse bounded
 candidate workspace. Group partitions consume borrowed blocks and import exact
 partial states without allocating a temporary input array per group. Partial
 admission, replay, skew fallback, and legacy wide records share the sequential
-reader's lifetime and retry contract.
+reader's lifetime and retry contract. Serial partition builds receive their full
+assigned workspace; sibling reservations apply only when parallel builds actually
+run. The enclosing statement reserves a delivery lane before assigning partition
+workspace, and partition costs estimate typed payloads, hash links, metadata, and
+capacity growth rather than expanded `Datum` cells. Open partition files share a
+bounded buffer allowance.
 
 PostgreSQL delivery reads cells from retained execution columns directly. Result
 views preserve ownership through portal slicing; scroll/hold cursors copy cells
@@ -82,7 +92,12 @@ conversion occurs at encoding. Retained pages must be released before their stre
 closes. Stateless HTTP SELECT encodes these leased columns directly into its bounded,
 atomic response envelope. NULL flags use one bit per cell during encoding;
 integers retain exact decimal-string wire values. Blocking delivery leases decoded
-sequential spill blocks and final sort-merge blocks. Pages gather row descriptors
+sequential spill blocks and final sort-merge blocks. Primitive columns decode into
+validated owned buffers, packed NULL flags, and compact position/text directories;
+`Datum` cells are reconstructed at access boundaries. Heterogeneous JSON and
+pattern columns keep the fallback decoder. Sorted delivery requests compact
+heads at final-merge initialization; switching from earlier scalar delivery
+transfers already decoded heads safely. Pages gather row descriptors
 and retain each distinct block once, without cloning payloads into another column
 store. Sorted page admission accounts for decoded block capacity as well as logical
 result bytes. In-memory sorted rows remain owned by the bounded sort after the
@@ -123,8 +138,14 @@ varied during timing samples, so allocation counts are the useful comparison.
 These local timings are not a cross-machine throughput guarantee. Run `zig build sql-native-pipeline-bench
 -Doptimize=ReleaseSafe` to reproduce allocation and peak-memory measurements.
 The recorded [workspace and lease samples](bench/baselines/native-lake-workspace-and-leases.json)
-include source hashes and the comparison against the reviewed branch. Sequential
-leases reduce delivery work in that fixture. Sorted timings overlap, and leases
+include source hashes and the comparison against the reviewed branch. A separate
+4,096-row, 32-integer-column decode fixture measures approximately 110 KB of live
+compact decode workspace versus 1.14 MB for expanded cells, with identical output
+checksums. This isolates spill decoding from file construction and other operators;
+it is not a whole-statement memory or throughput claim. The
+[compact state samples](bench/baselines/native-lake-compact-typed-state.json)
+record the measured source hashes and all three comparisons. Sequential
+leases reduce delivery work in the delivery fixture. Sorted timings overlap, and leases
 retain more decoded memory than gathering into a small dictionary; decoded-capacity
 admission keeps each page bounded. These are separate tradeoffs from join admission.
 

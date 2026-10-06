@@ -1045,7 +1045,12 @@ fn Engine(comptime Context: type) type {
                             } else {
                                 const consumed = try self.hash_join.?.addBatchUntilFull(a, batch, keys_);
                                 if (consumed != batch.len()) {
-                                    const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, self.engine.context.limits.retained_bytes, self.engine.context.limits.scan_rows, self.engine.context.limits.retained_bytes / 8, kind == .left or kind == .full, kind == .right or kind == .full);
+                                    // The partition workspace coexists with input decode,
+                                    // the enclosing operator, and result delivery. Reserve
+                                    // a statement lane for those consumers before assigning
+                                    // the remaining workspace to serial or parallel builds.
+                                    const workspace = self.engine.context.limits.retained_bytes - self.engine.context.limits.retained_bytes / 4;
+                                    const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, workspace, self.engine.context.limits.scan_rows, self.engine.context.limits.retained_bytes / 8, kind == .left or kind == .full, kind == .right or kind == .full);
                                     self.partition_join = owner;
                                     var transfer = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                                     defer transfer.deinit();

@@ -18,6 +18,14 @@ pub const Cursor = struct {
     memory_leased: bool = false,
     block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
     block_begin: usize = 0,
+    const Location = struct {
+        block: ?*@import("spill.zig").Sequential.OwnedBlock = null,
+        index: usize = 0,
+        values: []const @import("scalar.zig").Datum = &.{},
+        fn cell(self: Location, column: usize) !@import("scalar.zig").Datum {
+            return if (self.block) |block| block.cell(self.index, column) else self.values[column];
+        }
+    };
     pub const Lease = struct {
         values: @import("execution_batch.zig").Batch,
         owner: ?*Cursor = null,
@@ -38,13 +46,13 @@ pub const Cursor = struct {
         if (self.sorted) |top| {
             if (top.external == null) self.memory_leased = true;
             const capacity = @min(maximum, self.count() - self.index);
-            const rows = try a.alloc([]const @import("scalar.zig").Datum, capacity);
+            const rows = try a.alloc(Location, capacity);
             const blocks = try a.alloc(*@import("spill.zig").Sequential.OwnedBlock, capacity);
             var held: usize = 0;
             errdefer for (blocks[0..held]) |block| block.release();
             var count_rows: usize = 0;
             var bytes: usize = 0;
-            var leased_bytes: usize = capacity *| (@sizeOf([]const @import("scalar.zig").Datum) + @sizeOf(*@import("spill.zig").Sequential.OwnedBlock));
+            var leased_bytes: usize = capacity *| (@sizeOf(Location) + @sizeOf(*@import("spill.zig").Sequential.OwnedBlock));
             while (count_rows < capacity) {
                 if (top.external) |sort| {
                     while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
@@ -52,7 +60,7 @@ pub const Cursor = struct {
                         skipped.release();
                     }
                     const lease = (try sort.nextLeased()) orelse return error.InvalidSqlSpill;
-                    rows[count_rows] = lease.row.values;
+                    rows[count_rows] = .{ .block = lease.block, .index = lease.index, .values = lease.row.values };
                     if (lease.block) |block| {
                         const existing = for (blocks[0..held]) |prior| {
                             if (prior == block) break true;
@@ -63,22 +71,31 @@ pub const Cursor = struct {
                             leased_bytes +|= block.arena.queryCapacity() +| @sizeOf(@import("spill.zig").Sequential.OwnedBlock);
                         }
                     }
-                } else rows[count_rows] = self.sorted_rows[self.sorted_offset + self.index].values;
-                for (rows[count_rows]) |value| bytes +|= try @import("operators.zig").datumBytes(value);
+                } else rows[count_rows] = .{ .values = self.sorted_rows[self.sorted_offset + self.index].values };
+                for (0..self.width) |column| bytes +|= try @import("operators.zig").datumBytes(try rows[count_rows].cell(column));
                 self.index += 1;
                 count_rows += 1;
                 if (bytes >= byte_limit or leased_bytes >= byte_limit) break;
             }
+            const View = struct {
+                rows: []const Location,
+                fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    return view.rows[row].cell(column);
+                }
+            };
+            const view = try a.create(View);
+            view.* = .{ .rows = rows[0..count_rows] };
             _ = self.refs.fetchAdd(1, .monotonic);
-            return .{ .values = .{ .rows = rows[0..count_rows] }, .blocks = blocks[0..held], .owner = self };
+            return .{ .values = .{ .reader = .{ .ptr = view, .read = View.cell, .count = count_rows, .width = self.width } }, .blocks = blocks[0..held], .owner = self };
         }
         try self.loadBlock();
         const block = self.block.?;
         const begin = self.index - self.block_begin;
         var end = begin;
         var bytes: usize = 0;
-        while (end < block.rows.len and end - begin < maximum) {
-            for (block.rows[end].values) |value| bytes +|= try @import("operators.zig").datumBytes(value);
+        while (end < block.count() and end - begin < maximum) {
+            for (0..self.width) |column| bytes +|= try @import("operators.zig").datumBytes(try block.cell(end, column));
             end += 1;
             if (bytes >= byte_limit) break;
         }
@@ -87,7 +104,7 @@ pub const Cursor = struct {
             begin: usize,
             fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
                 const view: *@This() = @ptrCast(@alignCast(raw));
-                return view.block.rows[view.begin + row].values[column];
+                return view.block.cell(view.begin + row, column);
             }
         };
         const view = try a.create(View);
@@ -99,7 +116,7 @@ pub const Cursor = struct {
     }
     fn loadBlock(self: *Cursor) !void {
         if (self.block) |block| {
-            if (self.index >= self.block_begin and self.index - self.block_begin < block.rows.len) return;
+            if (self.index >= self.block_begin and self.index - self.block_begin < block.count()) return;
             block.release();
             self.block = null;
         }
@@ -186,7 +203,7 @@ pub const Cursor = struct {
         }
         if (self.block != null) {
             try self.loadBlock();
-            return self.block.?.rows[self.index - self.block_begin];
+            return self.block.?.row(a, self.index - self.block_begin);
         }
         return (try self.rows.readBorrowed(self.index)).row;
     }

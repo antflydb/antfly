@@ -834,16 +834,16 @@ pub const Stream = struct {
         var bytes: usize = 0;
         var read: usize = 0;
         for (rows, flags) |*out, *bits| {
-            const row = try spool.read(a);
-            out.* = try a.alloc(Json, row.values.len);
-            bits.* = try a.alloc(bool, row.values.len);
-            for (row.values, @constCast(out.*), @constCast(bits.*)) |value, *cell, *flag| {
-                cell.* = if (spool.ownsRead()) value.value else (try @import("operators.zig").cloneDatum(a, value)).value;
+            // Cursor.next owns the scalar delivery boundary, including the
+            // release policy after an earlier batch leased sorted rows.
+            const values = (try spool.next(a)) orelse return error.InvalidSqlSpill;
+            out.* = try a.alloc(Json, values.len);
+            bits.* = try a.alloc(bool, values.len);
+            for (values, @constCast(out.*), @constCast(bits.*)) |value, *cell, *flag| {
+                cell.* = value.value;
                 flag.* = value.sql_null;
                 bytes +|= try @import("operators.zig").datumBytes(value);
             }
-            if (spool.sorted) |top| if (top.external == null) top.releaseFinishedRow(spool.sorted_offset + spool.index);
-            spool.index += 1;
             read += 1;
             if (bytes >= self.context.limits.page_bytes) break;
         }
@@ -992,7 +992,27 @@ pub const Stream = struct {
             page: catalog.ColumnPage,
             projections: []const ?@import("execution_batch.zig").Batch,
             failures: []?anyerror,
-            bytes: usize = 0,
+            fn dictionary(raw: *anyopaque, alloc: std.mem.Allocator, ordinal: usize) anyerror!?@import("execution_batch.zig").Batch {
+                const projection_: *@This() = @ptrCast(@alignCast(raw));
+                const source = projection_.projections[ordinal] orelse blk: {
+                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = projection_.stream.context.binding.columns[ordinal].type }};
+                    const direct: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = projection_.page, .definitions = &definition } };
+                    break :blk (direct.dictionaryColumn(alloc, 0) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        return null;
+                    }) orelse return null;
+                };
+                if (source != .dictionary) return null;
+                const values = try alloc.dupe(@import("scalar.zig").Datum, source.dictionary.values);
+                for (values) |*value| {
+                    value.value = describe.coerceAlloc(alloc, value.value, projection_.stream.context.binding.columns[ordinal].type) catch |err| {
+                        if (err == error.OutOfMemory) return err;
+                        // Scalar delivery records the precise failing row.
+                        return null;
+                    };
+                }
+                return .{ .dictionary = .{ .values = values, .indices = source.dictionary.indices } };
+            }
             fn cell(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize) anyerror!@import("scalar.zig").Datum {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 const cell_ = if (projection_.projections[ordinal]) |values| try values.cell(alloc, index, 0) else blk: {
@@ -1005,7 +1025,6 @@ pub const Stream = struct {
                     return .{};
                 };
                 const value: @import("scalar.zig").Datum = .{ .value = coerced, .sql_null = cell_.sql_null, .patterns = cell_.patterns };
-                projection_.bytes +|= try @import("operators.zig").datumBytes(value);
                 return value;
             }
         };
@@ -1014,9 +1033,11 @@ pub const Stream = struct {
         // complete batch is published only after all typed columns succeed.
         if (self.one_scan_page) try pending.reserveRecords(selection.items.len);
         const before = pending.len();
-        try pending.values.appendBatch(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .count = selection.items.len, .width = self.fields.len } });
+        try pending.values.appendBatch(.{ .reader = .{ .ptr = &projection, .read = Projection.cell, .read_dictionary = Projection.dictionary, .count = selection.items.len, .width = self.fields.len } });
         if (self.one_scan_page) for (positions.items, failures) |position, failure| pending.record(position, failure);
-        output_bytes = projection.bytes;
+        for (before..pending.len()) |row| for (0..self.fields.len) |column| {
+            output_bytes +|= try @import("operators.zig").datumBytes(try pending.values.cell(a, row, column));
+        };
         if (!self.one_scan_page) for (failures, 0..) |failure, index| if (failure) |err| {
             pending.end = before + index;
             self.remaining -= index;
@@ -2162,4 +2183,32 @@ test "SQL blocking result pages remain valid after terminal stream failure" {
         try std.testing.expectError(error.SqlStreamFailed, stream.nextBatch(7));
         try std.testing.expectEqual(expected, (try first.values.cell(a, 0, 0)).value.integer);
     }
+}
+
+test "SQL public blocking stream mixes scalar pulls with live sorted batch leases" {
+    const a = std.testing.allocator;
+    var compiled = try compiler.compile(a, "SELECT n FROM docs ORDER BY n DESC LIMIT 10 OFFSET 2", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .count = 12 };
+    var backend = fixture.backend();
+    backend.execution_io = std.testing.io;
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 })).?;
+    defer stream.close();
+    try std.testing.expect(stream.spool.?.sorted.?.external == null);
+    var first = try stream.nextBatch(2);
+    defer first.deinit();
+    for (0..8) |index| {
+        if (index % 2 == 0) {
+            var page = try stream.next(1);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(i64, @intCast(7 - index)), page.output.rows[0][0].integer);
+        } else {
+            var page = try stream.nextBatch(1);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(i64, @intCast(7 - index)), (try page.values.cell(a, 0, 0)).value.integer);
+        }
+        try std.testing.expectEqual(@as(i64, 9), (try first.values.cell(a, 0, 0)).value.integer);
+        try std.testing.expectEqual(@as(i64, 8), (try first.values.cell(a, 1, 0)).value.integer);
+    }
+    try std.testing.expect(stream.exhausted);
 }

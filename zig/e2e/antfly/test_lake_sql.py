@@ -348,6 +348,20 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     else (9007199254740993 + i % 3, (i % 3) * 0.5 + 0.25)
                     for i in range(count)
                 ]
+                fused_numeric = list(
+                    cursor.stream(
+                        "SELECT exact, (exact - 9007199254740993) * 3 + 7, "
+                        "(exact - 9007199254740993) * 3 + 8 FROM "
+                        "(SELECT amount, exact FROM lake_events ORDER BY amount) q",
+                        size=29,
+                    )
+                )
+                assert fused_numeric == [
+                    (None, None, None)
+                    if i % 7 == 0
+                    else (9007199254740993 + i % 3, (i % 3) * 3 + 7, (i % 3) * 3 + 8)
+                    for i in range(count)
+                ]
                 # Repeated exact numerics survive a blocking derived relation,
                 # downstream predicate evaluation, sorting, and portal slicing.
                 retained_numeric = list(

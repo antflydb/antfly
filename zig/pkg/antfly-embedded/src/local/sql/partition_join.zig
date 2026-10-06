@@ -164,8 +164,8 @@ pub const Join = struct {
             while (lanes > 1 and largest > self.workspace_bytes / (lanes + 1)) lanes -= 1;
             self.build_lanes = lanes;
             self.parallel_builds = useful != 0 and largest <= self.workspace_bytes / (lanes + 1);
-            self.limits.bytes = @max(8192, if (self.parallel_builds) self.workspace_bytes / (lanes + 1) else self.workspace_bytes);
         }
+        self.limits.bytes = @max(8192, if (self.parallel_builds) self.workspace_bytes / (self.build_lanes + 1) else self.workspace_bytes);
         self.finished = true;
     }
     fn startBuilds(self: *Join) !void {
@@ -282,7 +282,8 @@ pub const Join = struct {
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
         const lanes = requested_lanes orelse @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
-        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (assigned) bytes else bytes / (lanes + 1)), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 and lanes >= 2 };
+        const parallel = !assigned and bytes >= 512 * 1024 and lanes >= 2;
+        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
@@ -362,17 +363,21 @@ pub const Join = struct {
         const partition: usize = @intCast((hash orelse 0) & (self.partitions - 1));
         const slot = if (build) &self.build[partition] else &self.probes[partition];
         if (slot.* == null) {
-            slot.* = try spill.Sequential.init(self.manager, @min(4096, self.limits.bytes / 128));
+            slot.* = try spill.Sequential.init(self.manager, @min(4096, self.workspace_bytes / 512));
             // Both sides may keep sixteen open partition files. Reserve a
             // bounded share for their I/O buffers rather than exhausting a
             // small statement before a build partition can be loaded.
-            slot.*.?.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 128));
+            slot.*.?.buffer_bytes = @max(128, @min(4096, self.workspace_bytes / 512));
         }
         _ = try slot.*.?.append(.{ .values = values, .keys = keys, .ordinal = ordinal }, spill.none);
         const costs = if (build) &self.build_cost else &self.probe_cost;
-        costs[partition] +|= @sizeOf(operators.Row);
-        for (values) |value| costs[partition] +|= try operators.datumBytes(value);
-        for (keys) |value| costs[partition] +|= try operators.datumBytes(value);
+        const typed = @import("typed_store.zig");
+        if (costs[partition] == 0) costs[partition] = typed.columnMetadataBytes(values.len + keys.len) *| 2;
+        // Hash links and bucket capacity coexist with typed vectors. Reserve
+        // growth headroom without pricing every primitive as a boxed Datum.
+        costs[partition] +|= 128;
+        for (values) |value| costs[partition] +|= (try typed.retainedCellBytes(value)) *| 2;
+        for (keys) |value| costs[partition] +|= (try typed.retainedCellBytes(value)) *| 2;
     }
     pub fn accept(self: *Join, index: usize) !void {
         if (self.active_join) |child| return child.accept(index);
@@ -380,8 +385,8 @@ pub const Join = struct {
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
     fn partitionFile(self: *Join) !spill.Sequential {
-        var file = try spill.Sequential.init(self.manager, @min(4096, self.limits.bytes / 128));
-        file.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 128));
+        var file = try spill.Sequential.init(self.manager, @min(4096, self.workspace_bytes / 512));
+        file.buffer_bytes = @max(128, @min(4096, self.workspace_bytes / 512));
         return file;
     }
     fn split(self: *Join, differences: u64) !bool {
@@ -783,6 +788,14 @@ test "SQL partition join child keeps its assigned workspace and prioritizes larg
     var dummy: u8 = 0;
     var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
+    for ([_]usize{ 128 * 1024, 2 * 1024 * 1024 }) |bytes| {
+        const serial = try Join.createWithLanes(&manager, bytes, 10000, 0, false, false, 1, false);
+        defer serial.close();
+        try std.testing.expect(!serial.parallel_builds);
+        try std.testing.expectEqual(bytes, serial.limits.bytes);
+        try serial.finishInputs();
+        try std.testing.expectEqual(bytes, serial.limits.bytes);
+    }
     const child = try Join.createWithLanes(&manager, 1024 * 1024, 10000, 0, false, false, 1, true);
     defer child.close();
     try std.testing.expectEqual(@as(usize, 1024 * 1024), child.limits.bytes);

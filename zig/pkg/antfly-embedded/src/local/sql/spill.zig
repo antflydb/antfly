@@ -821,11 +821,106 @@ pub const Sequential = struct {
     }
 
     pub const Block = struct { rows: []const Row, following: u64 };
+    /// Compact views over a validated typed record. Primitive payloads remain
+    /// in the decoded buffer; only legacy heterogeneous cells need Datum tags.
+    const EncodedColumn = struct {
+        flags: []const u8 = &.{},
+        values: union(enum) {
+            empty,
+            fixed: struct { bytes: []const u8, positions: []const u16, kind: u8 },
+            texts: struct { values: []const []const u8, decimal: bool },
+            dynamic: []const Datum,
+        },
+        fn cell(self: EncodedColumn, index: usize) Datum {
+            if (self.values == .dynamic) return self.values.dynamic[index];
+            const flag = (self.flags[index / 4] >> @as(u3, @intCast(index % 4 * 2))) & 3;
+            if (flag != 0) return .{ .sql_null = flag == 1 };
+            return Datum.json(switch (self.values) {
+                .empty => .null,
+                .fixed => |v| switch (v.kind) {
+                    1 => .{ .bool = v.bytes[v.positions[index]] == 1 },
+                    2 => .{ .integer = @bitCast(std.mem.readInt(u64, v.bytes[@as(usize, v.positions[index]) * 8 ..][0..8], .little)) },
+                    3 => .{ .float = @bitCast(std.mem.readInt(u64, v.bytes[@as(usize, v.positions[index]) * 8 ..][0..8], .little)) },
+                    else => unreachable,
+                },
+                .texts => |v| if (v.decimal) .{ .number_string = v.values[index] } else .{ .string = v.values[index] },
+                .dynamic => unreachable,
+            });
+        }
+        fn decode(decoder: *Decoder, count: usize) !EncodedColumn {
+            const kind = try decoder.byte();
+            if (kind == 255) {
+                const values = try decoder.a.alloc(Datum, count);
+                for (values) |*value| {
+                    const one = try decoder.cells();
+                    if (one.len != 1) return error.InvalidSqlSpill;
+                    value.* = one[0];
+                }
+                return .{ .values = .{ .dynamic = values } };
+            }
+            if (kind > 5) return error.InvalidSqlSpill;
+            const flags = try decoder.take((count + 3) / 4);
+            for (0..count) |row| if (((flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) == 3) return error.InvalidSqlSpill;
+            if (kind == 0) return .{ .flags = flags, .values = .empty };
+            if (kind <= 3) {
+                const positions = try decoder.a.alloc(u16, count);
+                const begin = decoder.position;
+                var physical: u16 = 0;
+                for (positions, 0..) |*position, row| {
+                    position.* = physical;
+                    if (((flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) != 0) continue;
+                    if (kind == 1) {
+                        if (try decoder.byte() > 1) return error.InvalidSqlSpill;
+                    } else _ = try decoder.word();
+                    physical += 1;
+                }
+                return .{ .flags = flags, .values = .{ .fixed = .{ .bytes = decoder.bytes[begin..decoder.position], .positions = positions, .kind = kind } } };
+            }
+            const values = try decoder.a.alloc([]const u8, count);
+            for (values, 0..) |*value, row| {
+                value.* = "";
+                if (((flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) == 0) value.* = try decoder.take(try decoder.count());
+            }
+            return .{ .flags = flags, .values = .{ .texts = .{ .values = values, .decimal = kind == 4 } } };
+        }
+    };
     pub const OwnedBlock = struct {
         a: Allocator,
         arena: std.heap.ArenaAllocator,
-        rows: []const Row,
+        rows: []const Row = &.{},
+        encoded: ?struct { values: []const EncodedColumn, keys: []const EncodedColumn, ordinals: []const u64 } = null,
         refs: std.atomic.Value(usize) = .init(1),
+        pub fn count(self: *const OwnedBlock) usize {
+            return if (self.encoded) |v| v.ordinals.len else self.rows.len;
+        }
+        pub fn width(self: *const OwnedBlock) usize {
+            return if (self.encoded) |v| v.values.len else self.rows[0].values.len;
+        }
+        pub fn cell(self: *const OwnedBlock, index: usize, column: usize) !Datum {
+            if (index >= self.count() or column >= self.width()) return error.InvalidSqlSpill;
+            return if (self.encoded) |v| v.values[column].cell(index) else self.rows[index].values[column];
+        }
+        pub fn keyRow(self: *OwnedBlock, index: usize) !Row {
+            if (index >= self.count()) return error.InvalidSqlSpill;
+            if (self.encoded) |v| {
+                const keys = try self.arena.allocator().alloc(Datum, v.keys.len);
+                for (keys, v.keys) |*key, column| key.* = column.cell(index);
+                return .{ .values = &.{}, .keys = keys, .ordinal = v.ordinals[index] };
+            }
+            return self.rows[index];
+        }
+        pub fn row(self: *const OwnedBlock, a: Allocator, index: usize) !Row {
+            if (index >= self.count()) return error.InvalidSqlSpill;
+            if (self.encoded) |v| {
+                const values = try a.alloc(Datum, v.values.len);
+                errdefer a.free(values);
+                const keys = try a.alloc(Datum, v.keys.len);
+                for (values, v.values) |*value, column| value.* = column.cell(index);
+                for (keys, v.keys) |*key, column| key.* = column.cell(index);
+                return .{ .values = values, .keys = keys, .ordinal = v.ordinals[index] };
+            }
+            return self.rows[index];
+        }
         pub fn retain(self: *OwnedBlock) void {
             _ = self.refs.fetchAdd(1, .monotonic);
         }
@@ -842,6 +937,51 @@ pub const Sequential = struct {
         const a = self.file.manager.allocator();
         const owner = try a.create(OwnedBlock);
         errdefer a.destroy(owner);
+        // A scalar merge may already have borrowed this record. Transfer its
+        // arena once; subsequent records decode directly into compact columns.
+        if (self.read_rows.len == 0 and self.read_single_offset != offset and offset == self.read_first) {
+            owner.* = .{ .a = a, .arena = .init(a) };
+            errdefer owner.arena.deinit();
+            try self.seal();
+            if (offset >= self.size) return error.InvalidSqlSpill;
+            var header: [17]u8 = undefined;
+            try self.file.readRaw(self.read_offset, &header);
+            const owned = owner.arena.allocator();
+            if (header[16] == 255) {
+                var decoded = try self.file.read(owned, self.read_offset);
+                if (decoded.next != none or decoded.matched) return error.InvalidSqlSpill;
+                self.read_offset = decoded.following;
+                decoded.following = offset + 1;
+                owner.rows = try owned.dupe(Row, &.{decoded.row});
+            } else {
+                const len = std.mem.readInt(u64, header[0..8], .little);
+                if (header[16] > 1 or len > self.file.manager.max_record_bytes or len > self.file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
+                const encoded = try owned.alloc(u8, @intCast(len));
+                try self.file.readRaw(self.read_offset + header.len, encoded);
+                const payload = if (header[16] == 1) blk: {
+                    if (try snappy.decodedLen(encoded) > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
+                    break :blk try snappy.decode(owned, encoded);
+                } else encoded;
+                if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
+                var decoder: Decoder = .{ .manager = self.file.manager, .a = owned, .bytes = payload };
+                const count_rows = try decoder.count();
+                const width_values = try decoder.count();
+                const width_keys = try decoder.count();
+                if (count_rows == 0 or count_rows > 256 or count_rows > self.size - offset or width_values > 1024 or width_keys > 256) return error.InvalidSqlSpill;
+                const ordinals = try owned.alloc(u64, count_rows);
+                for (ordinals) |*ordinal| ordinal.* = try decoder.word();
+                const values = try owned.alloc(EncodedColumn, width_values);
+                const keys = try owned.alloc(EncodedColumn, width_keys);
+                for (values) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
+                for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
+                if (decoder.position != payload.len) return error.InvalidSqlSpill;
+                owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals };
+                self.read_offset += header.len + len;
+            }
+            self.read_first = offset + owner.count();
+            self.read_single_offset = null;
+            return owner;
+        }
         const block = try self.readBatchBorrowed(offset, 256);
         // Typed block descriptors already belong to the transferred arena.
         // Only the legacy single-row descriptor lives inline in Sequential.
@@ -850,6 +990,7 @@ pub const Sequential = struct {
         self.read_arena = .init(a);
         self.read_rows = &.{};
         self.read_single_offset = null;
+        self.read_first = offset + rows.len;
         return owner;
     }
     /// A span of the current decoded block. It expires when another block is
@@ -1231,6 +1372,9 @@ pub const Sort = struct {
         }
     }
     pub fn finish(self: *Sort) !void {
+        return self.finishImpl(false);
+    }
+    fn finishImpl(self: *Sort, leased: bool) !void {
         if (self.finished) return;
         if (self.pending_run != null) {
             try self.flush();
@@ -1272,9 +1416,17 @@ pub const Sort = struct {
         };
         for (self.head_arenas[0..self.output_count]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
         errdefer for (self.head_arenas[0..self.output_count]) |*arena| arena.deinit();
-        for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count]) |*file, *arena, *head| {
-            head.* = if (file.*.?.size != 0) try self.readRun(&file.*.?, arena.allocator(), 0) else null;
+        for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count], 0..) |*file, *arena, *head, index| {
+            if (leased and file.*.?.size != 0) {
+                const block = try file.*.?.readOwnedBlock(0);
+                self.owned_heads[index] = block;
+                self.owned_positions[index] = 0;
+                var row = try block.keyRow(0);
+                row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
+                head.* = .{ .row = row, .next = none, .matched = false, .following = 1 };
+            } else head.* = if (file.*.?.size != 0) try self.readRun(&file.*.?, arena.allocator(), 0) else null;
         }
+        self.leased_reads = leased;
         self.finished = true;
     }
     pub fn next(self: *Sort, a: Allocator) !?Row {
@@ -1287,6 +1439,10 @@ pub const Sort = struct {
     pub const RowLease = struct {
         row: Row,
         block: ?*Sequential.OwnedBlock = null,
+        index: usize = 0,
+        pub fn cell(self: RowLease, column: usize) !Datum {
+            return if (self.block) |block| block.cell(self.index, column) else self.row.values[column];
+        }
         pub fn release(self: RowLease) void {
             if (self.block) |block| block.release();
         }
@@ -1294,7 +1450,7 @@ pub const Sort = struct {
     /// Sorted delivery holds decoded run blocks through the transport page.
     /// Only row descriptors are gathered; wide payload bytes remain in place.
     pub fn nextLeased(self: *Sort) !?RowLease {
-        try self.finish();
+        try self.finishImpl(true);
         if (!self.leased_reads) {
             for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
                 self.owned_heads[index] = try self.outputs[index].?.readOwnedBlock(value.following - 1);
@@ -1309,10 +1465,11 @@ pub const Sort = struct {
         if (selected) |index| {
             const head = self.heads[index].?;
             const owner = self.owned_heads[index].?;
+            const position = self.owned_positions[index];
             owner.retain();
             errdefer owner.release();
             self.owned_positions[index] += 1;
-            if (self.owned_positions[index] == owner.rows.len) {
+            if (self.owned_positions[index] == owner.count()) {
                 self.owned_heads[index] = null;
                 owner.release();
                 if (head.following < self.outputs[index].?.size) {
@@ -1321,11 +1478,11 @@ pub const Sort = struct {
                 }
             }
             self.heads[index] = if (self.owned_heads[index]) |block| blk: {
-                var row = block.rows[self.owned_positions[index]];
+                var row = try block.keyRow(self.owned_positions[index]);
                 row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
                 break :blk .{ .row = row, .next = none, .matched = false, .following = head.following + 1 };
             } else null;
-            return .{ .row = head.row, .block = owner };
+            return .{ .row = head.row, .block = owner, .index = position };
         }
         if (self.offset < self.rows.items.len) {
             const row = self.rows.items[@intCast(self.offset)];
@@ -1338,7 +1495,13 @@ pub const Sort = struct {
         if (self.leased_reads) {
             const lease = (try self.nextLeased()) orelse return null;
             defer lease.release();
-            const row = lease.row;
+            const row = if (lease.block) |block| try block.row(a, lease.index) else lease.row;
+            defer if (lease.block) |block| {
+                if (block.encoded != null) {
+                    a.free(row.values);
+                    a.free(row.keys);
+                }
+            };
             const values = try a.alloc(Datum, row.values.len);
             for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
             const keys: []Datum = if (retain_keys) try a.alloc(Datum, row.keys.len) else &.{};
@@ -1753,4 +1916,61 @@ test "SQL borrowed spill blocks support partial admission retries and rewinds" {
         }
         try std.testing.expectEqual(@as(u64, 37), offset);
     }
+}
+
+fn ownedCompactBlockScenario(a: Allocator) !void {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 64 * 1024);
+    var open = true;
+    defer if (open) file.close();
+    for (0..300) |index| _ = try file.append(.{ .values = &.{
+        Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(index)) }),
+        Datum.json(.{ .float = if (index % 2 == 0) -0.0 else 1.5 }),
+        if (index % 3 == 0) Datum{} else Datum.json(.null),
+        Datum.json(.{ .string = "embedded\x00text" }),
+        Datum.json(.{ .number_string = "1.0000000000000001" }),
+        if (index % 2 == 0) Datum.json(.{ .bool = true }) else Datum.json(.{ .integer = -1 }),
+    }, .keys = &.{Datum.json(.{ .integer = @intCast(index) })}, .ordinal = index }, none);
+    try file.seal();
+    const first = try file.readOwnedBlock(0);
+    defer first.release();
+    try std.testing.expect(first.encoded != null);
+    const second = try file.readOwnedBlock(first.count());
+    defer second.release();
+    file.rewind();
+    _ = try file.readBorrowed(0);
+    const transferred = try file.readOwnedBlock(1);
+    defer transferred.release();
+    try std.testing.expect(transferred.encoded == null);
+    const resumed = try file.readOwnedBlock(1 + transferred.count());
+    defer resumed.release();
+    try std.testing.expect(resumed.encoded != null);
+    try std.testing.expectEqual(9007199254740993 + @as(i64, @intCast(first.count())), (try resumed.cell(0, 0)).value.integer);
+    // Closing the source releases neither lease's backing payload.
+    file.close();
+    open = false;
+    for ([_]*Sequential.OwnedBlock{ first, second }, 0..) |block, block_index| {
+        for (0..block.count()) |row| {
+            const index = row + (if (block_index == 0) @as(usize, 0) else first.count());
+            try std.testing.expectEqual(9007199254740993 + @as(i64, @intCast(index)), (try block.cell(row, 0)).value.integer);
+            if (index % 2 == 0) try std.testing.expect(std.math.signbit((try block.cell(row, 1)).value.float));
+            const nullable = try block.cell(row, 2);
+            try std.testing.expectEqual(index % 3 == 0, nullable.sql_null);
+            try std.testing.expect(nullable.value == .null);
+            try std.testing.expectEqualStrings("embedded\x00text", (try block.cell(row, 3)).value.string);
+            try std.testing.expectEqualStrings("1.0000000000000001", (try block.cell(row, 4)).value.number_string);
+            try std.testing.expectEqual(index % 2 == 0, (try block.cell(row, 5)).value == .bool);
+            const keys = try block.keyRow(row);
+            try std.testing.expectEqual(@as(i64, @intCast(index)), keys.keys[0].value.integer);
+        }
+    }
+}
+test "SQL compact owned spill blocks retain exact cells after source close and unwind every allocation" {
+    try ownedCompactBlockScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ownedCompactBlockScenario, .{});
 }

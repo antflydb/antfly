@@ -30,7 +30,25 @@ pub fn evaluateColumns(a: std.mem.Allocator, program: *const scalar.Program, pag
 /// Unreferenced entries must never raise errors or consume expression work.
 pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) !?@import("execution_batch.zig").Batch {
     if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len != 1 or page.selection.len < 4) return null;
-    const ordinal = program.required_columns[0];
+    var selection = (try dictionarySelection(a, program.required_columns[0], page, columns)) orelse return null;
+    defer selection.deinit(a);
+    var compact = page;
+    compact.selection = selection.representatives.items;
+    const values = (try evaluateColumns(a, program, compact, columns, parameters)) orelse return null;
+    const indices = selection.indices;
+    selection.indices = &.{};
+    return .{ .dictionary = .{ .values = values, .indices = indices } };
+}
+const DictionarySelection = struct {
+    indices: []u32,
+    representatives: std.ArrayList(usize),
+    fn deinit(self: *DictionarySelection, a: std.mem.Allocator) void {
+        a.free(self.indices);
+        self.representatives.deinit(a);
+    }
+};
+fn dictionarySelection(a: std.mem.Allocator, ordinal: u32, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !?DictionarySelection {
+    if (page.selection.len < 4) return null;
     if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
     const source = if (page.native == null) page.batch.findColumn(columns[ordinal].name) else null;
     const native_ordinal = if (page.native) |native| for (native.names, 0..) |name, index| {
@@ -43,16 +61,13 @@ pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Pr
     if (page.native) |native| {
         const physical = page.selection[0];
         if (physical >= native.values.len()) return error.InvalidSqlBackendResponse;
-        switch (native.values.*) {
-            .retained => |retained| if ((try retained.store.dictionaryId(retained.begin + physical, native_ordinal.?)) == null) return null,
-            .dictionary => if (native_ordinal.? != 0) return null,
-            else => return null,
-        }
+        if ((try native.values.dictionaryIdentity(physical, native_ordinal.?)) == null) return null;
     }
     var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer ids.deinit(a);
     var representatives: std.ArrayList(usize) = .empty;
-    defer representatives.deinit(a);
+    var owned_representatives = true;
+    defer if (owned_representatives) representatives.deinit(a);
     const indices = try a.alloc(u32, page.selection.len);
     var owned = true;
     defer if (owned) a.free(indices);
@@ -60,11 +75,8 @@ pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Pr
         if (page.native) |native| if (physical >= native.values.len()) return error.InvalidSqlBackendResponse;
         const id: u64 = if (source) |column|
             if (try column.dictionaryId(physical)) |entry| @as(u64, entry) + 1 else 0
-        else switch (page.native.?.values.*) {
-            .retained => |retained| (try retained.store.dictionaryId(retained.begin + physical, native_ordinal.?)) orelse return null,
-            .dictionary => |dictionary| if (native_ordinal.? == 0) dictionary.indices[physical] else return null,
-            else => return null,
-        };
+        else
+            (try page.native.?.values.dictionaryIdentity(physical, native_ordinal.?)) orelse return null;
         const slot = try ids.getOrPut(a, id);
         if (!slot.found_existing) {
             slot.value_ptr.* = @intCast(representatives.items.len);
@@ -73,11 +85,9 @@ pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Pr
         index.* = slot.value_ptr.*;
     }
     if (representatives.items.len > page.selection.len / 2) return null;
-    var compact = page;
-    compact.selection = representatives.items;
-    const values = (try evaluateColumns(a, program, compact, columns, parameters)) orelse return null;
     owned = false;
-    return .{ .dictionary = .{ .values = values, .indices = indices } };
+    owned_representatives = false;
+    return .{ .indices = indices, .representatives = representatives };
 }
 
 /// Retain expression dictionaries across projection instead of expanding them
@@ -91,13 +101,47 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
     defer fallback.deinit(a);
     var positions: std.ArrayList(usize) = .empty;
     defer positions.deinit(a);
+    const visited = try a.alloc(bool, programs.len);
+    defer a.free(visited);
+    @memset(visited, false);
+    var group: std.ArrayList(*const scalar.Program) = .empty;
+    defer group.deinit(a);
+    var group_positions: std.ArrayList(usize) = .empty;
+    defer group_positions.deinit(a);
     for (programs, 0..) |program, index| {
-        outputs[index] = try evaluateDictionaryColumns(a, program, page, columns, parameters);
-        if (outputs[index] == null) {
-            try fallback.append(a, program);
-            try positions.append(a, index);
+        if (visited[index]) continue;
+        if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len != 1) continue;
+        const ordinal = program.required_columns[0];
+        var selection = (try dictionarySelection(a, ordinal, page, columns)) orelse continue;
+        defer selection.deinit(a);
+        group.clearRetainingCapacity();
+        group_positions.clearRetainingCapacity();
+        for (programs[index..], index..) |candidate, position| {
+            if (!visited[position] and @import("typed_kernel.zig").supported(candidate) and candidate.required_columns.len == 1 and candidate.required_columns[0] == ordinal) {
+                try group.append(a, candidate);
+                try group_positions.append(a, position);
+                visited[position] = true;
+            }
         }
+        var compact = page;
+        compact.selection = selection.representatives.items;
+        // Gather the dictionary IDs once, then share typed expression nodes
+        // across every projection over this input's referenced entries.
+        const vectors = try evaluateColumnsMany(a, group.items, compact, columns, parameters);
+        defer {
+            for (vectors) |values| if (values) |vector| a.free(vector);
+            a.free(vectors);
+        }
+        for (vectors, group_positions.items, 0..) |optional, position, offset| if (optional) |values| {
+            const indices = try a.dupe(u32, selection.indices);
+            outputs[position] = .{ .dictionary = .{ .values = values, .indices = indices } };
+            @constCast(vectors)[offset] = null;
+        };
     }
+    for (programs, 0..) |program, index| if (outputs[index] == null) {
+        try fallback.append(a, program);
+        try positions.append(a, index);
+    };
     const evaluated = try evaluateColumnsManyScheduled(a, fallback.items, page, columns, parameters, io);
     defer {
         for (evaluated) |vector| if (vector) |values| a.free(values);
@@ -844,4 +888,37 @@ test "SQL retained numeric dictionaries reuse expression results after relationa
         const expected = try program.evaluate(a, &.{.{ .value = input.value, .sql_null = input.sql_null }}, &.{}, .{});
         try std.testing.expectEqualDeep(expected, try batch.cell(a, row, 0));
     }
+}
+
+fn fusedDictionaryScenario(a: std.mem.Allocator) !void {
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" }, .{ .relational_key = "d" }, .{ .relational_key = "e" }, .{ .relational_key = "f" } },
+        .columns = &.{.{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 3, 4, 0 }, .indices = &.{ 0, 1, 0, 1, 0, 1 } } } }},
+    }, .selection = &.{ 5, 4, 3, 2, 1, 0 } };
+    var first = try @import("compiler.zig").compileScalar(a, "12 / n + 1", .{});
+    defer first.deinit();
+    var second = try @import("compiler.zig").compileScalar(a, "12 / n * 2", .{});
+    defer second.deinit();
+    var left = try scalar.bind(a, first.expression, &columns, &.{}, .{});
+    defer left.deinit();
+    var right = try scalar.bind(a, second.expression, &columns, &.{}, .{});
+    defer right.deinit();
+    const programs = [_]*const scalar.Program{ &left, &right };
+    const outputs = try evaluateColumnsEncodedMany(a, &programs, page, &columns, &.{}, null);
+    defer freeEncodedMany(a, outputs);
+    for (outputs, programs) |optional, program| {
+        const batch = optional.?;
+        try std.testing.expectEqual(@as(usize, 2), batch.dictionary.values.len);
+        for (0..page.selection.len) |row| {
+            const source = try page.cell(a, row, "n");
+            const expected = try program.evaluate(a, &.{.{ .value = source.value, .sql_null = source.sql_null }}, &.{}, .{});
+            try std.testing.expectEqualDeep(expected, try batch.cell(a, row, 0));
+        }
+    }
+}
+test "SQL fused dictionary projections share referenced inputs and release all allocation failures" {
+    try fusedDictionaryScenario(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, fusedDictionaryScenario, .{});
 }
