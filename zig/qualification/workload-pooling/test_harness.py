@@ -2,12 +2,94 @@
 
 import copy
 import unittest
+from unittest.mock import patch
 from compare_receipts import compare
 from limits import check_container
-from load_clients import percentile
+from load_clients import (
+    percentile,
+    operation_kind,
+    workload_breakdown,
+    admission_diagnostics,
+    workload_snapshot,
+    waiting_evidence_failures,
+)
+from run_matrix import variant_order
 
 
 class QualificationTests(unittest.TestCase):
+    def test_pressure_profile_requires_measured_waiting(self):
+        for diagnostics in (None, {}, {"wait_completed_total": 0}):
+            self.assertEqual(
+                ["fixed waiting was not exercised"],
+                waiting_evidence_failures(diagnostics, 1),
+            )
+        self.assertEqual([], waiting_evidence_failures({"wait_completed_total": 2}, 1))
+        self.assertEqual([], waiting_evidence_failures(None, 0))
+
+    def test_fixed_policy_rejects_ineffective_waiting_after_sql_work(self):
+        with patch.dict("os.environ", ANTFLY_QUALIFICATION_POLICY="fixed"):
+            for query in ({}, {"sql_waiting_enabled": False}):
+                with patch(
+                    "load_clients.operator_request",
+                    return_value=(200, {"query": query}),
+                ):
+                    # Before the first SQL request the pool may still be lazy.
+                    workload_snapshot(None)
+                    with self.assertRaisesRegex(RuntimeError, "enable SQL waiting"):
+                        workload_snapshot(None, require_waiting=True)
+            with patch(
+                "load_clients.operator_request",
+                return_value=(200, {"query": {"sql_waiting_enabled": True}}),
+            ):
+                self.assertTrue(
+                    workload_snapshot(None, require_waiting=True)["query"][
+                        "sql_waiting_enabled"
+                    ]
+                )
+        with patch.dict("os.environ", ANTFLY_QUALIFICATION_POLICY="failfast"):
+            with patch(
+                "load_clients.operator_request",
+                return_value=(200, {"query": {"sql_waiting_enabled": False}}),
+            ):
+                workload_snapshot(None, require_waiting=True)
+
+    def test_admission_diagnostics_keep_queue_wait_and_lease_ownership_separate(self):
+        before = {
+            "query": {
+                key: 0
+                for key in (
+                    "wait_ns_total",
+                    "wait_completed_total",
+                    "lease_hold_ns_total",
+                    "lease_completed_total",
+                    "rejected_total",
+                    "expired_total",
+                    "cancelled_total",
+                )
+            }
+        }
+        after = copy.deepcopy(before)
+        after["query"].update(
+            wait_ns_total=20_000_000,
+            wait_completed_total=2,
+            lease_hold_ns_total=12_000_000,
+            lease_completed_total=4,
+        )
+        result = admission_diagnostics(before, after)
+        self.assertEqual(0.01, result["mean_wait_seconds"])
+        self.assertEqual(0.003, result["mean_completed_lease_hold_seconds"])
+        self.assertIsNone(admission_diagnostics(None, None))
+        with self.assertRaises(RuntimeError):
+            admission_diagnostics(after, before)
+
+    def test_repeated_matrix_rotates_every_variant_through_every_position(self):
+        variants = ["main", "fixed", "failfast"]
+        orders = [variant_order(variants, i) for i in range(3)]
+        for position in range(3):
+            self.assertEqual(set(variants), {order[position] for order in orders})
+        self.assertEqual(variants, variant_order(variants, 3))
+        self.assertEqual(["main", "fixed", "failfast"], variants)
+
     def receipt(self):
         return dict(
             passed=True,
@@ -99,6 +181,32 @@ class QualificationTests(unittest.TestCase):
             "waiting": {"max_wait_ms": 0}
         }
         self.assertTrue(compare(baseline, candidate)["passed"])
+
+    def test_workload_breakdown_preserves_drops_failures_and_successes(self):
+        outcomes = [
+            {"kind": "cheap", "ok": True, "status": 200, "end_to_end_seconds": 0.1},
+            {"kind": "cheap", "ok": False, "status": 503, "end_to_end_seconds": 0.2},
+            {
+                "kind": "slow_reader",
+                "ok": True,
+                "status": 200,
+                "end_to_end_seconds": 0.4,
+            },
+        ]
+        measured = workload_breakdown(
+            outcomes, {"cheap": 4, "slow_reader": 1}, {"cheap": 2}, 2
+        )
+        self.assertEqual(sum(k["offered"] for k in measured.values()), 5)
+        self.assertEqual(
+            sum(k["completed"] + k["generator_dropped"] for k in measured.values()), 5
+        )
+        self.assertEqual(measured["cheap"]["successful_per_second"], 0.5)
+        self.assertEqual(measured["cheap"]["status_counts"], {"200": 1, "503": 1})
+        self.assertEqual(
+            [operation_kind(i, True) for i in (3, 7, 11, 15)],
+            ["expensive", "write", "expensive", "slow_reader"],
+        )
+        self.assertTrue(all(operation_kind(i, False) == "cheap" for i in range(16)))
 
     def test_empty_latency_sample_has_no_successful_percentile(self):
         self.assertIsNone(percentile([], 0.95))

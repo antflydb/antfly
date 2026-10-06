@@ -36,6 +36,12 @@ pub const singleNamespaceStore = system_store_client.singleNamespaceStore;
 pub const Context = struct {
     handle: ?*anyopaque = null,
 
+    pub fn memoryParent(self: *const Context) !abi.MemoryParent {
+        var result: abi.MemoryParent = undefined;
+        if (!abi.antfly_storage_context_memory_parent(self.handle, &result)) return error.StorageContextUnavailable;
+        return result;
+    }
+
     pub fn reclaimBackupPinJson(self: *Context, request: abi.BackupPinReclaimRequest) !Response {
         try self.ensure();
         var response: Response = .{};

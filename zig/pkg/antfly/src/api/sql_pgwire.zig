@@ -45,9 +45,13 @@ pub const Listener = struct {
         if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
         _ = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
-        const self = try api.state_alloc.create(Listener);
-        errdefer api.state_alloc.destroy(self);
-        self.alloc = api.state_alloc;
+        // Raw protocol/frame/runtime allocations must remain possible after
+        // foreground node memory is full, before a control can be classified.
+        // Prepared execution state still follows the adapter's API owners.
+        const transport_alloc = if (api.transport_memory) |memory| memory.allocator() else api.state_alloc;
+        const self = try transport_alloc.create(Listener);
+        errdefer transport_alloc.destroy(self);
+        self.alloc = transport_alloc;
         self.adapter = .{ .server = api };
         // Long-lived idle sessions must not consume the shared outbound lane.
         // One session task per connection plus accept, deadline and cancel slots.

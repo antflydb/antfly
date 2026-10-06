@@ -906,6 +906,12 @@ pub fn storageOwnerContextReleaseExternal(context: ?*anyopaque, bytes: usize) ca
     owner.resources.resource_manager.releaseExternal(bytes);
 }
 
+pub fn storageOwnerContextMemoryParent(context: ?*anyopaque, out_parent: *kernel_owner_abi.MemoryParent) callconv(.c) bool {
+    const owner = asStorageOwnerContext(context) orelse return false;
+    out_parent.* = owner.resources.resource_manager.memoryParentPort();
+    return true;
+}
+
 pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,

@@ -45,7 +45,18 @@ def sample(pid):
         fds = len(list((task / "fd").iterdir()))
     else:
         raise RuntimeError("process sampling requires macOS or Linux")
+    if platform.system() == "Linux":
+        fields = (task / "stat").read_text().rsplit(")", 1)[1].split()
+        cpu_seconds = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    else:
+        clock = subprocess.check_output(
+            ["ps", "-o", "cputime=", "-p", str(pid)], text=True
+        ).strip()
+        cpu_seconds = 0.0
+        for component in clock.split(":"):
+            cpu_seconds = cpu_seconds * 60 + float(component)
     return {
+        "cpu_seconds": cpu_seconds,
         "rss_bytes": int(values[0]) * 1024,
         "virtual_bytes": int(values[1]) * 1024,
         "threads": threads,

@@ -3285,6 +3285,155 @@ test "retained transaction reservations survive LSM reopen and guarantee committ
     }
 }
 
+test "workload accepted transactions preserve intents on node pressure and retry durably" {
+    const alloc = std.testing.allocator;
+    const ResourceManager = @import("resource_manager.zig").ResourceManager;
+    var resources = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 }, .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    const path = try tempTestPath(alloc, "txn-node-pressure");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const committed: TxnId = @splat(91);
+    const aborted: TxnId = @splat(92);
+    const committed_key = try internal_keys.documentKeyAlloc(alloc, "accepted");
+    defer alloc.free(committed_key);
+    const aborted_key = try internal_keys.documentKeyAlloc(alloc, "discarded");
+    defer alloc.free(aborted_key);
+    {
+        // Release competing ownership only after backend shutdown has joined.
+        var pressure: u64 = 0;
+        defer if (pressure != 0) resources.releaseExternal(pressure);
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(committed, 1);
+        try manager.writeIntents(committed, &.{.{ .key = "accepted", .value = "durable" }}, &.{});
+        try manager.initTransaction(aborted, 2);
+        try manager.writeIntents(aborted, &.{.{ .key = "discarded", .value = "never visible" }}, &.{});
+        var committed_batch = try manager.collectIntentBatch(alloc, committed);
+        defer committed_batch.deinit(alloc);
+        var aborted_batch = try manager.collectIntentBatch(alloc, aborted);
+        defer aborted_batch.deinit(alloc);
+        const snapshot = resources.snapshot().memory;
+        pressure = snapshot.hard_limit_bytes - snapshot.used_bytes;
+        try std.testing.expect(resources.reserveExternal(pressure));
+        try std.testing.expect(!resources.reserveExternal(1));
+        // A captured intent list alone does not reserve downstream cursors or
+        // publication memory. Preserve this failure as a regression until a
+        // typed completion reservation spans the entire storage operation.
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.resolveIntentsWithExtraBatch(committed, .committed, 100, .{ .captured_intents = committed_batch.owned_entries, .expected_intent_revision = committed_batch.revision }));
+        try std.testing.expectEqual(TxnStatus.pending, try manager.getTransactionStatus(committed));
+        resources.releaseExternal(pressure);
+        pressure = 0;
+        _ = try manager.resolveIntentsWithExtraBatch(committed, .committed, 100, .{ .captured_intents = committed_batch.owned_entries, .expected_intent_revision = committed_batch.revision });
+        _ = try manager.resolveIntentsWithExtraBatch(aborted, .aborted, 101, .{ .captured_intents = aborted_batch.owned_entries, .expected_intent_revision = aborted_batch.revision });
+        try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+        try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.lsm_wal_write_working_set).used_bytes);
+        const after = resources.snapshot().memory;
+        pressure = after.hard_limit_bytes - after.used_bytes;
+        try std.testing.expect(resources.reserveExternal(pressure));
+    }
+    // Check persisted mutations and transaction decisions after all owners close.
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, "durable", try read.get(committed_key));
+    try std.testing.expectError(error.NotFound, read.get(aborted_key));
+    try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+    try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+}
+
+test "workload accepted transactions recover durable decisions after pressured shutdown" {
+    const alloc = std.testing.allocator;
+    const ResourceManager = @import("resource_manager.zig").ResourceManager;
+    var resources = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 }, .identity_allocator = alloc });
+    defer resources.deinit(alloc);
+    const path = try tempTestPath(alloc, "txn-decided-node-pressure");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    const committed: TxnId = @splat(93);
+    const aborted: TxnId = @splat(94);
+    const committed_key = try internal_keys.documentKeyAlloc(alloc, "accepted");
+    defer alloc.free(committed_key);
+    const aborted_key = try internal_keys.documentKeyAlloc(alloc, "discarded");
+    defer alloc.free(aborted_key);
+    {
+        var pressure: u64 = 0;
+        // Keep competing ownership held until the backend joins shutdown.
+        defer if (pressure != 0) resources.releaseExternal(pressure);
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try manager.initTransaction(committed, 1);
+        try manager.writeIntents(committed, &.{.{ .key = "accepted", .value = "durable" }}, &.{});
+        try manager.initTransaction(aborted, 2);
+        try manager.writeIntents(aborted, &.{.{ .key = "discarded", .value = "never visible" }}, &.{});
+        // Model a participant that has persisted an externally learned decision
+        // but has not yet published or removed its intents. Preserve the real
+        // intent revision and current record encoding for restart recovery.
+        for ([_]TxnId{ committed, aborted }, [_]TxnStatus{ .committed, .aborted }) |id, status| {
+            var record = try manager.loadTransactionRecord(id);
+            try applyResolveDecision(&record, status, 100);
+            record.retain_terminal = true;
+            try manager.saveTransactionRecord(makeRecordKey(id), record);
+        }
+        var batch = try manager.collectIntentBatch(alloc, committed);
+        defer batch.deinit(alloc);
+        const snapshot = resources.snapshot().memory;
+        pressure = snapshot.hard_limit_bytes - snapshot.used_bytes;
+        try std.testing.expect(resources.reserveExternal(pressure));
+        try std.testing.expect(!resources.reserveExternal(1));
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.resolveIntentsWithExtraBatch(committed, .committed, 100, .{ .captured_intents = batch.owned_entries, .expected_intent_revision = batch.revision }));
+        try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+        try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+        try std.testing.expect(!(try manager.loadTransactionRecord(committed)).intents_resolved);
+    }
+    {
+        var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+        defer backend.close();
+        var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+        defer store.close();
+        var manager = try TxnManager.init(alloc, &store);
+        defer manager.deinit();
+        try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+        try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+        const recovered = try manager.recoverTransactions(0, 101);
+        try std.testing.expectEqual(@as(u64, 2), recovered.resolved_finalized);
+        try std.testing.expectEqual(@as(u64, 0), recovered.auto_aborted);
+        try std.testing.expect(!try manager.hasAnyIntents(committed));
+        try std.testing.expect(!try manager.hasAnyIntents(aborted));
+        try std.testing.expectEqual(@as(u64, 0), (try manager.recoverTransactions(0, 102)).resolved_finalized);
+        try std.testing.expectEqual(@as(u64, 0), resources.sliceStats(.lsm_wal_write_working_set).used_bytes);
+    }
+    // A second reopen proves recovery durably published the chosen outcomes.
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .resource_manager = &resources });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, "durable", try read.get(committed_key));
+    try std.testing.expectError(error.NotFound, read.get(aborted_key));
+    try std.testing.expectEqual(TxnStatus.committed, try manager.getTransactionStatus(committed));
+    try std.testing.expectEqual(TxnStatus.aborted, try manager.getTransactionStatus(aborted));
+    try std.testing.expect((try manager.loadTransactionRecord(committed)).intents_resolved);
+    try std.testing.expect((try manager.loadTransactionRecord(aborted)).intents_resolved);
+}
+
 test "retained transaction reservations admit existing prepares release abort and fence untracked roots" {
     const alloc = std.testing.allocator;
     var backend = mem_backend.Backend.init(alloc, .{});

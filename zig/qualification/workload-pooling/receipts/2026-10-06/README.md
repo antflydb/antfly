@@ -59,3 +59,53 @@ Do not reinterpret a missing sample as a passing zero-latency observation.
   profile. Fixed waiting validates all 64 authenticated sessions, 32 held cursors
   and two portals; RSS growth 85.3 MiB, status maximum 244 ms, zero FD growth after
   close. Main again fails during pgwire setup. All three shutdowns exit zero.
+
+## Post-main macOS ReleaseSafe measurements
+
+[`release-safe-macos`](release-safe-macos/provenance.json) compares main
+`e6d4ce9bbc716be5e7dc96ac37b9d70dc4d6778c` with the post-main shared-parent and
+transport-pin implementation. Both binaries use native ARM64 Zig 0.17.0,
+unstripped ReleaseSafe. The provenance file and compressed source patch identify
+the uncommitted candidate source; individual receipts include binary hashes.
+Each matrix runs three repetitions with rotated variant order. Measurements used
+a shared developer host with verification compilers and a Linux Docker build
+active; they do not claim isolated CPU scheduling. Raw receipts and
+redacted server logs are losslessly compressed. Recorded paths refer to the
+original temporary measurement directory; retained files have the same basenames.
+
+- `mixed`: all nine absolute profiles pass, and all three fixed/main comparisons
+  pass. Fixed/fail-fast comparisons fail low-load p95 in repetitions one and two,
+  and recovery p95 in repetition one. Sustained throughput is about 193/s for
+  every variant. The fixed variants report **zero completed admission waits**;
+  this workload measures overhead without proving behavior under saturation.
+- `waiting-pressure`: a distinct manifest uses one execution slot and offers
+  750 requests/s in sustained load. All nine absolute profiles pass, including
+  the new required completed-wait gate. Fixed variants record 2,045, 1,542 and
+  1,304 completed waits. Sustained successful throughput is 437.87, 341.78 and
+  296.52/s, respectively, versus main 205.98, 302.75 and 273.22/s and candidate
+  fail-fast 265.90, 308.54 and 322.45/s. Every sustained comparison passes the
+  unchanged 90% floor. The matrix nevertheless **fails**: repetition one fails
+  low-load p95 against both alternatives; repetition three fails recovery p95
+  against candidate fail-fast.
+
+The failures are preserved. This is evidence that the ReleaseSafe macOS pressure
+case avoids the historical Debug throughput regression, not qualification of
+Linux or automatic defaults. Relative latency, whole-process ownership and
+protected progress under arbitrary transport/storage exhaustion remain required.
+
+The post-main ReleaseSafe `idle` matrix retains 32 authenticated HTTP and 32
+pgwire sessions with 16 held cursors. All six candidate profiles pass the
+unchanged resource/recovery gates, with zero FD growth after close; all three
+main profiles fail during pgwire setup with SQLSTATE 57014. This manifest does
+not enable query waiting, so these receipts verify default transport/session
+ownership rather than queued SQL progress. The matrix fails because main fails.
+
+[`post-main-verification`](post-main-verification/) retains logs for the linked
+storage context ownership/ABI ReleaseSafe fixture; local durable-decision tests;
+all four authenticated six-node cascade cases (two controls and two suspended
+foreground schedules); the Nix GNU signal-stack overflow fixture; and compiler
+reservation unit tests. The completed ReleaseSafe contracts log records 48
+pooling tests, 98 resource/transaction tests and the filesystem fixture, with
+69/69 build steps succeeding and no leaks. The toolchain file records the pinned Nix compiler's
+actual store path, glibc interpreter and SHA-256. These targeted proofs do not
+claim mutating COMMIT can finish immediately at a full storage/transport ceiling.

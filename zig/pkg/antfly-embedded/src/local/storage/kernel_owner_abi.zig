@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 75;
+pub const abi_version: u32 = 76;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -432,6 +432,7 @@ pub const ContextResourceBudgetStats = extern struct {
     hard_limit_rejections: u64 = 0,
     oversized_single_grants: u64 = 0,
     accounting_errors: u64 = 0,
+    external_bytes: u64 = 0,
 
     /// Project aggregate or slice counters without importing the storage
     /// implementation across this ABI. Inapplicable counters remain zero.
@@ -445,6 +446,7 @@ pub const ContextResourceBudgetStats = extern struct {
             .hard_limit_rejections = stats.hard_limit_rejections,
             .oversized_single_grants = if (@hasField(@TypeOf(stats), "oversized_single_grants")) stats.oversized_single_grants else 0,
             .accounting_errors = if (@hasField(@TypeOf(stats), "accounting_errors")) stats.accounting_errors else 0,
+            .external_bytes = if (@hasField(@TypeOf(stats), "external_bytes")) stats.external_bytes else 0,
         };
     }
 };
@@ -1664,6 +1666,11 @@ pub extern fn antfly_storage_context_configure_remote_content_security(
 /// before destroying the context; reservation failure leaves ownership unchanged.
 pub extern fn antfly_storage_context_reserve_external(context: ?*anyopaque, bytes: usize) callconv(.c) bool;
 pub extern fn antfly_storage_context_release_external(context: ?*anyopaque, bytes: usize) callconv(.c) void;
+
+/// Borrows the context's node accounting/pressure owner. Every child must
+/// release its final observer balance before context destruction.
+pub const MemoryParent = @import("runtime_memory_abi").Parent;
+pub extern fn antfly_storage_context_memory_parent(context: ?*anyopaque, out_parent: *MemoryParent) callconv(.c) bool;
 
 pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,

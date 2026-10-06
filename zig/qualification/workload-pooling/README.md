@@ -103,6 +103,7 @@ elapsed time. A status code without valid rows is not a successful query.
 python3 zig/qualification/workload-pooling/run_matrix.py \
   --candidate /path/to/candidate/antfly --baseline /path/to/main/antfly \
   --manifest zig/qualification/workload-pooling/macos-mixed-load.json \
+  --repetitions 3 \
   --output-dir /tmp/fresh-pooling-comparison
 ```
 
@@ -111,9 +112,30 @@ an unlimited Linux host. Build native GNU Linux binaries outside the measurement
 container, then run the small profiles with two CPUs, 2 GiB, 512 PIDs and 512 FDs;
 the large profile uses four CPUs, 4 GiB, 768 PIDs and 1024 FDs. The Dockerfile and
 manual `Zig Workload Pooling Qualification` workflow provide that environment,
-build the selected baseline with the same optimization/toolchain, run the GNU
-signal-stack fixture, and retain all receipts. Small/large authenticated profiles
+build the selected baseline with the same stripped ReleaseSafe optimization and pinned
+Nix glibc-linked Zig toolchain, verify compiler version and dynamic linkage, run
+the GNU signal-stack fixture, and retain all receipts. Small/large authenticated profiles
 also exercise extended-protocol prepared portal suspension/continuation.
+
+Repeated matrices rotate the variant order so each binary/policy occupies every
+position. Every repetition retains its own receipts and comparisons; one failed
+repetition fails the matrix. The manual workflow uses three repetitions with
+ReleaseSafe binaries. Per-phase receipts also separate cheap queries, expensive
+queries, writes and slow readers, record server CPU consumed and preserve
+before/after operator counters for candidate policies. Operator snapshots occur
+outside the timed phase. Per-kind comparison ratios are diagnostic; the original
+aggregate latency and successful-throughput gates remain unchanged. The fixed
+variant must also report SQL waiting as effective after executing each phase;
+startup configuration alone cannot qualify an unavailable worker pool. CI builds
+portable x86_64 GNU binaries on the existing heavy build runner, then measures
+them on a separate Ubuntu runner in the enforced small/large Docker envelopes.
+
+The separate `macos-waiting-pressure.json` and `linux-waiting-pressure.json`
+profiles use one execution slot and offer 750 requests/s during sustained load.
+They retain the mixed-load resource and performance gates and require at least
+one completed admission wait in that phase. The original 200 requests/s profile
+remains a separate measurement: on ReleaseSafe it can measure overhead without
+forcing requests to queue. A pressure receipt with no completed waits fails.
 
 The comparison requires identical manifest hashes, enforced limits, offered
 work and zero retries. It checks a 25% low-load/recovery p95 regression ceiling
@@ -129,7 +151,8 @@ manifest explicitly records warm-up operations and uses cheap low-load/recovery
 queries; it is not a replacement for a failed cold profile. Historical development
 [receipts](receipts/2026-10-06/README.md) retain both outcomes and binary provenance.
 The API accounting port shares the actual storage owner in linked composition.
-Inference and unmanaged transport/native allocations remain independent owners;
+Managed inference and public HTTP transport now share the node accounting owner.
+Unmanaged native and independently supplied service allocations retain their owners;
 see [the ownership ledger](RESOURCE_OWNERSHIP.md) before interpreting health
 counters as a whole-process cap.
 

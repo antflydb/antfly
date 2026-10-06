@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// Licensed under the Elastic License 2.0 (ELv2); see https://www.antfly.io/licensing/ELv2-license.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Allocation-free FIFO admission. Queue entries belong to their callers and
 //! are retired under the same lock used by grant/close. Waiting occupies an
@@ -85,6 +97,9 @@ pub const Controller = struct {
     waited: u64 = 0,
     wait_ns: u64 = 0,
     wait_completed: u64 = 0,
+    lease_completed: u64 = 0,
+    lease_hold_ns: u64 = 0,
+    lease_hold_ns_max: u64 = 0,
     wait_buckets: [wait_bucket_ms.len + 1]u64 = @splat(0),
     expired: u64 = 0,
     cancelled: u64 = 0,
@@ -145,10 +160,26 @@ pub const Controller = struct {
     pub const Lease = struct {
         admission: *Controller,
         active: bool = true,
+        clock: ?struct { io: std.Io, native_now_ns: ?*const fn () u64 } = null,
+        started_ns: u64 = 0,
+
+        fn track(self: *Lease, options: Options) void {
+            self.clock = .{ .io = options.clock_io orelse options.io, .native_now_ns = options.native_now_ns };
+            self.started_ns = options.now();
+        }
 
         pub fn release(self: *Lease) void {
             if (!self.active) return;
             self.active = false;
+            if (self.clock) |clock| {
+                const now: u64 = if (clock.native_now_ns) |now_fn| now_fn() else @intCast(@max(0, std.Io.Clock.now(.awake, clock.io).nanoseconds));
+                const elapsed = now -| self.started_ns;
+                self.admission.lock();
+                self.admission.lease_completed +|= 1;
+                self.admission.lease_hold_ns +|= elapsed;
+                self.admission.lease_hold_ns_max = @max(self.admission.lease_hold_ns_max, elapsed);
+                self.admission.mutex.unlock();
+            }
             self.admission.release();
         }
     };
@@ -255,6 +286,7 @@ pub const Controller = struct {
                 lease.release();
                 return err;
             };
+            lease.track(options);
             return lease;
         }
         const started = options.now();
@@ -269,7 +301,9 @@ pub const Controller = struct {
             self.mutex.unlock();
             if (failure != null or done) {
                 if (did_wait) self.recordWait(options.now() -| started);
-                return self.retire(&entry, failure);
+                var lease = try self.retire(&entry, failure);
+                lease.track(options);
+                return lease;
             }
             // Atomic/external cancellation has no Event wake hook. Bound its
             // observation latency without spinning or extending the deadline.
@@ -366,6 +400,11 @@ pub const Controller = struct {
         waited_total: u64 = 0,
         wait_ns_total: u64 = 0,
         wait_completed_total: u64 = 0,
+        /// Granted operation ownership, including slow consumers/held portals.
+        /// Queue waiting is excluded; this is elapsed ownership, not CPU time.
+        lease_completed_total: u64 = 0,
+        lease_hold_ns_total: u64 = 0,
+        lease_hold_ns_max: u64 = 0,
         wait_buckets: [wait_bucket_ms.len + 1]u64 = @splat(0),
         expired_total: u64 = 0,
         cancelled_total: u64 = 0,
@@ -395,6 +434,9 @@ pub const Controller = struct {
             .waited_total = self.waited,
             .wait_ns_total = self.wait_ns,
             .wait_completed_total = self.wait_completed,
+            .lease_completed_total = self.lease_completed,
+            .lease_hold_ns_total = self.lease_hold_ns,
+            .lease_hold_ns_max = self.lease_hold_ns_max,
             .wait_buckets = self.wait_buckets,
             .expired_total = self.expired,
             .cancelled_total = self.cancelled,
@@ -410,6 +452,30 @@ pub const Controller = struct {
         };
     }
 };
+
+test "bounded admission contextual leases measure ownership once under both policies" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    inline for (.{ false, true }) |allow_wait| {
+        var gate = Controller.init(1);
+        Clock.value = 100;
+        var lease = try gate.acquire(.{ .io = std.testing.io, .native_now_ns = Clock.now, .allow_wait = allow_wait });
+        Clock.value = 250;
+        lease.release();
+        Clock.value = 500;
+        lease.release();
+        const stats = gate.stats();
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_completed_total);
+        try std.testing.expectEqual(@as(u64, 150), stats.lease_hold_ns_total);
+        try std.testing.expectEqual(@as(u64, 150), stats.lease_hold_ns_max);
+        try std.testing.expectEqual(@as(u64, 0), stats.wait_ns_total);
+        try std.testing.expectEqual(@as(usize, 0), stats.in_flight);
+    }
+}
 
 test "bounded admission FIFO grant cancellation and close transfer one owner" {
     var gate = try Controller.initConfigured(1, .{ .max_queued_requests = 2, .max_queued_bytes = 20, .max_wait_ms = 100 });

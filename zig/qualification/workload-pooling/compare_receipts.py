@@ -54,11 +54,30 @@ def compare(baseline, candidate):
             continue
         latency_ratio = new["success_p95_seconds"] / old["success_p95_seconds"]
         throughput_ratio = new["successful_per_second"] / old["successful_per_second"]
+        by_kind = {}
+        for kind in sorted(
+            old.get("by_kind", {}).keys() & new.get("by_kind", {}).keys()
+        ):
+            previous, current = old["by_kind"][kind], new["by_kind"][kind]
+            by_kind[kind] = {
+                "baseline_successful": previous["successful"],
+                "candidate_successful": current["successful"],
+                "throughput_ratio": current["successful_per_second"]
+                / previous["successful_per_second"]
+                if previous["successful_per_second"]
+                else None,
+                "success_p95_ratio": current["success_p95_seconds"]
+                / previous["success_p95_seconds"]
+                if previous["success_p95_seconds"]
+                and current["success_p95_seconds"] is not None
+                else None,
+            }
         comparisons.append(
             dict(
                 name=name,
                 success_p95_ratio=latency_ratio,
                 throughput_ratio=throughput_ratio,
+                by_kind=by_kind,
             )
         )
         if (

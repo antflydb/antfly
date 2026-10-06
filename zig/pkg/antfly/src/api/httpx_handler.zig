@@ -13245,8 +13245,17 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     defer prepared_store.deinit();
     var prepared_durable = transactions_api.DurableSessionStore.initRuntime(alloc, &prepared_store);
     var source: Source = .{};
+    const Accounting = struct {
+        fn reserve(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+            return @as(*resources.ResourceManager, @ptrCast(@alignCast(ptr))).reserveExternal(bytes);
+        }
+        fn release(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+            @as(*resources.ResourceManager, @ptrCast(@alignCast(ptr))).releaseExternal(bytes);
+        }
+    };
     var server = try ApiHttpServer.initWithConfig(alloc, .{
         .request_memory_bytes = 4 << 20,
+        .memory_accounting = .{ .ptr = &storage_manager, .reserve_fn = Accounting.reserve, .release_fn = Accounting.release },
         .backend_runtime = backend_runtime.ptr(),
         .session_store = &prepared_durable,
         .query_max_concurrent_requests = 1,

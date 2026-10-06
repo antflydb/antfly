@@ -6,7 +6,7 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 
 ## Implemented scope
 
-- [Shared admission controller](pkg/antfly/src/common/bounded_admission.zig):
+- [Shared admission controller](pkg/antfly-embedded/src/local/common/bounded_admission.zig):
   allocation-free FIFO queue, count/input-byte/wait limits, original deadlines,
   cancellation/grant ownership, close/drain notification, and single-release
   operation leases. Legacy callers retain fail-fast acquisition and zero-capacity
@@ -582,3 +582,66 @@ low-load/recovery latency gates passed; main failed authenticated idle setup.
 Raw receipts and server logs are preserved, including the earlier unequal-heap
 comparison and its limitation. Default waiting remains disabled; do not tune
 or relax an existing manifest to erase this result.
+
+
+### Post-main integration and ReleaseSafe qualification
+
+The branch includes origin/main e6d4ce9bbc. Managed local storage and inference
+now borrow the linked storage context's allocation-free memory parent. Strict
+reservations charge the parent before mutation; observers report actual existing
+usage, even over budget; releases from sibling owners share the pressure event.
+A separate bounded parent-reclamation callback runs outside child accounting
+locks and preserves child ceilings, allowing inference to reuse sibling storage
+cache capacity. The parent outlives child teardown, and consolidated memory reporting counts its
+aggregate once. The public HTTP and pgwire transport allocator reserves a bounded
+node pin before publication and releases it after listener/session joins. This
+protects those heaps against exhaustion of other managed owners; exhaustion of
+the transport pin itself still needs separate protected parser capacity.
+
+The matrix now runs three repetitions with rotated variant order. Phase receipts
+include operation-class throughput, client queue delay, CPU use, and independent
+admission wait/lease-hold counter deltas. Runtime limits and relative release gates
+are unchanged. These diagnostics are not substitutes for passing receipts.
+Linux ReleaseSafe qualification uses the pinned Nix glibc-linked Zig package for
+both variants and retains compiler version, store path, linkage and checksum.
+The interrupted official-archive ReleaseSafe attempts do not qualify this
+toolchain or justify increasing its compiler scheduling reservations.
+
+The new LSM transaction regression checks safe rejection with a captured intent
+batch under node exhaustion, preservation of pending intents, successful durable
+retry, shutdown while competing node ownership remains held, and reopen with
+committed data and aborted data absent. It does **not** prove immediate mutating
+COMMIT under exhaustion: both intent enumeration and later write-path cursors need
+storage resources outside the API control pin. A completion reserve must cover
+the whole downstream operation before that guarantee can be claimed. Distributed
+accepted-decision recovery remains a separate required receipt.
+
+A second LSM regression persists terminal commit/abort records with unresolved
+intents, rejects publication under node exhaustion while preserving the learned
+decisions, and closes all owners while pressure remains held. After reopening,
+recovery publishes the committed value and removes aborted intents without
+presuming abort or repeating resolution. A second reopen verifies durable results.
+This models a local participant's learned decision, rather than generating a
+distributed coordinator decision. The two real six-node ReleaseSafe fault cases
+passed with fresh queries suspended on every data node: owner restart and lost
+accepted-resolution reply both completed the durable cascade and permitted
+claim/reference reuse. Those schedules do not fill every distributed memory
+owner or prove arbitrary transport-heap exhaustion.
+
+Targeted post-main verification has passed 48 pooling cases, 98 resource and
+transaction cases plus the filesystem fixture, and 12 harness tests. Both macOS
+production ReleaseSafe binaries have built successfully. The original mixed-load matrix
+passed all three comparisons against main but failed candidate fail-fast
+low-load/recovery latency comparisons in two repetitions. Its fixed variant
+recorded no completed admission waits. Separate one-slot, 750 requests/s profiles
+require completed waiting and retain the original performance gates. All nine
+macOS pressure profiles passed; fixed waiting recorded 1,304–2,045 completed
+waits and passed every sustained throughput comparison. The matrix still failed
+relative low-load/recovery latency in two repetitions. Both successful and failed
+receipts are retained under `receipts/2026-10-06/release-safe-macos`. The linked
+storage context ownership/ABI fixture also passes in ReleaseSafe,
+and the GNU Linux signal-stack fixture passes with the pinned Nix compiler.
+Linux qualification uses identical stripped ReleaseSafe settings after preserving
+the unqualified unstripped attempt that exceeded the storage compiler claim.
+Linux production builds and qualification remain in progress;
+waiting remains opt-in.

@@ -42,6 +42,9 @@ pub const CompileMemoryProfile = struct {
 
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
     const target = profile.target;
+    const native_gnu_arm64_safe = profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
+        profile.optimize == .safe and !profile.sanitize_thread;
     const baseline_cpu = std.Target.Cpu.baseline(target.cpu.arch, target.os);
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
@@ -90,17 +93,21 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
         // build. Linux retains 10 GiB. The macOS claim now includes a
         // provisional margin over the subsequently exceeded 11 GiB claim.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 14 else 10) * 1024 * 1024 * 1024,
+        // Pinned Nix glibc Zig 0.17 native ARM64 GNU ReleaseSafe reached
+        // 12,550,221,824 bytes. Fifteen GiB provides >25% measured headroom.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 14 else if (native_gnu_arm64_safe) 15 else 10) * 1024 * 1024 * 1024,
         // September's macOS 20 GiB claim is below the reported 22–23 GB
         // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
         // Keep the measured Linux profiles separate. The other macOS bumps
         // below are provisional 25% margins over claims reported as exceeded;
         // replace them with cold-build evidence before lowering them.
         .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else 20) * 1024 * 1024 * 1024,
-        // The aarch64-macOS ReleaseSafe distributed unit reached 12.14 GB
-        // after the September 2026 runtime changes. Keep a measured margin
-        // without reducing Linux runner concurrency.
-        .distributed => @as(usize, if (target.os.tag == .macos) 13 else 11) * 1024 * 1024 * 1024,
+        // Latest-main aarch64-macOS ReleaseSafe reached 14.01 decimal GB,
+        // exceeding 13 GiB. Reserve 17 GiB (>25% above that observed peak)
+        // for this profile; preserve other hosts/modes and runtime limits.
+        // Pinned Nix GNU ARM64 ReleaseSafe peaked at 13,191,520,256 bytes;
+        // sixteen GiB provides >25% measured headroom for that profile.
+        .distributed => @as(usize, if (target.os.tag == .macos) (if (profile.optimize == .safe) 17 else 13) else if (native_gnu_arm64_safe) 16 else 11) * 1024 * 1024 * 1024,
         .enrichment_compute => 4 * 1024 * 1024 * 1024,
         // This is deliberately a separate non-PIC product unit. The
         // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
@@ -114,10 +121,28 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
         .inference => @as(usize, if (target.os.tag == .macos) 20 else 16) * 1024 * 1024 * 1024,
-        // macOS CLI exceeded the newer 3 GiB claim too; provision 4 GiB
-        // pending a fresh cold-build trace. Keep the Linux claim unchanged.
-        .cli => @as(usize, if (target.os.tag == .macos) 4 else 3) * 1024 * 1024 * 1024,
+        // Pinned Nix glibc Zig 0.17 native ARM64 GNU ReleaseSafe CLI peaked
+        // at 3,645,767,680 bytes. Five GiB provides >25% measured headroom.
+        // macOS retains its provisional four GiB claim; other Linux profiles
+        // retain their existing three GiB claim.
+        .cli => @as(usize, if (target.os.tag == .macos) 4 else if (native_gnu_arm64_safe) 5 else 3) * 1024 * 1024 * 1024,
     };
+}
+
+test "native GNU ARM64 ReleaseSafe claims cover pinned Nix compiler peaks" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = false, .cpu_inference = true };
+    for ([_]RuntimeLibraryUnit{ .cli, .api_kernel, .distributed }, [_]usize{ 3_645_767_680, 12_550_221_824, 13_191_520_256 }) |unit, peak| {
+        try std.testing.expect(runtimeCompileMaxRss(unit, profile) >= peak + peak / 4);
+    }
+    var other = profile;
+    other.optimize = .fast;
+    try std.testing.expectEqual(@as(usize, 3) << 30, runtimeCompileMaxRss(.cli, other));
+    try std.testing.expectEqual(@as(usize, 10) << 30, runtimeCompileMaxRss(.api_kernel, other));
+    try std.testing.expectEqual(@as(usize, 11) << 30, runtimeCompileMaxRss(.distributed, other));
+    other = profile;
+    other.sanitize_thread = true;
+    try std.testing.expectEqual(@as(usize, 10) << 30, runtimeCompileMaxRss(.api_kernel, other));
 }
 
 test "macOS reservations cover reported storage peak and prevent unsafe overlap" {
@@ -136,7 +161,7 @@ test "measured release reservations admit storage with inference and preserve un
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
     const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
     const budget = 22 * 1024 * 1024 * 1024;
-    try std.testing.expectEqual(@as(usize, 13) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.distributed, .{
+    try std.testing.expectEqual(@as(usize, 17) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.distributed, .{
         .host = macos,
         .target = macos,
         .optimize = .safe,

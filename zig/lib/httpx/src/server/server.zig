@@ -217,6 +217,9 @@ pub const ServerConfig = struct {
     /// Optional stable application allocation owners; the listener must join
     /// every response writer before those owners are destroyed.
     application_allocator: ?Allocator = null,
+    /// Stable owner for raw parser/body/HPACK, connection and runtime heaps.
+    /// Must outlive listener shutdown and all connection/request joins.
+    transport_allocator: ?Allocator = null,
     protected_application_allocator: ?Allocator = null,
     application_memory_budget_bytes: usize = 256 * 1024 * 1024,
     protected_application_memory_bytes: usize = 16 * 1024 * 1024,
@@ -1649,19 +1652,20 @@ pub const Server = struct {
     /// Creates a server with custom configuration.
     pub fn initWithConfig(allocator: Allocator, io: Io, config: ServerConfig) Self {
         const cfg = config.normalized();
+        const transport_alloc = cfg.transport_allocator orelse allocator;
 
         return .{
-            .allocator = allocator,
+            .allocator = transport_alloc,
             .io = io,
             .config = cfg,
-            .router = Router.init(allocator),
+            .router = Router.init(transport_alloc),
             .conn_semaphore = .{ .permits = cfg.max_connections },
             .request_permits = .init(cfg.max_request_tasks),
             .h1_body_budget = SharedBodyBudget.init(if (cfg.max_h1_inflight_bodies == 0) cfg.max_connections else cfg.max_h1_inflight_bodies),
             .body_budget = SharedBodyBudget.init(cfg.request_body_buffer_budget_bytes),
             .application_memory = SharedBodyBudget.init(cfg.application_memory_budget_bytes - cfg.protected_application_memory_bytes),
             .control_application_memory = SharedBodyBudget.init(cfg.protected_application_memory_bytes),
-            .owned_http_runtime = HttpRuntime.init(allocator, .{
+            .owned_http_runtime = HttpRuntime.init(transport_alloc, .{
                 .max_active_h1_requests = cfg.max_connections,
                 .max_active_connections = cfg.max_connections,
                 .max_active_requests = cfg.max_request_tasks,

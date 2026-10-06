@@ -3867,6 +3867,8 @@ pub const ApiHttpServer = struct {
     state_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
     request_memory: ?*RequestMemory = null,
     control_memory_reserved: usize = 0,
+    transport_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
+    transport_memory_reserved: usize = 0,
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
     sql_preparation_admission: RequestAdmission,
@@ -4300,18 +4302,22 @@ pub const ApiHttpServer = struct {
     pub const WorkloadMemoryStats = struct {
         node_accounted: bool,
         control_reserved_bytes: usize,
+        transport_reserved_bytes: usize,
         foreground: ?@import("../common/allocation_budget.zig").Shared.Stats,
         control: ?@import("../common/allocation_budget.zig").Shared.Stats,
         retained: ?@import("../common/allocation_budget.zig").Shared.Stats,
+        transport: ?@import("../common/allocation_budget.zig").Shared.Stats,
     };
 
     pub fn workloadMemoryStats(self: *const ApiHttpServer) WorkloadMemoryStats {
         return .{
             .node_accounted = self.cfg.memory_accounting != null,
             .control_reserved_bytes = self.control_memory_reserved,
+            .transport_reserved_bytes = self.transport_memory_reserved,
             .foreground = if (self.request_memory) |m| m.foreground.stats() else null,
             .control = if (self.request_memory) |m| m.control.stats() else null,
             .retained = if (self.state_memory) |m| m.stats() else null,
+            .transport = if (self.transport_memory) |m| m.stats() else null,
         };
     }
 
@@ -4408,6 +4414,7 @@ pub const ApiHttpServer = struct {
     pub fn configurePublicHttpTransport(self: *const ApiHttpServer, config: httpx.ServerConfig) httpx.ServerConfig {
         var result = configurePublicHttpTransportForConfig(self.cfg, config);
         result.application_allocator = self.alloc;
+        result.transport_allocator = if (self.transport_memory) |memory| memory.allocator() else null;
         result.protected_application_allocator = @constCast(self).controlAllocator();
         return result;
     }
@@ -4626,10 +4633,15 @@ pub const ApiHttpServer = struct {
         var memory_transferred = false;
         errdefer if (!memory_transferred) alloc.destroy(memory);
         const control_bytes = @min(16 << 20, cfg.request_memory_bytes / 8);
+        const transport_bytes = @min(64 << 20, cfg.request_memory_bytes);
+        const transport_memory = try alloc.create(@import("../common/allocation_budget.zig").Shared);
+        var transport_transferred = false;
+        errdefer if (!transport_transferred) alloc.destroy(transport_memory);
+        transport_memory.* = .{ .child = backing, .limit = transport_bytes };
         var control_transferred = false;
-        if (cfg.memory_accounting) |owner| if (!owner.reserve(control_bytes)) return error.OutOfMemory;
+        if (cfg.memory_accounting) |owner| if (!owner.reserve(control_bytes + transport_bytes)) return error.OutOfMemory;
         errdefer if (!control_transferred) {
-            if (cfg.memory_accounting) |owner| owner.release(control_bytes);
+            if (cfg.memory_accounting) |owner| owner.release(control_bytes + transport_bytes);
         };
 
         memory.* = .{
@@ -4665,6 +4677,9 @@ pub const ApiHttpServer = struct {
         owner_ids_transferred = true;
         server.request_memory = memory;
         server.control_memory_reserved = if (cfg.memory_accounting != null) control_bytes else 0;
+        server.transport_memory = transport_memory;
+        server.transport_memory_reserved = if (cfg.memory_accounting != null) transport_bytes else 0;
+        transport_transferred = true;
         control_transferred = true;
         server.state_memory = state_memory;
         state_transferred = true;
@@ -4691,9 +4706,9 @@ pub const ApiHttpServer = struct {
         if (cfg.join_job_store != null and cfg.join_job_store_path != null)
             return error.InvalidApiServerConfig;
         if (cfg.join_job_store) |runtime_store| {
-            const opened = try alloc.create(distributed_join.OpenedJoinJobStore);
+            const opened = try server.state_alloc.create(distributed_join.OpenedJoinJobStore);
             errdefer server.state_alloc.destroy(opened);
-            opened.* = try distributed_join.OpenedJoinJobStore.openRuntime(alloc, runtime_store);
+            opened.* = try distributed_join.OpenedJoinJobStore.openRuntime(server.state_alloc, runtime_store);
             server.join_job_store.opened_join_job_store = opened;
         } else if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
             const join_job_path = if (cfg.join_job_store_path != null)
@@ -4701,9 +4716,9 @@ pub const ApiHttpServer = struct {
             else
                 try std.fmt.allocPrint(alloc, "{s}.join_jobs", .{base_path});
             defer alloc.free(join_job_path);
-            const opened = try alloc.create(distributed_join.OpenedJoinJobStore);
+            const opened = try server.state_alloc.create(distributed_join.OpenedJoinJobStore);
             errdefer server.state_alloc.destroy(opened);
-            opened.* = try distributed_join.OpenedJoinJobStore.open(alloc, join_job_path);
+            opened.* = try distributed_join.OpenedJoinJobStore.open(server.state_alloc, join_job_path);
             server.join_job_store.opened_join_job_store = opened;
         }
         if (cfg.artifact_reprocess_job_store_path orelse cfg.session_store_path) |base_path| {
@@ -4712,9 +4727,9 @@ pub const ApiHttpServer = struct {
             else
                 try std.fmt.allocPrint(alloc, "{s}.artifact_reprocess_jobs", .{base_path});
             defer alloc.free(job_path);
-            const opened = try alloc.create(artifact_reprocess_jobs.OpenedStore);
+            const opened = try server.state_alloc.create(artifact_reprocess_jobs.OpenedStore);
             errdefer server.state_alloc.destroy(opened);
-            opened.* = try artifact_reprocess_jobs.OpenedStore.open(alloc, job_path);
+            opened.* = try artifact_reprocess_jobs.OpenedStore.open(server.state_alloc, job_path);
             errdefer opened.deinit();
             try server.artifact_reprocess_job_store.attachOpenedStore(opened);
         }
@@ -4726,9 +4741,9 @@ pub const ApiHttpServer = struct {
             else
                 try std.fmt.allocPrint(alloc, "{s}.research_jobs", .{base_path});
             defer alloc.free(job_path);
-            const opened = try alloc.create(research_jobs.OpenedStore);
+            const opened = try server.state_alloc.create(research_jobs.OpenedStore);
             errdefer server.state_alloc.destroy(opened);
-            opened.* = try research_jobs.OpenedStore.open(alloc, job_path);
+            opened.* = try research_jobs.OpenedStore.open(server.state_alloc, job_path);
             errdefer opened.deinit();
             try server.research_job_store.attachOpenedStore(opened);
         }
@@ -4738,9 +4753,9 @@ pub const ApiHttpServer = struct {
             else
                 try std.fmt.allocPrint(alloc, "{s}.repair_jobs", .{base_path});
             defer alloc.free(job_path);
-            const opened = try alloc.create(repair_jobs.OpenedStore);
+            const opened = try server.state_alloc.create(repair_jobs.OpenedStore);
             errdefer server.state_alloc.destroy(opened);
-            opened.* = try repair_jobs.OpenedStore.open(alloc, job_path);
+            opened.* = try repair_jobs.OpenedStore.open(server.state_alloc, job_path);
             errdefer opened.deinit();
             try server.repair_job_store.attachOpenedStore(opened);
         }
@@ -4752,9 +4767,9 @@ pub const ApiHttpServer = struct {
             else
                 try std.fmt.allocPrint(alloc, "{s}.restore_jobs", .{base_path});
             defer alloc.free(job_path);
-            const opened = try alloc.create(restore_jobs.OpenedStore);
+            const opened = try server.state_alloc.create(restore_jobs.OpenedStore);
             errdefer server.state_alloc.destroy(opened);
-            opened.* = try restore_jobs.OpenedStore.open(alloc, job_path);
+            opened.* = try restore_jobs.OpenedStore.open(server.state_alloc, job_path);
             errdefer opened.deinit();
             try server.restore_job_store.attach(opened);
         }
@@ -4858,6 +4873,11 @@ pub const ApiHttpServer = struct {
             self.owner_alloc.destroy(memory);
         }
         if (self.cfg.memory_accounting) |owner| owner.release(self.control_memory_reserved);
+        if (self.transport_memory) |memory| {
+            std.debug.assert(memory.used.load(.acquire) == 0);
+            self.owner_alloc.destroy(memory);
+        }
+        if (self.cfg.memory_accounting) |owner| owner.release(self.transport_memory_reserved);
         self.* = undefined;
     }
 
@@ -56917,6 +56937,41 @@ test "workload envelope preserves control allocation under aggregate foreground 
     try std.testing.expect(memory.control.used.load(.acquire) > 0);
     try std.testing.expectError(error.DeadlineExceeded, server.executeMcpApplicationOperationWithContext(.{ .query = .{ .table_name = "docs", .body = "{}" } }, null, .{ .deadline_ns = 0 }));
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+}
+
+test "workload envelope pins HTTP transport and control through node memory exhaustion" {
+    const alloc = std.testing.allocator;
+    const Manager = @import("antfly_local_sources").storage_resource_manager.ResourceManager;
+    var node = Manager.init(.{ .memory_budget = .{ .hard_limit_bytes = 4 << 20 }, .identity_allocator = alloc });
+    defer node.deinit(alloc);
+    const Callbacks = struct {
+        fn reserve(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+            return @as(*Manager, @ptrCast(@alignCast(ptr))).reserveExternal(bytes);
+        }
+        fn release(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+            @as(*Manager, @ptrCast(@alignCast(ptr))).releaseExternal(bytes);
+        }
+    };
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .request_memory_bytes = 1 << 20,
+        .memory_accounting = .{ .ptr = &node, .reserve_fn = Callbacks.reserve, .release_fn = Callbacks.release },
+    }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer server.deinit();
+    const pin = server.workloadMemoryStats();
+    try std.testing.expectEqual(@as(usize, 1 << 20), pin.transport_reserved_bytes);
+    const pressure = (4 << 20) - node.snapshot().memory.used_bytes;
+    try std.testing.expect(node.reserveExternal(pressure));
+    defer node.releaseExternal(pressure);
+    try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, 1));
+    var transport = httpx.Server.initWithConfig(alloc, std.testing.io, server.configurePublicHttpTransport(.{}));
+    defer transport.deinit();
+    const raw = try transport.allocator.alloc(u8, 4096);
+    defer transport.allocator.free(raw);
+    const control = try server.controlAllocator().alloc(u8, 1024);
+    defer server.alloc.free(control);
+    try std.testing.expectError(error.OutOfMemory, transport.allocator.alloc(u8, server.transport_memory.?.limit + 1));
+    try std.testing.expect(server.workloadMemoryStats().transport.?.used_bytes >= raw.len);
+    try std.testing.expectEqual(@as(u64, 4 << 20), node.snapshot().memory.used_bytes);
 }
 
 test "workload deadline survives NDJSON lines and MCP dispatch" {

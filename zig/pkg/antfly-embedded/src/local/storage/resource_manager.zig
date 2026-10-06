@@ -1067,6 +1067,9 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 }
 
 pub const ResourceManager = struct {
+    pub const MemoryParent = @import("runtime_memory_abi").Parent;
+    memory_parent: ?MemoryParent = null,
+
     dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
@@ -1169,6 +1172,93 @@ pub const ResourceManager = struct {
     reservation_identities: IdentityLedger(u64, ReservationIdentity) = .empty,
     batch_reservation_identities: IdentityLedger(u64, BatchReservationIdentity) = .empty,
     observer_identities: IdentityLedger(ObserverKey, ObserverIdentity) = .empty,
+
+    /// Install before publishing this owner. Existing startup charges join the
+    /// parent atomically; failure leaves both ledgers unchanged.
+    pub fn installMemoryParent(self: *ResourceManager, parent: MemoryParent) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (parent.ptr == @as(*anyopaque, @ptrCast(self))) return error.InvalidMemoryParent;
+        if (self.memory_parent) |existing| {
+            if (existing.ptr == parent.ptr and existing.reserve_fn == parent.reserve_fn) return;
+            return error.MemoryParentAlreadyInstalled;
+        }
+        if (!parent.reserve_fn(parent.ptr, self.memory.used_bytes)) return error.ResourceBudgetExceeded;
+        self.memory_parent = parent;
+    }
+
+    /// Stable callback table; the manager address and its pressure event must
+    /// outlive all children. Child-to-parent is the sole lock ordering.
+    pub fn memoryParentPort(self: *ResourceManager) MemoryParent {
+        return .{
+            .ptr = self,
+            .reserve_fn = ParentCallbacks.reserve,
+            .reclaim_fn = ParentCallbacks.reclaim,
+            .observe_fn = ParentCallbacks.observe,
+            .release_fn = ParentCallbacks.release,
+            .snapshot_fn = ParentCallbacks.snapshot,
+            .epoch_fn = ParentCallbacks.epoch,
+            .wait_fn = ParentCallbacks.wait,
+            .notify_fn = ParentCallbacks.notify,
+        };
+    }
+
+    const ParentCallbacks = struct {
+        fn owner(ptr: *anyopaque) *ResourceManager {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn reserve(ptr: *anyopaque, bytes: u64) callconv(.c) bool {
+            return owner(ptr).reserveExternal(bytes);
+        }
+        fn reclaim(ptr: *anyopaque, bytes: u64) callconv(.c) u64 {
+            // This requester has no local cache policy: reclaim only aggregate
+            // memory from registered owners, using the normal bounded passes.
+            return owner(ptr).reclaimForAllocation(.dense_apply_working_set, bytes);
+        }
+        fn observe(ptr: *anyopaque, bytes: u64) callconv(.c) void {
+            owner(ptr).observeExternal(bytes);
+        }
+        fn release(ptr: *anyopaque, bytes: u64) callconv(.c) void {
+            owner(ptr).releaseExternal(bytes);
+        }
+        fn snapshot(ptr: *anyopaque, out: *@import("runtime_memory_abi").ParentSnapshot) callconv(.c) void {
+            const self = owner(ptr);
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            out.* = .{ .used_bytes = self.memory.used_bytes, .soft_limit_bytes = self.memory.budget.soft_limit_bytes, .hard_limit_bytes = self.memory.budget.hard_limit_bytes };
+        }
+        fn epoch(ptr: *anyopaque) callconv(.c) u64 {
+            return owner(ptr).pressureEpoch();
+        }
+        fn wait(ptr: *anyopaque, observed: u64) callconv(.c) void {
+            owner(ptr).waitForPressureChange(observed);
+        }
+        fn notify(ptr: *anyopaque) callconv(.c) void {
+            owner(ptr).notifyPressureChange();
+        }
+    };
+
+    fn reserveParentLocked(self: *ResourceManager, bytes: u64) !void {
+        if (self.memory_parent) |parent| {
+            if (!parent.reserve_fn(parent.ptr, bytes)) {
+                self.memory.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            }
+        }
+    }
+
+    fn releaseMemoryLocked(self: *ResourceManager, bytes: u64) void {
+        self.memory.used_bytes -= bytes;
+        if (self.memory_parent) |parent| parent.release_fn(parent.ptr, bytes);
+    }
+
+    fn pressureEpoch(self: *ResourceManager) u64 {
+        return if (self.memory_parent) |parent| parent.epoch_fn(parent.ptr) else self.pressure_change.snapshot();
+    }
+
+    fn notifyPressureChange(self: *ResourceManager) void {
+        if (self.memory_parent) |parent| parent.notify_fn(parent.ptr) else self.pressure_change.advance();
+    }
 
     pub fn init(options: Options) ResourceManager {
         const cpu_count = if (comptime builtin.os.tag == .freestanding) 1 else std.Thread.getCpuCount() catch 1;
@@ -1385,15 +1475,32 @@ pub const ResourceManager = struct {
     /// meaningful. Cache callbacks run outside the accounting mutex and may
     /// therefore publish their byte decreases through normal accounting APIs.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
+        const local_reclaimed = self.reclaimLocalForAllocation(requester, additional_bytes);
+        const parent = self.memory_parent orelse return local_reclaimed;
+        const fits_local = blk: {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            const state = self.slices[sliceIndex(requester)];
+            break :blk (state.budget.hard_limit_bytes == 0 or state.used_bytes +| additional_bytes <= state.budget.hard_limit_bytes) and
+                (self.memory.budget.hard_limit_bytes == 0 or self.memory.used_bytes +| additional_bytes <= self.memory.budget.hard_limit_bytes);
+        };
+        // Parent eviction cannot repair a child ceiling. Never call a cache
+        // owner while holding the child's accounting or reclaimer mutex.
+        if (!fits_local) return local_reclaimed;
+        return local_reclaimed +| parent.reclaim_fn(parent.ptr, additional_bytes);
+    }
+
+    fn reclaimLocalForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
         if (additional_bytes == 0) return 0;
         const targets = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
-            const memory_hard = self.memory.budget.hard_limit_bytes;
+            const parent_snapshot = if (self.memory_parent) |parent| parent.snapshot() else null;
+            const memory_hard = if (parent_snapshot) |parent| parent.hard_limit_bytes else self.memory.budget.hard_limit_bytes;
             const memory_target = if (memory_hard == 0)
                 0
             else
-                (self.memory.used_bytes +| additional_bytes) -| memory_hard;
+                ((if (parent_snapshot) |parent| parent.used_bytes else self.memory.used_bytes) +| additional_bytes) -| memory_hard;
             const requester_state = &self.slices[sliceIndex(requester)];
             const slice_hard = requester_state.budget.hard_limit_bytes;
             // These slices mix active allocations with reclaimable retained
@@ -1891,6 +1998,10 @@ pub const ResourceManager = struct {
         self.batch_reservation_identities = .empty;
         self.observer_identities.deinit(self.identity_allocator);
         self.observer_identities = .empty;
+        // Observations end with their backing owners; strict leases were
+        // checked above. Return the terminal observer balance to the parent.
+        self.releaseMemoryLocked(self.memory.used_bytes);
+        self.memory_parent = null;
         self.replay_not_visible_tracker.deinit(self.identity_allocator);
         self.replay_not_visible_tracker = .{};
     }
@@ -2147,9 +2258,23 @@ pub const ResourceManager = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const next = self.checkMemoryLocked(bytes) catch return false;
+        self.reserveParentLocked(bytes) catch return false;
         self.commitMemoryLocked(next);
         self.memory.external_bytes += bytes;
         return true;
+    }
+
+    /// Observation reports existing memory even above a ceiling. It is never
+    /// used to authorize allocation; strict callers use reserveExternal.
+    fn observeExternal(self: *ResourceManager, bytes: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const next = std.math.add(u64, self.memory.used_bytes, bytes) catch @panic("external memory accounting overflow");
+        if (self.memory_parent) |parent| parent.observe_fn(parent.ptr, bytes);
+        self.commitMemoryLocked(next);
+        self.memory.external_bytes += bytes;
+        if (self.memory.budget.hard_limit_bytes != 0 and next > self.memory.budget.hard_limit_bytes) self.memory.hard_limit_rejections +|= 1;
+        self.notifyPressureChange();
     }
 
     pub fn releaseExternal(self: *ResourceManager, bytes: u64) void {
@@ -2157,8 +2282,8 @@ pub const ResourceManager = struct {
         defer self.mutex.unlock();
         std.debug.assert(bytes <= self.memory.external_bytes);
         self.memory.external_bytes -= bytes;
-        self.memory.used_bytes -= bytes;
-        self.pressure_change.advance();
+        self.releaseMemoryLocked(bytes);
+        self.notifyPressureChange();
     }
 
     fn issueIdentityLocked(self: *ResourceManager) u64 {
@@ -2312,6 +2437,11 @@ pub const ResourceManager = struct {
             return error.ResourceTemporarilyUnavailable;
         };
 
+        self.reserveParentLocked(host_charge_bytes) catch {
+            _ = self.batch_reservation_identities.remove(identity);
+            return error.ResourceTemporarilyUnavailable;
+        };
+
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
             const state = &self.slices[sliceIndex(amount.slice)];
@@ -2321,7 +2451,7 @@ pub const ResourceManager = struct {
                 state.soft_limit_events +|= 1;
         }
         self.commitMemoryLocked(next_memory);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return .{
             .manager = self,
             .identity = identity,
@@ -2387,12 +2517,12 @@ pub const ResourceManager = struct {
         inline for (0..slice_count) |index| {
             self.slices[index].used_bytes -= reservation.amounts[index] - retained[index];
         }
-        self.memory.used_bytes -= released_host;
+        self.releaseMemoryLocked(released_host);
         reservation.amounts = retained;
         reservation.host_charge_bytes = retained_host_charge_bytes;
         owned.amounts = retained;
         owned.host_charge_bytes = retained_host_charge_bytes;
-        self.pressure_change.advance();
+        self.notifyPressureChange();
     }
 
     pub fn recordAccountingError(self: *ResourceManager) void {
@@ -2431,9 +2561,9 @@ pub const ResourceManager = struct {
         }
         inline for (0..slice_count) |index|
             self.slices[index].used_bytes -= reservation.amounts[index];
-        self.memory.used_bytes -= reservation.host_charge_bytes;
+        self.releaseMemoryLocked(reservation.host_charge_bytes);
         _ = self.batch_reservation_identities.remove(reservation.identity);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return true;
     }
 
@@ -2522,7 +2652,7 @@ pub const ResourceManager = struct {
             requested_total
         else
             self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
-        const available = @min(slice_available, memory_available);
+        const available = @min(@min(slice_available, memory_available), if (self.memory_parent) |parent| parent.available() else std.math.maxInt(u64));
         if (available < required_secondary_bytes) return error.ResourceBudgetExceeded;
         const primary_bytes = @min(requested_primary_bytes, available - required_secondary_bytes);
         if (requested_primary_bytes > 0 and primary_bytes == 0) return error.ResourceBudgetExceeded;
@@ -2539,6 +2669,10 @@ pub const ResourceManager = struct {
         };
 
         const identity = try self.registerReservationIdentityLocked(slice, granted);
+        self.reserveParentLocked(granted) catch |err| {
+            _ = self.reservation_identities.remove(identity);
+            return err;
+        };
         state.used_bytes = next_slice;
         state.peak_bytes = @max(state.peak_bytes, state.used_bytes);
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
@@ -2547,7 +2681,7 @@ pub const ResourceManager = struct {
         self.memory.peak_bytes = @max(self.memory.peak_bytes, self.memory.used_bytes);
         if (self.memory.budget.soft_limit_bytes > 0 and self.memory.used_bytes > self.memory.budget.soft_limit_bytes)
             self.memory.soft_limit_events +|= 1;
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return .{
             .reservation = .{ .manager = self, .identity = identity, .slice = slice, .bytes = granted },
             .primary_bytes = primary_bytes,
@@ -2573,13 +2707,17 @@ pub const ResourceManager = struct {
         }
         const next_memory = try self.checkMemoryLocked(bytes);
         const identity = try self.registerReservationIdentityLocked(slice, bytes);
+        self.reserveParentLocked(bytes) catch |err| {
+            _ = self.reservation_identities.remove(identity);
+            return err;
+        };
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
         if (state.budget.soft_limit_bytes > 0 and next > state.budget.soft_limit_bytes) {
             state.soft_limit_events += 1;
         }
         self.commitMemoryLocked(next_memory);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return .{ .manager = self, .identity = identity, .slice = slice, .bytes = bytes };
     }
 
@@ -2618,6 +2756,10 @@ pub const ResourceManager = struct {
         // bypass the process-wide physical-memory envelope.
         const next_memory = try self.checkMemoryLocked(bytes);
         const identity = try self.registerReservationIdentityLocked(slice, bytes);
+        self.reserveParentLocked(bytes) catch |err| {
+            _ = self.reservation_identities.remove(identity);
+            return err;
+        };
         if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         state.peak_bytes = @max(state.peak_bytes, next);
@@ -2625,7 +2767,7 @@ pub const ResourceManager = struct {
             state.soft_limit_events +|= 1;
         }
         self.commitMemoryLocked(next_memory);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return .{ .manager = self, .identity = identity, .slice = slice, .bytes = bytes };
     }
 
@@ -2661,6 +2803,7 @@ pub const ResourceManager = struct {
             oversized_grant = reservation.bytes <= hard_limit;
         }
         const next_memory = try self.checkMemoryLocked(additional_bytes);
+        try self.reserveParentLocked(additional_bytes);
         if (oversized_grant) state.oversized_single_grants +|= 1;
         state.used_bytes = next;
         reservation.bytes = next_reservation;
@@ -2670,7 +2813,7 @@ pub const ResourceManager = struct {
             state.soft_limit_events +|= 1;
         }
         self.commitMemoryLocked(next_memory);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
     }
 
     fn growReservationAmortized(
@@ -2762,6 +2905,10 @@ pub const ResourceManager = struct {
             }
         }
 
+        self.reserveParentLocked(granted) catch {
+            granted = minimum_bytes;
+            try self.reserveParentLocked(granted);
+        };
         const previous_reservation = reservation.bytes;
         const next_memory = std.math.add(u64, self.memory.used_bytes, granted) catch unreachable;
         state.used_bytes += granted;
@@ -2773,7 +2920,7 @@ pub const ResourceManager = struct {
         if (state.budget.soft_limit_bytes > 0 and state.used_bytes > state.budget.soft_limit_bytes)
             state.soft_limit_events +|= 1;
         self.commitMemoryLocked(next_memory);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return granted;
     }
 
@@ -2796,9 +2943,9 @@ pub const ResourceManager = struct {
             return false;
         }
         state.used_bytes -= owned.bytes;
-        self.memory.used_bytes -= owned.bytes;
+        self.releaseMemoryLocked(owned.bytes);
         _ = self.reservation_identities.remove(reservation.identity);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return true;
     }
 
@@ -2821,10 +2968,10 @@ pub const ResourceManager = struct {
             return false;
         }
         state.used_bytes -= released;
-        self.memory.used_bytes -= released;
+        self.releaseMemoryLocked(released);
         owned.bytes -= released;
         reservation.bytes -= released;
-        self.pressure_change.advance();
+        self.notifyPressureChange();
         return true;
     }
 
@@ -2935,6 +3082,13 @@ pub const ResourceManager = struct {
             }
         }
 
+        if (memory_next > self.memory.used_bytes) {
+            const growth = memory_next - self.memory.used_bytes;
+            if (enforce_limits) try self.reserveParentLocked(growth) else if (self.memory_parent) |parent| parent.observe_fn(parent.ptr, growth);
+        } else if (memory_next < self.memory.used_bytes) {
+            if (self.memory_parent) |parent| parent.release_fn(parent.ptr, self.memory.used_bytes - memory_next);
+        }
+
         state.used_bytes = slice_next;
         self.memory.used_bytes = memory_next;
         owned.current = next;
@@ -2949,7 +3103,7 @@ pub const ResourceManager = struct {
         if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
         if (next == 0) _ = self.observer_identities.remove(key);
-        self.pressure_change.advance();
+        self.notifyPressureChange();
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
@@ -3009,7 +3163,7 @@ pub const ResourceManager = struct {
             requested_additional
         else
             self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
-        const granted = @min(requested_additional, @min(slice_available, memory_available));
+        const granted = @min(requested_additional, @min(@min(slice_available, memory_available), if (self.memory_parent) |parent| parent.available() else std.math.maxInt(u64)));
         if (granted == 0) return error.ResourceBudgetExceeded;
         const next = std.math.add(u64, current.*, granted) catch return error.ResourceBudgetExceeded;
         try self.reconcileUsageLocked(slice, @intFromPtr(current), current.*, next, true);
@@ -3096,6 +3250,12 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         }
 
+        if (memory_next > self.memory.used_bytes) {
+            try self.reserveParentLocked(memory_next - self.memory.used_bytes);
+        } else if (memory_next < self.memory.used_bytes) {
+            if (self.memory_parent) |parent| parent.release_fn(parent.ptr, self.memory.used_bytes - memory_next);
+        }
+
         if (source_next == 0) {
             _ = self.observer_identities.remove(source_key);
         } else {
@@ -3116,7 +3276,7 @@ pub const ResourceManager = struct {
             state.soft_limit_events +|= 1;
         if (self.memory.budget.soft_limit_bytes > 0 and memory_next > self.memory.budget.soft_limit_bytes)
             self.memory.soft_limit_events +|= 1;
-        self.pressure_change.advance();
+        self.notifyPressureChange();
     }
 
     fn adjustUsageOnce(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
@@ -3249,7 +3409,7 @@ pub const ResourceManager = struct {
             std.math.maxInt(u64)
         else
             self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
-        return @min(slice_available, memory_available);
+        return @min(@min(slice_available, memory_available), if (self.memory_parent) |parent| parent.available() else std.math.maxInt(u64));
     }
 
     /// Stable capacity, not momentary free space: durable transaction admission
@@ -3258,7 +3418,9 @@ pub const ResourceManager = struct {
     pub fn memoryHardLimitForSlice(self: *ResourceManager, slice: Slice) u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        const node = self.memory.budget.hard_limit_bytes;
+        const parent_hard = if (self.memory_parent) |parent| parent.snapshot().hard_limit_bytes else 0;
+        const own_hard = self.memory.budget.hard_limit_bytes;
+        const node = if (own_hard == 0) parent_hard else if (parent_hard == 0) own_hard else @min(own_hard, parent_hard);
         const local = self.slices[sliceIndex(slice)].budget.hard_limit_bytes;
         if (node == 0) return local;
         if (local == 0) return node;
@@ -3292,8 +3454,13 @@ pub const ResourceManager = struct {
         const state = self.slices[sliceIndex(slice)];
         const projected_bytes = state.used_bytes +| additional_bytes;
         const slice_pressure = pressureFor(state.budget, projected_bytes);
-        const projected_memory = self.memory.used_bytes +| additional_bytes;
-        const memory_pressure = pressureFor(self.memory.budget, projected_memory);
+        const parent_snapshot = if (self.memory_parent) |parent| parent.snapshot() else null;
+        const memory_budget: Budget = if (parent_snapshot) |parent| .{
+            .soft_limit_bytes = parent.soft_limit_bytes,
+            .hard_limit_bytes = parent.hard_limit_bytes,
+        } else self.memory.budget;
+        const projected_memory = (if (parent_snapshot) |parent| parent.used_bytes else self.memory.used_bytes) +| additional_bytes;
+        const memory_pressure = pressureFor(memory_budget, projected_memory);
         const aggregate_dominates = memory_pressure != .normal and
             @backingInt(memory_pressure) >= @backingInt(slice_pressure);
         const pressure = if (aggregate_dominates) memory_pressure else slice_pressure;
@@ -3307,9 +3474,9 @@ pub const ResourceManager = struct {
                 .hard => state.policy.hard_action,
             },
             .used_bytes = if (aggregate_dominates) projected_memory else projected_bytes,
-            .soft_limit_bytes = if (aggregate_dominates) self.memory.budget.soft_limit_bytes else state.budget.soft_limit_bytes,
-            .hard_limit_bytes = if (aggregate_dominates) self.memory.budget.hard_limit_bytes else state.budget.hard_limit_bytes,
-            .change_epoch = self.pressure_change.snapshot(),
+            .soft_limit_bytes = if (aggregate_dominates) memory_budget.soft_limit_bytes else state.budget.soft_limit_bytes,
+            .hard_limit_bytes = if (aggregate_dominates) memory_budget.hard_limit_bytes else state.budget.hard_limit_bytes,
+            .change_epoch = self.pressureEpoch(),
         };
     }
 
@@ -3318,7 +3485,7 @@ pub const ResourceManager = struct {
     }
 
     pub fn waitForPressureChange(self: *ResourceManager, observed_epoch: u64) void {
-        self.pressure_change.waitForChange(observed_epoch);
+        if (self.memory_parent) |parent| parent.wait_fn(parent.ptr, observed_epoch) else self.pressure_change.waitForChange(observed_epoch);
     }
 
     /// Applies a slice's admission policy at a boundary that is safe to
@@ -6328,4 +6495,115 @@ test "resource manager external allocator shares storage ceiling and preserves p
     try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
     manager.releaseExternal(10);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "resource manager parent reclaims sibling cache outside child locks and preserves local ceilings" {
+    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.inference_tokenizer_cache)] = .{ .hard_limit_bytes = 5 };
+    var child = ResourceManager.init(.{ .budgets = budgets, .identity_allocator = std.testing.allocator });
+    defer child.deinit(std.testing.allocator);
+    try child.installMemoryParent(root.memoryParentPort());
+    const Cache = struct {
+        root: *ResourceManager,
+        child: *ResourceManager,
+        bytes: u64 = 0,
+        calls: usize = 0,
+
+        fn reclaim(ptr: *anyopaque, requested: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            // This takes the child accounting lock: callback invocation must
+            // happen after the child releases it, even at aggregate pressure.
+            _ = self.child.snapshot();
+            self.calls += 1;
+            const released = @min(requested, self.bytes);
+            self.root.observeUsage(.lsm_block_table_cache, &self.bytes, self.bytes - released);
+            return released;
+        }
+    };
+    var cache: Cache = .{ .root = &root, .child = &child };
+    root.observeUsage(.lsm_block_table_cache, &cache.bytes, 100);
+    defer root.observeUsage(.lsm_block_table_cache, &cache.bytes, 0);
+    const registration = try root.registerReclaimer(.lsm_block_table_cache, &cache, Cache.reclaim);
+    defer root.unregisterReclaimer(registration);
+    try std.testing.expectError(error.ResourceBudgetExceeded, child.reserveWithoutReclaim(.inference_model_residency, 10));
+    try std.testing.expectError(error.ResourceBudgetExceeded, child.reserve(.inference_tokenizer_cache, 10));
+    try std.testing.expectEqual(@as(usize, 0), cache.calls);
+    var model = try child.reserve(.inference_model_residency, 10);
+    defer model.release();
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expectEqual(@as(u64, 90), cache.bytes);
+    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 10), child.snapshot().memory.used_bytes);
+}
+
+test "resource manager parent atomically coordinates storage inference and API memory" {
+    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var inference = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer inference.deinit(std.testing.allocator);
+    var storage = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer storage.deinit(std.testing.allocator);
+    try inference.installMemoryParent(root.memoryParentPort());
+    try storage.installMemoryParent(root.memoryParentPort());
+    var model = try inference.reserveWithoutReclaim(.inference_model_residency, 40);
+    defer model.release();
+    try std.testing.expect(root.reserveExternal(10));
+    defer root.releaseExternal(10);
+    var work = try storage.reserveWithoutReclaim(.lsm_wal_write_working_set, 50);
+    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 100), root.snapshot().memory.external_bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, model.growBoundedOversized(1, 2));
+    try std.testing.expectEqual(@as(u64, 40), model.bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, storage.reserveBatchClassified(&.{.{ .slice = .dense_search_working_set, .bytes = 1 }}));
+    try std.testing.expectEqual(@as(u32, 0), storage.batch_reservation_identities.count());
+    try std.testing.expectEqual(@as(u64, 0), storage.availableAdmissionBytes(.dense_search_working_set));
+    try std.testing.expectEqual(Pressure.hard, storage.admissionDecision(.dense_search_working_set, 1).pressure);
+    work.shrink(20);
+    try std.testing.expectEqual(@as(u64, 80), root.snapshot().memory.used_bytes);
+    var split = try storage.reserveOwnedSplitAtMost(.document_extraction_working_set, 80, 5);
+    try std.testing.expectEqual(@as(u64, 15), split.primary_bytes);
+    split.release();
+    work.release();
+    try std.testing.expectEqual(@as(u64, 50), root.snapshot().memory.used_bytes);
+}
+
+test "resource manager parent retains over-budget observations and returns terminal balance" {
+    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var child = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    var observed: u64 = 0;
+    child.observeUsage(.inference_model_residency, &observed, 20);
+    try child.installMemoryParent(root.memoryParentPort());
+    try std.testing.expectEqual(@as(u64, 20), root.snapshot().memory.used_bytes);
+    try std.testing.expect(root.reserveExternal(80));
+    try std.testing.expectError(error.ResourceBudgetExceeded, child.adjustUsage(.inference_model_residency, &observed, 21));
+    try std.testing.expectEqual(@as(u64, 20), observed);
+    child.observeUsage(.inference_model_residency, &observed, 30);
+    try std.testing.expectEqual(@as(u64, 110), root.snapshot().memory.used_bytes);
+    child.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 80), root.snapshot().memory.used_bytes);
+    root.releaseExternal(80);
+}
+
+test "resource manager parent wakes child waiters when another owner releases memory" {
+    if (!supports_pressure_wait) return error.SkipZigTest;
+    var root = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer root.deinit(std.testing.allocator);
+    var child = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer child.deinit(std.testing.allocator);
+    try child.installMemoryParent(root.memoryParentPort());
+    try std.testing.expect(root.reserveExternal(100));
+    const epoch = child.admissionDecision(.dense_search_working_set, 1).change_epoch;
+    const Waiter = struct {
+        fn run(manager: *ResourceManager, observed: u64) void {
+            manager.waitForPressureChange(observed);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &child, epoch });
+    root.releaseExternal(100);
+    thread.join();
+    var work = try child.reserveWithoutReclaim(.dense_search_working_set, 1);
+    work.release();
 }

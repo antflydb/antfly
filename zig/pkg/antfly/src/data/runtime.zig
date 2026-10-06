@@ -6223,6 +6223,10 @@ pub const DataServer = struct {
     /// httpx.Server instead of the built-in StdHttpListener.
     fn ensureKernelOwnerSource(self: *DataServer) !*antfly.public_api.ProvisionedKernelOwnerSource {
         if (self.kernel_owner_source) |owner_source| return owner_source;
+        var staged_control_lease: @FieldType(DataServer, "owner_apply_control_lease") = null;
+        // Registered before owner cleanup so its I/O stays alive through the
+        // owner's quiescence, including failure to attach the memory parent.
+        errdefer if (staged_control_lease) |*lease| lease.release();
         const owner_source = try self.alloc.create(antfly.public_api.ProvisionedKernelOwnerSource);
         owner_source.* = antfly.public_api.ProvisionedKernelOwnerSource.init(
             self.alloc,
@@ -6250,11 +6254,13 @@ pub const DataServer = struct {
             if (self.storageKernelContextHandle()) |handle|
                 _ = owner_source.withStorageContextHandle(handle);
             if (self.data_raft != null) {
-                var control_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{ .capacity = 1 });
-                errdefer control_lease.release();
-                try owner_source.startApplyControl(control_lease.io());
-                self.owner_apply_control_lease = control_lease;
+                staged_control_lease = try (try self.ensureBackendRuntime()).acquireWorkers(.{ .capacity = 1 });
+                try owner_source.startApplyControl(staged_control_lease.?.io());
             }
+        }
+        if (comptime linked_storage) {
+            try owner_source.context.ensure();
+            try self.provisioned_storage.resource_manager.installMemoryParent(try owner_source.context.memoryParent());
         }
         _ = self.read_source.withLocalReadSource(owner_source.readSource());
         self.read_source.resident_db = null;
@@ -6266,6 +6272,7 @@ pub const DataServer = struct {
             apply_sm.attachKernelOwnerSource(owner_source);
             _ = apply_sm.write_source.withInitialChildRetirementReader(.{ .ptr = self, .read = readInitialChildRetirementObservation });
         }
+        self.owner_apply_control_lease = staged_control_lease;
         self.kernel_owner_source = owner_source;
         return owner_source;
     }
@@ -6584,10 +6591,20 @@ pub const DataServer = struct {
         return owner_source.contextMetrics() catch null;
     }
 
-    /// Sum the two ledgers using the kernel's limits. Peaks remain an upper
-    /// bound, since independently recorded peaks need not occur together.
+    /// Root memory already owns the child's charges. Merge only the distinct
+    /// slice contributions; their independently observed peaks are upper bounds.
     fn mergeStorageOwnerResourceStats(stats: *resource_manager_mod.Stats, metrics: *const kernel_owner_client.ContextMetricsResult) void {
-        mergeStorageOwnerBudgetStats(&stats.memory, metrics.resource_memory);
+        // Root memory already includes the local child's host charges.
+        const local_errors = stats.memory.accounting_errors;
+        stats.memory.used_bytes = metrics.resource_memory.used_bytes;
+        stats.memory.external_bytes = metrics.resource_memory.external_bytes;
+        stats.memory.peak_bytes = metrics.resource_memory.peak_bytes;
+        stats.memory.soft_limit_bytes = metrics.resource_memory.soft_limit_bytes;
+        stats.memory.hard_limit_bytes = metrics.resource_memory.hard_limit_bytes;
+        stats.memory.soft_limit_events = metrics.resource_memory.soft_limit_events;
+        stats.memory.hard_limit_rejections = metrics.resource_memory.hard_limit_rejections;
+        stats.memory.accounting_errors = metrics.resource_memory.accounting_errors +| local_errors;
+        stats.memory.pressure = resource_manager_mod.pressureFor(.{ .soft_limit_bytes = stats.memory.soft_limit_bytes, .hard_limit_bytes = stats.memory.hard_limit_bytes }, stats.memory.used_bytes);
         const count = @min(@min(stats.slices.len, metrics.resource_slices.len), @as(usize, metrics.resource_slice_count));
         for (stats.slices[0..count], metrics.resource_slices[0..count]) |*slice, kernel| mergeStorageOwnerBudgetStats(slice, kernel);
     }
@@ -9520,18 +9537,6 @@ pub const DataServer = struct {
             apply_sm.deinit();
             self.alloc.destroy(apply_sm);
         }
-        // Any explicitly constructed owner belongs to DataServer, independent
-        // of the compiler unit's storage boundary. Native reconciliation does
-        // not construct one, but teardown must honor ownership if present.
-        if (self.kernel_owner_source) |owner_source| {
-            owner_source.deinit();
-            self.alloc.destroy(owner_source);
-        }
-        if (comptime linked_storage) {
-            if (self.owner_apply_control_lease) |*lease| lease.release();
-            self.owner_apply_control_lease = null;
-            if (self.storage_kernel_context) |*context| context.deinit();
-        }
         if (self.data_raft_store) |store| {
             store.deinit();
             self.alloc.destroy(store);
@@ -9572,6 +9577,20 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
         if (self.restore_terminal_ledger) |*ledger| ledger.deinit();
         self.provisioned_storage.deinit();
+        // Any explicitly constructed owner belongs to DataServer, independent
+        // of the compiler unit's storage boundary. Native reconciliation does
+        // not construct one, but teardown must honor ownership if present.
+        if (self.kernel_owner_source) |owner_source| {
+            owner_source.deinit();
+            self.alloc.destroy(owner_source);
+        }
+        if (comptime linked_storage) {
+            if (self.owner_apply_control_lease) |*lease| lease.release();
+            self.owner_apply_control_lease = null;
+        }
+        if (comptime linked_storage) {
+            if (self.storage_kernel_context) |*context| context.deinit();
+        }
         self.write_source.deinit();
         // Owner jobs drained before caches; native callbacks have now stopped
         // too, so no admission can race this final assertion/reclamation.

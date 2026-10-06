@@ -2701,9 +2701,15 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
     try std.testing.expect(!abi.antfly_storage_context_reserve_external(null, 1));
     const original_used = metrics.resource_memory.used_bytes;
+    const original_external = metrics.resource_memory.external_bytes;
+    var parent: abi.MemoryParent = undefined;
+    try std.testing.expect(!abi.antfly_storage_context_memory_parent(null, &parent));
+    try std.testing.expect(abi.antfly_storage_context_memory_parent(context, &parent));
+    try std.testing.expectEqual(original_used, parent.snapshot().used_bytes);
     try std.testing.expect(abi.antfly_storage_context_reserve_external(context, 4096));
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(original_used + 4096, metrics.resource_memory.used_bytes);
+    try std.testing.expectEqual(original_external + 4096, metrics.resource_memory.external_bytes);
     abi.antfly_storage_context_release_external(context, 4096);
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(original_used, metrics.resource_memory.used_bytes);

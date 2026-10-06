@@ -1,0 +1,14 @@
+{
+  "baseline_revision": "e6d4ce9bbc716be5e7dc96ac37b9d70dc4d6778c",
+  "candidate_parent_revision": "605b701b572de56713e27f9024132214f637d147",
+  "candidate_source_patch_sha256": "725e8fd124d2475d63f4851d7a7ef5614de36f84b5704143f969217790388d30",
+  "optimization": "ReleaseSafe",
+  "strip": false,
+  "target": "native aarch64-macos",
+  "zig_version": "0.17.0",
+  "zig_binary_sha256": "1c5f706db0ed6d55451940f31dc05a6177d05696bc1fa5d853696d04c718b523",
+  "automatic_defaults_qualified": false,
+  "baseline_build_only_patch": "Native macOS ReleaseSafe distributed compiler claim raised to 17 GiB; production source unchanged.",
+  "build_cache": "warm developer caches; three rotated repetitions are separate receipts, not cold compiler runs.",
+  "measurement_environment": "Shared macOS developer host; verification compilers and a Linux Docker compiler build were active during measurement. No CPU isolation is claimed."
+}

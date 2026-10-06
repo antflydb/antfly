@@ -21,6 +21,69 @@ def percentile(values, p):
     return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * p))]
 
 
+def operation_kind(index, mixed):
+    if not mixed:
+        return "cheap"
+    if index % 16 == 15:
+        return "slow_reader"
+    if index % 8 == 7:
+        return "write"
+    if index % 4 == 3:
+        return "expensive"
+    return "cheap"
+
+
+def workload_breakdown(results, offered, dropped, elapsed):
+    kinds = {}
+    for kind, count in offered.items():
+        selected = [r for r in results if r["kind"] == kind]
+        successful = [r["end_to_end_seconds"] for r in selected if r["ok"]]
+        statuses = {}
+        for result in selected:
+            code = str(result.get("status", "client_error"))
+            statuses[code] = statuses.get(code, 0) + 1
+        kinds[kind] = dict(
+            offered=count,
+            completed=len(selected),
+            generator_dropped=dropped.get(kind, 0),
+            successful=len(successful),
+            failed=len(selected) - len(successful),
+            successful_per_second=len(successful) / elapsed,
+            success_p95_seconds=percentile(successful, 0.95),
+            success_p99_seconds=percentile(successful, 0.99),
+            status_counts=statuses,
+        )
+    return kinds
+
+
+def admission_diagnostics(before, after):
+    if before is None or after is None:
+        return None
+    counters = (
+        "wait_ns_total",
+        "wait_completed_total",
+        "lease_hold_ns_total",
+        "lease_completed_total",
+        "rejected_total",
+        "expired_total",
+        "cancelled_total",
+    )
+    delta = {name: after["query"][name] - before["query"][name] for name in counters}
+    if any(value < 0 for value in delta.values()):
+        raise RuntimeError("admission counters decreased during qualification")
+    delta["mean_wait_seconds"] = (
+        delta["wait_ns_total"] / delta["wait_completed_total"] / 1e9
+        if delta["wait_completed_total"]
+        else None
+    )
+    delta["mean_completed_lease_hold_seconds"] = (
+        delta["lease_hold_ns_total"] / delta["lease_completed_total"] / 1e9
+        if delta["lease_completed_total"]
+        else None
+    )
+    return delta
+
+
 def run_phase(target, phase, manifest, pid):
     # A full client envelope drops the offered operation immediately. This is
     # counted separately from server rejection and never silently retried.
@@ -30,6 +93,8 @@ def run_phase(target, phase, manifest, pid):
     local = threading.local()
     stop = threading.Event()
     duration, rate = phase["duration_seconds"], phase["offered_per_second"]
+    workload_before = workload_snapshot(target)
+    cpu_before = sample(pid)["cpu_seconds"]
     started = time.monotonic()
 
     def observer():
@@ -43,7 +108,11 @@ def run_phase(target, phase, manifest, pid):
                 )
 
     def operation(index, scheduled):
-        result = {"offered_at_seconds": scheduled - started, "kind": "cheap"}
+        result = {
+            "offered_at_seconds": scheduled - started,
+            "kind": operation_kind(index, phase.get("workload", "mixed") == "mixed"),
+            "client_queue_seconds": time.monotonic() - scheduled,
+        }
         try:
             if not hasattr(local, "peer"):
                 local.peer = http.client.HTTPConnection(
@@ -155,11 +224,14 @@ def run_phase(target, phase, manifest, pid):
     futures = []
     offered = int(duration * rate)
     dropped = 0
+    offered_by_kind, dropped_by_kind = {}, {}
     try:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=manifest["client_workers"]
         ) as executor:
             for index in range(offered):
+                kind = operation_kind(index, phase.get("workload", "mixed") == "mixed")
+                offered_by_kind[kind] = offered_by_kind.get(kind, 0) + 1
                 scheduled = started + index / rate
                 delay = scheduled - time.monotonic()
                 if delay > 0:
@@ -168,6 +240,7 @@ def run_phase(target, phase, manifest, pid):
                     futures.append(executor.submit(operation, index, scheduled))
                 else:
                     dropped += 1
+                    dropped_by_kind[kind] = dropped_by_kind.get(kind, 0) + 1
             for future in futures:
                 results.append(future.result())
     finally:
@@ -176,6 +249,8 @@ def run_phase(target, phase, manifest, pid):
         for peer in peers:
             peer.close()
     elapsed = time.monotonic() - started
+    cpu_seconds = sample(pid)["cpu_seconds"] - cpu_before
+    workload_after = workload_snapshot(target, require_waiting=True)
     successful = [r["end_to_end_seconds"] for r in results if r["ok"]]
     all_latencies = [r["end_to_end_seconds"] for r in results]
     counts = {}
@@ -192,7 +267,13 @@ def run_phase(target, phase, manifest, pid):
         failed=len(results) - len(successful),
         retries=0,
         status_counts=counts,
+        by_kind=workload_breakdown(results, offered_by_kind, dropped_by_kind, elapsed),
         elapsed_seconds=elapsed,
+        server_cpu_seconds=cpu_seconds,
+        server_cpu_cores_average=cpu_seconds / elapsed,
+        workload_before=workload_before,
+        workload_after=workload_after,
+        admission_diagnostics=admission_diagnostics(workload_before, workload_after),
         successful_per_second=len(successful) / elapsed,
         success_p95_seconds=percentile(successful, 0.95),
         success_p99_seconds=percentile(successful, 0.99),
@@ -225,6 +306,30 @@ def operator_request(target, method, body=None, authenticated=True):
         return response.status, json.loads(payload) if response.status == 200 else None
     finally:
         peer.close()
+
+
+def workload_snapshot(target, *, require_waiting=False):
+    # Outside the timed phase: preserve server wait/allocation counters without
+    # adding a candidate-only sampling load to the baseline comparison.
+    policy = os.environ.get("ANTFLY_QUALIFICATION_POLICY")
+    if policy not in ("fixed", "failfast"):
+        return None
+    code, snapshot = operator_request(target, "GET")
+    if code != 200:
+        raise RuntimeError("candidate workload telemetry unavailable")
+    if (
+        require_waiting
+        and policy == "fixed"
+        and snapshot["query"].get("sql_waiting_enabled") is not True
+    ):
+        raise RuntimeError("fixed policy did not enable SQL waiting")
+    return snapshot
+
+
+def waiting_evidence_failures(diagnostics, minimum):
+    if minimum and (diagnostics or {}).get("wait_completed_total", 0) < minimum:
+        return ["fixed waiting was not exercised"]
+    return []
 
 
 def verify_operator_controls(target):
@@ -318,6 +423,14 @@ def main():
             measured = run_phase(target, phase, manifest, args.pid)
             receipt["phases"].append(measured)
             limits = phase["thresholds"]
+            if os.environ.get("ANTFLY_QUALIFICATION_POLICY") == "fixed":
+                failures.extend(
+                    phase["name"] + ": " + reason
+                    for reason in waiting_evidence_failures(
+                        measured["admission_diagnostics"],
+                        limits.get("fixed_wait_completed_min", 0),
+                    )
+                )
             if (
                 measured["offered"]
                 != measured["submitted"] + measured["generator_dropped"]

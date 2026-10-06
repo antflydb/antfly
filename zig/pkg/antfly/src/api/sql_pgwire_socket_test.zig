@@ -122,7 +122,8 @@ pub fn qualify(server: *http.ApiHttpServer, storage: *resources.ResourceManager)
 fn run(server: *http.ApiHttpServer, storage: *resources.ResourceManager, done: *std.Io.Event) anyerror!void {
     defer done.set(io);
     var adapter = @import("sql_pgwire.zig").Adapter{ .server = server };
-    var listener = try @import("../pgwire/server.zig").start(alloc, .{ .io = io, .backend = adapter.backend(), .bind_port = 0, .max_connections = 2 });
+    const transport_alloc = if (server.transport_memory) |memory| memory.allocator() else server.state_alloc;
+    var listener = try @import("../pgwire/server.zig").start(transport_alloc, .{ .io = io, .backend = adapter.backend(), .bind_port = 0, .max_connections = 2 });
     defer listener.deinit();
     var first: Peer = undefined;
     try first.init(listener.address());
