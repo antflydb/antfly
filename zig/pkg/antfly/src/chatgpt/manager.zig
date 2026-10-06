@@ -36,6 +36,8 @@ const Record = struct {
     expires_at: i64,
 };
 const State = struct { version: u32 = 1, host_id: []const u8, accounts: []Record = &.{} };
+// Every successful save must remain readable, including after a restart.
+const max_store_bytes = 1024 * 1024;
 const Token = struct { access_token: []const u8, refresh_token: ?[]const u8 = null, id_token: ?[]const u8 = null, scope: ?[]const u8 = null, expires_in: i64, token_type: []const u8 };
 const Session = struct { id: []const u8, epoch: std.atomic.Value(u64) = .init(0) };
 pub const Lease = struct {
@@ -236,7 +238,7 @@ pub const Manager = struct {
             };
             if (stat) |info| if (info.kind != .file or info.permissions.toMode() & 0o077 != 0) return error.InsecureCredentialStore;
         }
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, self.path, a, .limited(1024 * 1024)) catch |err| switch (err) {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, self.path, a, .limited(max_store_bytes)) catch |err| switch (err) {
             error.FileNotFound => {
                 var uuid: [16]u8 = undefined;
                 try self.io.randomSecure(&uuid);
@@ -271,6 +273,8 @@ pub const Manager = struct {
             std.crypto.secureZero(u8, bytes);
             self.alloc.free(bytes);
         }
+        // Reject before creating a temporary file or replacing durable grants.
+        if (bytes.len > max_store_bytes) return error.CapacityExhausted;
         const suffix = try self.random(self.alloc);
         defer self.alloc.free(suffix);
         const temp = try std.fmt.allocPrint(self.alloc, "{s}.{s}.tmp", .{ self.path, suffix });
@@ -919,4 +923,63 @@ test "chatgpt manager callback is one time owner bound and state checked" {
     instance.reap();
     try std.testing.expectEqual(@as(usize, 0), instance.attempts.items.len);
     try std.testing.expectError(error.NotFound, instance.outcome(local, "alice", begin.attempt_id));
+}
+
+test "chatgpt manager rejects oversized updates without replacing durable credentials" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var instance = try Manager.init(a, io, root);
+    var closed = false;
+    defer if (!closed) instance.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const local = arena.allocator();
+    var original = try instance.load(local);
+    defer original.deinit();
+    const host = original.value.host_id;
+    const accounts = try local.alloc(Record, 128);
+    for (accounts, 0..) |*account, i| account.* = .{
+        .connection_id = try std.fmt.allocPrint(local, "connection-{d}", .{i}),
+        .owner = "alice",
+        .subject = "user-a",
+        .email = "a@example.com",
+        .client_id = "client-a",
+        .access_token = "access",
+        .refresh_token = "refresh",
+        .id_token = "identity",
+        .scope = protocol.scopes,
+        .expires_at = 2_000_000_000,
+    };
+    try instance.save(.{ .host_id = host, .accounts = accounts });
+    const before = try tmp.dir.readFileAlloc(io, "accounts.json", local, .limited(max_store_bytes));
+    const large_token = try local.alloc(u8, 4096);
+    @memset(large_token, 'a');
+    for (accounts) |*account| {
+        account.access_token = large_token;
+        account.id_token = large_token;
+    }
+    // This update previously succeeded then made every subsequent load fail.
+    try std.testing.expectError(error.CapacityExhausted, instance.save(.{ .host_id = host, .accounts = accounts }));
+    const after = try tmp.dir.readFileAlloc(io, "accounts.json", local, .limited(max_store_bytes));
+    try std.testing.expectEqualStrings(before, after);
+    instance.deinit();
+    closed = true;
+    var reopened = try Manager.init(a, io, root);
+    defer reopened.deinit();
+    var retained = try reopened.load(local);
+    defer {
+        scrub(retained.value);
+        retained.deinit();
+    }
+    try std.testing.expectEqualStrings(host, retained.value.host_id);
+    try std.testing.expectEqual(@as(usize, 128), retained.value.accounts.len);
+    for (retained.value.accounts) |account| {
+        try std.testing.expectEqualStrings("access", account.access_token);
+        try std.testing.expectEqualStrings("refresh", account.refresh_token);
+        try std.testing.expectEqualStrings("identity", account.id_token);
+    }
 }

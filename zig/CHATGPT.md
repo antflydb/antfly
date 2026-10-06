@@ -311,6 +311,8 @@ origin. Basic-auth users own separate registrations; when database auth is
 disabled there is one local owner. API keys, internal service identities, remote
 origins and replicated provider configuration cannot consume a personal grant.
 Existing database authorization still applies to every retrieval operation.
+Antfarm's development proxy preserves the browser Host for loopback API targets,
+so its same-origin requests pass the runtime checks without rewriting Origin.
 
 Management endpoints under the public API base are:
 
@@ -361,8 +363,10 @@ is a future feature, not enabled by `ANTFLY_URL` or `--no-browser`. See the
 
 The registry lives in `<auth_store_root_dir>/chatgpt/accounts.json` with mode
 0600 inside a 0700 directory. A process lock prevents multiple runtimes sharing
-that credential store. Updates use an exclusive temporary file, file sync,
-rename and directory sync. Disconnect and reauthorization increment a session
+that credential store. Reads and writes share a 1 MiB serialized size limit;
+oversized updates fail with `CapacityExhausted` before replacing existing grants.
+Updates use an exclusive temporary file, file sync, rename and directory sync.
+Disconnect and reauthorization increment a session
 version; request-long account pins and token leases prevent a tool loop from
 switching accounts or resuming after disconnect/reconnect. Authorization attempts
 also capture the selected account version. Disconnect declines pending sign-ins
@@ -440,3 +444,6 @@ Delayed-refresh regressions cover deadline expiry, cancellation, preserved
 credentials, and bounded waits for request pins and credential leases.
 Refusal regressions cover refusal-only completions, ordered text and refusal
 parts, and preservation of refusal content and message phase in follow-up input.
+The latest regressions verify proxy headers using the actual Vite configuration
+and preserve credential bytes and restart behavior after oversized updates.
+All 221 runtime/generation tests and 166 Antfarm tests pass; Antfarm builds successfully.
