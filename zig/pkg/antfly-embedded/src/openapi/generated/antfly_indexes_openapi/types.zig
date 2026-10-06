@@ -11,14 +11,58 @@ const antfly_query_openapi = @import("antfly_query_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_sort_openapi = @import("antfly_sort_openapi");
 
-/// Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned.
+pub const AlgebraicAggregateConfig = struct {
+    name: []const u8,
+    op: []const u8,
+    group_by: ?[]const []const u8 = null,
+    /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
+    measure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "op", "op", false },
+        .{ "group_by", "group_by", true },
+        .{ "measure", "measure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.group_by) |value| {
+            try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.measure) |value| {
+            try jw.objectField("measure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned.
 pub const AlgebraicIndexConfig = struct {
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -33,6 +77,10 @@ pub const AlgebraicIndexConfig = struct {
         try jw.beginObject();
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         try jw.endObject();
@@ -617,8 +665,10 @@ pub const CreateAlgebraicIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -627,6 +677,7 @@ pub const CreateAlgebraicIndexRequest = struct {
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
         .{ "type", "type", false },
     };
 
@@ -654,6 +705,10 @@ pub const CreateAlgebraicIndexRequest = struct {
         }
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         try jw.objectField("type");
@@ -1245,8 +1300,10 @@ pub const CreatedAlgebraicIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -1256,6 +1313,7 @@ pub const CreatedAlgebraicIndex = struct {
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
         .{ "type", "type", false },
     };
 
@@ -1285,6 +1343,10 @@ pub const CreatedAlgebraicIndex = struct {
         }
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         try jw.objectField("type");
@@ -8780,8 +8842,10 @@ pub const IndexConfig = struct {
     artifact: ?GraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
     keys: ?[]const antfly_schema_openapi.RelationalIndexKey = null,
     /// Non-key columns stored for index-only projection; distinct from keys.
     include_columns: ?[]const []const u8 = null,
@@ -8826,6 +8890,7 @@ pub const IndexConfig = struct {
         .{ "algebraic_planning", "algebraic_planning", true },
         .{ "resolvers", "resolvers", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
         .{ "keys", "keys", true },
         .{ "include_columns", "include_columns", true },
         .{ "where", "where", true },
@@ -8979,6 +9044,10 @@ pub const IndexConfig = struct {
         }
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         if (self.keys) |value| {

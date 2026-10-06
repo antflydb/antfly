@@ -81,14 +81,32 @@ pub fn build(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRe
             std.mem.eql(u8, &published.signature.store, &signature.store)) published.declarations else &.{}
     else
         &.{};
-    var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
+    // Native exact reducers own algebraic publication; do not produce narrow
+    // legacy i64 folds alongside them or expose those as SQL materializations.
+    var native_arena = std.heap.ArenaAllocator.init(a);
+    defer native_arena.deinit();
+    const na = native_arena.allocator();
+    var legacy_indexes = try std.json.parseFromSliceLeaky(std.json.Value, na, table.indexes_json, .{ .allocate = .alloc_always });
+    if (legacy_indexes != .object) return error.InvalidTableIndexMetadata;
+    var index_position: usize = 0;
+    while (index_position < legacy_indexes.object.count()) {
+        const config = legacy_indexes.object.values()[index_position];
+        const is_algebraic = if (config == .object) if (config.object.get("type")) |kind| kind == .string and std.mem.eql(u8, kind.string, "algebraic") else false else false;
+        if (is_algebraic) _ = legacy_indexes.object.orderedRemove(legacy_indexes.object.keys()[index_position]) else index_position += 1;
+    }
+    const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
+    var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
+    const native_declarations = try @import("lake_index_native_aggregates.zig").build(a, na, table, source, &scoped, &provider, cancellation);
+    const declarations = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len);
+    @memcpy(declarations[0..manifest.artifacts.len], manifest.artifacts);
+    @memcpy(declarations[manifest.artifacts.len..], native_declarations);
     try cancellation.check();
     const verified = try coverage.pin(source, context);
     if (!std.meta.eql(pinned, verified)) return error.ExternalLakeIndexSourceChanged;
     const completed = try clock.now_ms(clock.ptr);
     try context.ensureActive();
-    const publication: catalog.Publication = .{ .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .declarations = manifest.artifacts };
+    const publication: catalog.Publication = .{ .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .declarations = declarations };
     return catalog.encode(a, try current.value.publish(publication, completed));
 }
 

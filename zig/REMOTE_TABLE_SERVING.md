@@ -42,10 +42,10 @@ The following paths remain required before claiming complete remote index servin
 
 | Path | Current implementation | Remaining integration |
 | --- | --- | --- |
-| Range caching | Public SQL/rows RAM → disk → source reads | Shared artifact-reader admission and per-statement explain accounting |
+| Range caching | Public SQL/rows ranges and authenticated native aggregate artifacts share bounded RAM → disk → source reads | Other artifact-reader admission and per-statement explain accounting |
 | Index construction | RowSource sidecar builders, scoped artifact uploads; native catalog CAS leases, API creation/deletion, maintenance recovery and catalog status | Lease renewal during long builds, streaming builders beyond bounded replay |
-| Index selection | Fresh per-execution catalog definitions, authorized complete-coverage selection proofs, explicit mismatch errors and automatic fallback helpers | Connect proofs and candidate/hydration readers to SQL/rows/search |
-| Algebraic execution | Native exact typed reducers, strict bound recipe matcher and SQL partial-state consumer; separate legacy lake fold artifacts | Durable native state artifacts and catalog-selected provider wiring |
+| Index selection | Fresh per-execution catalog definitions, complete-coverage proofs and catalog-selected native SQL aggregates | Connect candidate/hydration readers to rows/search and exact SQL predicates |
+| Algebraic execution | Native exact typed reducers, strict bound recipe matcher, durable authenticated column blocks and catalog-selected SQL provider | Multi-materialization slot composition, additional expression/predicate equivalence proofs |
 | Incremental refresh | Immutable file identities and invalidation foundations | Per-file contribution manifests, append merging and delete-aware correction |
 
 This table is an acceptance gate. Helper tests or a configured index alone do not
@@ -98,8 +98,9 @@ Coverage preparation requires real provider versions for every covered data and
 delete object. Its canonical data-file digest excludes discovered footer details
 and pins the delete-object versions used by the builder; publication must compare
 the completed build with that original coverage proof. The native maintenance
-worker uses this adapter and fencing protocol. Query cursors still need to consume
-the catalog selection proof before using the resulting sidecars.
+worker uses this adapter and fencing protocol. Native aggregate cursors consume
+the catalog selection proof before opening exact aggregate state. Search and row
+candidate consumers remain open.
 
 ## Native execution and delivery
 
@@ -181,9 +182,35 @@ source coverage. SQL imports their exact states, including i128 integer sums and
 compensated floating sums; restoring the first floating partial copies its
 state without arithmetic. The optimized COUNT(*) path uses this same provider
 and signature. Read failures after selection abort rather than mixing snapshots.
-The provider callback is optional and still needs native artifact-reader wiring.
+Public algebraic definitions accept `derive_from_schema: true` with optional
+`aggregates` recipes containing `name`, `op`, `group_by` and `measure`. For example,
+`{"type":"algebraic","derive_from_schema":true,"aggregates":[{"name":"total","op":"sum","measure":"amount"},{"name":"rows","op":"count"}]}`
+requests SUM(amount) and COUNT(*) over the full snapshot. Fields, physical state,
+laws and build policy remain engine-owned. COUNT(column) excludes SQL NULLs;
+COUNT(*) includes them. Schema derivation rejects unknown/incompatible fields.
 
-Operational remote index/materialization selection remains open.
+The native provider resolves the current catalog and authorized source before
+opening a matching aggregate root. Roots use the `native-sql-aggregate-v1` format;
+metadata version 1 distinguishes these from legacy algebraic segments. Each root
+binds its logical materialization name, exact recipe and group count to bounded,
+checksum-authenticated NCB1 column blocks containing AGS1 state cells. Readers
+retain one block, import borrowed state through the existing exact reducers and
+verify the statement catalog fence while draining. Native construction uses the
+same typed grouping state and disk partitions as SQL. Delete-free global COUNT(*)
+uses footer counts; Iceberg deletes use the delete-aware input adapter. One
+materialization currently matches one aggregate slot; multiple requested slots
+scan until a composition proof is implemented. Custom laws, joins, temporal
+buckets and other unsupported recipes do not claim SQL substitution.
+
+Aggregate roots and blocks share the server's bounded RAM and persistent disk
+cache. Keys bind artifact identity, expected length/checksum and resolved artifact
+store credentials. Fresh coverage and authorization checks precede lookup;
+cached bytes do not supply source authority. Concurrent misses share a load,
+waiters retain their own cancellation, and disk admission uses the existing
+sidecar priority lane. Damaged disk entries retry the verified provider; a
+provider integrity failure after selection aborts the query.
+
+Remote search/rows candidate selection and hydration remain open.
 
 Native partial aggregate handoff uses the `AGS` version 1 binary state codec.
 Its signature uses frozen explicit kind/type IDs, independent of enum declaration
@@ -314,7 +341,7 @@ exact snapshot coverage and equivalent semantics. HAVING, ordering and final
 projection still run through the native typed expression kernels.
 
 Use versioned typed reducer interchange shared with native execution. Preserve
-wide integer sums until final SQL narrowing; AVG merges sum/count states; floating
+wide integer sums until final SQL narrowing; AVG retains its exact native mean/count state; floating
 reducers retain compensation and mean state where required. Persist SQL NULL
 separately from JSON null and preserve distinct/extrema/pattern state domains.
 Legacy i64-only artifacts are selected only when their narrower contract is proved

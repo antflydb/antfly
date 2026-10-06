@@ -2268,3 +2268,37 @@ test "external lake public contract preserves opt-in indexes across metadata nor
         }
     }
 }
+
+test "external lake public contract admits typed aggregate recipes and SDK optional nulls" {
+    const a = std.testing.allocator;
+    const body =
+        \\{"type":"algebraic","derive_from_schema":true,"aggregates":[{"name":"total","op":"sum","measure":"amount","group_by":null},{"name":"rows","op":"count","measure":null}]}
+    ;
+    const normalized = try parseCreateIndexRequest(a, "stats", body);
+    defer a.free(normalized);
+    try @import("tables.zig").validatePublicAlgebraicIndexJson(a, normalized);
+    const schema =
+        \\{"version":0,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const expanded = try @import("tables.zig").expandSchemaDerivedAlgebraicIndexAlloc(a, "lake", normalized, schema);
+    defer a.free(expanded);
+    const config_api = @import("antfly_local_sources").storage_db_algebraic_index_config;
+    var config = try std.json.parseFromSlice(config_api.Config, a, expanded, .{ .ignore_unknown_fields = true });
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u32, 0), config.value.schema_version);
+    try config_api.validateConfig(config.value);
+    try @import("antfly_local_sources").storage_db_algebraic_index.validateConfig(config.value);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, expanded, .{});
+    defer parsed.deinit();
+    const mats = parsed.value.object.get("materializations").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), mats.len);
+    try std.testing.expect(mats[0].object.get("group_by") == null);
+    try std.testing.expect(mats[1].object.get("measure") == null);
+    const indexes = try std.fmt.allocPrint(a, "{{\"stats\":{s}}}", .{expanded});
+    defer a.free(indexes);
+    const regenerated = try @import("tables.zig").regenerateAlgebraicIndexesFromSchemaAlloc(a, "lake", indexes, schema);
+    defer a.free(regenerated);
+    var after = try std.json.parseFromSlice(std.json.Value, a, regenerated, .{});
+    defer after.deinit();
+    try std.testing.expectEqual(@as(usize, 2), after.value.object.get("stats").?.object.get("materializations").?.array.items.len);
+}

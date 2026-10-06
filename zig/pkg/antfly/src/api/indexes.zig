@@ -715,6 +715,22 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
     const published: ?u64 = if (state.value.published) |value| published: {
         if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
         for (value.declarations) |declaration| if (std.mem.eql(u8, declaration.name, index_name)) break :published value.generation;
+        if (config == .object) if (config.object.get("materializations")) |mats| {
+            if (mats == .array and mats.array.items.len != 0) {
+                for (mats.array.items) |mat| {
+                    if (mat != .object) break :published null;
+                    const name = mat.object.get("name") orelse break :published null;
+                    if (name != .string) break :published null;
+                    const expected = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ index_name, name.string });
+                    defer alloc.free(expected);
+                    const found = for (value.declarations) |declaration| {
+                        if (std.mem.eql(u8, declaration.name, expected)) break true;
+                    } else false;
+                    if (!found) break :published null;
+                }
+                break :published value.generation;
+            }
+        };
         break :published null;
     } else null;
     const serving_ready = queryable and published != null;
@@ -745,6 +761,9 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
 }
 
 pub fn encodeLakeIndexList(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) ![]u8 {
+    return encodeLakeIndexListWithProof(alloc, table, &.{});
+}
+pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, queryable_names: []const []const u8) ![]u8 {
     var configs = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(table.indexes_json), .{});
     defer configs.deinit();
     if (configs.value != .object) return error.InvalidTableIndexMetadata;
@@ -755,7 +774,10 @@ pub fn encodeLakeIndexList(alloc: std.mem.Allocator, table: metadata_table_manag
     var first = true;
     while (it.next()) |entry| {
         if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
-        const resource = try encodeLakeIndexResource(alloc, table, entry.key_ptr.*, entry.value_ptr.*, false);
+        const queryable = for (queryable_names) |name| {
+            if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
+        } else false;
+        const resource = try encodeLakeIndexResource(alloc, table, entry.key_ptr.*, entry.value_ptr.*, queryable);
         defer alloc.free(resource);
         if (!first) try out.append(alloc, ',');
         first = false;

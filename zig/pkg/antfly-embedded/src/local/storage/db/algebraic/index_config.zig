@@ -160,7 +160,9 @@ pub const Config = struct {
 pub fn validateConfig(cfg: Config) !void {
     if (cfg.version != 1 and cfg.version != 2) return error.InvalidAlgebraicConfig;
     if (cfg.version == 2) {
-        if (cfg.table.len == 0 or cfg.schema_version == 0 or cfg.capability_fingerprint.len == 0)
+        // Generation zero is the backend's initial schema. The table and
+        // capability fingerprint establish a bound config at every generation.
+        if (cfg.table.len == 0 or cfg.capability_fingerprint.len == 0)
             return error.InvalidAlgebraicConfig;
     }
 
@@ -387,5 +389,10 @@ test "algebraic index config validation retains exact failure identity" {
         .table = "docs",
         .schema_version = 1,
         .capability_fingerprint = "sha256:test",
+    });
+    try validateConfig(.{
+        .table = "docs",
+        .schema_version = 0,
+        .capability_fingerprint = "sha256:initial-generation",
     });
 }

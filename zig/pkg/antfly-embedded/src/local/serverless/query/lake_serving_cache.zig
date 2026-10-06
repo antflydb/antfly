@@ -148,6 +148,83 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         return self.stats;
     }
+
+    pub const ImmutableLoader = struct {
+        ptr: *anyopaque,
+        load: *const fn (*anyopaque, Allocator) anyerror![]u8,
+    };
+
+    /// The caller proves current authorization and coverage before this call.
+    /// Credential/store scope and authenticated identity partition both tiers;
+    /// cached bytes never provide source authority. Admission remains optional.
+    pub fn readImmutableAlloc(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
+        try context.ensureActive();
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("native-lake-immutable-cache-v1");
+        hash.update(&scope);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, identity.len, .little);
+        hash.update(&encoded);
+        hash.update(identity);
+        std.mem.writeInt(u64, &encoded, length, .little);
+        hash.update(&encoded);
+        hash.update(&digest);
+        const key = try std.fmt.allocPrint(a, "{s}:purpose=sidecar_payload", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
+        defer a.free(key);
+        if (try self.lookup(a, key)) |bytes| {
+            errdefer a.free(bytes);
+            try context.ensureActive();
+            return bytes;
+        }
+        var claim: ?Claim = null;
+        if (context.io) |io| {
+            while (true) {
+                claim = self.begin(key) catch null;
+                if (claim == null or claim.?.leader) break;
+                const waiting = claim.?;
+                claim = null;
+                {
+                    defer self.finish(waiting, io);
+                    while (!waiting.flight.event.isSet()) {
+                        try context.ensureActive();
+                        waiting.flight.event.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                            error.Timeout => continue,
+                            else => return err,
+                        };
+                    }
+                }
+                try context.ensureActive();
+                if (try self.lookup(a, key)) |bytes| return bytes;
+            }
+        }
+        defer if (claim) |active| self.finish(active, context.io.?);
+        if (claim != null) if (try self.lookup(a, key)) |bytes| return bytes;
+        const disk_bytes = if (self.persistent) |*disk| try disk.readAlloc(a, key, length) else null;
+        if (disk_bytes) |bytes| {
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (bytes.len == length and std.mem.eql(u8, &actual, &digest)) {
+                errdefer a.free(bytes);
+                try context.ensureActive();
+                self.recordRead(true, bytes.len);
+                self.store(key, bytes) catch {};
+                return bytes;
+            }
+            // An evictable cache entry is not authoritative. Retry the verified
+            // immutable provider rather than failing from local disk damage.
+            a.free(bytes);
+        }
+        const bytes = try loader.load(loader.ptr, a);
+        errdefer a.free(bytes);
+        try context.ensureActive();
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+        if (bytes.len != length or !std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
+        self.recordRead(false, bytes.len);
+        if (self.persistent) |*disk| _ = disk.enqueueWrite(key, bytes);
+        self.store(key, bytes) catch {};
+        return bytes;
+    }
     fn pin(self: *Cache, key: []const u8) ?ranges.RangeLease {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
@@ -499,6 +576,91 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     reader.drain(true);
     try std.testing.expect(slow.canceled.load(.acquire) > 0);
     for (reader.pending) |future| try std.testing.expect(future == null);
+}
+
+test "external lake immutable artifact cache survives restart without provider reads" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/immutable-cache", .{tmp.sub_path});
+    defer a.free(root);
+    var source = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.ProviderUnavailable;
+            return alloc.dupe(u8, "authenticated");
+        }
+    }{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &source, .load = @TypeOf(source).load };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("authenticated", &digest, .{});
+    {
+        var cache = Cache.initWithMemoryLimit(a, 0);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        const bytes = try cache.readImmutableAlloc(a, @splat(1), "root", 13, digest, .{ .io = io }, loader);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("authenticated", bytes);
+    }
+    source.fail = true;
+    {
+        var cache = Cache.initWithMemoryLimit(a, 0);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        const bytes = try cache.readImmutableAlloc(a, @splat(1), "root", 13, digest, .{ .io = io }, loader);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("authenticated", bytes);
+        try std.testing.expectEqual(@as(usize, 1), source.calls);
+        try std.testing.expectEqual(@as(u64, 1), cache.snapshot().disk_hits);
+        try std.testing.expectError(error.ProviderUnavailable, cache.readImmutableAlloc(a, @splat(2), "root", 13, digest, .{ .io = io }, loader));
+    }
+}
+
+test "external lake immutable cache authenticates payloads and separates credential scopes" {
+    const a = std.testing.allocator;
+    var cache = Cache.initWithMemoryLimit(a, 32);
+    defer cache.deinit();
+    var source = struct {
+        calls: usize = 0,
+        bytes: []const u8 = "immutable",
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, self.bytes);
+        }
+    }{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &source, .load = @TypeOf(source).load };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source.bytes, &digest, .{});
+    for (0..2) |_| {
+        const bytes = try cache.readImmutableAlloc(a, @splat(1), "artifact", 9, digest, .{ .io = std.testing.io }, loader);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("immutable", bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    const isolated = try cache.readImmutableAlloc(a, @splat(2), "artifact", 9, digest, .{}, loader);
+    defer a.free(isolated);
+    try std.testing.expectEqual(@as(usize, 2), source.calls);
+    source.bytes = "corrupted";
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.readImmutableAlloc(a, @splat(3), "artifact", 9, digest, .{}, loader));
+    source.bytes = "immutable";
+    const retry = try cache.readImmutableAlloc(a, @splat(3), "artifact", 9, digest, .{}, loader);
+    defer a.free(retry);
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
+    try std.testing.expect(cache.snapshot().stored_bytes <= 32);
+    const canceled = @import("../../storage/object_storage.zig").CancellationToken{ .ptr = &source, .is_cancelled_fn = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    }.check };
+    try std.testing.expectError(error.Canceled, cache.readImmutableAlloc(a, @splat(1), "artifact", 9, digest, .{ .cancellation = canceled }, loader));
+    try std.testing.expectEqual(@as(usize, 4), source.calls);
 }
 
 test "external lake range leases pin cache bytes across bounded eviction" {

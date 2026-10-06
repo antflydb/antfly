@@ -22,6 +22,8 @@ test {
     _ = @import("api/lake_index_store.zig");
     _ = @import("api/lake_index_coordinator.zig");
     _ = @import("api/lake_index_selection.zig");
+    _ = @import("api/lake_index_aggregate_artifact.zig");
+    _ = @import("api/lake_index_native_aggregates.zig");
     _ = @import("api/lake_schema_detection.zig");
     _ = @import("api/lake_table_reads.zig");
     _ = @import("antfly_local_sources").serverless_query_lake_schema;

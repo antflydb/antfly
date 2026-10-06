@@ -1273,6 +1273,7 @@ fn validatePublicAlgebraicIndexValue(value: std.json.Value) !void {
     const derive_value = value.object.get("derive_from_schema") orelse return error.InvalidCreateTableRequest;
     if (derive_value != .bool or !derive_value.bool) return error.InvalidCreateTableRequest;
 
+    if (value.object.get("aggregates")) |recipes| try @import("antfly_local_sources").api_local_tables.validatePublicAggregateRecipes(recipes);
     var it = value.object.iterator();
     while (it.next()) |entry| {
         if (isAlgebraicInternalConfigField(entry.key_ptr.*)) return error.InvalidCreateTableRequest;
@@ -1323,6 +1324,7 @@ fn isAlgebraicIndexValue(value: std.json.Value) bool {
 /// the schema and must survive a regeneration.
 fn isAlgebraicUserTunableField(field: []const u8) bool {
     const tunable = [_][]const u8{
+        "aggregates",
         "adaptive",
         "pathfact_policy",
         "max_result_buckets",
@@ -1366,6 +1368,11 @@ fn regenerateAlgebraicIndexValueAlloc(
             try alloc.dupe(u8, entry.key_ptr.*),
             try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
         );
+    }
+
+    if (source.object.get("aggregates")) |recipes| {
+        try @import("antfly_local_sources").api_local_tables.validatePublicAggregateRecipes(recipes);
+        try derived.object.put(alloc, "materializations", try cloneJsonValueAlloc(alloc, recipes));
     }
 
     var source_config = try std.json.parseFromValue(algebraic_mod.index.Config, alloc, source, .{
@@ -6532,4 +6539,28 @@ test "relational declarations metadata generated update admission precedes catal
     try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &table, removed));
     const plain: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = removed, .indexes_json = "{}" };
     try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &plain, json));
+}
+
+test "external lake public aggregate recipes expand through schema derivation" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":1,"default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"},"label":{"type":"string"}},"additionalProperties":false}}}}
+    ;
+    const request =
+        \\{"type":"algebraic","derive_from_schema":true,"aggregates":[{"name":"total","op":"sum","measure":"amount"},{"name":"rows","op":"count","group_by":["label"]}]}
+    ;
+    try validatePublicAlgebraicIndexJson(a, request);
+    const expanded = try expandSchemaDerivedAlgebraicIndexAlloc(a, "lake", request, schema);
+    defer a.free(expanded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, expanded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("materializations").?.array.items.len);
+    try std.testing.expectEqualStrings("amount", parsed.value.object.get("materializations").?.array.items[0].object.get("measure").?.string);
+    const invalid = [_][]const u8{
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"sum\"}]}",
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\",\"law\":\"custom\"}]}",
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\",\"group_by\":[\"label\",\"label\"]}]}",
+        "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"aggregates\":[{\"name\":\"n\",\"op\":\"count\"},{\"name\":\"n\",\"op\":\"count\"}]}",
+    };
+    for (invalid) |body| try std.testing.expectError(error.InvalidCreateTableRequest, validatePublicAlgebraicIndexJson(a, body));
 }

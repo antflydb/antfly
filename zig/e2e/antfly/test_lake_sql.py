@@ -130,10 +130,10 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             {"type": "full_text", "field": "label"},
         )
 
-        def await_publication():
+        def await_publication(index_name="label_text"):
             deadline = time.monotonic() + 30
             while True:
-                resource = request("GET", "/tables/lake_events/indexes/label_text")
+                resource = request("GET", f"/tables/lake_events/indexes/{index_name}")
                 status = resource["status"]
                 if status.get("published_revision") is not None:
                     return status["published_revision"]
@@ -148,6 +148,71 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         published_generation = await_publication()
         artifact_root = server.root / "artifacts" / "buckets" / "native-lake-indexes"
         assert artifact_root.exists()
+        request(
+            "POST",
+            "/tables/lake_events/indexes/exact_stats",
+            {
+                "type": "algebraic",
+                "derive_from_schema": True,
+                "aggregates": [
+                    {"name": "amount_total", "op": "sum", "measure": "amount"},
+                    {"name": "exact_min", "op": "min", "measure": "exact"},
+                    {"name": "row_count", "op": "count"},
+                    {"name": "non_null_count", "op": "count", "measure": "exact"},
+                    {"name": "measure_mean", "op": "avg", "measure": "measure"},
+                    {"name": "counts_by_amount", "op": "count", "group_by": ["amount"]},
+                ],
+            },
+        )
+        aggregate_generation = await_publication("exact_stats")
+        assert request("GET", "/tables/lake_events/indexes/exact_stats")["status"]["readiness"]["queryable"]
+        listed = request("GET", "/tables/lake_events/indexes")
+        assert next(item for item in listed if item["config"]["name"] == "exact_stats")["status"]["readiness"]["queryable"]
+        # Adding an index publishes the entire desired definition atomically.
+        published_generation = await_publication()
+        amount_sum = sum(range(count))
+        assert request("POST", "/sql", {"statement": "SELECT COUNT(*) FROM lake_events"})["rows"] == [[str(count)]]
+        assert request("POST", "/sql", {"statement": "SELECT MIN(exact) FROM lake_events"})["rows"] == [["9007199254740993"]]
+        non_null = [i for i in range(count) if i % 7 != 0]
+        assert request("POST", "/sql", {"statement": "SELECT COUNT(exact) FROM lake_events"})["rows"] == [[str(len(non_null))]]
+        mean = request("POST", "/sql", {"statement": "SELECT AVG(measure) FROM lake_events"})["rows"][0][0]
+        assert float(mean) == pytest.approx(sum((i % 3) * 0.5 for i in non_null) / len(non_null))
+        assert request("POST", "/sql", {"statement": "SELECT amount, COUNT(*) AS n FROM lake_events GROUP BY amount HAVING amount >= 1197 ORDER BY amount DESC LIMIT 2"})["rows"] == [["1199", "1"], ["1198", "1"]]
+
+        # Prove actual artifact consumption: a checksum failure after selection
+        # aborts an eligible query; a predicate lacking an equivalence proof
+        # still scans Parquet. Restore the object before the restart checks.
+        aggregate_root = None
+        for artifact_path in artifact_root.rglob("*"):
+            if not artifact_path.is_file():
+                continue
+            original = artifact_path.read_bytes()
+            marker = original.find(b'"format":"native-sql-aggregate-v1"')
+            if marker >= 0 and b'"name":"exact_stats.amount_total"' in original:
+                aggregate_root = json.loads(original[marker - 1 :])
+                break
+        assert aggregate_root is not None, "Native exact aggregate root missing"
+        checksum = aggregate_root["blocks"][0]["artifact"]["checksum"]
+        candidates = list((artifact_root / "objects").rglob(checksum))
+        assert len(candidates) == 1
+        artifact_path = candidates[0]
+        original = artifact_path.read_bytes()
+        marker = original.index(b"NCB\x01")
+        damaged = bytearray(original)
+        damaged[marker] ^= 1
+        artifact_path.write_bytes(damaged)
+        try:
+            response = requests.post(
+                server.api_url + "/sql",
+                json={"statement": "SELECT SUM(amount) FROM lake_events"},
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert not response.ok, "Selected corrupt aggregate silently fell back to scanning"
+            assert request("POST", "/sql", {"statement": "SELECT SUM(amount) FROM lake_events WHERE amount >= 0"})["rows"] == [[str(amount_sum)]]
+        finally:
+            artifact_path.write_bytes(original)
+        assert request("POST", "/sql", {"statement": "SELECT SUM(amount) FROM lake_events"})["rows"] == [[str(amount_sum)]]
         # Both independent empty-file layouts must remain valid attachments.
         for row_group in (False, True):
             empty_root = tmp_path / f"empty-{row_group}"
@@ -351,6 +416,8 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 server.restart()
                 assert request("POST", "/sql", {"statement": sql})["rows"] == expected
                 assert await_publication() == published_generation
+                assert await_publication("exact_stats") == aggregate_generation
+                assert request("POST", "/sql", {"statement": "SELECT SUM(amount) FROM lake_events"})["rows"] == [[str(amount_sum)]]
             with (
                 psycopg.connect(
                     host="127.0.0.1",

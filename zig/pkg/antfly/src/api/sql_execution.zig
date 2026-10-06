@@ -531,7 +531,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -805,6 +805,91 @@ pub const Adapter = struct {
             return try @import("sql_session_overlay.zig").open(alloc, native_cursor, staged, table, ordered, row_filter);
         }
         return openNativeScan(ptr, alloc, table, request);
+    }
+
+    const AggregateArtifactCursor = struct {
+        a: std.mem.Allocator,
+        adapter: *Adapter,
+        table: catalog.Table,
+        store: @import("lake_index_store.zig").Store,
+        reader: *@import("lake_index_aggregate_artifact.zig").Reader,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            self.adapter.context.ensureActive() catch return true;
+            return false;
+        }
+        fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.verify(a, self.table);
+            const cursor = self.reader.cursor();
+            const result = cursor.next(cursor.ptr, a, maximum) catch |err| {
+                try self.adapter.context.ensureActive();
+                return err;
+            };
+            try self.adapter.context.ensureActive();
+            return result;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const a = self.a;
+            const cursor = self.reader.cursor();
+            cursor.close(cursor.ptr);
+            self.store.deinit();
+            a.destroy(self);
+        }
+    };
+    fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        if (table.external_base_source == null or table.external_indexes == null) return null;
+        const local = @import("antfly_local_sources");
+        const artifact_api = @import("lake_index_aggregate_artifact.zig");
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var state = try local.metadata_lake_index_catalog.parse(sa, table.external_indexes.?.catalog_json);
+        defer state.deinit();
+        const publication = state.value.published orelse return null;
+        const identity = try @import("lake_index_native_aggregates.zig").recipeIdentity(sa, recipe);
+        const eligible = for (publication.declarations) |decl| {
+            if (decl.artifact.kind == .algebraic_segment and decl.artifact.metadata_version == artifact_api.metadata_version and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break true;
+        } else false;
+        if (!eligible) return null;
+        try self.verify(sa, table);
+        try self.checkLakeRead(sa, table);
+        try self.server.prepareLakeCache();
+        const normalized = try self.context.platformDeadline();
+        const context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
+        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
+        defer source.deinit();
+        const owner = try a.create(AggregateArtifactCursor);
+        var keep_owner = false;
+        defer if (!keep_owner) a.destroy(owner);
+        owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
+            try context.ensureActive();
+            if (err == error.OutOfMemory) return err;
+            return null;
+        };
+        var keep_store = false;
+        defer if (!keep_store) owner.store.deinit();
+        var selected = (try @import("lake_index_selection.zig").select(sa, table, &source, &owner.store, context, .automatic)) orelse return null;
+        defer selected.deinit();
+        const declaration = for (selected.publication().declarations) |decl| {
+            if (decl.artifact.kind == .algebraic_segment and decl.artifact.metadata_version == artifact_api.metadata_version and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break decl;
+        } else return error.InvalidNativeAggregateArtifact;
+        try self.verify(sa, table);
+        // From this point errors propagate: selected immutable state cannot be
+        // replaced with a fresh scan halfway through consumption.
+        owner.a = a;
+        owner.adapter = self;
+        owner.table = table;
+        owner.reader = artifact_api.Reader.openWithCache(a, owner.store.artifactStore(), declaration.artifact, recipe, .{ .ptr = owner, .is_cancelled_fn = AggregateArtifactCursor.canceled }, .{ .cache = &self.server.lake_read_cache, .scope = owner.store.identity, .context = context }) catch |err| {
+            try self.context.ensureActive();
+            return err;
+        };
+        keep_store = true;
+        keep_owner = true;
+        return .{ .ptr = owner, .next = AggregateArtifactCursor.next, .close = AggregateArtifactCursor.close };
     }
 
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {

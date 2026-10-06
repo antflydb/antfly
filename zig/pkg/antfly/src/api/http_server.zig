@@ -15423,7 +15423,15 @@ pub const ApiHttpServer = struct {
         if (table.schema_json.len > 0) {
             var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer schema.deinit(alloc);
-            if (schema.external_base_source != null) return indexes_api.encodeLakeIndexList(alloc, table.*) catch return error.InternalFailure;
+            if (schema.external_base_source != null) {
+                const names = @import("lake_index_readiness.zig").names(alloc, self, table.*, request) catch &.{};
+                defer {
+                    for (names) |name| alloc.free(name);
+                    alloc.free(names);
+                }
+                try ensureTableOperationActive(request);
+                return indexes_api.encodeLakeIndexListWithProof(alloc, table.*, names) catch return error.InternalFailure;
+            }
         }
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
@@ -15499,7 +15507,16 @@ pub const ApiHttpServer = struct {
             if (parsed.external_base_source != null) {
                 var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse return error.NotFound;
                 defer lookup.deinit();
-                return indexes_api.encodeLakeIndexResource(alloc, table.*, index_name, lookup.config, false) catch return error.InternalFailure;
+                const names = @import("lake_index_readiness.zig").names(alloc, self, table.*, request) catch &.{};
+                defer {
+                    for (names) |name| alloc.free(name);
+                    alloc.free(names);
+                }
+                try ensureTableOperationActive(request);
+                const queryable = for (names) |name| {
+                    if (std.mem.eql(u8, name, index_name)) break true;
+                } else false;
+                return indexes_api.encodeLakeIndexResource(alloc, table.*, index_name, lookup.config, queryable) catch return error.InternalFailure;
             }
             if (parsed.relational_indexes) |definitions| for (definitions.value) |definition| {
                 if (std.mem.eql(u8, definition.name, index_name)) return self.relationalIndexResource(alloc, table, &parsed, definition, request);
@@ -15968,8 +15985,10 @@ pub const ApiHttpServer = struct {
         var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = config, .secret_store = self.cfg.secret_store };
+        try self.prepareLakeCache();
         var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, options.lakeOptions(), context, &self.lake_read_cache);
         defer source.deinit();
+        try source.attachCache(&self.lake_read_cache, schema.external_base_source.?.binding, context);
         try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms });
     }
 
