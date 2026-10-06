@@ -116,9 +116,10 @@ Release-object retention is journal-aware. Stable releases are permanent;
 nightlies are retained for 30 days or for the newest 10 snapshots, whichever
 keeps more; and RC/alpha/beta artifacts remain until 90 days after the matching
 stable release's immutable completion receipt. Merely uploading stable bytes or
-creating a draft does not start that clock. Channel `current` and `pending`
-identities always override those windows. `Release object retention` emits a
-read-only plan every Monday. A manual dispatch with `apply=true`, protected by the
+creating a draft does not start that clock. Pending cleanup releases do not
+consume newest-nightly retention slots unless they are channel-protected.
+Channel `current` and `pending` identities always override those windows.
+`Release object retention` emits a read-only plan every Monday. A manual dispatch with `apply=true`, protected by the
 `release-promotion` environment, completes before the short release/GC lock is
 acquired. The apply phase recomputes the plan, verifies that no channel still
 reaches an expired container digest, removes its GAR and GHCR images, checks

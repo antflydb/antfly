@@ -453,6 +453,46 @@ class ReleaseGCTests(unittest.TestCase):
         self.assertNotIn(f"{gc.PENDING_ROOT}{ledger}.json", protected["delete_keys"])
         self.assertNotIn(f"antfly/{tag}/artifacts.json", protected["delete_keys"])
 
+    def nightly_pending_cleanup(self):
+        store = MemoryStore()
+        oldest = store.add_release("v0.0.0-dev.1", 100)
+        store.add_release("v0.0.0-dev.9", 100)
+        pending = store.add_release("v0.0.0-dev.10", 100)
+        store.add_journal("nightly", current=("v0.0.0-dev.1", oldest))
+        store.put("antfly/v9.0.0/antfly.tar.gz", b"legacy stable")
+        gc.apply_gc_plan(store, gc.plan_gc(store, now=NOW, delete_dev_releases=True))
+        newest = store.add_release("v0.0.0-dev.11", 0)
+        store.add_journal("nightly", current=("v0.0.0-dev.11", newest))
+        store.add_release("v9.0.0", 100)
+        return store, pending
+
+    def test_pending_expirations_do_not_consume_nightly_retention_slots(self) -> None:
+        store, _ = self.nightly_pending_cleanup()
+        plan = gc.plan_gc(store, now=NOW, nightly_min_count=3)
+        self.assertEqual(plan["retained"]["v0.0.0-dev.1"], "newest-nightly-count")
+        self.assertEqual(
+            plan["retained"]["v0.0.0-dev.11"], "channel-current-or-pending"
+        )
+        self.assertEqual(set(plan["expired"]), {"v0.0.0-dev.9", "v0.0.0-dev.10"})
+        self.assertNotIn("antfly/v0.0.0-dev.1/artifacts.json", plan["delete_keys"])
+
+    def test_channel_protected_pending_release_still_counts_as_retained(self) -> None:
+        store, pending = self.nightly_pending_cleanup()
+        newest = gc.load_releases(store, store.list_objects("antfly/"))[0][
+            "v0.0.0-dev.11"
+        ].ledger_sha256
+        store.add_journal(
+            "nightly",
+            current=("v0.0.0-dev.11", newest),
+            pending=("v0.0.0-dev.10", pending),
+        )
+        plan = gc.plan_gc(store, now=NOW, nightly_min_count=2)
+        self.assertEqual(
+            plan["retained"]["v0.0.0-dev.10"], "channel-current-or-pending"
+        )
+        self.assertEqual(set(plan["expired"]), {"v0.0.0-dev.1", "v0.0.0-dev.9"})
+        self.assertNotIn("antfly/v0.0.0-dev.10/artifacts.json", plan["delete_keys"])
+
     def test_pending_cleanup_rejects_changed_release_identity(self) -> None:
         store, tag, _, blocked = self.pending_legacy_cleanup()
         gc.apply_gc_plan(store, blocked)

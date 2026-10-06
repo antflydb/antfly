@@ -437,6 +437,13 @@ def plan_gc(
             release
             for release in releases.values()
             if NIGHTLY_PATTERN.fullmatch(release.tag)
+            # Pending expirations cannot fill retention slots unless a channel
+            # currently protects them and postpones their deletion.
+            and (
+                release.tag not in pending
+                or release.tag in protected_tags
+                or release.ledger_sha256 in protected_ledgers
+            )
         ),
         key=lambda release: int(
             NIGHTLY_PATTERN.fullmatch(release.tag).group("sequence")
