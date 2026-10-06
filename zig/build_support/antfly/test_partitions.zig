@@ -94,10 +94,10 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
             continue;
         }
         const text = sourceText(b, current) orelse continue;
-        if (std.mem.indexOf(u8, text, ".antfly_sources.physical_db") != null) break :search true;
+        if (findMarker(text, 0, ".antfly_sources.physical_db") != null) break :search true;
         var cursor: usize = 0;
         const marker = "@import(\"";
-        while (std.mem.indexOfPos(u8, text, cursor, marker)) |offset| {
+        while (findMarker(text, cursor, marker)) |offset| {
             const start = offset + marker.len;
             const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse break;
             const relative = text[start..end];
@@ -116,11 +116,61 @@ fn physicalName(b: *std.Build, name: []const u8) bool {
     const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/local/source_catalog.zig")).?;
     const text = sourceText(b, catalog) orelse return false;
     const marker = b.fmt("pub const {s} = @import(\"", .{name});
-    const offset = std.mem.indexOf(u8, text, marker) orelse return false;
+    const offset = findMarker(text, 0, marker) orelse return false;
     const start = offset + marker.len;
     const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse return false;
     const path = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(catalog).?, text[start..end] }) catch @panic("OOM");
     return requiresPhysical(b, path);
+}
+
+// Skip directly to candidate delimiters instead of comparing an import marker
+// at every byte. Build configurators also execute this code in debug mode.
+fn findMarker(text: []const u8, start: usize, marker: []const u8) ?usize {
+    var cursor = start;
+    while (std.mem.indexOfScalarPos(u8, text, cursor, marker[0])) |offset| {
+        if (std.mem.startsWith(u8, text[offset..], marker)) return offset;
+        cursor = offset + 1;
+    }
+    return null;
+}
+
+// Different test profiles often walk the same authored import graph. Parse
+// each file once; keep physical/control ownership filtering per consumer.
+const SourceImports = struct { local_names: []const []const u8, relative_paths: []const []const u8 };
+var source_imports: std.StringHashMapUnmanaged(SourceImports) = .empty;
+
+fn importsFor(b: *std.Build, path: []const u8) ?SourceImports {
+    if (source_imports.get(path)) |imports| return imports;
+    const text = sourceText(b, path) orelse return null;
+    var names: std.ArrayList([]const u8) = .empty;
+    var dependencies: std.ArrayList([]const u8) = .empty;
+    const marker = "@import(\"antfly_local_sources\").";
+    var cursor: usize = 0;
+    while (findMarker(text, cursor, marker)) |offset| {
+        const start = offset + marker.len;
+        var end = start;
+        while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) : (end += 1) {}
+        if (end > start) names.append(b.allocator, text[start..end]) catch @panic("OOM");
+        cursor = end;
+    }
+    cursor = 0;
+    const import = "@import(\"";
+    while (findMarker(text, cursor, import)) |offset| {
+        const start = offset + import.len;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse break;
+        const relative = text[start..end];
+        if (std.mem.endsWith(u8, relative, ".zig")) {
+            const dependency = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(path).?, relative }) catch @panic("OOM");
+            dependencies.append(b.allocator, dependency) catch @panic("OOM");
+        }
+        cursor = end + 1;
+    }
+    const imports: SourceImports = .{
+        .local_names = names.toOwnedSlice(b.allocator) catch @panic("OOM"),
+        .relative_paths = dependencies.toOwnedSlice(b.allocator) catch @panic("OOM"),
+    };
+    source_imports.put(b.allocator, path, imports) catch @panic("OOM");
+    return imports;
 }
 
 fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
@@ -138,28 +188,9 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
         if ((seen.getOrPut(path) catch @panic("OOM")).found_existing) continue;
         const base = std.fs.path.basename(path);
         if (std.mem.eql(u8, base, "local_test_sources.zig") or std.mem.startsWith(u8, base, "source_owner_")) continue;
-        const text = sourceText(b, path) orelse continue;
-        const marker = "@import(\"antfly_local_sources\").";
-        var cursor: usize = 0;
-        while (std.mem.indexOfPos(u8, text, cursor, marker)) |offset| {
-            const start = offset + marker.len;
-            var end = start;
-            while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) : (end += 1) {}
-            if (end > start) names.put(b.allocator, text[start..end], {}) catch @panic("OOM");
-            cursor = end;
-        }
-        cursor = 0;
-        const import = "@import(\"";
-        while (std.mem.indexOfPos(u8, text, cursor, import)) |offset| {
-            const start = offset + import.len;
-            const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse break;
-            const relative = text[start..end];
-            if (std.mem.endsWith(u8, relative, ".zig")) {
-                const dependency = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(path).?, relative }) catch @panic("OOM");
-                pending.append(b.allocator, dependency) catch @panic("OOM");
-            }
-            cursor = end + 1;
-        }
+        const imports = importsFor(b, path) orelse continue;
+        for (imports.local_names) |name| names.put(b.allocator, name, {}) catch @panic("OOM");
+        pending.appendSlice(b.allocator, imports.relative_paths) catch @panic("OOM");
     }
     var selected: std.ArrayList([]const u8) = .empty;
     for (names.keys()) |name| {
