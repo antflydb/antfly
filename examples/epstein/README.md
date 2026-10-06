@@ -573,7 +573,10 @@ when they use the same layout and settings. After a crashed process, remove the 
 OCR, transcription, chunking and embeddings run in Antfly's durable enrichment
 workers; completing `corpus load` means the source records were submitted, not that
 indexing finished. Failed provider work remains visible in server artifact/index
-status and can be repaired with the artifact reprocess API. `corpus graph` traverses
+status and can be repaired with the artifact reprocess API. Reprocessing acknowledges
+that repair was durably queued; poll the artifact generation/status for completion.
+Unrelated retrying providers do not turn that acknowledgment into a failure.
+`corpus graph` traverses
 units in bounded pages and reconciles deterministic graph-unit rows containing
 plain extracted text and provenance. Each source has a durable materialization
 revision marker in the table. Every invocation checks the latest artifact generation;

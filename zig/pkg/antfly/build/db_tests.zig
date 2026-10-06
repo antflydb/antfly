@@ -136,6 +136,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "db public artifact reprocess accepts durable work despite unrelated provider retries",
+        "db document extraction manifest inspection and reprocess API",
+        "db generic artifact repair queue",
+        "db shared repair completion",
+        "db repair completion cannot clear debt behind terminal coverage",
         "db resolver workers recover pending journal targets after reopen without new writes",
         "db resolver worker resumes durable backfill after deferred activation and reopen",
         "db managed resolver changes fence in-flight replay and reset durable cursors",

@@ -9376,11 +9376,24 @@ pub const DB = struct {
         return true;
     }
 
+    /// Public reprocessing acknowledges durable submission, not completion of
+    /// every enrichment/index on the source. Completion is observed through
+    /// artifact status; unrelated retrying providers must not fail submission.
     pub fn reprocessDocumentArtifact(
         self: *DB,
         alloc: Allocator,
         doc_key: []const u8,
         artifact_name: []const u8,
+    ) !bool {
+        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false);
+    }
+
+    fn reprocessDocumentArtifactWithCompletionWait(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        wait_for_completion: bool,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
@@ -9392,10 +9405,14 @@ pub const DB = struct {
 
         const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
         const force_artifacts = [_][]const u8{artifact_name};
+        // Preserve forced generation's precommit planning. A write-only sync
+        // level would lose the force flag for unchanged cached asset outputs.
+        // Public acceptance only skips the postcommit, table-wide visibility wait.
         try self.batchInternal(.{
             .writes = &writes,
             .sync_level = .full_index,
         }, null, .{
+            .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
         });
         return true;
@@ -9412,7 +9429,7 @@ pub const DB = struct {
             .doc_key = doc_key,
             .artifact_name = artifact_name,
         };
-        return self.reprocessEmbeddingArtifactIssue(alloc, issue) catch |err| switch (err) {
+        return self.reprocessEmbeddingArtifactIssue(alloc, issue, false) catch |err| switch (err) {
             error.NotFound => false,
             else => return err,
         };
@@ -9422,6 +9439,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         issue: types.ArtifactRepairIssue,
+        wait_for_completion: bool,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .embedding, issue.artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
@@ -9436,6 +9454,7 @@ pub const DB = struct {
             .writes = &writes,
             .sync_level = .full_index,
         }, null, .{
+            .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
         });
         return true;
@@ -11073,8 +11092,8 @@ pub const DB = struct {
         issue: types.ArtifactRepairIssue,
     ) !bool {
         return switch (issue.artifact_kind) {
-            .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue),
-            .asset => try self.reprocessDocumentArtifact(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name),
+            .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue, true),
+            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true),
             .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
             .graph, .full_text, .algebraic => false,
         };
@@ -79246,6 +79265,81 @@ test "db retries remote document child range dispatch from durable outbox" {
     const after = try db.core.scanStorePrefix(alloc, outbox_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "db public artifact reprocess accepts durable work despite unrelated provider retries" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{};
+    gated.allowed_successes.store(100, .release);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 10,
+        },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:repair", .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}" },
+            .{ .key = "doc:embedding", .value = "{\"body\":\"healthy cached output\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    var before = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer before.deinit(alloc);
+    gated.allowed_successes.store(0, .release);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:retry", .value = "{\"body\":\"provider unavailable\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+
+    // Both public endpoints acknowledge the committed request without waiting
+    // for the unrelated retry debt. The repair queue still uses full_index.
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:repair", "document_units_v1"));
+    // Permit only the requested embedding to succeed. The other document's
+    // provider debt remains retrying, so a table-wide completion wait still fails.
+    gated.allowed_successes.store(gated.successful_requests.load(.acquire) + 1, .release);
+    try std.testing.expect(try db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expectEqual(gated.allowed_successes.load(.acquire), gated.successful_requests.load(.acquire));
+    // A failure in the requested provider itself remains a real request error.
+    try std.testing.expectError(error.EmbedRateLimited, db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifact(alloc, "missing", "document_units_v1"));
+    try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:repair", "missing"));
+    try std.testing.expect(!try db.reprocessDocumentEmbeddingArtifact(alloc, "missing", "dense_v1"));
+
+    // Provider recovery lets the queued work finish; success did not discard it.
+    gated.allowed_successes.store(100, .release);
+    sleepNs(550 * std.time.ns_per_ms);
+    try db.runUntilIdle();
+    var after = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(before.generation + 1, after.generation);
+    const embedding_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:retry", "dense_v1");
+    defer alloc.free(embedding_key);
+    const embedding = try db.core.store.get(alloc, embedding_key);
+    defer alloc.free(embedding);
+    try std.testing.expect(embedding.len > 0);
 }
 
 test "db document extraction manifest inspection and reprocess API" {
