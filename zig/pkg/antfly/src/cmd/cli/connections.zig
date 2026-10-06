@@ -124,19 +124,37 @@ fn login(allocator: std.mem.Allocator, io: std.Io, client: *AntflyClient, option
         std.debug.print("Open the URL above manually; waiting for authorization.\n", .{});
     };
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + @as(i128, options.timeout_seconds) * std.time.ns_per_s;
-    while (std.Io.Clock.awake.now(io).nanoseconds < deadline) {
-        var outcome = try client.getChatGPTAttempt(attempt.attempt_id);
+    const id = try waitForConnection(allocator, io, client, attempt.attempt_id, deadline, 60_000);
+    defer allocator.free(id);
+    // Only the safe result is emitted, never the authorization URL or upstream error text.
+    try cli.writeJson(allocator, io, .{ .provider = "chatgpt", .status = "connected", .connection_id = id });
+}
+
+fn remainingLoginMs(io: std.Io, deadline: i128) !u64 {
+    const remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+    if (remaining <= 0) return error.ConnectionLoginTimedOut;
+    return @intCast(try std.math.divCeil(i128, remaining, std.time.ns_per_ms));
+}
+
+fn waitForConnection(allocator: std.mem.Allocator, io: std.Io, client: *AntflyClient, attempt_id: []const u8, deadline: i128, poll_timeout_ms: u64) ![]u8 {
+    while (true) {
+        const remaining = try remainingLoginMs(io, deadline);
+        var outcome = client.getChatGPTAttemptWithTimeout(attempt_id, @min(remaining, poll_timeout_ms)) catch |err| {
+            // This GET only observes an existing attempt. A timeout must not
+            // discard a valid OAuth exchange or start another authorization.
+            if (err == error.Timeout) continue;
+            return err;
+        };
         defer outcome.deinit();
+        _ = try remainingLoginMs(io, deadline);
         try requireData(outcome);
         const value = outcome.data.?.value;
         if (try completed(value.status)) {
             const id = value.connection_id orelse return error.InvalidConnectionResponse;
-            // Only the safe result is emitted, never the authorization URL or upstream error text.
-            return cli.writeJson(allocator, io, .{ .provider = "chatgpt", .status = "connected", .connection_id = id });
+            return allocator.dupe(u8, id);
         }
-        try io.sleep(.fromSeconds(1), .awake);
+        try io.sleep(.fromMilliseconds(@intCast(@min(1000, try remainingLoginMs(io, deadline)))), .awake);
     }
-    return error.ConnectionLoginTimedOut;
 }
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -163,6 +181,65 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *AntflyClient, args
             try cli.writeJson(allocator, io, response.data.?.value);
         },
     }
+}
+
+test "connections polling retries only status reads within the overall login budget" {
+    const httpx = @import("httpx");
+    const Mock = struct {
+        const Mode = enum(u8) { slow_first, delayed, declined };
+        mode: std.atomic.Value(Mode) = .init(.slow_first),
+        polls: std.atomic.Value(u32) = .init(0),
+        authorizations: std.atomic.Value(u32) = .init(0),
+        fn status(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            try std.testing.expectEqualStrings("Basic dXNlcjpwYXNz", ctx.header("Authorization").?);
+            const count = self.polls.fetchAdd(1, .acq_rel);
+            const mode = self.mode.load(.acquire);
+            if (mode == .delayed or (mode == .slow_first and count == 0)) try ctx.io.sleep(.fromMilliseconds(200), .awake);
+            return ctx.json(.{ .status = if (mode == .declined) "declined" else "connected", .connection_id = "one" });
+        }
+        fn authorize(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            _ = self.authorizations.fetchAdd(1, .acq_rel);
+            return ctx.status(400).text("unexpected authorization replay");
+        }
+        fn serve(server: *httpx.Server) std.Io.Cancelable!void {
+            server.listen() catch {};
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var mock: Mock = .{};
+    var server = httpx.Server.initWithConfig(a, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.get("/db/v1/connections/chatgpt/attempts/attempt-1", httpx.Handler.bind(&mock, Mock.status));
+    try server.post("/db/v1/connections/chatgpt/authorize", httpx.Handler.bind(&mock, Mock.authorize));
+    try server.bind();
+    const origin = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
+    defer a.free(origin);
+    var group: std.Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{&server});
+    defer {
+        server.stop();
+        group.cancel(io);
+    }
+    var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer http.deinit();
+    var client = try AntflyClient.init(a, &http, origin);
+    defer client.deinit();
+    try client.setBasicAuth("user", "pass");
+    const deadline = std.Io.Clock.awake.now(io).nanoseconds + 2 * std.time.ns_per_s;
+    const id = try waitForConnection(a, io, &client, "attempt-1", deadline, 50);
+    defer a.free(id);
+    try std.testing.expectEqualStrings("one", id);
+    try std.testing.expect(mock.polls.load(.acquire) >= 2);
+    mock.mode.store(.delayed, .release);
+    const short_deadline = std.Io.Clock.awake.now(io).nanoseconds + 50 * std.time.ns_per_ms;
+    try std.testing.expectError(error.ConnectionLoginTimedOut, waitForConnection(a, io, &client, "attempt-1", short_deadline, 1_000));
+    mock.mode.store(.declined, .release);
+    const declined_deadline = std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s;
+    const before = mock.polls.load(.acquire);
+    try std.testing.expectError(error.ConnectionLoginDeclined, waitForConnection(a, io, &client, "attempt-1", declined_deadline, 500));
+    try std.testing.expectEqual(before + 1, mock.polls.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), mock.authorizations.load(.acquire));
 }
 
 test "connections reject remote servers and ambiguous authorization URLs" {

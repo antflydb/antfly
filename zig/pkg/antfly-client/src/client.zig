@@ -20,6 +20,9 @@ const retrieval_agent_timeout_ms = 300_000;
 /// Research runs and job advances are bounded by the request's declared
 /// budget (at most 30 minutes); allow that plus transport slack.
 const research_agent_timeout_ms = 1_860_000;
+// OAuth exchange/validation and refresh followed by model discovery can each
+// take up to 45 seconds on the server. Leave transport and persistence slack.
+const personal_connection_timeout_ms = 60_000;
 
 pub const ApiError = struct {
     status_code: u16,
@@ -78,9 +81,15 @@ pub const AntflyClient = struct {
     }
 
     pub fn getChatGPTAttempt(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(openapi.types.ChatGPTOutcome) {
+        return self.getChatGPTAttemptWithTimeout(id, personal_connection_timeout_ms);
+    }
+
+    /// Polling may wait behind OAuth exchange. The CLI lends its remaining
+    /// overall login budget to each request; no automatic replay occurs here.
+    pub fn getChatGPTAttemptWithTimeout(self: *AntflyClient, id: []const u8, timeout_ms: u64) !openapi.ApiResponse(openapi.types.ChatGPTOutcome) {
         const path = try self.connectionPath("/db/v1/connections/chatgpt/attempts/", id, "");
         defer self.allocator.free(path);
-        return self.connectionRequest(openapi.types.ChatGPTOutcome, path, null);
+        return self.connectionRequestWithTimeout(openapi.types.ChatGPTOutcome, path, null, timeout_ms);
     }
 
     pub fn listChatGPTModels(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
@@ -102,6 +111,10 @@ pub const AntflyClient = struct {
     }
 
     fn connectionRequest(self: *AntflyClient, comptime T: type, path: []const u8, body: ?[]const u8) !openapi.ApiResponse(T) {
+        return self.connectionRequestWithTimeout(T, path, body, personal_connection_timeout_ms);
+    }
+
+    fn connectionRequestWithTimeout(self: *AntflyClient, comptime T: type, path: []const u8, body: ?[]const u8, timeout_ms: u64) !openapi.ApiResponse(T) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
         defer self.allocator.free(url);
         const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header| @as(*const [1][2][]const u8, header) else null;
@@ -109,7 +122,7 @@ pub const AntflyClient = struct {
             .json = body,
             .headers = headers,
             .max_response_size = 1 << 20,
-            .timeout_ms = 15_000,
+            .timeout_ms = @max(timeout_ms, 1),
             .max_retries = 0,
             .follow_redirects = false,
             .cookies_enabled = false,

@@ -629,21 +629,21 @@ export class AntflyClient {
   readonly chatgpt = {
     accounts: (signal?: AbortSignal) =>
       this.personalRequest<{ accounts: ChatGPTAccount[] }>(
-        "/connections/chatgpt/accounts",
+        "/db/v1/connections/chatgpt/accounts",
         "GET",
         undefined,
         signal
       ),
     authorize: (connectionId?: string, signal?: AbortSignal) =>
       this.personalRequest<ChatGPTBegin>(
-        "/connections/chatgpt/authorize",
+        "/db/v1/connections/chatgpt/authorize",
         "POST",
         connectionId ? { connection_id: connectionId } : {},
         signal
       ),
     attempt: (attemptId: string, signal?: AbortSignal) =>
       this.personalRequest<ChatGPTOutcome>(
-        `/connections/chatgpt/attempts/${encodeURIComponent(attemptId)}`,
+        `/db/v1/connections/chatgpt/attempts/${encodeURIComponent(attemptId)}`,
         "GET",
         undefined,
         signal
@@ -652,14 +652,14 @@ export class AntflyClient {
       this.personalRequest<{
         models: { slug: string; display_name: string; visibility: string }[];
       }>(
-        `/connections/${encodeURIComponent(connectionId)}/chatgpt/models`,
+        `/db/v1/connections/${encodeURIComponent(connectionId)}/chatgpt/models`,
         "GET",
         undefined,
         signal
       ),
     disconnect: (connectionId: string, signal?: AbortSignal) =>
       this.personalRequest<{ revocation_confirmed: boolean }>(
-        `/connections/${encodeURIComponent(connectionId)}/chatgpt/disconnect`,
+        `/db/v1/connections/${encodeURIComponent(connectionId)}/chatgpt/disconnect`,
         "POST",
         {},
         signal

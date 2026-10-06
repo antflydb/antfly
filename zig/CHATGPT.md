@@ -389,6 +389,8 @@ Antfarm Connections owns authorization and disconnect controls; Chat and RAG
 selectors show eligible accounts and catalog model slugs. Browser state contains
 safe summaries, models and opaque references. Switching the application user or
 API endpoint aborts previous operations and clears account/catalog state.
+The TypeScript helpers use `/db/v1` routes after normalizing the configured API
+URL to its server root, including Antfarm's default relative `/db/v1` URL.
 Catalog versions are tracked per account. Disconnect invalidates only that
 account’s pending catalog results; discarded requests cannot block a newer fetch.
 Reauthorization reloads the connected account’s catalog. Other generation pickers do not
@@ -406,19 +408,25 @@ No personal subscription or credentials are used in automated verification.
 Validated in the implementation worktree: `zig build antfly-generating-test
 lib-generating-test antfly -j2` (217 runtime and 13 library tests), Zig OpenAPI
 consistency check, retrieval regression suite, TypeScript SDK build/type checks
-and 399 tests, Antfarm build
-and 164 unit tests, Go SDK tests, Python generation consistency and 257 tests.
+and 402 active tests, Antfarm build
+and 165 unit tests, Go SDK tests, Python generation consistency and 257 tests.
 A local standalone HTTP smoke test verified safe summaries, origin rejection,
 authorization startup, PKCE parameters and a declined loopback callback. The
 repository-wide license check reports pre-existing missing/stale headers; the
 new ChatGPT Zig modules use the repository ELv2 header.
 
 Local CLI validation: `zig build antfly-cmd-test antfly-client-test antfly -j2`
-passed (91 command tests and 6 client tests, no leaks). A mock-runtime binary
+passed (92 command tests and 7 client tests, no leaks). A mock-runtime binary
 smoke test verified pending/connected/declined login, list/models/logout, Basic
 auth, no authorization replay or redirect, safe failure output and unsupported
 provider/path rejection. The CLI help and shell completion registry include the
 new commands. VM import/export was intentionally deferred.
+Native connection requests allow 60 seconds for OAuth validation, refresh and
+model discovery. CLI login clamps each status read and polling delay to the
+remaining `--timeout` budget. Timed-out status GETs can be retried within that
+budget; authorization POSTs are never replayed. Regressions cover a 16-second
+status response, short caller deadlines, recovery after a timed-out poll,
+declined consent, and absence of authorization replay.
 
 Review regressions cover delayed callbacks after logout, stale authorization
 pins, owner isolation, explicit reconnect, unrelated account catalog fetches,

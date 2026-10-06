@@ -253,6 +253,44 @@ test "list indexes response timeout bounds readiness preflight" {
     try std.testing.expect(!succeeded.load(.acquire));
 }
 
+test "personal connections polling accommodates slow status and explicit deadlines" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        var test_io: std.Io = undefined;
+        var delay_ms: i64 = 0;
+        fn request(_: httpx.testing_mod.RequestInfo) !void {
+            try test_io.sleep(.fromMilliseconds(delay_ms), .awake);
+        }
+    };
+    Assert.test_io = io;
+    for ([_]i64{ 16_000, 200 }) |delay| {
+        Assert.delay_ms = delay;
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .GET,
+            .path = "/db/v1/connections/chatgpt/attempts/attempt-1",
+            .respond = .{ .body = "{\"status\":\"connected\",\"connection_id\":\"one\"}" },
+            .assert_request = Assert.request,
+        }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer http.deinit();
+        var client = try AntflyClient.init(a, &http, server.baseUrl());
+        defer client.deinit();
+        if (delay == 16_000) {
+            var response = try client.getChatGPTAttempt("attempt-1");
+            defer response.deinit();
+            try std.testing.expectEqualStrings("connected", response.data.?.value.status);
+            try serving.await(io);
+        } else {
+            try std.testing.expectError(error.Timeout, client.getChatGPTAttemptWithTimeout("attempt-1", 50));
+        }
+        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+    }
+}
+
 test "personal connections preserve owner auth and forbid replay" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
