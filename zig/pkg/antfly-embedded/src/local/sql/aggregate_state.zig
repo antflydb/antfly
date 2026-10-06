@@ -244,6 +244,20 @@ pub const Column = struct {
             else => for (ids, values) |id, value| try self.update(a, id, value),
         }
     }
+    /// Consume a borrowed physical vector without expanding dictionary IDs.
+    /// Iterate source lanes in order so floating and dynamic reductions retain
+    /// exactly the same update order as the scalar path.
+    pub fn updateEncoded(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch) !void {
+        if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
+        switch (batch) {
+            .vectors => |vectors| return self.updateBatch(a, ids, vectors.values[0]),
+            .dictionary => |dictionary| for (ids, dictionary.indices) |id, index| {
+                if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
+                try self.update(a, id, dictionary.values[index]);
+            },
+            else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(a, index, 0)),
+        }
+    }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
         if (self.values == .dynamic) return @import("aggregate_partial.zig").merge(&self.values.dynamic.items[index], state);
@@ -257,7 +271,8 @@ pub const Column = struct {
             if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
             try self.update(a, index, state.selected.?.row.values[0]);
             switch (self.values) {
-                .counts, .dynamic => unreachable,
+                .counts => unreachable,
+                .dynamic => |*values| values.items[index].count = total,
                 inline else => |*values| values.items[index].count = total,
             }
             return;

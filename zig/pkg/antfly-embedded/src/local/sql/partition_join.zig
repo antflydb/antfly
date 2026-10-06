@@ -448,27 +448,33 @@ pub const Join = struct {
                 var offset: u64 = 0;
                 var skew_fallback = false;
                 while (offset < file.size) {
-                    const block = try file.readBatchBorrowed(offset, 256);
-                    var values: [256][]const Datum = undefined;
+                    const block = try file.readOwnedBlock(offset);
+                    defer block.release();
+                    _ = self.scratch.reset(.retain_capacity);
+                    const a = self.scratch.allocator();
+                    const values = try block.batch(a, false);
                     var keys: [256][]const Datum = undefined;
-                    for (block.rows, 0..) |row, index| {
-                        const h = (try operators.HashJoin.keyHash(row.keys)) orelse 0;
+                    const key_cells = try a.alloc(Datum, block.count() * block.keyWidth());
+                    for (keys[0..block.count()], 0..) |*key, index| {
+                        const row = key_cells[index * block.keyWidth() ..][0..block.keyWidth()];
+                        for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
+                        key.* = row;
+                        const h = (try operators.HashJoin.keyHash(key.*)) orelse 0;
                         hash_union |= h;
                         hash_intersection &= h;
-                        values[index] = row.values;
-                        keys[index] = row.keys;
                     }
                     if (skew_fallback) {
-                        for (block.rows) |row| try self.hash.?.add(row.values, row.keys);
-                        offset = block.following;
+                        try self.hash.?.addBatch(self.a, values, keys[0..block.count()]);
+                        offset += block.count();
                         continue;
                     }
-                    const consumed = try self.hash.?.addBatchUntilFull(self.a, .{ .rows = values[0..block.rows.len] }, keys[0..block.rows.len]);
+                    const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
+                    const following = offset + block.count();
                     offset += consumed;
-                    if (consumed == block.rows.len) continue;
+                    if (consumed == block.count()) continue;
                     // Inspect remaining hashes without copying payloads. A useful
                     // partition split wins over building a temporary disk chain.
-                    var remaining = offset;
+                    var remaining = following;
                     while (remaining < file.size) {
                         const scanned = try file.readBatchBorrowed(remaining, 256);
                         for (scanned.rows) |row| {

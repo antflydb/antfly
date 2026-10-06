@@ -265,8 +265,16 @@ pub const Grouped = struct {
             var offset: u64 = 0;
             while (offset < file.size) {
                 try self.sort.manager.check();
-                const block = try file.readBatchBorrowed(offset, 256);
-                for (block.rows) |row| {
+                const block = try file.readOwnedBlock(offset);
+                defer block.release();
+                var values_storage: [1024]Datum = undefined;
+                var keys_storage: [256]Datum = undefined;
+                const values = values_storage[0..block.width()];
+                const keys = keys_storage[0..block.keyWidth()];
+                for (0..block.count()) |lane| {
+                    for (values, 0..) |*value, column| value.* = try block.cell(lane, column);
+                    for (keys, 0..) |*key, column| key.* = try block.keyCell(lane, column);
+                    const row: operators.Row = .{ .values = values, .keys = keys, .ordinal = block.ordinal(lane) };
                     if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
                     const partial_state = row.values[0].value.bool;
                     if (self.fallback == null and ((!partial_state and !self.nativeInputs(row.values[1..])) or !try self.local.?.canRetain(row.keys, if (partial_state) &.{} else row.values[1..]))) {
@@ -289,7 +297,7 @@ pub const Grouped = struct {
                         try self.local.?.addOrdered(row.keys, row.values[1..], row.ordinal);
                     }
                 }
-                offset = block.following;
+                offset += block.count();
             }
             file.close();
             self.partitions[index] = null;

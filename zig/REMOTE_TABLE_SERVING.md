@@ -59,9 +59,12 @@ not reference dictionary entries. Cached decoded pages retain the dictionary
 lease; uncached pages borrow their cursor's dictionary. SQL kernels, Iceberg equality deletes,
 public row reads, and sidecar builders accept these representations. Predicate
 and dynamic-filter evaluation reuse dictionary results within each physical page.
-Supported single-input SQL expressions evaluate only referenced dictionary entries
-and retain an encoded intermediate. Projections over the same input share the
-selected-entry gather and typed expression graph. Direct projections, selected
+Supported SQL expressions evaluate only referenced dictionary entries or repeated
+tuples of dictionary inputs and retain an encoded intermediate. Projections over
+the same inputs share the selected-tuple gather and typed expression graph. Tuple
+identity compares physical IDs exactly, including the NULL lane, and abandons
+memoization when the selected tuple cardinality exceeds half the batch. Unselected
+dictionary entries are never evaluated. Direct projections, selected
 scans, mapped batches, and retained stores export compact referenced dictionaries;
 column stores remap each referenced entry once instead of hashing every row.
 Dictionary import validates IDs before mutation, preserves prior NULL rows, and
@@ -74,9 +77,12 @@ bit patterns and SQL NULL separately. Downstream expressions reuse these retaine
 dictionaries through selection and slicing. Unique numeric columns stay flat.
 Logical timestamp conversion currently retains its expanded numeric path.
 
-Spilled joins admit borrowed blocks into typed hash state and reuse bounded
-candidate workspace. Group partitions consume borrowed blocks and import exact
-partial states without allocating a temporary input array per group. Partial
+Spilled joins admit compact owned blocks into typed hash state and reuse bounded
+candidate workspace. Group partitions consume compact blocks using reusable row
+scratch and import exact partial states without expanding a whole block into a
+`Datum` matrix. Unfiltered grouped expression cohorts retain encoded columns through
+group hashing and aggregate updates. Dictionary keys memoize semantic hashes;
+aggregate inputs preserve source lane order, including floating reductions. Partial
 admission, replay, skew fallback, and legacy wide records share the sequential
 reader's lifetime and retry contract. Serial partition builds receive their full
 assigned workspace; sibling reservations apply only when parallel builds actually
@@ -95,7 +101,12 @@ integers retain exact decimal-string wire values. Blocking delivery leases decod
 sequential spill blocks and final sort-merge blocks. Primitive columns decode into
 validated owned buffers, packed NULL flags, and compact position/text directories;
 `Datum` cells are reconstructed at access boundaries. Heterogeneous JSON and
-pattern columns keep the fallback decoder. Sorted delivery requests compact
+pattern columns keep the fallback decoder. Compact blocks preserve repeated
+primitive/text columns with a private dictionary encoding
+when its serialized size is smaller than the flat encoding. IDs are validated at
+decode; exact integers, float bits, SQL NULL and JSON null remain distinct. Sort
+merging reuses a scratch arena per lane for keys instead of allocating each head
+into its payload lease. Sorted delivery requests compact
 heads at final-merge initialization; switching from earlier scalar delivery
 transfers already decoded heads safely. Pages gather row descriptors
 and retain each distinct block once, without cloning payloads into another column

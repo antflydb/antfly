@@ -103,6 +103,36 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *opera
     }
     var accepted = page;
     accepted.selection = selection.items;
+    // Unfiltered grouped cohorts preserve physical expression vectors all the
+    // way into typed state. Filtered cohorts below retain lazy evaluation.
+    if (bound.group_count != 0 and for (bound.filters) |filter| {
+        if (filter != null) break false;
+    } else true) {
+        const Batch = @import("execution_batch.zig").Batch;
+        var cohort: std.ArrayList(*const scalar.Program) = .empty;
+        for (bound.input.projections[0..bound.group_count]) |*optional| try cohort.append(a, &optional.*.?);
+        for (bound.inputs) |input| if (input) |slot| {
+            try cohort.append(a, &bound.input.projections[slot].?);
+        };
+        const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, cohort.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+        const key_batches = try a.alloc(Batch, bound.group_count);
+        const input_batches = try a.alloc(Batch, bound.inputs.len);
+        for (key_batches, cohort.items[0..key_batches.len], outputs[0..key_batches.len]) |*batch, program, output| {
+            batch.* = output orelse .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, accepted, program)}), .count = accepted.selection.len } };
+        }
+        var position = key_batches.len;
+        for (bound.inputs, input_batches) |input, *batch| {
+            if (input != null) {
+                batch.* = outputs[position] orelse .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, accepted, cohort.items[position])}), .count = accepted.selection.len } };
+                position += 1;
+            } else {
+                const indices = try a.alloc(u32, accepted.selection.len);
+                @memset(indices, 0);
+                batch.* = .{ .dictionary = .{ .values = &.{Datum.json(.{ .integer = 1 })}, .indices = indices } };
+            }
+        }
+        return grouped.addEncodedColumns(key_batches, input_batches, accepted.selection.len);
+    }
     const keys = try a.alloc([]const Datum, bound.group_count);
     const inputs = try a.alloc([]Datum, bound.inputs.len);
     for (inputs) |*input| {

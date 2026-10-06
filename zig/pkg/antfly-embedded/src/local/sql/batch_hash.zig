@@ -6,6 +6,38 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
+pub fn encodedColumns(a: A, values: []const @import("execution_batch.zig").Batch, count: usize, grouped: bool) ![]?u64 {
+    const states = try a.alloc(std.hash.Wyhash, count);
+    defer a.free(states);
+    for (states) |*state| state.* = .init(0);
+    const result = try a.alloc(?u64, count);
+    errdefer a.free(result);
+    @memset(result, 0);
+    for (values) |column| {
+        if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
+        var memo: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer memo.deinit(a);
+        for (states, result, 0..) |*state, *valid, index| {
+            const cell = try column.cell(a, index, 0);
+            if (!grouped and cell.sql_null) valid.* = null;
+            if (valid.* == null) continue;
+            const semantic = if (cell.sql_null) 0 else if (try column.dictionaryIdentity(index, 0)) |id| blk: {
+                if (memo.get(id)) |hash| break :blk hash;
+                const hash = try scalar.semanticHash(cell.value);
+                if (memo.count() < 4096) try memo.put(a, id, hash);
+                break :blk hash;
+            } else try scalar.semanticHash(cell.value);
+            var bytes: [9]u8 = undefined;
+            bytes[0] = @intFromBool(cell.sql_null);
+            std.mem.writeInt(u64, bytes[1..9], semantic, .little);
+            state.update(if (grouped) &bytes else bytes[1..9]);
+        }
+    }
+    for (states, result) |*state, *out| if (out.* != null) {
+        out.* = state.final();
+    };
+    return result;
+}
 pub fn columns(a: A, values: []const []const scalar.Datum, count: usize, grouped: bool) ![]?u64 {
     const hashes = try a.alloc(std.hash.Wyhash, count);
     defer a.free(hashes);

@@ -12,7 +12,7 @@ pub const Batch = union(enum) {
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -57,6 +57,7 @@ pub const Batch = union(enum) {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .dictionary => |v| if (v.indices[index] < v.values.len) @as(u64, v.indices[index]) else error.InvalidSqlBackendResponse,
+            .reader => |v| if (v.read_identity) |read| read(v.ptr, index, column) else null,
             .retained => |v| v.store.dictionaryId(v.begin + index, column),
             .mapped => |v| if (v.ordinals[column] == std.math.maxInt(usize)) null else v.source.dictionaryIdentity(v.selection[index], v.ordinals[column]),
             .columns => |v| blk: {

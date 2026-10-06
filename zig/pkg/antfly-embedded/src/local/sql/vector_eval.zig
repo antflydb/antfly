@@ -25,12 +25,11 @@ pub fn evaluate(a: std.mem.Allocator, program: *const scalar.Program, rows: []co
 pub fn evaluateColumns(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) anyerror!?[]const Datum {
     return evaluateInput(a, program, ColumnInput{ .page = page, .columns = columns, .count = page.selection.len }, parameters);
 }
-/// Evaluate only referenced dictionary entries. Programs with multiple inputs,
-/// lazy evaluation or external effects keep the existing fused scalar/vector path.
+/// Evaluate only referenced dictionary entries. Programs with lazy evaluation or external effects keep the existing fused scalar/vector path.
 /// Unreferenced entries must never raise errors or consume expression work.
 pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) !?@import("execution_batch.zig").Batch {
-    if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len != 1 or page.selection.len < 4) return null;
-    var selection = (try dictionarySelection(a, program.required_columns[0], page, columns)) orelse return null;
+    if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len == 0 or page.selection.len < 4) return null;
+    var selection = (try dictionarySelection(a, program.required_columns, page, columns)) orelse return null;
     defer selection.deinit(a);
     var compact = page;
     compact.selection = selection.representatives.items;
@@ -47,7 +46,46 @@ const DictionarySelection = struct {
         self.representatives.deinit(a);
     }
 };
-fn dictionarySelection(a: std.mem.Allocator, ordinal: u32, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !?DictionarySelection {
+fn dictionarySelection(a: std.mem.Allocator, ordinals: []const u32, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !?DictionarySelection {
+    if (ordinals.len == 1) return dictionarySelectionSingle(a, ordinals[0], page, columns);
+    if (ordinals.len == 0 or page.selection.len < 4) return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owned = arena.allocator();
+    const definitions = try owned.alloc(scalar.Column, ordinals.len);
+    for (ordinals, definitions) |ordinal, *definition| {
+        if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
+        definition.* = columns[ordinal];
+    }
+    const source: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = page, .definitions = definitions } };
+    // Full tuples are compared after hashing. Page-local IDs are identities,
+    // never semantic values, and NULL has its own identity in each column.
+    const tuple = try owned.alloc(u64, ordinals.len);
+    var ids: std.StringHashMapUnmanaged(u32) = .empty;
+    defer ids.deinit(a);
+    var representatives: std.ArrayList(usize) = .empty;
+    var transferred = false;
+    defer if (!transferred) representatives.deinit(a);
+    const indices = try a.alloc(u32, page.selection.len);
+    defer if (!transferred) a.free(indices);
+    for (page.selection, indices, 0..) |physical, *index, row| {
+        for (tuple, 0..) |*id, column| id.* = (try source.dictionaryIdentity(row, column)) orelse return null;
+        const bytes = std.mem.sliceAsBytes(tuple);
+        if (ids.get(bytes)) |id| {
+            index.* = id;
+        } else {
+            if (representatives.items.len >= page.selection.len / 2) return null;
+            const key = try owned.dupe(u8, bytes);
+            const id: u32 = @intCast(representatives.items.len);
+            try ids.put(a, key, id);
+            try representatives.append(a, physical);
+            index.* = id;
+        }
+    }
+    transferred = true;
+    return .{ .indices = indices, .representatives = representatives };
+}
+fn dictionarySelectionSingle(a: std.mem.Allocator, ordinal: u32, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !?DictionarySelection {
     if (page.selection.len < 4) return null;
     if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
     const source = if (page.native == null) page.batch.findColumn(columns[ordinal].name) else null;
@@ -110,14 +148,14 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
     defer group_positions.deinit(a);
     for (programs, 0..) |program, index| {
         if (visited[index]) continue;
-        if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len != 1) continue;
-        const ordinal = program.required_columns[0];
-        var selection = (try dictionarySelection(a, ordinal, page, columns)) orelse continue;
+        if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len == 0) continue;
+        const ordinals = program.required_columns;
+        var selection = (try dictionarySelection(a, ordinals, page, columns)) orelse continue;
         defer selection.deinit(a);
         group.clearRetainingCapacity();
         group_positions.clearRetainingCapacity();
         for (programs[index..], index..) |candidate, position| {
-            if (!visited[position] and @import("typed_kernel.zig").supported(candidate) and candidate.required_columns.len == 1 and candidate.required_columns[0] == ordinal) {
+            if (!visited[position] and @import("typed_kernel.zig").supported(candidate) and std.mem.eql(u32, candidate.required_columns, ordinals)) {
                 try group.append(a, candidate);
                 try group_positions.append(a, position);
                 visited[position] = true;
@@ -126,7 +164,7 @@ pub fn evaluateColumnsEncodedMany(a: std.mem.Allocator, programs: []const *const
         var compact = page;
         compact.selection = selection.representatives.items;
         // Gather the dictionary IDs once, then share typed expression nodes
-        // across every projection over this input's referenced entries.
+        // across projections over the same referenced input tuples.
         const vectors = try evaluateColumnsMany(a, group.items, compact, columns, parameters);
         defer {
             for (vectors) |values| if (values) |vector| a.free(vector);
@@ -921,4 +959,43 @@ fn fusedDictionaryScenario(a: std.mem.Allocator) !void {
 test "SQL fused dictionary projections share referenced inputs and release all allocation failures" {
     try fusedDictionaryScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, fusedDictionaryScenario, .{});
+}
+
+fn dictionaryTupleScenario(a: std.mem.Allocator) !void {
+    const definitions = [_]scalar.Column{ .{ .name = "n", .type = .integer }, .{ .name = "m", .type = .integer } };
+    const refs: [12]@import("../storage/rowsource/types.zig").RowRef = @splat(.{ .relational_key = "row" });
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &refs,
+        .columns = &.{
+            .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{ 3, 4, 0 }, .indices = &.{ 0, 1, 99, 0, 1, 99, 0, 1, 99, 0, 1, 99 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1 } } },
+            .{ .name = "m", .values = .{ .dictionary_i64 = .{ .values = &.{ 1, 2, 0 }, .indices = &.{ 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0 } } } },
+        },
+    }, .selection = &.{ 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 } };
+    var first = try @import("compiler.zig").compileScalar(a, "12 / (n + m)", .{});
+    defer first.deinit();
+    var second = try @import("compiler.zig").compileScalar(a, "12 / (n + m) + 1", .{});
+    defer second.deinit();
+    var p = try scalar.bind(a, first.expression, &definitions, &.{}, .{});
+    defer p.deinit();
+    var q = try scalar.bind(a, second.expression, &definitions, &.{}, .{});
+    defer q.deinit();
+    const outputs = try evaluateColumnsEncodedMany(a, &.{ &p, &q }, page, &definitions, &.{}, null);
+    defer freeEncodedMany(a, outputs);
+    for (outputs, [_]*const scalar.Program{ &p, &q }) |optional, program| {
+        const encoded = optional.?;
+        try std.testing.expect(encoded == .dictionary);
+        try std.testing.expectEqual(@as(usize, 3), encoded.dictionary.values.len);
+        for (0..page.selection.len) |row| {
+            var cells: [2]Datum = undefined;
+            for (definitions, &cells) |definition, *value| {
+                const cell = try page.cell(a, row, definition.name);
+                value.* = .{ .value = cell.value, .sql_null = cell.sql_null };
+            }
+            try std.testing.expectEqualDeep(try program.evaluate(a, &cells, &.{}, .{}), try encoded.cell(a, row, 0));
+        }
+    }
+}
+test "SQL multi-input dictionary kernels share tuples and preserve NULL and selected errors" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dictionaryTupleScenario, .{});
 }

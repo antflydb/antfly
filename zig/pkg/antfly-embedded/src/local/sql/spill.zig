@@ -618,6 +618,44 @@ pub const Sequential = struct {
             else => 255,
         };
     }
+    fn physicalEqual(a: Datum, b: Datum) bool {
+        if (std.meta.activeTag(a.value) != std.meta.activeTag(b.value)) return false;
+        return switch (a.value) {
+            .bool => |v| v == b.value.bool,
+            .integer => |v| v == b.value.integer,
+            .float => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(b.value.float)),
+            .string => |v| std.mem.eql(u8, v, b.value.string),
+            .number_string => |v| std.mem.eql(u8, v, b.value.number_string),
+            else => false,
+        };
+    }
+    fn physicalHash(value: Datum) u64 {
+        return switch (value.value) {
+            .bool => |v| @intFromBool(v),
+            .integer => |v| std.hash.Wyhash.hash(0, std.mem.asBytes(&v)),
+            .float => |v| std.hash.Wyhash.hash(0, std.mem.asBytes(&v)),
+            .string, .number_string => |v| std.hash.Wyhash.hash(0, v),
+            else => unreachable,
+        };
+    }
+    fn encodePhysical(encoder: *Encoder, kind: u8, value: Datum) !void {
+        switch (kind) {
+            1 => try encoder.append(&.{@intFromBool(value.value.bool)}),
+            2 => try encoder.word(@bitCast(value.value.integer)),
+            3 => try encoder.word(@bitCast(value.value.float)),
+            4 => try encoder.text(value.value.number_string),
+            5 => try encoder.text(value.value.string),
+            else => return error.InvalidSqlSpill,
+        }
+    }
+    fn physicalBytes(value: Datum) usize {
+        return switch (value.value) {
+            .bool => 1,
+            .integer, .float => 8,
+            .string, .number_string => |v| 8 +| v.len,
+            else => unreachable,
+        };
+    }
     fn encodeColumns(encoder: *Encoder, rows: []const Row, keys: bool) !void {
         const width = if (keys) rows[0].keys.len else rows[0].values.len;
         for (0..width) |column| {
@@ -629,7 +667,30 @@ pub const Sequential = struct {
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }
             const type_ = kind orelse 0;
-            try encoder.append(&.{type_});
+            var entries: [256]Datum = undefined;
+            var indices: [256]u16 = undefined;
+            var slots: [512]u16 = @splat(std.math.maxInt(u16));
+            var unique: usize = 0;
+            var present: usize = 0;
+            var expanded_bytes: usize = 0;
+            var unique_bytes: usize = 0;
+            if (type_ >= 1 and type_ <= 5) for (rows, 0..) |row, index| {
+                const value = (if (keys) row.keys else row.values)[column];
+                if (value.sql_null or value.value == .null) continue;
+                present += 1;
+                expanded_bytes +|= physicalBytes(value);
+                var slot: usize = @intCast(physicalHash(value) & 511);
+                while (slots[slot] != std.math.maxInt(u16) and !physicalEqual(entries[slots[slot]], value)) slot = (slot + 1) & 511;
+                if (slots[slot] == std.math.maxInt(u16)) {
+                    slots[slot] = @intCast(unique);
+                    entries[unique] = value;
+                    unique += 1;
+                    unique_bytes +|= physicalBytes(value);
+                }
+                indices[index] = slots[slot];
+            };
+            const dictionary = present != 0 and unique_bytes +| (present * 2) +| 9 < expanded_bytes;
+            try encoder.append(&.{if (dictionary) 6 else type_});
             if (type_ == 255) {
                 for (rows) |row| try encoder.cells((if (keys) row.keys else row.values)[column..][0..1]);
                 continue;
@@ -645,17 +706,21 @@ pub const Sequential = struct {
                 }
                 try encoder.append(&.{flags});
             }
-            for (rows) |row| {
+            if (dictionary) {
+                try encoder.append(&.{type_});
+                try encoder.word(unique);
+                for (entries[0..unique]) |value| try encodePhysical(encoder, type_, value);
+                for (rows, 0..) |row, index| {
+                    const value = (if (keys) row.keys else row.values)[column];
+                    if (value.sql_null or value.value == .null) continue;
+                    var bytes: [2]u8 = undefined;
+                    std.mem.writeInt(u16, &bytes, indices[index], .little);
+                    try encoder.append(&bytes);
+                }
+            } else for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
                 if (value.sql_null or value.value == .null) continue;
-                switch (type_) {
-                    1 => try encoder.append(&.{@intFromBool(value.value.bool)}),
-                    2 => try encoder.word(@bitCast(value.value.integer)),
-                    3 => try encoder.word(@bitCast(value.value.float)),
-                    4 => try encoder.text(value.value.number_string),
-                    5 => try encoder.text(value.value.string),
-                    else => return error.InvalidSqlSpill,
-                }
+                try encodePhysical(encoder, type_, value);
             }
         }
     }
@@ -705,40 +770,8 @@ pub const Sequential = struct {
     fn decodeColumns(decoder: *Decoder, rows: []Row, keys: bool) !void {
         const width = if (keys) rows[0].keys.len else rows[0].values.len;
         for (0..width) |column| {
-            const type_ = try decoder.byte();
-            if (type_ == 255) {
-                for (rows) |row| {
-                    const values = try decoder.cells();
-                    if (values.len != 1) return error.InvalidSqlSpill;
-                    @constCast(if (keys) row.keys else row.values)[column] = values[0];
-                }
-                continue;
-            }
-            if (type_ > 5) return error.InvalidSqlSpill;
-            const len = (rows.len + 3) / 4;
-            if (len > decoder.bytes.len - decoder.position) return error.InvalidSqlSpill;
-            const flags = decoder.bytes[decoder.position..][0..len];
-            decoder.position += len;
-            for (rows, 0..) |row, index| {
-                const flag = (flags[index / 4] >> @as(u3, @intCast((index % 4) * 2))) & 3;
-                if (flag == 3) return error.InvalidSqlSpill;
-                const value = &@constCast(if (keys) row.keys else row.values)[column];
-                value.* = .{ .sql_null = flag == 1 };
-                if (flag != 0) continue;
-                value.value = switch (type_) {
-                    0 => .null,
-                    1 => blk: {
-                        const boolean = try decoder.byte();
-                        if (boolean > 1) return error.InvalidSqlSpill;
-                        break :blk .{ .bool = boolean == 1 };
-                    },
-                    2 => .{ .integer = @bitCast(try decoder.word()) },
-                    3 => .{ .float = @bitCast(try decoder.word()) },
-                    4 => .{ .number_string = try decoder.text() },
-                    5 => .{ .string = try decoder.text() },
-                    else => unreachable,
-                };
-            }
+            const decoded = try EncodedColumn.decode(decoder, rows.len);
+            for (rows, 0..) |row, index| @constCast(if (keys) row.keys else row.values)[column] = decoded.cell(index);
         }
     }
     /// Start a new sequential pass; borrowed rows from the old pass expire.
@@ -830,6 +863,7 @@ pub const Sequential = struct {
             fixed: struct { bytes: []const u8, positions: []const u16, kind: u8 },
             texts: struct { values: []const []const u8, decimal: bool },
             dynamic: []const Datum,
+            dictionary: struct { entries: []const Datum, indices: []const u16 },
         },
         fn cell(self: EncodedColumn, index: usize) Datum {
             if (self.values == .dynamic) return self.values.dynamic[index];
@@ -844,6 +878,7 @@ pub const Sequential = struct {
                     else => unreachable,
                 },
                 .texts => |v| if (v.decimal) .{ .number_string = v.values[index] } else .{ .string = v.values[index] },
+                .dictionary => |v| v.entries[v.indices[index]].value,
                 .dynamic => unreachable,
             });
         }
@@ -858,9 +893,36 @@ pub const Sequential = struct {
                 }
                 return .{ .values = .{ .dynamic = values } };
             }
-            if (kind > 5) return error.InvalidSqlSpill;
+            if (kind > 6) return error.InvalidSqlSpill;
             const flags = try decoder.take((count + 3) / 4);
             for (0..count) |row| if (((flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) == 3) return error.InvalidSqlSpill;
+            if (kind == 6) {
+                const base = try decoder.byte();
+                if (base < 1 or base > 5) return error.InvalidSqlSpill;
+                const size = try decoder.count();
+                if (size == 0 or size > count) return error.InvalidSqlSpill;
+                const entries = try decoder.a.alloc(Datum, size);
+                for (entries) |*entry| entry.* = Datum.json(switch (base) {
+                    1 => blk: {
+                        const boolean = try decoder.byte();
+                        if (boolean > 1) return error.InvalidSqlSpill;
+                        break :blk .{ .bool = boolean == 1 };
+                    },
+                    2 => .{ .integer = @bitCast(try decoder.word()) },
+                    3 => .{ .float = @bitCast(try decoder.word()) },
+                    4 => .{ .number_string = try decoder.take(try decoder.count()) },
+                    5 => .{ .string = try decoder.take(try decoder.count()) },
+                    else => unreachable,
+                });
+                const indices = try decoder.a.alloc(u16, count);
+                for (indices, 0..) |*id, row| {
+                    id.* = 0;
+                    if (((flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3) != 0) continue;
+                    id.* = std.mem.readInt(u16, (try decoder.take(2))[0..2], .little);
+                    if (id.* >= size) return error.InvalidSqlSpill;
+                }
+                return .{ .flags = flags, .values = .{ .dictionary = .{ .entries = entries, .indices = indices } } };
+            }
             if (kind == 0) return .{ .flags = flags, .values = .empty };
             if (kind <= 3) {
                 const positions = try decoder.a.alloc(u16, count);
@@ -899,6 +961,58 @@ pub const Sequential = struct {
         pub fn cell(self: *const OwnedBlock, index: usize, column: usize) !Datum {
             if (index >= self.count() or column >= self.width()) return error.InvalidSqlSpill;
             return if (self.encoded) |v| v.values[column].cell(index) else self.rows[index].values[column];
+        }
+        pub fn keyWidth(self: *const OwnedBlock) usize {
+            return if (self.encoded) |v| v.keys.len else self.rows[0].keys.len;
+        }
+        pub fn ordinal(self: *const OwnedBlock, index: usize) u64 {
+            return if (self.encoded) |v| v.ordinals[index] else self.rows[index].ordinal;
+        }
+        pub fn keyCell(self: *const OwnedBlock, index: usize, column: usize) !Datum {
+            if (index >= self.count() or column >= self.keyWidth()) return error.InvalidSqlSpill;
+            return if (self.encoded) |v| v.keys[column].cell(index) else self.rows[index].keys[column];
+        }
+        pub fn batch(self: *OwnedBlock, a: Allocator, keys: bool) !@import("execution_batch.zig").Batch {
+            const View = struct {
+                block: *OwnedBlock,
+                keys: bool,
+                fn cell(raw: *anyopaque, _: Allocator, row_index: usize, column: usize) anyerror!Datum {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    return if (view.keys) view.block.keyCell(row_index, column) else view.block.cell(row_index, column);
+                }
+                fn identity(raw: *anyopaque, row_index: usize, column: usize) anyerror!?u64 {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    const encoded = view.block.encoded orelse return null;
+                    const stored = (if (view.keys) encoded.keys else encoded.values)[column];
+                    if (stored.values != .dictionary) return null;
+                    const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
+                    return if (flag != 0) flag - 1 else @as(u64, stored.values.dictionary.indices[row_index]) + 2;
+                }
+                fn dictionary(raw: *anyopaque, alloc: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+                    const view: *@This() = @ptrCast(@alignCast(raw));
+                    const encoded = view.block.encoded orelse return null;
+                    const stored = (if (view.keys) encoded.keys else encoded.values)[column];
+                    if (stored.values != .dictionary) return null;
+                    const entries = stored.values.dictionary.entries;
+                    const values = try alloc.alloc(Datum, entries.len + 2);
+                    errdefer alloc.free(values);
+                    values[0] = .{};
+                    values[1] = Datum.json(.null);
+                    @memcpy(values[2..], entries);
+                    const indices = try alloc.alloc(u32, view.block.count());
+                    for (indices, 0..) |*id, row_index| id.* = @intCast((try identity(raw, row_index, column)).?);
+                    return .{ .dictionary = .{ .values = values, .indices = indices } };
+                }
+            };
+            const view = try a.create(View);
+            view.* = .{ .block = self, .keys = keys };
+            return .{ .reader = .{ .ptr = view, .read = View.cell, .read_identity = View.identity, .read_dictionary = View.dictionary, .count = self.count(), .width = if (keys) self.keyWidth() else self.width() } };
+        }
+        pub fn keyRowAlloc(self: *OwnedBlock, a: Allocator, index: usize) !Row {
+            if (index >= self.count()) return error.InvalidSqlSpill;
+            const keys = try a.alloc(Datum, self.keyWidth());
+            for (keys, 0..) |*key, column| key.* = try self.keyCell(index, column);
+            return .{ .values = &.{}, .keys = keys, .ordinal = self.ordinal(index) };
         }
         pub fn keyRow(self: *OwnedBlock, index: usize) !Row {
             if (index >= self.count()) return error.InvalidSqlSpill;
@@ -1277,7 +1391,11 @@ pub const Sort = struct {
         // Below 64 KiB there is insufficient workspace to amortize block
         // decoding across merge heads. A 128-byte target selects records.
         if (self.memory_bytes < 64 * 1024) return 128;
-        return @min(32 * 1024, @max(128, self.memory_bytes / 64));
+        // Reserve up to a quarter of each merge head's workspace for block
+        // decoding (fanIn prices eight times this target). Keeping several
+        // wide rows together also lets repeated payloads remain dictionary
+        // encoded rather than producing one-row blocks.
+        return @min(32 * 1024, @max(128, self.memory_bytes / 32));
     }
     fn fanIn(self: *const Sort) usize {
         const block_workspace = if (self.blockBytes() > 128) self.blockBytes() *| 8 else 0;
@@ -1421,7 +1539,7 @@ pub const Sort = struct {
                 const block = try file.*.?.readOwnedBlock(0);
                 self.owned_heads[index] = block;
                 self.owned_positions[index] = 0;
-                var row = try block.keyRow(0);
+                var row = try block.keyRowAlloc(arena.allocator(), 0);
                 row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
                 head.* = .{ .row = row, .next = none, .matched = false, .following = 1 };
             } else head.* = if (file.*.?.size != 0) try self.readRun(&file.*.?, arena.allocator(), 0) else null;
@@ -1478,11 +1596,14 @@ pub const Sort = struct {
                 }
             }
             self.heads[index] = if (self.owned_heads[index]) |block| blk: {
-                var row = try block.keyRow(self.owned_positions[index]);
+                _ = self.head_arenas[index].reset(.retain_capacity);
+                var row = try block.keyRowAlloc(self.head_arenas[index].allocator(), self.owned_positions[index]);
                 row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
                 break :blk .{ .row = row, .next = none, .matched = false, .following = head.following + 1 };
             } else null;
-            return .{ .row = head.row, .block = owner, .index = position };
+            // A delivery lease exposes payload cells and ordinal. Merge keys
+            // belong to the lane's reusable scratch, never to a payload lease.
+            return .{ .row = .{ .values = &.{}, .keys = &.{}, .ordinal = head.row.ordinal }, .block = owner, .index = position };
         }
         if (self.offset < self.rows.items.len) {
             const row = self.rows.items[@intCast(self.offset)];
@@ -1973,4 +2094,75 @@ fn ownedCompactBlockScenario(a: Allocator) !void {
 test "SQL compact owned spill blocks retain exact cells after source close and unwind every allocation" {
     try ownedCompactBlockScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ownedCompactBlockScenario, .{});
+}
+
+fn dictionarySpillScenario(a: Allocator) !void {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 64 * 1024);
+    defer file.close();
+    for (0..128) |row| _ = try file.append(.{
+        .values = &.{
+            if (row % 7 == 0) Datum{} else Datum.json(.{ .integer = 9007199254740993 }),
+            if (row % 11 == 0) Datum.json(.null) else Datum.json(.{ .string = "long repeated string with embedded\x00NUL preserving exact bytes" }),
+            Datum.json(.{ .float = if (row % 2 == 0) -0.0 else 0.0 }),
+        },
+        .keys = &.{Datum.json(.{ .integer = @intCast(row % 3) })},
+        .ordinal = row,
+    }, none);
+    const block = try file.readOwnedBlock(0);
+    defer block.release();
+    try std.testing.expect(block.encoded != null);
+    try std.testing.expect(block.encoded.?.values[0].values == .dictionary);
+    try std.testing.expect(block.encoded.?.values[1].values == .dictionary);
+    try std.testing.expect(block.encoded.?.values[2].values == .dictionary);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const batch = try block.batch(arena.allocator(), false);
+    const encoded = (try batch.dictionaryColumn(arena.allocator(), 0)).?;
+    for (0..block.count()) |row| {
+        const integer = try batch.cell(a, row, 0);
+        try std.testing.expectEqual(row % 7 == 0, integer.sql_null);
+        if (!integer.sql_null) try std.testing.expectEqual(@as(i64, 9007199254740993), integer.value.integer);
+        try std.testing.expectEqualDeep(integer, try encoded.cell(a, row, 0));
+        const number = try block.cell(row, 2);
+        try std.testing.expectEqual(@as(u64, if (row % 2 == 0) 1 << 63 else 0), @as(u64, @bitCast(number.value.float)));
+        try std.testing.expectEqual(@as(u64, row), block.ordinal(row));
+    }
+    file.rewind();
+    const expanded = try file.readBatchBorrowed(0, 256);
+    for (expanded.rows, 0..) |row, index| for (row.values, 0..) |value, column| try std.testing.expectEqualDeep(try block.cell(index, column), value);
+}
+test "SQL dictionary spill preserves exact numeric bits strings and both NULL domains" {
+    try dictionarySpillScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, dictionarySpillScenario, .{});
+}
+
+test "SQL dictionary spill rejects invalid IDs counts tags and truncated payloads" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    // Dictionary integer column, one entry, one present row.
+    const valid = [_]u8{ 6, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (0..4) |mutation| {
+        var bytes = valid;
+        const length: usize = if (mutation == 3) bytes.len - 1 else bytes.len;
+        switch (mutation) {
+            0 => bytes[19] = 1,
+            1 => bytes[3] = 2,
+            2 => bytes[2] = 255,
+            else => {},
+        }
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var decoder: Decoder = .{ .manager = &manager, .a = arena.allocator(), .bytes = bytes[0..length] };
+        try std.testing.expectError(error.InvalidSqlSpill, Sequential.EncodedColumn.decode(&decoder, 1));
+    }
 }

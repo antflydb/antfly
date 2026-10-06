@@ -993,6 +993,47 @@ pub const Grouped = struct {
         for (self.state_columns, inputs) |*column, values| try column.updateBatch(self.budget.allocator(), ids, values);
     }
 
+    /// Keep encoded expression columns intact through group ID resolution.
+    /// Admission precedes mutation; disk, DISTINCT and pattern reducers use
+    /// the same ordered fallback as row input.
+    pub fn addEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize) !void {
+        if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
+        for (keys) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
+        for (inputs) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
+        if (count == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const row_keys = try a.alloc(Datum, keys.len);
+        const row_inputs = try a.alloc(Datum, inputs.len);
+        var needed: usize = 4096 +| count *| (512 +| self.specs.len *| @sizeOf(Aggregate) *| 2);
+        for (keys) |column| for (0..count) |index| {
+            needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
+        };
+        var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
+            fast = false;
+        };
+        if (!fast) {
+            for (0..count) |index| {
+                for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+                for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
+                try self.add(row_keys, row_inputs);
+            }
+            return;
+        }
+        const ids = try a.alloc(usize, count);
+        self.key_count = keys.len;
+        errdefer self.failed = true;
+        const hashes = try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
+        for (ids, 0..) |*id, index| {
+            for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+            id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
+            self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+        }
+        for (self.state_columns, inputs) |*column, values| try column.updateEncoded(self.budget.allocator(), ids, values);
+    }
+
     /// Global COUNT, integer SUM and boolean reductions do not need a hash
     /// probe per row. Validate the batch before changing state; unsupported
     /// kinds, DISTINCT, mixed values and disk groups retain ordered updates.
@@ -1945,4 +1986,50 @@ test "SQL binary partial import composes typed extrema floats distinct and patte
         try std.testing.expectEqualStrings(right, left);
     }
     try std.testing.expect(!actual.aggregates[8].sql_null and actual.aggregates[8].value == .null);
+}
+
+fn mixedExtremaPartialScenario(a: Allocator) !void {
+    for ([_]Aggregate.Kind{ .min, .max }) |kind| {
+        const specs = [_]AggregateSpec{.{ .kind = kind, .input_type = .number }};
+        const source = try Grouped.create(a, &specs, .{});
+        defer source.deinit();
+        const target = try Grouped.create(a, &specs, .{});
+        defer target.deinit();
+        const exact: i64 = if (kind == .min) -9007199254740993 else 9007199254740993;
+        for (0..3) |_| try source.add(&.{}, &.{Datum.json(.{ .integer = exact })});
+        try target.add(&.{}, &.{Datum.json(.{ .float = 2.5 })});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const partial = (try source.nextResultBatch(arena.allocator(), 1, true)).?;
+        try target.importPartial(&.{}, try partial.aggregates.row(arena.allocator(), 0), 0);
+        const state = try target.state_columns[0].snapshot(arena.allocator(), 0);
+        try std.testing.expectEqual(@as(u64, 4), state.count);
+        const result = (try target.nextResultBatch(arena.allocator(), 1, false)).?;
+        try std.testing.expectEqual(exact, (try result.aggregates.cell(a, 0, 0)).value.integer);
+    }
+}
+test "SQL mixed numeric extrema partials promote without narrowing or losing counts" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, mixedExtremaPartialScenario, .{});
+}
+
+fn encodedGroupScenario(a: Allocator) !void {
+    const Batch = @import("execution_batch.zig").Batch;
+    const specs = [_]AggregateSpec{ .{ .kind = .count, .input_type = .integer }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .sum, .input_type = .number } };
+    const encoded = try Grouped.create(a, &specs, .{});
+    defer encoded.deinit();
+    const reference = try Grouped.create(a, &specs, .{});
+    defer reference.deinit();
+    const indices = [_]u32{ 0, 1, 0, 2, 1, 2, 0, 1 };
+    const keys: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .string = "repeated" }), .{}, Datum.json(.null) }, .indices = &indices } };
+    const integers: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.{ .integer = -9007199254740993 }) }, .indices = &indices } };
+    const numbers: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .float = 1e16 }), Datum.json(.{ .float = -1e16 }), Datum.json(.{ .float = 1.5 }) }, .indices = &indices } };
+    try encoded.addEncodedColumns(&.{keys}, &.{ integers, integers, numbers }, indices.len);
+    for (0..indices.len) |index| try reference.add(&.{try keys.cell(a, index, 0)}, &.{ try integers.cell(a, index, 0), try integers.cell(a, index, 0), try numbers.cell(a, index, 0) });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqualDeep(try reference.finish(arena.allocator()), try encoded.finish(arena.allocator()));
+}
+test "SQL encoded grouping preserves exact integers floating lane order and distinct NULL keys" {
+    try encodedGroupScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, encodedGroupScenario, .{});
 }
