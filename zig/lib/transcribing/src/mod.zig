@@ -440,6 +440,9 @@ fn deinitSpeaker(alloc: Allocator, speaker: *Speaker) void {
 }
 
 pub const RemoteOptions = struct {
+    /// Trusted caller-owned recording already resolved under the document source
+    /// policy. Borrowed only for this invocation; never parsed from provider JSON.
+    resolved_audio: ?[]const u8 = null,
     source_table: []const u8 = "",
     timeout_ms: ?u64 = null,
     cancellation: ?httpx.CancellationToken = null,
@@ -488,23 +491,30 @@ const AppleTranscriberState = struct {
             .download_assets = state.cfg.download_assets,
         }, .{});
         defer alloc.free(json_request);
-        const security = remoteFetchSecurity(state.cfg.max_download_bytes);
-        const credentials: ?scraping.S3CredentialsConfig = if (request.s3_credentials) |value| .{
-            .endpoint = if (value.endpoint) |field| @constCast(field) else null,
-            .use_ssl = value.use_ssl,
-            .access_key_id = if (value.access_key_id) |field| @constCast(field) else null,
-            .secret_access_key = if (value.secret_access_key) |field| @constCast(field) else null,
-            .session_token = if (value.session_token) |field| @constCast(field) else null,
-        } else null;
-        var content = scraping.downloadContentAllocWithContext(alloc, .{
-            .io = state.http.io,
-            .timeout_ms = state.options.timeout_ms,
-            .cancellation = if (state.options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
-        }, request.url, &security, if (credentials) |*value| value else null) catch |err| {
-            if (err == error.Canceled) return error.Cancelled;
-            return err;
+        var downloaded: ?scraping.DownloadedContent = null;
+        defer if (downloaded) |*content| content.deinit(alloc);
+        const audio_bytes = if (state.options.resolved_audio) |bytes| blk: {
+            if (bytes.len > effectiveMaxDownloadBytes(state.cfg.max_download_bytes)) return error.AppleNativeInputTooLarge;
+            break :blk bytes;
+        } else blk: {
+            const security = remoteFetchSecurity(state.cfg.max_download_bytes);
+            const credentials: ?scraping.S3CredentialsConfig = if (request.s3_credentials) |value| .{
+                .endpoint = if (value.endpoint) |field| @constCast(field) else null,
+                .use_ssl = value.use_ssl,
+                .access_key_id = if (value.access_key_id) |field| @constCast(field) else null,
+                .secret_access_key = if (value.secret_access_key) |field| @constCast(field) else null,
+                .session_token = if (value.session_token) |field| @constCast(field) else null,
+            } else null;
+            downloaded = scraping.downloadContentAllocWithContext(alloc, .{
+                .io = state.http.io,
+                .timeout_ms = state.options.timeout_ms,
+                .cancellation = if (state.options.cancellation) |token| scraping.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null,
+            }, request.url, &security, if (credentials) |*value| value else null) catch |err| {
+                if (err == error.Canceled) return error.Cancelled;
+                return err;
+            };
+            break :blk downloaded.?.data;
         };
-        defer content.deinit(alloc);
         const remaining_ms = if (state.options.timeout_ms) |ms| blk: {
             if (ms == 0) break :blk ms;
             const deadline = started +| (ms *| std.time.ns_per_ms);
@@ -512,7 +522,7 @@ const AppleTranscriberState = struct {
             if (now >= deadline) return error.Timeout;
             break :blk @max(1, (deadline - now) / std.time.ns_per_ms);
         } else null;
-        const response_json = try apple_native.invoke(alloc, .transcribe, json_request, content.data, state.cfg.max_response_bytes orelse (8 * 1024 * 1024), .{
+        const response_json = try apple_native.invoke(alloc, .transcribe, json_request, audio_bytes, state.cfg.max_response_bytes orelse (8 * 1024 * 1024), .{
             .timeout_ms = remaining_ms,
             .cancellation = state.options.cancellation,
         });
@@ -571,6 +581,12 @@ test "Apple transcription recognizes a recording with phrase and word timestamps
         try std.testing.expect(words.len > 0);
         for (words) |word| try std.testing.expect(word.start_ms.? >= segment.start_ms.? and word.end_ms.? <= segment.end_ms.?);
     }
+    // A permitted private document source is already fetched by extraction.
+    // Borrowed bytes must not cause a second URL fetch under provider defaults.
+    var borrowed = try transcribeWithConfig(alloc, &client, .{ .provider = .apple, .language_code = "en-US" }, .{ .url = "http://127.0.0.1:1/must-not-fetch.wav" }, .{ .resolved_audio = fixture });
+    defer deinitResponse(alloc, &borrowed);
+    try std.testing.expectEqualStrings("The quick brown fox jumps over the lazy dog.", borrowed.text.?);
+    try std.testing.expectError(error.AppleNativeInputTooLarge, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .max_download_bytes = 1 }, .{ .url = "http://127.0.0.1:1/must-not-fetch.wav" }, .{ .resolved_audio = fixture }));
     try std.testing.expectError(error.UnsupportedAppleSpeechLocale, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .language_code = "xx-XX" }, .{ .url = uri }, .{}));
     try std.testing.expectError(error.ResponseTooLarge, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .max_response_bytes = 16 }, .{ .url = uri }, .{}));
     // Keep the recording compact while representing more than an hour of

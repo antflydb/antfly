@@ -9646,7 +9646,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     try scheduler.restoreTextUnits(alloc, &units);
     try std.testing.expectEqual(@as(usize, 0), scheduler.typed_replay_transactions);
     scheduler.current = 1;
-    try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, producer, config, .{ .max_items = 2, .max_bytes = 64 * 1024 * 1024 }, "https://example.test/source.pdf", "content-identity", "pdf", "application/pdf", &units, .ocr, null);
+    try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, producer, config, .{ .max_items = 2, .max_bytes = 64 * 1024 * 1024 }, "https://example.test/source.pdf", &.{}, "content-identity", "pdf", "application/pdf", &units, .ocr, null);
     try std.testing.expect(std.mem.startsWith(u8, units[0].text, "Reader"));
     try std.testing.expect(std.mem.startsWith(u8, units[1].text, "Reader"));
     try std.testing.expectEqual(@as(usize, 1), scheduler.typed_replay_transactions);
@@ -10295,7 +10295,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             const first_page = batch.results[0].rendered.?;
             const second_page = batch.results[1].rendered.?;
             const pixels = @max(@as(u64, first_page.width) * first_page.height, @as(u64, second_page.width) * second_page.height);
-            try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, bounded_producer, config, .{ .max_items = 2, .render_items = 2, .max_bytes = 64 * 1024 * 1024, .max_pixels = pixels }, "source.pdf", "pixel-owner", "pdf", "application/pdf", &pending, .ocr, coordinator);
+            try completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(&runtime, alloc, alloc, bounded_producer, config, .{ .max_items = 2, .render_items = 2, .max_bytes = 64 * 1024 * 1024, .max_pixels = pixels }, "source.pdf", &.{}, "pixel-owner", "pdf", "application/pdf", &pending, .ocr, coordinator);
             try std.testing.expectEqual(@as(usize, 2), owner.calls);
             try std.testing.expect(!owner.rejected_oversize);
             for (pending) |unit| try std.testing.expectEqualStrings("completed", unit.extraction_status.?);
@@ -15433,6 +15433,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithBackingAllocator(
         config,
         batch_policy,
         source_url,
+        source_bytes,
         source_fingerprint,
         route_type,
         source_content_type,
@@ -17290,6 +17291,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
     config: document_extraction_mod.Config,
     batch_policy: GeneratedTextBatchPolicy,
     source_url: []const u8,
+    source_bytes: []const u8,
     source_fingerprint: []const u8,
     route_type: []const u8,
     source_content_type: []const u8,
@@ -17324,6 +17326,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .ocr => document_extraction_mod.effectiveOcrConfigJson(config),
         .transcript => config.transcription_config_json,
     };
+    const borrowed_audio = kind == .transcript and (try isAppleGeneratedTextProvider(working_alloc, config_json));
+    const audio_media = [_]asset_producer_mod.EncodedMedia{.{ .bytes = source_bytes, .mime_type = source_content_type }};
     const method = switch (kind) {
         .ocr => "ocr_text",
         .transcript => "transcript_text",
@@ -17602,7 +17606,8 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             .source_text = if (has_rendered_media) "" else source_url,
             .source_parts_json = parts_json,
             .content_type = runtimeGeneratedTextContentType(kind, producer_type),
-            .inline_media_trusted = has_rendered_media,
+            .inline_media_trusted = has_rendered_media or borrowed_audio,
+            .media = if (borrowed_audio) &audio_media else &.{},
             .source_fingerprint = source_fingerprint,
             .item_id = unit.unit_id,
             .page_number = unit.page_number,
@@ -34789,4 +34794,10 @@ test "graph projection routing writer honors root tags without nested suppressio
         try std.testing.expectEqualStrings(if (custom) "custom_companies" else "companies", (try scratch.table(writes[0].metadata_json, "target_table")).?);
         if (!custom) try std.testing.expect(std.mem.indexOf(u8, writes[0].metadata_json, "1.00000000000000000000001") != null);
     }
+}
+
+fn isAppleGeneratedTextProvider(alloc: Allocator, config_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(struct { provider: []const u8 = "" }, alloc, config_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    return std.mem.eql(u8, parsed.value.provider, "apple");
 }

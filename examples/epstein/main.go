@@ -1866,6 +1866,8 @@ func serveCmd(args []string) error {
 	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "epstein_docs", "Table name to search")
 	listenAddr := fs.String("listen", ":3000", "Listen address for web server")
+	corpusMode := fs.Bool("corpus", false, "Search native corpus artifacts and link to original PDF/audio sources")
+	searchIndexes := fs.String("indexes", "", "Comma-separated search indexes (corpus default: document_text,embeddings)")
 	pdfDir := fs.String("pdf-dir", "./epstein-docs", "Directory containing PDF files (including pages/ subdirectory)")
 
 	if err := fs.Parse(args); err != nil {
@@ -1892,6 +1894,13 @@ func serveCmd(args []string) error {
 		tmpl:      tmpl,
 	}
 
+	if *corpusMode {
+		server.corpus = true
+		server.indexes = []string{corpusTextIndex, DefaultEmbeddingIndex}
+	}
+	if *searchIndexes != "" {
+		server.indexes = strings.Split(*searchIndexes, ",")
+	}
 	// Create a new mux to avoid conflicts with default mux
 	mux := http.NewServeMux()
 
@@ -1917,7 +1926,7 @@ func serveCmd(args []string) error {
 		}))
 		mux.Handle("/pdfs/", pdfHandler)
 		fmt.Printf("PDF files: %s (serving at /pdfs/)\n", pagesDir)
-	} else {
+	} else if !*corpusMode {
 		fmt.Printf("Note: No pages/ directory found at %s\n", pagesDir)
 		fmt.Printf("      Run 'epstein prepare --split-pages' to create individual page PDFs\n")
 	}
@@ -1933,6 +1942,8 @@ func serveCmd(args []string) error {
 
 // SearchServer handles web requests
 type SearchServer struct {
+	corpus    bool
+	indexes   []string
 	client    *antfly.AntflyClient
 	antflyURL string
 	tableName string
@@ -1948,6 +1959,7 @@ type SearchResult struct {
 	FilePath string
 	PageNum  int
 	URL      string
+	Audio    bool
 	Entities []EntityChip
 }
 
@@ -2001,12 +2013,7 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// Perform search
-	resp, err := s.client.Query(ctx, antfly.QueryRequest{
-		Table:          s.tableName,
-		SemanticSearch: query,
-		Indexes:        searchIndexNames(),
-		Limit:          20,
-	})
+	resp, err := s.client.Query(ctx, s.searchRequest(query))
 
 	data := SearchPageData{
 		Query: query,
@@ -2046,6 +2053,9 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			if s.corpus {
+				applyCorpusHit(&result, hit)
+			}
 			data.Results = append(data.Results, result)
 		}
 	}
@@ -2062,12 +2072,7 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	resp, err := s.client.Query(ctx, antfly.QueryRequest{
-		Table:          s.tableName,
-		SemanticSearch: query,
-		Indexes:        searchIndexNames(),
-		Limit:          20,
-	})
+	resp, err := s.client.Query(ctx, s.searchRequest(query))
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -4593,6 +4598,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Epstein court documents and DOJ files using Antfly.\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  epstein download [flags]  - Download documents from archive.org\n")
+		fmt.Fprintf(os.Stderr, "  epstein corpus [command]  - Stream PDF/audio sources with native Apple OCR/transcription\n")
 		fmt.Fprintf(os.Stderr, "  epstein prepare [flags]   - Process PDFs and create JSON data\n")
 		fmt.Fprintf(os.Stderr, "  epstein load [flags]      - Load JSON data into Antfly\n")
 		fmt.Fprintf(os.Stderr, "  epstein sync [flags]      - Full pipeline (process + load)\n")
@@ -4632,6 +4638,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "corpus":
+		err = corpusCmd(os.Args[2:])
 	case "download":
 		err = downloadCmd(os.Args[2:])
 	case "prepare":
@@ -4650,7 +4658,7 @@ func main() {
 		err = entitiesCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintf(os.Stderr, "Valid commands: download, prepare, load, sync, serve, audit, enrich, entities\n")
+		fmt.Fprintf(os.Stderr, "Valid commands: corpus, download, prepare, load, sync, serve, audit, enrich, entities\n")
 		os.Exit(1)
 	}
 

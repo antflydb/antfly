@@ -3139,6 +3139,10 @@ pub const Runtime = struct {
         cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
+        if (request.media.len > 0) {
+            if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
+            if (cfg_parsed.value.provider != .apple or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
+        }
         const antfly_model = if (cfg_parsed.value.provider == .antfly)
             try requiredAntflyTranscriberModel(cfg_parsed.value)
         else
@@ -3226,6 +3230,7 @@ pub const Runtime = struct {
                 .diarization = cfg_parsed.value.diarization orelse false,
             },
             .{
+                .resolved_audio = if (request.media.len == 1) request.media[0].bytes else null,
                 .source_table = self.execution.routing.source_table,
                 .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
                 .cancellation = httpx.CancellationToken.fromCallback(
