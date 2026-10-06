@@ -34,54 +34,50 @@ const platforms = [
   ["linux", "arm64", "libantfly.so"],
   ["darwin", "arm64", "libantfly.dylib"],
 ] as const;
-let installation: string;
+const installationNames = ["plain", "with spaces", "with#fragment", "with?query"] as const;
+let root: string;
 let consumer: string;
 
 beforeAll(() => {
-  installation = realpathSync(mkdtempSync(join(tmpdir(), "antfly-embedded-package-")));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "antfly-embedded-package-")));
   consumer = realpathSync(mkdtempSync(join(tmpdir(), "antfly-embedded-consumer-")));
   execFileSync("pnpm", ["run", "build"], { cwd: packageDir });
-  execFileSync(
-    "npm",
-    ["pack", "--ignore-scripts", "--json", "--pack-destination", installation, "."],
-    { cwd: packageDir }
-  );
-  const archives = readdirSync(installation).filter((name) => name.endsWith(".tgz"));
+  execFileSync("npm", ["pack", "--ignore-scripts", "--json", "--pack-destination", root, "."], {
+    cwd: packageDir,
+  });
+  const archives = readdirSync(root).filter((name) => name.endsWith(".tgz"));
   const archive = archives[0];
   if (archives.length !== 1 || !archive) throw new Error("npm pack must produce one archive");
-  const selector = join(installation, "node_modules", "@antfly", "embedded");
-  mkdirSync(selector, { recursive: true });
-  execFileSync("tar", [
-    "-xzf",
-    join(installation, archive),
-    "-C",
-    selector,
-    "--strip-components=1",
-  ]);
-  symlinkSync(
-    realpathSync(join(packageDir, "node_modules", "koffi")),
-    join(installation, "node_modules", "koffi"),
-    "junction"
-  );
-  for (const [platform, arch, library] of platforms) {
-    const name = `@antfly/embedded-${platform}-${arch}`;
-    const directory = join(installation, "node_modules", name);
-    mkdirSync(join(directory, "lib"), { recursive: true });
-    writeFileSync(join(directory, "package.json"), JSON.stringify({ name, version: "0.1.0" }));
-    // Discovery only: these files must never be loaded through the C ABI.
-    writeFileSync(join(directory, "lib", library), "native discovery fixture");
+  for (const name of installationNames) {
+    const installation = join(root, name);
+    const selector = join(installation, "node_modules", "@antfly", "embedded");
+    mkdirSync(selector, { recursive: true });
+    execFileSync("tar", ["-xzf", join(root, archive), "-C", selector, "--strip-components=1"]);
+    symlinkSync(
+      realpathSync(join(packageDir, "node_modules", "koffi")),
+      join(installation, "node_modules", "koffi"),
+      "junction"
+    );
+    for (const [platform, arch, library] of platforms) {
+      const name = `@antfly/embedded-${platform}-${arch}`;
+      const directory = join(installation, "node_modules", name);
+      mkdirSync(join(directory, "lib"), { recursive: true });
+      writeFileSync(join(directory, "package.json"), JSON.stringify({ name, version: "0.1.0" }));
+      // Discovery only: these files must never be loaded through the C ABI.
+      writeFileSync(join(directory, "lib", library), "native discovery fixture");
+    }
+    const sourceLibrary = join(installation, "zig", "zig-out", "lib");
+    mkdirSync(sourceLibrary, { recursive: true });
+    writeFileSync(join(sourceLibrary, "libantfly.so"), "source discovery fixture");
   }
-  const sourceLibrary = join(installation, "zig", "zig-out", "lib");
-  mkdirSync(sourceLibrary, { recursive: true });
-  writeFileSync(join(sourceLibrary, "libantfly.so"), "source discovery fixture");
 }, 60_000);
 
 afterAll(() => {
-  if (installation) rmSync(installation, { recursive: true, force: true });
+  if (root) rmSync(root, { recursive: true, force: true });
   if (consumer) rmSync(consumer, { recursive: true, force: true });
 });
 
-function discover(format: "cjs" | "esm", platform: string, arch: string) {
+function discover(installation: string, format: "cjs" | "esm", platform: string, arch: string) {
   const entry = join(installation, `consumer.${format === "cjs" ? "cjs" : "mjs"}`);
   const load =
     format === "cjs"
@@ -96,24 +92,29 @@ function discover(format: "cjs" | "esm", platform: string, arch: string) {
 
 // Load real packed exports through Node's conditional exports, without a
 // resolver mock, an explicit library override, or a checkout working directory.
-describe.each(["cjs", "esm"] as const)("packed %s entry point", (format) => {
-  it.each(platforms)("discovers the installed %s/%s native package", (platform, arch, library) => {
-    expect(discover(format, platform, arch)).toEqual({
-      path: join(
-        installation,
-        "node_modules",
-        `@antfly/embedded-${platform}-${arch}`,
-        "lib",
-        library
-      ),
-      source: "embedded-package",
+describe.each(installationNames)("installation path %s", (name) => {
+  const installation = () => join(root, name);
+  describe.each(["cjs", "esm"] as const)("packed %s entry point", (format) => {
+    it.each(
+      platforms
+    )("discovers the installed %s/%s native package", (platform, arch, library) => {
+      expect(discover(installation(), format, platform, arch)).toEqual({
+        path: join(
+          installation(),
+          "node_modules",
+          `@antfly/embedded-${platform}-${arch}`,
+          "lib",
+          library
+        ),
+        source: "embedded-package",
+      });
     });
-  });
 
-  it("finds a source library relative to the package rather than the working directory", () => {
-    expect(discover(format, "linux", "riscv64")).toEqual({
-      path: join(installation, "zig", "zig-out", "lib", "libantfly.so"),
-      source: "source-tree",
+    it("finds a source library relative to the package rather than the working directory", () => {
+      expect(discover(installation(), format, "linux", "riscv64")).toEqual({
+        path: join(installation(), "zig", "zig-out", "lib", "libantfly.so"),
+        source: "source-tree",
+      });
     });
   });
 });

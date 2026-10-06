@@ -18,7 +18,7 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: ["src/index.ts"],
   format: ["cjs", "esm"],
-  // Discovery uses import.meta.url in both exports; tsup supplies it in CJS.
+  // Preserve import.meta syntax in CJS; discovery uses native __filename there.
   shims: true,
   dts: true,
   clean: true,

@@ -85,14 +85,14 @@ export interface ResolveLibraryOptions {
   resolve?: (specifier: string) => string;
 }
 
+function moduleFilename(): string {
+  // Use Node's native CJS filename rather than tsup's import.meta.url shim,
+  // which does not escape URL-sensitive characters in filesystem paths.
+  return typeof __filename === "string" ? __filename : fileURLToPath(import.meta.url);
+}
+
 function defaultStartDir(): string {
-  try {
-    // import.meta.url is only available in ESM; the CJS build gets an
-    // equivalent shim from tsup. Fall back to cwd if neither works.
-    return dirname(fileURLToPath(import.meta.url));
-  } catch {
-    return process.cwd();
-  }
+  return dirname(moduleFilename());
 }
 
 function findUp(
@@ -160,7 +160,7 @@ export function resolveLibrary(options: ResolveLibraryOptions = {}): ResolvedLib
   const packageName = embeddedPlatformPackageName(platform, arch);
   if (packageName) {
     try {
-      const resolve = options.resolve ?? createRequire(import.meta.url).resolve;
+      const resolve = options.resolve ?? createRequire(moduleFilename()).resolve;
       const packageJsonPath = resolve(`${packageName}/package.json`);
       const candidate = join(dirname(packageJsonPath), "lib", fileName);
       if (existsSync(candidate)) {
