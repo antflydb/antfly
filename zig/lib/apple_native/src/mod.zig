@@ -18,9 +18,12 @@ pub const Control = struct {
 pub const Operation = enum(c_int) { generate = 1, transcribe = 2, availability = 3 };
 pub fn checkAvailable() !void {
     if (!enabled) return error.AppleIntelligenceProviderUnavailable;
+    if (antfly_apple_loader_available() != 0) return error.AppleIntelligenceProviderUnavailable;
 }
 
-extern fn antfly_apple_invoke(
+extern fn antfly_apple_loader_available() c_int;
+
+extern fn antfly_apple_loader_invoke(
     operation: c_int,
     json: [*]const u8,
     json_len: usize,
@@ -77,7 +80,7 @@ pub fn invoke(alloc: std.mem.Allocator, operation: Operation, json: []const u8, 
     };
     errdefer if (invocation.result) |value| alloc.free(value);
     try invocation.check();
-    const status = antfly_apple_invoke(@backingInt(operation), json.ptr, json.len, if (audio.len > 0) audio.ptr else null, audio.len, limit, &invocation, Invocation.cancel, Invocation.output);
+    const status = antfly_apple_loader_invoke(@backingInt(operation), json.ptr, json.len, if (audio.len > 0) audio.ptr else null, audio.len, limit, &invocation, Invocation.cancel, Invocation.output);
     try invocation.check();
     if (invocation.failure) |err| return err;
     switch (status) {
@@ -93,6 +96,8 @@ pub fn invoke(alloc: std.mem.Allocator, operation: Operation, json: []const u8, 
         9 => return error.ResponseTooLarge,
         10 => return error.AppleContextWindowExceeded,
         11 => return error.AppleGenerationRefused,
+        12 => return error.AppleNativeBridgeUnavailable,
+        15 => return error.AppleNativeBridgeIncompatible,
         else => return error.AppleNativeFailed,
     }
     return invocation.result orelse error.AppleNativeFailed;

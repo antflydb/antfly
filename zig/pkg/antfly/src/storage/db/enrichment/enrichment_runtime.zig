@@ -2170,6 +2170,8 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.AppleProviderUnavailable,
         error.AppleIntelligenceProviderUnavailable,
         error.AppleIntelligenceDisabled,
+        error.AppleNativeBridgeUnavailable,
+        error.AppleNativeBridgeIncompatible,
         error.UnsupportedAppleGenerationOptions,
         error.UnsupportedAppleTranscriptionOptions,
         error.InvalidAppleTranscribingConfig,

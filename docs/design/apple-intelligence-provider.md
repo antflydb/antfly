@@ -20,11 +20,23 @@ file transcription work, including phrase/word timestamps. Foundation Models
 initially reported `modelNotReady`, then became available without an Antfly
 settings change. Real text generation, history recall, and byte bounds passed.
 
-The combined opt-in build targets macOS 26+, uses the SDK 27 Swift toolchain, and
-strongly links its frameworks. Older macOS combined-binary deployment, Lite host
-qualification, packaging/signing, structured generation, tool calling, live
-transcription, image prompting, and PCC remain future work. There is no separate
-`apple-intelligence` build flag. Disabled/Linux builds do not link Swift.
+The opt-in build uses the SDK 27 Swift toolchain. Vision remains directly linked;
+Foundation Models and Speech live in a bundled macOS 26+ dylib. A small C loader
+checks the running OS before loading, verifies ABI version 1, caches its entry
+point with `pthread_once`, and retains the library for process lifetime. The CLI
+and Lite can keep their older deployment target without Swift/framework linkage.
+Discovery is relative to the owning executable or `libantfly`, with an explicit
+absolute-path override for custom layouts. Loading uses local symbol scope;
+missing or incompatible libraries fail cleanly. Library load failures require a
+restart after repair, while model readiness is rechecked on every call.
+
+Loader tests cover concurrent initialization, older-OS gating without opening
+the dylib, missing/incorrect ABI exports, cached failures, relocated CLI archives,
+and discovery from a Lite shared-library owner. Actual older-OS launch and Intel
+qualification remain pending target hardware. Structured generation, tool
+calling, live transcription, image prompting, and PCC remain future work. There
+is no separate `apple-intelligence` build flag. Disabled/Linux builds do not
+compile the loader or Swift library.
 
 The remainder records the original investigation and proposed broader roadmap,
 including contracts beyond the current synchronous bounded implementation.

@@ -45,6 +45,7 @@ const AntflyRootImports = @import("imports.zig").AntflyRootImports;
 const LmdbBackend = @import("storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    apple_bridge: ?std.Build.LazyPath = null,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     optimize: std.lang.Optimize,
@@ -146,7 +147,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
     });
     const apple_provider_test_step = b.step("antfly-apple-provider-test", "Run Apple OCR provider and PDF integration tests");
-    apple_provider_test_step.dependOn(&b.addRunArtifact(apple_provider_tests).step);
+    const run_apple_provider_tests = b.addRunArtifact(apple_provider_tests);
+    @import("../../../lib/apple_native/build_support.zig").configureTest(b, run_apple_provider_tests, options.apple_bridge);
+    apple_provider_test_step.dependOn(&run_apple_provider_tests.step);
     // The audit embeds library sources outside the Antfly package boundary.
     antfly_test_mod.addAnonymousImport("lmdb_vopr_source", .{
         .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),

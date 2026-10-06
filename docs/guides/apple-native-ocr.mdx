@@ -17,15 +17,48 @@ From the repository's `zig` directory, use its required Zig 0.17 toolchain:
 zig build antfly -Dapple-providers=true
 ```
 
-The combined provider requires macOS 26 or newer and a macOS 27 SDK / Swift 6
-command-line toolchain. It is tested on macOS 27.0.1, Apple M4 Max. The OCR API
-alone was also tested on macOS 15.6.1 before the Swift providers were added;
-the combined binary is not qualified for that older OS.
+The build requires a macOS 27 SDK / Swift 6 command-line toolchain. Vision OCR
+is linked directly; generation and transcription are bundled in
+`lib/libantfly-apple.dylib`, whose minimum macOS version is 26. The CLI and
+`libantfly` can retain an older deployment target, for example:
 
-The flag defaults to false and requires a macOS target with libc. Disabled and
-Linux builds compile without Swift or Apple frameworks and return an explicit
-unavailable error for native calls. Metal inference is independent; add
-`-Dmetal=false` to disable Metal for Antfly's other inference providers.
+```bash
+zig build antfly capi -Dapple-providers=true -Dtarget=aarch64-macos.15.0
+```
+
+Antfly checks the running OS before loading the sidecar. On macOS below 26,
+generation and transcription return `AppleIntelligenceProviderUnavailable`;
+OCR remains independent. Older/ineligible hardware on newer macOS is checked
+by the native APIs. The current validation host is macOS 27.0.1 / Apple M4 Max;
+a build with a macOS 15 deployment target does not itself establish that it
+launches correctly on an actual macOS 15 machine.
+
+The flag defaults to false. Disabled and Linux builds do not compile the loader
+or Swift sidecar. Metal inference is independent; add `-Dmetal=false` to disable
+Metal for Antfly's other inference providers.
+
+### Library loading and installation
+
+The Swift library is opened once, on the first generation/transcription call,
+with local symbol scope and an ABI version check. The handle and entry point
+remain cached for the process lifetime. Model readiness is checked separately
+on every generation request, so setup or an OS model update can recover without
+reloading the library. Failed library loads are cached; install or replace a
+missing/incompatible bridge and restart Antfly.
+
+Both `antfly` and `capi` build steps install the sidecar. Keep it beside
+`libantfly` in `lib/`; the CLI also finds it in its installation's `lib/` directory
+whether the executable is in `bin/` or at the archive root. Discovery uses the
+actual executable/shared-library location, including symlink resolution, and
+never searches the current directory or `PATH`.
+
+For a custom Lite layout, explicitly set `ANTFLY_APPLE_BRIDGE_PATH` to an
+absolute trusted library path before starting the host. An invalid override
+fails instead of falling through to other paths. Missing/unloadable and ABI
+incompatible libraries return `AppleNativeBridgeUnavailable` and
+`AppleNativeBridgeIncompatible`, respectively. Swift optimization follows `-Doptimize` (`-O` for release safe/fast, `-Osize`
+for release small). The build gives the dylib an ad-hoc signature; distribution signing should include this file whenever the
+CLI or Lite package is signed.
 
 ## Generate text
 
@@ -188,7 +221,7 @@ Production document budgets now scale from 256 MiB to 1 GiB with host memory;
 small process envelopes can reject work with `DocumentExtractionWorkingSetTooLarge`.
 
 ```bash
-zig build lib-readers-test lib-generating-test lib-transcribing-test \
+zig build apple-bridge-loader-test lib-readers-test lib-generating-test lib-transcribing-test \
   antfly-apple-provider-test apple-pdf-ocr-test \
   -Dapple-providers=true -Dmetal=false -j2
 zig build lib-readers-check lib-generating-check lib-transcribing-check \
@@ -210,3 +243,18 @@ model is available they also check real output and its byte limit. On the macOS 
 recall, and output-limit enforcement passed once the OS model was ready. The standalone C driver
 `scripts/apple-intelligence-probe.c` can query availability or exercise the same
 Swift C ABI independently of Antfly.
+
+To probe the installed Lite library from a separate C host, run from the repository
+root after building `capi`:
+
+```bash
+xcrun clang -DANTFLY_APPLE_HOSTED_PROBE scripts/apple-intelligence-probe.c \
+  -o /tmp/antfly-apple-hosted-probe
+ANTFLY_APPLE_HOST_LIBRARY="$PWD/zig/zig-out/lib/libantfly.dylib" \
+  /tmp/antfly-apple-hosted-probe
+```
+
+The default operation reports generation and speech availability. This exercises
+sidecar discovery from `libantfly`, independently of the probe executable's
+location. The same host probe has been qualified with real generation and file
+transcription on macOS 27.

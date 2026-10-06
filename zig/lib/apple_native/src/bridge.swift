@@ -42,6 +42,9 @@ private final class Invocation: @unchecked Sendable {
 }
 private let gate = NSLock()
 
+@_cdecl("antfly_apple_bridge_abi_version")
+public func bridgeABIVersion() -> UInt32 { 1 }
+
 @available(macOS 26.0, *)
 private func modelStatus() -> Int32 {
     switch SystemLanguageModel.default.availability {
