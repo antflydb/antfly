@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -36,13 +37,13 @@ pub const addFilteredTestRunArtifact = @import("../../../build_support/antfly/te
 pub const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 pub const expectQuietSuccess = @import("../../../build_support/antfly/test_support.zig").expectQuietSuccess;
 pub const release_scale_test_filters = @import("../../../build_support/antfly/test_support.zig").release_scale_test_filters;
-const addSnowballModule = @import("../../antfly-embedded/build/snowball.zig").addSnowballModule;
-const makeLmdbBuildOptions = @import("../../antfly-embedded/build/storage.zig").makeLmdbBuildOptions;
-const makeLmdbEngineModule = @import("../../antfly-embedded/build/storage.zig").makeLmdbEngineModule;
-const makeLmdbModule = @import("../../antfly-embedded/build/storage.zig").makeLmdbModule;
+const addSnowballModule = @import("../../../build_support/embedded/snowball.zig").addSnowballModule;
+const makeLmdbBuildOptions = @import("../../../build_support/embedded/storage.zig").makeLmdbBuildOptions;
+const makeLmdbEngineModule = @import("../../../build_support/embedded/storage.zig").makeLmdbEngineModule;
+const makeLmdbModule = @import("../../../build_support/embedded/storage.zig").makeLmdbModule;
 
 const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
-const LmdbBackend = @import("../../antfly-embedded/build/storage.zig").LmdbBackend;
+const LmdbBackend = @import("../../../build_support/embedded/storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
     apple_bridge: ?std.Build.LazyPath = null,
@@ -366,7 +367,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configureConsumer(b, data_consumer_module);
     // Control-plane session/lease stores also support the legacy engine. This
     // does not expose the physical DB owner to the consumer compilation unit.
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
     data_consumer_module.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     data_consumer_module.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     // HA replication test fixtures in data/runtime.zig construct a real

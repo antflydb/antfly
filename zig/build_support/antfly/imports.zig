@@ -1,24 +1,25 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const platform_build = @import("antfly_platform");
-const addSnowballModule = @import("../../pkg/antfly-embedded/build/snowball.zig").addSnowballModule;
+const addSnowballModule = @import("../embedded/snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
     sql_parser: *std.Build.Module,
-    storage_boundary: @import("../../pkg/antfly-embedded/build/storage_boundary.zig").Modules,
+    storage_boundary: @import("../embedded/storage_boundary.zig").Modules,
     cancellation: *std.Build.Module,
     cache_budget: *std.Build.Module,
     runtime_abi: *std.Build.Module,
@@ -48,7 +49,7 @@ pub const AntflyRootImports = struct {
     inference_runtime_paths: *std.Build.Module,
     inference_query_embedding_cache: *std.Build.Module,
     inference_host: *std.Build.Module,
-    boundary_profile: @import("../../pkg/antfly-embedded/build/storage_boundary.zig").Profile = .all,
+    boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
@@ -221,7 +222,7 @@ pub const AntflyRootImports = struct {
     /// Remote commands depend on client contracts and transport. In particular,
     /// they do not depend on local tokenization, inference, or storage engines.
     pub fn configureCli(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
-        @import("../../pkg/antfly-embedded/build/source_owner.zig").attach(mod);
+        @import("../embedded/source_owner.zig").attach(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);

@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Local/server test collection must retain selection and type identity."""
 
 import shutil
@@ -19,7 +32,7 @@ class LocalTestPartitions(unittest.TestCase):
         for relative in (
             "build_support/antfly/test_partitions.zig",
             "build_support/antfly/source_paths.zig",
-            "pkg/antfly-embedded/build/source_owner.zig",
+            "build_support/embedded/source_owner.zig",
             "pkg/antfly-embedded/src/local/test_runner.zig",
             "pkg/antfly-embedded/src/local/test_error_logs.zig",
             "tools/audit_test_selection.py",
@@ -77,7 +90,7 @@ test "server owned" { try std.testing.expectEqual(@as(u32, 7), accept(.{ .value 
         self.write(
             "build.zig",
             """const std = @import("std");
-const owner = @import("pkg/antfly-embedded/build/source_owner.zig");
+const owner = @import("build_support/embedded/source_owner.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const root = b.createModule(.{
