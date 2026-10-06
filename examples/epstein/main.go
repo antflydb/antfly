@@ -2154,7 +2154,7 @@ func graphVisualizationQuery(searchText string) map[string]any {
 					"limit":             80,
 					"include_paths":     true,
 					"include_documents": true,
-					"fields":            []string{"title", "url", "metadata"},
+					"fields":            []string{"title", "url", "original_url", "metadata"},
 				},
 			},
 		},
@@ -2177,7 +2177,7 @@ func graphVisualizationSampleQuery() map[string]any {
 					"limit":             80,
 					"include_paths":     true,
 					"include_documents": true,
-					"fields":            []string{"title", "url", "metadata"},
+					"fields":            []string{"title", "url", "original_url", "metadata"},
 				},
 			},
 		},
@@ -2294,7 +2294,9 @@ func graphNodeFromDocument(id string, document map[string]any, depth int) GraphN
 		if value, ok := document["title"].(string); ok && strings.TrimSpace(value) != "" {
 			title = value
 		}
-		if value, ok := document["url"].(string); ok {
+		if value, ok := document["original_url"].(string); ok {
+			url = value
+		} else if value, ok := document["url"].(string); ok {
 			url = value
 		}
 		if metadata, ok := document["metadata"].(map[string]any); ok {

@@ -64,14 +64,8 @@ func applyCorpusHit(result *SearchResult, hit antfly.QueryHit) {
 		page, _ = match.Source["page_number"].(float64)
 	}
 	if page > 0 {
-		start := float64(1)
-		if metadata, ok := hit.Source["metadata"].(map[string]any); ok {
-			if v, ok := metadata["page_start"].(float64); ok && v > 0 {
-				start = v
-			}
-		}
-		result.PageNum = int(start + page - 1)
-		result.URL = strings.Split(result.URL, "#")[0] + fmt.Sprintf("#page=%d", result.PageNum)
+		metadata, _ := hit.Source["metadata"].(map[string]any)
+		result.URL, result.PageNum = corpusPageCitation(result.URL, metadata, page)
 	}
 	// Native transcription assigns each chunk the first overlapping phrase's
 	// timestamp. The unit's first span may be minutes before this search match.
@@ -80,4 +74,16 @@ func applyCorpusHit(result *SearchResult, hit antfly.QueryHit) {
 			result.URL = strings.Split(result.URL, "#")[0] + fmt.Sprintf("#t=%.3f", start/1000)
 		}
 	}
+}
+
+func corpusPageCitation(original string, metadata map[string]any, page float64) (string, int) {
+	if page <= 0 {
+		return original, 0
+	}
+	start := float64(1)
+	if value, ok := metadata["page_start"].(float64); ok && value > 0 {
+		start = value
+	}
+	number := int(start + page - 1)
+	return strings.Split(original, "#")[0] + fmt.Sprintf("#page=%d", number), number
 }

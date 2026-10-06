@@ -574,10 +574,30 @@ OCR, transcription, chunking and embeddings run in Antfly's durable enrichment
 workers; completing `corpus load` means the source records were submitted, not that
 indexing finished. Failed provider work remains visible in server artifact/index
 status and can be repaired with the artifact reprocess API. `corpus graph` traverses
-units in bounded pages and upserts deterministic graph-unit rows containing plain
-extracted text and provenance, rather than extracting entities from a manifest.
+units in bounded pages and reconciles deterministic graph-unit rows containing
+plain extracted text and provenance. Each source has a durable materialization
+revision marker in the table. Every invocation checks the latest artifact generation;
+unchanged revisions are reused, repaired revisions update their unit rows, and
+obsolete units are deleted along with their generated relations. The local checkpoint
+reports pass progress; deleting it does not cause unchanged sources to be rewritten.
+Existing graph checkpoints migrate automatically on the next pass.
+
+A source is staged on disk and its revision is rechecked before publication. Failed
+or changing extraction leaves its prior materialization intact during preparation.
+Interrupted publication is recovered on the next pass; the revision marker is
+written only after upserts and stale-row cleanup succeed. A version-checked
+publishing marker fences every mutation through Antfly's OCC transaction API;
+a superseding writer or source replacement rejects the older pass's writes.
+If a repair overlaps publication, rerun the command to converge to the latest
+revision. Graph reconciliation requires document lookup version tokens and OCC
+transactions from the server. Graph-unit links
+use original PDF page numbers or the audio unit's recording timestamp, and appear
+in the graph visualization. Completion reports materialization submission; inspect
+graph index coverage separately for asynchronous relation extraction failures.
 These optional rows add stored text and default BM25 postings as well as graph
-artifacts/edges. The original small-dataset `prepare`, `enrich` and `entities`
+artifacts/edges. A validated OCR reader response with no detected text preserves
+embedded text (or completes an empty page) without counting as a provider failure;
+malformed responses, prompt echoes and actual rendering failures remain visible. The original small-dataset `prepare`, `enrich` and `entities`
 commands retain their JSON format; use the corpus pipeline for large inputs.
 
 ### Measure storage before scaling up

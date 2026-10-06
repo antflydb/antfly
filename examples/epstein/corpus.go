@@ -370,6 +370,33 @@ func corpusIndexes(embeddingModel, inferenceURL, language string, graph, semanti
 }
 
 func corpusRequest(client *http.Client, method, endpoint string, body any) (json.RawMessage, error) {
+	data, err := corpusRawRequest(client, method, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	if !json.Valid(data) {
+		return nil, fmt.Errorf("invalid JSON response from %s", endpoint)
+	}
+	return data, nil
+}
+
+type corpusHTTPError struct {
+	Method, Path string
+	StatusCode   int
+	Body         []byte
+}
+
+func (e *corpusHTTPError) Error() string {
+	return fmt.Sprintf("%s %s: HTTP %d: %.4096s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+func corpusRawRequest(client *http.Client, method, endpoint string, body any) ([]byte, error) {
+	return corpusRawRequestWithHeaders(client, method, endpoint, body, nil)
+}
+func corpusRawRequestWithHeaders(client *http.Client, method, endpoint string, body any, headers *http.Header) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -391,18 +418,18 @@ func corpusRequest(client *http.Client, method, endpoint string, body any) (json
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if headers != nil {
+		*headers = resp.Header.Clone()
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s: HTTP %d: %.4096s", method, req.URL.Path, resp.StatusCode, data)
+		return nil, &corpusHTTPError{Method: method, Path: req.URL.Path, StatusCode: resp.StatusCode, Body: data}
 	}
-	if len(bytes.TrimSpace(data)) == 0 {
-		return json.RawMessage(`{}`), nil
-	}
-	if !json.Valid(data) {
-		return nil, fmt.Errorf("invalid JSON response from %s", req.URL.Path)
+	if len(data) > 16<<20 {
+		return nil, fmt.Errorf("response from %s exceeds 16 MiB", req.URL.Path)
 	}
 	return data, nil
 }

@@ -18287,7 +18287,12 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     defer parsed.deinit(alloc);
     var grounded_ocr_text_len: usize = if (kind == .ocr) parsed.text.len else 0;
     if (kind == .ocr and document_extraction_mod.isOcrPromptEcho(parsed.text, ocr_prompt)) return error.OcrPromptEcho;
-    if (kind == .ocr and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
+    // A validated reader response with no observations is a successful OCR
+    // attempt (photos, blank and redacted pages commonly have no text). Empty
+    // generator/plain output and punctuation remain invalid, not silent success.
+    const reader_no_text = kind == .ocr and output_mode == .structured_reader and
+        std.mem.trim(u8, parsed.text, &std.ascii.whitespace).len == 0 and parsed.regions.len == 0;
+    if (kind == .ocr and !reader_no_text and !document_extraction_mod.hasMeaningfulOcrContent(parsed.text)) return error.TrivialOcrOutput;
     if (kind == .ocr) {
         if (unit.ocr_failure_stage) |value| alloc.free(value);
         unit.ocr_failure_stage = null;
@@ -18309,7 +18314,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
             unit.ocr_output_quality = owned_output_quality;
         }
         if (text_choice == .embedded) {
-            const owned_extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
+            const owned_extraction_status = try alloc.dupe(u8, if (reader_no_text and std.mem.trim(u8, unit.text, &std.ascii.whitespace).len == 0) "completed_no_text" else "completed_embedded_preferred");
             errdefer alloc.free(owned_extraction_status);
             const owned_method = try alloc.dupe(u8, "pdf_text");
             errdefer alloc.free(owned_method);
@@ -18362,7 +18367,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     }
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
-    const owned_status = try alloc.dupe(u8, status);
+    const owned_status = try alloc.dupe(u8, if (reader_no_text) "completed_no_text" else status);
     errdefer alloc.free(owned_status);
 
     const render_warning = unit.extraction_warning;
@@ -18387,7 +18392,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     unit.extraction_status = owned_status;
     switch (kind) {
         .ocr => {
-            unit.ocr_used = true;
+            unit.ocr_used = !reader_no_text;
             unit.ocr_confidence = parsed.confidence;
             unit.ocr_bbox = parsed.bbox;
             if (unit.text_regions.len > 0) alloc.free(unit.text_regions);
@@ -34801,4 +34806,30 @@ fn isAppleGeneratedTextProvider(alloc: Allocator, config_json: []const u8) !bool
     var parsed = try std.json.parseFromSlice(struct { provider: []const u8 = "" }, alloc, config_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return std.mem.eql(u8, parsed.value.provider, "apple");
+}
+
+test "document extraction accepts validated reader no-text results without hiding invalid output" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            for ([_][]const u8{ "", "EFTA02731411" }) |embedded| {
+                var unit = try cloneDocumentExtractionUnit(alloc, .{
+                    .unit_id = @constCast("page-1"),
+                    .unit_type = @constCast("page"),
+                    .text = @constCast(embedded),
+                    .method = @constCast("pdf_text"),
+                    .extraction_status = @constCast("pending_ocr"),
+                    .page_number = 1,
+                });
+                defer unit.deinit(alloc);
+                const response = try alloc.dupe(u8, "[{\"text\":\"\",\"regions_json\":\"[]\"}]");
+                try applyRuntimeGeneratedUnitText(alloc, alloc, &unit, response, "reader", "completed", .ocr, .structured_reader, .{}, "<OCR>");
+                try std.testing.expectEqualStrings(embedded, unit.text);
+                try std.testing.expectEqualStrings(if (embedded.len == 0) "completed_no_text" else "completed_embedded_preferred", unit.extraction_status.?);
+                try std.testing.expect(unit.ocr_attempted and !unit.ocr_used);
+                try std.testing.expect(unit.ocr_failure_stage == null);
+                try std.testing.expect(unit.ocr_output_quality != null);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }

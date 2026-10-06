@@ -317,7 +317,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 		t.Fatalf("graph traversal must hydrate visualization documents: %#v", traverse)
 	}
 	fields, ok := traverse["fields"].([]string)
-	if !ok || len(fields) != 3 || fields[0] != "title" || fields[1] != "url" || fields[2] != "metadata" {
+	if !ok || len(fields) != 4 || fields[0] != "title" || fields[1] != "url" || fields[2] != "original_url" || fields[3] != "metadata" {
 		t.Fatalf("unexpected graph document fields: %#v", traverse["fields"])
 	}
 }
