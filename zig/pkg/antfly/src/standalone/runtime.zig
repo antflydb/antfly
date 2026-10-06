@@ -5104,7 +5104,7 @@ pub fn runFromIterator(
     const chatgpt_manager = @import("../chatgpt/manager.zig");
     const chatgpt_root = try std.fs.path.join(alloc, &.{ resolved.auth_store_root_dir, "chatgpt" });
     defer alloc.free(chatgpt_root);
-    var chatgpt: ?chatgpt_manager.Manager = if (std.mem.eql(u8, public_listener.bind_host, "127.0.0.1") or std.mem.eql(u8, public_listener.bind_host, "::1") or std.mem.eql(u8, public_listener.bind_host, "localhost")) try chatgpt_manager.Manager.init(alloc, setup_io.io(), chatgpt_root) else null;
+    var chatgpt: ?chatgpt_manager.Manager = if ((if (loaded_config) |cfg| cfg.connectors.allowsLocalChatGPT() else true) and (std.mem.eql(u8, public_listener.bind_host, "127.0.0.1") or std.mem.eql(u8, public_listener.bind_host, "::1") or std.mem.eql(u8, public_listener.bind_host, "localhost"))) try chatgpt_manager.Manager.init(alloc, setup_io.io(), chatgpt_root) else null;
     defer if (chatgpt) |*manager| manager.deinit();
     if (chatgpt) |*connections| if (user_manager) |*users| {
         users.personal_grant_revoker = .{ .ptr = connections, .revoke_fn = chatgpt_manager.Manager.revokeDeletedUser };

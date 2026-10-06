@@ -304,6 +304,8 @@ pub const Config = struct {
     inference: ?antfly_inference_config_openapi.RuntimeConfig = null,
     tls: ?TLSInfo = null,
     remote_content: ?antfly_scraping_openapi.RemoteContentConfig = null,
+    /// Deployment policy for integrations, separate from named connections and login providers.
+    connectors: ?std.json.Value = null,
     /// Public connection resources keyed by stable connection ID. These are the external systems Antfly can use for inference, external IO, CDC, backups, indexing, agents, and related workflows.
     connections: ?std.json.ArrayHashMap(ConnectionConfig) = null,
     /// Named speech-to-text provider configurations. Define named STT providers that can be referenced by templates and API calls. The first provider defined becomes the default when no provider name is specified. **Example:** ```json { "speech_to_text": { "antfly-whisper": { "provider": "antfly", "api_url": "http://localhost:8080", "model": "openai/whisper-base" }, "openai-whisper": { "provider": "openai", "model": "whisper-1" } } } ``` Then in templates: `{{transcribeAudio url="..." provider="whisper-local"}}`
@@ -364,6 +366,7 @@ pub const Config = struct {
         .{ "inference", "inference", false },
         .{ "tls", "tls", true },
         .{ "remote_content", "remote_content", false },
+        .{ "connectors", "connectors", true },
         .{ "connections", "connections", true },
         .{ "speech_to_text", "speech_to_text", true },
         .{ "cors", "cors", false },
@@ -476,6 +479,10 @@ pub const Config = struct {
         } else if (jw.options.emit_null_optional_fields) {
             try jw.objectField("remote_content");
             try jw.write(@as(?u8, null));
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
+            try jw.write(value);
         }
         if (self.connections) |value| {
             try jw.objectField("connections");

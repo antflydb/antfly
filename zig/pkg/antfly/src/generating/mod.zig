@@ -161,7 +161,7 @@ pub const BackendFactory = struct {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
         if (cfg.provider == .chatgpt) {
             try cfg.validate();
-            const manager = self.chatgpt orelse return error.ChatGPTInteractiveOnly;
+            const manager = self.chatgpt orelse return error.ChatGPTDisabled;
             const owner = self.personal_owner orelse return error.ChatGPTInteractiveOnly;
             const state = try alloc.create(ChatGPTBackend);
             state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
@@ -1427,4 +1427,11 @@ test "generating backend tools complete agent conversations across all remote ad
         try group.await(io);
         if (failure) |err| return err;
     }
+}
+
+test "chatgpt disabled factory rejects inference without upstream work" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    try std.testing.expectError(error.ChatGPTDisabled, executeChainWithOptions(a, &client, &.{.{ .generator = .{ .provider = .chatgpt, .connection_id = "one", .model = "model", .url = "" } }}, .{}, &.{}));
 }

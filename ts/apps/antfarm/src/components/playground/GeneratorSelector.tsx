@@ -125,7 +125,9 @@ export function GeneratorSelector({
   const availableProviders = providers.filter(
     (provider) =>
       provider !== "chatgpt" ||
-      (allowPersonalConnections && (accounts.length > 0 || value?.provider === "chatgpt"))
+      (allowPersonalConnections &&
+        chatgpt.supported &&
+        (accounts.length > 0 || value?.provider === "chatgpt"))
   );
   const mode = value ? "custom" : "default";
   const id = useId();
@@ -226,6 +228,7 @@ export function GeneratorSelector({
 
       {value?.provider === "chatgpt" && (
         <div className="text-xs space-y-1">
+          {chatgpt.unavailableMessage && <p role="alert">{chatgpt.unavailableMessage}</p>}
           <p>
             Using ChatGPT plan ·{" "}
             <a

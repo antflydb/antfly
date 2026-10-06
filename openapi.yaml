@@ -14123,6 +14123,28 @@ components:
         - unsupported
       description: Whether artifact-backed index mutations are accepted now, temporarily fenced during
         a distributed rolling upgrade, or permanently unsupported by this deployment.
+    ConnectorCapabilities:
+      type: object
+      additionalProperties: false
+      required:
+        - chatgpt
+      description: Effective integration availability for this deployment; independent of login providers
+        and individual grants.
+      properties:
+        chatgpt:
+          type: object
+          additionalProperties: false
+          required:
+            - enabled
+          properties:
+            enabled:
+              type: boolean
+              x-omitzero: false
+            reason:
+              type: string
+              enum:
+                - operator_disabled
+                - local_runtime_required
     ClusterStatus:
       type: object
       required:
@@ -14146,6 +14168,8 @@ components:
             - standalone
             - serverless
           description: Runtime deployment topology
+        connectors:
+          $ref: '#/components/schemas/ConnectorCapabilities'
         index_capabilities:
           $ref: '#/components/schemas/IndexRuntimeCapabilities'
         secret_store:
@@ -14178,6 +14202,8 @@ components:
             - standalone
             - serverless
           description: Runtime deployment topology
+        connectors:
+          $ref: '#/components/schemas/ConnectorCapabilities'
         index_capabilities:
           $ref: '#/components/schemas/IndexRuntimeCapabilities'
         secret_store:

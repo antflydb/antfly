@@ -69,6 +69,7 @@ pub const Connection = types.Connection;
 pub const ConnectionKind = types.ConnectionKind;
 pub const ConnectionStatus = types.ConnectionStatus;
 pub const ConnectionsResponse = types.ConnectionsResponse;
+pub const ConnectorCapabilities = types.ConnectorCapabilities;
 pub const CreateTableRequest = types.CreateTableRequest;
 pub const CreateTablespaceRequest = types.CreateTablespaceRequest;
 pub const DatabaseCatalogRecord = types.DatabaseCatalogRecord;

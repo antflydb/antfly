@@ -27,9 +27,28 @@ pub const usage =
     \\  Login opens a local browser; --no-browser prints the URL for manual opening.
     \\  Credentials stay in the server's private store. JSON results go to stdout.
     \\  Logout clears the local grant and attempts upstream revocation.
-    \\  Remote credential transfer and additional providers are not yet implemented.
+    \\       antfly connections login google [--project <project>] [--no-browser]
+    \\       antfly connections list google
+    \\       antfly connections logout google
+    \\       antfly connections login aws --profile <name> [--sso] [--no-browser]
+    \\       antfly connections list aws --profile <name>
+    \\       antfly connections logout aws --profile <name>
+    \\  Google/AWS commands manage this machine's shared credentials without a server.
+    \\  Install gcloud for Google ADC, or AWS CLI v2 (>=2.32 for console login).
+    \\  AWS uses configured SSO automatically; --no-browser requires SSO.
+    \\  Restart Antfly after login/logout. Remote credential transfer is not implemented.
     \\
 ;
+
+/// Dispatch cloud credentials before constructing an Antfly HTTP client.
+pub fn runLocalProviderIfRequested(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !bool {
+    var probe = args.*;
+    _ = probe.next() orelse return false;
+    const provider = probe.next() orelse return false;
+    if (!std.mem.eql(u8, provider, "google") and !std.mem.eql(u8, provider, "aws")) return false;
+    try cli.cloud_connections.run(alloc, io, args);
+    return true;
+}
 
 const Operation = enum { login, list, models, logout };
 const Options = struct {
@@ -98,7 +117,14 @@ fn openBrowser(io: std.Io, url: []const u8) !void {
 
 fn requireData(response: anytype) !void {
     if (response.status_code == 401) return error.ConnectionAuthenticationRequired;
-    if (response.status_code == 403) return error.ConnectionOwnerOrLocalServerRequired;
+    if (response.status_code == 403) {
+        if (response.err_body) |body| {
+            var detail = std.json.parseFromSlice(struct { error_code: []const u8 = "" }, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return error.ConnectionOwnerOrLocalServerRequired;
+            defer detail.deinit();
+            if (std.mem.eql(u8, detail.value.error_code, "ChatGPTDisabled")) return error.ChatGPTDisabled;
+        }
+        return error.ConnectionOwnerOrLocalServerRequired;
+    }
     if (response.status_code == 404) return error.ConnectionNotFound;
     if (response.status_code < 200 or response.status_code >= 300) return error.ConnectionRequestFailed;
     if (response.data == null) return error.InvalidConnectionResponse;
@@ -274,4 +300,10 @@ test "connections require a terminal successful authorization" {
     try std.testing.expectError(error.ConnectionLoginExpired, completed("expired"));
     try std.testing.expectError(error.ConnectionLoginFailed, completed("error"));
     try std.testing.expectError(error.InvalidConnectionResponse, completed("unknown"));
+}
+
+test "connections recognize disabled connector errors before browser login" {
+    const Response = struct { status_code: u16, err_body: ?[]const u8, data: ?u8 = null };
+    try std.testing.expectError(error.ChatGPTDisabled, requireData(Response{ .status_code = 403, .err_body = "{\"error_code\":\"ChatGPTDisabled\"}" }));
+    try std.testing.expectError(error.ConnectionOwnerOrLocalServerRequired, requireData(Response{ .status_code = 403, .err_body = "forbidden" }));
 }

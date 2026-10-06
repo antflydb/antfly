@@ -4375,6 +4375,7 @@ pub const ApiHttpServer = struct {
         errdefer status.deinit(alloc);
         status.auth_enabled = self.cfg.auth_enabled;
         status.deployment_mode = self.cfg.deployment_mode;
+        status.connectors = self.connectorCapabilities();
         status.index_capabilities.artifact_sources_state = self.artifactSourcesCapabilityState(snapshot);
         status.index_capabilities.artifact_sources = status.index_capabilities.artifact_sources_state == .available;
         status.storage = self.currentStorageRuntimeStatus();
@@ -4403,6 +4404,15 @@ pub const ApiHttpServer = struct {
             return self.loadClusterStatusWithSnapshot(alloc, snapshot);
         }
         return self.loadClusterStatusWithSnapshot(alloc, null);
+    }
+
+    pub fn connectorCapabilities(self: *const ApiHttpServer) cluster.ConnectorCapabilities {
+        if (self.cfg.node_config) |config| if (!config.connectors.allowsLocalChatGPT())
+            return .{ .chatgpt = .{ .enabled = false, .reason = .operator_disabled } };
+        return if (self.cfg.chatgpt != null)
+            .{ .chatgpt = .{ .enabled = true, .reason = null } }
+        else
+            .{};
     }
 
     /// Transport-neutral topology operation. It composes the shared status

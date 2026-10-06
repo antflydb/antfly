@@ -92,7 +92,7 @@ const Attempt = struct {
         };
         std.crypto.secureZero(u8, @constCast(self.verifier));
         self.server.shutdown(1000);
-        return ctx.text(if (self.outcome.status == .connected) "ChatGPT connection saved. Return to Antfarm." else "ChatGPT connection was not enabled. Return to Antfarm.");
+        return ctx.text(if (self.outcome.status == .connected) "ChatGPT connection saved. Return to Antfly." else "ChatGPT connection was not enabled. Return to Antfly.");
     }
     fn complete(self: *Attempt, ctx: *httpx.Context) !void {
         try self.manager.checkOwner(self.owner);

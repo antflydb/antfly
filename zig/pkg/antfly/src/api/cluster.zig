@@ -33,6 +33,7 @@ pub const ClusterStatus = struct {
     auth_enabled: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     index_capabilities: IndexRuntimeCapabilities = .{},
+    connectors: ConnectorCapabilities = .{},
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?metadata_openapi.StorageRuntimeStatus = null,
@@ -51,6 +52,7 @@ pub const ClusterTopology = struct {
     auth_enabled: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     index_capabilities: IndexRuntimeCapabilities = .{},
+    connectors: ConnectorCapabilities = .{},
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?metadata_openapi.StorageRuntimeStatus = null,
@@ -68,6 +70,13 @@ pub const ClusterTopology = struct {
 pub const IndexRuntimeCapabilities = struct {
     artifact_sources: bool = true,
     artifact_sources_state: ArtifactSourcesCapabilityState = .available,
+};
+
+pub const ConnectorCapabilities = struct {
+    chatgpt: struct {
+        enabled: bool = false,
+        reason: ?enum { operator_disabled, local_runtime_required } = .local_runtime_required,
+    } = .{},
 };
 
 pub const ArtifactSourcesCapabilityState = enum {
@@ -309,6 +318,7 @@ pub fn topologyFromStatus(alloc: std.mem.Allocator, status: ClusterStatus) !Clus
         .auth_enabled = status.auth_enabled,
         .deployment_mode = status.deployment_mode,
         .index_capabilities = status.index_capabilities,
+        .connectors = status.connectors,
         .secret_store = secret_store,
         .runtime_config = runtime_config,
         .storage = status.storage,

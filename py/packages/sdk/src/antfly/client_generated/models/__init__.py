@@ -146,6 +146,9 @@ from .connection import Connection
 from .connection_kind import ConnectionKind
 from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
+from .connector_capabilities import ConnectorCapabilities
+from .connector_capabilities_chatgpt import ConnectorCapabilitiesChatgpt
+from .connector_capabilities_chatgpt_reason import ConnectorCapabilitiesChatgptReason
 from .create_algebraic_index_request import CreateAlgebraicIndexRequest
 from .create_algebraic_index_request_type import CreateAlgebraicIndexRequestType
 from .create_api_key_request import CreateApiKeyRequest
@@ -1536,6 +1539,9 @@ __all__ = (
     "ConnectionKind",
     "ConnectionsResponse",
     "ConnectionStatus",
+    "ConnectorCapabilities",
+    "ConnectorCapabilitiesChatgpt",
+    "ConnectorCapabilitiesChatgptReason",
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreateApiKeyRequest",

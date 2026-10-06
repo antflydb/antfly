@@ -2483,6 +2483,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -2494,6 +2495,7 @@ pub const ClusterStatus = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -2522,6 +2524,10 @@ pub const ClusterStatus = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -2552,6 +2558,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -2564,6 +2571,7 @@ pub const ClusterTopology = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -2593,6 +2601,10 @@ pub const ClusterTopology = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -2879,6 +2891,11 @@ pub const ConnectionStatus = enum {
 
 pub const ConnectionsResponse = struct {
     connections: []const Connection,
+};
+
+/// Effective integration availability for this deployment; independent of login providers and individual grants.
+pub const ConnectorCapabilities = struct {
+    chatgpt: std.json.Value,
 };
 
 pub const CreateTableRequest = struct {

@@ -4,6 +4,9 @@ Status: local standalone implementation (delivery phases 1–3). Research baseli
 October 5, 2026. Local CLI login is included. Remote VM credential transfer and
 commercial hosted identity remain separate later phases.
 
+Connector policy, capability reporting, and local disablement are implemented.
+Colony deployment configuration and hosted identity integration remain follow-ups.
+
 ## Decision
 
 Start with a personal ChatGPT inference connection in locally hosted Antfly,
@@ -62,6 +65,127 @@ Keep embeddings, reranking, transcription, indexing, scheduled evaluations, and
 unattended ingestion on their existing providers in the first release. A personal
 plan connection is available only to explicitly initiated interactive generation.
 Do not accept it as a table's durable background-generation configuration.
+
+## Connector configuration and Cloud policy
+
+Use `connectors` for integration policy and application setup. Keep `connections`
+for named services/resources and `auth_providers` for signing into Antfly or Colony.
+These are distinct from the protected grants obtained when someone connects an
+external account. Connecting a ChatGPT plan never establishes database identity.
+
+The implemented configuration is:
+
+```yaml
+connectors:
+  chatgpt:
+    enabled: false
+```
+
+`enabled` is optional. Omission preserves existing local standalone behavior;
+`false` disables ChatGPT even on a loopback listener. `true` permits the existing
+local flow but cannot relax loopback, request-origin, ownership, or interactive-use
+restrictions. Distributed and serverless runtimes remain unavailable. Unknown
+connector/configuration keys and nonboolean values are rejected at startup.
+Changes require a restart.
+
+When disabled, standalone does not initialize the manager, open/create its private
+credential store, acquire its lock, or start OAuth callback tasks. Existing stored
+grants are preserved; disabling does not revoke them or delete credentials.
+API and generation entrypoints also enforce availability before credential work.
+
+### Capability contract and clients
+
+Both `/db/v1/status` and `/db/v1/cluster` expose effective availability:
+
+```json
+{
+  "connectors": {
+    "chatgpt": {
+      "enabled": false,
+      "reason": "operator_disabled"
+    }
+  }
+}
+```
+
+`reason` is `operator_disabled` for explicit configuration disablement and
+`local_runtime_required` when no supported local manager exists. Enabled runtimes
+omit the reason. This describes deployment availability, independently
+of account state and permissions, and reveals no credentials. Generated Zig,
+TypeScript, Go, and Python API models carry the additive capability.
+
+After normal application authentication, disabled ChatGPT management routes return
+HTTP 403 with `error_code: "ChatGPTDisabled"`. Generation rejects a missing or
+disallowed manager with the same error before token refresh, model discovery, or
+inference. Existing interactive ownership restrictions and prohibition of mixed
+ChatGPT/provider fallback chains remain in effect.
+
+Antfarm checks status before querying accounts. Disabled deployments hide account
+controls and ChatGPT choices. A saved ChatGPT selection remains visible as
+unavailable with an explanation and blocks chat/RAG submission until another
+generator is chosen. It never silently switches providers. API/auth changes clear
+account and model state and recheck capability; older servers without the field
+retain the account-probe compatibility path. Preferences retain their existing
+storage scheme; endpoint/owner-scoped preference storage is a separate follow-up.
+
+The CLI recognizes `ChatGPTDisabled` from the authorization endpoint and reports
+it before opening a browser. Existing local URL restrictions remain; remote VM
+credential transfer is outside this release.
+
+### Colony deployment and eventual hosted sign-in
+
+Colony must publish `connectors.chatgpt.enabled: false` in operator-controlled
+Antfly runtime configuration, including loopback backends behind a gateway. A
+loopback bind alone is insufficient evidence that a deployment is personally
+hosted. This Antfly change supplies the enforcement mechanism; wiring it into
+Colony's deployment/configuration publication is a separate change. Cloud must
+retain the setting outside tenant-editable configuration. Antfly has no additional
+immutable Cloud-mode override in this release.
+
+Hosted ChatGPT identity sign-in remains independent and can be introduced through
+Colony's existing login/session and trusted-principal pipeline after client
+approval. Use registered client configuration under `auth_providers`, validate
+OIDC state, nonce, PKCE, issuer, audience and ID-token signature, and persist the
+stable provider identity independently of integration grants. Never use the
+identity login token as a ChatGPT inference credential. Cloud plan inference
+remains disabled until the applicable hosted authorization contract is implemented.
+
+OpenAI documents local/open-source plan sharing separately from website identity:
+[plan-sharing overview](https://developers.openai.com/siwc/token-sharing-open-source)
+and [website identity flow](https://developers.openai.com/siwc/website).
+
+### Google and AWS credentials and future hosted connectors
+
+Keep application-wide OAuth/client or integration settings under the corresponding
+connector (for example `connectors.google`). Named GCS, S3, or Bedrock resources
+belong under `connections`. They may eventually reference a protected grant through
+an `auth_ref`, rather than embedding reusable user tokens in resource configuration.
+A connector grant can authorize multiple appropriate resources; resource scope,
+owner/tenant checks, and refresh remain server responsibilities. Static service
+credentials retain their provider-specific configuration where already supported.
+
+Local `antfly connections login google` and `login aws --profile <name>` use
+vendor-managed credentials for GCS/Vertex and S3/Bedrock. See the implemented
+[local cloud credential design](CONNECTIONS.md#local-google-and-aws-login).
+These do not create per-user grants in the Antfly server.
+
+Only `connectors.chatgpt.enabled` is implemented now. Hosted Google/AWS connector settings,
+`auth_ref`, secret references, and hosted OAuth client configuration require their
+own typed schema and credential-lifecycle design; this release does not accept
+placeholder fields for them.
+
+### Verification contract
+
+- Configuration omission preserves local use; explicit false disables it and
+  malformed policy is rejected.
+- Explicit false takes precedence even if a manager pointer is present. All five
+  management routes reject before dereferencing it, and status reports the reason.
+- Generation with no manager rejects before any upstream work; CLI recognizes the
+  stable disabled error and retains normal ownership errors.
+- Antfarm does not query accounts/models or authorize while disabled and does not
+  silently replace saved ChatGPT generator selections.
+- A disabled standalone startup does not create its ChatGPT store or callback
+  listener; an enabled local startup retains account access.
 
 ## Existing integration points
 
@@ -359,8 +483,11 @@ retries, redirects and cookies and bound individual responses and requests.
 `connections` is the namespace for provider grants, separate from Antfly user
 identity/permissions under `auth`. Additional providers can define their own
 scopes and authentication mechanisms (including non-browser methods); Google,
-AWS and Antfly Cloud inference are not implemented here. Neither the CLI nor
-HTTP management API exposes credential import/export. Remote URLs are rejected.
+AWS use local vendor credential stores as described in
+[CONNECTIONS.md](CONNECTIONS.md#local-google-and-aws-login). Antfly Cloud inference
+sign-in remains future work. Neither the CLI nor HTTP management API exposes
+credential import/export. ChatGPT commands reject remote server URLs; Google/AWS
+commands authenticate only the machine where the CLI runs.
 
 The later VM flow is local browser authorization followed by protected transfer
 of a selected registration over SSH. A VM must persist its own stable host ID

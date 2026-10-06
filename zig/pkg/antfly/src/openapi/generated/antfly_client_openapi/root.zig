@@ -107,6 +107,7 @@ pub const Connection = types.Connection;
 pub const ConnectionKind = types.ConnectionKind;
 pub const ConnectionStatus = types.ConnectionStatus;
 pub const ConnectionsResponse = types.ConnectionsResponse;
+pub const ConnectorCapabilities = types.ConnectorCapabilities;
 pub const ContentPart = types.ContentPart;
 pub const CreateAlgebraicIndexRequest = types.CreateAlgebraicIndexRequest;
 pub const CreateApiKeyRequest = types.CreateApiKeyRequest;

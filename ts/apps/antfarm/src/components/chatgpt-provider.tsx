@@ -21,6 +21,8 @@ export function chatGPTErrorMessage(error: unknown): string {
       : error instanceof Error
         ? error.message
         : "";
+  if (code.includes("ChatGPTDisabled"))
+    return "ChatGPT connections are disabled on this server. Choose another generator.";
   if (code.includes("UsageLimitExceeded"))
     return "Your ChatGPT plan or app usage limit was reached. Manage usage in ChatGPT settings, or choose another provider.";
   if (code.includes("ReconnectRequired")) return "Reconnect your ChatGPT account to continue.";
@@ -34,6 +36,7 @@ export function chatGPTErrorMessage(error: unknown): string {
 }
 interface State {
   supported: boolean;
+  unavailableMessage: string | null;
   accounts: ChatGPTAccount[];
   models: Record<string, ChatGPTModel[]>;
   busy: boolean;
@@ -45,6 +48,7 @@ interface State {
 }
 const empty: State = {
   supported: false,
+  unavailableMessage: "Checking ChatGPT availability…",
   accounts: [],
   models: {},
   busy: false,
@@ -75,6 +79,9 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
     return new AntflyClient({ baseUrl: apiUrl, ...(auth ? { auth } : {}) });
   }, [apiUrl, user]);
   const [supported, setSupported] = useState(false);
+  const [unavailableMessage, setUnavailableMessage] = useState<string | null>(
+    "Checking ChatGPT availability…"
+  );
   const [accounts, setAccounts] = useState<ChatGPTAccount[]>([]);
   const [models, setModels] = useState<Record<string, ChatGPTModel[]>>({});
   const [busy, setBusy] = useState(false);
@@ -90,6 +97,7 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
       if (signal.aborted) return;
       setAccounts(result.accounts);
       setSupported(true);
+      setUnavailableMessage(null);
     },
     [client]
   );
@@ -99,6 +107,7 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
     catalogVersions.current.clear();
     modelCatalog.current = {};
     setSupported(false);
+    setUnavailableMessage("Checking ChatGPT availability…");
     setAccounts([]);
     setModels({});
     setError(null);
@@ -106,17 +115,31 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
     setBusy(false);
     modelRequests.current.clear();
     if (!isLoading && isAuthenticated)
-      refresh(controller.signal).catch((err: unknown) => {
+      (async () => {
+        const status = await client.getStatus();
+        if (controller.signal.aborted) return;
+        if (status?.connectors?.chatgpt?.enabled === false) {
+          setUnavailableMessage(
+            "ChatGPT connections are disabled on this server. Choose another generator."
+          );
+          return;
+        }
+        await refresh(controller.signal);
+      })().catch((err: unknown) => {
         if (
           !controller.signal.aborted &&
           !(err instanceof ChatGPTConnectionError && [403, 404].includes(err.status))
         )
           setError(chatGPTErrorMessage(err));
+        if (!controller.signal.aborted)
+          setUnavailableMessage(
+            "ChatGPT connections are unavailable on this server. Choose another generator."
+          );
       });
     return () => {
       controller.abort();
     };
-  }, [refresh, isAuthenticated, isLoading]);
+  }, [client, refresh, isAuthenticated, isLoading]);
 
   const invalidateModels = useCallback((id: string) => {
     catalogVersions.current.set(id, (catalogVersions.current.get(id) ?? 0) + 1);
@@ -131,7 +154,13 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
   const loadModels = useCallback(
     async (id: string) => {
       const signal = scope.current?.signal;
-      if (!signal || signal.aborted || modelRequests.current.has(id) || modelCatalog.current[id])
+      if (
+        !supported ||
+        !signal ||
+        signal.aborted ||
+        modelRequests.current.has(id) ||
+        modelCatalog.current[id]
+      )
         return;
       const request = Symbol(id);
       modelRequests.current.set(id, request);
@@ -151,12 +180,12 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         if (modelRequests.current.get(id) === request) modelRequests.current.delete(id);
       }
     },
-    [client]
+    [client, supported]
   );
   const connect = useCallback(
     async (id?: string) => {
       const signal = scope.current?.signal;
-      if (!signal || signal.aborted || busy) return;
+      if (!signal || signal.aborted || busy || !supported) return;
       // Open during the click gesture to avoid popup blockers while waiting for
       // the runtime to bind its callback listener.
       const popup = window.open("about:blank", "_blank");
@@ -219,12 +248,12 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         if (!signal.aborted) setBusy(false);
       }
     },
-    [client, refresh, busy, invalidateModels, loadModels]
+    [client, refresh, busy, supported, invalidateModels, loadModels]
   );
   const disconnect = useCallback(
     async (id: string) => {
       const signal = scope.current?.signal;
-      if (!signal || signal.aborted || busy) return;
+      if (!signal || signal.aborted || busy || !supported) return;
       setBusy(true);
       setError(null);
       try {
@@ -244,11 +273,22 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         if (!signal.aborted) setBusy(false);
       }
     },
-    [client, refresh, busy, invalidateModels]
+    [client, refresh, busy, supported, invalidateModels]
   );
   return (
     <Context.Provider
-      value={{ supported, accounts, models, busy, error, notice, connect, disconnect, loadModels }}
+      value={{
+        supported,
+        unavailableMessage,
+        accounts,
+        models,
+        busy,
+        error,
+        notice,
+        connect,
+        disconnect,
+        loadModels,
+      }}
     >
       {children}
     </Context.Provider>

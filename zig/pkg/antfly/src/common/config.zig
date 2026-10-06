@@ -84,6 +84,7 @@ pub const Config = struct {
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
+    connectors: ConnectorsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
 
     pub const RequestAdmissionConfig = struct {
@@ -422,6 +423,15 @@ pub const Config = struct {
     pub const RemoteContentConfig = scraping.RemoteContentConfig;
 
     pub const ConnectionsConfig = std.StringArrayHashMapUnmanaged(ConnectionConfig);
+
+    /// Integration policy, separate from named connections and login providers.
+    pub const ConnectorsConfig = struct {
+        chatgpt: struct { enabled: ?bool = null } = .{},
+
+        pub fn allowsLocalChatGPT(self: @This()) bool {
+            return self.chatgpt.enabled orelse true;
+        }
+    };
 
     pub const ConnectionKind = enum {
         inference,
@@ -817,6 +827,14 @@ pub const Config = struct {
         var connections = try parseConnectionsConfig(alloc, root.get("connections"));
         errdefer deinitConnectionsConfig(alloc, &connections);
         try validateStorageConnections(&storage_config, &connections);
+        var connectors: ConnectorsConfig = .{};
+        if (root.get("connectors")) |value| {
+            try validateObjectMemberFields(root, "connectors", &.{"chatgpt"});
+            if (value.object.get("chatgpt")) |chatgpt| {
+                try validateObjectMemberFields(value.object, "chatgpt", &.{"enabled"});
+                connectors.chatgpt.enabled = try optionalBoolField(chatgpt.object, "enabled");
+            }
+        }
 
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
@@ -871,6 +889,7 @@ pub const Config = struct {
         errdefer if (pgwire) |wire| if (wire.bind_host) |host| alloc.free(host);
         return .{
             .pgwire = pgwire,
+            .connectors = connectors,
             .registry = registry,
             .transcribers = transcribers,
             .readers = reader_registry,
@@ -3784,4 +3803,20 @@ test "common config bootstraps named secret sources before resolving credentials
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("credential", resolved);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
+}
+
+test "common config parses ChatGPT connector policy and rejects misspellings" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{}", "{\"chatgpt\":{}}", "{\"chatgpt\":{\"enabled\":true}}", "{\"chatgpt\":{\"enabled\":false}}" }, 0..) |connectors, index| {
+        const raw = try std.fmt.allocPrint(a, "{{\"storage\":{{\"engine\":\"local\",\"local\":{{\"base_dir\":\"antflydb\"}}}},\"connectors\":{s}}}", .{connectors});
+        defer a.free(raw);
+        var cfg = try Config.parseFromSlice(a, raw);
+        defer cfg.deinit();
+        try std.testing.expectEqual(index != 3, cfg.connectors.allowsLocalChatGPT());
+    }
+    for ([_][]const u8{ "false", "{\"chatgpt\":false}", "{\"chatgpt\":{\"enable\":false}}", "{\"chatgpt\":{\"enabled\":\"false\"}}", "{\"unknown\":{}}" }) |connectors| {
+        const raw = try std.fmt.allocPrint(a, "{{\"connectors\":{s}}}", .{connectors});
+        defer a.free(raw);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, raw));
+    }
 }

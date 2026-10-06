@@ -5615,6 +5615,14 @@ export interface components {
          * @enum {string}
          */
         ArtifactSourcesCapabilityState: "available" | "upgrade_pending" | "unsupported";
+        /** @description Effective integration availability for this deployment; independent of login providers and individual grants. */
+        ConnectorCapabilities: {
+            chatgpt: {
+                enabled: boolean;
+                /** @enum {string} */
+                reason?: "operator_disabled" | "local_runtime_required";
+            };
+        };
         ClusterStatus: {
             health: components["schemas"]["ClusterHealth"];
             /** @description Optional message providing details about the health status */
@@ -5626,6 +5634,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            connectors?: components["schemas"]["ConnectorCapabilities"];
             index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
@@ -5644,6 +5653,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            connectors?: components["schemas"]["ConnectorCapabilities"];
             index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];

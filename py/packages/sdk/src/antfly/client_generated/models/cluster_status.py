@@ -11,6 +11,7 @@ from ..models.cluster_status_deployment_mode import ClusterStatusDeploymentMode
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.connector_capabilities import ConnectorCapabilities
     from ..models.index_runtime_capabilities import IndexRuntimeCapabilities
     from ..models.runtime_config_status import RuntimeConfigStatus
     from ..models.secret_store_status import SecretStoreStatus
@@ -28,6 +29,8 @@ class ClusterStatus:
         message (str | Unset): Optional message providing details about the health status
         auth_enabled (bool | Unset): Indicates whether authentication is enabled for the cluster
         deployment_mode (ClusterStatusDeploymentMode | Unset): Runtime deployment topology
+        connectors (ConnectorCapabilities | Unset): Effective integration availability for this deployment; independent
+            of login providers and individual grants.
         index_capabilities (IndexRuntimeCapabilities | Unset): Deployment-level index capabilities clients can inspect
             before submitting index mutations.
         secret_store (SecretStoreStatus | Unset): Non-secret status for the local secrets file store, when one is
@@ -41,6 +44,7 @@ class ClusterStatus:
     message: str | Unset = UNSET
     auth_enabled: bool | Unset = UNSET
     deployment_mode: ClusterStatusDeploymentMode | Unset = UNSET
+    connectors: ConnectorCapabilities | Unset = UNSET
     index_capabilities: IndexRuntimeCapabilities | Unset = UNSET
     secret_store: SecretStoreStatus | Unset = UNSET
     runtime_config: RuntimeConfigStatus | Unset = UNSET
@@ -57,6 +61,10 @@ class ClusterStatus:
         deployment_mode: str | Unset = UNSET
         if not isinstance(self.deployment_mode, Unset):
             deployment_mode = self.deployment_mode.value
+
+        connectors: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.connectors, Unset):
+            connectors = self.connectors.to_dict()
 
         index_capabilities: dict[str, Any] | Unset = UNSET
         if not isinstance(self.index_capabilities, Unset):
@@ -87,6 +95,8 @@ class ClusterStatus:
             field_dict["auth_enabled"] = auth_enabled
         if deployment_mode is not UNSET:
             field_dict["deployment_mode"] = deployment_mode
+        if connectors is not UNSET:
+            field_dict["connectors"] = connectors
         if index_capabilities is not UNSET:
             field_dict["index_capabilities"] = index_capabilities
         if secret_store is not UNSET:
@@ -100,6 +110,7 @@ class ClusterStatus:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.connector_capabilities import ConnectorCapabilities
         from ..models.index_runtime_capabilities import IndexRuntimeCapabilities
         from ..models.runtime_config_status import RuntimeConfigStatus
         from ..models.secret_store_status import SecretStoreStatus
@@ -118,6 +129,13 @@ class ClusterStatus:
             deployment_mode = UNSET
         else:
             deployment_mode = ClusterStatusDeploymentMode(_deployment_mode)
+
+        _connectors = d.pop("connectors", UNSET)
+        connectors: ConnectorCapabilities | Unset
+        if isinstance(_connectors, Unset):
+            connectors = UNSET
+        else:
+            connectors = ConnectorCapabilities.from_dict(_connectors)
 
         _index_capabilities = d.pop("index_capabilities", UNSET)
         index_capabilities: IndexRuntimeCapabilities | Unset
@@ -152,6 +170,7 @@ class ClusterStatus:
             message=message,
             auth_enabled=auth_enabled,
             deployment_mode=deployment_mode,
+            connectors=connectors,
             index_capabilities=index_capabilities,
             secret_store=secret_store,
             runtime_config=runtime_config,

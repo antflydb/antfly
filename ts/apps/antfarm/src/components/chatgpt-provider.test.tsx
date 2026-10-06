@@ -6,6 +6,7 @@ import { GENERATOR_DEFAULT_CONFIG, GeneratorSelector } from "./playground/Genera
 const mock = vi.hoisted(() => ({
   owner: "alice",
   url: "http://localhost:8080",
+  status: vi.fn().mockResolvedValue({}),
   accounts: vi.fn(),
   models: vi.fn(),
   disconnect: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock("@/hooks/use-connections", () => ({
 vi.mock("@antfly/sdk", () => ({
   generatorProviders: ["openai", "chatgpt"],
   AntflyClient: class {
+    getStatus = mock.status;
     chatgpt = {
       accounts: mock.accounts,
       models: mock.models,
@@ -42,6 +44,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  mock.status.mockResolvedValue({});
   mock.owner = "alice";
   mock.url = "http://localhost:8080";
 });
@@ -332,4 +335,55 @@ it("does not reload the old owner's catalog if identity changes during sign-in r
   });
   expect(mock.models).not.toHaveBeenCalled();
   expect(context.models).toEqual({});
+});
+
+it("does not fetch credentials or start authorization when the connector is disabled", async () => {
+  mock.status.mockResolvedValue({
+    connectors: { chatgpt: { enabled: false, reason: "operator_disabled" } },
+  });
+  render(
+    <ChatGPTProvider>
+      <Consumer />
+      <SelectedAccount />
+    </ChatGPTProvider>
+  );
+  await waitFor(() => expect(context.unavailableMessage).toContain("disabled on this server"));
+  expect(context.supported).toBe(false);
+  expect(mock.accounts).not.toHaveBeenCalled();
+  expect(mock.models).not.toHaveBeenCalled();
+  await act(async () => {
+    await context.connect();
+  });
+  expect(mock.authorize).not.toHaveBeenCalled();
+});
+
+it("clears local account state when switching to a disabled endpoint", async () => {
+  mock.status.mockResolvedValue({ connectors: { chatgpt: { enabled: true } } });
+  mock.accounts.mockResolvedValue({
+    accounts: [
+      { connection_id: "one", email: "alice@example.com", connected: true, plan_enabled: true },
+    ],
+  });
+  const view = render(
+    <ChatGPTProvider>
+      <Consumer />
+    </ChatGPTProvider>
+  );
+  await screen.findByText("alice@example.com");
+  mock.status.mockResolvedValue({ connectors: { chatgpt: { enabled: false } } });
+  mock.url = "https://cloud.example.com";
+  view.rerender(
+    <ChatGPTProvider>
+      <Consumer />
+    </ChatGPTProvider>
+  );
+  await waitFor(() => expect(context.unavailableMessage).toContain("disabled"));
+  expect(context.supported).toBe(false);
+  expect(context.accounts).toEqual([]);
+  expect(context.models).toEqual({});
+  expect(mock.accounts).toHaveBeenCalledTimes(1);
+  await act(async () => {
+    await context.loadModels("one");
+  });
+  expect(mock.models).not.toHaveBeenCalled();
 });

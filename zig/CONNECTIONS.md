@@ -8,6 +8,127 @@ fetching, replication, agents, backups, and related workflows. They should
 become first-class resources with inventory, health, capability, and
 authorization metadata.
 
+## Local Google and AWS login
+
+`antfly connections` manages provider credentials separately from Antfly identity
+under `antfly auth`. ChatGPT uses the local server's protected grant store (see
+[CHATGPT.md](CHATGPT.md)). Google and AWS use vendor-managed local credential
+stores, shared by the existing storage and inference adapters. These CLI commands
+do not create named resources in the `/connections` inventory.
+
+```sh
+antfly connections login google --project my-project
+antfly connections list google
+antfly connections logout google
+
+antfly connections login aws --profile work
+antfly connections list aws --profile work
+antfly connections logout aws --profile work
+```
+
+Install `gcloud` for Google or AWS CLI v2 for AWS (2.32 or later for console
+sign-in). Antfly delegates browser authorization to these tools and needs no
+Antfly-owned OAuth client or AWS application registration. Commands work without
+a running Antfly server; `ANTFLY_URL` and Antfly API authentication do not affect
+them. Run them as the OS user that runs Antfly and restart an existing server
+after login/logout. Credentials stay on that machine and are shared with other
+local applications using the same vendor credential store.
+
+### Google Application Default Credentials
+
+Login runs `gcloud auth application-default login` with `cloud-platform`, `openid`
+and email scopes, then checks that ADC can refresh a token. `--no-browser` uses
+gcloud's local manual URL flow. `--project` selects the ADC quota project; it does
+not create a project, enable APIs, grant IAM access or configure Antfly's Vertex
+resource project.
+
+GCS default credentials and Vertex inference already load ADC and refresh
+`authorized_user` tokens. Configure Vertex's `project_id` and `location` (or the
+existing supported project environment variables), enable the required Google
+APIs and grant the user suitable IAM permissions. Google embeddings here mean
+Vertex AI embeddings billed to a Google Cloud project; consumer Gemini
+subscriptions and Gemini API keys remain separate.
+
+`GOOGLE_APPLICATION_CREDENTIALS` overrides local user ADC. Management commands
+reject that override instead of changing an unused credential file. Explicit
+service-account credentials remain supported in resource configuration.
+`CLOUDSDK_CONFIG` selects the vendor config directory. Logout revokes the shared
+local ADC and can affect other applications. `list` checks credential refresh,
+not permission to every bucket/model. Tokens and credential-check diagnostics
+never appear in its JSON output.
+
+### AWS console and IAM Identity Center
+
+Always specify `--profile`, including for list/logout. A configured SSO profile
+automatically uses `aws sso login`; `--sso` selects it explicitly. Configure IAM
+Identity Center first with `aws configure sso --profile work`. SSO supports
+`--no-browser`. Console sign-in uses `aws login` and requires a local browser;
+Antfly does not enable the vendor's separate remote authorization flow.
+
+For profiles containing `login_session`, `sso_session` or legacy `sso_start_url`,
+the credential resolver shared by S3 and Bedrock delegates resolution and refresh
+to `aws configure export-credentials --format process`. Captured credentials stay
+in memory, temporary grants retain expiration, and the existing cache refreshes
+them before expiration. The subprocess shares the request's remaining deadline
+and cancellation, with a 30-second ceiling, bounded output and no shell
+interpolation. A failed selected browser profile fails closed rather than
+falling back to instance metadata or stale static keys.
+
+Start Antfly with `AWS_PROFILE=work` for default S3 and Bedrock/Titan credentials.
+Existing environment static keys and web identity take precedence; unset static
+keys to use browser credentials. A named S3 connection can select a profile
+explicitly:
+
+```yaml
+connections:
+  archives:
+    kind: external_io
+    capabilities: [objects.read, objects.write, backup.write, restore.read]
+    external_io:
+      protocol: s3
+      buckets: [my-archive-bucket]
+      credentials:
+        source: profile
+        profile: work
+```
+
+The identity needs separate IAM permissions for S3 and Bedrock and an applicable
+region/model configuration. Login does not grant permissions or model access.
+Native static profiles, service credentials, web identity, ECS and instance
+credentials retain their paths. Explicit `shared_credentials_file` retains
+file-only semantics. Browser profiles require the AWS CLI to remain installed
+for refresh. Antfly does not execute arbitrary `credential_process` commands
+itself.
+
+Console logout selects the requested login profile. Profiles without a console
+login session are rejected. `aws sso logout` clears **all** cached SSO sessions;
+Antfly rejects per-profile SSO logout and explains how to invoke that global
+vendor command deliberately. Restart servers after logout to discard cached
+unexpired credentials. Local logout does not promise immediate upstream
+revocation of all issued STS credentials.
+
+### Configuration and hosted boundary
+
+Top-level `connectors` owns application integration policy and OAuth settings;
+`connections` owns configured resources; `auth_providers` owns Antfly identity
+login. Only `connectors.chatgpt.enabled` is implemented in this slice. Local
+Google/AWS credentials need no placeholder `connectors.google` or
+`connectors.aws` settings and are not per-user Antfly server grants.
+
+Antfly Cloud should use managed workload identities or explicitly configured
+service credentials. Laptop login does not authenticate a remote Antfly/Colony
+deployment. Hosted per-user grants, `auth_ref`, Google Drive indexing and scope
+escalation, cloud inference sign-in and remote credential transfer remain future
+work. Hosted connectors must define OAuth registration, tenant ownership, scopes,
+protected grant storage, refresh/revocation and resource references before adding
+login endpoints.
+
+Vendor contracts: [Google ADC login](https://docs.cloud.google.com/sdk/gcloud/reference/auth/application-default/login),
+[ADC resolution](https://docs.cloud.google.com/docs/authentication/application-default-credentials),
+[AWS console sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html),
+[AWS credential export](https://docs.aws.amazon.com/cli/latest/reference/configure/export-credentials.html)
+and [AWS logout](https://docs.aws.amazon.com/cli/latest/reference/logout/).
+
 ## Goals
 
 - Give operators one inventory of configured external systems.

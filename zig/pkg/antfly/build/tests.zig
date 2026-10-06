@@ -1587,6 +1587,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "ChatGPT connector policy",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
         "artifact enrichment accepts typed chunker and rejects ambiguous legacy config",
         "artifact enrichment list does not expose internal JSON or producer credentials",
@@ -1893,7 +1894,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{"cmd.cli."},
+        .filters = &.{ "cmd.cli.", "cloud credentials" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
