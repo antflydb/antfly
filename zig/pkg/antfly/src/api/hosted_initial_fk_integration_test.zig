@@ -167,7 +167,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
     // Hosted owner receipts require explicit administrator enrollment of the
     // physical store key; ordinary service registration cannot authorize it.
-    const signing_root = try @import("../storage/db/root_signing_identity.zig").load(alloc, io, data_root);
+    const signing_root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, data_root);
     const proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
         .metadata_incarnation = (try metadata.server.svc.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable,
         .node_id = 9,
@@ -236,7 +236,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
         if (observed) |value| {
             var response = value;
             defer response.deinit(alloc);
-            const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const Identity = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
             var identity = try std.json.parseFromSlice(Identity, alloc, response.json, .{ .ignore_unknown_fields = true });
             defer identity.deinit();
             try std.testing.expectEqual(parent_table_id, identity.value.namespace.table_id);
@@ -416,7 +416,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
             if (range.table_id == child_table_id) break range.group_id;
         } else return error.TestExpectedPublishedChildRange;
         const released_before = (try data.readHiddenInitialChildRecord(child_group, child_table_id)) orelse return error.TestExpectedHiddenChildReceipt;
-        try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.released, released_before.phase);
+        try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.released, released_before.phase);
         const parent_probe_started_ns = platform.time.monotonicNs();
         var parent_catalog_probe = (try reader.lookup(alloc, parent_name.?, "", .{
             .relational_integrity_catalog = true,
@@ -448,11 +448,11 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
         // outcome is uncertain.
         var parent_epoch = try std.json.parseFromSlice(struct { schema_version: u32 }, alloc, parent_catalog_probe.json, .{ .ignore_unknown_fields = true });
         defer parent_epoch.deinit();
-        var parent_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, parent_support.schema_json);
+        var parent_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, parent_support.schema_json);
         defer parent_schema.deinit(alloc);
         const Condition = struct { column: []const u8, op: []const u8 = "eq", value: std.json.Value };
         const conditions = [_]Condition{.{ .column = "a", .value = .{ .integer = 1 } }};
-        const support = try @import("../schema/relational_witness_indexes.zig").select(alloc, parent_schema, &conditions);
+        const support = try @import("antfly_local_sources").schema_relational_witness_indexes.select(alloc, parent_schema, &conditions);
         defer alloc.free(support.values);
         const scan_query = try std.json.Stringify.valueAlloc(alloc, .{
             .schema_version = parent_epoch.value.schema_version,
@@ -597,7 +597,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
             if (value) |record| break record;
             try io.sleep(.fromMilliseconds(10), .awake);
         } else return error.TestExpectedRecoveredHiddenChildReceipt;
-        try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.released, released_after.phase);
+        try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.released, released_after.phase);
         try std.testing.expectEqual(released_before.provision_term, released_after.provision_term);
         try std.testing.expectEqual(released_before.provision_index, released_after.provision_index);
         const restarted_base = try data.baseUri(alloc);

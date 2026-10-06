@@ -27,9 +27,9 @@ fn heapAllocator() std.mem.Allocator {
 const use_evented_async_runtime =
     build_options.lmdb_evented_async_io and
     builtin.os.tag == .macos and
-    std.Io.Evented != void;
+    @import("antfly_platform").Evented != void;
 
-const AsyncRuntime = if (use_evented_async_runtime) std.Io.Evented else std.Io.Threaded;
+const AsyncRuntime = if (use_evented_async_runtime) @import("antfly_platform").Evented else std.Io.Threaded;
 // This module is built independently from the Antfly root module, so it cannot
 // import common/threaded_io_limits.zig. Keep the LMDB commit runtime finite at
 // the same conservative process-lifetime ceiling.

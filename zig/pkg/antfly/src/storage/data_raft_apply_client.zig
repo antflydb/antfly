@@ -159,10 +159,10 @@ pub const RaftApplyStore = struct {
         return std.json.parseFromSliceLeaky(@import("../data/merge_membership_admission.zig").Observation, alloc, response.slice(), .{});
     }
 
-    pub fn currentMergeReceiverState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?@import("db/merge_contract.zig").State {
+    pub fn currentMergeReceiverState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !?@import("antfly_local_sources").storage_db_merge_contract.State {
         var response = try self.projection(.{ .kind = .current_merge_receiver, .group_id = group_id });
         defer abi.antfly_storage_owner_buffer_destroy(&response);
-        return try std.json.parseFromSliceLeaky(?@import("db/merge_contract.zig").State, alloc, response.slice(), .{ .allocate = .alloc_always });
+        return try std.json.parseFromSliceLeaky(?@import("antfly_local_sources").storage_db_merge_contract.State, alloc, response.slice(), .{ .allocate = .alloc_always });
     }
 
     pub fn currentSplitState(

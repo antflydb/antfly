@@ -14,7 +14,7 @@
 
 //! Server routing and bounded ownership transfer for local expiry observations.
 const std = @import("std");
-const local = @import("coordinated_ttl.zig");
+const local = @import("antfly_local_sources").storage_coordinated_ttl;
 pub const Candidate = local.Candidate;
 pub const Request = struct {
     table_id: u64,

@@ -4,7 +4,7 @@
 //! This adapter always executes in the archive that owns the HA Primary.
 const hot_standby_publisher_adapter = @import("hot_standby/db_commit.zig");
 const std = @import("std");
-const policy = @import("db/replication_contract.zig");
+const policy = @import("antfly_local_sources").storage_db_replication_contract;
 const port = @import("metadata_hot_standby_port.zig");
 const chunks = @import("hot_standby/metadata_effect_chunks.zig");
 

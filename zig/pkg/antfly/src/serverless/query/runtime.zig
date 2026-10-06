@@ -21,10 +21,10 @@ const manifest_mod = @import("../manifest/mod.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const graph_metric_config = @import("../build/graph_metric_config.zig");
 const cache_mod = @import("cache.zig");
-const bounded_decode = @import("../bounded_decode.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 const graph_reader = @import("graph_reader.zig");
 const request_mod = @import("request.zig");
-const operation = @import("../../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const CancellationToken = operation.CancellationToken;
 const read_lease = @import("../manifest/read_lease.zig");
 

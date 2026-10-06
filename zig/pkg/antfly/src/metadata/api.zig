@@ -23,10 +23,10 @@ const raft_host = @import("../raft/host.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
-const metadata_incarnation = @import("incarnation.zig");
+const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
 const reallocation_request = @import("reallocation_request.zig");
 
-pub const MetadataClusterIncarnation = @import("catalog_mutation_stamp.zig").MetadataClusterIncarnation;
+pub const MetadataClusterIncarnation = @import("antfly_local_sources").metadata_catalog_mutation_stamp.MetadataClusterIncarnation;
 
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
@@ -34,7 +34,7 @@ pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint
 /// The Raft log index is comparable only inside the same metadata namespace;
 /// carrying that namespace with the receipt prevents delayed callbacks from a
 /// replaced metadata group from superseding current control-plane work.
-pub const CatalogMutationStamp = @import("catalog_mutation_stamp.zig").CatalogMutationStamp;
+pub const CatalogMutationStamp = @import("antfly_local_sources").metadata_catalog_mutation_stamp.CatalogMutationStamp;
 
 /// Allocation-free subset of `/status` used by rolling-upgrade admission
 /// probes. Keeping this separate from MetadataStatus avoids parsing and
@@ -382,18 +382,18 @@ pub const CatalogRouteQuery = struct {
     group_id: u64 = 0,
 };
 
-pub const CatalogIdentityNamespace = @import("catalog_route_contract.zig").CatalogIdentityNamespace;
-pub const CatalogGroupRoute = @import("catalog_route_contract.zig").CatalogGroupRoute;
-pub const catalog_route_fence_protocol_current = @import("catalog_route_contract.zig").catalog_route_fence_protocol_current;
-pub const catalog_route_fence_header = @import("catalog_route_contract.zig").catalog_route_fence_header;
-pub const catalog_route_fence_ack_header = @import("catalog_route_contract.zig").catalog_route_fence_ack_header;
-pub const catalog_route_fence_ack_value = @import("catalog_route_contract.zig").catalog_route_fence_ack_value;
-pub const read_index_absence_header = @import("catalog_route_contract.zig").read_index_absence_header;
-pub const read_index_absence_value = @import("catalog_route_contract.zig").read_index_absence_value;
-pub const catalog_route_deadline_ms_header = @import("catalog_route_contract.zig").catalog_route_deadline_ms_header;
-pub const catalog_route_default_deadline_ms = @import("catalog_route_contract.zig").catalog_route_default_deadline_ms;
-pub const catalog_route_max_deadline_ms = @import("catalog_route_contract.zig").catalog_route_max_deadline_ms;
-pub const CatalogRouteFence = @import("catalog_route_contract.zig").CatalogRouteFence;
+pub const CatalogIdentityNamespace = @import("antfly_local_sources").metadata_catalog_route_contract.CatalogIdentityNamespace;
+pub const CatalogGroupRoute = @import("antfly_local_sources").metadata_catalog_route_contract.CatalogGroupRoute;
+pub const catalog_route_fence_protocol_current = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_protocol_current;
+pub const catalog_route_fence_header = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_header;
+pub const catalog_route_fence_ack_header = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_ack_header;
+pub const catalog_route_fence_ack_value = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_fence_ack_value;
+pub const read_index_absence_header = @import("antfly_local_sources").metadata_catalog_route_contract.read_index_absence_header;
+pub const read_index_absence_value = @import("antfly_local_sources").metadata_catalog_route_contract.read_index_absence_value;
+pub const catalog_route_deadline_ms_header = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_deadline_ms_header;
+pub const catalog_route_default_deadline_ms = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_default_deadline_ms;
+pub const catalog_route_max_deadline_ms = @import("antfly_local_sources").metadata_catalog_route_contract.catalog_route_max_deadline_ms;
+pub const CatalogRouteFence = @import("antfly_local_sources").metadata_catalog_route_contract.CatalogRouteFence;
 
 pub const CatalogRoutePlan = struct {
     metadata_group_id: u64,

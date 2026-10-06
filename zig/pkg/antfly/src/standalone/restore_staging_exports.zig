@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const bridge = @import("restore_staging_bridge.zig");
-const restore_staging = @import("../storage/lite/restore_staging.zig");
+const restore_staging = @import("antfly_local_sources").storage_lite_restore_staging;
 
 const State = struct {
     allocator: std.mem.Allocator,

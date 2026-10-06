@@ -4,20 +4,20 @@
 const std = @import("std");
 const httpx = @import("httpx");
 const readers = @import("antfly_readers");
-const asset_producer_runtime = @import("asset_producer_runtime.zig");
-const asset_producer = @import("storage/db/enrichment/asset_producer.zig");
-const enrichment_runtime = @import("storage/db/enrichment/enrichment_runtime.zig");
-const managed_embedder = @import("inference/managed_embedder.zig");
+const asset_producer_runtime = @import("antfly_local_sources").asset_producer_runtime;
+const asset_producer = @import("antfly_local_sources").storage_db_enrichment_asset_producer;
+const enrichment_runtime = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const inference_work = @import("antfly_inference_work");
 const inference_types = @import("antfly_inference_types");
-const embedder = @import("storage/db/enrichment/embedder.zig");
-const document_extraction = @import("storage/db/enrichment/document_extraction.zig");
-const template = @import("template.zig");
+const embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const document_extraction = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
+const template = @import("antfly_local_sources").template;
 const fixture = @import("pdf_integration_fixture");
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa.deinit() == 0);
     const alloc = gpa.allocator();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--qualify-apple")) {
             var runtime = asset_producer_runtime.Runtime.init(alloc, &client);
             defer runtime.deinit();
-            return enrichment_runtime.runApplePdfOcrGroundingIntegration(alloc, fixture.reader_two_lines_scanned_pdf, runtime.producer());
+            return enrichment_runtime.runApplePdfOcrGroundingIntegration(alloc, fixture.reader_two_lines_scanned_pdf, runtime.producer(), @import("storage/memory_budget.zig").smartResourceBudgets(0).options);
         }
         if (!std.mem.eql(u8, arg, "--qualify-real")) return error.InvalidIntegrationArgument;
         return try runRealModelQualification(alloc, &client);
@@ -356,6 +356,7 @@ pub fn main(init: std.process.Init) !void {
         alloc,
         fixture.reader_two_lines_scanned_pdf,
         producer,
+        @import("storage/memory_budget.zig").smartResourceBudgets(0).options,
     );
     if (local.read_calls != 4) return error.IntegrationGroundingReaderWasNotInvoked;
 }
@@ -484,3 +485,6 @@ fn runRealModelQualification(alloc: std.mem.Allocator, client: *httpx.Client) !v
             return error.InvalidQualificationEmbeddingOutput;
     }
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

@@ -44,7 +44,7 @@ pub const SplitTerminalOutcome = enum(u8) {
     rolled_back = 2,
 };
 
-pub const ByteRange = @import("byte_range.zig").ByteRange;
+pub const ByteRange = @import("antfly_local_sources").storage_byte_range.ByteRange;
 
 pub const SplitState = struct {
     phase: SplitPhase,

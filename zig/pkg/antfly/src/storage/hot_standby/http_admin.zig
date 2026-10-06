@@ -28,7 +28,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const platform_sync = @import("antfly_platform").sync;
 const admin_api = @import("../../admin/mod.zig");
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const http_operation = @import("http_operation.zig");
 const hot_standby_admin = @import("admin.zig");
 const http_internal = @import("http_internal.zig");
@@ -44,7 +44,7 @@ const owner_job_gate = @import("owner_job_gate.zig");
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const rejoin = @import("rejoin.zig");
 const seed_artifact = @import("seed_artifact.zig");
 const seed_capture = @import("seed_capture.zig");
@@ -4942,10 +4942,10 @@ test "storage.hot_standby http admin implemented admin routes are documented" {
 }
 
 test "storage.hot_standby http admin exposes request executor" {
-    var owner_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(owner_gpa.deinit() == .ok);
-    var caller_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(caller_gpa.deinit() == .ok);
+    var owner_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x48410101 });
+    defer std.debug.assert(owner_gpa.deinit() == 0);
+    var caller_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x48410102 });
+    defer std.debug.assert(caller_gpa.deinit() == 0);
 
     var server = Server.init(owner_gpa.allocator(), .{});
     defer server.deinit();

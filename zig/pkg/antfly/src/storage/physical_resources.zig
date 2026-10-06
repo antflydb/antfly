@@ -3,9 +3,9 @@
 
 const std = @import("std");
 const memory_budget = @import("memory_budget.zig");
-const lsm_backend = @import("lsm_backend/mod.zig");
-const hbc_mod = @import("hbc_adapter.zig");
-const resource_manager_mod = @import("resource_manager.zig");
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const hbc_mod = @import("antfly_local_sources").storage_hbc_adapter;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 
 /// Process-wide physical resources shared by every resident storage owner.
 /// This deliberately excludes API read/write/status caches so the compiled

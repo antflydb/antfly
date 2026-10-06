@@ -192,7 +192,8 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     var checked_iterator = checked.keyIterator();
     while (checked_iterator.next()) |entry| {
         const artifact = entry.*;
-        std.debug.print("ASSET_COMMAND {s}\n", .{artifact.name});
+        const report = b.addSystemCommand(&.{ "/bin/echo", "ASSET_COMMAND", artifact.name });
+        check_step.dependOn(&report.step);
         check_step.dependOn(&artifact.step);
     }
     const compose = b.addRunArtifact(assets.get("compose-lora-adapters").?);

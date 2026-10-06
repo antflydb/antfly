@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const tree = @import("../graph_segment/page_tree.zig");
 const page_store = @import("../graph_segment/page_store.zig");
 const artifacts = @import("../artifacts/store.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 
 pub const max_document_id_bytes = 256 * 1024;
 pub const max_pending_key_bytes = max_document_id_bytes + 8;

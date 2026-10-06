@@ -5,9 +5,9 @@
 //! commit authority: the session seals the final guarded plan before 2PC.
 const std = @import("std");
 const sessions = @import("transactions.zig");
-const integrity = @import("relational_integrity_commit.zig");
-const contract = @import("distributed_txn_contract.zig");
-const types = @import("../storage/db/types.zig");
+const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const types = @import("antfly_local_sources").storage_db_types;
 
 pub fn apply(alloc: std.mem.Allocator, candidate: *sessions.OwnedTransactionCommitRequest, updates: []const contract.TableCommitRequest) !void {
     for (updates) |update| {
@@ -72,7 +72,7 @@ fn changes(update: contract.TableCommitRequest, key: []const u8) bool {
     return false;
 }
 
-pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, context: @import("operation.zig").RequestContext) !void {
+pub fn validate(server: anytype, alloc: std.mem.Allocator, previous: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, statement: *const sessions.OwnedTransactionCommitRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
     var original = try statement.clone(alloc);
     defer original.deinit(alloc);
     const incoming = try original.distributedTables(alloc);

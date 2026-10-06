@@ -17,7 +17,7 @@
 //! concrete WAL implementation.
 
 const storage_source_options = @import("storage_source_options");
-const native = @import("wal.zig");
+const native = @import("antfly_local_sources").storage_wal;
 const client = @import("kernel_wal_client.zig");
 
 pub const WAL = if (storage_source_options.control_only) client.WAL else native.WAL;

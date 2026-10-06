@@ -18,15 +18,15 @@
 const std = @import("std");
 const wire = @import("../pgwire/backend.zig");
 const wire_values = @import("../pgwire/values.zig");
-const storage_schema = @import("../storage/schema.zig");
+const storage_schema = @import("antfly_local_sources").storage_schema;
 const http = @import("http_server.zig");
 const execution = @import("sql_execution.zig");
-const compiler = @import("../sql/compiler.zig");
-const describe_sql = @import("../sql/describe.zig");
-const native = @import("../sql/runtime.zig");
-const catalog = @import("../sql/catalog.zig");
-const ast = @import("../sql/ast.zig");
-const operation = @import("operation.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const describe_sql = @import("antfly_local_sources").sql_describe;
+const native = @import("antfly_local_sources").sql_runtime;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const ast = @import("antfly_local_sources").sql_ast;
+const operation = @import("antfly_local_sources").api_operation;
 const usermgr = @import("../usermgr/mod.zig");
 const io_abi = @import("antfly_runtime_abi").io_abi;
 const Mac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -39,7 +39,7 @@ pub const Listener = struct {
     adapter: Adapter,
     server: @import("../pgwire/server.zig").Server,
 
-    pub fn start(api: *http.ApiHttpServer, config: @import("../common/config.zig").Config.PgwireConfig) !*Listener {
+    pub fn start(api: *http.ApiHttpServer, config: @import("antfly_local_sources").common_config.Config.PgwireConfig) !*Listener {
         if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
         const io = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
@@ -138,7 +138,7 @@ pub const Adapter = struct {
         return .{ .context = self, .vtable = &.{ .authenticate = authenticate, .describe = describe, .execute = execute, .load_settings = loadSettings, .validate_namespace = validateNamespace, .evaluate_parameters = evaluateParameters, .fail_transaction = failTransaction, .open_stream = openStream, .disconnect = disconnect } };
     }
 
-    fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("../sql/setting_catalog.zig").RawSnapshot {
+    fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
         var authenticated: ?http.AuthenticatedIdentity = try credential.identity(self.server.alloc);
@@ -146,10 +146,10 @@ pub const Adapter = struct {
         var authority: Authority = .{ .credential = credential, .identity = &authenticated, .request = request };
         var context = try authority.context();
         context.setting_read_principal = credential.sessionPrincipal();
-        const scope: @import("../sql/setting_catalog.zig").Scope = .{ .principal = credential.sessionPrincipal(), .database = request.database orelse "default" };
+        const scope: @import("antfly_local_sources").sql_setting_catalog.Scope = .{ .principal = credential.sessionPrincipal(), .database = request.database orelse "default" };
         const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
         defer alloc.free(bytes);
-        return std.json.parseFromSliceLeaky(@import("../sql/setting_catalog.zig").RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        return std.json.parseFromSliceLeaky(@import("antfly_local_sources").sql_setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -172,7 +172,7 @@ pub const Adapter = struct {
 
     fn evaluateScalarParameters(alloc: std.mem.Allocator, request: wire.Request, expressions: []const []const u8) ![]const std.json.Value {
         if (expressions.len != request.parameter_types.len) return error.InvalidSqlParameters;
-        const scalar = @import("../sql/scalar.zig");
+        const scalar = @import("antfly_local_sources").sql_scalar;
         const result = try alloc.alloc(std.json.Value, expressions.len);
         for (expressions, request.parameter_types, result) |expression, kind, *value| {
             try request.check();
@@ -278,10 +278,10 @@ pub const Adapter = struct {
     }
 };
 
-const Pull = @import("../sql/read_stream.zig");
+const Pull = @import("antfly_local_sources").sql_read_stream;
 
-fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("../sql/setting_catalog.zig").OverlayEntry) ![]const @import("../sql/setting_catalog.zig").OverlayEntry {
-    const result = try alloc.alloc(@import("../sql/setting_catalog.zig").OverlayEntry, entries.len);
+fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry) ![]const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry {
+    const result = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.OverlayEntry, entries.len);
     for (entries, result) |entry, *out| {
         out.* = entry;
         if (entry.value == .string) out.value = .{ .string = try alloc.dupe(u8, entry.value.string) };
@@ -298,7 +298,7 @@ const OwnedRead = struct {
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
-    decision_runtime: ?@import("../functions/runtime.zig").Runtime = null,
+    decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null,
     session_id: ?[]u8 = null,
     staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
     range_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
@@ -569,7 +569,7 @@ const StreamJob = struct {
     fn runInner(self: *StreamJob) !void {
         if (self.namespace_only) {
             const server = self.adapter.server;
-            const domain = @import("../system_catalog/domain.zig");
+            const domain = @import("antfly_local_sources").system_catalog_domain;
             const database = self.request.database orelse "default";
             const namespace = self.request.namespace orelse "public";
             try domain.validateName(database);
@@ -1017,7 +1017,7 @@ const GuardedCatalog = struct {
             try self.guard.checkRead(self.table);
             return self.inner.count_rows.?(self.inner.ptr);
         }
-        fn setDynamicFilter(raw: *anyopaque, filter: *const @import("../sql/dynamic_filter.zig").Filter) !bool {
+        fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.guard.checkRead(self.table);
             return self.inner.set_dynamic_filter.?(self.inner.ptr, filter);
@@ -1270,7 +1270,7 @@ test "SQL pgwire binding manifest includes recursive mutation sources and dedupl
     var replaced = source;
     replaced.id = 3;
     try std.testing.expectError(error.CatalogGenerationChanged, verifyBindingGuard(inserted, 9, replaced));
-    var joined: @import("../sql/joined_mutation.zig").Bound = undefined;
+    var joined: @import("antfly_local_sources").sql_joined_mutation.Bound = undefined;
     joined.input = &source_binding;
     binding.insert_source = null;
     binding.returning = null;
@@ -1347,7 +1347,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             self.counts += 1;
             return 99;
         }
-        fn setFilter(ptr: *anyopaque, _: *const @import("../sql/dynamic_filter.zig").Filter) !bool {
+        fn setFilter(ptr: *anyopaque, _: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.filters += 1;
             return true;
@@ -1393,7 +1393,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try std.testing.expectEqual(@as(?u64, 1024), cursor.estimated_bytes);
     _ = try cursor.next_columns.?(cursor.ptr, alloc, 1);
     try std.testing.expectEqual(@as(?u64, 99), try cursor.count_rows.?(cursor.ptr));
-    const filter = try @import("../sql/dynamic_filter.zig").Filter.create(alloc, &.{}, 128);
+    const filter = try @import("antfly_local_sources").sql_dynamic_filter.Filter.create(alloc, &.{}, 128);
     defer filter.close();
     try std.testing.expect(try cursor.set_dynamic_filter.?(cursor.ptr, filter));
     const children = (try cursor.split_scan.?(cursor.ptr, alloc, 2)).?;

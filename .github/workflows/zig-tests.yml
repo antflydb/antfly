@@ -280,6 +280,9 @@ jobs:
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/antfly-embedded/build/**' \
+            ':(glob)zig/build_support/antfly/**' \
+            zig/embedded.build.zig \
             ':(glob)zig/pkg/inference/build/**' \
             ':(glob)zig/lib/**/build_support.zig' \
             ':(glob)zig/lib/**/build.zig' \
@@ -287,7 +290,7 @@ jobs:
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
-            zig/pkg/antfly/src/serverless/remote_uri.zig \
+            zig/pkg/antfly-embedded/src/local/serverless/remote_uri.zig \
             .github/workflows/zig-tests.yml
           then
             echo "backup_s3=false" >> "$GITHUB_OUTPUT"
@@ -313,11 +316,14 @@ jobs:
             ':(glob)scripts/tla-*.py' \
             ':(glob)zig/pkg/antfly/src/tracing/**' \
             ':(glob)zig/pkg/antfly/src/raft/**' \
-            ':(glob)zig/pkg/antfly/src/storage/db/**' \
+            ':(glob)zig/pkg/antfly-embedded/src/local/storage/db/**' \
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
+            ':(glob)zig/pkg/antfly-embedded/build/**' \
+            ':(glob)zig/build_support/antfly/**' \
+            zig/embedded.build.zig \
             ':(glob)zig/pkg/inference/build/**' \
             ':(glob)zig/lib/**/build_support.zig' \
             ':(glob)zig/lib/**/build.zig' \
@@ -439,10 +445,10 @@ jobs:
       - name: Run StreamVByte codec tests
         run: |
           set -euo pipefail
-          zig test zig/pkg/antfly/src/encoding/streamvbyte.zig
-          zig test -O fast zig/pkg/antfly/src/encoding/streamvbyte.zig
-          zig test zig/pkg/antfly/src/encoding/chunked_coder.zig
-          zig test -O fast zig/pkg/antfly/src/encoding/chunked_coder.zig
+          zig test zig/pkg/antfly-embedded/src/local/encoding/streamvbyte.zig
+          zig test -O fast zig/pkg/antfly-embedded/src/local/encoding/streamvbyte.zig
+          zig test zig/pkg/antfly-embedded/src/local/encoding/chunked_coder.zig
+          zig test -O fast zig/pkg/antfly-embedded/src/local/encoding/chunked_coder.zig
 
       - name: Check shared checksum usage
         run: make zig-checksums-check
@@ -583,6 +589,7 @@ jobs:
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
+          tools/test_local_test_partitions.py
           tools/test_sync_generated.py
 
       - name: Test benchmark orchestration and fixture setup
@@ -986,6 +993,7 @@ jobs:
           tools/test_retain_test_process.py
           tools/test_run_recall_checks.py
           tools/test_test_runner.py
+          tools/test_local_test_partitions.py
           tools/test_sync_generated.py
 
       - name: Test benchmark orchestration and fixture setup
@@ -1031,7 +1039,7 @@ jobs:
           fi
           exit "$status"
 
-      - name: Verify isolated embedded C API and WASM builds
+      - name: Verify isolated embedded lake, C API, and WASM builds
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 zig/tools/check_embedded_isolated_build.py --

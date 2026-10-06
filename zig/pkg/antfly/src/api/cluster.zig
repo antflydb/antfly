@@ -13,11 +13,11 @@
 // limitations.
 
 const std = @import("std");
-const common_secrets = @import("../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const table_manager = @import("../metadata/table_manager.zig");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_reconciler = @import("../raft/reconciler.zig");
 

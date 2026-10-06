@@ -15,14 +15,14 @@
 //! Private, authenticated owner I/O for the existing online merge transition.
 //! A callback never grants donor authority to a receiver or bypasses read-index.
 const std = @import("std");
-const operation = @import("operation.zig");
-pub const contract = @import("../storage/db/online_merge_io_contract.zig");
+const operation = @import("antfly_local_sources").api_operation;
+pub const contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
 pub const Port = struct {
     ptr: *anyopaque,
     execute_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, contract.Request, operation.RequestContext) anyerror![]u8,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
     const VTable = struct { execute_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, contract.Request, operation.RequestContext) anyerror![]u8 };
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
     pub fn execute(self: Port, alloc: std.mem.Allocator, group: u64, table: []const u8, request: contract.Request, context: operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();
@@ -36,7 +36,7 @@ pub const Port = struct {
     /// observation so a promotion cannot return another authority's result.
     /// Actual mutations still enter ordinary native batch admission, whose
     /// shared mutation lease and durable mirror own the commit boundary.
-    pub fn executeStandaloneRewrite(self: Port, alloc: std.mem.Allocator, group: u64, table: []const u8, request: contract.Request, context: operation.RequestContext, gate: ?@import("../storage/db/replication_contract.zig").WriteGate) ![]u8 {
+    pub fn executeStandaloneRewrite(self: Port, alloc: std.mem.Allocator, group: u64, table: []const u8, request: contract.Request, context: operation.RequestContext, gate: ?@import("antfly_local_sources").storage_db_replication_contract.WriteGate) ![]u8 {
         try context.ensureActive();
         if (request.scope.fence.role != .rewrite_source) return error.UnsupportedRestoreSource;
         const pinned = if (gate) |value| value.pinned() else null;
@@ -60,7 +60,7 @@ test "online merge private standalone rewrite port pins authority and never fabr
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, request: contract.Request, _: operation.RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqual(@import("../storage/db/online_source_contract.zig").Authority.native, request.scope.authority);
+            try std.testing.expectEqual(@import("antfly_local_sources").storage_db_online_source_contract.Authority.native, request.scope.authority);
             try std.testing.expectEqual(@as(u64, 0), request.scope.copy_attempt.donor_term);
             if (self.change_generation) _ = self.state.generation.fetchAdd(1, .acq_rel);
             return alloc.dupe(u8, "native-owner-clock");
@@ -70,7 +70,7 @@ test "online merge private standalone rewrite port pins authority and never fabr
     var state: gate_mod.State = .{};
     var probe: Probe = .{ .state = &state };
     const port: Port = .{ .ptr = &probe, .execute_fn = Probe.execute };
-    const gate: @import("../storage/db/replication_contract.zig").WriteGate = .{ .shared = .{ .state = state.storageWriteState() } };
+    const gate: @import("antfly_local_sources").storage_db_replication_contract.WriteGate = .{ .shared = .{ .state = state.storageWriteState() } };
     var request: contract.Request = .{
         .scope = .{
             .fence = .{ .transition_id = 1, .attempt = 0, .admission_epoch = 0, .owner_group_id = 2, .peer_group_id = 3, .role = .rewrite_source, .namespace = .{ .table_id = 1, .shard_id = 12, .range_id = 22 }, .catalog_digest = @splat(0) },

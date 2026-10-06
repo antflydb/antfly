@@ -3,8 +3,8 @@
 
 const std = @import("std");
 const process_memory = @import("antfly_platform").process_memory;
-const lsm_backend = @import("lsm_backend/mod.zig");
-const resource_manager_mod = @import("resource_manager.zig");
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 
 pub const MiB: u64 = 1024 * 1024;
 

@@ -16,8 +16,8 @@
 //! monotonic phase and verified-owner continuation; the exact source and
 //! replacement schema remain pinned.
 const std = @import("std");
-const native = @import("../storage/db/relational_integrity_retirement_contract.zig");
-const topology = @import("../common/topology_records.zig");
+const native = @import("antfly_local_sources").storage_db_relational_integrity_retirement_contract;
+const topology = @import("antfly_local_sources").common_topology_records;
 pub const Phase = enum { fencing, foreign_keys, unique, ready, published };
 pub const Job = struct {
     id: [16]u8,
@@ -42,7 +42,7 @@ pub const Job = struct {
         try jw.beginObject();
         inline for (.{ "id", "source_schema_digest", "target_schema_digest", "generation_set", "generations", "owners" }) |field| {
             try jw.objectField(field);
-            try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field), jw);
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(@field(self, field), jw);
         }
         // JSON is already valid UTF-8; byte-array encoding would amplify the
         // pinned schema severalfold on every metadata phase checkpoint.
