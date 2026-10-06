@@ -45,7 +45,7 @@ product maps them to node-owned resource slices.
 
 ## BackendRuntime: execution and lifetime authority
 
-The node `BackendRuntime` in `pkg/antfly-embedded/src/local/storage/background_runtime.zig`
+The node `BackendRuntime` in `pkg/antfly-embedded/src/storage/background_runtime.zig`
 owns process-long execution machinery. Its responsibilities are:
 
 - bounded general, Raft inbound, Raft outbound, public API, inference, and

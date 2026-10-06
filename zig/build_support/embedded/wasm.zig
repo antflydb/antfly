@@ -162,7 +162,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     const embedded_support_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/embedded_root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/embedded_root.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
