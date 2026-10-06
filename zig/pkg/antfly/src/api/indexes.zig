@@ -714,17 +714,18 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
     const failure = if (state.value.failure) |value| if (std.mem.eql(u8, &value.desired, &desired)) value else null else null;
     const published: ?u64 = if (state.value.published) |value| published: {
         if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
-        for (value.declarations) |declaration| if (std.mem.eql(u8, declaration.name, index_name)) break :published value.generation;
+        const algebraic = if (config == .object) if (config.object.get("type")) |kind| kind == .string and std.mem.eql(u8, kind.string, "algebraic") else false else false;
+        if (!algebraic) for (value.declarations) |declaration| {
+            if (std.mem.eql(u8, declaration.name, index_name)) break :published value.generation;
+        };
         if (config == .object) if (config.object.get("materializations")) |mats| {
             if (mats == .array and mats.array.items.len != 0) {
                 for (mats.array.items) |mat| {
                     if (mat != .object) break :published null;
                     const name = mat.object.get("name") orelse break :published null;
                     if (name != .string) break :published null;
-                    const expected = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ index_name, name.string });
-                    defer alloc.free(expected);
                     const found = for (value.declarations) |declaration| {
-                        if (std.mem.eql(u8, declaration.name, expected)) break true;
+                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string, declaration.artifact.metadata_version)) break true;
                     } else false;
                     if (!found) break :published null;
                 }

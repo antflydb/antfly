@@ -812,7 +812,11 @@ pub const Adapter = struct {
         adapter: *Adapter,
         table: catalog.Table,
         store: @import("lake_index_store.zig").Store,
-        reader: *@import("lake_index_aggregate_artifact.zig").Reader,
+        arena: std.heap.ArenaAllocator,
+        artifacts: []const @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef,
+        recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe,
+        read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
+        child: catalog.AggregatePartialCursor,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -821,7 +825,7 @@ pub const Adapter = struct {
         fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.adapter.verify(a, self.table);
-            const cursor = self.reader.cursor();
+            const cursor = self.child;
             const result = cursor.next(cursor.ptr, a, maximum) catch |err| {
                 try self.adapter.context.ensureActive();
                 return err;
@@ -832,10 +836,18 @@ pub const Adapter = struct {
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const a = self.a;
-            const cursor = self.reader.cursor();
+            const cursor = self.child;
             cursor.close(cursor.ptr);
             self.store.deinit();
+            self.arena.deinit();
             a.destroy(self);
+        }
+        fn openMember(raw: *anyopaque, slot: usize) !catalog.AggregatePartialCursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.adapter.verify(self.a, self.table);
+            const recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot .. slot + 1] };
+            const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+            return reader.cursor();
         }
     };
     fn openAggregatePartials(raw: *anyopaque, a: std.mem.Allocator, table: catalog.Table, recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe) !?catalog.AggregatePartialCursor {
@@ -849,10 +861,15 @@ pub const Adapter = struct {
         var state = try local.metadata_lake_index_catalog.parse(sa, table.external_indexes.?.catalog_json);
         defer state.deinit();
         const publication = state.value.published orelse return null;
-        const identity = try @import("lake_index_native_aggregates.zig").recipeIdentity(sa, recipe);
-        const eligible = for (publication.declarations) |decl| {
-            if (decl.artifact.kind == .algebraic_segment and decl.artifact.metadata_version == artifact_api.metadata_version and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break true;
-        } else false;
+        if (recipe.inputs.len == 0 or recipe.inputs.len > 256) return null;
+        const identities = try sa.alloc([]const u8, recipe.inputs.len);
+        for (identities, 0..) |*identity, slot| identity.* = try @import("lake_index_native_aggregates.zig").recipeIdentity(sa, .{ .keys = recipe.keys, .inputs = recipe.inputs[slot .. slot + 1] });
+        const eligible = for (identities) |identity| {
+            const present = for (publication.declarations) |decl| {
+                if (decl.artifact.kind == .algebraic_segment and artifact_api.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break true;
+            } else false;
+            if (!present) break false;
+        } else true;
         if (!eligible) return null;
         try self.verify(sa, table);
         try self.checkLakeRead(sa, table);
@@ -865,6 +882,8 @@ pub const Adapter = struct {
         const owner = try a.create(AggregateArtifactCursor);
         var keep_owner = false;
         defer if (!keep_owner) a.destroy(owner);
+        owner.arena = .init(a);
+        defer if (!keep_owner) owner.arena.deinit();
         owner.store = @import("lake_index_store.zig").Store.openNative(a, self.server.cfg.node_config, self.server.cfg.secret_store, true, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir) catch |err| {
             try context.ensureActive();
             if (err == error.OutOfMemory) return err;
@@ -874,16 +893,30 @@ pub const Adapter = struct {
         defer if (!keep_store) owner.store.deinit();
         var selected = (try @import("lake_index_selection.zig").select(sa, table, &source, &owner.store, context, .automatic)) orelse return null;
         defer selected.deinit();
-        const declaration = for (selected.publication().declarations) |decl| {
-            if (decl.artifact.kind == .algebraic_segment and decl.artifact.metadata_version == artifact_api.metadata_version and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break decl;
-        } else return error.InvalidNativeAggregateArtifact;
+        const owned = owner.arena.allocator();
+        const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);
+        for (references, identities) |*reference, identity| {
+            const declaration = for (selected.publication().declarations) |decl| {
+                if (decl.artifact.kind == .algebraic_segment and artifact_api.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break decl;
+            } else return error.InvalidNativeAggregateArtifact;
+            reference.* = declaration.artifact;
+            reference.name = try owned.dupe(u8, reference.name);
+            reference.artifact_id = try owned.dupe(u8, reference.artifact_id);
+            reference.checksum = try owned.dupe(u8, reference.checksum);
+        }
         try self.verify(sa, table);
         // From this point errors propagate: selected immutable state cannot be
         // replaced with a fresh scan halfway through consumption.
         owner.a = a;
         owner.adapter = self;
         owner.table = table;
-        owner.reader = artifact_api.Reader.openWithCache(a, owner.store.artifactStore(), declaration.artifact, recipe, .{ .ptr = owner, .is_cancelled_fn = AggregateArtifactCursor.canceled }, .{ .cache = &self.server.lake_read_cache, .scope = owner.store.identity, .context = context }) catch |err| {
+        owner.artifacts = references;
+        owner.recipe = recipe;
+        owner.read_context = context;
+        owner.child = (if (recipe.inputs.len == 1) AggregateArtifactCursor.openMember(owner, 0) else composed: {
+            const composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = owner, .open = AggregateArtifactCursor.openMember });
+            break :composed composition.cursor();
+        }) catch |err| {
             try self.context.ensureActive();
             return err;
         };

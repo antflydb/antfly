@@ -134,6 +134,7 @@ pub fn countFromProvider(context: anytype, table: catalog.Table) !?u64 {
         records += partials.len;
         for (partials) |partial| {
             if (partial.keys.len != 0 or partial.aggregates.len != 1) return error.InvalidSqlBackendResponse;
+            if (partial.aggregate_slots) |slots| if (slots.len != 1 or slots[0] != 0) return error.InvalidSqlBackendResponse;
             var state = try @import("aggregate_partial.zig").decode(a, partial.aggregates[0], spec);
             defer state.deinit();
             count = std.math.add(u64, count, state.count) catch return error.SqlNumericOutOfRange;

@@ -16,7 +16,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     defer state.deinit();
     const publication = state.value.published orelse return &.{};
     const eligible = for (publication.declarations) |declaration| {
-        if (declaration.artifact.kind == .algebraic_segment and declaration.artifact.metadata_version == artifacts.metadata_version) break true;
+        if (declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) break true;
     } else false;
     if (!eligible) return &.{};
     const normalized = try request.platformDeadline();
@@ -50,10 +50,9 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
             const recipe = (try recipes.recipeFor(sa, sql_table, config, mat)) orelse break false;
             const name = mat.object.get("name") orelse break false;
             if (name != .string) break false;
-            const expected = try std.fmt.allocPrint(sa, "{s}.{s}", .{ entry.key_ptr.*, name.string });
             const identity = try recipes.recipeIdentity(sa, recipe);
             const declaration = for (selected.publication().declarations) |decl| {
-                if (std.mem.eql(u8, decl.name, expected) and decl.artifact.kind == .algebraic_segment and decl.artifact.metadata_version == artifacts.metadata_version and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break decl;
+                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(sa, decl.name, entry.key_ptr.*, name.string, decl.artifact.metadata_version)) break decl;
             } else break false;
             // A bounded root check proves the reader's contract, not merely a
             // successful upload. Descendant blocks are verified as SQL drains.

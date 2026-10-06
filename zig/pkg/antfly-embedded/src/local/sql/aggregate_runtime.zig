@@ -262,8 +262,8 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;
         groups += partials.len;
         for (partials) |partial| {
-            if (partial.keys.len != recipe.keys.len or partial.aggregates.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
-            try grouped.importPartial(partial.keys, partial.aggregates, partial.ordinal);
+            if (partial.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
+            try grouped.importPartialMapped(partial.keys, partial.aggregates, partial.aggregate_slots, partial.ordinal);
         }
     }
     return true;

@@ -45,7 +45,7 @@ The following paths remain required before claiming complete remote index servin
 | Range caching | Public SQL/rows ranges and authenticated native aggregate artifacts share bounded RAM → disk → source reads | Other artifact-reader admission and per-statement explain accounting |
 | Index construction | RowSource sidecar builders, scoped artifact uploads; native catalog CAS leases, API creation/deletion, maintenance recovery and catalog status | Lease renewal during long builds, streaming builders beyond bounded replay |
 | Index selection | Fresh per-execution catalog definitions, complete-coverage proofs and catalog-selected native SQL aggregates | Connect candidate/hydration readers to rows/search and exact SQL predicates |
-| Algebraic execution | Native exact typed reducers, strict bound recipe matcher, durable authenticated column blocks and catalog-selected SQL provider | Multi-materialization slot composition, additional expression/predicate equivalence proofs |
+| Algebraic execution | Native exact typed reducers, strict recipe matching, shared construction scans/blocks and catalog-selected sparse slot composition | Additional expression/predicate equivalence proofs |
 | Incremental refresh | Immutable file identities and invalidation foundations | Per-file contribution manifests, append merging and delete-aware correction |
 
 This table is an acceptance gate. Helper tests or a configured index alone do not
@@ -190,17 +190,31 @@ laws and build policy remain engine-owned. COUNT(column) excludes SQL NULLs;
 COUNT(*) includes them. Schema derivation rejects unknown/incompatible fields.
 
 The native provider resolves the current catalog and authorized source before
-opening a matching aggregate root. Roots use the `native-sql-aggregate-v1` format;
-metadata version 1 distinguishes these from legacy algebraic segments. Each root
-binds its logical materialization name, exact recipe and group count to bounded,
+opening a matching aggregate root. New roots use `native-sql-aggregate-v2`, with
+metadata version 2; readers also accept exact version 1 roots. Each root
+binds its materialization identity, exact recipe and group count to bounded,
 checksum-authenticated NCB1 column blocks containing AGS1 state cells. Readers
 retain one block, import borrowed state through the existing exact reducers and
 verify the statement catalog fence while draining. Native construction uses the
 same typed grouping state and disk partitions as SQL. Delete-free global COUNT(*)
-uses footer counts; Iceberg deletes use the delete-aware input adapter. One
-materialization currently matches one aggregate slot; multiple requested slots
-scan until a composition proof is implemented. Custom laws, joins, temporal
+uses footer counts; Iceberg deletes use the delete-aware input adapter. Every
+requested aggregate slot must match a materialization from the same complete
+publication. Composition imports only the selected typed slot and retains one
+reader, avoiding a dense array of empty states for each input partial. Slot
+maps and every state signature validate before group mutation. Existing dense
+spill frames expand sparse slots only at the durable spill boundary. Group orders may differ after spilling;
+the SQL reducer merges by semantic keys rather than zipping matching positions.
+Incomplete slot coverage falls back before selection. Custom laws, joins, temporal
 buckets and other unsupported recipes do not claim SQL substitution.
+
+Construction groups compatible materializations by physical grouping paths,
+types and nullability, across index definitions. Each bounded cohort (up to 64
+reducers) scans the union of required columns once and shares typed grouping,
+disk partitions, keys and immutable output blocks. Each version 2 root binds its
+own reducer slot and the full state recipe, so selecting a slot cannot reinterpret
+another reducer's bytes. Materialization identities hash length-framed public
+index/recipe names to avoid punctuation collisions and exceed no catalog name
+limit. Roots remain distinct even when their shared block references coincide.
 
 Aggregate roots and blocks share the server's bounded RAM and persistent disk
 cache. Keys bind artifact identity, expected length/checksum and resolved artifact

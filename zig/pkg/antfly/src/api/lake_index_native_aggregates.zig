@@ -101,6 +101,8 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
         // Nested bytes are allocated in the publication arena by the caller.
         declarations.deinit(out);
     }
+    const Request = struct { recipe: recipes.Recipe, name: []const u8 };
+    var requests: std.ArrayList(Request) = .empty;
     var iterator = definitions.object.iterator();
     while (iterator.next()) |entry| {
         const config = entry.value_ptr.*;
@@ -114,6 +116,34 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
             const recipe = (try recipeFor(ca, sql_table, config, mat)) orelse continue;
             const name = mat.object.get("name") orelse return error.InvalidAlgebraicConfig;
             if (name != .string or name.string.len == 0) return error.InvalidAlgebraicConfig;
+            try requests.append(ca, .{ .recipe = recipe, .name = try @import("lake_index_names.zig").materialization(out, entry.key_ptr.*, name.string) });
+        }
+    }
+    const consumed = try ca.alloc(bool, requests.items.len);
+    @memset(consumed, false);
+    for (requests.items, 0..) |request, first| {
+        if (consumed[first]) continue;
+        var cohort: std.ArrayList(usize) = .empty;
+        // Cap reducer width independently of the number of configured indexes.
+        // Larger sets form another bounded cohort with the same semantic keys.
+        for (requests.items[first..], first..) |candidate, index| {
+            if (consumed[index]) continue;
+            const key_recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = &.{} };
+            if (!key_recipe.eql(.{ .keys = candidate.recipe.keys, .inputs = &.{} })) continue;
+            consumed[index] = true;
+            try cohort.append(ca, index);
+            if (cohort.items.len == 64) break;
+        }
+        const inputs = try ca.alloc(recipes.Input, cohort.items.len);
+        const specs = try ca.alloc(operators.AggregateSpec, cohort.items.len);
+        const names = try ca.alloc([]const u8, cohort.items.len);
+        for (cohort.items, inputs, specs, names) |index, *input, *spec, *name| {
+            input.* = requests.items[index].recipe.inputs[0];
+            spec.* = input.spec;
+            name.* = requests.items[index].name;
+        }
+        const recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = inputs };
+        {
             var projected: std.ArrayList([]const u8) = .empty;
             for (recipe.keys) |key| {
                 const present = for (projected.items) |path| {
@@ -121,13 +151,16 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
                 } else false;
                 if (!present) try projected.append(out, try out.dupe(u8, key.path));
             }
-            if (recipe.inputs[0].column) |column| {
+            for (recipe.inputs) |input| if (input.column) |column| {
                 const present = for (projected.items) |path| {
                     if (std.mem.eql(u8, path, column.path)) break true;
                 } else false;
                 if (!present) try projected.append(out, try out.dupe(u8, column.path));
-            }
-            const metadata_count = recipe.keys.len == 0 and recipe.inputs[0].spec.kind == .count and recipe.inputs[0].column == null and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
+            };
+            const counts_only = for (recipe.inputs) |input| {
+                if (input.spec.kind != .count or input.column != null) break false;
+            } else true;
+            const metadata_count = recipe.keys.len == 0 and counts_only and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             if (projected.items.len == 0) {
                 if (sql_table.columns.len == 0) return error.UnsupportedExternalLakeIndex;
                 try projected.append(out, try out.dupe(u8, sql_table.columns[0].path));
@@ -138,7 +171,6 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
                 .iceberg => .external_iceberg,
                 else => return error.UnsupportedExternalLakeIndex,
             }, .row_ref_kind = .external, .source_id = try out.dupe(u8, source.inventory.source_id), .snapshot_id = try out.dupe(u8, source.inventory.snapshot_id), .schema_fingerprint = try out.dupe(u8, source.inventory.schema_fingerprint), .column_bindings = columns, .index_config_hash = try recipeIdentity(out, recipe) };
-            const spec = recipe.inputs[0].spec;
             var checkpoint_context = provider.context;
             const Checkpoint = struct {
                 fn check(raw: *anyopaque) !void {
@@ -148,7 +180,7 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
             };
             var spill: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &checkpoint_context, .checkpoint = Checkpoint.check, .async_writes = false };
             defer spill.deinit();
-            const group = try operators.Grouped.create(a, &.{spec}, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &spill });
+            const group = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &spill });
             defer group.deinit();
             if (recipe.keys.len == 0) try group.ensureGlobalGroup();
             if (metadata_count) {
@@ -171,17 +203,21 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
                     for (selection, 0..) |*selected, i| selected.* = i;
                     const keys = try pa.alloc(local.sql_execution_batch.Batch, recipe.keys.len);
                     for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = definition.path, .type = definition.type, .nullable = definition.nullable }}) } };
-                    const input: local.sql_execution_batch.Batch = if (recipe.inputs[0].column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = column.path, .type = column.type, .nullable = column.nullable }}) } } else constant: {
+                    const input_batches = try pa.alloc(local.sql_execution_batch.Batch, recipe.inputs.len);
+                    for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = column.path, .type = column.type, .nullable = column.nullable }}) } } else constant: {
                         const ids = try pa.alloc(u32, batch.rowCount());
                         @memset(ids, 0);
                         break :constant .{ .dictionary = .{ .values = &.{local.sql_scalar.Datum.fromJson(.{ .integer = 1 })}, .indices = ids } };
                     };
-                    try group.addEncodedColumns(keys, &.{input}, batch.rowCount());
+                    try group.addEncodedColumns(keys, input_batches, batch.rowCount());
                 }
             }
-            const artifact_name = try std.fmt.allocPrint(out, "{s}.{s}", .{ entry.key_ptr.*, name.string });
-            const artifact = try artifacts.publish(a, out, store, artifact_name, group, recipe, cancellation);
-            try declarations.append(out, .{ .name = artifact_name, .binding = binding, .artifact = artifact });
+            const published = try artifacts.publishCohort(a, out, store, names, group, recipe, cancellation);
+            for (published, names, cohort.items) |artifact, name, index| {
+                var slot_binding = binding;
+                slot_binding.index_config_hash = try recipeIdentity(out, requests.items[index].recipe);
+                try declarations.append(out, .{ .name = name, .binding = slot_binding, .artifact = artifact });
+            }
         }
     }
     return declarations.toOwnedSlice(out);
@@ -241,7 +277,8 @@ test "external lake native algebraic publication reads real Parquet into exact S
     try std.testing.expectEqual(@as(usize, 2), declarations.len);
     const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
     const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true } }} };
-    const cursor = (try artifacts.Reader.open(a, store, declarations[0].artifact, recipe, .none)).cursor();
+    const sum_reader = try artifacts.Reader.open(a, store, declarations[0].artifact, recipe, .none);
+    const cursor = sum_reader.cursor();
     defer cursor.close(cursor.ptr);
     var page = std.heap.ArenaAllocator.init(a);
     defer page.deinit();
@@ -253,8 +290,18 @@ test "external lake native algebraic publication reads real Parquet into exact S
     try std.testing.expectEqual(@as(i64, 18014398509481985), result.aggregates[0].value.integer);
     try std.testing.expect((try cursor.next(cursor.ptr, page.allocator(), 32)) == null);
     const count_recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = .{ .kind = .count }, .column = null }} };
-    const count_cursor = (try artifacts.Reader.open(a, store, declarations[1].artifact, count_recipe, .none)).cursor();
+    const count_reader = try artifacts.Reader.open(a, store, declarations[1].artifact, count_recipe, .none);
+    const count_cursor = count_reader.cursor();
     defer count_cursor.close(count_cursor.ptr);
+    try std.testing.expect(sum_reader.root.state_slot != count_reader.root.state_slot);
+    try std.testing.expectEqualStrings(sum_reader.root.blocks[0].artifact.artifact_id, count_reader.root.blocks[0].artifact.artifact_id);
+    var wrong_slot = sum_reader.root;
+    wrong_slot.state_slot = count_reader.root.state_slot;
+    const wrong_bytes = try std.json.Stringify.valueAlloc(page.allocator(), wrong_slot, .{});
+    var wrong = try store.put(wrong_bytes);
+    defer wrong.deinit(a);
+    const wrong_reference: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .kind = .algebraic_segment, .metadata_version = artifacts.metadata_version, .name = sum_reader.root.name, .artifact_id = wrong.artifact_id, .checksum = wrong.checksum, .byte_len = wrong.byte_len };
+    try std.testing.expectError(error.InvalidNativeAggregateArtifact, artifacts.Reader.open(a, store, wrong_reference, recipe, .none));
     const counts = (try count_cursor.next(count_cursor.ptr, page.allocator(), 32)).?;
     var exact = try local.sql_aggregate_partial.decode(page.allocator(), counts[0].aggregates[0], .{ .kind = .count });
     defer exact.deinit();
