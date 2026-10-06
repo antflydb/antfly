@@ -2140,8 +2140,11 @@ func (s *SearchServer) queryGraphVisualization(ctx context.Context, payload map[
 
 func graphVisualizationQuery(searchText string) map[string]any {
 	return map[string]any{
+		// Graph edges are owned by the materialized rows. Artifact search can
+		// return their source PDFs instead, whose keys have no adjacency.
+		"full_text_index": DefaultFullTextIndex,
 		"full_text_search": map[string]any{
-			"query": searchText,
+			"match": map[string]any{"content": searchText},
 		},
 		"limit": 8,
 		"graph_queries": map[string]any{
@@ -2163,6 +2166,7 @@ func graphVisualizationQuery(searchText string) map[string]any {
 
 func graphVisualizationSampleQuery() map[string]any {
 	return map[string]any{
+		"full_text_index": DefaultFullTextIndex,
 		"query": map[string]any{
 			"match_all": map[string]any{},
 		},

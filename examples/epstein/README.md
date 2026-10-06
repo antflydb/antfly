@@ -608,7 +608,15 @@ revision. Graph reconciliation requires document lookup version tokens and OCC
 transactions from the server. Graph-unit links
 use original PDF page numbers or the audio unit's recording timestamp, and appear
 in the graph visualization. Completion reports materialization submission; inspect
-graph index coverage separately for asynchronous relation extraction failures.
+graph index `readiness.sources` and repair status separately for asynchronous
+relation extraction failures. The embedding index uses
+`coverage_policy: partial`: graph-unit rows, completion markers, and validated
+empty extraction outputs intentionally skip embedding work, while provider failures
+still block healthy coverage. Existing tables keep their previous policy; use a
+new pilot table with the updated load configuration. Graph visualization searches
+the row BM25 index's `content` field to seed the graph-unit keys that own edges;
+regular corpus search still groups artifact matches by source and keeps page/time
+citations.
 These optional rows add stored text and default BM25 postings as well as graph
 artifacts/edges. A validated OCR reader response with no detected text preserves
 embedded text (or completes an empty page) without counting as a provider failure;

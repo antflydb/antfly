@@ -347,6 +347,9 @@ func TestCorpusAppleIndexConfiguration(t *testing.T) {
 		}
 	}
 	graph := decoded[DefaultAutographIndex].(map[string]any)
+	if decoded[DefaultEmbeddingIndex].(map[string]any)["coverage_policy"] != "partial" {
+		t.Fatal("intentional graph-row skips must settle without hiding provider failures")
+	}
 	artifact := graph["artifact"].(map[string]any)
 	if artifact["source"].(map[string]any)["value"] != "content" {
 		t.Fatal("graph must consume materialized unit text")

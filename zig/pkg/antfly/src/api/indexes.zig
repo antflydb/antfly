@@ -3981,75 +3981,8 @@ fn appendSingleIndexRuntimeStatusWithGraphMetricRuntime(
         try out.appendSlice(alloc, ",\"degraded\":");
         try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
         try out.append(alloc, '}');
-    } else if ((index_type == .graph or index_type == .full_text) and
-        @hasField(@TypeOf(item), "coverage_identity_ready") and item.coverage_identity_ready and
-        @hasField(@TypeOf(item), "coverage_summary_ready"))
-    {
-        // Artifact-fed graph and full-text projections record the same
-        // durable per-document generation outcomes as embeddings indexes
-        // (the autoschema knowledge graph in particular). Without this block
-        // a corpus of terminally failed extractions reported NOTHING on the
-        // consuming index: settled failures looked like invisible pending
-        // work. The shape matches the embeddings `coverage` object so
-        // consumers read one contract; embeddings-only publication and
-        // activity fields are simply absent.
-        const skipped_count = if (@hasField(@TypeOf(item), "coverage_skipped_count")) item.coverage_skipped_count else 0;
-        const terminal_failed_count = if (@hasField(@TypeOf(item), "coverage_terminal_failed_count")) item.coverage_terminal_failed_count else 0;
-        const produced_count = if (@hasField(@TypeOf(item), "coverage_produced_count")) item.coverage_produced_count else 0;
-        const counters_valid = coverageCountersValid(table_doc_count, produced_count, skipped_count, terminal_failed_count);
-        const replay_current = coverageReplayCurrent(replay_applied_sequence, replay_target_sequence, replay_catch_up_required);
-        const observation_complete = coverage_runtime_present and item.coverage_summary_ready and counters_valid;
-        const coverage = evaluateCoverage(
-            .strict,
-            table_doc_count,
-            produced_count,
-            skipped_count,
-            terminal_failed_count,
-            observation_complete,
-            replay_current,
-        );
-        try out.appendSlice(alloc, ",\"coverage\":{");
-        try appendJsonString(alloc, out, "policy");
-        try out.append(alloc, ':');
-        try appendJsonString(alloc, out, "strict");
-        try out.appendSlice(alloc, ",\"observation_complete\":");
-        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
-        try out.appendSlice(alloc, ",\"config_fingerprint\":");
-        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
-        try out.appendSlice(alloc, ",\"summary_ready\":");
-        try out.appendSlice(alloc, if (item.coverage_summary_ready) "true" else "false");
-        try out.appendSlice(alloc, ",\"source_total\":");
-        try appendIntValue(alloc, out, table_doc_count);
-        try out.appendSlice(alloc, ",\"produced\":");
-        try appendIntValue(alloc, out, produced_count);
-        try out.appendSlice(alloc, ",\"skipped\":");
-        try appendIntValue(alloc, out, skipped_count);
-        try out.appendSlice(alloc, ",\"terminal_failed\":");
-        try appendIntValue(alloc, out, terminal_failed_count);
-        try out.appendSlice(alloc, ",\"covered\":");
-        try appendIntValue(alloc, out, coverage.covered);
-        try out.appendSlice(alloc, ",\"settled\":");
-        try appendIntValue(alloc, out, coverage.settled);
-        try out.appendSlice(alloc, ",\"uncovered\":");
-        if (coverage.uncovered) |uncovered| {
-            try appendIntValue(alloc, out, uncovered);
-        } else {
-            try out.appendSlice(alloc, "null");
-        }
-        try out.appendSlice(alloc, ",\"pending\":");
-        if (coverage.pending) |pending| {
-            try appendIntValue(alloc, out, pending);
-        } else {
-            try out.appendSlice(alloc, "null");
-        }
-        try out.appendSlice(alloc, ",\"complete\":");
-        try out.appendSlice(alloc, if (coverage.complete) "true" else "false");
-        try out.appendSlice(alloc, ",\"healthy\":");
-        try out.appendSlice(alloc, if (coverage.healthy) "true" else "false");
-        try out.appendSlice(alloc, ",\"degraded\":");
-        try out.appendSlice(alloc, if (coverage.degraded) "true" else "false");
-        try out.append(alloc, '}');
     }
+
     if (index_type == .graph) {
         try out.appendSlice(alloc, ",\"algebraic_graph\":{\"traversal\":{\"attempted\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_attempt_count);
@@ -8800,6 +8733,38 @@ fn consumerTests() type {
             try std.testing.expect(aggregate.replay_catch_up_required);
             try std.testing.expect(aggregate.backfill_active);
             try std.testing.expectEqual(@as(f64, 0.0), aggregate.backfill_progress);
+        }
+
+        test "derived coverage artifact projections use source readiness without vector counters" {
+            const alloc = std.testing.allocator;
+            var sources = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "asset", .published_sequence = 2, .target_sequence = 2 }};
+            for ([_]ApiIndexType{ .full_text, .graph }) |kind| {
+                var item: db_mod.types.DBIndexStats = .{
+                    .name = "artifact_index",
+                    .kind = if (kind == .graph) .graph else .full_text,
+                    .coverage_generation = 42,
+                    .coverage_config_hash = 99,
+                    .coverage_identity_ready = true,
+                    .replay_applied_sequence = 2,
+                    .replay_target_sequence = 2,
+                    .source_replay = &sources,
+                };
+                for (0..3) |scenario| {
+                    sources[0].failed = scenario == 1;
+                    if (scenario == 2) item.source_replay = &.{};
+                    var out = std.ArrayListUnmanaged(u8).empty;
+                    defer out.deinit(alloc);
+                    try appendSingleIndexRuntimeStatus(alloc, &out, kind, item, 2, .strict, false, 42, 99, .{}, null, null, null, .{}, .{ .source = .live_writer_publish, .freshness = .fresh }, true);
+                    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, out.items, .{});
+                    defer parsed.deinit();
+                    try std.testing.expect(parsed.value.object.get("coverage") == null);
+                    if (scenario != 2) {
+                        const source = parsed.value.object.get("readiness").?.object.get("sources").?.array.items[0].object;
+                        try std.testing.expectEqualStrings(if (scenario == 1) "failed" else "ready", source.get("state").?.string);
+                        try std.testing.expectEqual(scenario == 0, source.get("complete").?.bool);
+                    }
+                }
+            }
         }
 
         test "derived coverage ready full text status reports complete progress" {

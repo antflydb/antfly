@@ -288,7 +288,7 @@ func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
 func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	req := graphVisualizationQuery("Maxwell")
 	fullText, ok := req["full_text_search"].(map[string]any)
-	if !ok || fullText["query"] != "Maxwell" {
+	if !ok || fullText["match"].(map[string]any)["content"] != "Maxwell" || req["full_text_index"] != DefaultFullTextIndex {
 		t.Fatalf("unexpected full-text search: %#v", req["full_text_search"])
 	}
 	graphSearches, ok := req["graph_queries"].(map[string]any)
@@ -319,6 +319,12 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	fields, ok := traverse["fields"].([]string)
 	if !ok || len(fields) != 4 || fields[0] != "title" || fields[1] != "url" || fields[2] != "original_url" || fields[3] != "metadata" {
 		t.Fatalf("unexpected graph document fields: %#v", traverse["fields"])
+	}
+}
+
+func TestGraphVisualizationSampleUsesRowIndex(t *testing.T) {
+	if graphVisualizationSampleQuery()["full_text_index"] != DefaultFullTextIndex {
+		t.Fatal("graph sample must seed materialized row keys")
 	}
 }
 

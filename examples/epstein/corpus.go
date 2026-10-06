@@ -358,6 +358,10 @@ func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string
 	}
 	if semantic {
 		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": DefaultEmbeddingDims, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": map[string]any{"provider": "antfly", "model": embeddingModel, "api_url": apiURL}, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": DefaultEmbeddingDims}}}
+		// Graph units and revision markers intentionally have no document
+		// extraction input. Settle those skips, while keeping provider failures
+		// and unfinished extraction visible as incomplete coverage.
+		indexes[DefaultEmbeddingIndex].(map[string]any)["coverage_policy"] = "partial"
 	}
 	if graph {
 		index, e := createArtifactGraphIndex(DefaultAutographIndex, DefaultAutographAsset, "extractor", extractorModel, inferenceURL, strings.Split(DefaultEntityLabels, ","), strings.Split(DefaultRelationLabels, ","))

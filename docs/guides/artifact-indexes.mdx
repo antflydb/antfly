@@ -250,6 +250,8 @@ Creation starts materialization and replay; it does not mean coverage is complet
 
 Every index kind also reports a catalog-assigned `incarnation`, at the status root and inside `readiness`. A waiter succeeds only on a runtime observation of that same definition, so dropping and recreating an index under the same name cannot reuse stale readiness or searchable counts.
 
+The document-level `coverage` object belongs to embedding indexes. Full-text and graph indexes report completion through `readiness`, including `readiness.sources` for artifact-backed projections, and replay status. They do not publish embedding producer counters: an absent counter cannot distinguish unfinished extraction from an intentional empty output. Source extraction failures remain visible in source readiness and repair status, including after restart.
+
 Internal replay watermarks are diagnostics only.
 
 Changing source membership, projection fields, analyzer semantics, embedding space, or graph mapping changes what the index means and requires a new materialized generation. Execution batching fields tune work without changing artifact identity.
