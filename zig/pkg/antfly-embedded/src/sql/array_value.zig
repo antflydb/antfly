@@ -76,7 +76,7 @@ pub const Comparison = enum {
     gt,
     ge,
 
-    fn accepts(self: Comparison, order: std.math.Order) bool {
+    pub fn accepts(self: Comparison, order: std.math.Order) bool {
         return switch (self) {
             .eq => order == .eq,
             .ne => order != .eq,
@@ -140,7 +140,13 @@ pub const Value = struct {
     /// array is handled by the caller, separately from this non-NULL view.
     /// Empty arrays retain their quantifier identity even for a NULL scalar.
     pub fn quantified(self: Value, scalar_value: Element, comparison: Comparison, quantifier: Quantifier, work: *Budget) !?bool {
-        try validateElement(self.element_type, scalar_value, work);
+        // The SQL probe can have a wider numeric type than the array cells:
+        // comparing bigint against int[] must not narrow/overflow the probe.
+        try validateElement(switch (self.element_type) {
+            .int16, .int32 => .int64,
+            .float32 => .float64,
+            else => self.element_type,
+        }, scalar_value, work);
         var saw_null = false;
         for (self.elements) |element| {
             try work.consume(1);

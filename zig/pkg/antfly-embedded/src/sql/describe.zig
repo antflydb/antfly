@@ -51,6 +51,14 @@ pub const Column = struct {
     }
 };
 
+// The public protocol needs element OIDs and a lossless array value envelope
+// before array-valued result columns can be published. Scalar expressions
+// consuming arrays do not need that envelope and remain executable.
+fn publicKind(kind: ?ast.ColumnType) !ast.ColumnType {
+    if (kind == .array) return error.UnsupportedSqlShape;
+    return kind orelse .string;
+}
+
 test "SQL column JSON excludes internal unknown NULL provenance" {
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "value", .type = .integer, .untyped_null = true }, .{});
     defer std.testing.allocator.free(encoded);
@@ -290,7 +298,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const window = try allocator.create(@import("window_binding.zig").Bound);
         window.* = try @import("window_binding.zig").bind(allocator, backend, compiled, explicit_parameter_types);
         const columns = try allocator.alloc(Column, window.outputs.len);
-        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
+        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .untyped_null = program.output_type.kind == null };
         return .{ .table = window.input.table, .action = .read, .columns = columns, .parameter_types = window.input.parameter_types, .json_literals = .empty, .window = window };
     }
     if (compiled.statement == .select and @import("aggregate_binding.zig").accepts(compiled.statement.select)) {
@@ -302,7 +310,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
         aggregate.* = try @import("aggregate_binding.zig").bindWithSettings(allocator, table, compiled.statement.select, parameters, backend.settings_view);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
-        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
+        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
         if (table) |definition| {
             const contexts = try allocator.alloc(?ast.ColumnType, parameters.len);
@@ -475,7 +483,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
     } else for (statement.columns, scalars.projections, columns) |projection, program, *column| {
         const expression = program orelse return error.UndefinedColumn;
-        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = expression.output_type.kind orelse .string, .untyped_null = expression.output_type.kind == null };
+        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(expression.output_type.kind), .untyped_null = expression.output_type.kind == null };
     }
     // Ordering a singleton changes nothing, but names must still resolve.
     for (statement.order_by) |order| {
@@ -596,7 +604,7 @@ const Context = struct {
         if (statement.columns.len == 0) {
             if (self.table.columns.len > 256) return error.SqlProgramLimitExceeded;
             const columns = try self.allocator.alloc(Column, self.table.columns.len);
-            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = column.type };
+            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = try publicKind(column.type) };
             return columns;
         }
         const columns = try self.allocator.alloc(Column, statement.columns.len);
@@ -605,7 +613,7 @@ const Context = struct {
         for (statement.columns, columns, 0..) |projection, *output, index| {
             if (projection.expression != null) {
                 const program = self.scalars.projections[index] orelse return error.InvalidSqlBackendResponse;
-                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = program.output_type.kind orelse .string, .untyped_null = program.output_type.kind == null };
+                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(program.output_type.kind), .untyped_null = program.output_type.kind == null };
                 continue;
             }
             const column = try self.table.column(projection.field);
@@ -613,7 +621,7 @@ const Context = struct {
                 _ = try native_fields.getOrPut(self.allocator, column.path);
                 if (native_fields.count() > 256) return error.SqlProgramLimitExceeded;
             }
-            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = column.type };
+            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = try publicKind(column.type) };
         }
         return columns;
     }
@@ -802,6 +810,7 @@ pub fn coerceAlloc(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !J
 pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
     if (raw == .null) return .null;
     return switch (kind) {
+        .array => error.SqlTypeMismatch,
         .integer => switch (raw) {
             .integer => raw,
             .number_string, .string => |text| .{ .integer = std.fmt.parseInt(i64, text, 10) catch return error.SqlTypeMismatch },

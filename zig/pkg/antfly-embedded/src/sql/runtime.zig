@@ -2170,6 +2170,44 @@ test "SQL tableless SELECT uses one logical row without catalog or storage acces
     try std.testing.expectError(error.UndefinedColumn, execute(std.testing.allocator, iface, &undefined_column, &.{}, .{}));
 }
 
+test "SQL array scalar contracts execute without catalog or storage access" {
+    const NoLookup = struct {
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            return error.UnexpectedCatalogLookup;
+        }
+    };
+    const Entry = struct { sql: []const u8, value: Json };
+    const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_expression_reference.json"), .{});
+    defer fixture.deinit();
+    var backend: TestBackend = .{};
+    var iface = backend.iface();
+    var vtable = iface.vtable.*;
+    vtable.resolve = NoLookup.resolve;
+    iface.vtable = &vtable;
+    for (fixture.value.entries) |entry| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT {s} AS value", .{entry.sql});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, iface, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqual(entry.value == .null, result.output.sql_nulls.?[0][0]);
+        const actual = result.output.rows[0][0];
+        switch (entry.value) {
+            .integer => |value| try std.testing.expectEqual(value, try std.fmt.parseInt(i64, actual.string, 10)),
+            .bool => |value| try std.testing.expectEqual(value, actual.bool),
+            .null => try std.testing.expect(actual == .null),
+            else => return error.InvalidArrayScalarFixture,
+        }
+    }
+    var unsupported = try compiler.compile(std.testing.allocator, "SELECT ARRAY[1, NULL]", .{});
+    defer unsupported.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, execute(std.testing.allocator, iface, &unsupported, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.pages);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
 test "SQL expression errors never publish a partially prepared mutation" {
     var backend: TestBackend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "UPDATE things SET id = id / CAST(_id AS INTEGER)", .{});

@@ -103,6 +103,7 @@ pub fn createSchemaAlloc(alloc: std.mem.Allocator, create: ast.CreateTable) anye
         else
             try std.json.Stringify.valueAlloc(a, .{
                 .type = switch (column.type) {
+                    .array => return error.UnsupportedSqlShape,
                     .string => "keyword",
                     .uuid => unreachable,
                     .integer => "integer",

@@ -469,6 +469,17 @@ const Parser = struct {
             const kind = try self.columnType();
             try self.expect(.rparen);
             left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind } });
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
+            self.pos += 2;
+            var elements: std.ArrayList(*const ast.Scalar) = .empty;
+            if (!self.take(.rbracket)) {
+                while (true) {
+                    try elements.append(self.alloc, try self.scalar(depth + 1, 0));
+                    if (!self.take(.comma)) break;
+                }
+                try self.expect(.rbracket);
+            }
+            left = try self.scalarNode(.{ .call = .{ .name = "$array", .args = try elements.toOwnedSlice(self.alloc) } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
             // Typed literals use the same validating/canonicalizing cast as
             // CAST(text AS timestamptz), including offset normalization.
@@ -497,6 +508,7 @@ const Parser = struct {
             self.pos += 2;
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
+            if (std.mem.startsWith(u8, name_value, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
             if (std.mem.eql(u8, name_value, "current_setting")) self.uses_current_setting = true;
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
@@ -670,6 +682,24 @@ const Parser = struct {
                 const every = self.keyword(.all);
                 if (every or self.keyword(.any) or self.keyword(.some)) {
                     try self.expect(.lparen);
+                    if (self.pos < self.tokens.len and !self.tokens[self.pos].isKeyword(.select) and !self.tokens[self.pos].isKeyword(.with)) {
+                        if (op == .like or op == .ilike) return self.fail(error.UnsupportedSqlShape, "array pattern quantification is not activated");
+                        const input = try self.scalar(depth + 1, 0);
+                        try self.expect(.rparen);
+                        const comparison_value: @import("array_value.zig").Comparison = switch (op) {
+                            .eq => .eq,
+                            .neq => .ne,
+                            .lt => .lt,
+                            .lte => .le,
+                            .gt => .gt,
+                            .gte => .ge,
+                            else => unreachable,
+                        };
+                        const comparison_node = try self.scalarNode(.{ .literal = .{ .integer = @backingInt(comparison_value) } });
+                        const all_node = try self.scalarNode(.{ .literal = .{ .boolean = every } });
+                        left = try self.scalarNode(.{ .call = .{ .name = "$array_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, input, comparison_node, all_node }) } });
+                        continue;
+                    }
                     if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
                     self.relation_depth += 1;
                     const query = try self.alloc.create(ast.Select);
@@ -2502,6 +2532,12 @@ test "compiler preserves keyword-named columns and quoted SQL-looking values" {
     try std.testing.expectEqualStrings("count", columns.statement.select.columns[0].field);
     try std.testing.expectEqualStrings("select", columns.statement.select.predicate.?.comparison.field);
     try std.testing.expectEqualStrings("x'; DELETE FROM t; --", columns.statement.select.predicate.?.comparison.value.string);
+}
+
+test "SQL compiler helper names are not a public function surface" {
+    for ([_][]const u8{ "SELECT \"$array\"(1)", "SELECT \"$array_quantified\"(1, ARRAY[1], 99, TRUE)", "SELECT \"$validate\"(1)" }) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    }
 }
 
 test "SQL incomplete value expressions report syntax errors" {

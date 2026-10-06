@@ -409,7 +409,7 @@ const OwnedRead = struct {
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = wireType(column.type) };
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type) };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
@@ -783,9 +783,9 @@ const Job = struct {
             var description = try describe_sql.describe(self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
-            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = wireType(column.type) };
+            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type) };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
-            for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| wireType(value) else .unknown;
+            for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
                 .columns = columns,
                 .parameter_types = parameter_types,
@@ -824,7 +824,7 @@ const Job = struct {
             }
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
-        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = wireType(column.type) };
+        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type) };
         self.result = .{
             .columns = columns,
             .rows = result.output.rows,
@@ -884,8 +884,9 @@ fn datetimeResult(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Val
     return wire_values.timestampValue(alloc, nanos);
 }
 
-fn wireType(kind: ast.ColumnType) wire.Type {
+fn wireType(kind: ast.ColumnType) !wire.Type {
     return switch (kind) {
+        .array => error.UnsupportedSqlShape,
         inline else => |tag| @field(wire.Type, @tagName(tag)),
     };
 }

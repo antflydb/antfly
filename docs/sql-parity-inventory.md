@@ -89,9 +89,9 @@ kernels; exact comparison or fallback retains their identity. Spill decoders
 reject invalid types, noncanonical empty dimensions, nested SQL-array tags and
 every truncated array-cell prefix. Encoded record limits, decoded array bounds
 and statement resident-memory quotas are independent. Allocation-fault tests
-cover retained columns and codecs. Array parsing/binding, durable typed-column
-metadata, public result types and pgwire codecs still need end-to-end
-integration. Numeric/temporal element types and non-C collations also remain
+cover retained columns and codecs. Full array parsing/binding, durable
+typed-column metadata, public result types and pgwire codecs still need
+end-to-end integration. Numeric/temporal element types and non-C collations also remain
 outside this layer's current contract. No original
 typed-array cases are marked complete on this evidence alone.
 
@@ -106,8 +106,26 @@ and JSONB NULL provenance. Fault injection covers decoding every fixture and
 every truncated text-array prefix. Boundary probes preserve PostgreSQL's
 advisory NULL flags, nonzero boolean receive bytes and empty-extent
 normalization; the core now rejects an exclusive upper bound that cannot fit
-int32, with SQLSTATE `54000`. This still does not activate array SQL syntax,
-catalog types, public result descriptors or pgwire routes.
+int32, with SQLSTATE `54000`. The codec alone does not activate catalog types,
+public result descriptors or pgwire array parameters/results.
+
+SQL binding now distinguishes array types from both JSON and unknown NULL,
+including element identity. One-dimensional `ARRAY[...]` constructors feed
+strict comparisons, `ANY`/`ALL`/`SOME`, cardinality and dimension/bound queries.
+Thirty-one shared PostgreSQL expression contracts run through binding,
+native statement execution and the HTTP API, checking exact values and SQL
+NULL flags. Constant constructors are prepared once into the immutable
+program; the 10,000-row debug benchmark uses zero constructor scratch bytes
+versus 688 bytes per row for the parameter-dependent equivalent (about 7 ms
+versus 15 ms in one local run, not a production latency claim). Allocation
+faults cover both preparation and parameter-dependent evaluation. Wider
+integer probes against narrow array cells compare without narrowing overflow.
+Array-valued public outputs, array parameters, multidimensional constructor
+syntax, explicit array casts, catalog storage and overloads converting arrays
+to text/JSON remain explicit activation gaps. Constructor integer cells use
+the existing SQL integer binding contract (int64); PostgreSQL's complete
+element-width inference is not yet active. No original disposition credit is
+granted by these supplemental contracts.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.

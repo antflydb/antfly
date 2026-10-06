@@ -524,6 +524,31 @@ pub fn run(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const
     return runReference(alloc, handler, case_ids, fixtures.read_reference);
 }
 
+/// Supplemental PostgreSQL contracts, not original-corpus disposition credit.
+pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
+    const reference = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, value: Json },
+    }, alloc, fixtures.array_expression_reference, .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 31), reference.value.entries.len);
+    for (reference.value.entries) |entry| {
+        const sql = try std.fmt.allocPrint(alloc, "SELECT {s} AS value", .{entry.sql});
+        defer alloc.free(sql);
+        const case: fixtures.Corpus.Case = .{ .id = "array-expression-contract", .name = entry.sql, .family = "array", .sql = sql, .params = &.{}, .source_expectation = "success" };
+        const response = try execute(alloc, handler, &case);
+        defer response.deinit();
+        const result = response.value;
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+        try std.testing.expectEqualStrings("value", result.columns[0].name);
+        try std.testing.expectEqualStrings("SELECT", result.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
+        try std.testing.expect(try rowMatchesWithNulls(alloc, result.columns, result.rows[0], result.sql_nulls.?[0], &.{entry.value}, &.{entry.value == .null}));
+    }
+    std.debug.print("SQL public array expression contracts: 31 passed; no original disposition credit\n", .{});
+}
+
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
     const discovery = try std.testing.environ.containsUnempty(alloc, "ANTFLY_SQL_READ_DISCOVERY");
     var corpus = try fixtures.Corpus.init(alloc);

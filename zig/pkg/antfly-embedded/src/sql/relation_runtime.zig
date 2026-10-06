@@ -1192,6 +1192,7 @@ fn Engine(comptime Context: type) type {
                 for (self.iterator.node.columns, columns, 0..) |definition, *column, ordinal| {
                     const nulls = try a.alloc(u8, batch.len());
                     const values: types.ColumnValues = switch (definition.type) {
+                        .array => return error.UnsupportedSqlShape,
                         .integer => .{ .i64 = try a.alloc(i64, batch.len()) },
                         .number => .{ .f64 = try a.alloc(f64, batch.len()) },
                         .boolean => .{ .bool = try a.alloc(bool, batch.len()) },

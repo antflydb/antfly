@@ -183,7 +183,9 @@ pub const Merge = struct {
         };
     };
 };
-pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json };
+/// Array element identity belongs to the accompanying binding descriptor;
+/// an array is never represented as a JSON column or an unknown NULL type.
+pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array };
 pub const Column = struct { name: []const u8, type: ColumnType, nullable: bool = true, default_value: ?Value = null };
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };

@@ -170,6 +170,7 @@ pub const Projection = struct {
 
 fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
     return switch (kind) {
+        .array => error.UnsupportedSqlShape,
         .json => typed_json.clone(alloc, value),
         .integer => switch (value) {
             .integer => value,

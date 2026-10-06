@@ -77,6 +77,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlGroupingError => .{ .code = "42803", .message = "A grouped expression references an ungrouped column or invalid aggregate.", .hint = "Group every non-aggregate column and avoid nested aggregate functions.", .retryable = false },
         error.SqlDivisionByZero => .{ .code = "22012", .message = "A numeric expression divides by zero.", .retryable = false },
         error.UnknownSqlParameterType => .{ .code = "42P18", .message = "A parameter type cannot be inferred.", .hint = "Add an explicit cast or provide a parameter type." },
+        error.UnknownSqlArrayType => .{ .code = "42P18", .message = "The array element type cannot be inferred.", .hint = "Provide an explicit array element type." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },
         error.SqlTransactionNotActive => .{ .code = "25P01", .message = "This command requires an active transaction.", .retryable = false },
         error.SessionLeaseLost => .{ .code = "40003", .message = "SQL session ownership changed; reconcile the original transaction before continuing.", .hint = "Reconnect through the active session owner; do not replay staged mutations.", .retryable = false },

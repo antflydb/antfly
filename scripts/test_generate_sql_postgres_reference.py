@@ -223,6 +223,26 @@ class PostgresReferenceTest(unittest.TestCase):
                                 ],
                             )
 
+    def test_typed_array_scalar_expression_contracts(self):
+        import json
+        from pathlib import Path
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_expression_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(len(fixture["entries"]), 31)
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("SET TRANSACTION READ ONLY")
+                    self.assertEqual(
+                        self.db.execute("SELECT " + case["sql"]).fetchone(),
+                        (case["value"],),
+                    )
+
     def test_typed_array_binary_receive_boundary_admission(self):
         import struct
 

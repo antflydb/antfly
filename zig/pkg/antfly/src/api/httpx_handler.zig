@@ -5709,6 +5709,7 @@ pub const AntflyApiHandler = struct {
                 const encoded_owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{self.adapter.server.localSessionNodeId()});
                 const parameter_types = description.arena.allocator().alloc(sql_wire.SQLColumnType, description.binding.parameter_types.len) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
                 for (description.binding.parameter_types, parameter_types) |kind, *output| output.* = if (kind) |value| switch (value) {
+                    .array => return error.UnsupportedSqlShape,
                     inline else => |tag| @field(sql_wire.SQLColumnType, @tagName(tag)),
                 } else .unknown;
                 const response = std.json.Stringify.valueAlloc(self.prepared_response_budget.allocator(), .{ .prepared_id = @as([]const u8, &id), .expires_at_ms = expires, .owner_node_id = encoded_owner, .parameter_types = parameter_types, .columns = description.binding.columns }, .{}) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
@@ -5951,6 +5952,7 @@ pub const AntflyApiHandler = struct {
         };
         defer ctx.allocator.free(columns);
         for (result.output.columns, columns) |column, *output| output.* = .{ .name = column.name, .type = switch (column.type) {
+            .array => return error.UnsupportedSqlShape,
             inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
         } };
         const output: sql_wire.SQLResponse = .{
@@ -13178,6 +13180,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         "sql-1372", "sql-1373", "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384",
         "sql-1385", "sql-1386", "sql-1387",
     };
+    try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
     try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
     {
         const parity = @import("sql_parity_reference.zig");
