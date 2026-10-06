@@ -1497,7 +1497,7 @@ const Parser = struct {
                 if (!self.take(.comma)) break;
                 continue;
             }
-            if (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign)) {
+            if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
                 const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_constraint_{d}", .{constraints.items.len});
                 try constraints.append(self.alloc, try self.constraintDefinition(constraint_name));
                 if (!self.take(.comma)) break;
@@ -1521,8 +1521,7 @@ const Parser = struct {
                     null_seen = true;
                 } else if (self.keyword(.default)) {
                     if (default_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column default");
-                    definition.default_value = try self.value();
-                    if (definition.default_value.? == .parameter) return self.fail(error.UnsupportedSqlShape, "schema defaults cannot contain execution parameters");
+                    definition.default_value = try self.schemaDefault();
                     default_seen = true;
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
@@ -1533,7 +1532,7 @@ const Parser = struct {
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
-                } else if (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES")) {
+                } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES"))) {
                     const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_inline_{d}", .{constraints.items.len});
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
                 } else break;
@@ -1589,7 +1588,7 @@ const Parser = struct {
                     try self.expectKeyword(.null);
                     column.nullable = false;
                 }
-                if (self.keyword(.default)) column.default_value = try self.value();
+                if (self.keyword(.default)) column.default_value = try self.schemaDefault();
                 ddl.action = .alter_schema;
                 ddl.schema_change = .{ .add_column = column };
             } else if (kind == .table and self.keyword(.drop)) {
@@ -1607,7 +1606,7 @@ const Parser = struct {
                 ddl.action = .alter_schema;
                 if (self.keyword(.set)) {
                     try self.expectKeyword(.default);
-                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .value = try self.value() } };
+                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .value = try self.schemaDefault() } };
                 } else {
                     try self.expectKeyword(.drop);
                     try self.expectKeyword(.default);
@@ -1725,6 +1724,19 @@ const Parser = struct {
         return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
     }
 
+    fn schemaDefault(self: *Parser) Error!ast.Value {
+        // Persistent defaults cannot capture a request's parameter values or
+        // run a subquery. Keep CREATE and both ALTER paths consistent before
+        // any catalog admission or physical schema publication.
+        var probe = self.pos;
+        while (probe < self.tokens.len and self.tokens[probe].kind == .lparen) probe += 1;
+        if (probe > self.pos and probe < self.tokens.len and (self.tokens[probe].isKeyword(.select) or self.tokens[probe].isKeyword(.with)))
+            return self.fail(error.UnsupportedSqlShape, "subqueries are not allowed in schema defaults");
+        const result = try self.value();
+        if (result == .parameter) return self.fail(error.UnsupportedSqlShape, "schema defaults cannot contain execution parameters");
+        return result;
+    }
+
     fn ddlWord(self: *Parser, word: []const u8) bool {
         if (self.pos >= self.tokens.len or self.tokens[self.pos].owned or !std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, word)) return false;
         self.pos += 1;
@@ -1789,7 +1801,7 @@ const Parser = struct {
             return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .primary = true } });
         }
         if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns } });
-        if (self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
+        if (self.peek(.identifier) and self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
         return self.foreignKeyDefinition(constraint_name, columns);
     }
 
@@ -2445,6 +2457,32 @@ test "compiler implicit projection aliases preserve clause and expression bounda
     }
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id name extra FROM usage_records", .{}));
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id 42 FROM usage_records", .{}));
+}
+
+test "compiler incomplete catalog definitions report EOF and release partial allocations" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator, sql: []const u8) !void {
+            var diagnostic: Diagnostic = .{};
+            var compiled = compileDiagnostic(alloc, sql, .{}, &diagnostic) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidSqlSyntax, err);
+                try std.testing.expect(diagnostic.start <= sql.len and diagnostic.end <= sql.len);
+                try std.testing.expect(diagnostic.message.len > 0);
+                return;
+            };
+            defer compiled.deinit();
+            return error.UnexpectedCatalogAdmission;
+        }
+    };
+    for ([_][]const u8{
+        "CREATE TABLE broken (",
+        "CREATE TABLE broken (n bigint",
+        "CREATE TABLE broken (n bigint NULL",
+        "CREATE TABLE broken (n bigint CONSTRAINT only_name",
+        "CREATE TABLE broken (n bigint CONSTRAINT only_name REFERENCES",
+        "CREATE TABLE broken (n bigint PRIMARY KEY,",
+        "CREATE TABLE broken (CONSTRAINT only_name",
+    }) |sql| try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{sql});
 }
 
 test "compiler preserves PostgreSQL expression labels before relational lowering" {

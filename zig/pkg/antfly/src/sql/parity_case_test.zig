@@ -113,6 +113,85 @@ test "SQL mutation campaign discovery reports exact compiler admission without p
     std.debug.print("MUTATION DISCOVERY compiler admitted {d}/235; execution and storage outcomes are separate gates\n", .{admitted});
 }
 
+test "SQL catalog campaign discovery separates compiler admission from owner activation" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const verbose = try std.testing.environ.containsUnempty(std.testing.allocator, "ANTFLY_SQL_CATALOG_DISCOVERY");
+    var reviewed: usize = 0;
+    var admitted: usize = 0;
+    var commands: std.StringHashMapUnmanaged(usize) = .empty;
+    defer commands.deinit(std.testing.allocator);
+    for (corpus.parsed.value.entries) |case| {
+        if (!std.mem.eql(u8, case.family, "ddl") and !std.mem.eql(u8, case.family, "unsupported_ddl")) continue;
+        reviewed += 1;
+        var diagnostic: compiler.Diagnostic = .{};
+        var compiled = compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic) catch |err| {
+            if (verbose) std.debug.print("CATALOG DISCOVERY {s} {s}: {s} at {d}: {s}\n", .{ case.id, case.family, @errorName(err), diagnostic.start, diagnostic.message });
+            continue;
+        };
+        defer compiled.deinit();
+        admitted += 1;
+        const kind = @tagName(compiled.statement);
+        const count = try commands.getOrPut(std.testing.allocator, kind);
+        if (!count.found_existing) count.value_ptr.* = 0;
+        count.value_ptr.* += 1;
+        if (verbose) std.debug.print("CATALOG DISCOVERY {s} admitted {s}; native catalog activation not certified\n", .{ case.id, kind });
+    }
+    // Fixed original source cohort, including deliberate negative contracts.
+    // No compiler outcome changes a source classification or disposition.
+    try std.testing.expectEqual(@as(usize, 479), reviewed);
+    var totals = commands.iterator();
+    while (totals.next()) |count| std.debug.print("CATALOG DISCOVERY admitted shape={s} cases={}\n", .{ count.key_ptr.*, count.value_ptr.* });
+    std.debug.print("CATALOG DISCOVERY compiler admitted {}/479; authorization, durable publication and storage semantics remain separate gates\n", .{admitted});
+}
+
+test "SQL catalog default admission matches PostgreSQL subquery prohibition" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for (1109..1141) |ordinal| {
+        var buffer: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffer, "sql-{d:0>4}", .{ordinal});
+        const case = try corpus.get(id);
+        var diagnostic: compiler.Diagnostic = .{};
+        try std.testing.expectError(error.UnsupportedSqlShape, compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic));
+        try std.testing.expectEqualStrings("subqueries are not allowed in schema defaults", diagnostic.message);
+        try std.testing.expectEqualStrings("0A000", sources.sql_errors.describe(error.UnsupportedSqlShape).code);
+    }
+    for ([_][]const u8{
+        "CREATE TABLE items (n bigint DEFAULT $1)",
+        "ALTER TABLE items ADD COLUMN n bigint DEFAULT $1",
+        "ALTER TABLE items ALTER COLUMN n SET DEFAULT $1",
+    }) |sql| {
+        var diagnostic: compiler.Diagnostic = .{};
+        try std.testing.expectError(error.UnsupportedSqlShape, compiler.compileDiagnostic(std.testing.allocator, sql, .{}, &diagnostic));
+        try std.testing.expectEqualStrings("schema defaults cannot contain execution parameters", diagnostic.message);
+    }
+}
+
+test "SQL original catalog request truncations never access missing tokens" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    var prefixes: usize = 0;
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (corpus.parsed.value.entries) |case| {
+        if (!std.mem.eql(u8, case.family, "ddl") and !std.mem.eql(u8, case.family, "unsupported_ddl")) continue;
+        for (0..case.sql.len + 1) |end| {
+            // Include token boundaries and punctuation cuts, including cuts
+            // inside quoted bodies. EOF is never a valid token to dereference.
+            if (end != case.sql.len and !std.ascii.isWhitespace(case.sql[end]) and std.mem.indexOfScalar(u8, "(),;", case.sql[end]) == null) continue;
+            prefixes += 1;
+            var diagnostic: compiler.Diagnostic = .{};
+            var compiled = compiler.compileDiagnostic(std.testing.allocator, case.sql[0..end], .{}, &diagnostic) catch {
+                try std.testing.expect(diagnostic.start <= end);
+                try std.testing.expect(diagnostic.end <= end);
+                continue;
+            };
+            compiled.deinit();
+        }
+    }
+    std.debug.print("SQL catalog truncation contracts: source_cases=479 prefixes={} elapsed_ns={}\n", .{ prefixes, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+}
+
 test "SQL exact corpus lookup owns parameters and rejects malformed identities" {
     var corpus = try fixtures.Corpus.init(std.testing.allocator);
     defer corpus.deinit();

@@ -39,6 +39,33 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
 
+    def test_original_catalog_subquery_defaults_are_not_postgres_features(self):
+        import json
+        from pathlib import Path
+
+        fixtures = (
+            Path(__file__).resolve().parents[1]
+            / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+        )
+        cases = json.loads((fixtures / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        selected = [case for case in cases if "sql-1109" <= case["id"] <= "sql-1140"]
+        self.assertEqual(len(selected), 32)
+        for case in selected:
+            with self.subTest(id=case["id"]):
+                with self.db.transaction(force_rollback=True):
+                    if case["sql"].upper().startswith("ALTER"):
+                        self.db.execute(
+                            "CREATE TABLE usage_records(id uuid, status text, amount bigint)"
+                        )
+                    import psycopg
+
+                    with self.assertRaises(psycopg.errors.FeatureNotSupported) as error:
+                        with self.db.transaction(force_rollback=True):
+                            self.db.execute(case["sql"])
+                    self.assertEqual(error.exception.sqlstate, "0A000")
+
     def case(self, sql, params=()):
         return {"id": "sql-0001", "sql": sql, "params": params}
 

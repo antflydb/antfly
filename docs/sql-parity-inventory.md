@@ -49,6 +49,27 @@ the complete cohorts, not a claim that every case works. Oracle admission and
 discovery-mode native runs do not change dispositions; selected goldens must
 pass the non-discovery native endpoint gate before receiving completion credit.
 
+Catalog discovery separately exercises all 479 original `ddl`/`unsupported_ddl`
+cases, including the already-dispositioned negative contracts. The current
+compiler admits 74, principally catalog operations, transactions and policy
+commands; that is not proof of authorization, durable publication, populated
+schema rewrites or constraint activation. Enable per-case diagnostics with
+`ANTFLY_SQL_CATALOG_DISCOVERY=1` and run `zig build sql-test
+-Dtest-filter='SQL catalog campaign discovery'` from `zig/`.
+
+The catalog boundary now tests 6,585 original-source request truncations, with
+bounded diagnostic positions and no missing-token dereferences. Targeted
+allocation-fault tests cover incomplete CREATE definitions. CREATE defaults,
+ALTER ADD defaults and ALTER SET defaults share admission checks before any
+catalog operation: request parameters cannot become durable schema defaults,
+and subqueries are prohibited. PostgreSQL independently rejects the exact 32
+original DEFAULT-subquery cases (`sql-1109`–`sql-1140`) with SQLSTATE `0A000`;
+these historical forms are not PostgreSQL features waiting to be activated.
+Their dispositions remain unchanged: discovery and rejection evidence do not
+inflate implemented-case counts. Mounted HTTP regression tests verify the
+malformed-request and unsupported-default diagnostics with zero catalog calls,
+so neither a truncated request nor a request-bound default reaches publication.
+
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
 Original source SHA-256: `52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6`.

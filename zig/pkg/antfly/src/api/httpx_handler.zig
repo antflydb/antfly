@@ -12966,6 +12966,56 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
 }
 
+test "httpx SQL malformed catalog requests fail before publication" {
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        publications: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, _: std.mem.Allocator, _: operation_contract.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.publications += 1;
+            return error.UnexpectedCatalogCall;
+        }
+    };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var source: Source = .{};
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const Harness = struct {
+        fn check(a: std.mem.Allocator, h: *AntflyApiHandler, sql: []const u8, code: []const u8, status: u16) !void {
+            const body = try std.json.Stringify.valueAlloc(a, .{ .statement = sql }, .{});
+            defer a.free(body);
+            var request = try httpx.Request.init(a, .POST, "http://127.0.0.1/db/v1/sql");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try h.executeSQL(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(status, response.status.code);
+            const diagnostic = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings(code, diagnostic.value.object.get("code").?.string);
+        }
+    };
+    for ([_][]const u8{ "CREATE TABLE broken (", "CREATE TABLE broken (n bigint", "CREATE TABLE broken (n bigint CONSTRAINT only_name" }) |sql|
+        try Harness.check(alloc, &handler, sql, "42601", 400);
+    for ([_][]const u8{ "ALTER TABLE items ADD COLUMN n bigint DEFAULT $1", "ALTER TABLE items ALTER COLUMN n SET DEFAULT $1" }) |sql|
+        try Harness.check(alloc, &handler, sql, "0A000", 501);
+    var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    for (1109..1141) |ordinal| {
+        var buffer: [8]u8 = undefined;
+        const id = try std.fmt.bufPrint(&buffer, "sql-{d:0>4}", .{ordinal});
+        try Harness.check(alloc, &handler, (try corpus.get(id)).sql, "0A000", 501);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.publications);
+}
+
 test "httpx SQL document campaign verifies exact native mutation and storage outcomes" {
     // Exact PostgreSQL-backed campaign IDs (source SQL is looked up, not copied):
     // sql-0886, sql-0887, sql-0888, sql-0890, sql-0893, sql-0947.
