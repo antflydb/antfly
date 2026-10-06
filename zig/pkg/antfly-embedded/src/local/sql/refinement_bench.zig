@@ -745,7 +745,7 @@ test "native pipeline refinements benchmark leased blocking delivery" {
     };
 }
 
-fn compactTypedDecode(compact: bool) !struct { ns: i96, peak: usize, checksum: i64 } {
+fn compactTypedDecode(compact: bool, dictionary: bool) !struct { ns: i96, peak: usize, checksum: i64 } {
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 16 * 1024 * 1024 };
     const a = budget.allocator();
     const Hook = struct {
@@ -758,7 +758,7 @@ fn compactTypedDecode(compact: bool) !struct { ns: i96, peak: usize, checksum: i
     defer file.close();
     var values: [32]Datum = undefined;
     for (0..4096) |row| {
-        for (&values, 0..) |*value, column| value.* = if ((row + column) % 7 == 0) Datum{} else Datum.json(.{ .integer = @intCast(row + column) });
+        for (&values, 0..) |*value, column| value.* = if ((row + column) % 7 == 0) Datum{} else Datum.json(.{ .integer = @intCast((if (dictionary) row % 4 else row) + column) });
         _ = try file.append(.{ .values = &values, .keys = &.{}, .ordinal = row }, spill.none);
     }
     try file.seal();
@@ -789,9 +789,18 @@ fn compactTypedDecode(compact: bool) !struct { ns: i96, peak: usize, checksum: i
 }
 test "native pipeline refinements benchmark compact typed spill decoding" {
     for (0..3) |sample| {
-        const expanded = try compactTypedDecode(false);
-        const compact = try compactTypedDecode(true);
+        const expanded = try compactTypedDecode(false, false);
+        const compact = try compactTypedDecode(true, false);
         try std.testing.expectEqual(expanded.checksum, compact.checksum);
         std.debug.print("native_refinement {{\"case\":\"compact_typed_spill_decode\",\"rows\":4096,\"width\":32,\"sample\":{d},\"expanded_ns\":{d},\"compact_ns\":{d},\"expanded_peak_bytes\":{d},\"compact_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, compact.ns, expanded.peak, compact.peak });
+    }
+}
+
+test "native pipeline refinements benchmark dictionary spill decoding" {
+    for (0..3) |sample| {
+        const expanded = try compactTypedDecode(false, true);
+        const compact = try compactTypedDecode(true, true);
+        try std.testing.expectEqual(expanded.checksum, compact.checksum);
+        std.debug.print("native_refinement {{\"case\":\"dictionary_spill_decode\",\"rows\":4096,\"width\":32,\"sample\":{d},\"expanded_ns\":{d},\"compact_ns\":{d},\"expanded_peak_bytes\":{d},\"compact_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, compact.ns, expanded.peak, compact.peak });
     }
 }

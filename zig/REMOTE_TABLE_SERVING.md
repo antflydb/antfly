@@ -77,10 +77,13 @@ bit patterns and SQL NULL separately. Downstream expressions reuse these retaine
 dictionaries through selection and slicing. Unique numeric columns stay flat.
 Logical timestamp conversion currently retains its expanded numeric path.
 
-Spilled joins admit compact owned blocks into typed hash state and reuse bounded
+Spilled joins admit compact blocks into typed hash state and reuse bounded
 candidate workspace. Group partitions consume compact blocks using reusable row
 scratch and import exact partial states without expanding a whole block into a
-`Datum` matrix. Unfiltered grouped expression cohorts retain encoded columns through
+`Datum` matrix. Singleton records and already-expanded replay spans borrow the
+source's read arena; typed multi-row blocks own compact payloads until admission
+finishes. Consumers copy retained state before advancing the source. This avoids
+allocating a payload lease for each singleton. Unfiltered grouped expression cohorts retain encoded columns through
 group hashing and aggregate updates. Dictionary keys memoize semantic hashes;
 aggregate inputs preserve source lane order, including floating reductions. Partial
 admission, replay, skew fallback, and legacy wide records share the sequential

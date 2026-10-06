@@ -265,8 +265,9 @@ pub const Grouped = struct {
             var offset: u64 = 0;
             while (offset < file.size) {
                 try self.sort.manager.check();
-                const block = try file.readOwnedBlock(offset);
-                defer block.release();
+                var input = try file.readInputBlock(offset);
+                defer input.deinit();
+                const block = input.view();
                 var values_storage: [1024]Datum = undefined;
                 var keys_storage: [256]Datum = undefined;
                 const values = values_storage[0..block.width()];

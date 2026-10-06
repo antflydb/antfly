@@ -857,13 +857,30 @@ pub const Sequential = struct {
     /// Compact views over a validated typed record. Primitive payloads remain
     /// in the decoded buffer; only legacy heterogeneous cells need Datum tags.
     const EncodedColumn = struct {
+        const Dictionary = struct {
+            kind: u8,
+            size: usize,
+            bytes: []const u8 = &.{},
+            texts: []const []const u8 = &.{},
+            indices: []const u16,
+            fn entry(self: Dictionary, index: usize) std.json.Value {
+                return switch (self.kind) {
+                    1 => .{ .bool = self.bytes[index] == 1 },
+                    2 => .{ .integer = @bitCast(std.mem.readInt(u64, self.bytes[index * 8 ..][0..8], .little)) },
+                    3 => .{ .float = @bitCast(std.mem.readInt(u64, self.bytes[index * 8 ..][0..8], .little)) },
+                    4 => .{ .number_string = self.texts[index] },
+                    5 => .{ .string = self.texts[index] },
+                    else => unreachable,
+                };
+            }
+        };
         flags: []const u8 = &.{},
         values: union(enum) {
             empty,
             fixed: struct { bytes: []const u8, positions: []const u16, kind: u8 },
             texts: struct { values: []const []const u8, decimal: bool },
             dynamic: []const Datum,
-            dictionary: struct { entries: []const Datum, indices: []const u16 },
+            dictionary: Dictionary,
         },
         fn cell(self: EncodedColumn, index: usize) Datum {
             if (self.values == .dynamic) return self.values.dynamic[index];
@@ -878,7 +895,7 @@ pub const Sequential = struct {
                     else => unreachable,
                 },
                 .texts => |v| if (v.decimal) .{ .number_string = v.values[index] } else .{ .string = v.values[index] },
-                .dictionary => |v| v.entries[v.indices[index]].value,
+                .dictionary => |v| v.entry(v.indices[index]),
                 .dynamic => unreachable,
             });
         }
@@ -901,19 +918,18 @@ pub const Sequential = struct {
                 if (base < 1 or base > 5) return error.InvalidSqlSpill;
                 const size = try decoder.count();
                 if (size == 0 or size > count) return error.InvalidSqlSpill;
-                const entries = try decoder.a.alloc(Datum, size);
-                for (entries) |*entry| entry.* = Datum.json(switch (base) {
-                    1 => blk: {
-                        const boolean = try decoder.byte();
+                var fixed: []const u8 = &.{};
+                var texts: []const []const u8 = &.{};
+                if (base <= 3) {
+                    fixed = try decoder.take(size * (if (base == 1) @as(usize, 1) else 8));
+                    if (base == 1) for (fixed) |boolean| {
                         if (boolean > 1) return error.InvalidSqlSpill;
-                        break :blk .{ .bool = boolean == 1 };
-                    },
-                    2 => .{ .integer = @bitCast(try decoder.word()) },
-                    3 => .{ .float = @bitCast(try decoder.word()) },
-                    4 => .{ .number_string = try decoder.take(try decoder.count()) },
-                    5 => .{ .string = try decoder.take(try decoder.count()) },
-                    else => unreachable,
-                });
+                    };
+                } else {
+                    const entries = try decoder.a.alloc([]const u8, size);
+                    for (entries) |*entry| entry.* = try decoder.take(try decoder.count());
+                    texts = entries;
+                }
                 const indices = try decoder.a.alloc(u16, count);
                 for (indices, 0..) |*id, row| {
                     id.* = 0;
@@ -921,7 +937,7 @@ pub const Sequential = struct {
                     id.* = std.mem.readInt(u16, (try decoder.take(2))[0..2], .little);
                     if (id.* >= size) return error.InvalidSqlSpill;
                 }
-                return .{ .flags = flags, .values = .{ .dictionary = .{ .entries = entries, .indices = indices } } };
+                return .{ .flags = flags, .values = .{ .dictionary = .{ .kind = base, .size = size, .bytes = fixed, .texts = texts, .indices = indices } } };
             }
             if (kind == 0) return .{ .flags = flags, .values = .empty };
             if (kind <= 3) {
@@ -993,12 +1009,12 @@ pub const Sequential = struct {
                     const encoded = view.block.encoded orelse return null;
                     const stored = (if (view.keys) encoded.keys else encoded.values)[column];
                     if (stored.values != .dictionary) return null;
-                    const entries = stored.values.dictionary.entries;
-                    const values = try alloc.alloc(Datum, entries.len + 2);
+                    const entries = stored.values.dictionary;
+                    const values = try alloc.alloc(Datum, entries.size + 2);
                     errdefer alloc.free(values);
                     values[0] = .{};
                     values[1] = Datum.json(.null);
-                    @memcpy(values[2..], entries);
+                    for (values[2..], 0..) |*value, index| value.* = Datum.json(entries.entry(index));
                     const indices = try alloc.alloc(u32, view.block.count());
                     for (indices, 0..) |*id, row_index| id.* = @intCast((try identity(raw, row_index, column)).?);
                     return .{ .dictionary = .{ .values = values, .indices = indices } };
@@ -1045,6 +1061,38 @@ pub const Sequential = struct {
             a.destroy(self);
         }
     };
+    pub const InputBlock = union(enum) {
+        owned: *OwnedBlock,
+        borrowed: OwnedBlock,
+        pub fn view(self: *InputBlock) *OwnedBlock {
+            return switch (self.*) {
+                .owned => |block| block,
+                .borrowed => |*block| block,
+            };
+        }
+        pub fn deinit(self: *InputBlock) void {
+            if (self.* == .owned) self.owned.release();
+        }
+    };
+    /// Retaining consumers finish copying state before advancing this source.
+    /// Singleton and already-expanded records borrow the existing read arena;
+    /// typed blocks retain their compact column payloads through admission.
+    pub fn readInputBlock(self: *Sequential, offset: u64) !InputBlock {
+        try self.seal();
+        if (offset >= self.size) return error.InvalidSqlSpill;
+        const expanded = (self.read_rows.len != 0 and offset >= self.read_first and offset < self.read_first + self.read_rows.len) or self.read_single_offset == offset;
+        var singleton = false;
+        if (!expanded and offset == self.read_first) {
+            var header: [17]u8 = undefined;
+            try self.file.readRaw(self.read_offset, &header);
+            singleton = header[16] == 255;
+        }
+        if (!expanded and !singleton) return .{ .owned = try self.readOwnedBlock(offset) };
+        const batch_rows = try self.readBatchBorrowed(offset, 256);
+        const a = self.file.manager.allocator();
+        return .{ .borrowed = .{ .a = a, .arena = .init(a), .rows = batch_rows.rows } };
+    }
+
     /// Transfer a decoded arena without copying its cell payloads. The file
     /// retains only its forward physical offset; the lease owns this block.
     pub fn readOwnedBlock(self: *Sequential, offset: u64) !*OwnedBlock {
@@ -1391,11 +1439,7 @@ pub const Sort = struct {
         // Below 64 KiB there is insufficient workspace to amortize block
         // decoding across merge heads. A 128-byte target selects records.
         if (self.memory_bytes < 64 * 1024) return 128;
-        // Reserve up to a quarter of each merge head's workspace for block
-        // decoding (fanIn prices eight times this target). Keeping several
-        // wide rows together also lets repeated payloads remain dictionary
-        // encoded rather than producing one-row blocks.
-        return @min(32 * 1024, @max(128, self.memory_bytes / 32));
+        return @min(32 * 1024, @max(128, self.memory_bytes / 64));
     }
     fn fanIn(self: *const Sort) usize {
         const block_workspace = if (self.blockBytes() > 128) self.blockBytes() *| 8 else 0;
@@ -2165,4 +2209,40 @@ test "SQL dictionary spill rejects invalid IDs counts tags and truncated payload
         var decoder: Decoder = .{ .manager = &manager, .a = arena.allocator(), .bytes = bytes[0..length] };
         try std.testing.expectError(error.InvalidSqlSpill, Sequential.EncodedColumn.decode(&decoder, 1));
     }
+}
+
+fn retainingInputScenario(a: Allocator) !void {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 1024);
+    defer file.close();
+    const wide: [4096]u8 = @splat('x');
+    for (0..21) |index| _ = try file.append(.{ .values = &.{Datum.json(.{ .string = if (index == 10) &wide else "small" })}, .keys = &.{Datum.json(.{ .integer = @intCast(index) })}, .ordinal = index }, none);
+    for (0..2) |_| {
+        file.rewind();
+        var offset: usize = 0;
+        var owned: usize = 0;
+        var borrowed: usize = 0;
+        while (offset < 21) {
+            var input = try file.readInputBlock(offset);
+            defer input.deinit();
+            if (input == .owned) owned += 1 else borrowed += 1;
+            const block = input.view();
+            for (0..block.count()) |index| {
+                try std.testing.expectEqual(@as(u64, offset + index), block.ordinal(index));
+                try std.testing.expectEqual(@as(i64, @intCast(offset + index)), (try block.keyCell(index, 0)).value.integer);
+                try std.testing.expectEqualStrings(if (offset + index == 10) &wide else "small", (try block.cell(index, 0)).value.string);
+            }
+            offset += block.count();
+        }
+        try std.testing.expect(owned != 0 and borrowed == 1);
+    }
+}
+test "SQL retaining spill consumers borrow singleton records between compact blocks" {
+    try retainingInputScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainingInputScenario, .{});
 }

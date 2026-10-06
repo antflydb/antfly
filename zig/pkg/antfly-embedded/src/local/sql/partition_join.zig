@@ -448,8 +448,9 @@ pub const Join = struct {
                 var offset: u64 = 0;
                 var skew_fallback = false;
                 while (offset < file.size) {
-                    const block = try file.readOwnedBlock(offset);
-                    defer block.release();
+                    var input = try file.readInputBlock(offset);
+                    defer input.deinit();
+                    const block = input.view();
                     _ = self.scratch.reset(.retain_capacity);
                     const a = self.scratch.allocator();
                     const values = try block.batch(a, false);

@@ -17,6 +17,8 @@ pub fn encodedColumns(a: A, values: []const @import("execution_batch.zig").Batch
         if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
         var memo: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer memo.deinit(a);
+        var text: std.StringHashMapUnmanaged(u64) = .empty;
+        defer text.deinit(a);
         for (states, result, 0..) |*state, *valid, index| {
             const cell = try column.cell(a, index, 0);
             if (!grouped and cell.sql_null) valid.* = null;
@@ -25,6 +27,11 @@ pub fn encodedColumns(a: A, values: []const @import("execution_batch.zig").Batch
                 if (memo.get(id)) |hash| break :blk hash;
                 const hash = try scalar.semanticHash(cell.value);
                 if (memo.count() < 4096) try memo.put(a, id, hash);
+                break :blk hash;
+            } else if (cell.value == .string) blk: {
+                if (text.get(cell.value.string)) |hash| break :blk hash;
+                const hash = try scalar.semanticHash(cell.value);
+                if (text.count() < 4096) try text.put(a, cell.value.string, hash);
                 break :blk hash;
             } else try scalar.semanticHash(cell.value);
             var bytes: [9]u8 = undefined;
