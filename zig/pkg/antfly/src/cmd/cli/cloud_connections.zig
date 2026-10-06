@@ -63,7 +63,9 @@ fn interactive(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8, p
         else => return err,
     };
     defer command.deinit();
-    var child = std.process.spawn(io, .{ .argv = command.argv, .environ_map = &command.environment }) catch |err| switch (err) {
+    // Vendor prompts and success banners remain interactive on stderr while
+    // stdout contains only Antfly's JSON result. Keep stdin inherited for codes.
+    var child = std.process.spawn(io, .{ .argv = command.argv, .environ_map = &command.environment, .stdout = .{ .file = std.Io.File.stderr() } }) catch |err| switch (err) {
         error.FileNotFound => return if (provider == .aws) error.AwsCliRequired else error.GcloudCliRequired,
         else => return err,
     };

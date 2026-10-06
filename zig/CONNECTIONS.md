@@ -32,7 +32,8 @@ Antfly-owned OAuth client or AWS application registration. Commands work without
 a running Antfly server; `ANTFLY_URL` and Antfly API authentication do not affect
 them. Run them as the OS user that runs Antfly and restart an existing server
 after login/logout. Credentials stay on that machine and are shared with other
-local applications using the same vendor credential store.
+local applications using the same vendor credential store. Antfly JSON results
+go to stdout; interactive vendor prompts and success messages go to stderr.
 
 ### Google Application Default Credentials
 
@@ -100,9 +101,10 @@ credential export always selects the requested role. Cyclic or overly deep
 chains fail closed. Browser and role profiles must export an unexpired session
 token and expiration; login/list reject static keys that shadow browser grants.
 Native static profiles, service credentials, web identity, ECS and instance
-credentials retain their paths. Explicit `shared_credentials_file` retains
-file-only semantics. Browser and role profiles require the AWS CLI to remain
-installed for refresh. Antfly does not execute arbitrary `credential_process`
+credentials retain their paths. Shared-file session-token profiles remain valid
+without expiration metadata; browser and role grants still require it.
+Explicit `shared_credentials_file` retains file-only semantics. Browser and role
+profiles require the AWS CLI to remain installed for refresh. Antfly does not execute arbitrary `credential_process`
 commands itself.
 
 Console logout selects the browser source profile, including for role chains;

@@ -76,6 +76,8 @@ if args[:2]==["configure","export-credentials"]:
  print(json.dumps(value))
 elif args[:3]==["auth","application-default","print-access-token"]:
  print("fake-google-token")
+else:
+ print("vendor-interactive-output")
 """
     )
     for name in ("aws", "gcloud"):
@@ -107,6 +109,7 @@ elif args[:3]==["auth","application-default","print-access-token"]:
 def assert_safe(result, status="available"):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["status"] == status
+    assert "vendor-interactive-output" not in result.stdout
     for secret in (
         "fake-secret",
         "fake-session",
@@ -136,7 +139,9 @@ def test_google_adc_login_list_logout_without_antfly_server(cloud_cli):
 
 def test_aws_console_profile_login_list_logout_without_antfly_server(cloud_cli):
     run, calls, _ = cloud_cli
-    assert_safe(run("login", "aws", "--profile", "work"))
+    logged_in = run("login", "aws", "--profile", "work")
+    assert_safe(logged_in)
+    assert "vendor-interactive-output" in logged_in.stderr
     assert calls()[0] == ["aws", "login", "--profile", "work", "--no-cli-pager"]
     assert calls()[1] == [
         "aws",
@@ -259,7 +264,8 @@ def test_aws_browser_readiness_rejects_incomplete_temporary_exports(
     assert "fake-secret" not in result.stdout + result.stderr
 
 
-def test_aws_static_profile_list_remains_available(cloud_cli):
+@pytest.mark.parametrize("omit", ["SessionToken,Expiration", "Expiration"])
+def test_aws_static_profile_list_remains_available(cloud_cli, omit):
     run, _, env = cloud_cli
     Path(env["AWS_CONFIG_FILE"]).write_text("[profile work]\nregion=us-east-1\n")
     assert_safe(
@@ -268,7 +274,7 @@ def test_aws_static_profile_list_remains_available(cloud_cli):
             "aws",
             "--profile",
             "work",
-            extra_env={"CLOUD_TEST_OMIT": "SessionToken,Expiration"},
+            extra_env={"CLOUD_TEST_OMIT": omit},
         )
     )
 

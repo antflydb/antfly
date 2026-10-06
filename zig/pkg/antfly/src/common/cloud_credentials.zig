@@ -161,7 +161,9 @@ pub fn parseAwsExport(alloc: std.mem.Allocator, raw: []const u8) !std.json.Parse
     };
     errdefer parsed.deinit();
     if (parsed.value.Version != 1 or parsed.value.AccessKeyId.len == 0 or parsed.value.SecretAccessKey.len == 0) return error.InvalidAwsCredentialExport;
-    if (parsed.value.SessionToken) |token| if (token.len == 0 or parsed.value.Expiration == null) return error.InvalidAwsCredentialExport;
+    // Shared-file session tokens have no expiration metadata. Browser/role
+    // readiness applies the stricter temporary-grant contract separately.
+    if (parsed.value.SessionToken) |token| if (token.len == 0) return error.InvalidAwsCredentialExport;
     if (parsed.value.Expiration) |expiration| _ = try parseExpiration(expiration);
     return parsed;
 }
@@ -359,7 +361,16 @@ test "cloud credentials reject malformed AWS exports without leaking secrets" {
     var valid = try parseAwsExport(a, "{\"Version\":1,\"AccessKeyId\":\"access\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"session\",\"Expiration\":\"2030-01-01T00:00:00Z\"}");
     defer valid.deinit();
     try std.testing.expectEqualStrings("session", valid.value.SessionToken.?);
-    for ([_][]const u8{ "{}", "{\"Version\":2,\"AccessKeyId\":\"a\",\"SecretAccessKey\":\"s\"}", "{\"Version\":1,\"AccessKeyId\":\"\",\"SecretAccessKey\":\"s\"}", "{\"Version\":1,\"AccessKeyId\":\"a\",\"SecretAccessKey\":\"s\",\"SessionToken\":\"t\"}" }) |raw| try std.testing.expectError(error.InvalidAwsCredentialExport, parseAwsExport(a, raw));
+    for ([_][]const u8{ "{}", "{\"Version\":2,\"AccessKeyId\":\"a\",\"SecretAccessKey\":\"s\"}", "{\"Version\":1,\"AccessKeyId\":\"\",\"SecretAccessKey\":\"s\"}", "{\"Version\":1,\"AccessKeyId\":\"a\",\"SecretAccessKey\":\"s\",\"SessionToken\":\"\"}" }) |raw| try std.testing.expectError(error.InvalidAwsCredentialExport, parseAwsExport(a, raw));
+}
+
+test "cloud credentials accept shared-file session tokens without expiration" {
+    const a = std.testing.allocator;
+    var parsed = try parseAwsExport(a, "{\"Version\":1,\"AccessKeyId\":\"access\",\"SecretAccessKey\":\"secret\",\"SessionToken\":\"session\"}");
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("session", parsed.value.SessionToken.?);
+    try std.testing.expect(parsed.value.Expiration == null);
+    try std.testing.expectError(error.InvalidAwsCredentialExport, validateTemporaryAwsExport(parsed.value, 0));
 }
 
 test "cloud credentials validate AWS UTC expiration" {
