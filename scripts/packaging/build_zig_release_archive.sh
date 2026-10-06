@@ -18,7 +18,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -43,6 +43,7 @@ target=
 archive_name=
 out_dir=
 metal=false
+apple_providers=false
 system_blas=false
 optimize=fast
 strip=true
@@ -68,6 +69,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --out-dir)
       out_dir="${2:?missing --out-dir value}"
+      shift 2
+      ;;
+    --apple-providers)
+      apple_providers="${2:?missing --apple-providers value}"
       shift 2
       ;;
     --metal)
@@ -136,6 +141,17 @@ case "$strip" in
     ;;
 esac
 
+case "$apple_providers" in
+  true|false) ;;
+  *) echo "--apple-providers must be true or false" >&2; exit 2 ;;
+esac
+if [ "$apple_providers" = true ]; then
+  case "$target" in
+    *macos*) ;;
+    *) echo "--apple-providers requires a macOS target" >&2; exit 2 ;;
+  esac
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
 if ! [[ "$source_date_epoch" =~ ^[0-9]+$ ]]; then
@@ -194,6 +210,7 @@ zig_build_options=(
   -Dcpu=baseline
   -Dantfly-version="$version"
   -Donnx=false
+  -Dapple-providers="$apple_providers"
   -Dmetal="$metal"
   -Dcuda="$cuda"
   -Dpjrt="$pjrt"
@@ -323,6 +340,10 @@ if [[ "$product" = lite || "$product" = embedded ]]; then
   # native compile or a dependency on the ELv2 server executable.
   cp "$prefix/bin/antfly-lite" "$stage/antfly-inference-worker"
 fi
+if [ "$apple_providers" = true ] && [ ! -f "$prefix/lib/libantfly-apple.dylib" ]; then
+  echo "missing native Apple bridge: $prefix/lib/libantfly-apple.dylib" >&2
+  exit 1
+fi
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
 fi
@@ -404,4 +425,7 @@ if [ "$product" = server ]; then
   grep -Fx "./LICENSES/Elastic-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
 fi
 grep -Fx "./LICENSES/Apache-2.0.txt" "$work_root/archive-contents.txt" >/dev/null
+if [ "$apple_providers" = true ]; then
+  grep -Fx "./lib/libantfly-apple.dylib" "$work_root/archive-contents.txt" >/dev/null
+fi
 echo "wrote $out_dir/$archive_name"

@@ -30,7 +30,7 @@ function loadStoredGenerator(): GeneratorConfig | null {
       parsed &&
       typeof parsed === "object" &&
       typeof parsed.provider === "string" &&
-      typeof parsed.model === "string"
+      (parsed.provider === "apple" ? !("model" in parsed) : typeof parsed.model === "string")
     ) {
       return parsed as GeneratorConfig;
     }

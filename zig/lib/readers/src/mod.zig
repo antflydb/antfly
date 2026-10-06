@@ -48,6 +48,7 @@ test "reader classifies retryable HTTP statuses" {
 
 pub const Provider = config.Provider;
 pub const Config = config.Config;
+pub const apple = @import("apple.zig");
 
 pub const InlineContentTrust = enum {
     untrusted,
@@ -348,22 +349,27 @@ pub const Registry = struct {
 };
 
 pub fn cloneConfig(alloc: Allocator, cfg: Config) !Config {
-    return .{
-        .provider = cfg.provider,
-        .model = try dupOpt(alloc, cfg.model),
-        .prompt = try dupOpt(alloc, cfg.prompt),
-        .max_tokens = cfg.max_tokens,
-        .api_key = try dupOpt(alloc, cfg.api_key),
-        .bearer_token = try dupOpt(alloc, cfg.bearer_token),
-        .capability_token = try dupOpt(alloc, cfg.capability_token),
-        .capability_revision = try dupOpt(alloc, cfg.capability_revision),
-        .base_url = try dupOpt(alloc, cfg.base_url),
-        .url = try dupOpt(alloc, cfg.url),
-        .api_url = try dupOpt(alloc, cfg.api_url),
-        .project_id = try dupOpt(alloc, cfg.project_id),
-        .location = try dupOpt(alloc, cfg.location),
-        .credentials_path = try dupOpt(alloc, cfg.credentials_path),
-    };
+    var owned = cfg;
+    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+        @field(owned, field) = null;
+    }
+    owned.recognition_languages = &.{};
+    errdefer deinitConfig(alloc, &owned);
+    inline for (.{ "model", "prompt", "api_key", "bearer_token", "capability_token", "capability_revision", "base_url", "url", "api_url", "project_id", "location", "credentials_path" }) |field| {
+        @field(owned, field) = try dupOpt(alloc, @field(cfg, field));
+    }
+    const languages = try alloc.alloc([]const u8, cfg.recognition_languages.len);
+    var filled: usize = 0;
+    errdefer {
+        for (languages[0..filled]) |value| alloc.free(value);
+        alloc.free(languages);
+    }
+    for (cfg.recognition_languages, languages) |value, *target| {
+        target.* = try alloc.dupe(u8, value);
+        filled += 1;
+    }
+    owned.recognition_languages = languages;
+    return owned;
 }
 
 pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
@@ -379,6 +385,8 @@ pub fn deinitConfig(alloc: Allocator, cfg: *Config) void {
     freeOpt(alloc, cfg.project_id);
     freeOpt(alloc, cfg.location);
     freeOpt(alloc, cfg.credentials_path);
+    for (cfg.recognition_languages) |value| alloc.free(value);
+    alloc.free(cfg.recognition_languages);
     cfg.* = undefined;
 }
 
@@ -403,6 +411,7 @@ fn initReaderWithOptions(alloc: Allocator, http: *httpx.Client, cfg: Config, opt
         .antfly => try AntflyReaderState.init(alloc, http, cfg, options),
         .openai => try OpenAiReaderState.init(alloc, http, cfg),
         .vertex => try VertexReaderState.init(alloc, http, cfg),
+        .apple => try AppleReaderState.init(alloc, http, cfg, options),
     };
 }
 
@@ -429,12 +438,47 @@ pub fn readEncodedWithConfigReported(
     request: EncodedRequest,
     options: RemoteOptions,
 ) !BatchResult {
+    if (cfg.provider == .apple) return apple.readEncoded(alloc, cfg, request, options);
     if (cfg.provider != .antfly) return error.UnsupportedReaderProvider;
     const reader = try AntflyReaderState.init(alloc, http, cfg, options);
     defer reader.deinit();
     const state: *AntflyReaderState = @ptrCast(@alignCast(reader.ptr));
     return try state.readEncodedReported(alloc, request);
 }
+
+pub fn readRasterWithConfigReported(alloc: Allocator, cfg: Config, request: RasterRequest, options: RemoteOptions) !BatchResult {
+    if (cfg.provider != .apple) return error.BorrowedRasterUnsupported;
+    return apple.readRasters(alloc, cfg, request, options);
+}
+
+const AppleReaderState = struct {
+    alloc: Allocator,
+    http: *httpx.Client,
+    cfg: Config,
+    options: RemoteOptions,
+
+    fn init(alloc: Allocator, http: *httpx.Client, cfg: Config, options: RemoteOptions) !Reader {
+        const state = try alloc.create(AppleReaderState);
+        errdefer alloc.destroy(state);
+        state.* = .{ .alloc = alloc, .http = http, .cfg = try cloneConfig(alloc, cfg), .options = options };
+        return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
+    }
+
+    fn read(ptr: *anyopaque, alloc: Allocator, request: Request) ![]Result {
+        return (try readReported(ptr, alloc, request)).items;
+    }
+
+    fn readReported(ptr: *anyopaque, alloc: Allocator, request: Request) !BatchResult {
+        const state: *AppleReaderState = @ptrCast(@alignCast(ptr));
+        return apple.read(alloc, state.http, state.cfg, request, state.options);
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const state: *AppleReaderState = @ptrCast(@alignCast(ptr));
+        deinitConfig(state.alloc, &state.cfg);
+        state.alloc.destroy(state);
+    }
+};
 
 fn encodeReadRequestAlloc(alloc: Allocator, request: inference_api.ReadRequest) ![]u8 {
     // Data URI bodies need one exact allocation: allocating-writer growth can

@@ -231,6 +231,9 @@ pub fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
     const vector_block_build_hard = adaptiveSliceHardLimit(total, 16, MinSmartVectorBlockBuildBytes, MaxSmartVectorBlockBuildBytes);
+    // Native OCR needs admission for OS-owned recognition memory as well as
+    // rendered pages. Preserve the small-host floor and the process envelope.
+    const document_extraction_hard = adaptiveSliceHardLimit(total, 32, 256 * MiB, GiB);
 
     options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
     options.budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
@@ -252,6 +255,7 @@ pub fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@backingInt(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
     options.budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = resourceBudget(3, shard_transition_hard);
     options.budgets[@backingInt(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = resourceBudget(3, document_extraction_hard);
     // Inference slices are logical host-plus-accelerator metrics. Their host
     // component is enforced by the aggregate budget above; ModelManager and
     // BackendRuntime retain device-aware backend admission.
@@ -260,4 +264,13 @@ pub fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
         .options = options,
         .lsm_cache_budget_bytes = clampU64ToUsize(lsm_hard),
     };
+}
+
+test "apple OCR document memory budgets scale within the host envelope" {
+    const slice = @backingInt(resource_manager_mod.Slice.document_extraction_working_set);
+    const small = smartResourceBudgetsForTotal(GiB);
+    const mac = smartResourceBudgetsForTotal(36 * GiB);
+    try std.testing.expectEqual(@as(u64, 256 * MiB), small.options.budgets[slice].hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, GiB), mac.options.budgets[slice].hard_limit_bytes);
+    try std.testing.expect(mac.options.budgets[slice].hard_limit_bytes < mac.options.memory_budget.hard_limit_bytes);
 }
