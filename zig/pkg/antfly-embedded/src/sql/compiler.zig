@@ -602,6 +602,12 @@ const Parser = struct {
                     const every = self.keyword(.all);
                     if (every or self.keyword(.any) or self.keyword(.some)) {
                         try self.expect(.lparen);
+                        if (self.pos < self.tokens.len and !self.tokens[self.pos].isKeyword(.select) and !self.tokens[self.pos].isKeyword(.with)) {
+                            const input = try self.scalar(depth + 1, 0);
+                            try self.expect(.rparen);
+                            left = try self.patternArray(left, input, every, insensitive, true);
+                            continue;
+                        }
                         if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
                         self.relation_depth += 1;
                         const query = try self.alloc.create(ast.Select);
@@ -684,9 +690,12 @@ const Parser = struct {
                 if (every or self.keyword(.any) or self.keyword(.some)) {
                     try self.expect(.lparen);
                     if (self.pos < self.tokens.len and !self.tokens[self.pos].isKeyword(.select) and !self.tokens[self.pos].isKeyword(.with)) {
-                        if (op == .like or op == .ilike) return self.fail(error.UnsupportedSqlShape, "array pattern quantification is not activated");
                         const input = try self.scalar(depth + 1, 0);
                         try self.expect(.rparen);
+                        if (op == .like or op == .ilike) {
+                            left = try self.patternArray(left, input, every, op == .ilike, false);
+                            continue;
+                        }
                         const comparison_value: @import("array_value.zig").Comparison = switch (op) {
                             .eq => .eq,
                             .neq => .ne,
@@ -1482,6 +1491,13 @@ const Parser = struct {
             else => null,
         };
         return if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = label };
+    }
+
+    fn patternArray(self: *Parser, operand: *const ast.Scalar, input: *const ast.Scalar, every: bool, insensitive: bool, negated: bool) Error!*const ast.Scalar {
+        const all_node = try self.scalarNode(.{ .literal = .{ .boolean = every } });
+        const insensitive_node = try self.scalarNode(.{ .literal = .{ .boolean = insensitive } });
+        const negated_node = try self.scalarNode(.{ .literal = .{ .boolean = negated } });
+        return self.scalarNode(.{ .call = .{ .name = "$array_pattern_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, input, all_node, insensitive_node, negated_node }) } });
     }
 
     const CastType = struct { type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null };

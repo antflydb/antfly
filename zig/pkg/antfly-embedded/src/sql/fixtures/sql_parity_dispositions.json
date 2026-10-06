@@ -267,7 +267,7 @@
       "timeout_seconds": 600
     },
     "sql-pattern-quantified": {
-      "command": ["zig", "build", "sql-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=quantified pattern sets", "-Dtest-filter=quantified pattern parameter", "-Dtest-filter=pattern aggregate"],
+      "command": ["zig", "build", "sql-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=quantified pattern sets", "-Dtest-filter=quantified pattern parameter", "-Dtest-filter=pattern aggregate", "-Dtest-filter=SQL array pattern quantifiers", "-Dtest-filter=SQL bound array expressions", "-Dtest-filter=SQL array casts match PostgreSQL"],
       "cwd": "zig",
       "timeout_seconds": 600
     },
@@ -1808,18 +1808,21 @@
     },
     {
       "id": "sql-0220",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-0221",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-0222",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-0223",
@@ -2941,8 +2944,9 @@
     },
     {
       "id": "sql-0284",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-0285",
@@ -3067,8 +3071,9 @@
     },
     {
       "id": "sql-0302",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-0303",
@@ -11122,13 +11127,15 @@
     },
     {
       "id": "sql-1226",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-1227",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-1228",
@@ -11972,8 +11979,9 @@
     },
     {
       "id": "sql-1340",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL executes through the public HTTP boundary over native typed rows. PostgreSQL verifies complete results, labels, types and SQL NULL provenance; independent peer-frontier contracts cover non-unique ordering and LIMIT. Typed array pattern matching retains per-comparison negation and bounded allocation-free constant execution. This does not certify unimplemented array parameters, catalog arrays or LATERAL execution.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-campaigns"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL array pattern quantifiers bound work and avoid hot loop allocations","gate":"sql-pattern-quantified"}]
     },
     {
       "id": "sql-1341",

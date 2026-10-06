@@ -1300,6 +1300,138 @@
       "affected": 0
     },
     {
+      "id": "sql-0220",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0221",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u19"
+        ],
+        [
+          "u2"
+        ],
+        [
+          "u20"
+        ],
+        [
+          "u21"
+        ],
+        [
+          "u22"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0222",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "c1"
+        ],
+        [
+          "c2"
+        ],
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0226",
       "columns": [
         "id"
@@ -3247,6 +3379,102 @@
       "affected": 0
     },
     {
+      "id": "sql-0284",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u1"
+        ],
+        [
+          "u10"
+        ],
+        [
+          "u11"
+        ],
+        [
+          "u13"
+        ],
+        [
+          "u14"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0302",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "u5"
+        ],
+        [
+          "u3"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "u5"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "u3"
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
       "id": "sql-0454",
       "columns": [
         "id"
@@ -3875,6 +4103,130 @@
       "affected": 0
     },
     {
+      "id": "sql-1226",
+      "columns": [
+        "organization_id",
+        "openish_count"
+      ],
+      "rows": [
+        [
+          "org_1",
+          6
+        ],
+        [
+          "org_2",
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "org_1",
+              6
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "org_2",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1227",
+      "columns": [
+        "organization_id",
+        "openish_count"
+      ],
+      "rows": [
+        [
+          "org_1",
+          6
+        ],
+        [
+          "org_2",
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "org_1",
+              6
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "org_2",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
       "id": "sql-1265",
       "columns": [
         "id"
@@ -4000,6 +4352,62 @@
         [
           "u13",
           "c1"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1340",
+      "columns": [
+        "order_id",
+        "customer_name"
+      ],
+      "rows": [
+        [
+          "c1",
+          "Ada Customer"
+        ],
+        [
+          "c2",
+          "Grace Customer"
+        ],
+        [
+          "u1",
+          "Ada Customer"
+        ],
+        [
+          "u10",
+          "Grace Customer"
+        ],
+        [
+          "u11",
+          "Ada Customer"
         ]
       ],
       "sql_nulls": [

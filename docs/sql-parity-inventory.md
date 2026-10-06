@@ -29,7 +29,7 @@ document property. Source schemas remain intact; an explicit current document
 schema models the historical object-valued `metadata: json` shorthand without
 granting any index-readiness or cardinality authority.
 
-Four non-unique ordering contracts additionally use independent, bounded
+Seven non-unique ordering contracts additionally use independent, bounded
 PostgreSQL observers for the complete eligible peer frontier. Validation checks
 a complete ordered prefix, allowing arbitrary selection only within genuine
 peers at the LIMIT boundary. Skipping better rows, duplicating rows or selecting
@@ -112,7 +112,7 @@ public result descriptors or pgwire array parameters/results.
 SQL binding now distinguishes array types from both JSON and unknown NULL,
 including element identity. One-dimensional `ARRAY[...]` constructors feed
 strict comparisons, `ANY`/`ALL`/`SOME`, cardinality and dimension/bound queries.
-Seventy-six shared PostgreSQL expression contracts run through binding,
+Ninety-eight shared PostgreSQL expression contracts run through binding,
 native statement execution and the HTTP API, checking exact values and SQL
 NULL flags. Constant constructors are prepared once into the immutable
 program; the 10,000-row debug benchmark uses zero constructor scratch bytes
@@ -126,10 +126,19 @@ chains are prepared once and require no evaluation allocator. Scalar and
 vector integer arithmetic check their inferred widths; real arithmetic uses
 the scalar path to preserve float4 rounding. Floating-point casts round ties
 to even; JSONB numeric casts round exact decimal tokens away from zero without
-an intermediate double. Eighteen shared PostgreSQL SQLSTATE contracts cover
+an intermediate double. Twenty shared PostgreSQL SQLSTATE contracts cover
 invalid syntax, range overflow, unsupported cast pairs and array operators.
 Comparison operators require matching array element identities, while
 CASE/COALESCE use common-type promotion.
+
+LIKE/ILIKE ANY/ALL/SOME over typed text arrays use the existing bounded pattern
+matcher without materializing a JSON copy or allocating per pattern. Negation
+applies to each comparison, not to the combined quantifier result. SQL NULL
+arrays differ from empty arrays; NULL elements preserve three-valued logic.
+Twenty-two PostgreSQL contracts cover these boundaries, C-locale UTF-8 matching,
+escaping and short-circuiting past an invalid later pattern. A 10,000-row debug
+probe runs with a zero-byte evaluation allocator (about 7 ms locally, not a
+production latency claim). Allocation-fault tests also cover dynamic arrays.
 
 Array-valued public outputs, array parameters, raw text-array input,
 multidimensional constructor syntax, catalog storage and overloads converting
@@ -155,8 +164,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 323 implemented, 136 rejected and 67 superseded
-cases, with 1,060 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 331 implemented, 136 rejected and 67 superseded
+cases, with 1,052 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 117 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -169,7 +178,16 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 now requires at least 261 additional resolved dispositions.
+getting below 800 now requires at least 253 additional resolved dispositions.
+
+Eight further original cases (`sql-0220`–`sql-0222`, `sql-0284`, `sql-0302`,
+`sql-1226`, `sql-1227` and `sql-1340`) now execute typed array predicates through
+reads, aggregate FILTER and a left join. The PostgreSQL read campaign contains
+68 exact contracts, with peer-frontier checks for the new non-unique aggregate
+and timestamp ordering. `sql-1363` remains an unresolved candidate: its LATERAL
+relation needs correlated derived-table binding and a parameterized apply
+operator with per-parent ORDER/LIMIT and left-null-extension semantics; scalar
+pattern support alone does not activate that relation shape.
 
 Six additional read contracts exercise PostgreSQL text slicing and replacement
 through the native endpoint. The text oracle independently verifies 54 UTF-8,

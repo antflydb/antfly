@@ -18,6 +18,8 @@
     {"sql": "ARRAY['1e50']::real[]", "code": "22003"},
     {"sql": "ARRAY['9223372036854775807.5']::jsonb[]::bigint[]", "code": "22003"},
     {"sql": "2147483647::integer + 1", "code": "22003"},
-    {"sql": "2147483647 + 1", "code": "22003"}
+    {"sql": "2147483647 + 1", "code": "22003"},
+    {"sql": "'abc' LIKE ANY(ARRAY[1])", "code": "42883"},
+    {"sql": "'abc' LIKE ANY(ARRAY['%\\'])", "code": "22025"}
   ]
 }

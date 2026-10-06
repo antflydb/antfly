@@ -233,7 +233,7 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_expression_reference.json"
             ).read_text()
         )
-        self.assertEqual(len(fixture["entries"]), 76)
+        self.assertEqual(len(fixture["entries"]), 98)
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 with self.db.transaction(force_rollback=True):
@@ -255,7 +255,7 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_cast_errors.json"
             ).read_text()
         )
-        self.assertEqual(len(fixture["entries"]), 18)
+        self.assertEqual(len(fixture["entries"]), 20)
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 with self.assertRaises(psycopg.Error) as caught:

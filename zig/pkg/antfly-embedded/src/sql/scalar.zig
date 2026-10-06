@@ -71,7 +71,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified" };
 
 pub const Instruction = struct {
     type: Type,
@@ -238,7 +238,7 @@ test "SQL bound array expressions match PostgreSQL scalar contracts" {
     const Entry = struct { sql: []const u8, value: Json };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_expression_reference.json"), .{});
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 76), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 98), fixture.value.entries.len);
     for (fixture.value.entries) |entry| {
         var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
         defer compiled.deinit();
@@ -257,7 +257,7 @@ test "SQL array casts match PostgreSQL rejection diagnostics" {
     const Entry = struct { sql: []const u8, code: []const u8 };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_cast_errors.json"), .{});
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 18), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 20), fixture.value.entries.len);
     const Check = struct {
         fn evaluate(sql: []const u8) !void {
             var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
@@ -332,6 +332,37 @@ test "SQL array binding retains element identity NULL provenance and bounded all
     var strict_program = try bind(std.testing.allocator, strict.expression, &.{.{ .name = "a", .type = .array, .element_type = .int32 }}, &.{}, .{});
     defer strict_program.deinit();
     try std.testing.expectError(error.SqlDivisionByZero, strict_program.evaluate(arena.allocator(), &.{.{}}, &.{}, .{}));
+}
+
+test "SQL array pattern quantifiers bound work and avoid hot loop allocations" {
+    const Faults = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "probe ILIKE ANY(ARRAY[$1, 'open%'])", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{.{ .name = "probe", .type = .string }}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const result = try program.evaluate(arena.allocator(), &.{Datum.json(.{ .string = "READY-value" })}, &.{.{ .string = "ready%" }}, .{});
+            try std.testing.expect(result.value.bool);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "probe ILIKE ANY(ARRAY['ready%', 'open%'])", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{.{ .name = "probe", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 1), program.constant_arrays.count());
+    var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(no_memory.allocator(), &.{Datum.json(.{ .string = "READY-value" })}, &.{}, .{ .pattern_steps = 1 }));
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var matched: usize = 0;
+    for (0..10000) |row| {
+        const result = try program.evaluate(no_memory.allocator(), &.{Datum.json(.{ .string = if (row % 2 == 0) "READY-value" else "closed" })}, &.{}, .{});
+        matched += @intFromBool(result.value.bool);
+    }
+    try std.testing.expectEqual(@as(usize, 5000), matched);
+    std.debug.print("SQL array pattern quantifiers: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
 }
 
 test "SQL array cast execution preserves bounds and releases allocations on every fault" {
@@ -482,7 +513,7 @@ fn arity(function: Function, count: usize) !void {
         .jsonb_build_object => count % 2 == 0,
         .jsonb_extract_path_text => count >= 2,
         .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .date_trunc, .@"$single" => count == 2,
-        .@"$pattern_quantified" => count == 5,
+        .@"$pattern_quantified", .@"$array_pattern_quantified" => count == 5,
         .substring, .lpad, .rpad => count == 2 or count == 3,
         .replace, .translate, .split_part => count == 3,
         .overlay => count == 3 or count == 4,
@@ -631,7 +662,7 @@ const Binder = struct {
                 }
                 for (call.args) |arg| if ((try self.infer(arg, depth + 1)).kind == .array) {
                     switch (function) {
-                        .coalesce, .nullif, .greatest, .least, .@"$single" => {},
+                        .coalesce, .nullif, .greatest, .least, .@"$single", .@"$array_pattern_quantified" => {},
                         // PostgreSQL has these array overloads, but they need
                         // lossless array-to-JSON/text conversion, not .value
                         // (which intentionally remains JSON null for arrays).
@@ -658,10 +689,14 @@ const Binder = struct {
                     if (name.* != .literal or name.literal != .string) return error.UnsupportedSqlShape;
                     break :blk .{ .kind = .string, .nullable = false };
                 }
-                if (function == .@"$pattern_quantified") {
+                if (function == .@"$pattern_quantified" or function == .@"$array_pattern_quantified") {
                     for (call.args, 0..) |arg, index| {
                         const actual = try self.infer(arg, depth + 1);
-                        const required: ast.ColumnType = if (index == 0) .string else if (index == 1) .json else .boolean;
+                        const required: ast.ColumnType = if (index == 0) .string else if (index == 1) (if (function == .@"$array_pattern_quantified") .array else .json) else .boolean;
+                        if (function == .@"$array_pattern_quantified" and index == 1 and actual.kind == .array) {
+                            if (actual.element_type != .text) return error.SqlUndefinedOperator;
+                            continue;
+                        }
                         if (actual.kind != null and actual.kind != required) return error.SqlTypeMismatch;
                     }
                     break :blk .{ .kind = .boolean, .nullable = true };
@@ -807,6 +842,7 @@ const Binder = struct {
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
+                        .@"$array_pattern_quantified" => if (i == 0) .string else if (i == 1) .array else .boolean,
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
                         .concat_ws => if (i == 0) .string else null,
                         .jsonb_typeof => .json,
@@ -1437,7 +1473,7 @@ const Evaluator = struct {
     }
 
     fn invokeFunction(self: *Evaluator, function: Function, args: []const u32, translation: ?*const TextTranslation, depth: usize) anyerror!Json {
-        if (function == .@"$pattern_quantified") {
+        if (function == .@"$pattern_quantified" or function == .@"$array_pattern_quantified") {
             const operand = try self.run(args[0], depth + 1);
             const set_datum = try self.runDatum(args[1], depth + 1);
             const set = set_datum.value;
@@ -1445,6 +1481,25 @@ const Evaluator = struct {
             const insensitive = try self.run(args[3], depth + 1);
             const negated = try self.run(args[4], depth + 1);
             if (all != .bool or insensitive != .bool or negated != .bool) return error.SqlTypeMismatch;
+            if (function == .@"$array_pattern_quantified") {
+                if (set_datum.sql_null) return .null;
+                const array = set_datum.array orelse return error.InvalidSqlProgram;
+                if (array.element_type != .text) return error.SqlUndefinedOperator;
+                if (array.elements.len == 0) return .{ .bool = all.bool };
+                if (operand == .null) return .null;
+                var unknown = false;
+                for (array.elements) |pattern| {
+                    if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+                    self.steps += 1;
+                    if (pattern.sql_null) {
+                        unknown = true;
+                        continue;
+                    }
+                    const matches = (try self.like(operand, pattern.value, insensitive.bool)) != negated.bool;
+                    if (matches != all.bool) return .{ .bool = matches };
+                }
+                return if (unknown) .null else .{ .bool = all.bool };
+            }
             if (set != .null and set != .array) return error.SqlTypeMismatch;
             const patterns: []const Json = if (set == .null) &.{} else set.array.items;
             if (set_datum.patterns) |source| {
@@ -1836,7 +1891,7 @@ const Evaluator = struct {
             if (j < glob.len and glob[j] == '\\') {
                 j += 1;
                 escaped = true;
-                if (j == glob.len) return error.InvalidSqlParameters;
+                if (j == glob.len) return error.SqlInvalidEscapeSequence;
             }
             if (j < glob.len and (if (insensitive) std.ascii.toLower(text[i]) == std.ascii.toLower(glob[j]) else text[i] == glob[j])) {
                 i += 1;

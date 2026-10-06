@@ -55,6 +55,9 @@ ORDER_OBSERVERS = {
     "sql-0238": "SELECT greatest(amount,quantity,0) AS max_amount, least(amount,quantity,100) AS min_amount, least(amount,quantity,100) AS order_key FROM usage_records WHERE greatest(amount,quantity,0) > $1 ORDER BY order_key",
     "sql-0239": "SELECT id, octet_length(status) AS status_bytes, character_length(status) AS order_key FROM usage_records WHERE char_length(status) > $1 ORDER BY order_key DESC",
     "sql-0240": "SELECT id, bit_length(status) AS status_bits, bit_length(status) AS order_key FROM usage_records WHERE bit_length(status) > $1 ORDER BY order_key DESC",
+    "sql-0302": "SELECT id, created_at AS order_key FROM usage_records WHERE status = ANY(ARRAY['closed','pending']::text[]) OR status = 'open' AND amount > 20 ORDER BY order_key DESC",
+    "sql-1226": "SELECT organization_id, COUNT(*) FILTER (WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])) AS openish_count, COUNT(*) FILTER (WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])) AS order_key FROM usage_records GROUP BY organization_id ORDER BY order_key DESC",
+    "sql-1227": "SELECT organization_id, COUNT(*) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) AS openish_count, COUNT(*) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) AS order_key FROM usage_records GROUP BY organization_id ORDER BY order_key DESC",
 }
 
 
