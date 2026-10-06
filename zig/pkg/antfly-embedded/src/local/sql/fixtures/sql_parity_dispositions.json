@@ -2,6 +2,33 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-postgres-text-reference": {
+      "command": [
+        "uv",
+        "run",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_text_reference.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
+    "sql-postgres-text-contracts": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "--cache-dir",
+        ".zig-cache/sql-parity-evidence",
+        "-Dtest-filter=SQL PostgreSQL text",
+        "-Dtest-filter=SQL UTF8 text",
+        "-Dtest-filter=SQL prepared Unicode translation"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-postgres-campaigns": {
       "command": [
         "zig",
@@ -1641,8 +1668,35 @@
     },
     {
       "id": "sql-0202",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact source SQL and parameters execute through the native HTTP boundary and a bounded PostgreSQL oracle; UTF-8 text slicing, replacement and result provenance additionally have independent edge/error and allocation-fault contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-campaigns"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-read-reference"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-contracts"
+        }
+      ]
     },
     {
       "id": "sql-0203",
@@ -2215,8 +2269,35 @@
     },
     {
       "id": "sql-0245",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact source SQL and parameters execute through the native HTTP boundary and a bounded PostgreSQL oracle; UTF-8 text slicing, replacement and result provenance additionally have independent edge/error and allocation-fault contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-campaigns"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-read-reference"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-contracts"
+        }
+      ]
     },
     {
       "id": "sql-0246",
@@ -2264,23 +2345,131 @@
     },
     {
       "id": "sql-0248",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact source SQL and parameters execute through the native HTTP boundary and a bounded PostgreSQL oracle; UTF-8 text slicing, replacement and result provenance additionally have independent edge/error and allocation-fault contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-campaigns"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-read-reference"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-contracts"
+        }
+      ]
     },
     {
       "id": "sql-0249",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact source SQL and parameters execute through the native HTTP boundary and a bounded PostgreSQL oracle; UTF-8 text slicing, replacement and result provenance additionally have independent edge/error and allocation-fault contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-campaigns"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-read-reference"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-contracts"
+        }
+      ]
     },
     {
       "id": "sql-0250",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact source SQL and parameters execute through the native HTTP boundary and a bounded PostgreSQL oracle; UTF-8 text slicing, replacement and result provenance additionally have independent edge/error and allocation-fault contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-campaigns"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-read-reference"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-contracts"
+        }
+      ]
     },
     {
       "id": "sql-0251",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact source SQL and parameters execute through the native HTTP boundary and a bounded PostgreSQL oracle; UTF-8 text slicing, replacement and result provenance additionally have independent edge/error and allocation-fault contracts.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-campaigns"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-read-reference"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL executes one relational page with exact integer parameters",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-reference"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/local/sql/scalar.zig",
+          "test": "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors",
+          "gate": "sql-postgres-text-contracts"
+        }
+      ]
     },
     {
       "id": "sql-0252",

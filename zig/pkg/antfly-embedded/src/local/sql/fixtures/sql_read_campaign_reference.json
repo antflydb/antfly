@@ -1180,6 +1180,70 @@
       "affected": 0
     },
     {
+      "id": "sql-0202",
+      "columns": [
+        "id",
+        "status_prefix",
+        "status_bucket",
+        "status_overlay",
+        "status_translated",
+        "dash_pos",
+        "status_left",
+        "status_right",
+        "status_lpad",
+        "status_rpad",
+        "status_repeat",
+        "status_reverse"
+      ],
+      "rows": [
+        [
+          "u4",
+          "ope",
+          "",
+          "oXen",
+          "open",
+          0,
+          "open",
+          "open",
+          "000000open",
+          "open______",
+          "openopen",
+          "nepo"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25,
+        25,
+        25,
+        25,
+        23,
+        25,
+        25,
+        25,
+        25,
+        25,
+        25
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0209",
       "columns": [
         "email_key",
@@ -2500,6 +2564,26 @@
       "affected": 0
     },
     {
+      "id": "sql-0245",
+      "columns": [
+        "status_translated"
+      ],
+      "rows": [
+        [
+          "hello"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0246",
       "columns": [
         "status_label"
@@ -2516,6 +2600,134 @@
       ],
       "column_oids": [
         25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0248",
+      "columns": [
+        "status_mid"
+      ],
+      "rows": [
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ],
+        [
+          "cti"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0249",
+      "columns": [
+        "status_overlay"
+      ],
+      "rows": [
+        [
+          "aXve"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0250",
+      "columns": [
+        "status_part"
+      ],
+      "rows": [
+        [
+          "123"
+        ],
+        [
+          ""
+        ],
+        [
+          "user"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0251",
+      "columns": [
+        "dash_pos"
+      ],
+      "rows": [
+        [
+          1
+        ],
+        [
+          7
+        ],
+        [
+          7
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        23
       ],
       "affected": 0
     },

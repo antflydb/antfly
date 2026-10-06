@@ -62,7 +62,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr };
 
 pub const Instruction = struct {
     type: Type,
@@ -80,6 +80,8 @@ pub const Instruction = struct {
     const Branch = struct { condition: u32, value: u32 };
 };
 
+const TextTranslation = std.AutoHashMapUnmanaged(u21, []const u8);
+
 pub const Program = struct {
     arena: std.heap.ArenaAllocator,
     instructions: []const Instruction,
@@ -88,6 +90,8 @@ pub const Program = struct {
     parameter_types: []const ?ast.ColumnType,
     required_columns: []const u32,
     settings: ?*const setting_catalog.View = null,
+    /// Derived execution caches are never part of serialized instructions.
+    translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
 
     pub fn deinit(self: *Program) void {
         self.arena.deinit();
@@ -182,6 +186,7 @@ pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar,
         .parameter_types = parameter_types,
         .required_columns = required_columns,
         .settings = settings,
+        .translations = binder.translations,
     };
 }
 
@@ -217,6 +222,7 @@ fn functionId(name: []const u8) !Function {
     if (std.mem.eql(u8, name, "char_length") or std.mem.eql(u8, name, "character_length")) return .length;
     if (std.mem.eql(u8, name, "ceiling")) return .ceil;
     if (std.mem.eql(u8, name, "substr")) return .substring;
+    if (std.mem.eql(u8, name, "position")) return .strpos;
     if (std.mem.eql(u8, name, "btrim")) return .trim;
     return error.UnsupportedSqlShape;
 }
@@ -224,14 +230,15 @@ fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
-        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .trunc, .sign, .sqrt, .to_timestamp, .current_setting, .to_jsonb, .bit_length, .jsonb_typeof, .reverse => count == 1,
+        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .trunc, .sign, .sqrt, .to_timestamp, .current_setting, .to_jsonb, .bit_length, .jsonb_typeof, .reverse, .ascii, .chr => count == 1,
         .concat_ws => count >= 2,
         .jsonb_build_object => count % 2 == 0,
         .jsonb_extract_path_text => count >= 2,
-        .nullif, .power, .mod, .starts_with, .strpos, .repeat, .date_part, .date_trunc, .@"$single" => count == 2,
+        .nullif, .power, .mod, .starts_with, .strpos, .repeat, .left, .right, .date_part, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified" => count == 5,
         .substring, .lpad, .rpad => count == 2 or count == 3,
-        .replace => count == 3,
+        .replace, .translate, .split_part => count == 3,
+        .overlay => count == 3 or count == 4,
         .trim, .ltrim, .rtrim => count == 1 or count == 2,
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
@@ -246,6 +253,7 @@ const Binder = struct {
     names: std.StringHashMapUnmanaged(u32) = .empty,
     inferred: std.AutoHashMapUnmanaged(*const ast.Scalar, Type) = .empty,
     instructions: std.ArrayList(Instruction) = .empty,
+    translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
     parameters: [1024]?ast.ColumnType = @splat(null),
     parameter_count: usize = 0,
@@ -365,7 +373,7 @@ const Binder = struct {
                 }
                 break :blk .{ .kind = switch (function) {
                     .to_jsonb, .jsonb_build_object => .json,
-                    .length, .octet_length, .bit_length, .strpos => .integer,
+                    .length, .octet_length, .bit_length, .strpos, .ascii => .integer,
                     .starts_with, .@"$pattern_quantified" => .boolean,
                     .sqrt, .power, .date_part => .number,
                     .date_trunc, .to_timestamp => .datetime,
@@ -477,10 +485,13 @@ const Binder = struct {
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
-                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse => .string,
+                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
                         .concat_ws => if (i == 0) .string else null,
                         .jsonb_typeof => .json,
-                        .substring, .repeat => if (i == 0) .string else .integer,
+                        .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
+                        .split_part => if (i == 2) .integer else .string,
+                        .overlay => if (i < 2) .string else .integer,
+                        .chr => .integer,
                         .lpad, .rpad => if (i == 1) .integer else .string,
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
@@ -492,6 +503,23 @@ const Binder = struct {
                     const actual = try self.infer(arg, depth + 1);
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     out.* = try self.compile(arg, desired, depth + 1);
+                }
+                if (function == .translate) {
+                    const from = self.instructions.items[args[1]].operation;
+                    const to = self.instructions.items[args[2]].operation;
+                    if (from == .literal and from.literal == .string and to == .literal and to.literal == .string) {
+                        // Program-owned literal slices outlive the parsed AST.
+                        // A constant alphabet is prepared once, not per row.
+                        const mapping = try self.alloc.create(TextTranslation);
+                        mapping.* = .empty;
+                        var source = (std.unicode.Utf8View.init(from.literal.string) catch return error.SqlTypeMismatch).iterator();
+                        var target = (std.unicode.Utf8View.init(to.literal.string) catch return error.SqlTypeMismatch).iterator();
+                        while (source.nextCodepoint()) |codepoint| {
+                            const replacement = target.nextCodepointSlice() orelse "";
+                            if (!mapping.contains(codepoint)) try mapping.put(self.alloc, codepoint, replacement);
+                        }
+                        try self.translations.put(self.alloc, @intCast(self.instructions.items.len), mapping);
+                    }
                 }
                 break :blk .{ .call = .{ .function = function, .args = args } };
             },
@@ -748,7 +776,7 @@ const Evaluator = struct {
                         }
                         break :blk Datum.json(.{ .string = try output.toOwnedSlice(self.alloc) });
                     },
-                    else => break :blk Datum.fromJson(try self.invokeFunction(call.function, call.args, depth + 1)),
+                    else => break :blk Datum.fromJson(try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1)),
                 }
             },
             else => Datum.fromJson(try self.runLegacy(index, depth)),
@@ -808,7 +836,7 @@ const Evaluator = struct {
                     else => unreachable,
                 };
             },
-            .call => |call| try self.invokeFunction(call.function, call.args, depth + 1),
+            .call => |call| try self.invokeFunction(call.function, call.args, self.program.translations.get(index), depth + 1),
             .case_when => |case| blk: {
                 for (case.branches) |branch| {
                     const condition = try self.run(branch.condition, depth + 1);
@@ -929,7 +957,7 @@ const Evaluator = struct {
         return .{ .string = try result.toOwnedSlice(self.alloc) };
     }
 
-    fn invokeFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) anyerror!Json {
+    fn invokeFunction(self: *Evaluator, function: Function, args: []const u32, translation: ?*const TextTranslation, depth: usize) anyerror!Json {
         if (function == .@"$pattern_quantified") {
             const operand = try self.run(args[0], depth + 1);
             const set_datum = try self.runDatum(args[1], depth + 1);
@@ -1009,12 +1037,22 @@ const Evaluator = struct {
             }
             return .{ .string = try result.toOwnedSlice(self.alloc) };
         }
-        var values: [3]Json = @splat(.null);
+        var values: [4]Json = @splat(.null);
         for (args, 0..) |arg, i| values[i] = try self.run(arg, depth);
         if (function == .nullif) return if (values[0] == .null or (values[1] != .null and (try compare(values[0], values[1])) == .eq)) .null else values[0];
         for (values[0..args.len]) |value| if (value == .null) return .null;
         const first = values[0];
         switch (function) {
+            .chr => {
+                if (first != .integer) return error.SqlTypeMismatch;
+                if (first.integer < 0) return error.InvalidSqlParameters;
+                const codepoint = std.math.cast(u21, first.integer) orelse return error.InvalidSqlCharacterCode;
+                if (codepoint == 0) return error.InvalidSqlCharacterCode;
+                var buffer: [4]u8 = undefined;
+                const size = std.unicode.utf8Encode(codepoint, &buffer) catch return error.InvalidSqlCharacterCode;
+                try self.charge(size);
+                return .{ .string = try self.alloc.dupe(u8, buffer[0..size]) };
+            },
             .date_part, .date_trunc => {
                 if (first != .string or values[1] != .string) return error.SqlTypeMismatch;
                 const field = datetime.unit(first.string) orelse return error.InvalidSqlParameters;
@@ -1059,6 +1097,64 @@ const Evaluator = struct {
         if (first != .string) return error.SqlTypeMismatch;
         const text_value = first.string;
         return switch (function) {
+            .left, .right => blk: {
+                if (values[1] != .integer) return error.SqlTypeMismatch;
+                try self.textWork(text_value.len *| 2);
+                const count: i128 = std.unicode.utf8CountCodepoints(text_value) catch return error.SqlTypeMismatch;
+                const requested: i128 = values[1].integer;
+                // PostgreSQL 18 right(text, INT_MIN) returns the full input;
+                // preserve the observed contract without signed negation.
+                const length: usize = if (function == .right and requested == std.math.minInt(i32)) @intCast(count) else @intCast(@min(count, @max(0, if (requested < 0) count + requested else requested)));
+                const begin: usize = if (function == .left) 0 else @as(usize, @intCast(count)) - length;
+                break :blk .{ .string = try textSlice(text_value, begin, begin + length) };
+            },
+            .ascii => blk: {
+                var iterator = (std.unicode.Utf8View.init(text_value) catch return error.SqlTypeMismatch).iterator();
+                break :blk .{ .integer = iterator.nextCodepoint() orelse 0 };
+            },
+            .split_part => blk: {
+                if (values[1] != .string or values[2] != .integer) return error.SqlTypeMismatch;
+                const field = values[2].integer;
+                if (field == 0) return error.InvalidSqlParameters;
+                const delimiter = values[1].string;
+                if (delimiter.len == 0) break :blk .{ .string = if (field == 1 or field == -1) text_value else "" };
+                try self.textWork(text_value.len *| @max(delimiter.len, 1) *| 2);
+                var chunks = std.mem.splitSequence(u8, text_value, delimiter);
+                var target: i128 = field;
+                if (field < 0) {
+                    var count: i128 = 0;
+                    while (chunks.next() != null) count += 1;
+                    target = count + field + 1;
+                    chunks.reset();
+                }
+                if (target <= 0) break :blk .{ .string = "" };
+                var index: i128 = 1;
+                while (chunks.next()) |chunk| : (index += 1) if (index == target) break :blk .{ .string = chunk };
+                break :blk .{ .string = "" };
+            },
+            .translate => try self.translateText(text_value, values[1], values[2], translation),
+            .overlay => blk: {
+                if (values[1] != .string or values[2] != .integer or (args.len == 4 and values[3] != .integer)) return error.SqlTypeMismatch;
+                const start = values[2].integer;
+                if (start <= 0) return error.SqlSubstringError;
+                const replacement = values[1].string;
+                try self.textWork(text_value.len *| 2 +| replacement.len);
+                const count: i128 = std.unicode.utf8CountCodepoints(text_value) catch return error.SqlTypeMismatch;
+                const replaced: i128 = if (args.len == 4) values[3].integer else std.unicode.utf8CountCodepoints(replacement) catch return error.SqlTypeMismatch;
+                // PostgreSQL permits negative counts: prefix and suffix may
+                // overlap. Use wide arithmetic even at the signed extremes.
+                const end = @min(count, @max(0, @as(i128, start) - 1 + replaced));
+                const prefix = try textSlice(text_value, 0, @intCast(@min(count, start - 1)));
+                const suffix = try textSlice(text_value, @intCast(end), @intCast(count));
+                const size = std.math.add(usize, prefix.len, replacement.len) catch return error.SqlProgramLimitExceeded;
+                const total = std.math.add(usize, size, suffix.len) catch return error.SqlProgramLimitExceeded;
+                try self.charge(total);
+                const output = try self.alloc.alloc(u8, total);
+                @memcpy(output[0..prefix.len], prefix);
+                @memcpy(output[prefix.len..size], replacement);
+                @memcpy(output[size..], suffix);
+                break :blk .{ .string = output };
+            },
             .ai_decide, .ai_choice, .ai_score, .ai_probability => error.DecisionNotEvaluated,
             .length => .{ .integer = @intCast(std.unicode.utf8CountCodepoints(text_value) catch return error.SqlTypeMismatch) },
             .octet_length => .{ .integer = @intCast(text_value.len) },
@@ -1127,7 +1223,7 @@ const Evaluator = struct {
                 if (values[1] != .integer or (args.len == 3 and values[2] != .integer)) return error.SqlTypeMismatch;
                 const start = values[1].integer;
                 const length = if (args.len == 3) values[2].integer else std.math.maxInt(i64);
-                if (length < 0) return error.InvalidSqlParameters;
+                if (length < 0) return error.SqlSubstringError;
                 const end = if (args.len == 3) start +| length else std.math.maxInt(i64);
                 var iterator = (std.unicode.Utf8View.init(text_value) catch return error.SqlTypeMismatch).iterator();
                 var position: i64 = 1;
@@ -1163,6 +1259,45 @@ const Evaluator = struct {
             },
             else => unreachable,
         };
+    }
+
+    fn textWork(self: *Evaluator, bytes: usize) !void {
+        if (bytes > self.limits.pattern_steps -| self.pattern_steps) return error.SqlProgramLimitExceeded;
+        self.pattern_steps += bytes;
+    }
+
+    fn translateText(self: *Evaluator, text: []const u8, from: Json, to: Json, prepared: ?*const TextTranslation) !Json {
+        if (from != .string or to != .string) return error.SqlTypeMismatch;
+        try self.textWork(text.len *| 2 +| (if (prepared == null) from.string.len +| to.string.len else 0));
+        var mapping: std.AutoHashMapUnmanaged(u21, []const u8) = .empty;
+        defer mapping.deinit(self.alloc);
+        var source = (std.unicode.Utf8View.init(from.string) catch return error.SqlTypeMismatch).iterator();
+        var target = (std.unicode.Utf8View.init(to.string) catch return error.SqlTypeMismatch).iterator();
+        while (prepared == null) {
+            const codepoint = source.nextCodepoint() orelse break;
+            const replacement = target.nextCodepointSlice() orelse "";
+            if (!mapping.contains(codepoint)) {
+                try self.charge(@sizeOf(u21) + @sizeOf([]const u8) + 16);
+                try mapping.put(self.alloc, codepoint, replacement);
+            }
+        }
+        const lookup = prepared orelse &mapping;
+        var input = (std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch).iterator();
+        var size: usize = 0;
+        while (input.nextCodepointSlice()) |bytes| {
+            const replacement = lookup.get(std.unicode.utf8Decode(bytes) catch return error.SqlTypeMismatch) orelse bytes;
+            size = std.math.add(usize, size, replacement.len) catch return error.SqlProgramLimitExceeded;
+        }
+        try self.charge(size);
+        const output = try self.alloc.alloc(u8, size);
+        input.i = 0;
+        var offset: usize = 0;
+        while (input.nextCodepointSlice()) |bytes| {
+            const replacement = lookup.get(std.unicode.utf8Decode(bytes) catch return error.SqlTypeMismatch) orelse bytes;
+            @memcpy(output[offset..][0..replacement.len], replacement);
+            offset += replacement.len;
+        }
+        return .{ .string = output };
     }
 
     fn padText(self: *Evaluator, left: bool, text: []const u8, length: Json, filling: Json) !Json {
@@ -1309,6 +1444,15 @@ pub fn semanticHash(value: Json) !u64 {
     var budget: json_order.Budget = .{};
     return json_order.hash(value, &budget, 0);
 }
+/// Borrow a UTF-8 character interval; callers account for its linear work.
+fn textSlice(text: []const u8, begin: usize, end: usize) ![]const u8 {
+    var iterator = (std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch).iterator();
+    for (0..begin) |_| _ = iterator.nextCodepointSlice();
+    const offset = iterator.i;
+    for (begin..end) |_| _ = iterator.nextCodepointSlice();
+    return text[offset..iterator.i];
+}
+
 pub fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
     return .{ .bool = switch (op) {
         .eq => order == .eq,
@@ -1319,6 +1463,105 @@ pub fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
         .gte => order != .lt,
         else => unreachable,
     } };
+}
+
+test "SQL PostgreSQL text reference preserves Unicode slicing replacement and errors" {
+    const fixture = try std.json.parseFromSlice(Json, std.testing.allocator, @embedFile("fixtures/sql_text_reference.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.object.get("entries").?.array.items) |case| {
+        const sql = case.object.get("sql").?.string;
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        if (case.object.get("error")) |code| {
+            const expected_error = if (std.mem.eql(u8, code.string, "22011")) error.SqlSubstringError else if (std.mem.eql(u8, code.string, "54000")) error.InvalidSqlCharacterCode else error.InvalidSqlParameters;
+            try std.testing.expectError(expected_error, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+            try std.testing.expectEqualStrings(code.string, @import("errors.zig").describe(expected_error).code);
+        } else {
+            const expected = case.object.get("value").?;
+            const actual = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+            try std.testing.expectEqual(expected == .null, actual.sql_null);
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), expected, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), actual.value, .{}));
+        }
+    }
+}
+
+test "SQL UTF8 text transforms bound work allocation and parameter types" {
+    const Harness = struct {
+        fn prepared(alloc: Allocator) !void {
+            var program = blk: {
+                var compiled = try @import("compiler.zig").compileScalar(alloc, "translate($1,'aé🍎','xê')", .{});
+                defer compiled.deinit();
+                break :blk try bind(alloc, compiled.expression, &.{}, &.{}, .{});
+            };
+            defer program.deinit();
+            var buffer: [6]u8 = undefined;
+            var output_memory = std.heap.FixedBufferAllocator.init(&buffer);
+            const output = try program.evaluate(output_memory.allocator(), &.{}, &.{.{ .string = "aé🍎aé🍎" }}, .{});
+            try std.testing.expectEqualStrings("xêxê", output.value.string);
+        }
+
+        fn run(alloc: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(alloc, "overlay(translate($1,$2,$3) placing chr(127822) from 2 for 1)", .{});
+            defer compiled.deinit();
+            var program = try bind(alloc, compiled.expression, &.{}, &.{}, .{});
+            defer program.deinit();
+            try std.testing.expectEqualSlices(?ast.ColumnType, &.{ .string, .string, .string }, program.parameter_types);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const parameters: []const Json = &.{ .{ .string = "abcé" }, .{ .string = "acé" }, .{ .string = "xê" } };
+            const output = try program.evaluate(arena.allocator(), &.{}, parameters, .{});
+            try std.testing.expectEqualStrings("x🍎ê", output.value.string);
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, parameters, .{ .output_bytes = 1 }));
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, parameters, .{ .pattern_steps = 1 }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.prepared, .{});
+    for ([_][]const u8{ "left($1,2)", "right($1,-1)", "split_part($1,'🍎',-2)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var no_memory = std.heap.FixedBufferAllocator.init(&.{});
+        _ = try program.evaluate(no_memory.allocator(), &.{}, &.{.{ .string = "aé🍎z" }}, .{});
+    }
+}
+
+test "SQL prepared Unicode translation owns literals and avoids per row map allocation" {
+    const compiler = @import("compiler.zig");
+    var compiled = try compiler.compileScalar(std.testing.allocator, "translate($1,'aé🍎','xê')", .{});
+    var program = bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+        compiled.deinit();
+        return err;
+    };
+    compiled.deinit();
+    defer program.deinit();
+    try std.testing.expect(program.translations.contains(program.root));
+    var dynamic_compiled = try compiler.compileScalar(std.testing.allocator, "translate($1,$2,$3)", .{});
+    defer dynamic_compiled.deinit();
+    var dynamic = try bind(std.testing.allocator, dynamic_compiled.expression, &.{}, &.{}, .{});
+    defer dynamic.deinit();
+    for ([_]*const Program{ &program, &dynamic }, 0..) |bound, index| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const parameters: []const Json = if (index == 0) &.{.{ .string = "aé🍎aé🍎" }} else &.{ .{ .string = "aé🍎aé🍎" }, .{ .string = "aé🍎" }, .{ .string = "xê" } };
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..50000) |_| {
+            const output = try bound.evaluate(arena.allocator(), &.{}, parameters, .{});
+            try std.testing.expectEqualStrings("xêxê", output.value.string);
+            try std.testing.expect(arena.reset(.retain_capacity));
+        }
+        std.debug.print("SQL translate hot loop: prepared={} rows=50000 scratch_bytes={} elapsed_ns={}\n", .{ index == 0, arena.queryCapacity(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    }
+    var six_bytes: [6]u8 = undefined;
+    var exact = std.heap.FixedBufferAllocator.init(&six_bytes);
+    const output = try program.evaluate(exact.allocator(), &.{}, &.{.{ .string = "aé🍎aé🍎" }}, .{});
+    try std.testing.expectEqualStrings("xêxê", output.value.string);
+    try std.testing.expectEqual(@as(usize, 6), exact.end_index);
 }
 
 test "SQL scalar bound programs preserve lazy truth exact integers and function semantics" {

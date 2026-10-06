@@ -13035,6 +13035,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     // sql-0196, sql-0199, sql-0209, sql-0226, sql-0227, sql-0228.
     // sql-0232, sql-0233, sql-0238, sql-0239, sql-0240, sql-0241.
     // sql-0242, sql-0243, sql-0246, sql-0253, sql-0254, sql-0255.
+    // sql-0202, sql-0245, sql-0248, sql-0249, sql-0250, sql-0251.
     // sql-0258, sql-0271, sql-0272, sql-0273, sql-0275.
     // sql-0276, sql-0277, sql-0278, sql-0279, sql-0281, sql-0282.
     // sql-0454, sql-0455, sql-0457, sql-0458, sql-0491, sql-0511.

@@ -504,10 +504,33 @@ const Parser = struct {
             if (star) {
                 if (!std.mem.eql(u8, name_value, "count")) return self.fail(error.InvalidSqlSyntax, "only COUNT accepts a star argument");
                 try self.expect(.rparen);
+            } else if (!function.owned and std.mem.eql(u8, name_value, "position")) {
+                // IN is otherwise a comparison operator. Parse its first
+                // operand above comparison precedence, then swap SQL's order
+                // into the shared strpos(text, needle) bound instruction.
+                const needle = try self.scalar(depth + 1, 4);
+                try self.expectKeyword(.in);
+                const haystack = try self.scalar(depth + 1, 0);
+                try args.appendSlice(self.alloc, &.{ haystack, needle });
+                try self.expect(.rparen);
             } else if (!self.take(.rparen)) {
-                while (true) {
+                const first = try self.scalar(depth + 1, 0);
+                try args.append(self.alloc, first);
+                if (!function.owned and std.mem.eql(u8, name_value, "substring") and (self.keyword(.from) or (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.@"for")))) {
+                    if (self.keyword(.@"for")) {
+                        try args.append(self.alloc, try self.scalarNode(.{ .literal = .{ .integer = 1 } }));
+                        try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    } else {
+                        try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                        if (self.keyword(.@"for")) try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    }
+                } else if (!function.owned and std.mem.eql(u8, name_value, "overlay") and self.ddlWord("placing")) {
                     try args.append(self.alloc, try self.scalar(depth + 1, 0));
-                    if (!self.take(.comma)) break;
+                    try self.expectKeyword(.from);
+                    try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    if (self.keyword(.@"for")) try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                } else while (self.take(.comma)) {
+                    try args.append(self.alloc, try self.scalar(depth + 1, 0));
                 }
                 try self.expect(.rparen);
             }

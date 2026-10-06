@@ -1547,6 +1547,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",
         error.InvalidSqlParameters, error.InvalidSqlParameter, error.InvalidSqlNumber, error.SqlTypeMismatch, error.InvalidSqlLimit, error.InvalidSettingValue => "22023",
+        error.SqlSubstringError => "22011",
+        error.InvalidSqlCharacterCode => "54000",
         error.SqlNotNullViolation => "23502",
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded => "54000",
         error.UnknownSetting => "42704",

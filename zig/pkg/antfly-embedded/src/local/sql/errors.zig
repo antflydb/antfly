@@ -71,6 +71,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.TableTopologyProtocolUpgradeRequired => .{ .code = "53300", .message = "The metadata cluster is not yet ready for coordinated foreign-key publication.", .hint = "No schema change was admitted. Upgrade all metadata voters and learners, then retry the complete DDL.", .retryable = true },
         error.SettingAuthorityUnavailable => .{ .code = "53300", .message = "The metadata setting authority is not configured for this SQL operation.", .hint = "Ask an operator to configure trusted setting authority, then inspect schema state before resubmitting DDL. Do not automatically replay a mutation.", .retryable = false },
         error.SqlNumericOutOfRange => .{ .code = "22003", .message = "A numeric expression exceeds its supported range.", .retryable = false },
+        error.SqlSubstringError => .{ .code = "22011", .message = "The substring start or length is invalid.", .retryable = false },
+        error.InvalidSqlCharacterCode => .{ .code = "54000", .message = "The character code is not a nonzero Unicode scalar value.", .retryable = false },
         error.InvalidSqlDateTime => .{ .code = "22007", .message = "The datetime is invalid or outside the supported UTC nanosecond range.", .hint = "Use a valid ISO date or RFC3339 timestamp representable as unsigned epoch nanoseconds.", .retryable = false },
         error.SqlGroupingError => .{ .code = "42803", .message = "A grouped expression references an ungrouped column or invalid aggregate.", .hint = "Group every non-aggregate column and avoid nested aggregate functions.", .retryable = false },
         error.SqlDivisionByZero => .{ .code = "22012", .message = "A numeric expression divides by zero.", .retryable = false },

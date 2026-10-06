@@ -63,8 +63,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 317 implemented, 136 rejected and 67 superseded
-cases, with 1,066 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 323 implemented, 136 rejected and 67 superseded
+cases, with 1,060 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 117 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -77,7 +77,20 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 still requires at least 267 additional resolved dispositions.
+getting below 800 now requires at least 261 additional resolved dispositions.
+
+Six additional read contracts exercise PostgreSQL text slicing and replacement
+through the native endpoint. The text oracle independently verifies 54 UTF-8,
+NULL and error contracts, including negative split positions, duplicate
+translation characters, SQL-standard substring/position/overlay syntax and
+PostgreSQL SQLSTATEs. Borrowed slices avoid output allocations; immutable
+constant translation alphabets are prepared once in execution-owned caches,
+outside serialized instructions. Allocation-fault tests verify cache ownership
+after the parsed AST is released. A local debug 50,000-row translation benchmark
+measured about 113 ms prepared versus 149 ms dynamic, with reusable scratch
+capacity of 46 versus 336 bytes; these are local microbenchmark observations,
+not production latency claims. Typed-array/element-width and temporal profiles
+remain separate unresolved work, not JSON approximations or synthetic credit.
 
 The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
 provenance, affected rows, persisted state and untouched rows. A failed RETURNING
