@@ -23,7 +23,7 @@ const Run = repository.Run;
 const generation_index = @import("generation_index.zig");
 
 test "directory accounting pin retention scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Fixture = struct {
         allocator: std.mem.Allocator,
         pins: usize = 0,
@@ -1109,7 +1109,7 @@ test "run directory path copies preserve pinned epochs through inserts removals 
     }
     try std.testing.expectEqualSlices(bool, &changes.removed, &incremental_changes.removed);
     const Validator = struct {
-        fn validate(runs: []const Run) !void {
+        pub fn validate(runs: []const Run) !void {
             for (runs, 0..) |run, i| {
                 if (run.entry_count == 0) return error.InvalidTableFile;
                 if (i > 0 and std.mem.order(u8, runs[i - 1].largest_key, run.smallest_key) != .lt) return error.InvalidTableFile;

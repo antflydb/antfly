@@ -33,7 +33,7 @@ const inverted = antfly.inverted;
 const scorer_mod = antfly.scorer;
 const roaring_mod = antfly.roaring;
 const platform_time = antfly.platform_time;
-const vellum = antfly.vellum;
+const fst = antfly.fst;
 
 const QuickstartDoc = struct {
     doc_id: []const u8,
@@ -178,7 +178,7 @@ const WikiHttpResponse = struct {
     status: u16,
     body: []u8,
 
-    fn deinit(self: *WikiHttpResponse, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *WikiHttpResponse, alloc: std.mem.Allocator) void {
         alloc.free(self.body);
         self.* = undefined;
     }
@@ -206,7 +206,7 @@ const WikiHttpClient = struct {
         return out;
     }
 
-    fn deinit(self: *WikiHttpClient) void {
+    pub fn deinit(self: *WikiHttpClient) void {
         self.client.deinit();
         self.io_impl.deinit();
         self.alloc.destroy(self.io_impl);
@@ -256,7 +256,7 @@ const WikiHttpClient = struct {
         var transfer_buffer: [1024]u8 = undefined;
         const response_body = try response.reader(&transfer_buffer).allocRemaining(self.alloc, .limited(16 << 20));
         return .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .body = response_body,
         };
     }
@@ -400,7 +400,7 @@ fn runPrefixFilter(
     reader: *const inverted.InvertedIndexReader,
     prefix: []const u8,
 ) !usize {
-    var aut = vellum.StartsWith{ .prefix = prefix };
+    var aut = fst.StartsWith{ .prefix = prefix };
     var term_iter = try reader.fstSearchIterator(aut.automaton());
     defer term_iter.deinit();
 
@@ -552,11 +552,11 @@ fn benchFstBuilderOverhead(alloc: std.mem.Allocator, iters: usize) !void {
     // Empty FST: pure init+finish overhead at the default registry size.
     var t0 = nanotime();
     for (0..iters) |_| {
-        var fst = try vellum.Builder.init(alloc, .{});
-        const bytes = try fst.finish();
+        var builder = try fst.Builder.init(alloc, .{});
+        const bytes = try builder.finish();
         std.mem.doNotOptimizeAway(bytes.ptr);
         alloc.free(bytes);
-        fst.deinit();
+        builder.deinit();
     }
     const empty_default_ns = nanotime() - t0;
 
@@ -564,11 +564,11 @@ fn benchFstBuilderOverhead(alloc: std.mem.Allocator, iters: usize) !void {
     // registry_table_size differs, so any delta is the registry alloc/memset.
     t0 = nanotime();
     for (0..iters) |_| {
-        var fst = try vellum.Builder.init(alloc, .{ .registry_table_size = 4 });
-        const bytes = try fst.finish();
+        var builder = try fst.Builder.init(alloc, .{ .registry_table_size = 4 });
+        const bytes = try builder.finish();
         std.mem.doNotOptimizeAway(bytes.ptr);
         alloc.free(bytes);
-        fst.deinit();
+        builder.deinit();
     }
     const empty_tiny_ns = nanotime() - t0;
 
@@ -579,33 +579,33 @@ fn benchFstBuilderOverhead(alloc: std.mem.Allocator, iters: usize) !void {
     const term2 = "relativ";
     const term3 = "rome";
     for (0..iters) |_| {
-        var fst = try vellum.Builder.init(alloc, .{});
-        try fst.insert(term1, 0);
-        try fst.insert(term2, 1);
-        try fst.insert(term3, 2);
-        const bytes = try fst.finish();
+        var builder = try fst.Builder.init(alloc, .{});
+        try builder.insert(term1, 0);
+        try builder.insert(term2, 1);
+        try builder.insert(term3, 2);
+        const bytes = try builder.finish();
         std.mem.doNotOptimizeAway(bytes.ptr);
         alloc.free(bytes);
-        fst.deinit();
+        builder.deinit();
     }
     const three_default_ns = nanotime() - t0;
 
     // Same three keys with the tiny registry.
     t0 = nanotime();
     for (0..iters) |_| {
-        var fst = try vellum.Builder.init(alloc, .{ .registry_table_size = 4 });
-        try fst.insert(term1, 0);
-        try fst.insert(term2, 1);
-        try fst.insert(term3, 2);
-        const bytes = try fst.finish();
+        var builder = try fst.Builder.init(alloc, .{ .registry_table_size = 4 });
+        try builder.insert(term1, 0);
+        try builder.insert(term2, 1);
+        try builder.insert(term3, 2);
+        const bytes = try builder.finish();
         std.mem.doNotOptimizeAway(bytes.ptr);
         alloc.free(bytes);
-        fst.deinit();
+        builder.deinit();
     }
     const three_tiny_ns = nanotime() - t0;
 
     const n = @as(f64, @floatFromInt(iters));
-    print("Vellum FST builder overhead ({d} samples each):\n", .{iters});
+    print("FST builder overhead ({d} samples each):\n", .{iters});
     print("  init+finish, no inserts, registry=10000 (default) : {d:.2} us\n", .{
         @as(f64, @floatFromInt(empty_default_ns)) / n / 1e3,
     });
@@ -905,7 +905,7 @@ fn runStandaloneWikiBench(
     if (cfg.health_port == 0) cfg.health_port = port_base + 1;
 
     var root_buf: [256]u8 = undefined;
-    const root_path = std.fmt.bufPrintZ(&root_buf, "/tmp/antfly-quickstart-wiki-{d}", .{platform_time.monotonicNs()}) catch unreachable;
+    const root_path = std.fmt.bufPrintSentinel(&root_buf, "/tmp/antfly-quickstart-wiki-{d}", .{platform_time.monotonicNs()}, 0) catch unreachable;
     defer cleanupTempDir(root_path);
 
     const cwd = try std.process.currentPathAlloc(io, alloc);

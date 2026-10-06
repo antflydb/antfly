@@ -250,3 +250,18 @@ func TestExtractionV2ResponseIDsArePositionalAndPreserveRawExtensions(t *testing
 	_, err = extractionV2ResponseClient(t, `{"object":"extraction","model":"m","schema_version":2,"data":[{}]}`).ExtractV2(context.Background(), emptyRequest)
 	require.Error(t, err, "an omitted ID must not match an explicitly empty ID")
 }
+
+func TestExtractionV2LayaDecisionsPreserveZeroValues(t *testing.T) {
+	const decision = `{"name":"needed","type":"boolean","label":"false","probabilities":[{"label":"false","probability":1},{"label":"true","probability":0}],"confidence":1,"confidence_method":"max_probability","act_probability":0,"true_probability":0}`
+	var response ExtractionV2Response
+	require.NoError(t, json.Unmarshal([]byte(`{"object":"extraction","model":"laya","schema_version":2,"data":[{"decisions":[`+decision+`]}]}`), &response))
+	require.Len(t, response.Data[0].Decisions, 1)
+	require.NotNil(t, response.Data[0].Decisions[0].TrueProbability)
+	encoded, err := json.Marshal(response.Data[0].Decisions[0])
+	require.NoError(t, err)
+	require.JSONEq(t, decision, string(encoded))
+	var score oapi.ExtractionDecision
+	require.NoError(t, json.Unmarshal([]byte(`{"expected_value":0}`), &score))
+	require.NotNil(t, score.ExpectedValue)
+	require.Zero(t, *score.ExpectedValue)
+}

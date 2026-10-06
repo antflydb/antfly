@@ -297,18 +297,18 @@ pub const CapabilityReason = enum {
 };
 
 pub const CapabilityDiagnostics = struct {
-    counts: [@typeInfo(CapabilityReason).@"enum".fields.len]usize = .{0} ** @typeInfo(CapabilityReason).@"enum".fields.len,
+    counts: [@typeInfo(CapabilityReason).@"enum".field_names.len]usize = @splat(0),
     operator_stats: operator_plan.Stats = .{},
 
     pub fn record(self: *CapabilityDiagnostics, decision: CapabilityDecision) void {
-        self.counts[@intFromEnum(decision.reason)] += 1;
+        self.counts[@backingInt(decision.reason)] += 1;
         if (decision.can_execute and decision.should_execute) {
             if (decision.operator_plan) |plan| self.operator_stats.add(plan.operator());
         }
     }
 
     pub fn count(self: *const CapabilityDiagnostics, reason: CapabilityReason) usize {
-        return self.counts[@intFromEnum(reason)];
+        return self.counts[@backingInt(reason)];
     }
 
     pub fn operatorCount(self: *const CapabilityDiagnostics, operator: operator_plan.Operator) usize {
@@ -999,7 +999,7 @@ fn inferTensorDesc(graph: *const Graph, descs: []const ?contracts.TensorDesc, no
         .slice => inferViewDesc(graph, descs, node_id, n.inputs[0], inputStrides(descs, n.inputs[0]) orelse contracts.TensorStrides.none()),
         .broadcast_in_dim => inferViewDesc(graph, descs, node_id, n.inputs[0], contracts.TensorStrides.none()),
         .concat_prim => inferConcatDesc(graph, descs, node_id),
-        .shape_of, .range => contracts.TensorDesc.init(n.output_shape, .host_dense),
+        .shape_of, .size_of, .range => contracts.TensorDesc.init(n.output_shape, .host_dense),
         else => inferComputeDesc(graph, descs, node_id),
     };
 }

@@ -88,7 +88,7 @@ pub const DistributedTransactionScenario = struct {
             self.manager = next;
         }
 
-        fn deinit(self: *Node) void {
+        pub fn deinit(self: *Node) void {
             self.manager.deinit();
             self.store.deinit();
             self.backend.close();
@@ -129,7 +129,7 @@ pub const DistributedTransactionScenario = struct {
             for (self.nodes) |node| node.manager.trace_writer = writer;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             for (self.nodes) |node| node.deinit();
         }
     };
@@ -249,7 +249,7 @@ pub const DistributedTransactionScenario = struct {
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".decision", @intFromEnum(state.decision));
+        try builder.addNamed(allocator, name ++ ".decision", @backingInt(state.decision));
         try builder.addNamed(allocator, name ++ ".prepared", state.prepared);
         try builder.addNamed(allocator, name ++ ".delivered", state.delivered);
         try builder.addNamed(allocator, name ++ ".lease_epoch", state.lease_epoch);
@@ -470,12 +470,12 @@ pub const DataPlaneScenario = struct {
             state.query_visible = try read_file.readPositionalAll(io, &bytes, 0) == bytes.len and std.mem.eql(u8, &bytes, "put:a=1");
             state.stage = .terminal;
         } else return error.InvalidDataPlaneTransition;
-        try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(state.stage));
+        try events.emitNamed(allocator, .domain, selected.name, @backingInt(state.stage));
         return .applied();
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".stage", @intCast(@intFromEnum(state.stage)));
+        try builder.addNamed(allocator, name ++ ".stage", @intCast(@backingInt(state.stage)));
         try builder.addNamed(allocator, name ++ ".owner_epoch", @intCast(state.owner_epoch));
         try builder.addNamed(allocator, name ++ ".acknowledged", @intFromBool(state.acknowledged));
         try builder.addNamed(allocator, name ++ ".query_visible", @intFromBool(state.query_visible));
@@ -562,7 +562,7 @@ pub const DerivedWorkflowScenario = struct {
             }
         }
 
-        fn deinit(_: *anyopaque) void {}
+        pub fn deinit(_: *anyopaque) void {}
     };
     const State = struct {
         vopr_io: vopr.vopr_io.VoprIo,
@@ -644,12 +644,12 @@ pub const DerivedWorkflowScenario = struct {
             state.canceled = true;
             state.stage = .cleanup_ready;
         } else try state.vopr_io.scheduler().executeReady(selected.id, events, allocator);
-        try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(state.stage));
+        try events.emitNamed(allocator, .domain, selected.name, @backingInt(state.stage));
         return .applied();
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".stage", @intCast(@intFromEnum(state.stage)));
+        try builder.addNamed(allocator, name ++ ".stage", @intCast(@backingInt(state.stage)));
         try builder.addNamed(allocator, name ++ ".source_revision", @intCast(state.source_revision));
         try builder.addNamed(allocator, name ++ ".derived_revision", @intCast(state.derived_revision));
         try builder.addNamed(allocator, name ++ ".pending_jobs", @intCast(state.lane.stats().pending_jobs));
@@ -670,7 +670,7 @@ pub const DerivedWorkflowScenario = struct {
     }
 
     fn submit(state: *State, kind: JobKind, pending: Stage) !void {
-        const context = &state.contexts[@intFromEnum(kind)];
+        const context = &state.contexts[@backingInt(kind)];
         try state.lane.lane().submit(.{
             .owner_id = state.owner_id,
             .class = if (kind == .cleanup) background_runtime.Job.Class.cleanup else .maintenance,
@@ -728,7 +728,7 @@ pub const BackupRestoreScenario = struct {
         required_generation_deleted: bool = false,
         winner: Winner = .none,
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             if (self.manifest_bytes) |bytes| self.allocator.free(bytes);
         }
     };
@@ -822,13 +822,13 @@ pub const BackupRestoreScenario = struct {
             if (!state.pinned) state.required_generation_deleted = true;
             state.stage = .terminal;
         } else return error.InvalidBackupRestoreTransition;
-        try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(state.stage));
+        try events.emitNamed(allocator, .domain, selected.name, @backingInt(state.stage));
         return .applied();
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".stage", @intCast(@intFromEnum(state.stage)));
-        try builder.addNamed(allocator, name ++ ".winner", @intCast(@intFromEnum(state.winner)));
+        try builder.addNamed(allocator, name ++ ".stage", @intCast(@backingInt(state.stage)));
+        try builder.addNamed(allocator, name ++ ".winner", @intCast(@backingInt(state.winner)));
         try builder.addNamed(allocator, name ++ ".upload_chunks", state.upload_chunks);
         try builder.addNamed(allocator, name ++ ".download_chunks", state.download_chunks);
     }
@@ -992,6 +992,8 @@ pub fn recordClockLeaseTtl(allocator: Allocator, seed: u64) !vopr.trace.Trace {
 }
 
 pub fn replayKnown(allocator: Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
+    if (std.mem.eql(u8, artifact.header.scenario, @import("secrets.zig").Scenario.name))
+        return vopr.replay.exact(@import("secrets.zig").Scenario, allocator, artifact);
     if (std.mem.eql(u8, artifact.header.scenario, @import("index_maintenance.zig").OwnerScenario.name))
         return vopr.replay.exact(@import("index_maintenance.zig").OwnerScenario, allocator, artifact);
     if (std.mem.eql(u8, artifact.header.scenario, @import("index_maintenance.zig").Scenario.name))
@@ -1010,6 +1012,7 @@ pub fn replayKnown(allocator: Allocator, artifact: *const vopr.trace.Trace) !vop
 }
 
 pub const Kind = enum {
+    secrets,
     index_maintenance,
     index_ownership,
     distributed_transaction,
@@ -1027,6 +1030,7 @@ pub const Kind = enum {
             .clock_fault => "clock-fault",
             .index_maintenance => "index-maintenance",
             .index_ownership => "index-ownership",
+            .secrets => "secrets",
         };
     }
 
@@ -1039,6 +1043,7 @@ pub const Kind = enum {
             .clock_fault => ClockLeaseTtlScenario,
             .index_maintenance => @import("index_maintenance.zig").Scenario,
             .index_ownership => @import("index_maintenance.zig").OwnerScenario,
+            .secrets => @import("secrets.zig").Scenario,
         };
     }
 
@@ -1061,6 +1066,7 @@ pub const Kind = enum {
             .clock_fault => 8,
             .index_maintenance => 256,
             .index_ownership => 8,
+            .secrets => 32,
         };
     }
 };
@@ -1088,6 +1094,7 @@ pub fn recordNamed(allocator: Allocator, cli_name: []const u8, seed: u64) !vopr.
         .clock_fault => recordClockLeaseTtl(allocator, seed),
         .index_maintenance => record(@import("index_maintenance.zig").Scenario, allocator, seed, 256),
         .index_ownership => record(@import("index_maintenance.zig").OwnerScenario, allocator, seed, 8),
+        .secrets => record(@import("secrets.zig").Scenario, allocator, seed, 32),
     };
 }
 
@@ -1137,6 +1144,7 @@ pub fn runKnownWithChoicesAndRecorder(
         .clock_fault => runWithChoices(ClockLeaseTtlScenario, allocator, artifact, source, recorder),
         .index_maintenance => runWithChoices(@import("index_maintenance.zig").Scenario, allocator, artifact, source, recorder),
         .index_ownership => runWithChoices(@import("index_maintenance.zig").OwnerScenario, allocator, artifact, source, recorder),
+        .secrets => runWithChoices(@import("secrets.zig").Scenario, allocator, artifact, source, recorder),
     };
 }
 
@@ -1149,6 +1157,7 @@ pub fn reduceKnown(allocator: Allocator, artifact: *const vopr.trace.Trace, targ
         .clock_fault => vopr.reducer.reduce(ClockLeaseTtlScenario, allocator, artifact, target, config),
         .index_maintenance => vopr.reducer.reduce(@import("index_maintenance.zig").Scenario, allocator, artifact, target, config),
         .index_ownership => vopr.reducer.reduce(@import("index_maintenance.zig").OwnerScenario, allocator, artifact, target, config),
+        .secrets => vopr.reducer.reduce(@import("secrets.zig").Scenario, allocator, artifact, target, config),
     };
 }
 

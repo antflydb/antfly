@@ -153,7 +153,7 @@ pub const Cache = struct {
     }
 
     fn bucket(id: [32]u8) usize {
-        return std.mem.readInt(u64, id[0..8], .little) % 1024;
+        return @intCast(std.mem.readInt(u64, id[0..8], .little) % 1024);
     }
 
     fn find(self: *Cache, id: [32]u8) ?*Entry {

@@ -21,13 +21,13 @@ pub fn configureModule(
     mod: *std.Build.Module,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
-    lmdb_engine_mod: *std.Build.Module,
     json_mod: *std.Build.Module,
     public_openapi_mod: *std.Build.Module,
     query_openapi_mod: *std.Build.Module,
     indexes_openapi_mod: *std.Build.Module,
     sort_openapi_mod: *std.Build.Module,
     metadata_openapi_mod: *std.Build.Module,
+    schema_openapi_mod: *std.Build.Module,
     reranking_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
     httpx_mod: *std.Build.Module,
@@ -37,7 +37,7 @@ pub fn configureModule(
     vector_mod: *std.Build.Module,
     vectorindex_mod: *std.Build.Module,
     hash_mod: *std.Build.Module,
-    vellum_mod: *std.Build.Module,
+    fst_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     font_mod: *std.Build.Module,
@@ -48,13 +48,15 @@ pub fn configureModule(
     storage_boundary.configure(mod, false, false);
     mod.addOptions("build_options", build_options);
     mod.addImport("antfly_lite_options", lite_options);
-    mod.addImport("lmdb_engine", lmdb_engine_mod);
     mod.addImport("antfly-json", json_mod);
     mod.addImport("antfly_public_openapi", public_openapi_mod);
     mod.addImport("antfly_query_openapi", query_openapi_mod);
     mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
     mod.addImport("antfly_sort_openapi", sort_openapi_mod);
     mod.addImport("antfly_metadata_openapi", metadata_openapi_mod);
+    // schema/table_schema_impl.zig takes the public table storage mode and
+    // the relational wire types from the schema OpenAPI module (#784).
+    mod.addImport("antfly_schema_openapi", schema_openapi_mod);
     mod.addImport("antfly_reranking", reranking_mod);
     mod.addImport("objectstore", objectstore_mod);
     mod.addImport("httpx", httpx_mod);
@@ -64,7 +66,7 @@ pub fn configureModule(
     mod.addImport("antfly_vector", vector_mod);
     mod.addImport("antfly_vectorindex", vectorindex_mod);
     mod.addImport("antfly_hash", hash_mod);
-    mod.addImport("antfly_vellum", vellum_mod);
+    mod.addImport("antfly_fst", fst_mod);
     mod.addImport("antfly_regex", regex_mod);
     mod.addImport("antfly_image", image_mod);
     mod.addImport("antfly_font", font_mod);
@@ -81,7 +83,7 @@ const selectTestFilters = @import("tests.zig").selectTestFilters;
 pub const AddEmbeddedOptions = struct {
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     antfly_imports: AntflyRootImports,
     antfly_mod: *std.Build.Module,
@@ -101,7 +103,11 @@ pub const AddEmbeddedResult = struct {
     install_libantfly: *std.Build.Step.InstallArtifact,
     install_capi_header: *std.Build.Step.InstallFile,
     run_capi_smoke: *std.Build.Step.Run,
+    run_capi_conformance: *std.Build.Step.Run,
     run_lite_go_tests: *std.Build.Step.Run,
+    run_lite_py_tests: *std.Build.Step.Run,
+    run_lite_rs_tests: *std.Build.Step.Run,
+    run_lite_ts_tests: *std.Build.Step.Run,
     run_lite_go_example: *std.Build.Step.Run,
     run_lite_go_retrieval_template: *std.Build.Step.Run,
     run_cabi_packaging_tests: *std.Build.Step.Run,
@@ -114,7 +120,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const strip = options.strip;
     const link_libc = options.antfly_imports.platform_link_libc;
     const build_options = options.antfly_imports.build_options;
-    const lmdb_engine_mod = options.lmdb_engine;
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
     const public_openapi_mod = options.antfly_imports.public_openapi;
@@ -123,6 +128,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const sort_openapi_mod = options.antfly_imports.sort_openapi;
     const query_openapi_mod = options.antfly_imports.query_openapi;
     const metadata_openapi_mod = options.antfly_imports.metadata_openapi;
+    const schema_openapi_mod = options.antfly_imports.schema_openapi;
     const handlebars_mod = options.antfly_imports.handlebars;
     const platform_mod = options.antfly_imports.platform;
     const objectstore_mod = options.antfly_imports.objectstore;
@@ -130,7 +136,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const vector_mod = options.antfly_imports.vector;
     const hash_mod = options.antfly_imports.hash;
     const vectorindex_mod = options.antfly_imports.vectorindex;
-    const vellum_mod = options.antfly_imports.vellum;
+    const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
     const matcher_mod = options.antfly_imports.matcher;
@@ -148,13 +154,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const embedded_deps = .{
         build_options,
         antfly_imports.lite_options,
-        lmdb_engine_mod,
         json_mod,
         public_openapi_mod,
         query_openapi_mod,
         indexes_openapi_mod,
         sort_openapi_mod,
         metadata_openapi_mod,
+        schema_openapi_mod,
         reranking_mod,
         objectstore_mod,
         httpx_mod,
@@ -164,7 +170,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         vector_mod,
         vectorindex_mod,
         hash_mod,
-        vellum_mod,
+        fst_mod,
         regex_mod,
         image_mod,
         font_mod,
@@ -178,6 +184,15 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     @call(.auto, configureEmbeddedModule, .{ b, antfly_imports.storage_boundary, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
+    embedded_support_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
+    embedded_support_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    embedded_support_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
+    embedded_support_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
+    embedded_support_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
+    embedded_support_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    embedded_support_mod.addImport("antfly_public_limits", antfly_imports.public_limits);
+    embedded_support_mod.addImport("antfly_template_content", antfly_imports.template_content);
+    embedded_support_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
     embedded_support_mod.addImport("antfly_scraping", scraping_mod);
     embedded_support_mod.addImport("antfly_resolver", resolver_mod);
     embedded_support_mod.addImport("antfly_matcher", matcher_mod);
@@ -185,21 +200,21 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
 
     const embedded_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
         .target = target,
         .optimize = optimize,
     });
     embedded_mod.addImport("embedded_support", embedded_support_mod);
 
     const embedded_db_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/db.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/db.zig"),
         .target = target,
         .optimize = optimize,
     });
     embedded_db_mod.addImport("embedded_support", embedded_support_mod);
 
     const embedded_api_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/embedded/api.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/engine/api.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -246,7 +261,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     _ = lib;
 
     const capi_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi_root.zig"),
+        .root_source_file = b.path("pkg/antfly/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -264,22 +279,48 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_root_mod.addImport("usermgr_storage", capi_usermgr_storage_mod);
 
     const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+        .root_source_file = b.path("pkg/antfly/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
     });
     antfly_imports.storage_boundary.configure(capi_mod, false, false);
-    capi_mod.addImport("antfly_source_root", capi_root_mod);
+    capi_mod.addImport("antfly_platform", platform_mod);
     const capi_options = b.addOptions();
     capi_options.addOption(bool, "linked_storage", false);
+    // The inference runtime is always linked into libantfly (see
+    // link_anchor.zig and addRuntime's storage_kernel unit), so this is
+    // unconditionally true. Unit tests compile the inference call path
+    // directly (no archive/trap boundary either way).
+    capi_options.addOption(bool, "inference_enabled", true);
     capi_mod.addOptions("capi_build_options", capi_options);
-    capi_mod.addImport("antfly_storage_root", capi_root_mod);
+    capi_root_mod.addOptions("capi_build_options", capi_options);
+    capi_root_mod.addImport("antfly_storage_root", capi_root_mod);
     capi_mod.addImport("antfly_vector", vector_mod);
     capi_mod.addImport("structlog", structlog_mod);
 
+    // Public C API compilation has its own physical/local source owner. No
+    // private storage-provider archive is needed to analyze this object.
+    antfly_imports.configureEmbedded(b, capi_mod, link_libc);
+    capi_mod.addImport("antfly_storage_root", capi_mod);
+    const capi_native_object = b.addObject(.{
+        .name = "antfly-embedded-capi",
+        .root_module = capi_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const capi_native_check = b.step("embedded-capi-check", "Compile the public C API with its independent local source owner");
+    capi_native_check.dependOn(&capi_native_object.step);
+    const capi_boundary = @import("embedded_boundary.zig").add(b, capi_mod);
+    b.step("embedded-native-module-boundary-check", "Resolve the native public C API source and module boundary").dependOn(&capi_boundary.step);
+
     // The public C ABI and executable reuse the distributed PIC storage
     // archive, so production builds analyze and optimize that graph once.
+    // libantfly embeds the standalone inference runtime in-process, the same
+    // as the `antfly` executable (see link_anchor.zig and addRuntime's
+    // storage_kernel unit): this is a deliberate product decision
+    // (2026-09-17) so Lite hosts get local inference without a separate
+    // runtime, at the cost of a much larger shared library (see
+    // COMPILATION.md's "C API composition" section).
     const libantfly_link_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/capi/link_anchor.zig"),
         .target = target,
@@ -292,7 +333,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .linkage = .dynamic,
         .name = "antfly",
         .root_module = libantfly_link_mod,
-        .max_rss = 2 * 1024 * 1024 * 1024,
+        .max_rss = 4 * 1024 * 1024 * 1024,
     });
     libantfly.link_gc_sections = true;
     // Homebrew rewrites the dylib ID to its absolute opt/lib path on install.
@@ -329,21 +370,92 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     capi_smoke_step.dependOn(&run_capi_smoke.step);
 
+    // Reference runner for the shared conformance cases every binding runs
+    // (pkg/antfly/capi-conformance/README.md). It calls libantfly only
+    // through the public header, so a case that fails here is an ABI bug
+    // rather than a binding bug.
+    const capi_conformance_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/conformance_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    capi_conformance_mod.link_libc = true;
+    capi_conformance_mod.addIncludePath(b.path("pkg/antfly/include"));
+    const capi_conformance = b.addExecutable(.{
+        .name = "antfly-capi-conformance",
+        .root_module = capi_conformance_mod,
+    });
+    capi_conformance.root_module.linkLibrary(libantfly);
+    const run_capi_conformance = b.addRunArtifact(capi_conformance);
+    run_capi_conformance.addDirectoryArg2(b.path("pkg/antfly/capi-conformance/cases"), .{ .make_absolute = true });
+    _ = run_capi_conformance.addOutputDirectoryArg2("capi-conformance-work", .{ .make_absolute = true });
+    const capi_conformance_step = b.step("capi-conformance", "Run the shared libantfly conformance cases against the C ABI");
+    capi_conformance_step.dependOn(&run_capi_conformance.step);
+
     const run_lite_go_tests = b.addSystemCommand(&.{
         "env",
         "GOWORK=off",
         "go",
         "test",
         "-tags",
-        "antflylite_capi",
+        "libantfly",
         "-count=1",
         "./...",
     });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
+    run_lite_go_tests.setCwd(b.path("../go/pkg/lite"));
     run_lite_go_tests.step.dependOn(&install_libantfly.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
+
+    // The Python, Rust, and TypeScript bindings skip their native tests
+    // when libantfly is absent; ANTFLY_LITE_REQUIRE_LIBRARY turns that into
+    // a failure here, and ANTFLY_LIB_DIR points them at this build's copy.
+    const run_lite_py_tests = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_LITE_REQUIRE_LIBRARY=1",
+        "uv",
+        "run",
+        "--locked",
+        "pytest",
+        "-q",
+    });
+    run_lite_py_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
+    run_lite_py_tests.setCwd(b.path("../py/packages/lite"));
+    run_lite_py_tests.step.dependOn(&install_libantfly.step);
+    const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
+    lite_py_test_step.dependOn(&run_lite_py_tests.step);
+
+    const run_lite_rs_tests = b.addSystemCommand(&.{
+        "env",
+        "cargo",
+        "test",
+        "--locked",
+        "--manifest-path",
+        "../rs/Cargo.toml",
+        "--package",
+        "antfly-lite",
+        "--features",
+        "libantfly",
+    });
+    run_lite_rs_tests.argv.insert(b.allocator, 1, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
+    run_lite_rs_tests.setCwd(b.path("."));
+    run_lite_rs_tests.step.dependOn(&install_libantfly.step);
+    const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
+    lite_rs_test_step.dependOn(&run_lite_rs_tests.step);
+
+    const run_lite_ts_tests = b.addSystemCommand(&.{
+        "env",
+        "ANTFLY_LITE_REQUIRE_LIBRARY=1",
+        "pnpm",
+        "run",
+        "test",
+    });
+    run_lite_ts_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
+    run_lite_ts_tests.setCwd(b.path("../ts/packages/lite"));
+    run_lite_ts_tests.step.dependOn(&install_libantfly.step);
+    const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");
+    lite_ts_test_step.dependOn(&run_lite_ts_tests.step);
 
     const run_lite_go_example = b.addSystemCommand(&.{
         "env",
@@ -392,24 +504,56 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     capi_package_test_step.dependOn(&run_cabi_packaging_tests.step);
 
     const capi_default_filters = [_][]const u8{
+        "capi SQL",
+        "storage owner runtime status",
+        "capi relational expression errors preserve public status semantics",
         "capi artifact decode and lookup json",
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
         "capi system write cursor",
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
+        "capi directory restore coordinates with open handles and publishes atomically",
+        "capi directory restore publishes with derived work drained",
+        "capi handle ids are safe to use after close and across slot reuse",
+        "capi handle registry retires a slot instead of wrapping its generation",
+        "capi concurrent calls and closes on one handle never touch freed memory",
+        "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
+        "capi fact relationships preserve identities and filter before ranking",
+        "capi fact path serialization and parsing release partial allocations",
+        "capi fact algebraic paths retain provenance and respect frontier limits",
+        "capi fact edge cleanup releases the owned array exactly once",
         "capi search rejects stale identity generation before readable lease hook",
         "capi search json returns stamped identity generation",
         "packed dense response exposes public ids not doc ordinals",
         "dense response identity generation footer",
         "capi aggregate hits rejects stale identity generation before aggregation materialization",
+        "capi lite local-runtime-configured flag reports local_embedded only when the build links inference",
+        "capi lite explicit resource budget overrides are reported in status",
+        "capi lite defaults embedded generation budgets when no override is given",
+        "capi lite drains an antfly embedder with no api_url through the embedded inference provider",
+        "capi inference options are prefix compatible and reject unknown flags and reserved bits",
+        "capi inference calls reject null, closed, and database handles",
+        "capi inference lists models and reports route errors",
+        "capi inference embeds text with a local model",
+        "capi inference reranks documents with a local model",
+        "capi inference chunks text without a model",
+        "capi inference generates text with a local model and rejects streaming",
+        "capi inference pull rejects invalid requests with a JSON error",
+        "capi inference pulls a model with progress",
+        "capi inference streaming reports request errors without a model",
         "capi get edges json does not double free a non-empty edge slice",
+        "run until idle no-progress error maps to a dedicated stalled ABI code, not internal",
+        "capi lite merged indexes JSON discovers a standalone asset extractor and chunk enrichment with no owning index",
+        "capi lite run until idle drains a standalone chunk enrichment with no owning index",
+        "capi lite AddIndexJSON registers a graph config",
+        "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const capi_tests = b.addTest(.{
-        .root_module = capi_mod,
-        // Storage-backed Mach-O ReleaseSafe codegen needs 12 GiB headroom.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .root_module = capi_root_mod,
+        // Storage-backed Mach-O Debug codegen measured 13.51 GB.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -430,12 +574,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .embedded_db_mod = embedded_db_mod,
         .embedded_support_mod = embedded_support_mod,
         .capi_root_mod = capi_root_mod,
-        .capi_mod = capi_mod,
+        .capi_mod = capi_root_mod,
         .libantfly_link_mod = libantfly_link_mod,
         .install_libantfly = install_libantfly,
         .install_capi_header = install_capi_header,
         .run_capi_smoke = run_capi_smoke,
+        .run_capi_conformance = run_capi_conformance,
         .run_lite_go_tests = run_lite_go_tests,
+        .run_lite_py_tests = run_lite_py_tests,
+        .run_lite_rs_tests = run_lite_rs_tests,
+        .run_lite_ts_tests = run_lite_ts_tests,
         .run_lite_go_example = run_lite_go_example,
         .run_lite_go_retrieval_template = run_lite_go_retrieval_template,
         .run_cabi_packaging_tests = run_cabi_packaging_tests,

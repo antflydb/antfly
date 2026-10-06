@@ -183,15 +183,15 @@ func (r *AntflyCluster) Default() {
 	}
 
 	if r.Spec.Standalone.Inference == nil {
+		// Leave APIURL unset: standalone runs its embedded, in-process inference
+		// provider by default. A set inference.apiURL is a hard isolation
+		// contract in the runtime (it disables the embedded provider, preloads,
+		// and /ai/v1 routes), so the operator must never invent one — only an
+		// explicit user-supplied apiURL should point standalone at an
+		// external/shared inference endpoint.
 		r.Spec.Standalone.Inference = &StandaloneInferenceSpec{
 			Enabled: true,
-			APIURL:  "http://0.0.0.0:11433",
 		}
-		return
-	}
-
-	if r.Spec.Standalone.Inference.APIURL == "" {
-		r.Spec.Standalone.Inference.APIURL = "http://0.0.0.0:11433"
 	}
 }
 
@@ -2379,10 +2379,10 @@ func (r *AntflyCluster) validateStandaloneConfig() error {
 		return nil
 	}
 
-	if standalone.Inference != nil && standalone.Inference.Enabled && strings.TrimSpace(standalone.Inference.APIURL) == "" {
-		return fmt.Errorf("spec.standalone.inference.apiURL must be set when inference is enabled")
-	}
-
+	// An empty apiURL is the normal, expected configuration: standalone runs
+	// its embedded, in-process inference provider and never binds a separate
+	// inference listener. apiURL is only required when the user explicitly
+	// points standalone at an external/shared inference endpoint.
 	if standalone.Inference != nil && strings.TrimSpace(standalone.Inference.APIURL) != "" {
 		parsed, err := url.Parse(standalone.Inference.APIURL)
 		if err != nil {

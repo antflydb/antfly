@@ -12,7 +12,7 @@
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_time = @import("antfly_platform").time;
 
 const file_name = "root_identity.checkpoint";

@@ -31,7 +31,7 @@ fn afterAdmission(err: anyerror) anyerror {
     return error.MetadataMutationOutcomeUnknown;
 }
 
-fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+pub fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     const Service = @TypeOf(svc.*);
     if (comptime @hasDecl(Service, "lockTableCatalogMutation")) {
         svc.lockTableCatalogMutation(table_name);
@@ -42,7 +42,7 @@ fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     }
 }
 
-fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+pub fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
     const Service = @TypeOf(svc.*);
     if (comptime @hasDecl(Service, "unlockTableCatalogMutation")) {
         svc.unlockTableCatalogMutation(table_name);
@@ -124,6 +124,8 @@ pub fn create(
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
     // different definitions for the same request.
     var normalized_req = req;
+    if (try @import("fk_generation_publication.zig").schemaHasForeignKeys(alloc, tables_api.effectiveSchemaJson(req.schema_json)))
+        return error.ForeignKeyGenerationPublicationRequired;
     if (req.storage) |storage| {
         if (storage.dense_embeddings == .vector_store)
             return error.VectorStoreRequiresLocalSingleShardTable;
@@ -150,18 +152,25 @@ pub fn create(
     var catalog_locked = true;
     defer if (catalog_locked) unlockTableCatalogMutation(svc, table_name);
     try request.ensureActive();
-    const table = tables_api.deriveTableRecord(table_name, normalized_req);
+    var table = tables_api.deriveTableRecord(table_name, normalized_req);
+    const original_table_id = table.table_id;
     // Read the durable fence on the leader while holding the catalog mutation
     // lock. Its generation is both the apply precondition and the storage
     // incarnation salt, so a recreate cannot reuse paths owned by an earlier
     // drop even when post-commit cleanup is delayed or the caller crashes.
     try svc.ensureLinearizableReadWithContext(request);
     try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
+    if (comptime @hasDecl(@typeInfo(@TypeOf(svc)).pointer.child, "resolveTableCreateIdentity")) {
+        table.table_id = try svc.resolveTableCreateIdentity(table.table_id);
+    }
     const transition_generation = try svc.captureTableCreateGeneration(alloc, table.table_id);
+    var identity_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &identity_bytes, table.table_id, .little);
+    const storage_generation = if (table.table_id == original_table_id) transition_generation else std.hash.Wyhash.hash(transition_generation, &identity_bytes);
     const ranges = try tables_api.deriveInitialRangesForGeneration(
         alloc,
         table,
-        transition_generation,
+        storage_generation,
     );
     defer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);

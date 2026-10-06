@@ -55,14 +55,14 @@ pub const PageType = enum(i32) {
 
 pub const Encoding = enum(i32) {
     plain = 0,
-    plain_dictionary = 1,
-    rle = 2,
-    bit_packed = 3,
-    delta_binary_packed = 4,
-    delta_length_byte_array = 5,
-    delta_byte_array = 6,
-    rle_dictionary = 7,
-    byte_stream_split = 8,
+    plain_dictionary = 2,
+    rle = 3,
+    bit_packed = 4,
+    delta_binary_packed = 5,
+    delta_length_byte_array = 6,
+    delta_byte_array = 7,
+    rle_dictionary = 8,
+    byte_stream_split = 9,
 };
 
 pub const CompressionCodec = enum {
@@ -158,10 +158,10 @@ pub fn inspectColumnChunkResourceUsage(column_chunk_bytes: []const u8) !ColumnCh
     return usage;
 }
 
-const PagePayload = struct {
+pub const PagePayload = struct {
     bytes: []u8,
 
-    fn deinit(self: PagePayload, alloc: Allocator) void {
+    pub fn deinit(self: PagePayload, alloc: Allocator) void {
         alloc.free(self.bytes);
     }
 };
@@ -747,19 +747,30 @@ pub fn scanDictionaryI32AsI64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) ![]i64 {
+    return scanDictionaryI32AsI64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanDictionaryI32AsI64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const i64,
+) ![]i64 {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainI32DictionaryPageAsI64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainI32DictionaryPageAsI64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(i64).empty;
     errdefer values.deinit(alloc);
@@ -785,19 +796,30 @@ pub fn scanOptionalDictionaryI32AsI64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) !NullableI64Values {
+    return scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const i64,
+) !NullableI64Values {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainI32DictionaryPageAsI64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainI32DictionaryPageAsI64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(i64).empty;
     errdefer values.deinit(alloc);
@@ -835,19 +857,30 @@ pub fn scanDictionaryI64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) ![]i64 {
+    return scanDictionaryI64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanDictionaryI64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const i64,
+) ![]i64 {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainI64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainI64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(i64).empty;
     errdefer values.deinit(alloc);
@@ -873,19 +906,30 @@ pub fn scanDictionaryF64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) ![]f64 {
+    return scanDictionaryF64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanDictionaryF64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const f64,
+) ![]f64 {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainF64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainF64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(f64).empty;
     errdefer values.deinit(alloc);
@@ -911,19 +955,30 @@ pub fn scanDictionaryF32AsF64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) ![]f64 {
+    return scanDictionaryF32AsF64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanDictionaryF32AsF64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const f64,
+) ![]f64 {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainF32DictionaryPageAsF64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainF32DictionaryPageAsF64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(f64).empty;
     errdefer values.deinit(alloc);
@@ -949,19 +1004,30 @@ pub fn scanOptionalDictionaryI64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) !NullableI64Values {
+    return scanOptionalDictionaryI64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanOptionalDictionaryI64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const i64,
+) !NullableI64Values {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainI64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainI64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(i64).empty;
     errdefer values.deinit(alloc);
@@ -1682,19 +1748,30 @@ pub fn scanOptionalDictionaryF64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) !NullableF64Values {
+    return scanOptionalDictionaryF64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanOptionalDictionaryF64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const f64,
+) !NullableF64Values {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainF64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainF64DictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(f64).empty;
     errdefer values.deinit(alloc);
@@ -1732,19 +1809,30 @@ pub fn scanOptionalDictionaryF32AsF64ColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) !NullableF64Values {
+    return scanOptionalDictionaryF32AsF64ColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanOptionalDictionaryF32AsF64ColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const f64,
+) !NullableF64Values {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainF32DictionaryPageAsF64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer alloc.free(dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainF32DictionaryPageAsF64Alloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) alloc.free(dictionary);
 
     var values = std.ArrayListUnmanaged(f64).empty;
     errdefer values.deinit(alloc);
@@ -2050,6 +2138,54 @@ pub fn decodePlainFixedLenByteArrayDictionaryPageAlloc(
     }, page_payload, type_length);
 }
 
+/// Decode dictionary IDs without expanding/copying a byte payload per row.
+/// A page owns its dictionary so decoded-cache eviction cannot borrow a cursor.
+pub fn decodeByteDictionaryVectorAlloc(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+    return decodeByteDictionaryVector(a, header, dictionary, payload, optional, false);
+}
+pub fn decodeByteDictionaryVector(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool, borrow: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+    try header.validateDictionaryRequired();
+    const count: usize = header.value_count;
+    if (header.data_payload_offset > payload.len) return error.InvalidParquetPage;
+    if (optional and (header.page_type != .data_page_v2 or header.repetition_level_bytes != 0 or header.definition_level_bytes == 0 or header.definition_level_bytes > payload.len)) return error.UnsupportedParquetPage;
+    const levels = if (optional) try decodeHybridLevelsAlloc(a, payload[0..header.definition_level_bytes], 1, count) else null;
+    defer if (levels) |values| a.free(values);
+    var present: usize = if (optional) 0 else count;
+    if (levels) |values| for (values) |value| {
+        if (value > 1) return error.InvalidParquetPage;
+        present += value;
+    };
+    const data = payload[header.data_payload_offset..];
+    if (present != 0 and (data.len == 0 or data[0] > 32)) return error.InvalidParquetPage;
+    const decoded = try decodeHybridIndexesAlloc(a, if (present == 0) &.{} else data[1..], if (present == 0) 0 else @intCast(data[0]), present);
+    defer a.free(decoded);
+    const indices = try a.alloc(u32, count);
+    errdefer a.free(indices);
+    const nulls: []u8 = if (optional) try a.alloc(u8, count) else &.{};
+    errdefer if (optional) a.free(nulls);
+    var next: usize = 0;
+    for (indices, 0..) |*id, row| {
+        const is_null = if (levels) |values| values[row] == 0 else false;
+        if (optional) nulls[row] = @intFromBool(is_null);
+        id.* = 0;
+        if (!is_null) {
+            if (decoded[next] >= dictionary.len) return error.InvalidParquetPage;
+            id.* = @intCast(decoded[next]);
+            next += 1;
+        }
+    }
+    if (borrow) return .{ .values = .{ .values = dictionary, .indices = indices }, .nulls = nulls };
+    const values = try a.alloc([]const u8, dictionary.len);
+    errdefer a.free(values);
+    var initialized: usize = 0;
+    errdefer for (values[0..initialized]) |value| a.free(value);
+    for (dictionary, values) |source, *value| {
+        value.* = try a.dupe(u8, source);
+        initialized += 1;
+    }
+    return .{ .values = .{ .values = values, .indices = indices }, .nulls = nulls };
+}
+
 pub fn decodeDictionaryByteArrayDataPageAlloc(
     alloc: Allocator,
     header: Header,
@@ -2236,19 +2372,31 @@ pub fn scanDictionaryFixedLenByteArrayColumnChunkAlloc(
     compression: CompressionCodec,
     type_length: usize,
 ) ![][]u8 {
+    return scanDictionaryFixedLenByteArrayColumnChunkAllocCached(alloc, column_chunk_bytes, compression, type_length, null);
+}
+
+pub fn scanDictionaryFixedLenByteArrayColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    type_length: usize,
+    cached_dictionary: ?[]const []u8,
+) ![][]u8 {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainFixedLenByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes, type_length);
-    defer freePlainByteArrays(alloc, dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainFixedLenByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes, type_length);
+    };
+    defer if (cached_dictionary == null) freePlainByteArrays(alloc, @constCast(dictionary));
 
     var values = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -2281,19 +2429,31 @@ pub fn scanOptionalDictionaryFixedLenByteArrayColumnChunkAlloc(
     compression: CompressionCodec,
     type_length: usize,
 ) !NullableByteArrayValues {
+    return scanOptionalDictionaryFixedLenByteArrayColumnChunkAllocCached(alloc, column_chunk_bytes, compression, type_length, null);
+}
+
+pub fn scanOptionalDictionaryFixedLenByteArrayColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    type_length: usize,
+    cached_dictionary: ?[]const []u8,
+) !NullableByteArrayValues {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainFixedLenByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes, type_length);
-    defer freePlainByteArrays(alloc, dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainFixedLenByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes, type_length);
+    };
+    defer if (cached_dictionary == null) freePlainByteArrays(alloc, @constCast(dictionary));
 
     var values = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -2340,19 +2500,30 @@ pub fn scanDictionaryByteArrayColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) ![][]u8 {
+    return scanDictionaryByteArrayColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanDictionaryByteArrayColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const []u8,
+) ![][]u8 {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer freePlainByteArrays(alloc, dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) freePlainByteArrays(alloc, @constCast(dictionary));
 
     var values = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -2391,19 +2562,30 @@ pub fn scanOptionalDictionaryByteArrayColumnChunkAlloc(
     column_chunk_bytes: []const u8,
     compression: CompressionCodec,
 ) !NullableByteArrayValues {
+    return scanOptionalDictionaryByteArrayColumnChunkAllocCached(alloc, column_chunk_bytes, compression, null);
+}
+
+pub fn scanOptionalDictionaryByteArrayColumnChunkAllocCached(
+    alloc: Allocator,
+    column_chunk_bytes: []const u8,
+    compression: CompressionCodec,
+    cached_dictionary: ?[]const []u8,
+) !NullableByteArrayValues {
     var cursor: usize = 0;
     if (cursor >= column_chunk_bytes.len) return error.InvalidParquetPage;
 
-    const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
-    try parsed_dictionary.header.validatePlainDictionary();
-    cursor += parsed_dictionary.header_len;
-    if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
-    const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
-    cursor += parsed_dictionary.header.compressed_page_size;
-    const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
-    defer dictionary_payload.deinit(alloc);
-    const dictionary = try decodePlainByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
-    defer freePlainByteArrays(alloc, dictionary);
+    const dictionary = cached_dictionary orelse owned: {
+        const parsed_dictionary = try parsePageHeader(column_chunk_bytes[cursor..]);
+        try parsed_dictionary.header.validatePlainDictionary();
+        cursor += parsed_dictionary.header_len;
+        if (parsed_dictionary.header.compressed_page_size > column_chunk_bytes.len - cursor) return error.InvalidParquetPage;
+        const compressed_dictionary_payload = column_chunk_bytes[cursor .. cursor + parsed_dictionary.header.compressed_page_size];
+        cursor += parsed_dictionary.header.compressed_page_size;
+        const dictionary_payload = try decodePagePayloadAlloc(alloc, parsed_dictionary.header, compression, compressed_dictionary_payload);
+        defer dictionary_payload.deinit(alloc);
+        break :owned try decodePlainByteArrayDictionaryPageAlloc(alloc, parsed_dictionary.header, dictionary_payload.bytes);
+    };
+    defer if (cached_dictionary == null) freePlainByteArrays(alloc, @constCast(dictionary));
 
     var values = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -2450,7 +2632,7 @@ pub fn freePlainByteArrays(alloc: Allocator, values: [][]u8) void {
     alloc.free(values);
 }
 
-fn decodePagePayloadAlloc(
+pub fn decodePagePayloadAlloc(
     alloc: Allocator,
     header: Header,
     compression: CompressionCodec,
@@ -2649,18 +2831,7 @@ fn pageTypeFromInt(raw: i32) !PageType {
 }
 
 fn encodingFromInt(raw: i32) !Encoding {
-    return switch (raw) {
-        0 => .plain,
-        1 => .plain_dictionary,
-        2 => .rle,
-        3 => .bit_packed,
-        4 => .delta_binary_packed,
-        5 => .delta_length_byte_array,
-        6 => .delta_byte_array,
-        7 => .rle_dictionary,
-        8 => .byte_stream_split,
-        else => error.InvalidParquetPage,
-    };
+    return std.enums.fromInt(Encoding, raw) orelse error.InvalidParquetPage;
 }
 
 const Field = struct {
@@ -2674,7 +2845,7 @@ const Reader = struct {
 
     fn readFieldHeader(self: *Reader, previous_field_id: *i16) !?Field {
         const raw = try self.readByte();
-        const field_type: CompactType = @enumFromInt(raw & 0x0f);
+        const field_type: CompactType = @fromBackingInt(@intCast(raw & 0x0f));
         if (field_type == .stop) return null;
         const delta: i16 = @intCast(raw >> 4);
         const field_id = if (delta == 0) try self.readI16() else previous_field_id.* + delta;
@@ -2757,8 +2928,8 @@ const Reader = struct {
                 const count = try self.readVarintUsize();
                 if (count == 0) return;
                 const types = try self.readByte();
-                const key_type: CompactType = @enumFromInt(types >> 4);
-                const value_type: CompactType = @enumFromInt(types & 0x0f);
+                const key_type: CompactType = @fromBackingInt(@intCast(types >> 4));
+                const value_type: CompactType = @fromBackingInt(@intCast(types & 0x0f));
                 for (0..count) |_| {
                     try self.skip(key_type);
                     try self.skip(value_type);
@@ -2777,7 +2948,7 @@ const Reader = struct {
 
     fn readListHeader(self: *Reader) !struct { elem_type: CompactType, len: usize } {
         const raw = try self.readByte();
-        const elem_type: CompactType = @enumFromInt(raw & 0x0f);
+        const elem_type: CompactType = @fromBackingInt(@intCast(raw & 0x0f));
         const inline_len = raw >> 4;
         const len = if (inline_len == 15) try self.readVarintUsize() else inline_len;
         return .{ .elem_type = elem_type, .len = len };
@@ -2881,9 +3052,9 @@ fn zigzagDecode(raw: u64) i64 {
 fn appendField(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, previous: *i16, id: i16, field_type: CompactType) !void {
     const delta = id - previous.*;
     if (delta > 0 and delta <= 15) {
-        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @as(u8, @intFromEnum(field_type)));
+        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @as(u8, @backingInt(field_type)));
     } else {
-        try out.append(alloc, @intFromEnum(field_type));
+        try out.append(alloc, @backingInt(field_type));
         try appendI16(out, alloc, id);
     }
     previous.* = id;
@@ -2903,7 +3074,7 @@ fn appendI32(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: i32) !vo
 
 fn appendZigzag(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: anytype) !void {
     const Int = @TypeOf(value);
-    const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(Int));
+    const Unsigned = @Int(.unsigned, @bitSizeOf(Int));
     const encoded: Unsigned = @bitCast((value << 1) ^ (value >> (@bitSizeOf(Int) - 1)));
     try appendVarint(out, alloc, encoded);
 }
@@ -2955,9 +3126,9 @@ fn buildDataPageHeaderFixtureWithSizesAndEncoding(
     try appendField(&out, alloc, &data_prev, 2, .i32);
     try appendI32(&out, alloc, encoding);
     try appendField(&out, alloc, &data_prev, 3, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendField(&out, alloc, &data_prev, 4, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendStop(&out, alloc);
 
     try appendStop(&out, alloc);
@@ -3005,11 +3176,11 @@ fn buildDictionaryDataPageHeaderFixture(alloc: Allocator, value_count: i32, comp
     try appendField(&out, alloc, &data_prev, 1, .i32);
     try appendI32(&out, alloc, value_count);
     try appendField(&out, alloc, &data_prev, 2, .i32);
-    try appendI32(&out, alloc, 7);
+    try appendI32(&out, alloc, 8);
     try appendField(&out, alloc, &data_prev, 3, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendField(&out, alloc, &data_prev, 4, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendStop(&out, alloc);
 
     try appendStop(&out, alloc);
@@ -3642,7 +3813,7 @@ test "parquet page scanner decodes optional dictionary i64 v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 3, 24);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3696,7 +3867,7 @@ test "parquet page scanner decodes optional dictionary f64 v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 16);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3749,7 +3920,7 @@ test "parquet page scanner decodes optional dictionary f32 v2 pages as f64" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 8);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3798,7 +3969,7 @@ test "parquet page scanner decodes optional dictionary i32 v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 3, 12);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3887,7 +4058,7 @@ test "parquet page scanner decodes optional dictionary byte array v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 12);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3993,6 +4164,40 @@ test "parquet page parser rejects unsupported pages and truncated payloads" {
 
     var unsupported = parsed.header;
     unsupported.encoding = .rle_dictionary;
-    const payload = [_]u8{0} ** 16;
+    const payload = @as([16]u8, @splat(0));
     try std.testing.expectError(error.UnsupportedParquetPage, decodePlainI64Alloc(alloc, unsupported, &payload));
 }
+
+/// One decoded dictionary per column chunk; data pages borrow it until close.
+pub const Dictionary = union(enum) {
+    i64: []i64,
+    f64: []f64,
+    bytes: [][]u8,
+    pub fn deinit(self: *Dictionary, a: Allocator) void {
+        switch (self.*) {
+            .i64 => |v| a.free(v),
+            .f64 => |v| a.free(v),
+            .bytes => |v| freePlainByteArrays(a, v),
+        }
+    }
+    pub fn retainedBytes(self: Dictionary) usize {
+        return switch (self) {
+            .i64 => |v| v.len * @sizeOf(i64),
+            .f64 => |v| v.len * @sizeOf(f64),
+            .bytes => |v| blk: {
+                var size = v.len * @sizeOf([]u8);
+                for (v) |item| size +|= item.len;
+                break :blk size;
+            },
+        };
+    }
+    pub fn values(comptime tag: std.meta.Tag(Dictionary), source: ?*const Dictionary) !?switch (tag) {
+        .i64 => []const i64,
+        .f64 => []const f64,
+        .bytes => []const []u8,
+    } {
+        const value = source orelse return null;
+        if (value.* != tag) return error.InvalidParquetPage;
+        return @field(value.*, @tagName(tag));
+    }
+};

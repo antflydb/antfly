@@ -20,4 +20,11 @@ pub const RaftNdjsonTraceLogger = raft_trace_logger.RaftNdjsonTraceLogger;
 pub const AntflyTraceWriter = antfly_trace_writer.AntflyTraceWriter;
 pub const AntflyNdjsonTraceWriter = antfly_trace_writer.AntflyNdjsonTraceWriter;
 pub const stderrAntflyTraceWriter = stderr_writer.stderrAntflyTraceWriter;
-pub const stderrRaftTraceLogger = stderr_writer.stderrRaftTraceLogger;
+pub const stderrRaftTraceLogger = @import("server_raft_writer.zig").stderrRaftTraceLogger;
+
+test {
+    // File ownership is part of the normal Raft unit gate too. Without an
+    // explicit import its tests are discovered only when TLA logging is used.
+    _ = @import("trace_file.zig");
+    _ = antfly_trace_writer;
+}

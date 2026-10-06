@@ -1,0 +1,22 @@
+{
+  "name": "backup_across_storage",
+  "description": "A .aflite backup restores into directory storage and imports into empty databases of either kind; importing into a non-empty database fails.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:portable", "value": {"title": "portable", "body": "crosses storage kinds"}}
+    ]},
+    {"op": "run_until_idle"},
+    {"op": "backup"},
+    {"op": "import_backup", "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}},
+    {"op": "restore_open", "path": "restored-dir", "storage": "directory", "no_sync": true},
+    {"op": "status", "expect": {"json_subset": {"storage": {"format": "directory"}}}},
+    {"op": "lookup", "key": "doc:portable", "expect": {"json_subset": {"title": "portable"}}},
+    {"op": "reopen", "path": "empty.aflite", "create": true, "no_sync": true},
+    {"op": "import_backup"},
+    {"op": "lookup", "key": "doc:portable", "expect": {"json_subset": {"title": "portable"}}},
+    {"op": "reopen", "path": "empty-dir", "storage": "directory", "no_sync": true},
+    {"op": "import_backup"},
+    {"op": "lookup", "key": "doc:portable", "expect": {"json_subset": {"title": "portable"}}}
+  ]
+}

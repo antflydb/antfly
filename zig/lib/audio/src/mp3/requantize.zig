@@ -38,29 +38,29 @@ pub const Part2Info = struct {
 
 pub const RawScalefactors = struct {
     count: usize = 0,
-    values: [39]u8 = [_]u8{0} ** 39,
+    values: [39]u8 = @as([39]u8, @splat(0)),
 };
 
 pub const invalid_intensity_position: u8 = 0xFF;
 
 pub const RawIntensityPositions = struct {
     count: usize = 0,
-    values: [39]u8 = [_]u8{invalid_intensity_position} ** 39,
+    values: [39]u8 = @as([39]u8, @splat(invalid_intensity_position)),
 };
 
 pub const BandScalefactors = struct {
-    long: [21]u8 = [_]u8{0} ** 21,
-    short: [3][13]u8 = [_][13]u8{[_]u8{0} ** 13} ** 3,
-    intensity_long: [21]u8 = [_]u8{invalid_intensity_position} ** 21,
-    intensity_short: [3][13]u8 = [_][13]u8{[_]u8{invalid_intensity_position} ** 13} ** 3,
+    long: [21]u8 = @as([21]u8, @splat(0)),
+    short: [3][13]u8 = @as([3][13]u8, @splat(@as([13]u8, @splat(0)))),
+    intensity_long: [21]u8 = @as([21]u8, @splat(invalid_intensity_position)),
+    intensity_short: [3][13]u8 = @as([3][13]u8, @splat(@as([13]u8, @splat(invalid_intensity_position)))),
     long_band_count: usize = 0,
     short_band_start: usize = 12,
     short_band_count: usize = 0,
 };
 
 pub const BandScalePlan = struct {
-    long: [21]f32 = [_]f32{0} ** 21,
-    short: [3][13]f32 = [_][13]f32{[_]f32{0} ** 13} ** 3,
+    long: [21]f32 = @as([21]f32, @splat(0)),
+    short: [3][13]f32 = @as([3][13]f32, @splat(@as([13]f32, @splat(0)))),
     long_band_count: usize = 0,
     short_band_start: usize = 12,
     short_band_count: usize = 0,
@@ -525,7 +525,7 @@ pub fn requantizeBigValuePairsShort(
     var source_sample: usize = 0;
 
     if (info.mixed_block_flag) {
-        const long_samples = @min(total_samples, 36);
+        const long_samples = @min(total_samples, mixedBlockLongSamples(sample_rate));
         var mixed_long_scales = BandScalePlan{
             .long_band_count = band_scales.long_band_count,
         };
@@ -627,9 +627,10 @@ fn requantizeCount1QuadsShort(
     var quad_index: usize = 0;
     var value_index: usize = 0;
 
-    if (info.mixed_block_flag and source_sample < 36) {
+    const mixed_long_samples = mixedBlockLongSamples(sample_rate);
+    if (info.mixed_block_flag and source_sample < mixed_long_samples) {
         const long_progress = try requantizeCount1QuadsLong(sample_rate, band_scales, source_sample, quads, out_coefficients);
-        if (long_progress.samples_decoded < 36) return long_progress;
+        if (long_progress.samples_decoded < mixed_long_samples) return long_progress;
         source_sample = long_progress.samples_decoded;
         const consumed_values = source_sample - start_sample;
         quad_index = consumedValuesToQuadIndex(consumed_values);
@@ -692,17 +693,18 @@ pub fn reorderShortCoefficients(
     if (coefficients.len < 576) return;
 
     const short_bands = scalefactorBandShort(sample_rate);
-    var reordered: [576]f32 = [_]f32{0} ** 576;
+    var reordered: [576]f32 = @as([576]f32, @splat(0));
 
     var source_offset: usize = 0;
     var dest_offset: usize = 0;
     var band_start_index: usize = 0;
 
     if (info.mixed_block_flag) {
-        @memcpy(reordered[0..36], coefficients[0..36]);
-        source_offset = 36;
-        dest_offset = 36;
-        band_start_index = 3;
+        const long_samples = mixedBlockLongSamples(sample_rate);
+        @memcpy(reordered[0..long_samples], coefficients[0..long_samples]);
+        source_offset = long_samples;
+        dest_offset = long_samples;
+        band_start_index = mixed_short_band_start;
     }
 
     for (band_start_index..12) |band| {
@@ -791,8 +793,19 @@ pub fn scalefactorBandLong(sample_rate: u32) []const usize {
         32000 => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 44, 54, 66, 82, 102, 126, 156, 194, 240, 296, 364, 448, 550, 576 },
         24000 => &.{ 0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 114, 136, 162, 194, 232, 278, 330, 394, 464, 540, 576 },
         22050, 16000, 12000, 11025 => &.{ 0, 6, 12, 18, 24, 30, 36, 44, 54, 66, 80, 96, 116, 140, 168, 200, 238, 284, 336, 396, 464, 522, 576 },
+        8000 => &.{ 0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576 },
         else => &.{ 0, 4, 8, 12, 16, 20, 24, 30, 36, 42, 50, 60, 72, 88, 106, 128, 156, 190, 230, 276, 330, 384, 576 },
     };
+}
+
+/// Mixed blocks transform their lowest bands with long windows and the rest
+/// with short ones. The switch happens at the third short scalefactor band,
+/// counted across all three windows: 36 samples at every rate except 8 kHz,
+/// whose wider bands put it at 72.
+pub const mixed_short_band_start: usize = 3;
+
+pub fn mixedBlockLongSamples(sample_rate: u32) usize {
+    return 3 * scalefactorBandShort(sample_rate)[mixed_short_band_start];
 }
 
 pub fn scalefactorBandShort(sample_rate: u32) []const usize {
@@ -800,8 +813,18 @@ pub fn scalefactorBandShort(sample_rate: u32) []const usize {
         44100 => &.{ 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 },
         48000 => &.{ 0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192 },
         32000 => &.{ 0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192 },
-        16000 => &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192 },
-        else => @panic("unsupported short-band sample rate"),
+        // MPEG-2 (ISO 13818-3) and MPEG-2.5 low sampling frequencies. 11025 and
+        // 12000 share the 16000 table, and 8000 has its own, which is why a
+        // decoder that only knows the MPEG-1 rates cannot guess these.
+        22050 => &.{ 0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192 },
+        24000 => &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192 },
+        16000, 12000, 11025 => &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192 },
+        8000 => &.{ 0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192 },
+        // Every rate a frame header can carry is covered above. An unknown one
+        // is rejected when the header is parsed rather than reaching here, so
+        // that one unreadable file fails its own request instead of taking the
+        // process down with it.
+        else => &.{ 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 },
     };
 }
 
@@ -835,7 +858,8 @@ test "compute LSF part2 info for long blocks" {
     const part2 = try computePart2Info(header, info, 0, .{ false, false, false, false });
     try std.testing.expectEqual([4]u8{ 1, 3, 2, 1 }, part2.slen);
     try std.testing.expectEqual([4]u8{ 6, 5, 5, 5 }, part2.partition_scalefactor_bands);
-    try std.testing.expectEqual(@as(usize, 31), part2.bit_length);
+    // Six bands of one bit, five of three, five of two and five of one.
+    try std.testing.expectEqual(@as(usize, 36), part2.bit_length);
 }
 
 test "compute LSF part2 info for short blocks" {
@@ -866,9 +890,11 @@ test "compute LSF part2 info for short blocks" {
         .count1table_select = false,
     };
     const part2 = try computePart2Info(header, info, 0, .{ false, false, false, false });
-    try std.testing.expectEqual([4]u8{ 2, 3, 0, 3 }, part2.slen);
+    // scalefac_compress 215 splits as 13 over the first two partitions and
+    // (215 & 0xf) >> 2 = 1 then 215 & 3 = 3 over the last two.
+    try std.testing.expectEqual([4]u8{ 2, 3, 1, 3 }, part2.slen);
     try std.testing.expectEqual([4]u8{ 9, 9, 9, 9 }, part2.partition_scalefactor_bands);
-    try std.testing.expectEqual(@as(usize, 72), part2.bit_length);
+    try std.testing.expectEqual(@as(usize, 81), part2.bit_length);
 }
 
 test "decode raw scalefactors consumes synthetic long-block part2 payload" {
@@ -877,9 +903,11 @@ test "decode raw scalefactors consumes synthetic long-block part2 payload" {
         .slen = .{ 1, 2, 0, 1 },
         .partition_scalefactor_bands = .{ 2, 1, 2, 1 },
     };
+    // 1, 0 from the first partition's one-bit bands, 0b01 from the second's
+    // two-bit band, two implicit zeros where slen is zero, then one more bit.
     const scalefactors = try decodeRawScalefactors(&.{0b10010010}, 0, part2);
     try std.testing.expectEqual(@as(usize, 6), scalefactors.count);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 2, 0, 0, 1 }, scalefactors.values[0..scalefactors.count]);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 1, 0, 0, 0 }, scalefactors.values[0..scalefactors.count]);
 }
 
 test "expand long-block scalefactors fills 21 long bands" {
@@ -1160,7 +1188,7 @@ test "requantize long big values uses band scales and preserves sign" {
         .{ .x = 1, .y = -8 },
         .{ .x = 0, .y = 2 },
     };
-    var coeffs = [_]f32{0} ** 8;
+    var coeffs = @as([8]f32, @splat(0));
     const progress = try requantizeBigValuePairsLong(16000, &pairs, scales, &coeffs);
     try std.testing.expectEqual(@as(usize, 4), progress.samples_decoded);
     try std.testing.expect(progress.unsupported_sample_index == null);
@@ -1211,7 +1239,7 @@ test "requantize short big values reorders by band and window" {
         .{ .x = 1, .y = 2 }, .{ .x = 3, .y = 4 },  .{ .x = 5, .y = 6 },
         .{ .x = 7, .y = 8 }, .{ .x = 9, .y = 10 }, .{ .x = 11, .y = 12 },
     };
-    var coeffs = [_]f32{0} ** 64;
+    var coeffs = @as([64]f32, @splat(0));
     const progress = try requantizeBigValuePairs(header, info, &pairs, scales, &coeffs);
     try std.testing.expectEqual(@as(usize, 12), progress.samples_decoded);
     try std.testing.expect(progress.unsupported_sample_index == null);
@@ -1225,6 +1253,123 @@ test "mpeg1 short scalefactor band tables are available for 44.1/48/32 kHz" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 16, 22, 30, 40, 52, 66, 84, 106, 136, 192 }, scalefactorBandShort(44100));
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 16, 22, 28, 38, 50, 64, 80, 100, 126, 192 }, scalefactorBandShort(48000));
     try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 16, 22, 30, 42, 58, 78, 104, 138, 180, 192 }, scalefactorBandShort(32000));
+}
+
+test "low sampling frequency short scalefactor band tables cover mpeg2 and mpeg2.5" {
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 18, 24, 32, 42, 56, 74, 100, 132, 174, 192 }, scalefactorBandShort(22050));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 136, 180, 192 }, scalefactorBandShort(24000));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 4, 8, 12, 18, 26, 36, 48, 62, 80, 104, 134, 174, 192 }, scalefactorBandShort(16000));
+    // 11025 and 12000 share the 16000 table; guessing either of its neighbours
+    // decodes short blocks into noise instead of audio.
+    try std.testing.expectEqualSlices(usize, scalefactorBandShort(16000), scalefactorBandShort(12000));
+    try std.testing.expectEqualSlices(usize, scalefactorBandShort(16000), scalefactorBandShort(11025));
+    try std.testing.expectEqualSlices(usize, &.{ 0, 8, 16, 24, 36, 52, 72, 96, 124, 160, 162, 164, 166, 192 }, scalefactorBandShort(8000));
+}
+
+test "8 kHz long scalefactor bands are its own table, not the 48 kHz fallback" {
+    try std.testing.expectEqualSlices(
+        usize,
+        &.{ 0, 12, 24, 36, 48, 60, 72, 88, 108, 132, 160, 192, 232, 280, 336, 400, 476, 566, 568, 570, 572, 574, 576 },
+        scalefactorBandLong(8000),
+    );
+}
+
+test "every sample rate a frame header can carry has well formed band tables" {
+    // The decoder rejects rates outside this set before a granule is decoded,
+    // so this is the complete set the tables have to answer for.
+    for ([_]u32{ 44100, 48000, 32000, 22050, 24000, 16000, 12000, 11025, 8000 }) |rate| {
+        try std.testing.expect(bitstream.supportsSampleRate(rate));
+
+        const long = scalefactorBandLong(rate);
+        try std.testing.expectEqual(@as(usize, 23), long.len);
+        try std.testing.expectEqual(@as(usize, 0), long[0]);
+        try std.testing.expectEqual(@as(usize, 576), long[long.len - 1]);
+        for (long[1..], 0..) |edge, index| try std.testing.expect(edge > long[index]);
+
+        const short = scalefactorBandShort(rate);
+        try std.testing.expectEqual(@as(usize, 14), short.len);
+        try std.testing.expectEqual(@as(usize, 0), short[0]);
+        try std.testing.expectEqual(@as(usize, 192), short[short.len - 1]);
+        for (short[1..], 0..) |edge, index| try std.testing.expect(edge > short[index]);
+    }
+    try std.testing.expect(!bitstream.supportsSampleRate(7350));
+}
+
+test "the mixed block boundary follows the band tables, and widens at 8 kHz" {
+    // ffmpeg puts it the same way: "if switched mode, we handle the 36 first
+    // samples as long blocks. For 8000Hz, we handle the 72 first exponents as
+    // long blocks."
+    for ([_]u32{ 44100, 48000, 32000, 22050, 24000, 16000, 12000, 11025 }) |rate| {
+        try std.testing.expectEqual(@as(usize, 36), mixedBlockLongSamples(rate));
+    }
+    try std.testing.expectEqual(@as(usize, 72), mixedBlockLongSamples(8000));
+
+    // The same boundary seen from the long table: eight bands for MPEG-1 and
+    // six for the low sampling frequencies, which is where the scalefactors
+    // for a mixed block stop being long.
+    for ([_]u32{ 44100, 48000, 32000 }) |rate| {
+        try std.testing.expectEqual(mixedBlockLongSamples(rate), scalefactorBandLong(rate)[8]);
+    }
+    for ([_]u32{ 22050, 24000, 16000, 12000, 11025, 8000 }) |rate| {
+        try std.testing.expectEqual(mixedBlockLongSamples(rate), scalefactorBandLong(rate)[6]);
+    }
+}
+
+test "an 8 kHz mixed block keeps 72 coefficients on long gains" {
+    const info = bitstream.GranuleChannelInfo{
+        .part2_3_length = 100,
+        .big_values = 48,
+        .global_gain = 210,
+        .scalefac_compress = 215,
+        .window_switching_flag = true,
+        .block_type = 2,
+        .mixed_block_flag = true,
+        .table_select = .{ 5, 6, 0 },
+        .subblock_gain = .{ 0, 0, 0 },
+        .region0_count = 8,
+        .region1_count = 12,
+        .preflag = false,
+        .scalefac_scale = false,
+        .count1table_select = false,
+    };
+    // Long bands carry gain 1, short bands gain 4. Every coefficient the long
+    // window owns has to come back at its own value, and the first short one
+    // at four times its own.
+    var scales = BandScalePlan{
+        .long_band_count = 6,
+        .short_band_start = mixed_short_band_start,
+        .short_band_count = 10,
+    };
+    for (0..6) |band| scales.long[band] = 1.0;
+    for (mixed_short_band_start..13) |band| {
+        scales.short[0][band] = 4.0;
+        scales.short[1][band] = 4.0;
+        scales.short[2][band] = 4.0;
+    }
+
+    var pairs: [48]huffman.DecodedPair = undefined;
+    for (0..48) |i| pairs[i] = .{ .x = 1, .y = 1 };
+    var coeffs = @as([128]f32, @splat(0));
+    const progress = try requantizeBigValuePairs(
+        .{
+            .version = .mpeg25,
+            .layer = .layer3,
+            .has_crc = false,
+            .free_format = false,
+            .bitrate_kbps = 32,
+            .sample_rate = 8000,
+            .padding = false,
+            .channel_mode = .mono,
+        },
+        info,
+        &pairs,
+        scales,
+        &coeffs,
+    );
+
+    try std.testing.expect(progress.samples_decoded > 72);
+    for (coeffs[0..72]) |coefficient| try std.testing.expectApproxEqAbs(@as(f32, 1.0), coefficient, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.0), coeffs[72], 0.0001);
 }
 
 test "requantize mixed big values keeps first 36 samples long and reorders remainder short" {
@@ -1260,7 +1405,7 @@ test "requantize mixed big values keeps first 36 samples long and reorders remai
     for (0..24) |i| {
         pairs[i] = .{ .x = @intCast(i * 2 + 1), .y = @intCast(i * 2 + 2) };
     }
-    var coeffs = [_]f32{0} ** 128;
+    var coeffs = @as([128]f32, @splat(0));
     const progress = try requantizeBigValuePairs(
         .{
             .version = .mpeg2,
@@ -1299,7 +1444,7 @@ test "alias reduction changes long block boundary coefficients" {
         .scalefac_scale = false,
         .count1table_select = false,
     };
-    var coeffs = [_]f32{0} ** 576;
+    var coeffs = @as([576]f32, @splat(0));
     coeffs[17] = 1;
     coeffs[18] = 2;
 
@@ -1326,7 +1471,7 @@ test "alias reduction skips pure short blocks" {
         .scalefac_scale = false,
         .count1table_select = false,
     };
-    var coeffs = [_]f32{0} ** 576;
+    var coeffs = @as([576]f32, @splat(0));
     coeffs[17] = 1;
     coeffs[18] = 2;
 
@@ -1353,7 +1498,7 @@ test "alias reduction on mixed blocks only touches first long boundary" {
         .scalefac_scale = false,
         .count1table_select = false,
     };
-    var coeffs = [_]f32{0} ** 576;
+    var coeffs = @as([576]f32, @splat(0));
     coeffs[17] = 1;
     coeffs[18] = 2;
     coeffs[35] = 3;

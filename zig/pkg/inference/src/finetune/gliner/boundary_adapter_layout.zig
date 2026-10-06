@@ -100,6 +100,8 @@ fn stringHash(hash: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
 }
 
 pub fn init(a: Allocator, backbone: model.Backbone, config: peft.Config, limits: peft.Limits) !Layout {
+    // Adapter targets come from a published inventory; ModernBERT has none yet.
+    if (backbone == .modern_bert) return error.UnsupportedBoundaryAdapterBackbone;
     try peft.validateConfig(config, limits);
     var arena = std.heap.ArenaAllocator.init(a);
     errdefer arena.deinit();

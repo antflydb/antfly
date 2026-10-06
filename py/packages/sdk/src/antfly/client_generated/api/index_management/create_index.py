@@ -10,10 +10,12 @@ from ...models.create_algebraic_index_request import CreateAlgebraicIndexRequest
 from ...models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
 from ...models.create_full_text_index_request import CreateFullTextIndexRequest
 from ...models.create_graph_index_request import CreateGraphIndexRequest
+from ...models.create_relational_index_request import CreateRelationalIndexRequest
 from ...models.created_algebraic_index import CreatedAlgebraicIndex
 from ...models.created_embeddings_index import CreatedEmbeddingsIndex
 from ...models.created_full_text_index import CreatedFullTextIndex
 from ...models.created_graph_index import CreatedGraphIndex
+from ...models.created_relational_index import CreatedRelationalIndex
 from ...models.error import Error
 from ...models.index_mutation_conflict_error import IndexMutationConflictError
 from ...models.index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
@@ -29,7 +31,8 @@ def _get_kwargs(
     body: CreateAlgebraicIndexRequest
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
-    | CreateGraphIndexRequest,
+    | CreateGraphIndexRequest
+    | CreateRelationalIndexRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -47,6 +50,8 @@ def _get_kwargs(
         _kwargs["json"] = body.to_dict()
     elif isinstance(body, CreateGraphIndexRequest):
         _kwargs["json"] = body.to_dict()
+    elif isinstance(body, CreateAlgebraicIndexRequest):
+        _kwargs["json"] = body.to_dict()
     else:
         _kwargs["json"] = body.to_dict()
 
@@ -63,6 +68,7 @@ def _parse_response(
     | CreatedEmbeddingsIndex
     | CreatedFullTextIndex
     | CreatedGraphIndex
+    | CreatedRelationalIndex
     | Error
     | Error
     | IndexMutationServiceUnavailableError
@@ -76,7 +82,13 @@ def _parse_response(
 
         def _parse_response_201(
             data: object,
-        ) -> CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex:
+        ) -> (
+            CreatedAlgebraicIndex
+            | CreatedEmbeddingsIndex
+            | CreatedFullTextIndex
+            | CreatedGraphIndex
+            | CreatedRelationalIndex
+        ):
             try:
                 if not isinstance(data, dict):
                     raise TypeError()
@@ -101,11 +113,19 @@ def _parse_response(
                 return componentsschemas_created_index_type_2
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
+
+                return componentsschemas_created_index_type_3
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
             if not isinstance(data, dict):
                 raise TypeError()
-            componentsschemas_created_index_type_3 = CreatedAlgebraicIndex.from_dict(data)
+            componentsschemas_created_index_type_4 = CreatedRelationalIndex.from_dict(data)
 
-            return componentsschemas_created_index_type_3
+            return componentsschemas_created_index_type_4
 
         response_201 = _parse_response_201(response.json())
 
@@ -196,6 +216,7 @@ def _build_response(
     | CreatedEmbeddingsIndex
     | CreatedFullTextIndex
     | CreatedGraphIndex
+    | CreatedRelationalIndex
     | Error
     | Error
     | IndexMutationServiceUnavailableError
@@ -220,12 +241,14 @@ def sync_detailed(
     body: CreateAlgebraicIndexRequest
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
-    | CreateGraphIndexRequest,
+    | CreateGraphIndexRequest
+    | CreateRelationalIndexRequest,
 ) -> Response[
     CreatedAlgebraicIndex
     | CreatedEmbeddingsIndex
     | CreatedFullTextIndex
     | CreatedGraphIndex
+    | CreatedRelationalIndex
     | Error
     | Error
     | IndexMutationServiceUnavailableError
@@ -240,15 +263,15 @@ def sync_detailed(
         table_name (str):
         index_name (str):
         body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
-            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
-            index. The index name is owned by the request path.
+            CreateFullTextIndexRequest | CreateGraphIndexRequest | CreateRelationalIndexRequest):
+            Type-safe configuration for a new index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | CreatedRelationalIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -272,12 +295,14 @@ def sync(
     body: CreateAlgebraicIndexRequest
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
-    | CreateGraphIndexRequest,
+    | CreateGraphIndexRequest
+    | CreateRelationalIndexRequest,
 ) -> (
     CreatedAlgebraicIndex
     | CreatedEmbeddingsIndex
     | CreatedFullTextIndex
     | CreatedGraphIndex
+    | CreatedRelationalIndex
     | Error
     | Error
     | IndexMutationServiceUnavailableError
@@ -293,15 +318,15 @@ def sync(
         table_name (str):
         index_name (str):
         body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
-            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
-            index. The index name is owned by the request path.
+            CreateFullTextIndexRequest | CreateGraphIndexRequest | CreateRelationalIndexRequest):
+            Type-safe configuration for a new index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | CreatedRelationalIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError
     """
 
     return sync_detailed(
@@ -320,12 +345,14 @@ async def asyncio_detailed(
     body: CreateAlgebraicIndexRequest
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
-    | CreateGraphIndexRequest,
+    | CreateGraphIndexRequest
+    | CreateRelationalIndexRequest,
 ) -> Response[
     CreatedAlgebraicIndex
     | CreatedEmbeddingsIndex
     | CreatedFullTextIndex
     | CreatedGraphIndex
+    | CreatedRelationalIndex
     | Error
     | Error
     | IndexMutationServiceUnavailableError
@@ -340,15 +367,15 @@ async def asyncio_detailed(
         table_name (str):
         index_name (str):
         body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
-            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
-            index. The index name is owned by the request path.
+            CreateFullTextIndexRequest | CreateGraphIndexRequest | CreateRelationalIndexRequest):
+            Type-safe configuration for a new index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | CreatedRelationalIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -370,12 +397,14 @@ async def asyncio(
     body: CreateAlgebraicIndexRequest
     | CreateEmbeddingsIndexRequest
     | CreateFullTextIndexRequest
-    | CreateGraphIndexRequest,
+    | CreateGraphIndexRequest
+    | CreateRelationalIndexRequest,
 ) -> (
     CreatedAlgebraicIndex
     | CreatedEmbeddingsIndex
     | CreatedFullTextIndex
     | CreatedGraphIndex
+    | CreatedRelationalIndex
     | Error
     | Error
     | IndexMutationServiceUnavailableError
@@ -391,15 +420,15 @@ async def asyncio(
         table_name (str):
         index_name (str):
         body (CreateAlgebraicIndexRequest | CreateEmbeddingsIndexRequest |
-            CreateFullTextIndexRequest | CreateGraphIndexRequest): Type-safe configuration for a new
-            index. The index name is owned by the request path.
+            CreateFullTextIndexRequest | CreateGraphIndexRequest | CreateRelationalIndexRequest):
+            Type-safe configuration for a new index. The index name is owned by the request path.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | CreatedRelationalIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | IndexMutationConflictError | StorageResourceExhaustedError
     """
 
     return (

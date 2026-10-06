@@ -24,7 +24,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 REPO_ROOT = ROOT
@@ -35,6 +34,38 @@ ELV2_ROOTS = (
     "zig/e2e/antfly",
 )
 
+# Source moves preserve the original license until the licensing PR lands.
+ELV2_FILES = {
+    "zig/lib/runtime/src/mutation_barrier.zig",
+    "zig/build_support/openapi.zig",
+    "zig/build_support/openapi_exact_sort_test.zig",
+    "zig/build_support/openapi_split_test.zig",
+    "zig/lib/raft/src/read_state_observer.zig",
+    "zig/lib/runtime/src/cache_budget.zig",
+    "zig/lib/runtime/src/cancellation.zig",
+    "zig/lib/runtime/src/fs_paths.zig",
+    "zig/lib/runtime/src/private_error_diagnostics.zig",
+    "zig/lib/runtime/src/runtime_error_abi.zig",
+    "zig/lib/runtime/src/runtime_http_abi.zig",
+    "zig/lib/runtime/src/runtime_http_bridge.zig",
+    "zig/lib/runtime/src/runtime_io_abi.zig",
+    "zig/lib/runtime/src/runtime_native_abi.zig",
+    "zig/lib/runtime/src/threaded_io_limits.zig",
+    "zig/pkg/inference/src/host/bridge.zig",
+    "zig/pkg/inference/src/host/embedding_wire.zig",
+    "zig/pkg/inference/src/host/execution_control.zig",
+    "zig/pkg/inference/src/host/host.zig",
+    "zig/pkg/inference/src/host/provider_failure.zig",
+    "zig/pkg/inference/src/host/request_types.zig",
+    "zig/pkg/inference/src/host/runtime_paths.zig",
+    "zig/pkg/inference/src/host/sparse_embedding.zig",
+    "zig/pkg/inference/src/host/types.zig",
+    "zig/pkg/inference/src/host/work.zig",
+    "zig/pkg/inference/src/host/worker.zig",
+    "zig/pkg/inference/src/host/worker_rpc.zig",
+    "zig/pkg/inference/src/host/worker_wire.zig",
+}
+
 APACHE_ROOTS = (
     "zig/build.zig",
     "zig/build.zig.zon",
@@ -42,7 +73,11 @@ APACHE_ROOTS = (
     "zig/pkg/inference",
     "zig/lib",
     "zig/e2e/inference",
-    "go/pkg/antflylite",
+    "go/pkg/lite",
+    "py/packages/lite",
+    "ts/packages/lite",
+    "rs",
+    "examples",
     "go/pkg/docsaf",
     "go/pkg/evalaf",
     "go/pkg/genkit",
@@ -57,6 +92,11 @@ APACHE_ROOTS = (
     "compat",
 )
 
+# Files inside an ELv2 root that are Apache-2.0 anyway. The public C ABI
+# header is vendored or transcribed by the Apache-licensed Lite bindings.
+APACHE_FILES = {
+    "zig/pkg/antfly/include/antfly.h",
+}
 EXCLUDED_PARTS = {
     ".git",
     ".pytest_cache",
@@ -80,6 +120,8 @@ EXCLUDED_GLOBS = (
     "specs/tla/*etcdraft*",
     "scripts/uv.lock",
     "e2e/*/uv.lock",
+    # Its generator emits the Apache header; CI checks the file is current.
+    "rs/crates/sdk/src/graph_identifier_policy_generated.rs",
 )
 
 SLASH_EXTS = {
@@ -94,6 +136,7 @@ SLASH_EXTS = {
     ".m",
     ".metal",
     ".mjs",
+    ".rs",
     ".ts",
     ".tsx",
     ".wgsl",
@@ -179,7 +222,11 @@ def excluded(path: str) -> bool:
 
 def group_for(path: str, selected_group: str) -> str | None:
     group: str | None = None
-    if is_under(path, ELV2_ROOTS):
+    if path in ELV2_FILES:
+        group = "elv2"
+    elif path in APACHE_FILES:
+        group = "apache"
+    elif is_under(path, ELV2_ROOTS):
         group = "elv2"
     elif is_under(path, APACHE_ROOTS):
         group = "apache"
@@ -234,7 +281,8 @@ def render_header(path: Path, header: Header) -> str:
 
 
 def insertion_offset(lines: list[str]) -> int:
-    if lines and lines[0].startswith("#!"):
+    # A shebang keeps its line; a Rust inner attribute (`#![...]`) does not.
+    if lines and lines[0].startswith("#!") and not lines[0].startswith("#!["):
         return 1
     return 0
 
@@ -276,6 +324,10 @@ def strip_existing_antfly_header(text: str, path: Path) -> tuple[str, int]:
 def apply_header(text: str, path: Path, header: Header) -> str:
     stripped, offset = strip_existing_antfly_header(text, path)
     lines = stripped.splitlines(keepends=True)
+    # The rendered header ends with its own blank line; drop any the body
+    # already starts with so applying twice gives the same result.
+    while offset < len(lines) and lines[offset].strip() == "":
+        del lines[offset]
     rendered = render_header(path, header)
     if not "".join(lines[offset:]).strip():
         rendered = rendered.rstrip("\n") + "\n"

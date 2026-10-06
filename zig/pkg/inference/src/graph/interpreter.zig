@@ -34,6 +34,7 @@ const contracts = @import("backend_contracts.zig");
 const transpose_utils = @import("transpose_utils.zig");
 const buffer_plan_mod = @import("buffer_plan.zig");
 const runtime_slice = @import("runtime_slice.zig");
+const runtime_shape_values = @import("runtime_shape_values.zig");
 
 const Graph = ml.graph.Graph;
 const Node = ml.graph.Node;
@@ -147,6 +148,10 @@ pub const ExecuteOptions = struct {
     /// Strict training graphs use physical integer index tensors. Legacy
     /// imported graphs retain their established numeric-constant behavior.
     strict_integer_constants: bool = false,
+    /// A shape-specialized inference session can execute primitive GPU graphs
+    /// inside planned command frames even without model-specific fused regions.
+    /// Controlled requests still submit at bounded cancellation boundaries.
+    planned_device_execution: bool = false,
     /// Require independent resident capture allocations. This controls tape
     /// snapshots only; it does not certify residency of other graph operations.
     require_resident_capture: bool = false,
@@ -234,7 +239,7 @@ const OpProfiler = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayListUnmanaged(OpProfileEntry) = .empty,
 
-    fn deinit(self: *OpProfiler) void {
+    pub fn deinit(self: *OpProfiler) void {
         self.entries.deinit(self.allocator);
     }
 
@@ -314,6 +319,31 @@ fn nullCtAliases(values: []?CT, needle: CT) void {
     for (values) |*value| {
         if (value.* == needle) value.* = null;
     }
+}
+
+/// Return true when another graph value aliases `needle` and is still needed
+/// after `current_node`. Backends may return one stable borrowed handle for
+/// multiple parameter nodes (CUDA resident/tied weights do this). Releasing
+/// one node's last use must not clear that later alias merely because the
+/// opaque CT pointers compare equal.
+fn hasFutureParameterCtAlias(
+    graph: *const Graph,
+    values: []const ?CT,
+    last_use: []const u32,
+    needle: CT,
+    releasing_id: NodeId,
+    current_node: usize,
+) bool {
+    if (graph.node(releasing_id).op != .parameter) return false;
+    // Search only graph parameters. A whole-values scan at every release is
+    // quadratic in the full Gemma graph; the aliasing contract at issue is
+    // specifically backend weight handles, while view/output aliases are
+    // handled by cloneOutputIfAliasedInputWouldBeFreedFast above.
+    for (graph.parameters.items) |other_id| {
+        if (other_id == releasing_id or values[other_id] != needle) continue;
+        if (last_use[other_id] > current_node) return true;
+    }
+    return false;
 }
 
 fn graphExecTraceEnabled() bool {
@@ -843,6 +873,17 @@ pub fn execute(
                             continue;
                         }
                     }
+                    // `getWeight` may return a stable backend-owned handle for
+                    // duplicate parameter nodes (notably Gemma's tied input
+                    // embedding and LM head on CUDA). Topological sorting puts
+                    // both parameters before their consumers, so clearing all
+                    // equal CTs at the embedding's last use used to erase the
+                    // still-live LM-head binding. Defer the backend release to
+                    // the final live alias instead.
+                    if (hasFutureParameterCtAlias(graph, values, last_use, ct, input_id, i)) {
+                        values[input_id] = null;
+                        continue;
+                    }
                     // Clear every alias before releasing the handle. Keeping
                     // raw addresses of already-freed handles is ABA-unsafe:
                     // the allocator may recycle an address for a later live
@@ -1321,7 +1362,7 @@ const MoeGroupedState = struct {
     tile_row_counts: []u32,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *MoeGroupedState) void {
+    pub fn deinit(self: *MoeGroupedState) void {
         self.allocator.free(self.rows);
         self.allocator.free(self.expert_ids);
         self.allocator.free(self.route_weights);
@@ -1581,6 +1622,17 @@ fn fillShapeDims(graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64
     return buf[0..rank];
 }
 
+fn reductionInputShape(cb: *const ComputeBackend, input: CT, graph: *const Graph, node_id: NodeId, buf: *[8]i64) ![]const i64 {
+    const declared = fillShapeDims(graph, node_id, buf);
+    if (!hasNegativeDim(declared)) return declared;
+    const actual = try cb.tensorShape(input, graph.allocator);
+    defer graph.allocator.free(actual);
+    // Flat-only backends still resolve a single symbolic extent themselves.
+    if (actual.len != declared.len or hasNegativeDim(actual)) return declared;
+    @memcpy(buf[0..actual.len], actual);
+    return buf[0..actual.len];
+}
+
 fn runtimeOrDeclaredShape(state: *const ExecState, graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64 {
     if (state.runtime_shapes) |runtime_shapes| {
         if (node_id < runtime_shapes.len) {
@@ -1717,6 +1769,13 @@ fn positiveResolvedDim(actual: ?[]const i64, shape: Shape, axis: usize) !usize {
     }
     return positiveShapeDim(shape, axis);
 }
+fn declaredShapeDimMatches(shape: Shape, axis: usize, actual: usize) bool {
+    if (axis >= shape.rank()) return false;
+    const declared = shape.dim(@intCast(axis));
+    if (declared < 0) return true;
+    const concrete = std.math.cast(usize, declared) orelse return false;
+    return concrete == actual;
+}
 
 /// For shape-tracking backends (MLX), reshape a tensor to its declared
 /// shape when the declared shape is fully concrete, the actual rank differs,
@@ -1732,7 +1791,7 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
         if (dims[d] <= 0) return null;
     }
     if (cb.tensorShapeMatches(val, dims[0..rank]) catch null) |matches| {
-        return if (matches) null else cb.primReshape(val, dims[0..rank]) catch null;
+        if (matches) return null;
     }
     const actual = cb.tensorShape(val, std.heap.page_allocator) catch {
         return cb.primReshape(val, dims[0..rank]) catch null;
@@ -1948,8 +2007,10 @@ fn resolveSingleInferredDim(dims: []i64, input_numel: usize) bool {
     return known_product == input_numel;
 }
 
+const readRuntimeShape = @import("runtime_shape_values.zig").read;
+
 fn resolveOnnxRuntimeReshapeDims(
-    shape_values: []const f32,
+    shape_values: []const i64,
     actual_input_shape: []const i64,
     allow_zero: bool,
     out: *[8]i64,
@@ -1960,14 +2021,7 @@ fn resolveOnnxRuntimeReshapeDims(
     var inferred_axis: ?usize = null;
     var known_product: usize = 1;
     for (shape_values, 0..) |value, axis| {
-        const rounded = @round(value);
-        if (!std.math.isFinite(rounded) or @abs(value - rounded) > 1e-3 or
-            rounded < @as(f32, @floatFromInt(std.math.minInt(i32))) or
-            rounded > @as(f32, @floatFromInt(std.math.maxInt(i32))))
-        {
-            return error.InvalidTensorShape;
-        }
-        var dim: i64 = @intFromFloat(rounded);
+        var dim = value;
         if (dim == 0 and !allow_zero) {
             if (axis >= actual_input_shape.len or actual_input_shape[axis] <= 0) return error.InvalidTensorShape;
             dim = actual_input_shape[axis];
@@ -2450,6 +2504,7 @@ pub fn executeNode(
         },
 
         .constant => |attrs| {
+            if (n.output_shape.rank() > 8) return error.UnsupportedShape;
             if (state.options.strict_integer_constants) switch (n.output_shape.dtype) {
                 .i32 => {
                     const byte_count = std.math.mul(usize, attrs.data_len, @sizeOf(i32)) catch return error.UnsupportedShape;
@@ -2470,6 +2525,9 @@ pub fn executeNode(
                 .i8, .i16, .i64, .u8, .bool_ => return error.UnsupportedIntegerTensor,
                 else => {},
             };
+            const byte_count = std.math.mul(usize, attrs.data_len, n.output_shape.dtype.byteSize()) catch return error.UnsupportedShape;
+            if (attrs.data_offset > graph.constant_pool.items.len or byte_count > graph.constant_pool.items.len - attrs.data_offset) return error.UnsupportedShape;
+            if (try cb.fromConstantBytes(graph.constant_pool.items[attrs.data_offset..][0..byte_count], n.output_shape.dtype, n.output_shape.dims[0..n.output_shape.rank()])) |tensor| return tensor;
             const constant = try graph.constantDataAsF32(
                 graph.allocator,
                 n.output_shape.dtype,
@@ -2477,15 +2535,12 @@ pub fn executeNode(
                 attrs.data_len,
             );
             defer constant.deinit(graph.allocator);
-            if (n.output_shape.rank() > 1) {
-                var shape_buf: [8]i32 = undefined;
-                const rank = n.output_shape.rank();
-                for (0..rank) |ax| {
-                    shape_buf[ax] = @intCast(n.output_shape.dim(@intCast(ax)));
-                }
-                return cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
+            var shape_buf: [8]i32 = undefined;
+            const rank = n.output_shape.rank();
+            for (0..rank) |axis| {
+                shape_buf[axis] = std.math.cast(i32, n.output_shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
             }
-            return cb.fromFloat32(constant.data);
+            return cb.fromFloat32Shape(constant.data, shape_buf[0..rank]);
         },
 
         // ── Fused ops → backend dispatch ──────────────────────────────
@@ -2631,6 +2686,36 @@ pub fn executeNode(
                 if (try cb.multiplyConsumeLeft(V.get(ins[0]), V.get(ins[1]))) |consumed| return consumed;
             }
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
+        },
+
+        .fused_selected_tied_head_logits => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var output_shape_buf: [8]i64 = undefined;
+            const output_shape = fillShapeDims(graph, node_id, &output_shape_buf);
+            return cb.selectedTiedHeadLogits(&.{
+                .hidden = V.get(ins[0]),
+                .weight = V.get(ins[1]),
+                .token_ids = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .output_shape = output_shape,
+            });
+        },
+
+        .fused_selected_tied_head_backward => |attrs| {
+            if (!attrs.frozen_weight) return error.UnsupportedPrimitiveOp;
+            var hidden_shape_buf: [8]i64 = undefined;
+            const hidden_shape = fillShapeDims(graph, node_id, &hidden_shape_buf);
+            return cb.selectedTiedHeadBackward(&.{
+                .weight = V.get(ins[0]),
+                .token_ids = V.get(ins[1]),
+                .upstream = V.get(ins[2]),
+                .in_dim = attrs.in_dim,
+                .vocab_size = attrs.vocab_size,
+                .frozen_weight = attrs.frozen_weight,
+                .hidden_shape = hidden_shape,
+            });
         },
 
         .fused_masked_bce_with_logits_loss => |attrs| {
@@ -2821,6 +2906,26 @@ pub fn executeNode(
         .fused_deberta_training_attention_backward_v1 => |attrs| {
             if (ins.len != 4) return error.InvalidDebertaTrainingAttentionShape;
             return cb.debertaTrainingAttentionBackwardV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), V.get(ins[3]), attrs);
+        },
+
+        .fused_segment_training_attention_v1 => |attrs| {
+            if (ins.len != 2) return error.InvalidSegmentTrainingAttentionShape;
+            return cb.segmentTrainingAttentionV1(V.get(ins[0]), V.get(ins[1]), attrs);
+        },
+
+        .fused_segment_training_attention_backward_v1 => |attrs| {
+            if (ins.len != 3) return error.InvalidSegmentTrainingAttentionShape;
+            return cb.segmentTrainingAttentionBackwardV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs);
+        },
+
+        .fused_modernbert_training_attention_v1 => |attrs| {
+            if (ins.len != 2) return error.InvalidModernBertTrainingAttentionShape;
+            return cb.modernBertTrainingAttentionV1(V.get(ins[0]), V.get(ins[1]), attrs);
+        },
+
+        .fused_modernbert_training_attention_backward_v1 => |attrs| {
+            if (ins.len != 3) return error.InvalidModernBertTrainingAttentionShape;
+            return cb.modernBertTrainingAttentionBackwardV1(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]), attrs);
         },
 
         .fused_disentangled_attention => |attrs| {
@@ -3499,17 +3604,17 @@ pub fn executeNode(
 
         .reduce_sum => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = try reductionInputShape(cb, V.get(ins[0]), graph, ins[0], &sbuf);
             return cb.primReduceSum(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_max => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = try reductionInputShape(cb, V.get(ins[0]), graph, ins[0], &sbuf);
             return cb.primReduceMax(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .reduce_mean => |attrs| {
             var sbuf: [8]i64 = undefined;
-            const in_shape = fillShapeDims(graph, ins[0], &sbuf);
+            const in_shape = try reductionInputShape(cb, V.get(ins[0]), graph, ins[0], &sbuf);
             return cb.primReduceMean(V.get(ins[0]), attrs.axes[0..attrs.num_axes], in_shape);
         },
         .argmax => |attrs| {
@@ -3533,8 +3638,8 @@ pub fn executeNode(
                     if (ins.len < 2 or ins[1] == null_node) return error.MissingRuntimeInput;
                     const actual = try cb.tensorShape(input_value, std.heap.page_allocator);
                     defer std.heap.page_allocator.free(actual);
-                    const shape_values = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
-                    defer std.heap.page_allocator.free(shape_values);
+                    var shape_buf: [8]i64 = undefined;
+                    const shape_values = try readRuntimeShape(cb, V.get(ins[1]), &shape_buf);
                     break :blk try resolveOnnxRuntimeReshapeDims(shape_values, actual, attrs.allow_zero, &resolved_dims);
                 }
                 const actual = cb.tensorShape(input_value, std.heap.page_allocator) catch break :blk dims[0..rank];
@@ -3624,18 +3729,15 @@ pub fn executeNode(
             // any statically materializable values in target_shape and keeps
             // the original shape input as input 1 for dynamic shape graphs.
             if (ins.len > 1 and ins[1] != null_node) {
-                const shape_values = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
-                defer std.heap.page_allocator.free(shape_values);
+                var shape_buf: [8]i64 = undefined;
+                const shape_values = try readRuntimeShape(cb, V.get(ins[1]), &shape_buf);
                 if (shape_values.len > 0 and shape_values.len <= target_dims.len) {
                     rank = shape_values.len;
                     const actual_input_shape = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
                     defer if (actual_input_shape) |actual| std.heap.page_allocator.free(actual);
                     const effective_input_shape = actual_input_shape orelse in_shape;
                     for (0..rank) |d| {
-                        const rounded = @round(shape_values[d]);
-                        if (!std.math.isFinite(rounded) or @abs(shape_values[d] - rounded) > 1e-3)
-                            return error.InvalidTensorShape;
-                        var target_dim: i64 = @intFromFloat(rounded);
+                        var target_dim = shape_values[d];
                         const aligned_input_axis = if (d + effective_input_shape.len >= rank)
                             d + effective_input_shape.len - rank
                         else
@@ -3644,12 +3746,10 @@ pub fn executeNode(
                             effective_input_shape[aligned_input_axis]
                         else
                             1;
-                        if (target_dim <= 0) {
-                            const declared = if (d < attrs.target_shape.rank()) attrs.target_shape.dim(@intCast(d)) else -1;
-                            target_dim = if (declared > 0) declared else if (input_dim > 0) input_dim else 1;
-                        } else if (target_dim == 1 and input_dim > 1) {
+                        if (target_dim < 0) return error.InvalidTensorShape;
+                        if (target_dim == 1) {
                             target_dim = input_dim;
-                        } else if (input_dim > 1 and target_dim != input_dim) {
+                        } else if (input_dim != 1 and target_dim != input_dim) {
                             return error.ShapeMismatch;
                         }
                         target_dims[d] = target_dim;
@@ -3671,12 +3771,15 @@ pub fn executeNode(
                 }
                 const declared_numel = safeNumel(in_shape);
                 if (target_known and declared_numel != null and declared_numel.? != target_numel) {
-                    const data = try cb.toFloat32(V.get(ins[0]), std.heap.page_allocator);
-                    defer std.heap.page_allocator.free(data);
-                    if (data.len == target_numel) {
-                        var target_i32: [8]i32 = undefined;
-                        for (target_dims[0..rank], 0..) |d, i| target_i32[i] = @intCast(d);
-                        return cb.fromFloat32Shape(data, target_i32[0..rank]);
+                    const actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch |err| switch (err) {
+                        error.UnsupportedShape => null,
+                        else => return err,
+                    };
+                    defer if (actual) |shape| std.heap.page_allocator.free(shape);
+                    if (actual) |shape| {
+                        if (safeNumel(shape) == target_numel) {
+                            return cb.primReshape(V.get(ins[0]), target_dims[0..rank]);
+                        }
                     }
                 }
             }
@@ -3922,7 +4025,15 @@ pub fn executeNode(
                     return fused;
                 }
             }
-            const result = try cb.primGather(V.get(ins[0]), V.get(ins[1]), attrs.axis, in_shape);
+            // A scalar index removes the selected axis. Some imported scalar
+            // constants use a one-element storage vector; restore rank zero
+            // before dispatch so the backend does not retain an extra axis.
+            const scalar_indices = if (graph.node(ins[1]).output_shape.rank() == 0)
+                try cb.primReshape(V.get(ins[1]), &.{})
+            else
+                null;
+            defer if (scalar_indices) |value| cb.free(value);
+            const result = try cb.primGather(V.get(ins[0]), scalar_indices orelse V.get(ins[1]), attrs.axis, in_shape);
             return result;
         },
         .slice => |attrs| {
@@ -3952,6 +4063,45 @@ pub fn executeNode(
             };
             return result;
         },
+        .cumulative_sum => |attrs| {
+            if (try cb.tryCumulativeSum(V.get(ins[0]), attrs.axis, attrs.exclusive, attrs.reverse)) |result| return result;
+            // An unimplemented integer backend must fail rather than silently
+            // change dtype and lose precision in the floating-point fallback.
+            switch (try cb.tensorDType(V.get(ins[0]))) {
+                .i8, .i16, .i32, .i64, .u8, .bool_ => return error.UnsupportedTensorType,
+                else => {},
+            }
+            // Like runtime shape/range evaluation, use the actual tensor
+            // dimensions. BGE uses this small scan for dynamic position IDs.
+            const alloc = graph.allocator;
+            const shape = try cb.tensorShape(V.get(ins[0]), alloc);
+            defer alloc.free(shape);
+            if (attrs.axis >= shape.len or shape.len > 8) return error.InvalidTensorShape;
+            var dims: [8]i32 = undefined;
+            var outer: usize = 1;
+            var inner: usize = 1;
+            for (shape, 0..) |dim, i| {
+                if (dim < 0 or dim > std.math.maxInt(i32)) return error.InvalidTensorShape;
+                dims[i] = @intCast(dim);
+                if (i < attrs.axis) outer = try std.math.mul(usize, outer, @intCast(dim));
+                if (i > attrs.axis) inner = try std.math.mul(usize, inner, @intCast(dim));
+            }
+            const width: usize = @intCast(shape[attrs.axis]);
+            const data = try cb.toFloat32(V.get(ins[0]), alloc);
+            defer alloc.free(data);
+            if (data.len != try std.math.mul(usize, try std.math.mul(usize, outer, width), inner)) return error.InvalidTensorShape;
+            for (0..outer) |batch| for (0..inner) |channel| {
+                var sum: f32 = 0;
+                for (0..width) |step| {
+                    const index = (batch * width + (if (attrs.reverse) width - 1 - step else step)) * inner + channel;
+                    const value = data[index];
+                    if (attrs.exclusive) data[index] = sum;
+                    sum += value;
+                    if (!attrs.exclusive) data[index] = sum;
+                }
+            };
+            return cb.fromFloat32Shape(data, dims[0..shape.len]);
+        },
         .shape_of => |attrs| {
             const tmp_alloc = std.heap.page_allocator;
             const actual = try cb.tensorShape(V.get(ins[0]), tmp_alloc);
@@ -3962,24 +4112,49 @@ pub fn executeNode(
             if (end < start or end > actual.len) return error.InvalidTensorShape;
 
             const count = end - start;
-            const data = try tmp_alloc.alloc(f32, count);
-            defer tmp_alloc.free(data);
-            for (0..count) |i| {
-                data[i] = @floatFromInt(actual[start + i]);
+            const exact_shape = [_]i64{@intCast(count)};
+            if (try cb.fromConstantBytes(std.mem.sliceAsBytes(actual[start..end]), .i64, &exact_shape)) |tensor| return tensor;
+            return error.UnsupportedTensorType;
+        },
+        .size_of => {
+            const tmp_alloc = std.heap.page_allocator;
+            const actual = try cb.tensorShape(V.get(ins[0]), tmp_alloc);
+            defer tmp_alloc.free(actual);
+            var count: i64 = 1;
+            for (actual) |dim| {
+                if (dim < 0) return error.InvalidTensorShape;
+                count = std.math.mul(i64, count, dim) catch return error.InvalidTensorShape;
             }
-
-            const shape = [_]i32{@intCast(count)};
-            return cb.fromFloat32Shape(data, &shape);
+            return fromIntegerValues(cb, &.{count}, .i64);
         },
         .range => {
             const tmp_alloc = std.heap.page_allocator;
 
-            const start_data = try cb.toFloat32(V.get(ins[0]), tmp_alloc);
-            defer tmp_alloc.free(start_data);
-            const limit_data = try cb.toFloat32(V.get(ins[1]), tmp_alloc);
-            defer tmp_alloc.free(limit_data);
-            const delta_data = try cb.toFloat32(V.get(ins[2]), tmp_alloc);
-            defer tmp_alloc.free(delta_data);
+            const out_dtype = graph.node(node_id).output_shape.dtype;
+            if (isIntegerDType(out_dtype)) {
+                var start_buf: [8]i64 = undefined;
+                var limit_buf: [8]i64 = undefined;
+                var delta_buf: [8]i64 = undefined;
+                const start_data = try runtime_shape_values.read(cb, V.get(ins[0]), &start_buf);
+                const limit_data = try runtime_shape_values.read(cb, V.get(ins[1]), &limit_buf);
+                const delta_data = try runtime_shape_values.read(cb, V.get(ins[2]), &delta_buf);
+                if (start_data.len != 1 or limit_data.len != 1 or delta_data.len != 1) return error.InvalidTensorShape;
+                const count = try integerRangeCount(start_data[0], limit_data[0], delta_data[0]);
+                var range_values: [4096]i64 = undefined;
+                for (0..count) |i| {
+                    const value = @as(i128, start_data[0]) + @as(i128, @intCast(i)) * @as(i128, delta_data[0]);
+                    range_values[i] = std.math.cast(i64, value) orelse return error.InvalidTensorShape;
+                }
+                return fromIntegerValues(cb, range_values[0..count], out_dtype);
+            }
+
+            var start_buf: [8]f64 = undefined;
+            var limit_buf: [8]f64 = undefined;
+            var delta_buf: [8]f64 = undefined;
+            const start_data = try runtime_shape_values.readFloat(cb, V.get(ins[0]), &start_buf);
+            const limit_data = try runtime_shape_values.readFloat(cb, V.get(ins[1]), &limit_buf);
+            const delta_data = try runtime_shape_values.readFloat(cb, V.get(ins[2]), &delta_buf);
+            if (start_data.len != 1 or limit_data.len != 1 or delta_data.len != 1) return error.InvalidTensorShape;
 
             const start = if (start_data.len > 0) start_data[0] else 0.0;
             const limit = if (limit_data.len > 0) limit_data[0] else 0.0;
@@ -3987,15 +4162,18 @@ pub fn executeNode(
             if (delta == 0.0) return error.InvalidAttribute;
 
             const raw_count = @ceil((limit - start) / delta);
-            const count = if (raw_count <= 0.0) @as(usize, 0) else @as(usize, @intFromFloat(raw_count));
-            const data = try tmp_alloc.alloc(f32, count);
+            const count = if (raw_count <= 0.0) @as(usize, 0) else blk: {
+                if (!std.math.isFinite(raw_count) or raw_count > @as(f64, @floatFromInt(std.math.maxInt(usize)))) return error.InvalidTensorShape;
+                break :blk @as(usize, @intFromFloat(raw_count));
+            };
+            if (count > 4096) return error.InvalidTensorShape;
+            const data = try tmp_alloc.alloc(f64, count);
             defer tmp_alloc.free(data);
             for (0..count) |i| {
-                data[i] = start + @as(f32, @floatFromInt(i)) * delta;
+                data[i] = start + @as(f64, @floatFromInt(i)) * delta;
             }
 
-            const shape = [_]i32{@intCast(count)};
-            return cb.fromFloat32Shape(data, &shape);
+            return fromFloatValues(cb, data[0..count], out_dtype);
         },
         .concat_prim => |attrs| {
             var abuf: [8]i64 = undefined;
@@ -4074,15 +4252,102 @@ pub fn executeNode(
                 else => return V.get(ins[0]),
             }
         },
+        .average_pool => |attrs| return cb.averagePool(V.get(ins[0]), &attrs),
         .conv_general => |attrs| {
             const input_shape = graph.node(ins[0]).output_shape;
             const weight_shape = graph.node(ins[1]).output_shape;
             const input_actual = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
             defer if (input_actual) |shape| std.heap.page_allocator.free(shape);
+            if (attrs.transposed) {
+                if (cb.kind() != .native) return error.UnsupportedPrimitiveOp;
+                const output_shape = graph.node(node_id).output_shape;
+                if (input_shape.dtype != .f32 or weight_shape.dtype != .f32 or output_shape.dtype != .f32) {
+                    return error.UnsupportedPrimitiveOp;
+                }
+                if (attrs.num_spatial != 1 and attrs.num_spatial != 2) return error.UnsupportedShape;
+
+                const expected_rank: u8 = attrs.num_spatial + 2;
+                const expected_rank_usize: usize = expected_rank;
+                if (input_shape.rank() != expected_rank or weight_shape.rank() != expected_rank or
+                    output_shape.rank() != expected_rank)
+                {
+                    return error.UnsupportedShape;
+                }
+                if (input_actual) |dims| {
+                    if (dims.len != expected_rank_usize) return error.UnsupportedShape;
+                }
+
+                const weight_actual = cb.tensorShape(V.get(ins[1]), std.heap.page_allocator) catch null;
+                defer if (weight_actual) |shape| std.heap.page_allocator.free(shape);
+                if (weight_actual) |dims| {
+                    if (dims.len != expected_rank_usize) return error.UnsupportedShape;
+                }
+
+                const batch = try positiveResolvedDim(input_actual, input_shape, 0);
+                const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
+                const weight_in_channels = try positiveResolvedDim(weight_actual, weight_shape, 0);
+                if (weight_in_channels != in_channels) return error.UnsupportedShape;
+
+                const groups = std.math.cast(usize, attrs.groups) orelse return error.UnsupportedShape;
+                if (groups == 0 or in_channels % groups != 0) return error.UnsupportedShape;
+                const out_channels_per_group = try positiveResolvedDim(weight_actual, weight_shape, 1);
+                const out_channels = std.math.mul(usize, out_channels_per_group, groups) catch return error.UnsupportedShape;
+                if (!declaredShapeDimMatches(output_shape, 0, batch) or
+                    !declaredShapeDimMatches(output_shape, 1, out_channels))
+                {
+                    return error.UnsupportedShape;
+                }
+
+                var input_spatial: [2]usize = .{ 1, 1 };
+                var kernel: [2]usize = .{ 1, 1 };
+                var strides: [2]usize = .{ 1, 1 };
+                var padding: [2][2]i32 = .{ .{ 0, 0 }, .{ 0, 0 } };
+                var dilations: [2]usize = .{ 1, 1 };
+                var output_padding: [2]usize = .{ 0, 0 };
+                var output_spatial: [2]usize = .{ 1, 1 };
+                for (0..attrs.num_spatial) |axis| {
+                    input_spatial[axis] = try positiveResolvedDim(input_actual, input_shape, axis + 2);
+                    kernel[axis] = try positiveResolvedDim(weight_actual, weight_shape, axis + 2);
+                    strides[axis] = std.math.cast(usize, attrs.strides[axis]) orelse return error.UnsupportedShape;
+                    padding[axis] = attrs.padding[axis];
+                    dilations[axis] = std.math.cast(usize, attrs.dilations[axis]) orelse return error.UnsupportedShape;
+                    output_padding[axis] = std.math.cast(usize, attrs.output_padding[axis]) orelse return error.UnsupportedShape;
+                    output_spatial[axis] = ops_mod.convTransposeOutputDim(
+                        input_spatial[axis],
+                        kernel[axis],
+                        strides[axis],
+                        padding[axis],
+                        dilations[axis],
+                        output_padding[axis],
+                    ) orelse return error.UnsupportedShape;
+                    if (!declaredShapeDimMatches(output_shape, axis + 2, output_spatial[axis])) {
+                        return error.UnsupportedShape;
+                    }
+                }
+
+                const result = try cb.convTranspose(&.{
+                    .input = V.get(ins[0]),
+                    .weight = V.get(ins[1]),
+                    .batch = batch,
+                    .in_channels = in_channels,
+                    .out_channels = out_channels,
+                    .input_spatial = input_spatial,
+                    .kernel = kernel,
+                    .strides = strides,
+                    .padding = padding,
+                    .dilations = dilations,
+                    .output_padding = output_padding,
+                    .output_spatial = output_spatial,
+                    .groups = groups,
+                    .num_spatial = attrs.num_spatial,
+                });
+                return result orelse error.UnsupportedPrimitiveOp;
+            }
 
             if (attrs.num_spatial == 1 and attrs.groups == 1 and
                 input_shape.rank() == 3 and weight_shape.rank() == 3 and
-                attrs.padding[0][0] == attrs.padding[0][1])
+                attrs.padding[0][0] == attrs.padding[0][1] and
+                attrs.dilations[0] > 0 and attrs.output_padding[0] == 0)
             {
                 const batch = try positiveResolvedDim(input_actual, input_shape, 0);
                 const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
@@ -4150,7 +4415,9 @@ pub fn executeNode(
             if (attrs.num_spatial == 2 and
                 input_shape.rank() == 4 and weight_shape.rank() == 4 and
                 attrs.padding[0][0] == attrs.padding[0][1] and
-                attrs.padding[1][0] == attrs.padding[1][1])
+                attrs.padding[1][0] == attrs.padding[1][1] and
+                attrs.dilations[0] == 1 and attrs.dilations[1] == 1 and
+                attrs.output_padding[0] == 0 and attrs.output_padding[1] == 0)
             {
                 const batch = try positiveResolvedDim(input_actual, input_shape, 0);
                 const in_channels = try positiveResolvedDim(input_actual, input_shape, 1);
@@ -4210,6 +4477,61 @@ pub fn executeNode(
             return error.UnsupportedPrimitiveOp;
         },
     };
+}
+
+fn isIntegerDType(dtype: ml.graph.DType) bool {
+    return switch (dtype) {
+        .i8, .i16, .i32, .i64, .u8, .bool_ => true,
+        else => false,
+    };
+}
+
+fn integerRangeCount(start: i64, limit: i64, delta: i64) !usize {
+    if (delta == 0) return error.InvalidAttribute;
+    const distance: i128 = if (delta > 0)
+        @as(i128, limit) - @as(i128, start)
+    else
+        @as(i128, start) - @as(i128, limit);
+    if (distance <= 0) return 0;
+    const step: i128 = if (delta > 0) @as(i128, delta) else -@as(i128, delta);
+    const count = std.math.cast(usize, @divTrunc(distance + step - 1, step)) orelse return error.InvalidTensorShape;
+    if (count > 4096) return error.InvalidTensorShape;
+    return count;
+}
+
+fn fromIntegerValues(cb: *const ComputeBackend, values: []const i64, dtype: ml.graph.DType) !CT {
+    const allocator = std.heap.page_allocator;
+    const bytes = try allocator.alloc(u8, values.len * dtype.byteSize());
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| switch (dtype) {
+        .i64 => std.mem.writeInt(i64, bytes[i * 8 ..][0..8], value, .little),
+        .i32 => std.mem.writeInt(i32, bytes[i * 4 ..][0..4], std.math.cast(i32, value) orelse return error.InvalidTensorShape, .little),
+        .i16 => std.mem.writeInt(i16, bytes[i * 2 ..][0..2], std.math.cast(i16, value) orelse return error.InvalidTensorShape, .little),
+        .i8 => bytes[i] = @bitCast(std.math.cast(i8, value) orelse return error.InvalidTensorShape),
+        .u8 => bytes[i] = std.math.cast(u8, value) orelse return error.InvalidTensorShape,
+        .bool_ => bytes[i] = if (value == 0) 0 else if (value == 1) 1 else return error.InvalidTensorShape,
+        else => return error.UnsupportedTensorType,
+    };
+    const shape = [_]i64{@intCast(values.len)};
+    return (try cb.fromConstantBytes(bytes, dtype, &shape)) orelse error.UnsupportedTensorType;
+}
+
+fn fromFloatValues(cb: *const ComputeBackend, values: []const f64, dtype: ml.graph.DType) !CT {
+    const allocator = std.heap.page_allocator;
+    const bytes = try allocator.alloc(u8, values.len * dtype.byteSize());
+    defer allocator.free(bytes);
+    for (values, 0..) |value, i| switch (dtype) {
+        .f64 => std.mem.writeInt(u64, bytes[i * 8 ..][0..8], @bitCast(value), .little),
+        .f32 => std.mem.writeInt(u32, bytes[i * 4 ..][0..4], @bitCast(@as(f32, @floatCast(value))), .little),
+        .f16 => std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @bitCast(@as(f16, @floatCast(value))), .little),
+        .bf16 => {
+            const bits: u32 = @bitCast(@as(f32, @floatCast(value)));
+            std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @intCast(bits >> 16), .little);
+        },
+        else => return error.UnsupportedTensorType,
+    };
+    const shape = [_]i64{@intCast(values.len)};
+    return (try cb.fromConstantBytes(bytes, dtype, &shape)) orelse error.UnsupportedTensorType;
 }
 
 fn executeGatherElements(
@@ -4430,6 +4752,7 @@ const TestBuf = struct {
     data: []f32,
     allocator: std.mem.Allocator,
     owned: bool,
+    destroy_header: bool = true,
 };
 
 fn testToBuf(ct: CT) *TestBuf {
@@ -4443,10 +4766,14 @@ fn testGetData(ct: CT) []f32 {
 const TestCompute = struct {
     allocator: std.mem.Allocator,
     weights: std.StringHashMapUnmanaged([]f32),
+    /// Model CUDA resident weights expose stable backend-owned CT handles.
+    /// Tests opt into the same aliasing contract with this embedded header.
+    return_shared_weight_handle: bool = false,
+    shared_weight_handle: ?TestBuf = null,
 
     /// Attention layer indices received via gqaPagedAttention dispatch.
     /// Used to verify the interpreter auto-increments layer_index.
-    received_layer_indices: [8]usize = .{0} ** 8,
+    received_layer_indices: [8]usize = @splat(0),
     num_attn_calls: usize = 0,
 
     /// Embedding IDs received via embeddingLookup dispatch.
@@ -4457,7 +4784,7 @@ const TestCompute = struct {
         return .{ .allocator = allocator, .weights = .empty };
     }
 
-    fn deinit(self: *TestCompute) void {
+    pub fn deinit(self: *TestCompute) void {
         if (self.received_embedding_ids_owned) |ids| self.allocator.free(ids);
         self.weights.deinit(self.allocator);
     }
@@ -4503,6 +4830,7 @@ const TestCompute = struct {
 
     fn freeTensor(_: *anyopaque, tensor: CT) void {
         const b = testToBuf(tensor);
+        if (!b.destroy_header) return;
         if (b.owned) b.allocator.free(b.data);
         b.allocator.destroy(b);
     }
@@ -4510,6 +4838,18 @@ const TestCompute = struct {
     fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
         const self = fromCtx(ctx);
         const data = self.weights.get(name) orelse return error.MissingWeight;
+        if (self.return_shared_weight_handle) {
+            if (self.shared_weight_handle == null) {
+                self.shared_weight_handle = .{
+                    .data = data,
+                    .allocator = self.allocator,
+                    .owned = false,
+                    .destroy_header = false,
+                };
+            }
+            if (self.shared_weight_handle) |*shared| return @ptrCast(shared);
+            unreachable;
+        }
         return self.makeBuf(data, false); // borrowed
     }
 
@@ -5218,6 +5558,45 @@ test "runtime shape tensors preserve distinct ONNX reshape layouts" {
     try std.testing.expectEqualSlices(i64, &.{ 1, 16, 1 }, column_shape);
 }
 
+test "native transpose preserves runtime shape over stale concrete hints" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", Shape.init(.f32, &.{12}));
+    const target = try builder.parameter("target", Shape.init(.i64, &.{4}));
+    const hint = Shape.init(.f32, &.{ 1, 1, 1, 3 });
+    const reshaped = try graph.addNode(.{
+        .op = .{ .reshape = .{ .new_shape = hint, .runtime_shape = true } },
+        .output_shape = hint,
+        .inputs = .{ input, target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const transposed = try builder.transpose(reshaped, &.{ 0, 3, 1, 2 });
+    try graph.markOutput(transposed);
+
+    var store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var backend = compute.computeBackend();
+    const values = try backend.fromFloat32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }, &.{12});
+    defer backend.free(values);
+    const dimensions = try backend.fromFloat32Shape(&.{ 1, 1, 4, 3 }, &.{4});
+    defer backend.free(dimensions);
+    const inputs = [_]RuntimeInput{
+        .{ .node_id = input, .value = values },
+        .{ .node_id = target, .value = dimensions },
+    };
+    var result = try execute(allocator, &graph, &backend, .{ .runtime_inputs = &inputs });
+    defer result.deinit(&backend);
+    const shape = try backend.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3, 1, 4 }, shape);
+    const actual = try backend.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11 }, actual);
+}
+
 test "resolveRuntimeReshapeDims preserves runtime batch for exported singleton reshape" {
     var out: [8]i64 = undefined;
     const resolved = resolveRuntimeReshapeDims(
@@ -5432,10 +5811,10 @@ test "stateful: paged attention dispatch with layer_index auto-increment" {
     const hidden = heads * head_dim; // 8
 
     // Weights for 2-layer decoder: each layer has Q, K, V projections + attention
-    var embed_w_data = [_]f32{0.1} ** (4 * hidden); // vocab=4, dim=8
-    var qw_data = [_]f32{0.5} ** (hidden * hidden);
-    var kw_data = [_]f32{0.3} ** (hidden * hidden);
-    var vw_data = [_]f32{0.2} ** (hidden * hidden);
+    var embed_w_data = @as([(4 * hidden)]f32, @splat(0.1)); // vocab=4, dim=8
+    var qw_data = @as([(hidden * hidden)]f32, @splat(0.5));
+    var kw_data = @as([(hidden * hidden)]f32, @splat(0.3));
+    var vw_data = @as([(hidden * hidden)]f32, @splat(0.2));
 
     var tc_backend = TestCompute.init(allocator);
     try tc_backend.addWeight("embed", &embed_w_data);
@@ -5528,7 +5907,7 @@ test "stateful: causal attention without paged context" {
     const head_dim = 4;
 
     // Single-layer: Q projection + attention (no paged context)
-    var qw_data = [_]f32{0.5} ** (hidden * hidden);
+    var qw_data = @as([(hidden * hidden)]f32, @splat(0.5));
     var q_input = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
     var k_input = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
     var v_input = [_]f32{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
@@ -5860,6 +6239,151 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
 const native_mod = if (build_options.enable_native) @import("../ops/native_compute.zig") else struct {};
 const NativeCompute = if (build_options.enable_native) native_mod.NativeCompute else opaque {};
 const WeightStore = if (build_options.enable_native) native_mod.WeightStore else opaque {};
+fn expectNativeConvolution(
+    attrs: ml.graph.node.ConvAttrs,
+    input_declared: Shape,
+    weight_declared: Shape,
+    output_declared: Shape,
+    input_data: []const f32,
+    input_actual_shape: []const i32,
+    weight_data: []const f32,
+    weight_actual_shape: []const i32,
+    expected: []const f32,
+    expected_shape: []const i64,
+) !void {
+    if (!build_options.enable_native) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", input_declared);
+    const weight = try builder.parameter("weight", weight_declared);
+    const output = try graph.addNode(.{
+        .op = .{ .conv_general = attrs },
+        .output_shape = output_declared,
+        .inputs = .{ input, weight, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try graph.markOutput(output);
+
+    var weight_store = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &weight_store, null);
+    defer compute.deinit();
+    var backend = compute.computeBackend();
+
+    const input_tensor = try backend.fromFloat32Shape(input_data, input_actual_shape);
+    defer backend.free(input_tensor);
+    const weight_tensor = try backend.fromFloat32Shape(weight_data, weight_actual_shape);
+    defer backend.free(weight_tensor);
+    const runtime_inputs = [_]RuntimeInput{
+        .{ .node_id = input, .value = input_tensor },
+        .{ .node_id = weight, .value = weight_tensor },
+    };
+
+    var result = try execute(allocator, &graph, &backend, .{ .runtime_inputs = &runtime_inputs });
+    defer result.deinit(&backend);
+    const actual = try backend.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+
+    const actual_shape = try backend.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, expected_shape, actual_shape);
+}
+
+test "native ConvTranspose 1d executes scatter-add with asymmetric kernel" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.transposed = true;
+    attrs.num_spatial = 1;
+
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ -1, 1, -1 }),
+        Shape.init(.f32, &.{ 1, 1, 3 }),
+        Shape.init(.f32, &.{ 1, 1, -1 }),
+        &.{ 1, 2 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 2, 4 },
+        &.{ 1, 1, 3 },
+        &.{ 1, 4, 8, 8 },
+        &.{ 1, 1, 4 },
+    );
+}
+
+test "native ConvTranspose 1d stride two handles overlap and non-overlap" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.transposed = true;
+    attrs.num_spatial = 1;
+    attrs.strides[0] = 2;
+
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ 1, 1, 2 }),
+        Shape.init(.f32, &.{ 1, 1, 3 }),
+        Shape.init(.f32, &.{ 1, 1, 5 }),
+        &.{ 1, 2 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 1, 1 },
+        &.{ 1, 1, 3 },
+        &.{ 1, 1, 3, 2, 2 },
+        &.{ 1, 1, 5 },
+    );
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ 1, 1, 2 }),
+        Shape.init(.f32, &.{ 1, 1, 2 }),
+        Shape.init(.f32, &.{ 1, 1, 4 }),
+        &.{ 1, 2 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 1 },
+        &.{ 1, 1, 2 },
+        &.{ 1, 1, 2, 2 },
+        &.{ 1, 1, 4 },
+    );
+}
+
+test "native ConvTranspose 2d executes groups dilation signed pads and output padding" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.transposed = true;
+    attrs.num_spatial = 2;
+    attrs.groups = 2;
+    attrs.strides = .{ 2, 2, 1, 1 };
+    attrs.padding = .{ .{ -1, 1 }, .{ 0, 1 }, .{ 0, 0 }, .{ 0, 0 } };
+    attrs.dilations = .{ 2, 1, 1, 1 };
+    attrs.output_padding = .{ 1, 1, 0, 0 };
+
+    try expectNativeConvolution(
+        attrs,
+        Shape.init(.f32, &.{ 1, 2, 2, 2 }),
+        Shape.init(.f32, &.{ 2, 1, 2, 1 }),
+        Shape.init(.f32, &.{ 1, 2, 6, 3 }),
+        &.{
+            1, 2,
+            3, 4,
+            5, 6,
+            7, 8,
+        },
+        &.{ 1, 2, 2, 2 },
+        &.{ 1, 10, 2, -1 },
+        &.{ 2, 1, 2, 1 },
+        &.{
+            0,  0, 0,
+            1,  0, 2,
+            0,  0, 0,
+            13, 0, 24,
+            0,  0, 0,
+            30, 0, 40,
+            0,  0, 0,
+            10, 0, 12,
+            0,  0, 0,
+            9,  0, 10,
+            0,  0, 0,
+            -7, 0, -8,
+        },
+        &.{ 1, 2, 6, 3 },
+    );
+}
 
 test "interpreter cancellation releases owned intermediates and preserves borrowed inputs" {
     const Control = struct {
@@ -5936,6 +6460,38 @@ test "native interpreter does not donate a reshape view before a future sibling 
     const original_data = try cb_val.toFloat32(x_ct, allocator);
     defer allocator.free(original_data);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, original_data);
+}
+
+test "execute preserves a tied resident weight handle until its final parameter use" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var bld = ml.graph.Builder.init(&g);
+
+    // Topological graph sorting places all parameter nodes before compute.
+    // CUDA returns the same backend-owned CT for these tied names, matching
+    // Gemma's input embedding and LM-head relationship.
+    const embed_weight = try bld.parameter("model.embed_tokens.weight", Shape.init(.f32, &.{ 2, 2 }));
+    const lm_head_weight = try bld.parameter("lm_head.tied.weight", Shape.init(.f32, &.{ 2, 2 }));
+    const x = try bld.tensorConst(&.{ 3.0, 4.0 }, Shape.init(.f32, &.{ 1, 2 }));
+    const embedded = try bld.linearNoBias(x, embed_weight, 1, 2, 2);
+    const logits = try bld.linearNoBias(embedded, lm_head_weight, 1, 2, 2);
+    try g.markOutput(logits);
+
+    var tc_backend = TestCompute.init(allocator);
+    defer tc_backend.deinit();
+    defer tc_backend.freeWeights();
+    try tc_backend.addWeight("model.embed_tokens.weight", &.{ 1.0, 0.0, 0.0, 1.0 });
+    try tc_backend.addWeight("lm_head.tied.weight", &.{ 1.0, 0.0, 0.0, 1.0 });
+    tc_backend.return_shared_weight_handle = true;
+    var cb = tc_backend.backend();
+
+    var result = try execute(allocator, &g, &cb, .{});
+    defer result.deinit(&cb);
+    const actual = try cb.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0 }, actual);
 }
 
 fn testDuplicateWeightParameters(allocator: std.mem.Allocator, capture: bool) !void {
@@ -6337,6 +6893,41 @@ test "runtime shape drives symbolic reduce" {
     const actual = try cb_val.toFloat32(result.outputs[0], allocator);
     defer allocator.free(actual);
     try std.testing.expectEqualSlices(f32, &.{ 22, 26, 30, 70, 74, 78 }, actual);
+}
+
+test "runtime shape drives symbolic reductions on Metal" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1, 3 }));
+    const index = try builder.scalarConst(.i64, 0);
+    const cls = try g.addNode(.{
+        .op = .{ .gather = .{ .axis = 1 } },
+        .output_shape = Shape.init(.f32, &.{ -1, 3 }),
+        .inputs = .{ x, index, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(try builder.reduceSum(cls, &.{1}));
+    try g.markOutput(try builder.reduceMax(cls, &.{1}));
+    try g.markOutput(try builder.reduceMean(cls, &.{1}));
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = allocator, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 2, 2, 3 });
+    defer cb.free(input);
+    var result = try execute(allocator, &g, &cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = input }} });
+    defer result.deinit(&cb);
+    const expected = [_][2]f32{ .{ 6, 24 }, .{ 3, 9 }, .{ 2, 8 } };
+    for (result.outputs, expected) |output, values| {
+        const actual = try cb.toFloat32(output, allocator);
+        defer allocator.free(actual);
+        try std.testing.expectEqualSlices(f32, &values, actual);
+    }
 }
 
 test "runtime shape drives symbolic slice" {
@@ -7010,7 +7601,7 @@ test "reshape restores batched flattened projection shape before gather" {
 
     var input: [2 * 4 * 6]f32 = undefined;
     for (&input, 0..) |*value, i| value.* = @floatFromInt(i + 1);
-    var identity: [6 * 6]f32 = .{0} ** (6 * 6);
+    var identity: [6 * 6]f32 = @splat(0);
     for (0..6) |i| identity[i * 6 + i] = 1.0;
 
     const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 4, 6 });
@@ -7047,4 +7638,800 @@ test "reshape restores batched flattened projection shape before gather" {
         43, 44, 45,
         46, 47, 48,
     }, actual);
+}
+
+test "runtime CumSum scans dynamic axes including reverse exclusive and padding" {
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |reverse| for ([_]bool{ false, true }) |exclusive| {
+        var g = Graph.init(allocator);
+        defer g.deinit();
+        var builder = ml.graph.Builder.init(&g);
+        const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, -1 }));
+        const out = try g.addNode(.{
+            .op = .{ .cumulative_sum = .{ .axis = 1, .reverse = reverse, .exclusive = exclusive } },
+            .output_shape = Shape.init(.f32, &.{ -1, -1 }),
+            .inputs = .{ x, ml.graph.null_node, ml.graph.null_node, ml.graph.null_node },
+            .num_inputs = 1,
+        });
+        try g.markOutput(out);
+        var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+        var compute = NativeCompute.init(allocator, &ws, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        const input = [_]f32{ 1, 1, 1, 0, 2, 3, 4, 5 };
+        const tensor = try cb.fromFloat32Shape(&input, &.{ 2, 4 });
+        defer cb.free(tensor);
+        var result = try execute(allocator, &g, &cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = tensor }} });
+        defer result.deinit(&cb);
+        const actual = try cb.toFloat32(result.outputs[0], allocator);
+        defer allocator.free(actual);
+        for (0..2) |batch| for (0..4) |position| {
+            var expected: f32 = 0;
+            for (0..4) |source| {
+                const included = if (reverse) source > position or (!exclusive and source == position) else source < position or (!exclusive and source == position);
+                if (included) expected += input[batch * 4 + source];
+            }
+            try std.testing.expectEqual(expected, actual[batch * 4 + position]);
+        };
+    };
+}
+
+test "runtime CumSum preserves exact integers and dtype" {
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+    const x = try builder.parameter("x", Shape.init(.i32, &.{2}));
+    const out = try g.addNode(.{
+        .op = .{ .cumulative_sum = .{ .axis = 0 } },
+        .output_shape = Shape.init(.i32, &.{2}),
+        .inputs = .{ x, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(out);
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(a, &ws, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const input = (try cb.fromInt32Shape(&.{ 16777217, 1 }, &.{2})).?;
+    defer cb.free(input);
+    var result = try execute(a, &g, &cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = input }} });
+    defer result.deinit(&cb);
+    const exported = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(exported.payload.bytes);
+    try std.testing.expectEqual(.i32, exported.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 16777218 }), exported.payload.bytes);
+}
+
+test "runtime CumSum preserves exact Metal graph integer constants" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var g = Graph.init(a);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+    const input = try builder.tensorConstBytes(
+        std.mem.sliceAsBytes(&[_]i32{ 16777217, 1 }),
+        Shape.init(.i32, &.{2}),
+    );
+    const out = try g.addNode(.{
+        .op = .{ .cumulative_sum = .{ .axis = 0 } },
+        .output_shape = Shape.init(.i32, &.{2}),
+        .inputs = .{ input, null_node, null_node, null_node },
+        .num_inputs = 1,
+    });
+    try g.markOutput(out);
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    var result = try execute(a, &g, &cb, .{});
+    defer result.deinit(&cb);
+    const exported = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(exported.payload.bytes);
+    try std.testing.expectEqual(.i32, exported.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i32{ 16777217, 16777218 }), exported.payload.bytes);
+}
+
+test "runtime CumSum retains vector constant shape and exact native dtype" {
+    const a = std.testing.allocator;
+    inline for (.{ i32, i64, f32 }) |T| {
+        const dtype: ml.graph.DType = if (T == i32) .i32 else if (T == i64) .i64 else .f32;
+        const large: T = if (T == i32) 16777217 else if (T == i64) 9007199254740993 else 1;
+        var g = Graph.init(a);
+        defer g.deinit();
+        var builder = ml.graph.Builder.init(&g);
+        const x = try builder.tensorConstBytes(std.mem.sliceAsBytes(&[_]T{ large, 1 }), Shape.init(dtype, &.{2}));
+        const out = try g.addNode(.{
+            .op = .{ .cumulative_sum = .{ .axis = 0 } },
+            .output_shape = Shape.init(dtype, &.{2}),
+            .inputs = .{ x, null_node, null_node, null_node },
+            .num_inputs = 1,
+        });
+        try g.markOutput(out);
+        var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+        var compute = NativeCompute.init(a, &ws, null);
+        defer compute.deinit();
+        var cb = compute.computeBackend();
+        var result = try execute(a, &g, &cb, .{});
+        defer result.deinit(&cb);
+        const exported = (try cb.exportTensorData(result.outputs[0], a)).?;
+        defer a.free(exported.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, large + 1 }), exported.payload.bytes);
+        const shape = try cb.tensorShape(result.outputs[0], a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{2}, shape);
+    }
+}
+
+test "Metal graph constants preserve all integer widths through scans casts and clones" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try Metal.init(a, &weights, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype: ml.graph.DType = @field(ml.graph.DType, @typeName(T));
+        const large: T = if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const pattern = [_]T{ large, 1, 1, std.math.minInt(T), 2, 3 };
+        var values: [2 * 513 * 3]T = undefined;
+        for (&values, 0..) |*v, i| v.* = pattern[i % pattern.len];
+        for ([_]bool{ false, true }) |exclusive| for ([_]bool{ false, true }) |reverse| {
+            var g = Graph.init(a);
+            defer g.deinit();
+            var builder = ml.graph.Builder.init(&g);
+            const x = try builder.tensorConstBytes(std.mem.sliceAsBytes(&values), Shape.init(dtype, &.{ 2, 513, 3 }));
+            const out = try g.addNode(.{
+                .op = .{ .cumulative_sum = .{ .axis = 1, .exclusive = exclusive, .reverse = reverse } },
+                .output_shape = Shape.init(dtype, &.{ 2, 513, 3 }),
+                .inputs = .{ x, null_node, null_node, null_node },
+                .num_inputs = 1,
+            });
+            try g.markOutput(out);
+            var result = try execute(a, &g, &cb, .{});
+            defer result.deinit(&cb);
+            try std.testing.expect(Metal.debugHasDeviceTensor(&cb, result.outputs[0]));
+            const copy = (try cb.cloneTensorShape(result.outputs[0], &.{ 2, 513, 3 })).?;
+            defer cb.free(copy);
+            const exported = (try cb.exportTensorData(copy, a)).?;
+            defer a.free(exported.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+            const actual = std.mem.bytesAsSlice(T, exported.payload.bytes);
+            for (0..2) |batch| for (0..3) |channel| {
+                var total: T = 0;
+                for (0..513) |step| {
+                    const index = (batch * 513 + (if (reverse) 512 - step else step)) * 3 + channel;
+                    if (!exclusive) total +%= values[index];
+                    try std.testing.expectEqual(total, actual[index]);
+                    if (exclusive) total +%= values[index];
+                }
+            };
+        };
+        const empty = (try cb.fromConstantBytes(&.{}, dtype, &.{ 2, 0, 3 })).?;
+        defer cb.free(empty);
+        const scanned = (try cb.tryCumulativeSum(empty, 1, false, false)).?;
+        defer cb.free(scanned);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(try cb.tensorDType(scanned)));
+    }
+    const wide = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 2147483647, 1 }), .i64, &.{2})).?;
+    defer cb.free(wide);
+    const sum = (try cb.tryCumulativeSum(wide, 0, false, false)).?;
+    defer cb.free(sum);
+    const bytes = (try cb.exportTensorData(sum, a)).?;
+    defer a.free(bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 2147483647, 2147483648 }), bytes.payload.bytes);
+    const tiny = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i8{ -128, 127 }), .i8, &.{2})).?;
+    defer cb.free(tiny);
+    const widened = (try cb.tryConvertDType(tiny, .i64)).?;
+    defer cb.free(widened);
+    const cast_bytes = (try cb.exportTensorData(widened, a)).?;
+    defer a.free(cast_bytes.payload.bytes);
+    try std.testing.expectEqual(.i64, cast_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ -128, 127 }), cast_bytes.payload.bytes);
+    const booleans = (try cb.fromConstantBytes(&.{ 0, 1 }, .bool_, &.{2})).?;
+    defer cb.free(booleans);
+    const cloned = (try cb.cloneTensorShape(booleans, &.{ 1, 2 })).?;
+    defer cb.free(cloned);
+    const boolean_bytes = (try cb.exportTensorData(cloned, a)).?;
+    defer a.free(boolean_bytes.payload.bytes);
+    try std.testing.expectEqual(.bool_, boolean_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1 }, boolean_bytes.payload.bytes);
+}
+
+test "Metal exact integer constants survive transfers and gather on every axis" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try Metal.init(a, &weights, null);
+    defer compute.deinit();
+    var gpu = compute.computeBackend();
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cpu = native.computeBackend();
+    inline for (.{ i8, i16, i32, i64, u8, bool }) |T| {
+        const dtype: ml.graph.DType = if (T == bool) .bool_ else @field(ml.graph.DType, @typeName(T));
+        const Storage = if (T == bool) u8 else T;
+        const large: Storage = if (T == bool) 1 else if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const values = [_]Storage{ large, 0, 1, 0 };
+        const original = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&values), dtype, &.{ 2, 2 })).?;
+        defer gpu.free(original);
+        const host = try @import("multi_executor.zig").transferTensor(a, original, &gpu, &cpu);
+        defer cpu.free(host);
+        const back = try @import("multi_executor.zig").transferTensor(a, host, &cpu, &gpu);
+        defer gpu.free(back);
+        const copy = try @import("multi_executor.zig").transferTensor(a, back, &gpu, &gpu);
+        defer gpu.free(copy);
+        const exported = (try gpu.exportTensorData(copy, a)).?;
+        defer a.free(exported.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(exported.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&values), exported.payload.bytes);
+        const indices = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ -1, 0 }), .i64, &.{2})).?;
+        defer gpu.free(indices);
+        for ([_]u8{ 0, 1 }) |axis| {
+            const selected = try gpu.primGather(copy, indices, axis, &.{ 2, 2 });
+            defer gpu.free(selected);
+            try std.testing.expect(Metal.debugHasDeviceTensor(&gpu, selected));
+            const actual = (try gpu.exportTensorData(selected, a)).?;
+            defer a.free(actual.payload.bytes);
+            const expected = if (axis == 0) [_]Storage{ 1, 0, large, 0 } else [_]Storage{ 0, large, 0, 1 };
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(actual.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), actual.payload.bytes);
+        }
+    }
+}
+
+fn checkExactIntegerBroadcasts(cb: *const ComputeBackend, metal: bool) !void {
+    const a = std.testing.allocator;
+    const Case = struct { lhs: []const i64, rhs: []const i64, out: []const i64, li: []const usize, ri: []const usize };
+    const cases = [_]Case{
+        .{ .lhs = &.{ 2, 1 }, .rhs = &.{3}, .out = &.{ 2, 3 }, .li = &.{ 0, 0, 0, 1, 1, 1 }, .ri = &.{ 0, 1, 2, 0, 1, 2 } },
+        .{ .lhs = &.{ 2, 1 }, .rhs = &.{ 1, 2 }, .out = &.{ 2, 2 }, .li = &.{ 0, 0, 1, 1 }, .ri = &.{ 0, 1, 0, 1 } },
+        .{ .lhs = &.{ 2, 1, 2 }, .rhs = &.{ 3, 1 }, .out = &.{ 2, 3, 2 }, .li = &.{ 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3 }, .ri = &.{ 0, 0, 1, 1, 2, 2, 0, 0, 1, 1, 2, 2 } },
+        .{ .lhs = &.{ 1, 2 }, .rhs = &.{2}, .out = &.{ 1, 2 }, .li = &.{ 0, 1 }, .ri = &.{ 0, 1 } },
+        .{ .lhs = &.{}, .rhs = &.{ 1, 2 }, .out = &.{ 1, 2 }, .li = &.{ 0, 0 }, .ri = &.{ 0, 1 } },
+        .{ .lhs = &.{ 2, 1, 1, 1, 1, 1, 1, 1 }, .rhs = &.{2}, .out = &.{ 2, 1, 1, 1, 1, 1, 1, 2 }, .li = &.{ 0, 0, 1, 1 }, .ri = &.{ 0, 1, 0, 1 } },
+    };
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype = @field(ml.graph.DType, @typeName(T));
+        const wide: T = if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const lv = [_]T{ wide, std.math.minInt(T), 3, 5 };
+        const rv = [_]T{ 1, 2, 3 };
+        for (cases) |case| {
+            var ln: usize = 1;
+            var rn: usize = 1;
+            for (case.lhs) |dim| ln *= @intCast(dim);
+            for (case.rhs) |dim| rn *= @intCast(dim);
+            const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(lv[0..ln]), dtype, case.lhs)).?;
+            defer cb.free(lhs);
+            const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(rv[0..rn]), dtype, case.rhs)).?;
+            defer cb.free(rhs);
+            inline for (.{ "add", "primSubtract", "multiply" }) |op| {
+                // Swap operands too: subtraction detects reversed indexing.
+                for ([_]bool{ false, true }) |swap| {
+                    const out = try @field(ComputeBackend, op)(cb, if (swap) rhs else lhs, if (swap) lhs else rhs);
+                    defer cb.free(out);
+                    if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, out));
+                    const shape = try cb.tensorShape(out, a);
+                    defer a.free(shape);
+                    try std.testing.expectEqualSlices(i64, case.out, shape);
+                    const actual = (try cb.exportTensorData(out, a)).?;
+                    defer a.free(actual.payload.bytes);
+                    try std.testing.expectEqualStrings(@tagName(dtype), @tagName(actual.dtype));
+                    const values = std.mem.bytesAsSlice(T, actual.payload.bytes);
+                    try std.testing.expectEqual(case.li.len, values.len);
+                    for (case.li, case.ri, values) |li, ri, value| {
+                        const x = if (swap) rv[ri] else lv[li];
+                        const y = if (swap) lv[li] else rv[ri];
+                        const expected = if (comptime std.mem.eql(u8, op, "add")) x +% y else if (comptime std.mem.eql(u8, op, "multiply")) x *% y else x -% y;
+                        try std.testing.expectEqual(expected, value);
+                    }
+                }
+            }
+        }
+    }
+    const empty = (try cb.fromConstantBytes(&.{}, .i64, &.{ 2, 0, 3 })).?;
+    defer cb.free(empty);
+    const scalar = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{1}), .i64, &.{})).?;
+    defer cb.free(scalar);
+    const row = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3 }), .i64, &.{ 1, 3 })).?;
+    defer cb.free(row);
+    for ([_]CT{ scalar, row }) |rhs| {
+        const out = try cb.add(empty, rhs);
+        defer cb.free(out);
+        const shape = try cb.tensorShape(out, a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 0, 3 }, shape);
+        const data = (try cb.exportTensorData(out, a)).?;
+        defer a.free(data.payload.bytes);
+        try std.testing.expectEqual(@as(usize, 0), data.payload.bytes.len);
+    }
+    const square = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3, 4 }), .i64, &.{ 2, 2 })).?;
+    defer cb.free(square);
+    try std.testing.expectError(error.ShapeMismatch, cb.add(square, row));
+    const flat = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 2, 3, 4 }), .i64, &.{4})).?;
+    defer cb.free(flat);
+    try std.testing.expectError(error.ShapeMismatch, cb.multiply(square, flat));
+}
+
+fn checkExactComparisons(cb: *const ComputeBackend) !void {
+    const a = std.testing.allocator;
+    inline for (.{ i8, i16, i32, i64, u8, bool }) |Left| {
+        inline for (.{ i8, i16, i32, i64, u8, bool }) |Right| {
+            const L = if (Left == bool) u8 else Left;
+            const R = if (Right == bool) u8 else Right;
+            const ld: ml.graph.DType = if (Left == bool) .bool_ else @field(ml.graph.DType, @typeName(Left));
+            const rd: ml.graph.DType = if (Right == bool) .bool_ else @field(ml.graph.DType, @typeName(Right));
+            const lv = [_]L{ if (Left == bool) 0 else std.math.minInt(L), if (Left == bool) 1 else std.math.maxInt(L) };
+            const rv = [_]R{ 0, 1, if (Right == bool) 0 else std.math.maxInt(R) };
+            const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&lv), ld, &.{ 2, 1 })).?;
+            defer cb.free(lhs);
+            const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&rv), rd, &.{3})).?;
+            defer cb.free(rhs);
+            const out = try cb.primLessThan(lhs, rhs);
+            defer cb.free(out);
+            const values = try cb.toFloat32(out, a);
+            defer a.free(values);
+            const shape = try cb.tensorShape(out, a);
+            defer a.free(shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+            for (lv, 0..) |l, i| for (rv, 0..) |r, j| {
+                try std.testing.expectEqual(@as(f32, if (@as(i64, l) < @as(i64, r)) 1 else 0), values[i * 3 + j]);
+            };
+        }
+    }
+    const iv = [_]i64{ 9007199254740993, 9007199254740994, -9007199254740993, std.math.minInt(i64), std.math.maxInt(i64), 0 };
+    const lhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&iv), .i64, &.{ 6, 1 })).?;
+    defer cb.free(lhs);
+    const rhs = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&iv), .i64, &.{6})).?;
+    defer cb.free(rhs);
+    const exact = try cb.primLessThan(lhs, rhs);
+    defer cb.free(exact);
+    const exact_values = try cb.toFloat32(exact, a);
+    defer a.free(exact_values);
+    for (iv, 0..) |l, i| for (iv, 0..) |r, j| {
+        try std.testing.expectEqual(@as(f32, if (l < r) 1 else 0), exact_values[i * 6 + j]);
+    };
+    const fv = [_]f32{ -std.math.inf(f32), -9223372036854775808.0, -9007199254740992, -0.5, 0, 0.5, 9007199254740992, 9223372036854775808.0, std.math.inf(f32), std.math.nan(f32) };
+    const floats = try cb.fromFloat32Shape(&fv, &.{10});
+    defer cb.free(floats);
+    for ([_]bool{ false, true }) |swap| {
+        const out = try cb.primLessThan(if (swap) floats else lhs, if (swap) lhs else floats);
+        defer cb.free(out);
+        const values = try cb.toFloat32(out, a);
+        defer a.free(values);
+        const shape = try cb.tensorShape(out, a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{ 6, 10 }, shape);
+        for (iv, 0..) |integer, i| for (fv, 0..) |floating, j| {
+            // f128 exactly represents every i64 and f32: independent oracle.
+            const wide: f128 = @floatFromInt(integer);
+            const float_wide: f128 = floating;
+            const expected: f32 = if (if (swap) float_wide < wide else wide < float_wide) 1 else 0;
+            try std.testing.expectEqual(expected, values[i * 10 + j]);
+        };
+    }
+    const empty = (try cb.fromConstantBytes(&.{}, .i64, &.{ 0, 1 })).?;
+    defer cb.free(empty);
+    const empty_out = try cb.primLessThan(empty, rhs);
+    defer cb.free(empty_out);
+    const shape = try cb.tensorShape(empty_out, a);
+    defer a.free(shape);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 6 }, shape);
+    try std.testing.expectError(error.ShapeMismatch, cb.primLessThan(rhs, floats));
+}
+
+test "native exact comparisons preserve integer precision and broadcasting" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkExactComparisons(&cb);
+    const floating = try cb.fromFloat32Shape(&.{9007199254740992}, &.{1});
+    defer cb.free(floating);
+    const integer = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), .i64, &.{1})).?;
+    defer cb.free(integer);
+    try std.testing.expectEqual(@as(?CT, null), try cb.lessThanConsumeLeft(floating, integer));
+    const out = try cb.primLessThan(floating, integer);
+    defer cb.free(out);
+    const values = try cb.toFloat32(out, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{1}, values);
+}
+
+test "Metal exact comparisons match native precision and broadcasting" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkExactComparisons(&cb);
+}
+
+test "native exact integer multidimensional broadcasting" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkExactIntegerBroadcasts(&cb, false);
+}
+
+test "Metal exact integer multidimensional broadcasting" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkExactIntegerBroadcasts(&cb, true);
+    const ints = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, -9007199254740993 }), .i64, &.{ 2, 1 })).?;
+    defer cb.free(ints);
+    const floats = try cb.fromFloat32Shape(&.{ -9007199254740992, 0, 9007199254740992 }, &.{3});
+    defer cb.free(floats);
+    for ([_]bool{ false, true }) |swap| {
+        const out = try cb.primLessThan(if (swap) floats else ints, if (swap) ints else floats);
+        defer cb.free(out);
+        const values = try cb.toFloat32(out, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, if (swap) &.{ 1, 1, 1, 0, 0, 0 } else &.{ 0, 0, 0, 1, 1, 1 }, values);
+        const shape = try cb.tensorShape(out, a);
+        defer a.free(shape);
+        try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+    }
+}
+
+fn checkIntegerShapePipeline(cb: *const ComputeBackend, comptime metal: bool) !void {
+    const a = std.testing.allocator;
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype = @field(ml.graph.DType, @typeName(T));
+        const large: T = if (T == i64) 9007199254740993 else 100;
+        const data = [_]T{ large, 2, 3, 4, 5, 6 };
+        const tensor = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&data), dtype, &.{ 2, 3 })).?;
+        defer cb.free(tensor);
+        const cases = .{
+            .{ .start = [_]i64{ 0, 1 }, .limit = [_]i64{ 2, 3 }, .step = [_]i64{ 1, 1 }, .expected = [_]T{ 2, 3, 5, 6 } },
+            .{ .start = [_]i64{ 0, 0 }, .limit = [_]i64{ 2, 3 }, .step = [_]i64{ 1, 2 }, .expected = [_]T{ large, 3, 4, 6 } },
+            .{ .start = [_]i64{ 1, 2 }, .limit = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) }, .step = [_]i64{ -1, -1 }, .expected = [_]T{ 6, 5, 4, 3, 2, large } },
+            .{ .start = [_]i64{ 1, 0 }, .limit = [_]i64{ 2, 3 }, .step = [_]i64{ 1, 1 }, .expected = [_]T{ 4, 5, 6 } },
+            .{ .start = [_]i64{ 0, 2 }, .limit = [_]i64{ 2, 2 }, .step = [_]i64{ 1, 1 }, .expected = [_]T{} },
+        };
+        inline for (cases) |case| {
+            const starts: [2]i64 = case.start;
+            const limits: [2]i64 = case.limit;
+            const steps: [2]i64 = case.step;
+            const expected: [case.expected.len]T = case.expected;
+            const result = try cb.primSlice(tensor, &starts, &limits, &steps, &.{ 2, 3 });
+            defer cb.free(result);
+            if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, result));
+            const raw = (try cb.exportTensorData(result, a)).?;
+            defer a.free(raw.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(raw.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), raw.payload.bytes);
+        }
+        var graph = Graph.init(a);
+        defer graph.deinit();
+        var b = ml.graph.Builder.init(&graph);
+        const x = try b.parameter("x", Shape.init(dtype, &.{ 2, 3 }));
+        const idx = try b.scalarConst(.i64, 0);
+        var attributes = [_]@import("onnx_graph").proto.AttributeProto{.{ .name = "axis", .i = 1 }};
+        const gather = try @import("onnx_graph").ops.convertNode(a, &b, &.{ .op_type = "Gather", .attributes = &attributes }, &.{ x, idx }, null);
+        const one = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]T{ 1, 1 }), Shape.init(dtype, &.{2}));
+        const sum = try b.add(gather, one);
+        const product = try b.mul(sum, one);
+        const out = try b.sub(product, one);
+        try graph.markOutput(out);
+        var result = try execute(a, &graph, cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = tensor }} });
+        defer result.deinit(cb);
+        const raw = (try cb.exportTensorData(result.outputs[0], a)).?;
+        defer a.free(raw.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(raw.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 4 }), raw.payload.bytes);
+    }
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ -1, 3 }));
+    const shape = try graph.addNode(.{ .op = .{ .shape_of = .{ .start = 0, .end = 2 } }, .output_shape = Shape.init(.i64, &.{2}), .inputs = .{ x, null_node, null_node, null_node }, .num_inputs = 1 });
+    const one = try b.tensorConstBytes(std.mem.sliceAsBytes(&[_]i64{ 1, 1 }), Shape.init(.i64, &.{2}));
+    const sum = try b.add(shape, one);
+    try graph.markOutput(sum);
+    const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer cb.free(input);
+    var result = try execute(a, &graph, cb, .{ .runtime_inputs = &.{.{ .node_id = x, .value = input }} });
+    defer result.deinit(cb);
+    const raw = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(raw.payload.bytes);
+    try std.testing.expectEqual(.i64, raw.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 3, 4 }), raw.payload.bytes);
+
+    var size_graph = Graph.init(a);
+    defer size_graph.deinit();
+    var size_builder = ml.graph.Builder.init(&size_graph);
+    const size_input = try size_builder.parameter("size_input", Shape.init(.f32, &.{ -1, 3 }));
+    const size = try size_graph.addNode(.{ .op = .{ .size_of = {} }, .output_shape = Shape.scalar(.i64), .inputs = .{ size_input, null_node, null_node, null_node }, .num_inputs = 1 });
+    try size_graph.markOutput(size);
+    var size_result = try execute(a, &size_graph, cb, .{ .runtime_inputs = &.{.{ .node_id = size_input, .value = input }} });
+    defer size_result.deinit(cb);
+    const size_raw = (try cb.exportTensorData(size_result.outputs[0], a)).?;
+    defer a.free(size_raw.payload.bytes);
+    try std.testing.expectEqual(.i64, size_raw.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{6}), size_raw.payload.bytes);
+}
+
+test "native exact integer shape pipeline" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkIntegerShapePipeline(&cb, false);
+}
+
+test "Metal exact integer shape pipeline" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkIntegerShapePipeline(&cb, true);
+}
+
+fn checkExactIntegerRange(cb: *const ComputeBackend, comptime metal: bool) !void {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const start = try b.parameter("start", Shape.scalar(.i64));
+    const limit = try b.parameter("limit", Shape.scalar(.i64));
+    const delta = try b.parameter("delta", Shape.scalar(.i64));
+    const range = try graph.addNode(.{ .op = .{ .range = {} }, .output_shape = Shape.init(.i64, &.{-1}), .inputs = .{ start, limit, delta, null_node }, .num_inputs = 3 });
+    try graph.markOutput(range);
+    const start_value = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740993}), .i64, &.{})).?;
+    defer cb.free(start_value);
+    const limit_value = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{9007199254740996}), .i64, &.{})).?;
+    defer cb.free(limit_value);
+    const delta_value = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{1}), .i64, &.{})).?;
+    defer cb.free(delta_value);
+    var result = try execute(a, &graph, cb, .{ .runtime_inputs = &.{
+        .{ .node_id = start, .value = start_value },
+        .{ .node_id = limit, .value = limit_value },
+        .{ .node_id = delta, .value = delta_value },
+    } });
+    defer result.deinit(cb);
+    if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, result.outputs[0]));
+    const raw = (try cb.exportTensorData(result.outputs[0], a)).?;
+    defer a.free(raw.payload.bytes);
+    try std.testing.expectEqual(.i64, raw.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, 9007199254740994, 9007199254740995 }), raw.payload.bytes);
+}
+
+test "native exact integer Range" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkExactIntegerRange(&cb, false);
+}
+
+test "Metal exact integer Range" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkExactIntegerRange(&cb, true);
+}
+
+fn checkTypedSelections(cb: *const ComputeBackend, comptime metal: bool) !void {
+    const a = std.testing.allocator;
+    const mask = (try cb.fromConstantBytes(&.{ 1, 0 }, .bool_, &.{ 2, 1 })).?;
+    defer cb.free(mask);
+    const ones = try cb.fromFloat32Shape(&.{ 1, 2, 3 }, &.{3});
+    defer cb.free(ones);
+    const zeros = try cb.fromFloat32Shape(&.{0}, &.{});
+    defer cb.free(zeros);
+    const floats = try cb.primWhereSelect(mask, ones, zeros);
+    defer cb.free(floats);
+    const values = try cb.toFloat32(floats, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 0, 0, 0 }, values);
+    const bools = try cb.primWhereSelect(mask, mask, mask);
+    defer cb.free(bools);
+    const bool_bytes = (try cb.exportTensorData(bools, a)).?;
+    defer a.free(bool_bytes.payload.bytes);
+    try std.testing.expectEqual(.bool_, bool_bytes.dtype);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0 }, bool_bytes.payload.bytes);
+    inline for (.{ i8, i16, i32, i64, u8 }) |T| {
+        const dtype = @field(ml.graph.DType, @typeName(T));
+        const large: T = if (T == i64) 9007199254740993 else std.math.maxInt(T);
+        const x = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]T{ large, 2 }), dtype, &.{ 2, 1 })).?;
+        defer cb.free(x);
+        const expanded = try cb.primBroadcastInDim(x, &.{ 2, 3 }, &.{ 0, 1 }, &.{ 2, 1 });
+        defer cb.free(expanded);
+        if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, expanded));
+        const raw = (try cb.exportTensorData(expanded, a)).?;
+        defer a.free(raw.payload.bytes);
+        try std.testing.expectEqualStrings(@tagName(dtype), @tagName(raw.dtype));
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, large, large, 2, 2, 2 }), raw.payload.bytes);
+        const transposed = try cb.primBroadcastInDim(x, &.{ 3, 2 }, &.{ 1, 0 }, &.{ 2, 1 });
+        defer cb.free(transposed);
+        const traw = (try cb.exportTensorData(transposed, a)).?;
+        defer a.free(traw.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 2, large, 2, large, 2 }), traw.payload.bytes);
+        const y = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]T{ 3, 4, 5 }), dtype, &.{3})).?;
+        defer cb.free(y);
+        const integer_condition = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]T{ large, 0 }), dtype, &.{ 2, 1 })).?;
+        defer cb.free(integer_condition);
+        const integer_selected = try cb.primWhereSelect(integer_condition, x, y);
+        defer cb.free(integer_selected);
+        const integer_raw = (try cb.exportTensorData(integer_selected, a)).?;
+        defer a.free(integer_raw.payload.bytes);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, large, large, 3, 4, 5 }), integer_raw.payload.bytes);
+        // Match the importer's explicit broadcast lowering, using parameters
+        // so graph execution cannot constant-fold the regression away.
+        for ([_]bool{ false, true }) |dynamic| {
+            var g = Graph.init(a);
+            defer g.deinit();
+            var builder = ml.graph.Builder.init(&g);
+            const gx = try builder.parameter("x", Shape.init(dtype, &.{ 2, 1 }));
+            const gy = try builder.parameter("y", Shape.init(dtype, &.{3}));
+            const gc = try builder.parameter("condition", Shape.init(.bool_, &.{3}));
+            var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(dtype, &.{ 2, 3 }) };
+            attrs.broadcast_axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 };
+            attrs.num_axes = 2;
+            const shape_node = try builder.parameter("shape", Shape.init(.i64, &.{2}));
+            const gb = try g.addNode(.{ .op = .{ .broadcast_in_dim = attrs }, .output_shape = attrs.target_shape, .inputs = .{ gx, if (dynamic) shape_node else null_node, null_node, null_node }, .num_inputs = if (dynamic) 2 else 1 });
+            const gw = try g.addNode(.{ .op = .{ .where_select = {} }, .output_shape = attrs.target_shape, .inputs = .{ gc, gb, gy, null_node }, .num_inputs = 3 });
+            try g.markOutput(gw);
+            const condition = (try cb.fromConstantBytes(&.{ 1, 0, 1 }, .bool_, &.{3})).?;
+            defer cb.free(condition);
+            const shape_tensor = (try cb.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 2, 3 }), .i64, &.{2})).?;
+            defer cb.free(shape_tensor);
+            var result = try execute(a, &g, cb, .{ .runtime_inputs = &.{ .{ .node_id = gx, .value = x }, .{ .node_id = gy, .value = y }, .{ .node_id = gc, .value = condition }, .{ .node_id = shape_node, .value = shape_tensor } } });
+            defer result.deinit(cb);
+            if (metal) try std.testing.expect(@import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, result.outputs[0]));
+            const graph_raw = (try cb.exportTensorData(result.outputs[0], a)).?;
+            defer a.free(graph_raw.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(graph_raw.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 4, large, 2, 4, 2 }), graph_raw.payload.bytes);
+        }
+        inline for (.{ false, true }) |float_condition| {
+            const c = if (float_condition) try cb.fromFloat32Shape(&.{ 1, 0, 1 }, &.{3}) else (try cb.fromConstantBytes(&.{ 1, 0, 1 }, .bool_, &.{3})).?;
+            defer cb.free(c);
+            const out = try cb.primWhereSelect(c, x, y);
+            defer cb.free(out);
+            const bytes = (try cb.exportTensorData(out, a)).?;
+            defer a.free(bytes.payload.bytes);
+            try std.testing.expectEqualStrings(@tagName(dtype), @tagName(bytes.dtype));
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]T{ large, 4, large, 2, 4, 2 }), bytes.payload.bytes);
+            const shape = try cb.tensorShape(out, a);
+            defer a.free(shape);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, shape);
+        }
+        try std.testing.expectError(error.ShapeMismatch, cb.primBroadcastInDim(x, &.{ 3, 3 }, &.{ 0, 1 }, &.{ 2, 1 }));
+        try std.testing.expectError(error.InvalidTensorShape, cb.primBroadcastInDim(x, &.{ 2, 3 }, &.{ 0, 0 }, &.{ 2, 1 }));
+        const empty = try cb.primBroadcastInDim(x, &.{ 2, 0 }, &.{ 0, 1 }, &.{ 2, 1 });
+        defer cb.free(empty);
+        const empty_raw = (try cb.exportTensorData(empty, a)).?;
+        defer a.free(empty_raw.payload.bytes);
+        try std.testing.expectEqual(@as(usize, 0), empty_raw.payload.bytes.len);
+    }
+}
+
+test "native shape-aware typed selections" {
+    const a = std.testing.allocator;
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cb = native.computeBackend();
+    try checkTypedSelections(&cb, false);
+}
+
+test "Metal shape-aware typed selections" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try @import("../ops/metal_compute.zig").MetalCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try checkTypedSelections(&cb, true);
+}
+
+test "Metal i64 arithmetic and mixed comparisons never round through float" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    var weights = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .empty };
+    defer weights.lazy_weights.deinit(a);
+    var compute = try Metal.init(a, &weights, null);
+    defer compute.deinit();
+    const gpu = compute.computeBackend();
+    const left = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{ 9007199254740993, -9007199254740993, std.math.maxInt(i64) }), .i64, &.{3})).?;
+    defer gpu.free(left);
+    const one = (try gpu.fromConstantBytes(std.mem.sliceAsBytes(&[_]i64{1}), .i64, &.{})).?;
+    defer gpu.free(one);
+    var ws = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    var native = NativeCompute.init(a, &ws, null);
+    defer native.deinit();
+    const cpu = native.computeBackend();
+    const cpu_left = try @import("multi_executor.zig").transferTensor(a, left, &gpu, &cpu);
+    defer cpu.free(cpu_left);
+    const cpu_one = try @import("multi_executor.zig").transferTensor(a, one, &gpu, &cpu);
+    defer cpu.free(cpu_one);
+    inline for (.{ "add", "primSubtract", "multiply" }) |operation| {
+        const expected = try @field(ComputeBackend, operation)(&cpu, cpu_left, cpu_one);
+        defer cpu.free(expected);
+        const actual = try @field(ComputeBackend, operation)(&gpu, left, one);
+        defer gpu.free(actual);
+        const expected_bytes = (try cpu.exportTensorData(expected, a)).?;
+        defer a.free(expected_bytes.payload.bytes);
+        const actual_bytes = (try gpu.exportTensorData(actual, a)).?;
+        defer a.free(actual_bytes.payload.bytes);
+        try std.testing.expectEqual(.i64, actual_bytes.dtype);
+        try std.testing.expectEqualSlices(u8, expected_bytes.payload.bytes, actual_bytes.payload.bytes);
+    }
+    const sum = try gpu.add(left, one);
+    defer gpu.free(sum);
+    const exact = (try gpu.exportTensorData(sum, a)).?;
+    defer a.free(exact.payload.bytes);
+    try std.testing.expectEqual(.i64, exact.dtype);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ 9007199254740994, -9007199254740992, std.math.minInt(i64) }), exact.payload.bytes);
+    const floats = try gpu.fromFloat32Shape(&.{ 9007199254740992, -9007199254740992, 9223372036854775808.0 }, &.{3});
+    defer gpu.free(floats);
+    const less = try gpu.primLessThan(left, floats);
+    defer gpu.free(less);
+    const less_values = try gpu.toFloat32(less, a);
+    defer a.free(less_values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 1 }, less_values);
+    const reverse = try gpu.primLessThan(floats, left);
+    defer gpu.free(reverse);
+    const reverse_values = try gpu.toFloat32(reverse, a);
+    defer a.free(reverse_values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, reverse_values);
+    const fractional = try gpu.fromFloat32Shape(&.{ -1.9, 0.5, 2.9 }, &.{3});
+    defer gpu.free(fractional);
+    const cast = (try gpu.tryConvertDType(fractional, .i64)).?;
+    defer gpu.free(cast);
+    const cast_bytes = (try gpu.exportTensorData(cast, a)).?;
+    defer a.free(cast_bytes.payload.bytes);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]i64{ -1, 0, 2 }), cast_bytes.payload.bytes);
+}
+
+test "native Conv1d preserves dilation with padding stride and multiple channels" {
+    var attrs: ml.graph.node.ConvAttrs = .{};
+    attrs.num_spatial = 1;
+    attrs.dilations[0] = 2;
+    try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 1, 5 }), Shape.init(.f32, &.{ 1, 1, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5 }, &.{ 1, 1, 5 }, &.{ 1, 1 }, &.{ 1, 1, 2 }, &.{ 4, 6, 8 }, &.{ 1, 1, 3 });
+    attrs.padding[0] = .{ 1, 1 };
+    attrs.strides[0] = 2;
+    try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 1, 5 }), Shape.init(.f32, &.{ 1, 1, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5 }, &.{ 1, 1, 5 }, &.{ 1, 1 }, &.{ 1, 1, 2 }, &.{ 2, 6, 4 }, &.{ 1, 1, 3 });
+    attrs.padding[0] = .{ 0, 0 };
+    attrs.strides[0] = 1;
+    try expectNativeConvolution(attrs, Shape.init(.f32, &.{ 1, 2, 5 }), Shape.init(.f32, &.{ 1, 2, 2 }), Shape.init(.f32, &.{ 1, 1, 3 }), &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }, &.{ 1, 2, 5 }, &.{ 1, 2, 3, 4 }, &.{ 1, 2, 2 }, &.{ 57, 67, 77 }, &.{ 1, 1, 3 });
 }

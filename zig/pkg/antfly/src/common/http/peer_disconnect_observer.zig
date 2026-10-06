@@ -72,14 +72,14 @@ pub const Observer = struct {
 
     const PeerAction = struct {
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*std.atomic.Value(u64),
-        observer_failures_total: ?*std.atomic.Value(u64),
+        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
+        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
     };
 
     const DeadlineAction = struct {
         state: *Deadline,
         expires_at_ns: u64,
-        expirations_total: ?*std.atomic.Value(u64),
+        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
     };
 
     const ProbeAction = struct {
@@ -133,7 +133,7 @@ pub const Observer = struct {
     active_count: std.atomic.Value(usize) = .init(0),
     active_peer_count: std.atomic.Value(usize) = .init(0),
     active_deadline_count: std.atomic.Value(usize) = .init(0),
-    deadline_expirations_total: std.atomic.Value(u64) = .init(0),
+    deadline_expirations_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
     scheduling_io: ?std.Io = null,
@@ -219,8 +219,8 @@ pub const Observer = struct {
         self: *Observer,
         fd: std.posix.fd_t,
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*std.atomic.Value(u64),
-        observer_failures_total: ?*std.atomic.Value(u64),
+        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
+        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
         if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
@@ -254,7 +254,7 @@ pub const Observer = struct {
         fd: std.posix.fd_t,
         timeout_ms: u32,
         state: *Deadline,
-        expirations_total: ?*std.atomic.Value(u64),
+        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
             return error.ObserverUnavailable;
@@ -641,7 +641,7 @@ test "std http listener multiplexed peer observer cancels many disconnected sock
     defer observer.deinit();
 
     var sockets: [32][2]std.posix.fd_t = undefined;
-    var cancellations = [_]http_common.RequestCancellation{.{}} ** 32;
+    var cancellations = @as([32]http_common.RequestCancellation, @splat(.{}));
     var registrations: [32]Observer.Registration = undefined;
     var initialized: usize = 0;
     var clients_open: usize = 0;
@@ -732,7 +732,7 @@ test "std http listener peer observer sees FIN behind unread bytes without consu
 fn runDeadlineStormRound(observer: *Observer) !void {
     const batch_size = 32;
     var sockets: [32][2]std.posix.fd_t = undefined;
-    var deadlines = [_]Observer.Deadline{.{}} ** 32;
+    var deadlines = @as([32]Observer.Deadline, @splat(.{}));
     var registrations: [32]Observer.Registration = undefined;
     var initialized: usize = 0;
     defer {

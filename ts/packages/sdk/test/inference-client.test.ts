@@ -448,6 +448,48 @@ describe("InferenceClient with mock fetch", () => {
     });
   });
 
+  describe("rerank", () => {
+    it("sends text and content-part documents to /rerank", async () => {
+      const mockResponse = {
+        object: "list" as const,
+        model: "owner/colqwen",
+        data: [
+          { object: "rerank.score" as const, index: 0, score: 0.2 },
+          { object: "rerank.score" as const, index: 1, score: 0.9 },
+        ],
+        usage: { prompt_tokens: 2, completion_tokens: 0, total_tokens: 2 },
+      };
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(mockResponse),
+        text: () => Promise.resolve(JSON.stringify(mockResponse)),
+        headers: new Headers({ "Content-Type": "application/json" }),
+      } as Response);
+
+      const client = new InferenceClient({ baseUrl: "http://localhost:8080" });
+      const documents = [
+        "plain text page",
+        [
+          { type: "text" as const, text: "scanned page" },
+          { type: "image_url" as const, image_url: { url: "data:image/png;base64,AA==" } },
+        ],
+      ];
+      const result = await client.rerank("owner/colqwen", "invoice total", documents);
+
+      expect(result.data.map((item) => item.score)).toEqual([0.2, 0.9]);
+      const [input] = vi.mocked(fetch).mock.calls.at(-1) ?? [];
+      expect(input instanceof Request ? input.url : String(input)).toBe(
+        "http://localhost:8080/ai/v1/rerank"
+      );
+      expect(await lastFetchJSONBody()).toEqual({
+        model: "owner/colqwen",
+        query: "invoice total",
+        documents,
+      });
+    });
+  });
+
   describe("embed (JSON response)", () => {
     it("should request JSON format and parse response", async () => {
       const mockResponse = {

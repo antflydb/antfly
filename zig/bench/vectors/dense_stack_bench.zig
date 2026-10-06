@@ -1060,7 +1060,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
     db_closed = true;
 
     const capi_packed_ns = blk: {
-        const zpath = try alloc.dupeZ(u8, path);
+        const zpath = try alloc.dupeSentinel(u8, path, 0);
         defer alloc.free(zpath);
 
         var handle_ptr: ?*anyopaque = null;
@@ -1080,7 +1080,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 0,
                 &packed_result,
             ));
-            capi_db.antfly_db_packed_dense_search_result_free(&packed_result);
+            capi_db.antfly_packed_dense_search_result_free(&packed_result);
         }
 
         var total_ns: u64 = 0;
@@ -1101,14 +1101,14 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 ));
                 total_ns += elapsedSince(start_ns);
                 std.mem.doNotOptimizeAway(packed_result.hit_count);
-                capi_db.antfly_db_packed_dense_search_result_free(&packed_result);
+                capi_db.antfly_packed_dense_search_result_free(&packed_result);
             }
         }
         break :blk @divTrunc(total_ns, query_total);
     };
 
     const capi_wire_ns = blk: {
-        const zpath = try alloc.dupeZ(u8, path);
+        const zpath = try alloc.dupeSentinel(u8, path, 0);
         defer alloc.free(zpath);
 
         var handle_ptr: ?*anyopaque = null;
@@ -1127,7 +1127,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
         for (requests) |req| {
             var buf: capi.Buffer = .{};
             try expectOk(capi_db.antfly_db_search_dense_wire(handle_ptr, sliceBytes(req), &buf));
-            capi_db.antfly_db_buffer_free(buf.ptr, buf.len);
+            capi_db.antfly_buffer_free(&buf);
         }
 
         var total_ns: u64 = 0;
@@ -1138,7 +1138,7 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
                 try expectOk(capi_db.antfly_db_search_dense_wire(handle_ptr, sliceBytes(req), &buf));
                 total_ns += elapsedSince(start_ns);
                 std.mem.doNotOptimizeAway(buf.len);
-                capi_db.antfly_db_buffer_free(buf.ptr, buf.len);
+                capi_db.antfly_buffer_free(&buf);
             }
         }
         break :blk @divTrunc(total_ns, query_total);
@@ -1156,12 +1156,12 @@ fn runBench(alloc: std.mem.Allocator, path: []const u8, cfg: Config, queries: []
 fn captureResourceSummary(manager: *resource_manager_mod.ResourceManager) ResourceSummary {
     const stats = manager.snapshot();
     return .{
-        .lsm_block_table_cache = captureSliceSummary(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)]),
-        .lsm_in_memory_state = captureSliceSummary(stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)]),
-        .hbc_node_metadata_cache = captureSliceSummary(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)]),
-        .dense_search_working_set = captureSliceSummary(stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)]),
-        .dense_apply_working_set = captureSliceSummary(stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)]),
-        .dense_routing_working_set = captureSliceSummary(stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)]),
+        .lsm_block_table_cache = captureSliceSummary(stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)]),
+        .lsm_in_memory_state = captureSliceSummary(stats.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)]),
+        .hbc_node_metadata_cache = captureSliceSummary(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)]),
+        .dense_search_working_set = captureSliceSummary(stats.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)]),
+        .dense_apply_working_set = captureSliceSummary(stats.slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)]),
+        .dense_routing_working_set = captureSliceSummary(stats.slices[@backingInt(resource_manager_mod.Slice.dense_routing_working_set)]),
     };
 }
 

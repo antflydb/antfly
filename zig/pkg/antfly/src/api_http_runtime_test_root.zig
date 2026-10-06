@@ -23,8 +23,8 @@ const kernel_abi = @import("api/kernel_abi.zig");
 const kernel_bridge = @import("api/kernel_bridge.zig");
 const kernel_exports = @import("api/kernel_exports.zig");
 const openapi_contract = @import("api/openapi_contract.zig");
-const runtime_http_abi = @import("runtime_http_abi.zig");
-const runtime_http_bridge = @import("runtime_http_bridge.zig");
+const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const table_contract = @import("api/table_contract.zig");
 const table_read_source = @import("api/table_read_source.zig");
 
@@ -34,6 +34,10 @@ pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
+    _ = @import("api/sql_connection_record.zig");
+    _ = @import("api/sql_connections.zig");
+    _ = @import("api/kernel_owner_source.zig");
+    _ = @import("api/sql_pgwire.zig");
     _ = @import("api/table_catalog.zig");
     _ = @import("api/table_reads.zig");
     _ = @import("api/tables.zig");
@@ -43,7 +47,7 @@ test {
     _ = @import("api/http_client.zig");
     _ = @import("api/distributed_join.zig");
     _ = @import("api/distributed_graph.zig");
-    _ = @import("inference/query_embedding_cache.zig");
+    _ = @import("antfly_inference_query_embedding_cache");
     _ = @import("api/agent_tools.zig");
     _ = @import("generating/mod.zig");
     _ = @import("api/query_builder_agent.zig");
@@ -69,4 +73,12 @@ test "system catalog routing and transport discovery" {
     _ = @import("api/table_catalog.zig");
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
+}
+
+test {
+    _ = @import("api/lake_sql_cursor.zig");
+}
+
+test {
+    _ = @import("api/lake_sql_integration_test.zig");
 }

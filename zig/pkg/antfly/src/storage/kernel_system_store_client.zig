@@ -21,6 +21,11 @@ const abi = @import("kernel_owner_abi");
 const backend = @import("backend_erased.zig");
 const error_identity = @import("kernel_error_identity");
 
+pub fn nativeHandle(store: *const backend.Store) !*anyopaque {
+    if (store.vtable != &store_vtable) return error.UnsupportedOperation;
+    return store.ptr;
+}
+
 pub fn open(
     allocator: std.mem.Allocator,
     context: ?*anyopaque,

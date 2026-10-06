@@ -190,13 +190,25 @@ pub const ExtractedWrite = struct {
                 errdefer alloc.free(target);
                 const edge_type = try alloc.dupe(u8, write.edge_type);
                 errdefer alloc.free(edge_type);
+                const edge_id = try alloc.dupe(u8, write.edge_id);
+                errdefer alloc.free(edge_id);
+                const owner_document = try alloc.dupe(u8, write.owner_document);
+                errdefer alloc.free(owner_document);
                 const metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "";
+                errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
+                const owner = if (write.owner.len > 0) try alloc.dupe(u8, write.owner) else "";
                 break :blk .{
                     .index_name = index_name,
                     .source = source,
                     .target = target,
                     .edge_type = edge_type,
+                    .edge_id = edge_id,
+                    .owner_document = owner_document,
+                    .weight = write.weight,
+                    .created_at = write.created_at,
+                    .updated_at = write.updated_at,
                     .metadata_json = metadata_json,
+                    .owner = owner,
                 };
             };
             graph_initialized += 1;
@@ -285,7 +297,10 @@ pub const ExtractedWrite = struct {
             alloc.free(@constCast(graph_write.source));
             alloc.free(@constCast(graph_write.target));
             alloc.free(@constCast(graph_write.edge_type));
+            if (graph_write.edge_id.len > 0) alloc.free(@constCast(graph_write.edge_id));
+            if (graph_write.owner_document.len > 0) alloc.free(@constCast(graph_write.owner_document));
             if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
+            if (graph_write.owner.len > 0) alloc.free(@constCast(graph_write.owner));
         }
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
         for (self.mentioned_graph_indexes) |index_name| alloc.free(index_name);
@@ -309,6 +324,35 @@ pub const ExtractedWrite = struct {
     }
 };
 
+/// Internal cold-scan projection, never a primary-row write. Omitted required
+/// fields outside the selected constraint are not missing user input. Selected
+/// required fields, types, NULL rules and the immutable layout still apply.
+pub const PreparedRelationalProjection = struct {
+    arena: std.heap.ArenaAllocator,
+    view: relational_row_codec.OrdinalRowView,
+
+    pub fn init(alloc: Allocator, json: []const u8, schema: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout, selected_fields: []const []const u8) !PreparedRelationalProjection {
+        if (schema.version != layout.schema_version or schema.relational_columns.len != layout.column_count)
+            return error.RelationalRowSchemaMismatch;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, owned, json, .{ .allocate = .alloc_always, .parse_numbers = false });
+        var required: std.ArrayList(u32) = .empty;
+        for (selected_fields) |name| {
+            const ordinal = layout.ordinalForName(schema.relational_columns, name) orelse return error.InvalidBatchRequest;
+            if (schema.relational_columns[ordinal].required) try required.append(owned, @intCast(ordinal));
+        }
+        const encoded = try buildRelationalRowValueFromParsedInternal(owned, owned, parsed, schema, layout, required.items, &.{});
+        return .{ .arena = arena, .view = try relational_row_codec.ordinalRowViewTrusted(encoded.bytes, schema, layout) };
+    }
+
+    pub fn deinit(self: *PreparedRelationalProjection) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 /// Fully owned output of the relational write preparation boundary. One JSON
 /// parse supplies validation, special-field extraction, the semantic digest,
 /// and the physical base row.
@@ -318,6 +362,11 @@ pub const PreparedRelationalWrite = struct {
     packed_row: []u8,
     semantic_hash: document_content_hash.Digest,
     schema_version: u32,
+    /// Borrowed immutable preparation identity. The request retains its epoch;
+    /// a matching numeric version from another table/registry is not sufficient
+    /// to reinterpret trusted row bytes under that registry's layout.
+    physical_layout: *const relational_row_codec.PhysicalLayout,
+    schema_columns: []const runtime_schema.RelationalColumn,
     metadata_finalized: bool = false,
     owned_region: ?*PreparedRowRegion = null,
     packed_row_owned_individually: bool = true,
@@ -377,6 +426,8 @@ pub const PreparedRelationalWrite = struct {
             table_schema,
             physical_layout,
             null,
+            false,
+            &.{},
         );
     }
 
@@ -391,7 +442,19 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
     ) !PreparedRelationalWrite {
-        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null);
+        return try initWithAllocators(alloc, scratch, scratch, false, key, document_json, validator, table_schema, physical_layout, null, false, &.{});
+    }
+
+    pub fn initTyped(alloc: Allocator, parse_alloc: Allocator, scratch: Allocator, retain_text_root: bool, key: []const u8, document_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8, preserve: bool) !PreparedRelationalWrite {
+        return initWithAllocators(alloc, parse_alloc, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null, preserve, json_null_fields);
+    }
+
+    pub fn initTypedInSharedRegion(region: *PreparedRowRegion, scratch: Allocator, retain_text_root: bool, key: []const u8, document_json: []const u8, validator: ?schema_api.CompiledTableValidator, table_schema: runtime_schema.TableSchema, physical_layout: *const relational_row_codec.PhysicalLayout, json_null_fields: []const []const u8, preserve: bool) !PreparedRelationalWrite {
+        var prepared = try initTyped(region.arena.allocator(), if (retain_text_root) region.arena.allocator() else scratch, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, json_null_fields, preserve);
+        region.retain();
+        prepared.owned_region = region;
+        if (retain_text_root) prepared.extracted.prepared_text_root = prepared.parsedValue();
+        return prepared;
     }
 
     /// Split transient parse ownership from retained row ownership. Batch
@@ -410,6 +473,8 @@ pub const PreparedRelationalWrite = struct {
         table_schema: runtime_schema.TableSchema,
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
+        preserve_logical_values: bool,
+        json_null_fields: []const []const u8,
     ) !PreparedRelationalWrite {
         var intent_digest: ?document_content_hash.Digest = null;
         var parsed = if (durable_row) |bytes| blk: {
@@ -429,7 +494,38 @@ pub const PreparedRelationalWrite = struct {
             else => return error.InvalidBatchRequest,
         };
         errdefer parsed.deinit();
-        if (durable_row == null) if (validator) |compiled| try compiled.validateValue(scratch, &parsed.value);
+        var effective_json_null_fields = std.ArrayListUnmanaged([]const u8).empty;
+        defer effective_json_null_fields.deinit(scratch);
+        if (json_null_fields.len != 0) {
+            if (durable_row != null or parsed.value != .object or json_null_fields.len > table_schema.relational_columns.len) return error.InvalidBatchRequest;
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(scratch);
+            for (json_null_fields) |name| {
+                const ordinal = physical_layout.ordinalForName(table_schema.relational_columns, name) orelse return error.InvalidBatchRequest;
+                const column = table_schema.relational_columns[ordinal];
+                if (!column.is_json or column.json_kind != .any) return error.InvalidBatchRequest;
+                const datum = parsed.value.object.get(name) orelse return error.InvalidBatchRequest;
+                if (datum != .null or (try seen.getOrPut(scratch, name)).found_existing) return error.InvalidBatchRequest;
+                // Generated fields are output-only. Their expression result
+                // owns its null semantics, regardless of submitted metadata.
+                if (!preserve_logical_values) if (validator) |compiled| if (compiled.execution.expressions) |expressions| {
+                    if (expressions.generated_columns[ordinal]) continue;
+                };
+                try effective_json_null_fields.append(scratch, name);
+            }
+        }
+        if (durable_row == null) if (validator) |compiled| {
+            // Defaults and stored generated values cross the same immutable
+            // schema boundary as CHECKs, extraction, indexes and logical hash.
+            // Durable intents have already crossed it and must never evaluate
+            // the current expression plan again during replay.
+            if (effective_json_null_fields.items.len != 0)
+                try compiled.prepareTypedValue(parsed.arena.allocator(), scratch, &parsed.value, effective_json_null_fields.items, preserve_logical_values)
+            else if (preserve_logical_values)
+                try compiled.validateValue(scratch, &parsed.value)
+            else
+                try compiled.prepareValue(parsed.arena.allocator(), scratch, &parsed.value);
+        };
 
         var extracted = extractWriteFromParsedPrepared(
             alloc,
@@ -478,22 +574,40 @@ pub const PreparedRelationalWrite = struct {
                 .packed_row = packed_bytes,
                 .semantic_hash = intent_digest.?,
                 .schema_version = table_schema.version,
+                .physical_layout = physical_layout,
+                .schema_columns = table_schema.relational_columns,
             };
         }
-        const prepared_row = try buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
+        const prepared_row = try buildRelationalRowValueFromParsedInternal(
             alloc,
             scratch,
             parsed.value,
             table_schema,
             physical_layout,
+            physical_layout.required_ordinals,
+            effective_json_null_fields.items,
         );
         errdefer alloc.free(prepared_row.bytes);
+        if (validator) |compiled| if (compiled.execution.expressions) |expressions| if (expressions.bindings.len != 0) {
+            // Original API JSON predates defaults/generated evaluation. Lazy
+            // JSON consumers (including deferred text publication) must render
+            // the typed authority, never index that obsolete input snapshot.
+            const source = try alloc.create(ExtractedWrite.LazyLogicalSource);
+            errdefer alloc.destroy(source);
+            source.* = .{ .alloc = alloc, .row = try relational_row_codec.ordinalRowViewTrusted(prepared_row.bytes, table_schema, physical_layout) };
+            if (extracted.cleaned_value_owned) if (extracted.cleaned_value) |value| alloc.free(value);
+            extracted.cleaned_value = null;
+            extracted.cleaned_value_owned = false;
+            extracted.logical_source = source;
+        };
         return .{
             .parsed = parsed,
             .extracted = extracted,
             .packed_row = prepared_row.bytes,
             .semantic_hash = prepared_row.semantic_hash,
             .schema_version = table_schema.version,
+            .physical_layout = physical_layout,
+            .schema_columns = table_schema.relational_columns,
         };
     }
 
@@ -506,6 +620,9 @@ pub const PreparedRelationalWrite = struct {
     /// Trusted because this request just encoded the row. This view is valid
     /// even before timestamp/checksum finalization and borrows the row region.
     pub fn typedView(self: *const PreparedRelationalWrite, schema: runtime_schema.TableSchema, layout: *const relational_row_codec.PhysicalLayout) !relational_row_codec.OrdinalRowView {
+        if (self.schema_version != schema.version or self.physical_layout != layout or
+            self.schema_columns.ptr != schema.relational_columns.ptr or self.schema_columns.len != schema.relational_columns.len)
+            return error.RelationalRowSchemaMismatch;
         return try relational_row_codec.ordinalRowViewTrusted(self.packed_row, schema, layout);
     }
 
@@ -559,7 +676,38 @@ pub const PreparedRelationalWrite = struct {
         physical_layout: *const relational_row_codec.PhysicalLayout,
         durable_row: ?[]const u8,
     ) !PreparedRelationalWrite {
-        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row);
+        return try initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, durable_row, false, &.{});
+    }
+
+    /// A restore is not a new mutation: preserve missing values and verify
+    /// stored generated results instead of applying current defaults or
+    /// repairing invalid generated fields. Type/CHECK validation remains live.
+    pub fn initPreserved(
+        alloc: Allocator,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        return initWithAllocators(alloc, alloc, alloc, false, key, document_json, validator, table_schema, physical_layout, null, true, &.{});
+    }
+
+    pub fn initInSharedRegionPreserved(
+        region: *PreparedRowRegion,
+        scratch: Allocator,
+        retain_text_root: bool,
+        key: []const u8,
+        document_json: []const u8,
+        validator: ?schema_api.CompiledTableValidator,
+        table_schema: runtime_schema.TableSchema,
+        physical_layout: *const relational_row_codec.PhysicalLayout,
+    ) !PreparedRelationalWrite {
+        var prepared = try initWithAllocators(region.arena.allocator(), if (retain_text_root) region.arena.allocator() else scratch, scratch, retain_text_root, key, document_json, validator, table_schema, physical_layout, null, true, &.{});
+        region.retain();
+        prepared.owned_region = region;
+        if (retain_text_root) prepared.extracted.prepared_text_root = prepared.parsedValue();
+        return prepared;
     }
 
     pub fn initInSharedRegionFromIntent(
@@ -584,6 +732,8 @@ pub const PreparedRelationalWrite = struct {
             table_schema,
             physical_layout,
             durable_row,
+            false,
+            &.{},
         );
         region.retain();
         prepared.owned_region = region;
@@ -644,6 +794,10 @@ pub const PreparedRelationalWrite = struct {
         self.parsed = null;
     }
 
+    /// Region-backed rows transfer the shared owner. For individually allocated
+    /// rows, lazy logical projections borrow the packed row: the caller must
+    /// retain this preparation, or takePackedRow() and retain those bytes, until
+    /// the extracted effects are consumed. The pinned schema must also survive.
     pub fn takeExtracted(self: *PreparedRelationalWrite) ExtractedWrite {
         if (self.owned_region) |region| {
             if (self.parsed) |*parsed| parsed.deinit();
@@ -853,6 +1007,7 @@ pub const TextProjectionBatchBuilder = struct {
             .text_fields = extracted.fields,
             .recursive_typed_fields = extracted.recursive_typed_fields,
             .infer_type_dynamic_paths = extracted.infer_type_dynamic_paths,
+            .unindexed_paths = extracted.unindexed_paths,
             // A selected-field index must not inherit typed doc values from the
             // whole source document. Besides violating the projection contract,
             // doing so would let filters and sorts observe fields the index was
@@ -917,6 +1072,7 @@ const ExtractedTextFields = struct {
     fields: []const introducer_mod.TextField,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    unindexed_paths: []const []const u8 = &.{},
     typed_fields: ?[]const introducer_mod.TypedFieldValue = null,
 };
 
@@ -2071,7 +2227,10 @@ fn extractWriteFromParsedPrepared(
             alloc.free(@constCast(graph_write.source));
             alloc.free(@constCast(graph_write.target));
             alloc.free(@constCast(graph_write.edge_type));
+            if (graph_write.edge_id.len > 0) alloc.free(@constCast(graph_write.edge_id));
+            if (graph_write.owner_document.len > 0) alloc.free(@constCast(graph_write.owner_document));
             if (graph_write.metadata_json.len > 0) alloc.free(@constCast(graph_write.metadata_json));
+            if (graph_write.owner.len > 0) alloc.free(@constCast(graph_write.owner));
         }
         graph_writes.deinit(alloc);
     }
@@ -2123,25 +2282,28 @@ fn extractWriteFromParsedPrepared(
                     const target_value = edge_item.object.get("target") orelse return error.InvalidGraphEdges;
                     if (target_value != .string) return error.InvalidGraphEdges;
 
+                    const edge_id: []const u8 = if (edge_item.object.get("edge_id")) |value| blk: {
+                        if (value != .string or value.string.len == 0) return error.InvalidGraphEdges;
+                        break :blk value.string;
+                    } else "";
                     var metadata_json: []const u8 = "";
                     if (edge_item.object.get("metadata")) |metadata_value| {
                         metadata_json = try std.json.Stringify.valueAlloc(alloc, metadata_value, .{});
                     }
                     errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
 
-                    try graph_writes.append(alloc, .{
-                        .index_name = try alloc.dupe(u8, index_name),
-                        .source = try alloc.dupe(u8, key),
-                        .target = try alloc.dupe(u8, target_value.string),
-                        .edge_type = try alloc.dupe(u8, edge_type),
-                        .weight = if (edge_item.object.get("weight")) |weight_value|
-                            try jsonNumberToF64(weight_value)
-                        else
-                            1.0,
-                        .created_at = 0,
-                        .updated_at = 0,
+                    const borrowed: types.GraphEdgeWrite = .{
+                        .index_name = index_name,
+                        .source = key,
+                        .target = target_value.string,
+                        .edge_type = edge_type,
+                        .edge_id = edge_id,
+                        .weight = if (edge_item.object.get("weight")) |weight_value| try jsonNumberToF64(weight_value) else 1.0,
                         .metadata_json = metadata_json,
-                    });
+                    };
+                    try graph_writes.ensureUnusedCapacity(alloc, 1);
+                    graph_writes.appendAssumeCapacity(try borrowed.cloneAlloc(alloc));
+                    if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
                 }
             }
         }
@@ -2158,9 +2320,14 @@ fn extractWriteFromParsedPrepared(
                 .array, .string => {
                     const vector = try parseDenseEmbeddingValue(alloc, emb_value);
                     errdefer alloc.free(vector);
-                    try dense_embeddings.append(alloc, .{
-                        .index_name = try alloc.dupe(u8, index_name),
-                        .doc_key = try alloc.dupe(u8, key),
+                    try dense_embeddings.ensureUnusedCapacity(alloc, 1);
+                    const owned_index = try alloc.dupe(u8, index_name);
+                    errdefer alloc.free(owned_index);
+                    const owned_key = try alloc.dupe(u8, key);
+                    errdefer alloc.free(owned_key);
+                    dense_embeddings.appendAssumeCapacity(.{
+                        .index_name = owned_index,
+                        .doc_key = owned_key,
                         .vector = vector,
                     });
                 },
@@ -2170,9 +2337,14 @@ fn extractWriteFromParsedPrepared(
                         alloc.free(sparse_vec.indices);
                         alloc.free(sparse_vec.values);
                     }
-                    try sparse_embeddings.append(alloc, .{
-                        .index_name = try alloc.dupe(u8, index_name),
-                        .doc_key = try alloc.dupe(u8, key),
+                    try sparse_embeddings.ensureUnusedCapacity(alloc, 1);
+                    const owned_index = try alloc.dupe(u8, index_name);
+                    errdefer alloc.free(owned_index);
+                    const owned_key = try alloc.dupe(u8, key);
+                    errdefer alloc.free(owned_key);
+                    sparse_embeddings.appendAssumeCapacity(.{
+                        .index_name = owned_index,
+                        .doc_key = owned_key,
                         .indices = sparse_vec.indices,
                         .values = sparse_vec.values,
                     });
@@ -2191,17 +2363,31 @@ fn extractWriteFromParsedPrepared(
         break :blk try stringifyWithoutSpecialFieldsAlloc(alloc, root.object);
     } else if (borrow_original_json) @constCast(original_json) else try alloc.dupe(u8, original_json);
 
-    return .{
+    var result: ExtractedWrite = .{
         .cleaned_value = cleaned_value,
         .cleaned_value_owned = has_special_fields or !borrow_original_json,
-        .graph_writes = try graph_writes.toOwnedSlice(alloc),
-        .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
+        .graph_writes = &.{},
+        .mentioned_graph_indexes = &.{},
+        .dense_embeddings = &.{},
+        .sparse_embeddings = &.{},
     };
+    errdefer result.deinit(alloc);
+    result.graph_writes = try graph_writes.toOwnedSlice(alloc);
+    result.mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc);
+    result.dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
+    result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
+    return result;
 }
 
 fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: []const u8) !?ExtractedWrite {
+    // This writer owns an allocating buffer; WriteFailed means OOM.
+    return extractWriteFastDenseEmbeddingsOnlyImpl(alloc, key, data) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn extractWriteFastDenseEmbeddingsOnlyImpl(alloc: Allocator, key: []const u8, data: []const u8) !?ExtractedWrite {
     var scanner = std.json.Scanner.initCompleteInput(alloc, data);
     defer scanner.deinit();
 
@@ -2261,12 +2447,15 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
     if (!saw_embeddings) return null;
 
+    const cleaned_value = if (has_non_special_fields) try alloc.dupe(u8, cleaned_writer.writer.buffered()) else null;
+    errdefer if (cleaned_value) |value| alloc.free(value);
+    const owned_dense = try dense_embeddings.toOwnedSlice(alloc);
     dense_owned = true;
     return .{
-        .cleaned_value = if (has_non_special_fields) try alloc.dupe(u8, cleaned_writer.writer.buffered()) else null,
+        .cleaned_value = cleaned_value,
         .graph_writes = &.{},
         .mentioned_graph_indexes = &.{},
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
+        .dense_embeddings = owned_dense,
         .sparse_embeddings = &.{},
     };
 }
@@ -2350,11 +2539,12 @@ fn extractFastDenseEmbeddingsField(
         };
         errdefer alloc.free(vector);
 
-        try dense_embeddings.append(alloc, .{
-            .index_name = try alloc.dupe(u8, index_name),
-            .doc_key = try alloc.dupe(u8, key),
-            .vector = vector,
-        });
+        try dense_embeddings.ensureUnusedCapacity(alloc, 1);
+        const owned_index = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_index);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        dense_embeddings.appendAssumeCapacity(.{ .index_name = owned_index, .doc_key = owned_key, .vector = vector });
     }
 }
 
@@ -2362,7 +2552,10 @@ fn parseFastDenseEmbeddingString(alloc: Allocator, scanner: *std.json.Scanner) !
     const value_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
     defer freeJsonAllocatedToken(alloc, value_token);
     const value = jsonTokenSlice(value_token) orelse return error.InvalidEmbeddingField;
-    return vector_codec.decodePackedF32Base64Alloc(alloc, value) catch return error.InvalidEmbeddingField;
+    return vector_codec.decodePackedF32Base64Alloc(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingField,
+    };
 }
 
 fn parseFastDenseEmbeddingArray(alloc: Allocator, scanner: *std.json.Scanner) ![]f32 {
@@ -2431,8 +2624,16 @@ fn extractTextFieldsFromValue(
 
     if (schema) |runtime| {
         if (!runtimeHasSchemaDrivenText(runtime)) {
+            // A schema that declares no text mapping still indexes every
+            // string like a schema-less table, but a declaration that
+            // disables indexing is honoured even here.
+            const unindexed_paths = if (resolveFullTextDocument(runtime, root.object)) |resolved|
+                resolved.unindexed_paths
+            else
+                &.{};
             return .{
-                .fields = try extractStringFieldsNoSchema(alloc, root.object),
+                .fields = try extractStringFieldsNoSchema(alloc, root.object, unindexed_paths),
+                .unindexed_paths = unindexed_paths,
             };
         }
 
@@ -2454,6 +2655,7 @@ fn extractTextFieldsFromValue(
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
             .infer_type_dynamic_paths = if (document_schema) |resolved| resolved.infer_type_dynamic_paths else &.{},
+            .unindexed_paths = if (document_schema) |resolved| resolved.unindexed_paths else &.{},
             .typed_fields = if (typed_fields.items.len > 0) try alloc.dupe(introducer_mod.TypedFieldValue, typed_fields.items) else null,
         };
     }
@@ -2461,7 +2663,35 @@ fn extractTextFieldsFromValue(
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
 }
 
-fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
+/// Analyzer provenance for one value emitted into the text index. Highlight
+/// from these contributions instead of guessing analysis from a source name.
+pub const HighlightTextField = struct {
+    indexed_field: []const u8,
+    source_field: []const u8,
+    text: []const u8,
+    analyzer: *const analysis_mod.Analyzer,
+};
+
+pub fn highlightTextFieldsFromValue(
+    alloc: Allocator,
+    root: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema.TableSchema,
+) ![]const HighlightTextField {
+    const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
+    for (extracted.fields) |field| {
+        try fields.append(alloc, .{
+            .indexed_field = field.field_name,
+            .source_field = field.source_field orelse field.field_name,
+            .text = field.text,
+            .analyzer = introducer_mod.effectiveTextFieldAnalyzer(field, text_analysis),
+        });
+    }
+    return try fields.toOwnedSlice(alloc);
+}
+
+pub fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
     if (schema.exact_fields.len > 0) return true;
     if (schema.dynamic_templates.len > 0) return true;
     for (schema.full_text_documents) |doc| {
@@ -2492,12 +2722,14 @@ fn appendSchemaTextFields(
         for (values.items) |text| {
             try fields.append(alloc, .{
                 .field_name = field.emitted_name,
+                .source_field = field.path,
                 .text = text,
                 .analyzer = analyzer,
             });
             if (field.include_in_all) {
                 try fields.append(alloc, .{
                     .field_name = "_all",
+                    .source_field = field.path,
                     .text = text,
                     .analyzer = analyzer,
                 });
@@ -2774,6 +3006,16 @@ fn collectDynamicSchemaTextFields(
     text_analysis: introducer_mod.TextAnalysisConfig,
     observed_field_analyzers: ?*std.ArrayListUnmanaged(ObservedFieldAnalyzer),
 ) !void {
+    // `x-antfly-index: false` disables every dynamic projection for the whole
+    // subtree, regardless of how the enclosing object opts into dynamic
+    // indexing. Explicit fields never reach here, so this only guards the
+    // dynamic fallbacks below.
+    if (path.len > 0) {
+        if (document_schema) |resolved| {
+            if (runtime_schema.pathFallsUnderAnyPrefix(resolved.unindexed_paths, path)) return;
+        }
+    }
+
     var dynamic_typed_terminal = false;
     if (path.len > 0 and !containsStringSlice(explicit_paths, path)) {
         if (document_schema) |resolved| {
@@ -2827,7 +3069,12 @@ fn collectDynamicSchemaTextFields(
         .string => |text| {
             if (path.len == 0) return;
             if (containsStringSlice(explicit_paths, path)) return;
+            // A declared property is indexed only as its declaration says.
+            // One that emits no text field (`blob`, `embedding`, numeric
+            // shorthand, ...) is not an undeclared string for the dynamic
+            // rules, templates, or open paths to pick up.
             if (document_schema) |resolved| {
+                if (runtime_schema.containsPath(resolved.declared_paths, path)) return;
                 if (resolveDynamicRule(resolved, path)) |rule| {
                     try appendDynamicRuleTextField(alloc, fields, path, text, rule, text_analysis);
                     return;
@@ -2885,7 +3132,7 @@ fn appendMappedSubfieldTextFields(
         };
         const mapping = field.mapping;
         if (!isTextFieldType(mapping.field_type)) continue;
-        try appendMappedTextField(alloc, fields, subfield_path, text, mapping, text_analysis);
+        if (mapping.do_index) try appendNamedTextField(alloc, fields, subfield_path, path, text, mapping.analyzer, mapping.include_in_all, text_analysis);
         if (observed_field_analyzers) |collector| {
             try appendObservedFieldAnalyzer(alloc, collector, subfield_path, mapping);
         }
@@ -2988,7 +3235,7 @@ fn appendMappedGeoPointTextField(
     const precision = geo_mod.index_geohash_precision;
     const geohash = geo_mod.encode(.{ .lat = point.lat, .lon = point.lon }, precision);
     const term = try alloc.dupe(u8, geohash[0..precision]);
-    try appendNamedTextField(alloc, fields, path, term, "keyword", false, text_analysis);
+    try appendNamedTextField(alloc, fields, path, path, term, "keyword", false, text_analysis);
 }
 
 fn appendMappedTextField(
@@ -3002,7 +3249,7 @@ fn appendMappedTextField(
     if (!mapping.do_index) return;
 
     switch (mapping.field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => try appendNamedTextField(alloc, fields, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => try appendNamedTextField(alloc, fields, path, path, text, mapping.analyzer, mapping.include_in_all, text_analysis),
         else => {},
     }
 }
@@ -3025,6 +3272,7 @@ fn appendDynamicRuleTextField(
             alloc,
             fields,
             field_name,
+            path,
             text,
             variant.analyzer,
             variant.include_in_all,
@@ -3037,20 +3285,25 @@ fn appendNamedTextField(
     alloc: Allocator,
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
     field_name: []const u8,
+    source_field: []const u8,
     text: []const u8,
     analyzer_name: []const u8,
     include_in_all: bool,
     text_analysis: introducer_mod.TextAnalysisConfig,
 ) !void {
     const analyzer = introducer_mod.resolveAnalyzerName(analyzer_name, text_analysis);
+    const owned_name = try alloc.dupe(u8, field_name);
+    const owned_source = if (std.mem.eql(u8, field_name, source_field)) owned_name else try alloc.dupe(u8, source_field);
     try fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, field_name),
+        .field_name = owned_name,
+        .source_field = owned_source,
         .text = text,
         .analyzer = analyzer,
     });
     if (include_in_all) {
         try fields.append(alloc, .{
             .field_name = "_all",
+            .source_field = owned_source,
             .text = text,
             .analyzer = analyzer,
         });
@@ -3067,7 +3320,7 @@ fn appendDynamicSchemaLessStringTextFields(
 ) !void {
     // Unmapped dynamic strings have the same cross-field search default as
     // schemaless strings. Explicit mappings are handled before this fallback.
-    try appendNamedTextField(alloc, fields, path, text, "standard", true, text_analysis);
+    try appendNamedTextField(alloc, fields, path, path, text, "standard", true, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, path, .{
             .field_type = .text,
@@ -3082,7 +3335,7 @@ fn appendDynamicSchemaLessStringTextFields(
 
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     defer alloc.free(exact_field);
-    try appendNamedTextField(alloc, fields, exact_field, text, "keyword", false, text_analysis);
+    try appendNamedTextField(alloc, fields, exact_field, path, text, "keyword", false, text_analysis);
     if (observed_field_analyzers) |collector| {
         try appendObservedFieldAnalyzer(alloc, collector, exact_field, .{
             .field_type = .keyword,
@@ -3095,10 +3348,14 @@ fn appendDynamicSchemaLessStringTextFields(
     }
 }
 
-fn extractStringFieldsNoSchema(alloc: Allocator, object: std.json.ObjectMap) ![]introducer_mod.TextField {
+fn extractStringFieldsNoSchema(
+    alloc: Allocator,
+    object: std.json.ObjectMap,
+    unindexed_paths: []const []const u8,
+) ![]introducer_mod.TextField {
     var fields = std.ArrayListUnmanaged(introducer_mod.TextField).empty;
     defer fields.deinit(alloc);
-    try collectStringFieldsNoSchema(alloc, &fields, .{ .object = object }, "");
+    try collectStringFieldsNoSchema(alloc, &fields, .{ .object = object }, "", unindexed_paths);
     return try alloc.dupe(introducer_mod.TextField, fields.items);
 }
 
@@ -3354,7 +3611,9 @@ fn collectStringFieldsNoSchema(
     fields: *std.ArrayListUnmanaged(introducer_mod.TextField),
     value: std.json.Value,
     path: []const u8,
+    unindexed_paths: []const []const u8,
 ) !void {
+    if (path.len > 0 and runtime_schema.pathFallsUnderAnyPrefix(unindexed_paths, path)) return;
     switch (value) {
         .object => |object| {
             var it = object.iterator();
@@ -3365,12 +3624,12 @@ fn collectStringFieldsNoSchema(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectStringFieldsNoSchema(alloc, fields, entry.value_ptr.*, child_path);
+                try collectStringFieldsNoSchema(alloc, fields, entry.value_ptr.*, child_path, unindexed_paths);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectStringFieldsNoSchema(alloc, fields, item, path);
+                try collectStringFieldsNoSchema(alloc, fields, item, path, unindexed_paths);
             }
         },
         .string => |text| {
@@ -3387,18 +3646,22 @@ fn appendSchemaLessStringTextFields(
     path: []const u8,
     text: []const u8,
 ) !void {
+    const owned_path = try alloc.dupe(u8, path);
     try fields.append(alloc, .{
-        .field_name = try alloc.dupe(u8, path),
+        .field_name = owned_path,
+        .source_field = owned_path,
         .text = text,
     });
     try fields.append(alloc, .{
         .field_name = "_all",
+        .source_field = owned_path,
         .text = text,
     });
     if (text.len > schema_less_exact_max_bytes or std.mem.endsWith(u8, path, schema_less_exact_field_suffix)) return;
     const exact_field = try schemaLessExactFieldNameAlloc(alloc, path);
     try fields.append(alloc, .{
         .field_name = exact_field,
+        .source_field = owned_path,
         .text = text,
         .analyzer = &analysis_mod.keyword_analyzer,
     });
@@ -3458,7 +3721,7 @@ fn collectFieldValues(
 
 fn isTextFieldType(field_type: runtime_schema.AntflyType) bool {
     return switch (field_type) {
-        .text, .html, .keyword, .link, .search_as_you_type => true,
+        .text, .html, .keyword, .link, .search_as_you_type, .substring => true,
         else => false,
     };
 }
@@ -3553,7 +3816,10 @@ fn parseDenseEmbeddingValue(alloc: Allocator, value: std.json.Value) ![]f32 {
             }
             break :blk vector;
         },
-        .string => vector_codec.decodePackedF32Base64Alloc(alloc, value.string) catch return error.InvalidEmbeddingField,
+        .string => vector_codec.decodePackedF32Base64Alloc(alloc, value.string) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidEmbeddingField,
+        },
         else => error.InvalidEmbeddingField,
     };
 }
@@ -3790,6 +4056,14 @@ fn cloneWithoutSpecialFields(alloc: Allocator, root: std.json.Value) !std.json.V
 }
 
 fn stringifyWithoutSpecialFieldsAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]u8 {
+    // This writer owns an allocating buffer; WriteFailed means OOM.
+    return stringifyWithoutSpecialFieldsAllocImpl(alloc, object) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn stringifyWithoutSpecialFieldsAllocImpl(alloc: Allocator, object: std.json.ObjectMap) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
     try writer.writer.writeByte('{');
@@ -3819,6 +4093,7 @@ pub fn stripTopLevelFieldsAlloc(alloc: Allocator, data: []const u8, fields: []co
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{
         .allocate = .alloc_always,
+        .parse_numbers = false,
     });
     defer parsed.deinit();
     if (parsed.value != .object) return try alloc.dupe(u8, data);
@@ -3970,7 +4245,8 @@ fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), val
     for (list.items) |existing| {
         if (std.mem.eql(u8, existing, value)) return;
     }
-    try list.append(alloc, try alloc.dupe(u8, value));
+    try list.ensureUnusedCapacity(alloc, 1);
+    list.appendAssumeCapacity(try alloc.dupe(u8, value));
 }
 
 pub fn buildRelationalRowValueForSchemaFromParsedAlloc(
@@ -4005,6 +4281,8 @@ fn buildPreparedRelationalRowValueForSchemaFromParsedAlloc(
         root,
         table_schema,
         physical_layout,
+        physical_layout.required_ordinals,
+        &.{},
     );
 }
 
@@ -4014,6 +4292,8 @@ fn buildRelationalRowValueFromParsedInternal(
     root: std.json.Value,
     table_schema: runtime_schema.TableSchema,
     physical_layout: *const relational_row_codec.PhysicalLayout,
+    required_ordinals: []const u32,
+    json_null_fields: []const []const u8,
 ) !PreparedEncodedRow {
     if (root != .object) return error.InvalidBatchRequest;
     const columns = table_schema.relational_columns;
@@ -4037,10 +4317,11 @@ fn buildRelationalRowValueFromParsedInternal(
             ordinal: usize,
             column: runtime_schema.RelationalColumn,
             found: std.json.Value,
+            json_literal_null: bool,
             owned_buffers: *std.ArrayListUnmanaged([]u8),
         ) !relational_row_codec.Cell {
             const value_type = relationalValueType(column.column_type);
-            if (found == .null) {
+            if (found == .null and !json_literal_null) {
                 if (!column.allows_null) return error.InvalidBatchRequest;
                 return .{
                     .ordinal = @intCast(ordinal),
@@ -4097,6 +4378,9 @@ fn buildRelationalRowValueFromParsedInternal(
                 ordinal,
                 columns[ordinal],
                 found,
+                for (json_null_fields) |name| {
+                    if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
+                } else false,
                 &owned,
             ));
         }
@@ -4113,7 +4397,7 @@ fn buildRelationalRowValueFromParsedInternal(
         // the present cells costs more than sorting the small present set. Check
         // required columns directly through the already-parsed object, then do
         // one canonical-name sort and one final physical-ordinal sort.
-        for (physical_layout.required_ordinals) |required_ordinal| {
+        for (required_ordinals) |required_ordinal| {
             const required_name = columns[required_ordinal].name;
             if (isSpecialField(required_name) or root.object.get(required_name) == null)
                 return error.InvalidBatchRequest;
@@ -4138,7 +4422,7 @@ fn buildRelationalRowValueFromParsedInternal(
             if (positions[cell.ordinal] != std.math.maxInt(u32)) return error.InvalidBatchRequest;
             positions[cell.ordinal] = @intCast(index);
         }
-        for (physical_layout.required_ordinals) |ordinal|
+        for (required_ordinals) |ordinal|
             if (positions[ordinal] == std.math.maxInt(u32)) return error.InvalidBatchRequest;
         // Gather in place, updating the inverse map after every swap. Scratch
         // is four bytes per schema column rather than another full Cell array.
@@ -5149,6 +5433,46 @@ test "document mapper emits schema geo point typed doc values" {
     try std.testing.expect((try typedDocValueForMappedFieldAlloc(alloc, mapping, invalid_lon.value)) == null);
 }
 
+test "document mapper indexes substring companions under every suffix" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const schema: runtime_schema.TableSchema = .{
+        .version = 0,
+        .default_type = "product",
+        .ttl_field = "_timestamp",
+        .full_text_documents = &.{
+            .{
+                .name = "product",
+                .fields = &.{
+                    .{ .path = "name", .emitted_name = "name", .analyzer = "standard" },
+                    .{ .path = "name", .emitted_name = "name._substring", .analyzer = "substring" },
+                },
+            },
+        },
+    };
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"name\":\"Rag3-Weaver Kit\"}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    const root = (try reader.invertedIndex("name")) orelse return error.TestExpectedEqual;
+    try std.testing.expect(root.lookup("rag3") != null);
+    try std.testing.expect(root.lookup("g3weaver") == null);
+
+    const companion = (try reader.invertedIndex("name._substring")) orelse return error.TestExpectedEqual;
+    // Whole tokens, inner suffixes, and suffixes of the joined adjacent pair.
+    try std.testing.expect(companion.lookup("rag3") != null);
+    try std.testing.expect(companion.lookup("ag3") != null);
+    try std.testing.expect(companion.lookup("g3weaver") != null);
+    try std.testing.expect(companion.lookup("weaverkit") != null);
+    try std.testing.expect(companion.lookup("g3weaverkit") == null);
+    try std.testing.expect(companion.lookup("t") == null);
+}
+
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
@@ -5689,6 +6013,131 @@ test "document mapper emits additionalProperties true fallback text fields" {
     try std.testing.expect((try reader.invertedIndex("skip.title")) == null);
 }
 
+test "document mapper honours explicit declarations under additionalProperties true" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true,"properties":{
+        \\  "body":{"type":"string","x-antfly-types":["text"]},
+        \\  "stored_only":{"type":"string","x-antfly-index":false},
+        \\  "attachment":{"type":"string","x-antfly-types":["blob"]},
+        \\  "notes":{"type":"array","items":{"type":"string","x-antfly-index":false}},
+        \\  "meta":{"type":"object","properties":{
+        \\    "label":{"type":"string"},
+        \\    "secret":{"type":"object","x-antfly-index":false,"properties":{"token":{"type":"string"}}}
+        \\  }}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "doc:1", .value =
+        \\{"_type":"doc","body":"zebrafish","stored_only":"xylophone","attachment":"aGVsbG8=","notes":["quince"],
+        \\ "undeclared":"quokka","meta":{"label":"lemur","secret":{"token":"walrus","extra":"yak"},"loose":"ibex"}}
+        },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    // Declared text fields and undeclared fields are indexed as before.
+    try std.testing.expect((try reader.invertedIndex("body")) != null);
+    try std.testing.expect((try reader.invertedIndex("undeclared")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.label")) != null);
+    try std.testing.expect((try reader.invertedIndex("meta.loose")) != null);
+
+    // Explicit declarations win over the open dynamic mapper.
+    try std.testing.expect((try reader.invertedIndex("stored_only")) == null);
+    try std.testing.expect((try reader.invertedIndex("stored_only.keyword")) == null);
+    try std.testing.expect((try reader.invertedIndex("attachment")) == null);
+    try std.testing.expect((try reader.invertedIndex("notes")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.secret.token")) == null);
+    try std.testing.expect((try reader.invertedIndex("meta.secret.extra")) == null);
+}
+
+test "document mapper skips unindexed subtrees for infer_types and dynamic rules" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object",
+        \\  "additionalProperties":true,"x-antfly-dynamic-indexing":{"mode":"infer_types"},
+        \\  "properties":{
+        \\    "count":{"type":"integer"},
+        \\    "hidden_count":{"type":"integer","x-antfly-index":false},
+        \\    "stored_only":{"type":"string","x-antfly-index":false},
+        \\    "tags":{"type":"object","additionalProperties":{"type":"string","x-antfly-types":["text","search_as_you_type"]},
+        \\      "properties":{"private":{"type":"string","x-antfly-index":false}}}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:1", .value =
+        \\{"count":7,"hidden_count":11,"stored_only":"2024-01-02T03:04:05Z","free":"ocelot",
+        \\ "tags":{"public":"gamma ray","private":"delta ray"}}
+        },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+    const segment = result.segment.?;
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    // Declared shorthand integers and undeclared fields keep their inferred
+    // projections; unindexed fields get neither text nor typed doc values.
+    try std.testing.expect((try reader.getSection("count", .typed_doc_values)) != null);
+    try std.testing.expect((try reader.invertedIndex("free")) != null);
+    try std.testing.expect((try reader.getSection("hidden_count", .typed_doc_values)) == null);
+    try std.testing.expect((try reader.invertedIndex("stored_only")) == null);
+    try std.testing.expect((try reader.getSection("stored_only", .typed_doc_values)) == null);
+
+    // The additionalProperties rule applies to undeclared members only.
+    try std.testing.expect((try reader.invertedIndex("tags.public")) != null);
+    try std.testing.expect((try reader.invertedIndex("tags.public._2gram")) != null);
+    try std.testing.expect((try reader.invertedIndex("tags.private")) == null);
+    try std.testing.expect((try reader.invertedIndex("tags.private._2gram")) == null);
+}
+
+test "document mapper honours x-antfly-index false without any schema-driven text" {
+    const alloc = std.testing.allocator;
+    // No declaration produces a text mapping, so the table indexes strings
+    // like a schema-less one; the unindexed declarations still hold.
+    const schema_json =
+        \\{"version":0,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{
+        \\  "count":{"type":"integer"},
+        \\  "hidden_count":{"type":"integer","x-antfly-index":false},
+        \\  "content":{"type":"string","x-antfly-index":false}
+        \\}}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    try std.testing.expect(!runtimeHasSchemaDrivenText(schema));
+
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var result = try buildTextSegmentFromDocumentsWithMetadata(alloc, &.{
+        .{ .key = "doc:1", .value = "{\"count\":7,\"hidden_count\":11,\"content\":\"xylophone\",\"title\":\"zebrafish\"}" },
+    }, text_analysis, schema);
+    defer result.deinit(alloc);
+    const segment = result.segment.?;
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("title")) != null);
+    try std.testing.expect((try reader.getSection("count", .typed_doc_values)) != null);
+    try std.testing.expect((try reader.invertedIndex("content")) == null);
+    try std.testing.expect((try reader.getSection("hidden_count", .typed_doc_values)) == null);
+}
+
 test "document mapper emits schema-present infer_types text fields" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
@@ -5973,6 +6422,26 @@ test "relational JSON cells have canonical physical bytes" {
     const right_row = try buildRelationalRowValueForSchemaFromParsedAlloc(alloc, right.value, table_schema);
     defer alloc.free(right_row);
     try std.testing.expectEqualSlices(u8, left_row, right_row);
+}
+
+test "relational UUID ingress shares canonical typed bytes and semantic hash" {
+    const alloc = std.testing.allocator;
+    const parsed = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var validator = try schema_api.CompiledTableValidator.takeParsed(alloc, parsed);
+    defer validator.deinit(alloc);
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    var upper = try PreparedRelationalWrite.init(alloc, "row", "{\"id\":\"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}\"}", validator, schema, &layout);
+    defer upper.deinit(alloc);
+    var lower = try PreparedRelationalWrite.init(alloc, "row", "{\"id\":\"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\"}", validator, schema, &layout);
+    defer lower.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &upper.semantic_hash, &lower.semantic_hash);
+    try std.testing.expectEqualSlices(u8, upper.packed_row, lower.packed_row);
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", upper.parsedValue().object.get("id").?.string);
 }
 
 test "sparse relational preparation preserves canonical hash order with one physical sort" {

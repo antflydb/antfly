@@ -382,13 +382,13 @@ pub const Pruner = struct {
         };
     }
 
-    fn sweepScopedUploads(self: *Pruner, namespace: []const u8, retired_before: u64, retained: *const std.StringHashMapUnmanaged(void), cancellation: @import("../../common/cancellation.zig").CancellationToken) !usize {
+    fn sweepScopedUploads(self: *Pruner, namespace: []const u8, retired_before: u64, retained: *const std.StringHashMapUnmanaged(void), cancellation: @import("antfly_cancellation").CancellationToken) !usize {
         const Sweep = struct {
             artifacts: *artifacts_mod.ArtifactStore,
             retained: *const std.StringHashMapUnmanaged(void),
             retired_before: u64,
             deleted: usize = 0,
-            cancellation: @import("../../common/cancellation.zig").CancellationToken,
+            cancellation: @import("antfly_cancellation").CancellationToken,
 
             fn visit(ptr: *anyopaque, scope: scoped_artifacts.UploadScope, id: []const u8) !void {
                 const self_: *@This() = @ptrCast(@alignCast(ptr));
@@ -625,7 +625,7 @@ test "serverless retention follows graph root reachability across publication an
     var reads: u64 = 10 * 1024 * 1024;
     var writes: u64 = 10 * 1024 * 1024;
     var pages: graph_page_store.PageStore = .{ .attempt = @splat(1), .domain = graph_page_store.PageStore.namespaceDomain("docs"), .artifacts = &artifacts, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
-    const value = [_]u8{42} ** 16000;
+    const value = @as([16000]u8, @splat(42));
     var roots: [3]graph_page_root = undefined;
     roots[0] = .{ .domain = pages.domain, .nodes = 6, .edges = 0, .page = try tree.apply(alloc, pages.store(), null, &.{
         .{ .key = "a", .value = &value }, .{ .key = "b", .value = &value },
@@ -663,7 +663,7 @@ test "serverless retention follows graph root reachability across publication an
     var pruner = Pruner.init(alloc, &artifacts, &manifests, &progress, &wal);
     var unix: u64 = 100;
     pruner.read_lease_clock = .{ .ptr = &unix, .unix_fn = struct {
-        fn read(ptr: *const anyopaque) u64 {
+        pub fn read(ptr: *const anyopaque) u64 {
             return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
         }
     }.read };
@@ -809,7 +809,7 @@ test "serverless retention snapshots HEAD before concurrent publication and fail
         fn delete(ptr: *anyopaque, namespace: []const u8, version: u64) !void {
             return state(ptr).manifests.deleteVersion(namespace, version);
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         const vtable: manifest_mod.ManifestStore.VTable = .{
             .deinit = deinit,
             .put = put,
@@ -916,7 +916,7 @@ test "serverless retention never sweeps recreated candidate artifacts or deletes
         fn remove(ptr: *anyopaque, ns: []const u8, version: u64) !void {
             return state(ptr).manifests.deleteVersion(ns, version);
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         const vtable: manifest_mod.ManifestStore.VTable = .{
             .deinit = deinit,
             .put = put,

@@ -15,12 +15,18 @@
 //! Production API surface shared by runtime entry points.
 //!
 //! Keep test harnesses and whole-module compile assertions in `mod.zig`; a
-//! production runtime importing this facade must not pull `e2e.zig` or another
+//! production runtime importing this facade must not pull `integration_test.zig` or another
 //! command runtime into its potential dependency graph.
 
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
+pub const restore_owner = @import("restore_owner.zig");
+pub const restore_parent_activation = @import("restore_parent_activation.zig");
+pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
+pub const row_policy_install = @import("row_policy_install.zig");
+pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
+pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
@@ -78,7 +84,7 @@ pub const MemoryLimitSource = provisioned_storage.MemoryLimitSource;
 pub const ProvisionedTableReadCache = table_reads.ProvisionedTableReadCache;
 pub const ProvisionedTableReadSource = table_reads.ProvisionedTableReadSource;
 pub const GroupVisibleRootGenerationSource = table_reads.GroupVisibleRootGenerationSource;
-pub const HAReadGate = table_reads.HAReadGate;
+pub const HotStandbyReadGate = table_reads.HotStandbyReadGate;
 pub const backend_current_root_generation = table_reads.backend_current_root_generation;
 pub const HostedProvisionedTableReadSource = table_reads.HostedProvisionedTableReadSource;
 pub const DistributedCandidateSource = distributed_candidate_source.DistributedCandidateSource;
@@ -87,6 +93,7 @@ pub const TableWriteSource = table_writes.TableWriteSource;
 pub const BoundTableWriteSource = table_writes.BoundTableWriteSource;
 pub const ProvisionedTableWriteCache = table_writes.ProvisionedTableWriteCache;
 pub const ProvisionedTableWriteSource = table_writes.ProvisionedTableWriteSource;
+pub const InitialChildRetirementObservation = table_writes.InitialChildRetirementObservation;
 pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTableWriteSource;
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = kernel_bridge.ApiHttpServer;

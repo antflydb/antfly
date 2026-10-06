@@ -50,8 +50,8 @@ The server topology remains Antfly Standalone.
 The implementation now consists of:
 
 - `pkg/antfly-embedded` exposes a standalone embedded package.
-- `pkg/antfly/src/embedded/db.zig` wraps the high-level DB surface.
-- `pkg/antfly/src/embedded/api.zig` exposes JSON-oriented helpers for batch,
+- `pkg/antfly-embedded/src/engine/db.zig` wraps the high-level DB surface.
+- `pkg/antfly-embedded/src/engine/api.zig` exposes JSON-oriented helpers for batch,
   lookup, scan, search, stats, indexes, enrichments, capabilities, and
   `runUntilIdle`.
 - `storage/db/db.zig` already supports open modes such as writer,
@@ -59,14 +59,29 @@ The implementation now consists of:
 - `storage/lite/native.zig` owns the native revision-3 header, alternating checkpoint roots,
   page allocation, free map, crash recovery, integrity checks, stable snapshots,
   and atomic vacuum replacement. Document commits publish a namespace-head
-  directory and per-namespace page links in the same checkpoint, so a cold
-  table snapshot walks that table's history rather than the global document
-  log. Namespace-head updates are append-only deltas backed by an in-memory
-  materialized directory; a full directory snapshot is emitted every 256
-  deltas. This makes the normal commit cost proportional to the namespaces
-  touched by the transaction instead of every namespace in the database while
-  bounding cold-open replay. The checkpoint links the directory delta and
-  document pages atomically. Normal commits remain append-only; explicit vacuum
+  directory and per-namespace page links in the same checkpoint for mutation
+  and integrity bookkeeping. Materialized document snapshots seek the pinned
+  live-key index, group record references by physical page, and reuse a record
+  reader, so reads scale with live pages rather than overwritten history or
+  key-to-page disorder. Output keys are allocated once through the caller's
+  allocator and transferred from the cursor; results remain in key order. Namespace heads use a copy-on-write catalog B+ tree, so updates and
+  cold writes touch only the requested namespaces and their tree paths. Batches
+  collect distinct namespaces, share a sorted tree traversal to resolve their
+  heads, and group record references by physical page before decoding them.
+  Tracking memory scales with distinct namespaces rather than document count;
+  one-namespace batches retain the point-lookup fast path. Tiny
+  directories (at most 32 namespaces fitting one page) retain the existing
+  inline snapshot encoding without extra tree pages. Their bounded cache retains
+  namespace keys across mutations, reserving new ownership before checkpoint
+  publication and updating heads without allocation afterward. Promotion and
+  rollback invalidate the cache. Larger legacy snapshot/
+  delta directories migrate atomically on their next document mutation; new
+  large directories and vacuum output build the index directly. Old pinned
+  checkpoints retain their original layout. Both layouts use existing v3 page
+  kinds; this binary reads packed and unpacked v3 files without an offline
+  conversion. Older binaries that lack indexed namespace-directory support
+  may reject namespace operations on promoted files. The checkpoint publishes
+  namespace heads and document pages atomically. Normal commits remain append-only; explicit vacuum
   reclaims superseded pages without putting a reachability walk on the write
   path. Each checkpoint also pins a copy-on-write ordered B+ tree mapping every
   live logical document key to its newest document page. Deletes remove keys
@@ -84,7 +99,13 @@ The implementation now consists of:
 - `storage/lite/docstore.zig` provides ordered document transactions, pinned
   snapshots, replay lanes, and prefix-bounded logical namespaces. Point reads
   and ordered seeks traverse the checkpoint's disk-resident B+ tree in
-  `O(log N)` pages. A cursor retains one decoded root-to-leaf path, its current
+  `O(log N)` pages. Warm point reads binary-search validated immutable page
+  views instead of rescanning every slot. Encoded bytes and decoded offsets
+  share the page cache's byte budget and CLOCK eviction; active readers pin
+  evicted views until release, and their memory remains accounted. Page reuse,
+  rollback, and vacuum invalidate residency, and integrity checks bypass views
+  as well as encoded pages. Overflow keys use per-reader reusable scratch.
+  A cursor retains one decoded root-to-leaf path, its current
   key, and its current value, so sequential next/previous traversal is
   amortized `O(1)` and cold-scan memory remains bounded by tree height and the
   page cache rather than live-key count or document payload volume. Overflow
@@ -120,9 +141,10 @@ The implementation now consists of:
   references against the new generation; integrity checks prove that the
   referenced records remain reachable in the checkpoint. Updates retain encoded
   key references and resolve only comparison keys, including during splits.
-  A transaction-local tree editor decodes each visited node once and writes
-  each surviving changed node once at commit, avoiding intermediate tree
-  versions during catalog and document batches.
+  A transaction-local tree editor shares changed paths across catalog and
+  document batches. Sorted batches seal and release completed subtrees, keeping
+  the active frontier and adjacent rebalance siblings. Unsorted batches retain
+  their touched nodes until finalization. All pages remain private until commit.
   Deleting a catalog key removes it from the current tree using copy-on-write
   merging and redistribution. Historical records and older checkpoint roots
   remain intact, but retired filenames no longer accumulate directory-scan
@@ -170,10 +192,12 @@ The implementation now consists of:
   cold-written data normally.
   Native external-value writes encode directly into an operation-owned 64 KiB
   page buffer. Staged imports, buffered external values, appends, document chains,
-  and vacuum copies coalesce consecutive page IDs into positional writes;
-  fragmented free-page runs flush separately. Value-chain writers retain only
+  and vacuum copies stage pages by address and coalesce contiguous runs into
+  positional writes. When the buffer fills, it drains the earliest contiguous
+  run and retains later pages so late packed-record pages can fill their gaps.
+  Fragmented free-page runs flush separately. Value-chain writers retain only
   one next-page ID. A completed tree is flushed before its root can be read or
-  published. A failed flush admits no pages and poisons its batch; abort drops
+  published. A failed flush admits none of its requested pages and poisons its batch; abort drops
   pending bytes without an implicit retry. Cache policy is applied per page
   after a successful write.
   Positional page writes extend the file directly, without per-page stat or
@@ -226,6 +250,13 @@ antfly lite compact app.aflite
 antfly lite vacuum app.aflite
 antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
+
+A Lite database is provisioned with the default `full_text_index_v0`
+full-text index on creation, matching the server's table-create behavior,
+regardless of which surface creates it -- the CLI (`antfly lite init` /
+`antfly lite create`), the C ABI, and the native Go/Zig `embedded` package all
+share the same creation routine, so `antfly lite index create` is only needed
+for indexes beyond that default.
 
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
 and rejects an existing database path. Destructive replacement should stay on
@@ -606,7 +637,10 @@ Antfly Lite should match the familiar embedded database model:
 - Cross-process locking for the database path.
 - Read-only opens for tooling and inspection.
 - Clear `ANTFLY_BUSY` errors when another process or in-process write handle
-  owns the writer lock.
+  owns the writer lock, or an optional `busy_timeout_ms` wait for it.
+- Serialized threading within a process: one handle may be shared by any
+  number of threads, with reads running in parallel and alongside writes. See
+  `CAPI.md` "Thread Safety" for the per-call access classes.
 
 The CLI should expose this plainly:
 
@@ -766,15 +800,62 @@ unexpectedly start sending data to a network provider.
 
 #### Local Embedded Inference
 
-Local inference should be optional packaging:
+Local inference is built in, not optional packaging: every `libantfly`/
+`antfly lite` build embeds the standalone inference runtime in-process, the
+same as the `antfly` executable (see COMPILATION.md's "C API composition"
+section). There is no separate base/full build distinction -- `zig build
+capi` always links the inference archive (2026-09-17 product decision: Lite
+hosts get local inference without a separate runtime, at the cost of a much
+larger shared library).
 
-- `antfly lite` base build: database, search, vector indexes, no heavy model
-  runtime requirement.
-- `antfly lite` full build: bundled or dynamically available inference runtime.
-- Application embedding: caller links the inference runtime if wanted.
+Opening a Lite handle with the local-runtime-configured flag constructs an
+embedded inference provider owned by the handle and reports
+`local_inference_runtime: true` and `inference_mode: "local_embedded"`.
+Adding an `embeddings` index whose `embedder` (or chunker/extractor producer)
+uses `"provider": "antfly"` with no `api_url` runs against that embedded
+provider instead of failing or requiring a remote URL -- `antfly lite
+run-until-idle app.aflite` drains the resulting enrichment work locally, with
+no network calls. Application embedding (see `go/pkg/lite/README.md`
+for the Go binding) gets the same embedded behavior automatically by linking
+the standard `libantfly` -- no separate library or extra link flags.
 
-Local inference is important for demos and offline use, but it should not be
-required for the core embedded database.
+Models are still auto-discovered the same way as `antfly inference pull`,
+under `~/.antfly/inference/models/`.
+
+**Worker process.** GPU-hosted and driver-backed backends (Metal, CUDA, ONNX,
+PJRT) run model construction and, for Metal/CUDA/PJRT, execution itself in a
+separate, replaceable child process (`<worker executable> inference
+_worker`), not in the host process -- see
+`BackendRuntime.requiresProcessIsolation` in
+`zig/pkg/inference/src/backends/backends.zig`. This is crash containment, not
+an implementation accident: an unabortable driver call or a model load that
+corrupts GPU state can only be recovered by killing and respawning the
+process that made it, and that must never be the process embedding
+`libantfly`. Worker placement is decided per build, not per model: when any
+process-isolated backend is compiled in (Metal is on by default on macOS), the
+worker starts when a local-runtime handle opens and all local inference runs
+there, CPU models included. Only builds without those backends run inference
+in-process.
+
+The `antfly` CLI resolves the worker by re-executing itself (`argv[0]` names
+the `antfly` binary the user launched, which understands `inference
+_worker`). A library host has no such self -- `argv[0]` is the Go test
+binary, `examples/dogfood`, or whatever else linked `libantfly` -- so the
+runtime resolves the worker executable in this order:
+
+1. `ANTFLY_INFERENCE_WORKER`, an environment variable naming the worker
+   executable directly (typically the path to an `antfly` binary).
+2. The image this code was loaded from, via `dladdr`: for the statically
+   linked `antfly` executable this is itself (unchanged CLI behavior); for a
+   shared `libantfly`/`libantfly.dylib`, the runtime looks for a sibling
+   `antfly` binary in the same directory.
+3. `antfly` on `PATH`.
+
+If none of these resolve, model construction on a process-isolated backend
+fails with a clear error naming `ANTFLY_INFERENCE_WORKER`. Set that variable
+(or ship an `antfly` binary next to `libantfly`, or put one on `PATH`) when
+embedding Lite in a host that is not the `antfly` binary itself and needs
+Metal/CUDA/ONNX/PJRT models.
 
 #### Manual Maintenance
 
@@ -882,6 +963,10 @@ antfly lite serve
 
 The CLI should accept JSON request files that match the public API contracts.
 This keeps Lite compatible with normal Antfly examples, tests, and SDKs.
+`antfly lite index create` adds indexes beyond the default `full_text_index_v0`
+full-text index that every creation surface (CLI, C ABI, and embedded)
+already provisions, matching the server; it does not need to be run just to
+make text search work.
 
 ## Packaging
 
@@ -993,7 +1078,7 @@ query-visible results should match within documented index rebuild semantics.
 - Expose stable error-code names and descriptions for language bindings.
 - Provide a buffer free-and-zero helper for generated bindings while retaining
   the raw pointer/length free function.
-- Add Go as the first post-Zig/C binding in `go/pkg/antflylite`, backed by the
+- Add Go as the first post-Zig/C binding in `go/pkg/lite`, backed by the
   stable C ABI and gated C-library smoke tests.
 - Freeze the Lite open options and capabilities response.
 
@@ -1046,13 +1131,23 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native v3 now has two explicit signatures: `AFLITE\x03N` for the original
-unpacked encoding and `AFLITE\x03P` for packed records. New files use the packed
-encoding. Existing unpacked v3 files remain readable and writable without
-conversion; explicit vacuum writes a packed replacement. Revision 2 remains
-unsupported. Older binaries reject the packed signature before checkpoint
-selection, preventing an older reader from silently selecting a pre-packing
-fallback checkpoint. A packed file requires a binary supporting this encoding.
+Native owners create revision-4 files (`AFLITE\x04P`) with packed records and
+durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
+unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
+owners migrate revision 3 through an atomic compact-generation replacement;
+read-only opens preserve the existing encoding. The Zig `page_reuse = false`
+option preserves revision-3 creation/open behavior. Raw native primitives also
+retain their revision-3 default for compatibility. Revision 2 remains unsupported,
+and older binaries reject the revision-4 signature before checkpoint selection.
+
+Revision 4 removes historical record chains. Ordered indexes identify live
+records; journaled ownership counters and a hierarchical bitmap replenish free
+pages through incremental retirement. Shared values and packed slots retire
+independently, behind recovery, durability, and reader fences. Page reuse remains
+enabled when optional physical shrinking is disabled. Shrinking rewrites a
+compact generation independently of routine reuse. See the
+[reclamation design](../docs/design/lite-reclamation.md) for policy options,
+storage admission, format encoding, memory costs, and qualification.
 
 Small records in multi-key transactions share immutable record pages. A tagged
 reference identifies a physical page and a validated record offset; large
@@ -1063,8 +1158,9 @@ accounting. Record and index writes coalesce in bounded page-write buffers.
 
 Write transactions maintain one ordered pending-key index. Point reads and
 cursors use that index directly, and commit emits only each key's final mutation.
-Earlier value versions remain alive until transaction teardown because `get`
-returns borrowed values. Sorted multi-reads visit each relevant index node once,
+Each pending key has one active value. Replacements release unborrowed values
+immediately; versions returned by `get` or `getManySorted` remain owned until
+transaction teardown. Cursor copies have their own lifetime. Sorted multi-reads visit each relevant index node once,
 then order record references by physical page so a packed page is read and
 checksummed once for all requested records on it. Result order remains the
 caller's key order; missing keys and duplicate requests retain their semantics.
@@ -1106,9 +1202,13 @@ four frontier slots are occupied flushes private state without publishing or
 ending the transaction. These changes retain
 the revision-3 encoding and immutable checkpoint semantics.
 An already assembled large batch is consumed synchronously from the caller's
-buffers with one index edit, avoiding another owned staging copy. Its existing
-batch editor uses scratch proportional to the supplied batch; the 1,024-key /
-1 MiB bounds apply to mutations retained across calls.
+buffers with one index edit, avoiding another owned staging copy. Sorted updates
+retain a bounded tree frontier, including deletion-rebalance neighbors, rather
+than every touched node. Sorted initial document batches stream each key's
+last mutation directly into the bulk index builder, preserving tombstones and
+last-write-wins semantics without retaining all index entries. Unsorted batches
+retain scratch proportional to their size; the 1,024-key / 1 MiB bounds apply
+to mutations retained across calls.
 Reaching either staging limit flushes privately without ending the transaction;
 abort discards all flushed and pending changes together.
 
@@ -1151,7 +1251,7 @@ Compaction releases the namespace registry lock after its initial sync barrier.
 Secret metadata enumeration also uses a scope-bounded catalog cursor. It does
 not materialize unrelated private metadata or encrypted values from other scopes.
 
-Run `zig build lite-native-benchmark -Doptimize=ReleaseSafe` for the reproducible
+Run `zig build lite-native-benchmark -Doptimize=safe` for the reproducible
 transaction-assembly, commit, and sorted-read workloads. Timings are observations;
 structural tests enforce page-read, write-call, memory, and correctness bounds.
 
@@ -1239,3 +1339,118 @@ read of a 4 MiB index file now rejects with three logical reads and no payload
 allocation; previously it allocated the whole payload and performed 1,053 reads.
 These measurements disable page caching; regressions enforce memory and I/O
 bounds, pinned snapshot semantics, and rollback after private deletion flushes.
+
+Large document and index values share a checksum-checked chunk reader for
+linked chains and extent trees. A 64 KiB positional-read window coalesces nearby
+value pages. Extent reads coalesce only physically contiguous references within
+the requested range; linked chains grow read-ahead while page adjacency holds
+and reset it at gaps. Requested pages enter the shared cache according to its
+normal or metadata-only policy; unused prefetched pages are never admitted.
+Full reads allocate
+the returned value once and retain only bounded traversal state. Read windows
+remain tied to their pinned checkpoint and never cross its page-count bound.
+
+Follow-up measurements with page caching disabled: 64 blind overwrites of a
+256 KiB transaction value retain 262,363 bytes rather than 16,779,704 bytes.
+An 8 MiB document read uses three allocations and an index-file read uses two,
+down from 4,127 and 4,193 respectively. At 16,384 namespaces, updating one
+namespace uses 108,756 bytes of temporary heap and eight page writes rather
+than the previous periodic 1,627,634-byte / 102-page snapshot. Ordinary indexed
+updates trade the former five-page delta for eight pages to remove snapshot
+spikes and whole-directory cold loads. Tiny directories keep their original
+page layout. Regression tests bound allocation counts, physical value-read
+calls, hot/cold mutation heap, and page writes; timings are not assertions.
+
+Read regressions also bound bytes transferred for values assembled by small
+appends, not just the number of calls. A fragmented 1 MiB value now reads
+1,081,344 bytes through the value-page reader (including extent metadata,
+excluding catalog lookup and the root probe). Repeated small range reads need
+no value-page I/O after warming under the normal cache policy; metadata-only
+readers retain extent metadata while leaving payloads uncached. Across 200
+small document commits, the single-namespace path uses 3,621 allocations.
+Retaining the inline directory cache reduces the 32-namespace path from
+11,821 to 4,421. Failure sweeps cover directory-loading ownership and
+inline-cache preparation, including private publication followed by rollback.
+
+Batched namespace resolution reduces a 16,384-namespace update from 49,348
+logical page reads to 449 with caching disabled. Physical grouping keeps packed
+record reads bounded after interleaved namespace updates and a cold reopen.
+A sorted 65,536-document initial batch in one namespace uses 28,849 bytes of
+peak temporary native heap instead of 6,451,968 bytes. At 16,384 and 131,072
+documents it uses 22,347 and 28,879 bytes, excluding caller-owned input. Regressions cover read and
+heap bounds, repeated mutations in input order, missing namespaces, external
+index keys, pinned checkpoints, and allocation-failure rollback in packed and
+unpacked v3 files.
+
+Read-only index traversals retain validated page views and slot offsets rather
+than copying every inline key. Batch reads, namespace-head resolution, and
+cursors reuse buffers by tree depth; overflow keys are resolved lazily into
+bounded scratch buffers. Sorted batches advance from the previous separator
+and skip larger gaps with a bounded search. Record readers reuse their physical
+page buffers. Returned cursor keys and batch values remain independently owned;
+failed refills invalidate the active cursor path and permit a fresh seek.
+
+With 16,384 short-key documents and caching disabled, a one-key batch uses 13
+allocations instead of 279, a full batch uses 16,396 instead of 33,599, and an
+index cursor scan uses 16,391 instead of 33,385. After warming its traversal
+buffers, each seek allocates only its returned key. A one-document snapshot
+among 16,384 namespaces seeks the pinned document index: three logical reads,
+16 allocations, and 14,459 bytes of peak temporary heap, down from 255 reads,
+49,881 allocations, and 1,402,790 bytes. The cursor retains bounded traversal
+scratch and reads external values from the same checkpoint. Legacy indexed
+tombstones remain excluded. With one live key after 16,384 versions, a snapshot
+uses two reads and 11 allocations rather than 16,387 reads and 32,779 allocations.
+Arbitrary byte prefixes stop at the first nonmatching key. Regressions cover
+allocation bounds, dense and sparse overflow reads, packed and unpacked v3
+records, pinned roots, malformed pages, and allocation-failure recovery.
+
+Integrity coverage scans the index once and walks history newest first. It stores
+hash buckets of record references, resolving every candidate collision with a
+complete key comparison, and requires each indexed reference to name the newest
+record for its key. Missing live keys, stale references, extra entries, and
+legacy tombstone references retain their existing validation rules. History,
+namespace-link, and leaf-record audits reuse packed-page readers while checks
+continue bypassing the page cache to validate on-disk checksums.
+
+With caching disabled and 16,384 short-key documents, complete integrity checks
+use 1,279 logical reads instead of 98,811. With 16,384 distinct namespaces, they
+use 2,127 instead of 164,780. Neither workload performs per-record point probes.
+These bounds describe the packed, ordered fixtures; overwritten or physically
+scattered history can require additional record reads for exact comparisons.
+
+Sorted document updates use 98,923 bytes of peak temporary native heap at 16,384
+documents, 209,341 at 65,536, and 210,033 at 131,072, down from 3,274,182,
+14,251,272, and 26,493,930 respectively. Caller-owned input is excluded. Per-node
+ownership, geometric reclamation of dead arena allocations, and retention of
+rebalance neighbors keep update and delete scratch tied to the frontier.
+Private pages are flushed before a rebalance rereads them; ordinary frontier
+advances preserve packed-record filling and buffered writes. Regressions cover
+sparse-write bounds, multi-level deletion, mixed inline/overflow keys, duplicate
+mutations, pinned roots, packed/unpacked v3, collision handling, allocation
+failures, and rollback after partial writes.
+
+The bounded page-addressed buffer also preserves coalescing across streamed
+index nodes and late packed-record pages. For 65,536 sorted document updates,
+page-write calls fall from 1,203 to 83 while 1,221 written pages and 411 reads
+remain unchanged. For catalog updates, calls fall from 1,223 to 99 with 1,434
+written pages unchanged. Regressions cover out-of-order pages, duplicate
+staged addresses, partial-run failures without cache admission, sorted initial
+ingest under a 512 KiB native heap budget, and pinned snapshots after overwrites.
+
+Document, catalog, namespace, and vacuum record writers share reusable encoding
+scratch owned by their page allocator. The bulk builder copies inline leaf keys
+into one fixed page-sized slab; parent separators retain independent ownership
+before that slab is reused. A sorted 65,536-document ingest now makes 858 native
+allocations rather than 131,928, excluding caller-owned input. At 16,384 documents
+it makes 238 rather than 33,004. Peak scratch remains bounded by page size and
+tree height; packed and unpacked revision-3 layouts are unchanged.
+
+Materialized snapshots retain one temporary reference per indexed result, group
+records by physical page, and sort the owned output back into key order. On a
+65,536-document fixture inserted out of key order with caching disabled, reads
+fall from 65,945 to 1,181 and allocations from 196,640 to 131,120. The ordered
+fixture also takes 1,181 reads. Metadata storage scales with the requested live
+result set, never its historical versions; legacy indexed tombstones are filtered
+before returning. Regressions cover allocation churn, scattered pages, distinct
+file/output allocators, pinned external values, mixed tombstones, and exhaustive
+allocation-failure cleanup.

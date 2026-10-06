@@ -2,13 +2,14 @@ SHELL := /bin/bash
 ZIG_MAKE := $(MAKE) -C ./zig
 ZIG_BUILD_FLAGS ?=
 SCRIPTS_PY ?= uv run --project scripts --locked python
+
 # ====================================================================================
 # Go Version Configuration
 # ====================================================================================
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 GO_MODULES := \
-	./go/pkg/antflylite \
+	./go/pkg/lite \
 	./go/pkg/sdk \
 	./go/pkg/proxy \
 	./go/pkg/operator \
@@ -102,6 +103,7 @@ generate: graph-identifier-generate build-docs tidy
 		(cd $$mod && $(GO) generate ./...) || exit 1; \
 	done
 	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate
+	cd ts/apps/model-explorer && node --experimental-strip-types generator/index.ts
 	$(MAKE) -C ./py/packages/sdk generate
 	$(MAKE) build-antfarm
 
@@ -368,3 +370,14 @@ sdk-test: ## Run SDK tests
 
 sdk-lint: ## Run SDK linter
 	(cd ./go/pkg/sdk && $(GO) vet ./...)
+
+# Explicit SQL extraction audits; intentionally outside default build/test gates.
+.PHONY: sql-parity-inventory-check sql-parity-evidence-check sql-parity-release-check
+sql-parity-inventory-check:
+	python3 scripts/check_sql_parity_inventory.py
+
+sql-parity-evidence-check:
+	python3 scripts/check_sql_parity_inventory.py --evidence
+
+sql-parity-release-check:
+	python3 scripts/check_sql_parity_inventory.py --release

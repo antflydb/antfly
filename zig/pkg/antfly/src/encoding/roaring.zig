@@ -14,7 +14,7 @@
 
 //! Roaring Bitmap: compressed bitmap for document ID sets.
 //!
-//! Compatible with the roaring bitmap format used by bleve/zapx for posting lists.
+//! Compatible with the standard roaring bitmap serialization; used for posting lists.
 //! Uses SIMD (@Vector(8, u64)) for bulk bitwise operations on bitmap containers.
 //!
 //! Roaring bitmaps partition the 32-bit space into 16-bit "chunks" (high 16 bits).
@@ -38,7 +38,7 @@ const Container = union(enum) {
     array: std.ArrayListUnmanaged(u16),
     bitmap: []u64, // always bitmap_words long
 
-    fn deinit(self: *Container, alloc: Allocator) void {
+    pub fn deinit(self: *Container, alloc: Allocator) void {
         switch (self.*) {
             .array => |*a| a.deinit(alloc),
             .bitmap => |b| alloc.free(b),
@@ -498,7 +498,7 @@ fn andNotContainers(_: Allocator, self: *Container, other: *const Container) voi
 
 fn cloneContainer(alloc: Allocator, src: *const Container) !Container {
     return switch (src.*) {
-        .array => |*a| .{ .array = .{ .items = try alloc.dupe(u16, a.items), .capacity = a.items.len } },
+        .array => |*a| .{ .array = .{ .items = try alloc.dupe(u16, a.items), .capacity = a.items.len, .pointer_stability = .{} } },
         .bitmap => |b| .{ .bitmap = try alloc.dupe(u64, b) },
     };
 }
@@ -788,19 +788,19 @@ pub const RoaringBitmap = struct {
         var pos: usize = 0;
 
         // Num containers
-        buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, @as(u16, @intCast(n))));
+        buf[pos..][0..2].* = @bitCast(@as(u16, @as(u16, @intCast(n))));
         pos += 2;
 
         // Keys
         for (self.keys.items) |k| {
-            buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, k));
+            buf[pos..][0..2].* = @bitCast(@as(u16, k));
             pos += 2;
         }
 
         // Cardinalities (stored as card - 1)
         for (self.containers.items) |*c| {
             const card: u16 = @intCast(c.cardinality() - 1);
-            buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, card));
+            buf[pos..][0..2].* = @bitCast(@as(u16, card));
             pos += 2;
         }
 
@@ -809,13 +809,13 @@ pub const RoaringBitmap = struct {
             switch (c.*) {
                 .array => |*a| {
                     for (a.items) |v| {
-                        buf[pos..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, v));
+                        buf[pos..][0..2].* = @bitCast(@as(u16, v));
                         pos += 2;
                     }
                 },
                 .bitmap => |b| {
                     for (b) |word| {
-                        buf[pos..][0..8].* = @bitCast(std.mem.nativeToLittle(u64, word));
+                        buf[pos..][0..8].* = @bitCast(@as(u64, word));
                         pos += 8;
                     }
                 },
@@ -1039,6 +1039,7 @@ fn shiftArrayContainer(alloc: Allocator, items: []const u16, low_offset: u16) !S
                 .array = .{
                     .items = try alloc.dupe(u16, items),
                     .capacity = items.len,
+                    .pointer_stability = .{},
                 },
             },
         };

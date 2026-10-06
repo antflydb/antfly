@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 //go:generate go tool oapi-codegen --config=cfg.yaml ../../../openapi.yaml
+//go:generate go run ./internal/gensqlpolicy
 
 package sdk
 

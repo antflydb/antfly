@@ -31,6 +31,10 @@ class GraphPathEdge:
             type_ (str): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is
                 the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
             weight (float): Finite durable edge weight. max_weight_product paths further require values in [0,1].
+            edge_id (str | Unset): Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this
+                graph index, owning document, and endpoint/type tuple.
+            owner_document (str | Unset): Owning fact document key in the graph index table when it differs from the logical
+                source. The document is the authority for replay and deletion.
             metadata (GraphPathEdgeMetadata | Unset):
     """
 
@@ -39,6 +43,8 @@ class GraphPathEdge:
     direction: GraphPathEdgeDirection
     type_: str
     weight: float
+    edge_id: str | Unset = UNSET
+    owner_document: str | Unset = UNSET
     metadata: GraphPathEdgeMetadata | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -51,6 +57,10 @@ class GraphPathEdge:
         type_ = self.type_
 
         weight = self.weight
+
+        edge_id = self.edge_id
+
+        owner_document = self.owner_document
 
         metadata: dict[str, Any] | Unset = UNSET
         if not isinstance(self.metadata, Unset):
@@ -67,6 +77,10 @@ class GraphPathEdge:
                 "weight": weight,
             }
         )
+        if edge_id is not UNSET:
+            field_dict["edge_id"] = edge_id
+        if owner_document is not UNSET:
+            field_dict["owner_document"] = owner_document
         if metadata is not UNSET:
             field_dict["metadata"] = metadata
 
@@ -88,6 +102,10 @@ class GraphPathEdge:
 
         weight = d.pop("weight")
 
+        edge_id = d.pop("edge_id", UNSET)
+
+        owner_document = d.pop("owner_document", UNSET)
+
         _metadata = d.pop("metadata", UNSET)
         metadata: GraphPathEdgeMetadata | Unset
         if isinstance(_metadata, Unset):
@@ -101,6 +119,8 @@ class GraphPathEdge:
             direction=direction,
             type_=type_,
             weight=weight,
+            edge_id=edge_id,
+            owner_document=owner_document,
             metadata=metadata,
         )
 

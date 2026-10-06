@@ -14,7 +14,6 @@
 
 //! Chunked integer coder using StreamVByte encoding.
 //!
-//! Wire-compatible with zapx's streamVByteChunkedIntCoder/Decoder.
 //! Supports all chunk formats: legacy varint, StreamVByte, StreamVByte+delta, and columnar.
 //!
 //! Data is divided into chunks (default 1024 docs) with an offset table for
@@ -24,7 +23,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const svb = @import("streamvbyte.zig");
 
-/// Chunk format byte values (wire-compatible with zapx).
+/// Chunk format byte values.
 pub const ChunkFormat = enum(u8) {
     varint = 0x00, // Legacy varint encoding
     stream_vbyte = 0x01, // StreamVByte encoding
@@ -80,7 +79,6 @@ fn writeUvarint(buf: []u8, value: u64) usize {
 // ============================================================================
 
 /// Encodes integers using StreamVByte within chunks.
-/// Wire-compatible with zapx's streamVByteChunkedIntCoder.
 /// Controls which chunk format the encoder uses.
 pub const EncoderMode = enum {
     /// Columnar format (0x03) for location data with delta-encoded starts/ends.
@@ -169,7 +167,7 @@ pub const ChunkedIntEncoder = struct {
         }
     }
 
-    /// Flush using columnar format (format 0x03) - matches zapx's closeColumnar.
+    /// Flush using columnar format (format 0x03).
     fn flushChunkColumnar(self: *ChunkedIntEncoder) !void {
         const vals = self.chunk_values.items;
 
@@ -227,7 +225,7 @@ pub const ChunkedIntEncoder = struct {
         const start_len = self.final.items.len;
 
         // Format byte
-        try self.final.append(self.alloc, @intFromEnum(ChunkFormat.columnar));
+        try self.final.append(self.alloc, @backingInt(ChunkFormat.columnar));
 
         // Header: numDocs, numLocs, numArrayPos
         var hdr_buf: [30]u8 = undefined;
@@ -280,7 +278,7 @@ pub const ChunkedIntEncoder = struct {
         const start_len = self.final.items.len;
 
         // Format byte
-        try self.final.append(self.alloc, @intFromEnum(ChunkFormat.stream_vbyte));
+        try self.final.append(self.alloc, @backingInt(ChunkFormat.stream_vbyte));
 
         // numValues, controlLen
         var hdr_buf: [20]u8 = undefined;
@@ -345,7 +343,6 @@ pub const ChunkedIntEncoder = struct {
 // ============================================================================
 
 /// Decodes StreamVByte-encoded chunks.
-/// Wire-compatible with zapx's streamVByteChunkedIntDecoder.
 pub const ChunkedIntDecoder = struct {
     data: []const u8,
     start_offset: u64,
@@ -734,7 +731,7 @@ test "ChunkedIntDecoder rejects inconsistent columnar cardinalities" {
     var header_pos: usize = 0;
     _ = try readUvarint(bytes, &header_pos); // numChunks
     _ = try readUvarint(bytes, &header_pos); // chunk offset
-    try std.testing.expectEqual(@as(u8, @intFromEnum(ChunkFormat.columnar)), bytes[header_pos]);
+    try std.testing.expectEqual(@as(u8, @backingInt(ChunkFormat.columnar)), bytes[header_pos]);
     header_pos += 1;
     _ = try readUvarint(bytes, &header_pos); // numDocs
     _ = try readUvarint(bytes, &header_pos); // numLocs

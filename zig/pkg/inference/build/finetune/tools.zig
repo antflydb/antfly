@@ -22,6 +22,14 @@ const gemma_lora_imports = &.{ .build_options, .ml, .inference_internal };
 
 pub const specs = [_]common.CommandSpec{
     .{
+        .name = "train-laya",
+        .root_source_file = "src/finetune/train/train_laya.zig",
+        .description = "Finetune native Laya typed decisions with resumable optimizer state and serving export",
+        .imports = &.{ .build_options, .inference_internal },
+        .native_link = .default,
+        .link_libc = true,
+    },
+    .{
         .name = "materialize-gliner25-adapter",
         .root_source_file = "src/finetune/tools/materialize_gliner25_adapter.zig",
         .description = "Materialize a verified GLiNER2.5 PEFT adapter with bounded immutable-source streaming",

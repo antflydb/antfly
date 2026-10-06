@@ -7,8 +7,8 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const cache_budget = @import("../common/cache_budget.zig");
-const query_cache = @import("../inference/query_embedding_cache.zig");
+const cache_budget = @import("antfly_cache_budget");
+const query_cache = @import("antfly_inference_query_embedding_cache");
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
@@ -59,8 +59,8 @@ pub const Scenario = struct {
         name ++ ".service-rate",
     };
 
-    const key_a: query_cache.Key = [_]u8{0xa1} ** 32;
-    const key_b: query_cache.Key = [_]u8{0xb2} ** 32;
+    const key_a: query_cache.Key = @as([32]u8, @splat(0xa1));
+    const key_b: query_cache.Key = @as([32]u8, @splat(0xb2));
 
     const cache_node = vopr.service_rate.Node{
         .id = vopr.id.stable(name, "node.cache-owner"),
@@ -147,7 +147,7 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             if (self.cache) |*cache| cache.deinit(&self.budget);
             if (self.service_rate_model) |*model| model.deinit();
             self.sim.deinit();
@@ -454,7 +454,7 @@ pub const Scenario = struct {
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
         const stats = if (state.cache) |*cache| cache.stats(&state.budget) else query_cache.Stats{};
-        try builder.addNamed(allocator, name ++ ".mode", if (state.mode) |mode| @as(i64, @intFromEnum(mode)) + 1 else 0);
+        try builder.addNamed(allocator, name ++ ".mode", if (state.mode) |mode| @as(i64, @backingInt(mode)) + 1 else 0);
         try builder.addNamed(allocator, name ++ ".compute-calls", @intCast(state.compute_calls));
         try builder.addNamed(allocator, name ++ ".results", @intCast(state.successful_results));
         try builder.addNamed(allocator, name ++ ".inflight", @intCast(stats.inflight));

@@ -1,0 +1,466 @@
+# Local storage and server replication boundary
+
+This refactor precedes the physical local-engine move into `antfly-embedded`
+(#953), which precedes the Apache/ELv2 licensing and release changes (#893).
+It preserves source locations and licenses. Raft and hot-standby runtime
+implementations remain server owned.
+
+## Ownership
+
+| Local storage | Server adapters |
+| --- | --- |
+| Atomic mutations and replay receipts | Raft entry dispatch and recovery coordination |
+| Durable publication outbox and retry ordering | Hot-standby log, slots, transport, and record matching |
+| Local apply, publication, and transition locks | Role, promotion, fencing, and standby selection |
+| Admission and publication callbacks | Remote durability policy, waits, and telemetry |
+| Background-work permission supplied by admission | Whether a particular role may run background mutations |
+
+`storage/db/replication_contract.zig` contains borrowed ports. Its write gate
+has borrowed, captured, and generation-pinned forms, without server role tags.
+The DB checks admission and asks whether background work is allowed. Captured
+admission equality is supplied by its adapter; opaque bytes are never compared
+because captures may contain padding or slices.
+
+A publication binding exposes three local requirements: synchronous completion,
+durable outbox retention, and preflight admission. The hot-standby adapter maps
+its policy to these requirements. Local storage never selects standbys or
+interprets acknowledgement policy. Publication and failure telemetry are
+callbacks into the adapter. `storage/hot_standby/durability_policy.zig` owns the
+server policy types.
+
+## Binding lifetime
+
+Bindings are copied into open options, caches, DB state, and deferred completion
+records. Their callback capture therefore stores configuration by value. It
+must not borrow a temporary adapter or depend on its own address. Captures may
+contain borrowed pointers and slices whose targets outlive every binding copy;
+they must not own resources requiring destruction.
+
+`BorrowedCapture` bounds the inline payload at 256 bytes with 16-byte alignment.
+Both encoding and decoding enforce these limits at compile time; debug builds also validate the captured type identity. Only the
+adapter that installed the callbacks interprets the payload. The hot-standby
+factory captures policy, wait context, and telemetry pointers; copying a binding
+preserves its configuration snapshot without an allocation or mutable global
+policy. Semantic equality belongs to the adapter.
+
+## Commit and recovery ordering
+
+Fail-closed preflight still runs under the publication lock before local commit.
+Mutation, replay receipt, and pending outbox writes remain atomic. Publication
+happens after local commit even when authority expires, so committed mutations
+do not disappear from the replication tail. Acknowledgement waits release the
+local apply and transition locks; successful completion reacquires the transition
+lock and checks admission again before acknowledging the client.
+
+Ordered transaction APIs use `OrderedApplyReceipt` and `AtOrderedReceipt` names.
+Raft entry dispatch remains in server adapters, which translate term/index into
+that receipt. The local store retains ordered receipt validation and atomic
+persistence; it does not implement consensus.
+
+Existing receipt keys, outbox keys, envelope versions, and binary encodings are
+unchanged. Historical `raft` provenance discriminants remain where they are
+part of existing serialized source-authority and artifact-position formats.
+The runtime error ABI preserves the existing corruption status identity.
+Direct local dispatch returns the generic receipt error; foreign runtime
+dispatch decodes the released canonical error name. Compatibility tests cover
+both paths without renumbering or renaming the wire detail.
+
+## Naming and enforcement
+
+Authored runtime helpers, types, and DataServer configuration use `hot_standby`,
+`hotStandby`, or `HotStandby`. Legacy `--ha-*` CLI aliases, serialized field
+names, persisted key strings, deprecated OpenAPI aliases and configuration keys,
+published ABI declarations and runtime status enum names, and established
+server error tags remain compatible. Comments referring to internal symbols
+follow the authored names; compatibility tests retain the legacy vocabulary
+they exercise.
+Raft keeps its own name in server coordination.
+
+The source boundary audit rejects both server imports and server policy fields
+in the local DB ports and commit integration. Tests cover copied policy captures,
+borrowed counters, policy-to-requirement mapping, admission generations,
+background-work permission, lock release during waits, final admission rechecks,
+and unchanged durable receipt encodings. Physical package moves and relicensing
+belong to the dependent PRs.
+
+New local mutation paths must use the same admission and publication ports.
+For example, entity-edge rewrite retains its local mutation/replay/outbox
+ordering and checkpoint barrier while using generic publication errors and
+completion hooks. The audit rejects legacy hot-standby publisher names in the
+local owner, so incoming server changes cannot silently restore that coupling.
+
+`unit-storage-test-audit` checks explicit test ownership before storage unit
+compilation. An adapter that acquires tests must be registered in
+`storage/test_manifest.zig`, even when focused tests already reach it through
+another import. The inventory and disjoint shard checks remain required.
+
+The focused storage gate validates caller filters against the combined local
+and server test inventories before dispatching to either owner. A filter may
+select just one owner; unknown filters still fail. The server's aggregate
+slice remains independent of filters intended for the local root.
+
+## Local maintenance requirements and external upload recovery
+
+Resolver retirement asks the promotion runtime for typed readiness while holding
+its catalog activity fence. Diagnostic status strings remain available to users
+but do not grant retirement authority. A pending publisher blocks retirement;
+a runtime without local publication ownership leaves server reconciliation free
+to remove its local resolver.
+
+Storage interprets historical source-authority records as local or ordered
+maintenance requirements. The persisted format, legacy ordered receipt fence,
+publication namespace, and corruption checks remain unchanged. DB maintenance
+uses these requirements without selecting a Raft role.
+
+`storage/artifact_upload_recovery.zig` owns upload polling cadence, idle detection,
+fairness, and queue admission cursors. A cheap borrowed dispatcher hook checks
+cadence before DB reads its bounded upload inventory. Storage releases the read
+snapshot before handing those facts to the owner; the owner releases its own
+mutex before queue admission. A refused proposal never advances its cursor.
+Explicit retries bypass periodic cadence. Durable exact-incarnation and progress
+checks remain in storage and are the only authority to retire upload bytes.
+
+## Producer scheduling, publication recovery, and TTL routing
+
+`storage/db/artifact_producer_scheduler.zig` owns volatile producer polling,
+single-flight admission, fairness cursors, and retry rounds. It is shared local
+maintenance, including native inference. DB supplies budgeted transactional work;
+it retains durable obligations, exact-generation checks, replay-journal append,
+and completion receipts. A scheduler cursor advances only after accepted work,
+and a restart rediscovers obligations from storage.
+
+`storage/db/publication_outbox_recovery.zig` owns the publication retry driver.
+Its borrowed port provides queue submission, probes, clocks, and fenced draining.
+The DB owner still drains queued work before destruction. Durable outboxes,
+startup publication barriers, and local append/acknowledgement ordering remain in
+storage. Retry deadlines never prove delivery or discharge an obligation.
+
+`storage/coordinated_ttl.zig` contains only local expiration observations and their
+borrowed callback. `storage/server_coordinated_ttl.zig` binds group routing and owns
+the bounded server queue. Stable cache-entry bindings synchronize route refreshes
+with callbacks without holding a routing lock across distributed work. C ABI
+adapters attach their existing group identity; the wire layout is unchanged.
+Storage retains timestamps, content digests, schema guards, and local deletion.
+
+Upload recovery is one optional dispatcher capability containing both cadence and
+recovery callbacks. Its integration regression uses the actual server runtime-hook
+factory and verifies refused periodic admission, cadence suppression, explicit
+retry, and the following maintenance opportunity against reopened upload state.
+
+## Visibility observations and child-range effects
+
+The DB emits `QueryVisibilityEvent` through a borrowed context and callback.
+`storage/server_query_visibility.zig` binds table, group, cache, and owner identity
+outside storage. The private C owner attaches its handle's existing routing
+identity when encoding the unchanged notification ABI. Detachment still waits
+for in-flight observations, and installing a hook still rehydrates durable repair
+state. An observer that needs local DB access borrows it through its own context.
+
+`storage/db/document_child_range_effects.zig` partitions prepared generated effects
+against local manifest snapshots and physical key bounds. A pure, bounded
+selection callback supplies a destination; planning does not inspect server role
+or placement status. `storage/server_document_child_range.zig` interprets committed
+server placement. Delivery adapters retain live routing and transport admission
+checks after the local apply fence is released.
+
+`document_child_range_manifest.zig` owns child-range decoding and allocation
+cleanup. `document_child_range_outbox.zig` owns intent encoding, staging, and
+delivery iteration. DB supplies fenced manifest reads, snapshot scans, and intent
+deletion. Local effects and staged intents still commit in the same batch; an
+intent is deleted only after successful delivery. The version-one record and
+persisted destination remain compatible. Allocation failure cannot transfer only
+part of a record's key/value ownership.
+
+## Local recovery and maintenance owners
+
+`storage/db/portable_activation_recovery.zig` owns activation queue admission,
+retry jitter, supervisor probes, the running flag, and permanent close state.
+Its stable borrowed port invokes DB's fenced catalog activation. The completion
+handshake and runtime owner drain protect the DB and callback context through
+shutdown, including a supervisor probe claimed before close.
+
+`storage/db/quarantine_recovery.zig` owns index-load retry registration and joining.
+DB supplies load-failure observation and its fenced retry operation. A completed
+cohort is joined before another cohort can be scheduled; close permanently
+rejects new registration. These are embedded self-healing mechanisms and have
+no server coordination dependency.
+
+`storage/db/independent_maintenance.zig` owns bounded operation order, retry
+suppression, active/idle and source-scan cadence, scheduler registration, and
+shutdown. DB supplies local activity and the budgeted, fenced operations. Runtime
+awake time controls repair retry deadlines; relational-index activity retains its
+existing clock. Activation contention yields the turn without increasing repair
+backoff. Other repair errors leave relational maintenance able to progress.
+
+Publication recovery snapshots its diagnostic counter and publishes the next
+retry deadline before releasing its single-flight state. A successor admitted by
+a rearm callback cannot change the previous failure's report. Producer
+single-flight tests advance the clock while a page is active so cadence cannot
+hide missing admission protection.
+
+## Remaining local worker owners and server metadata
+
+`storage/server_group_metadata.zig` owns the server's group creation timestamp
+key and accessors. DB provides ordinary reads and writes without interpreting
+this server metadata. The existing key and decimal encoding remain unchanged;
+server status consumers attach their group identity in the adapter.
+
+`storage/db/graph_cleanup_owner.zig` owns scheduler registration, bounded polling
+cadence, and a permanent shutdown barrier. DB supplies write eligibility and one
+fenced graph cleanup page. A registration borrows the stable DB address until
+stop joins its callback outside the admission mutex.
+
+`storage/db/runtime_restart_owner.zig` owns restart admission, coalesced rerun
+requests, capped retry delay, and bounded durable-lane resubmission. Enrichment,
+text merge, and sparse compaction each have a separate owner. DB supplies desired
+state and a start attempt; enrichment runtime replacement remains protected by
+its lifecycle mutex, and structural mutations still govern paused runtimes.
+The durable owner lane drains before the borrowed context is destroyed.
+
+`storage/db/native_projection_owner.zig` owns wakeups, worker admission, retryable
+failure classification, and shutdown/join. Its stable AsyncContext supplies one
+publication round. Catalog pins, stable-tip/cardinality checks, snapshot admission,
+and durable checkpoint publication remain local storage operations. Shutdown
+joins outside the worker admission mutex; a stopped owner cannot be restarted.
+
+`storage/db/index_repair_scheduler.zig` owns the revision projection, exact runnable
+heap, fairness cursor, progress waits, and independent summary types. Durable
+repair checkpoints remain the authority. DB reconciles committed events under
+its scheduler mutex and executes selected fenced work. A revision gap still
+invalidates the projection; volatile progress hints cannot authorize publication.
+
+## Cleanup supervision, visibility lifetime, and local batching
+
+`storage/db/cleanup_job_owner.zig` owns repair-shadow and generated-artifact job
+admission, notification coalescing, bounded pages, retry delays, and queue yielding.
+IndexManager owns the shared admission atomics; the durable owner lane drains
+before either IndexManager or the borrowed operation context is destroyed. DB
+retains the actual cleanup page, catalog/snapshot/apply fences, durable cursors,
+and terminal filesystem finalization. Inline lanes yield after a bounded slice
+on errors, contention, and progress; an explicit maintenance request or reopen
+rediscovers the durable marker. Restart supervision uses the same inline-yield
+rule, keeping desired runtime state available for the next explicit request.
+
+`storage/db/query_visibility.zig` owns the local visibility event contracts and
+observer attachment, replay leases, in-flight callbacks, and detachment barrier.
+Callbacks run outside the attachment mutex. A replay lease protects the borrowed
+observer while DB reconstructs exact repair identity from durable checkpoints;
+no borrowed intent strings survive a notification. Existing DB type aliases and
+C notification layouts remain compatible. Detachment must be invoked outside
+that observer's own callback and joins outstanding callback and replay leases.
+
+`storage/db/source_pin_cleanup_owner.zig` owns fairness turns, retry deadlines,
+progress-sensitive backoff, and diagnostics. Source-pin intents, bounded deletion,
+and epoch fencing remain in the local storage reconciliation code. Work-unit
+counters allow an error after partial progress to retain a short retry delay.
+
+`storage/db/applied_sequence_coalescer.zig` owns watermark batching and owned
+index-name memory. DB retains checkpoint serialization and durable publication.
+The existing maximum-per-index rule and 100 ms cadence are unchanged; removing
+a pending item transfers its key ownership to the caller.
+
+The independent-maintenance shutdown regression waits for the stop critical
+section to release its mutex, with a bounded deadline. This distinguishes the
+normal flag-before-unlock handoff from a join-under-lock regression without
+leaving a callback borrowed past owner destruction.
+
+## Bulk sessions, target tracking, and schema reconciliation
+
+`storage/db/bulk_ingest_session.zig` retains direct-write bulk admission and the
+active-session statistic. The unused buffered staging map and recursive flush
+path have been removed. Writes and transforms still commit through ordinary
+batch execution before session finish. The public bulk-coalescing statistics
+layout is preserved; obsolete staging counters remain zero. Scratch mutation
+execution has no resident bulk session.
+
+`storage/db/target_advance_tracker.zig` owns process-local maintenance handoffs,
+stuck-index observations, warning cooldowns, their owned index names, and a
+mutex. Diagnostic snapshots own their names independently of later clears.
+Allocation failure rolls back an inserted map reservation. DB still verifies
+durable counters, generation identity, coverage, and publication authority before
+turning a handoff into a rebuild or repair intent. The abandoned dense-maintenance
+cooldown map and urgent-score setting were removed; the live warning cooldown
+setting remains supported.
+
+`storage/db/schema_reconcile_owner.zig` owns admission, coalesced publication
+reruns, queued execution, synchronous fallback, and permanent stop state. Movable
+and inline handles complete on the caller without retaining a callback context.
+Queue rejection uses the same caller fallback. DB supplies one reconciliation
+pass and keeps schema-version checks and durable building/failed/ready states.
+Close stops admission before draining the durable owner lane, which protects the
+borrowed DB and reconciliation owner until queued work completes.
+
+Server group-created timestamp persistence and schema-upgrade assertions belong
+to the server integration suite. Local relational tests preserve opaque internal
+metadata through ordinary storage operations and have no server metadata import.
+Enrichment runtime replacement and dense replay session ownership now have local
+owners, described below. Their provider leases and durable publication fences
+remain part of the embedded engine closure.
+
+
+## Enrichment bundle and dense replay session ownership
+
+`storage/db/enrichment_runtime_owner.zig` owns the runtime and its append context
+as one bundle. Construction adopts moved providers only after runtime init
+succeeds; every later failure destroys the bundle exactly once. DB hydrates the
+resident security/execution capabilities and supplies callbacks for durable
+failure-envelope recovery and replay target selection. Replacement is serialized
+by an owner mutex even when transaction recovery is absent. The recovery provider
+borrow fence still encloses replacement when that runtime is present.
+
+A replacement is constructed before stopping the old worker. Its durable state
+is reloaded after that worker joins, before starting or publishing the replacement.
+Failure retains the original bundle and restores both active and pending restart
+demand. Paused replacement transfers ownership without starting the new worker.
+The existing DB and AsyncContext runtime/context fields are borrowed views;
+publication updates them under the lifecycle fence, and only the bundle destroys
+those allocations. Close drains background callbacks before bundle teardown.
+
+`storage/db/dense_catch_up_session_owner.zig` owns the token nonce, session map,
+owned index names, capture leases, snapshot replay leases, and active tracking.
+A failed registration leaves replay admission with the caller. Token/name checks
+fence stale finish and retain callbacks, and retaining admission under the map
+mutex allows an in-flight transaction to outlive token removal. DB retains the
+catalog and incarnation checks, dense-finish admission fence, resource accounting,
+native WAL commit, generation publication, and durable lifecycle checkpoints.
+Tracking transitions remain serialized by that dense-finish fence; callback drain
+precedes session-owner destruction.
+
+The merge-page regression uses direct bulk writes and checks committed copy
+cursors and receiver base rows across reopen, without fabricating retired staging
+state. Focused maintenance tests include provider replacement, token admission,
+allocation rollback, and both owner modules; normal test ownership is preserved.
+
+Constructor failure paths also unwind the runtime's lease adapter and owned
+identity before returning an error. Providers remain with the caller until
+construction succeeds, and cleanup does not release a pre-existing durable
+lease. Allocation-failure and corrupt persisted-status regressions exercise
+these ownership boundaries.
+
+## Admission and remaining local owners
+
+`storage/db/coalesced_job_admission.zig` defines the shared idle/active/dirty
+notification handshake used by restart and cleanup jobs. Failed compare-exchanges
+retry from the observed state, so an old worker retiring during notification
+cannot strand the new request. Operation-specific retry limits and shutdown
+remain in the job owners; durable work is still rediscovered from storage.
+
+`storage/db/dense_publication_admission.zig` owns replay and external-session
+admission, waiters, finalization requests, commit admission, deferred notification
+sequences and pending checkpoint names. Its profiled mutex remains available to
+DB's coordinator so local admission and durable publication use the existing
+critical sections. Optimistic projection construction leaves source admission
+open; only checkpoint commit closes it. DB retains catalog-incarnation checks,
+WAL commits, immutable-generation publication and apply/snapshot ordering.
+
+Schema reconciliation uses the same coalesced admission handshake as restart and
+cleanup jobs. Dense admission also owns finalization-pass handoff and pending
+checkpoint-name retirement; DB supplies the catalog eligibility predicate under
+the existing apply and admission fences. Pruning those volatile hints requires no
+temporary allocation and cannot discard durable publication work.
+
+`storage/db/local_runtime_owner.zig` owns stable allocation and destruction of
+resolution/promotion, TTL, transaction-recovery, text-merge, sparse-compaction and
+graph-metric runtimes.
+Callback contexts are adopted only after successful construction. Resolution's
+context has a separate retirement step: resolution drains first, promotion drains
+while that context remains alive, then the context is released. DB assembles the
+borrowed execution capabilities and coordinates this shutdown dependency graph.
+Transaction recovery bundles its stable identity/local contexts and releases
+identity-owned resources only after recovery and source publication have drained.
+
+`storage/db/embedding_activity_cache.zig` owns sample names, synchronization,
+pruning and generation/age retention. Cached telemetry remains readiness-neutral;
+DB supplies the authoritative current index set and optional live runtime sample.
+
+The visibility-hook routing guard covers the extracted `query_visibility.zig`
+definition as well as the legacy inline location, preventing server table/group
+identity or a DB pointer from becoming fields of the shared local hook.
+
+`storage/db/document_collectors.zig` owns synchronous document materialization,
+text projections and their retained output buffers over borrowed stores/managers.
+DB retains the source selection and publication fences. `result_collectors.zig`
+owns scan rows and enrichment arrays until their public result is fully assembled.
+Artifact conversion consumes its input on success and failure, including its
+first allocation; each entry is adopted only after its identity clone succeeds.
+A partially finished result releases transferred slices while the collector
+releases unfinished lists. Allocation-failure sweeps cover conversion and scan
+collection.
+
+`storage/db/managed_admission_owner.zig` owns requested/completed generations and
+single-flight drain admission. Each successful pass acknowledges only the demand
+captured before that pass; raced requests force another pass and failures retain
+pending demand. DB continues to own structural serialization, apply fencing and
+durable admission markers. Scheduler name lookups use directory methods while
+DB retains the existing control/scheduler lock ordering.
+
+`storage/db/publication_recovery_owner.zig` owns the retry registration's owner
+ID, immutable callback binding, durable jobs and maintenance probes. It binds
+only after DB reaches a stable address. Close permanently stops admission,
+disarms the probe, drains claimed callbacks through the runtime owner barrier,
+and waits for direct admission borrows before releasing their context. Retry
+policy remains in `publication_outbox_recovery.zig`; fenced scans, delivery
+acknowledgement and durable receipt deletion remain in DB. Empty outboxes can
+retain a probe to observe notifications from TTL callbacks.
+
+Public enrichment result builders reserve list capacity before constructing an
+owned entry. Generator configuration, planned requests, index-name lists,
+chunk-cache adoption and public artifact conversion each unwind their own
+partial allocations; only complete values transfer into the result collector.
+Allocation-failure sweeps cover both these owners and the real
+`DB.computeEnrichments` chunk/dense-provider path.
+
+`storage/db/result_collectors.zig` also owns public extraction arrays. Mapper
+outputs are cloned only after capacity is reserved, and final transfer adopts
+one array at a time into an unwindable result. Graph mutations use their
+canonical destructor, including edge IDs and producing-document identities.
+The mapper applies the same ownership rules before handing outputs to DB.
+
+`storage/db/materialized_sources.zig` collects chunk inputs over a borrowed
+store and pending-key indexes. Its deduplication map borrows keys owned by the
+source list. Both list and map capacity are reserved before adoption; pending
+writes and deletions suppress older stored rows. Invalid JSON remains an absent
+source, while allocation failure propagates instead of silently dropping it.
+
+`bulk_ingest_session.IdentityScratch` owns trusted identity proof state and
+seen document keys for both resident DB and borrowed mutation execution. Reset
+releases keys and proof state; failed batch adoption invalidates the proof.
+DB retains namespace eligibility, apply fencing and durable visibility summary
+publication. Direct bulk writes and legacy status fields retain their behavior.
+
+`storage/db/graph_restore_materialization.zig` owns parsed artifact/document
+caches and deterministic relation-page planning, including nested metadata
+rendering. A fully built replacement cache is adopted before the prior one is
+released. DB retains source acquisition, graph generation validation, contender
+reconciliation and durable segment/manifest/cursor publication.
+
+`storage/db/status_projection.zig` owns status clones, destruction and persisted
+snapshot codecs. The existing v1/v2 formats and public fields are unchanged.
+DB retains locks, live snapshot acquisition, bounded runtime sampling and store
+reads/writes; retained telemetry cannot manufacture readiness authority.
+
+Allocation-failure regressions cover the real public extraction path, complete
+graph identities, pending and stored chunk sources, bulk proof scratch, graph
+page/cache ownership and status clones. Source and module boundary checks cover
+the extracted owners before their later physical package move.
+
+## Shared local mutation implementation and result ownership
+
+Local mutation execution now resides in `storage/db/local_mutation.zig` rather
+than aliasing implementations back into DB. A compile-time binding supplies
+borrowed local resource and codec types. The bounded recovery receiver owns
+invocation scratch, while the owning DB supplies resident scheduling and caller
+acknowledgement. Receipt/primary effects remain atomic, journal/outbox order and
+transition fencing are unchanged, and recovery retains its `.propose` sync policy.
+Prepared-row workers borrow pinned plans and release their regions under the
+same lifetime rules as foreground execution.
+
+Replay vector collectors own cloned identities and sparse numeric results in
+`replay_vector_collectors.zig`, with explicit borrowed payload lifetimes and
+original array lengths retained through tombstone compaction. Graph-field
+planning shares one transactional builder in `graph_field_plan.zig`; no partially
+published result survives an allocation error. Owned key insertion reserves
+capacity before cloning. Relational reader/session cleanup and artifact
+projection have local owners that receive admitted readers or a borrowed core,
+not a DB wrapper. These moves preserve source licenses and the public C ABI;
+physical placement under `antfly-embedded` remains a separate step.

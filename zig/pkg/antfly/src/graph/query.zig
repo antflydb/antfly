@@ -21,6 +21,7 @@
 //!   - k_shortest_paths: via paths.findKShortestPaths()
 
 const std = @import("std");
+pub const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
@@ -290,14 +291,14 @@ test "graph public operation names and edge filters stay unambiguous and bounded
     try std.testing.expect(!isValidIdentifier("author\u{202e}name"));
     try std.testing.expect(!isValidIdentifier("*"));
     try std.testing.expect(!isValidIdentifier("$query_results"));
-    try std.testing.expect(!isValidIdentifier("a" ** (max_identifier_bytes + 1)));
+    try std.testing.expect(!isValidIdentifier(&@as([max_identifier_bytes + 1]u8, @splat('a'))));
 
     try validateEdgeTypes(&.{ "cites", "related" });
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{""}));
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{ "cites", "cites" }));
-    const too_many = [_][]const u8{"edge"} ** (max_edge_types + 1);
+    const too_many = @as([max_edge_types + 1][]const u8, @splat("edge"));
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_many));
-    const too_large = [_][]const u8{"x" ** (max_edge_type_bytes + 1)};
+    const too_large = [_][]const u8{&@as([max_edge_type_bytes + 1]u8, @splat('x'))};
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_large));
 
     try std.testing.expectEqual(@as(usize, 101), resultCollectionLimit(100));
@@ -337,6 +338,7 @@ pub const ResultRef = struct {
 };
 
 pub const QueryParams = struct {
+    edge_filter: relationship_filter.Filter = .{},
     edge_types: []const []const u8 = &.{},
     direction: graph_mod.EdgeDirection = .out,
     max_depth: u32 = 1,
@@ -361,6 +363,10 @@ pub const graph_metric_projection_limit: usize = 16;
 pub const graph_metric_order_limit: usize = 8;
 pub const graph_metric_filter_limit: usize = 32;
 pub const graph_metric_dependency_limit: usize = 16;
+/// Query-seeded personalization resolves each seed key against the metric
+/// topology; bound the per-read seed set so request parsing and seed
+/// resolution stay proportional to the query, not the graph.
+pub const graph_metric_seed_limit: usize = 128;
 
 /// Backend-independent late-materialization plan. Names borrow the validated
 /// query; each stage is deduplicated and ordering remains user-defined.
@@ -384,15 +390,29 @@ pub const MetricReadPlan = struct {
     orders: Names = .{},
     projections: Names = .{},
     policies: [graph_metric_dependency_limit]graph_mod.GraphIndex.GraphMetricColumnReadPolicy = @splat(.{}),
+    /// Dependency-aligned personalization. A personalized dependency never
+    /// reads a published column, so it carries no publication policy; its
+    /// column is computed fresh from the current edge snapshot instead.
+    personalizations: [graph_metric_dependency_limit]?GraphMetricPersonalization = @splat(null),
 
     fn require(self: *@This(), name: []const u8, freshness: GraphMetricFreshness, published: bool) void {
+        const i = self.dependencyIndex(name);
+        self.policies[i].require_published = self.policies[i].require_published or published;
+        self.policies[i].require_fresh = self.policies[i].require_fresh or freshness == .fresh;
+    }
+
+    fn dependencyIndex(self: *const @This(), name: []const u8) usize {
         for (self.dependencies.slice(), 0..) |dependency, i| {
-            if (!std.mem.eql(u8, dependency, name)) continue;
-            self.policies[i].require_published = self.policies[i].require_published or published;
-            self.policies[i].require_fresh = self.policies[i].require_fresh or freshness == .fresh;
-            return;
+            if (std.mem.eql(u8, dependency, name)) return i;
         }
         unreachable;
+    }
+
+    pub fn personalizationFor(self: *const @This(), name: []const u8) ?GraphMetricPersonalization {
+        for (self.dependencies.slice(), 0..) |dependency, i| {
+            if (std.mem.eql(u8, dependency, name)) return self.personalizations[i];
+        }
+        return null;
     }
 
     pub fn init(query: GraphQuery) !MetricReadPlan {
@@ -401,16 +421,33 @@ pub const MetricReadPlan = struct {
         for (query.metrics) |metric| {
             plan.dependencies.append(metric.name);
             plan.projections.append(metric.name);
+            if (metric.seed_nodes.len != 0) {
+                plan.personalizations[plan.dependencyIndex(metric.name)] = .{
+                    .seed_nodes = metric.seed_nodes,
+                    .damping = metric.damping,
+                };
+                continue;
+            }
             plan.require(metric.name, metric.freshness, false);
         }
         for (query.order_by) |order| {
             plan.dependencies.append(order.name);
             plan.orders.append(order.name);
+            if (plan.personalizationFor(order.name) != null) {
+                // Ordering consumes the personalized column; a published
+                // policy here would silently mix global and seeded scores.
+                if (order.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+                continue;
+            }
             plan.require(order.name, order.freshness, true);
         }
         for (query.where_metric) |filter| {
             plan.dependencies.append(filter.name);
             plan.filters.append(filter.name);
+            if (plan.personalizationFor(filter.name) != null) {
+                if (filter.freshness != .fresh) return error.GraphMetricPersonalizationRequiresFresh;
+                continue;
+            }
             plan.require(filter.name, filter.freshness, true);
         }
         return plan;
@@ -453,14 +490,26 @@ pub const GraphQuery = struct {
     /// Query-wide row limit for canonical MATCH results. Shards may over-fetch
     /// to let the coordinator determine truncation accurately.
     return_limit: u32 = 0,
+    evaluation_output_limit: ?u32 = null,
     aggregates: []const NamedCountAggregate = &.{},
     include_documents: bool = false,
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
+    /// Fetch expression inputs independently of the final document projection.
+    defer_document_projection: bool = false,
     metrics: []const GraphMetricRead = &.{},
     order_by: []const GraphMetricOrder = &.{},
     where_metric: []const GraphMetricFilter = &.{},
     include_metric_status: bool = false,
+
+    pub fn documentRetrievalQuery(self: @This()) @This() {
+        var retrieval = self;
+        if (self.defer_document_projection) {
+            retrieval.fields = &.{};
+            retrieval.include_all_fields = true;
+        }
+        return retrieval;
+    }
 };
 
 pub const NamedCountAggregate = struct {
@@ -476,6 +525,22 @@ pub const GraphMetricFreshness = enum { published, fresh };
 pub const GraphMetricRead = struct {
     name: []const u8,
     freshness: GraphMetricFreshness = .published,
+    /// Query-seeded personalized PageRank: teleport mass restricted to these
+    /// node keys (uniform per seed). The column is computed at query time from
+    /// the current edge snapshot, so personalization requires freshness=fresh;
+    /// published generations are global-only and reads against them fail
+    /// closed. Seed keys absent from the graph are skipped, not errors.
+    seed_nodes: []const []const u8 = &.{},
+    /// Damping override for personalized reads. Null keeps the metric's
+    /// configured damping. Only valid together with seed_nodes.
+    damping: ?f64 = null,
+};
+
+/// Personalization parameters carried per read-plan dependency. Borrowed from
+/// the validated query like every other plan name.
+pub const GraphMetricPersonalization = struct {
+    seed_nodes: []const []const u8,
+    damping: ?f64 = null,
 };
 
 pub const GraphMetricOrderDirection = enum { asc, desc };
@@ -510,6 +575,16 @@ pub fn validateGraphMetricQueryShape(query: GraphQuery) !void {
         if (metric.name.len == 0) return error.InvalidQueryRequest;
         for (query.metrics[0..i]) |previous|
             if (std.mem.eql(u8, previous.name, metric.name)) return error.InvalidQueryRequest;
+        if (metric.seed_nodes.len > graph_metric_seed_limit) return error.InvalidQueryRequest;
+        for (metric.seed_nodes) |seed| if (seed.len == 0) return error.InvalidQueryRequest;
+        if (metric.damping) |damping| {
+            if (metric.seed_nodes.len == 0 or !std.math.isFinite(damping) or damping <= 0 or damping >= 1)
+                return error.InvalidQueryRequest;
+        }
+        // Published generations are global-only; a seeded read against one
+        // would silently return unpersonalized scores. Fail closed instead.
+        if (metric.seed_nodes.len != 0 and metric.freshness != .fresh)
+            return error.GraphMetricPersonalizationRequiresFresh;
         try appendGraphMetricDependencyName(&dependency_names, &dependency_count, metric.name);
     }
     for (query.order_by, 0..) |order, i| {
@@ -581,6 +656,8 @@ pub const GraphResultNode = struct {
                 alloc.free(e.source);
                 alloc.free(e.target);
                 alloc.free(e.edge_type);
+                if (e.edge_id.len > 0) alloc.free(e.edge_id);
+                if (e.owner_document.len > 0) alloc.free(e.owner_document);
                 if (e.metadata.len > 0) alloc.free(e.metadata);
             }
             alloc.free(pe);
@@ -724,7 +801,7 @@ pub const GraphMetricStatus = struct {
     }
 };
 
-fn cloneGraphMetricStatus(alloc: Allocator, source: graph_mod.GraphIndex.GraphMetricStatus) !GraphMetricStatus {
+pub fn cloneGraphMetricStatus(alloc: Allocator, source: graph_mod.GraphIndex.GraphMetricStatus) !GraphMetricStatus {
     const name = try alloc.dupe(u8, source.name);
     errdefer alloc.free(name);
     var edge_filter = try source.edge_filter.cloneAlloc(alloc);
@@ -807,12 +884,37 @@ pub const GraphQueryResult = struct {
 // Graph Query Engine
 // ============================================================================
 
+/// Per-request scope for the local graph executors, derived by the caller
+/// from what it knows about the executing snapshot. It rides the executor
+/// vtables so the storage layer, which knows neither its table's name nor
+/// its group count, can apply the caller's routing knowledge.
+pub const ExecutionScope = struct {
+    ttl_now_ns: ?u64 = null,
+    /// Physical name of the index-owning table. A `target_table` tag naming
+    /// it canonicalizes to the local (null) identity, mirroring the
+    /// distributed coordinator's canonicalGraphNodeTable, so a self-table
+    /// tag never stops expansion or splits node identity.
+    owning_table: []const u8 = "",
+    /// True when the executing snapshot holds the graph index's COMPLETE
+    /// row set (a single-group table, or an embedded caller): local
+    /// traversal, paths, and MATCH may then expand THROUGH cross-table
+    /// tagged nodes, because entity-sourced edges are document-owned rows
+    /// in this same index (same-snapshot single-index read).
+    expand_cross_table_local: bool = false,
+};
+
 pub const GraphQueryEngine = struct {
     alloc: Allocator,
     node_admission: ?NodeAdmission = null,
     /// Public request coordinators install one shared budget here. Internal
     /// callers may omit it and retain the graph algorithms' standalone limit.
     work_budget: ?*work_budget_mod.WorkBudget = null,
+    /// A coordinator can supply one expiration time for all operations and
+    /// shards. A standalone execution captures it for that call.
+    ttl_now_ns: ?u64 = null,
+    /// See ExecutionScope; defaults keep the historical terminal behavior at
+    /// cross-table tagged nodes.
+    scope: ExecutionScope = .{},
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -822,6 +924,9 @@ pub const GraphQueryEngine = struct {
         gq: GraphQuery,
         resolved_keys: []const []const u8,
     ) !GraphQueryResult {
+        const supplied_time = self.ttl_now_ns;
+        if (supplied_time == null) self.ttl_now_ns = self.scope.ttl_now_ns orelse graph_index.clock.nowRealtimeNs();
+        defer self.ttl_now_ns = supplied_time;
         try validateGraphMetricQueryShape(gq);
         const defer_result_limit = graphMetricPostProcessingNeedsFullCandidateSet(gq);
         var execution_params = gq.params;
@@ -1352,7 +1457,34 @@ pub const GraphQueryEngine = struct {
                 local_columns[initialized] = column.*[0..local_count];
                 initialized += 1;
             }
-            try reader.readColumns(self.alloc, missing.slice(), keys, local_columns[0..missing.len]);
+            // Personalized dependencies compute a fresh seeded column instead
+            // of reading the published generation; only readers that can run
+            // the seeded kernel expose readPersonalizedColumn, everything else
+            // fails closed (for example the serverless published-segment
+            // reader).
+            var published_names: MetricReadPlan.Names = .{};
+            var published_columns: [graph_metric_dependency_limit][]?f64 = undefined;
+            for (missing.slice(), local_columns[0..missing.len]) |name, local_column| {
+                if (self.plan.personalizationFor(name)) |personalization| {
+                    if (comptime std.meta.hasMethod(@TypeOf(reader), "readPersonalizedColumn")) {
+                        try reader.readPersonalizedColumn(
+                            self.alloc,
+                            name,
+                            personalization.seed_nodes,
+                            personalization.damping,
+                            keys,
+                            local_column,
+                        );
+                    } else {
+                        return error.GraphMetricPersonalizationUnsupported;
+                    }
+                } else {
+                    published_columns[published_names.len] = local_column;
+                    published_names.append(name);
+                }
+            }
+            if (published_names.len != 0)
+                try reader.readColumns(self.alloc, published_names.slice(), keys, published_columns[0..published_names.len]);
             // Expand backwards in-place: qualified identities must not alias a
             // local document with the same key. No second score slab is needed.
             if (local_count != self.rows.len) for (columns[0..missing.len]) |column| {
@@ -1433,6 +1565,7 @@ pub const GraphQueryEngine = struct {
         };
         var rules = traversal_mod.TraversalRules{
             .edge_types = params.edge_types,
+            .edge_filter = params.edge_filter,
             .direction = params.direction,
             .max_depth = params.max_depth,
             .min_weight = params.min_weight,
@@ -1442,6 +1575,9 @@ pub const GraphQueryEngine = struct {
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .ttl_now_ns = self.ttl_now_ns,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
             .result_admission = .{
                 .ctx = &result_admission_context,
                 .admit_one = TraverseResultAdmissionContext.admit,
@@ -1488,6 +1624,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !?GraphQueryResult {
+        if (params.edge_filter.active()) return null;
         if (!algebraicTraversalProof(graph_index, params).safe()) return null;
         if (!try algebraicTraversalTensorProgramAccepted(self.alloc, graph_index, params, target_keys)) return null;
 
@@ -1575,13 +1712,17 @@ pub const GraphQueryEngine = struct {
 
         const opts = paths_mod.PathFindOptions{
             .weight_mode = gq.params.weight_mode,
+            .ttl_now_ns = self.ttl_now_ns,
             .edge_types = gq.params.edge_types,
+            .edge_filter = gq.params.edge_filter,
             .direction = gq.params.direction,
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -1620,6 +1761,7 @@ pub const GraphQueryEngine = struct {
         start_keys: []const []const u8,
         target_keys: []const []const u8,
     ) !?GraphQueryResult {
+        if (params.edge_filter.active()) return null;
         if (!(params.algebraic_semiring or graph_index.supportsAlgebraicSemiringTraversal())) return null;
         if (params.weight_mode != .min_hops) return null;
         if (params.max_depth == 0) return null;
@@ -1698,13 +1840,17 @@ pub const GraphQueryEngine = struct {
 
         const opts = paths_mod.PathFindOptions{
             .weight_mode = gq.params.weight_mode,
+            .ttl_now_ns = self.ttl_now_ns,
             .edge_types = gq.params.edge_types,
+            .edge_filter = gq.params.edge_filter,
             .direction = gq.params.direction,
             .max_depth = gq.params.max_depth,
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
             .work_budget = self.work_budget,
+            .owning_table = self.scope.owning_table,
+            .expand_cross_table_local = self.scope.expand_cross_table_local,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -1773,6 +1919,9 @@ pub const GraphQueryEngine = struct {
                 .return_aliases = gq.return_aliases,
                 .node_admission = self.node_admission,
                 .work_budget = self.work_budget,
+                .ttl_now_ns = self.ttl_now_ns,
+                .owning_table = self.scope.owning_table,
+                .expand_cross_table_local = self.scope.expand_cross_table_local,
             },
         );
         errdefer pattern_mod.freeMatches(self.alloc, matches);
@@ -1925,15 +2074,15 @@ fn traversalResultNodeAlloc(
 
     const path_edges = if (result.path_edges) |edges| blk: {
         const owned = try alloc.alloc(PathEdgeInfo, edges.len);
-        var initialized: usize = 0;
-        errdefer freePathEdgeItems(alloc, owned, initialized);
-        for (edges, owned) |edge, *out| {
-            out.* = try pathEdgeInfoFromPathEdge(alloc, edge);
-            initialized += 1;
+        var count: usize = 0;
+        errdefer freePathEdgeItems(alloc, owned, count);
+        for (edges, 0..) |edge, i| {
+            owned[i] = try pathEdgeInfoFromPathEdge(alloc, edge);
+            count += 1;
         }
         break :blk owned;
     } else null;
-
+    errdefer if (path_edges) |edges| freePathEdgeItems(alloc, edges, edges.len);
     return .{
         .key = key,
         .table = table,
@@ -1954,12 +2103,9 @@ fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !us
         total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf(?[]const u8)));
         if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
     }
-    if (result.path_edges) |edges| {
-        total = try std.math.add(usize, total, try std.math.mul(usize, edges.len, @sizeOf(PathEdgeInfo)));
-        for (edges) |edge| inline for (.{ "source", "target", "edge_type", "metadata" }) |field| {
-            total = try std.math.add(usize, total, @field(edge, field).len);
-        };
-    }
+    if (result.path_edges) |edges| for (edges) |edge| {
+        total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
+    };
     return total;
 }
 
@@ -1988,11 +2134,12 @@ fn algebraicPatternPlan(gq: GraphQuery) ?AlgebraicPatternPlan {
     if (!algebraicPatternAliasesUnique(gq.pattern)) return null;
 
     const first_edge = gq.pattern[1].edge;
-    if (!algebraicPatternStepIsOneHop(first_edge)) return null;
+    if (!algebraicPatternStepIsOneHop(first_edge) or first_edge.edge_filter.active()) return null;
     if (gq.pattern[1].node_filter.filter_query_json != null) return null;
     for (gq.pattern[2..]) |step| {
         if (step.node_filter.filter_query_json != null) return null;
         if (!algebraicPatternStepIsOneHop(step.edge)) return null;
+        if (step.edge.edge_filter.active()) return null;
         if (step.edge.direction != first_edge.direction) return null;
         if (step.edge.min_weight != first_edge.min_weight or step.edge.max_weight != first_edge.max_weight) return null;
         if (!stringSlicesEqual(step.edge.types, first_edge.types)) return null;
@@ -2069,15 +2216,18 @@ fn algebraicPatternMatchFromNodeAlloc(
         if (all_bindings.len > 0) alloc.free(all_bindings);
     }
 
+    var table_scratch = traversal_mod.MetadataScratch.init(alloc, null);
+    defer table_scratch.deinit();
     for (pattern, 0..) |step, i| {
         if (!graphQueryPassesPrefixFilter(node_path[i], step.node_filter)) return null;
         var alias_buf: [32]u8 = undefined;
         const alias = graphQueryEffectiveAlias(step.alias, i, &alias_buf);
-        const table = if (i > 0 and
-            std.mem.eql(u8, edge_path[i - 1].target, node_path[i]))
-            traversal_mod.metadataTargetTable(edge_path[i - 1].metadata)
+        const table = if (i == 0)
+            null
+        else if (std.mem.eql(u8, edge_path[i - 1].target, node_path[i]))
+            try traversal_mod.metadataTargetTable(&table_scratch, edge_path[i - 1].metadata)
         else
-            null;
+            try traversal_mod.metadataSourceTable(&table_scratch, edge_path[i - 1].metadata);
         all_bindings[i] = try clonePatternBindingAlloc(
             alloc,
             alias,
@@ -2165,14 +2315,7 @@ fn clonePatternPathEdgesFromInfoAlloc(alloc: Allocator, edges: []const PathEdgeI
         if (out.len > 0) alloc.free(out);
     }
     for (edges, 0..) |edge, i| {
-        out[i] = .{
-            .source = try alloc.dupe(u8, edge.source),
-            .target = try alloc.dupe(u8, edge.target),
-            .edge_type = try alloc.dupe(u8, edge.edge_type),
-            .weight = edge.weight,
-            .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
-            .traversal_direction = edge.traversal_direction,
-        };
+        out[i] = try paths_mod.clonePathEdge(alloc, edge);
         initialized += 1;
     }
     return out;
@@ -2183,6 +2326,8 @@ fn freeGraphPatternPathEdgeItems(alloc: Allocator, edges: []const paths_mod.Path
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
 }
@@ -2240,6 +2385,8 @@ fn pathToResultNodeRetained(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (path_edges.len > 0) alloc.free(path_edges);
@@ -2280,7 +2427,7 @@ fn pathGraphResultNodeOwnedBytes(path: *const paths_mod.Path) !usize {
     }
     total = try std.math.add(usize, total, try std.math.mul(usize, path.edges.len, @sizeOf(PathEdgeInfo)));
     for (path.edges) |edge| {
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part|
             total = try std.math.add(usize, total, part.len);
     }
     return total;
@@ -2326,11 +2473,17 @@ fn pathEdgeInfoFromPathEdge(alloc: Allocator, edge: paths_mod.PathEdge) !PathEdg
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = edge.traversal_direction,
@@ -2360,6 +2513,11 @@ fn algebraicTraversalResultNodeAlloc(
     errdefer alloc.free(key);
     const provenance = try algebraic_path_mod.provenanceLabelsAlloc(alloc, result.provenance);
     errdefer freeProvenanceLabels(alloc, provenance);
+    for (provenance) |*label| if (provenanceLabelNeedsEncoding(label.*)) {
+        const text = try publicProvenanceLabelAlloc(alloc, label.*);
+        alloc.free(label.*);
+        label.* = text;
+    };
     return .{
         .key = key,
         .depth = result.depth,
@@ -2371,6 +2529,8 @@ fn algebraicTraversalResultNodeAlloc(
 }
 
 const ParsedProvenanceEdge = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     edge_type: []const u8,
     target: []const u8,
@@ -2419,14 +2579,8 @@ fn algebraicShortestPathResultNodeAlloc(
         }
         const index = match_index orelse return null;
         const next_key = provenanceEdgeNextNode(params.direction, current, match_edge) orelse return null;
-        const weight = (try resolveUniqueGraphEdgeWeight(alloc, graph_index, current, match_edge, params.direction)) orelse return null;
-
-        path_edges[path_edge_count] = .{
-            .source = try alloc.dupe(u8, match_edge.source),
-            .target = try alloc.dupe(u8, match_edge.target),
-            .edge_type = try alloc.dupe(u8, match_edge.edge_type),
-            .weight = weight,
-        };
+        const path_edge = (try resolveUniqueGraphPathEdge(alloc, graph_index, current, match_edge, params.direction)) orelse return null;
+        path_edges[path_edge_count] = path_edge;
         path_edge_count += 1;
 
         path_nodes[path_node_count] = try alloc.dupe(u8, next_key);
@@ -2458,7 +2612,42 @@ fn algebraicShortestPathResultNodeAlloc(
     };
 }
 
+fn graphEdgeProvenanceLabelAlloc(alloc: Allocator, edge: graph_mod.Edge) ![]u8 {
+    // Keep unambiguous legacy tuples readable. A reserved leading byte or
+    // an embedded separator needs the same framed identity as explicit edges.
+    if (edge.edge_id.len == 0 and (edge.source.len == 0 or edge.source[0] != 2) and
+        std.mem.indexOfScalar(u8, edge.source, 0x1f) == null and
+        std.mem.indexOfScalar(u8, edge.edge_type, 0x1f) == null and
+        std.mem.indexOfScalar(u8, edge.target, 0x1f) == null)
+        return std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, 2);
+    for ([_][]const u8{ edge.source, edge.edge_type, edge.target, edge.edge_id, edge.owner_document }) |part| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, @intCast(part.len), .little);
+        try out.appendSlice(alloc, &length);
+        try out.appendSlice(alloc, part);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 fn parseProvenanceEdge(label: []const u8) ?ParsedProvenanceEdge {
+    if (label.len > 0 and label[0] == 2) {
+        var pos: usize = 1;
+        var parts: [5][]const u8 = undefined;
+        for (&parts) |*part| {
+            if (label.len - pos < 8) return null;
+            const len = std.math.cast(usize, std.mem.readInt(u64, label[pos..][0..8], .little)) orelse return null;
+            pos += 8;
+            if (len > label.len - pos) return null;
+            part.* = label[pos..][0..len];
+            pos += len;
+        }
+        if (pos != label.len) return null;
+        return .{ .source = parts[0], .edge_type = parts[1], .target = parts[2], .edge_id = parts[3], .owner_document = parts[4] };
+    }
+
     var it = std.mem.splitScalar(u8, label, 0x1f);
     const source = it.next() orelse return null;
     const edge_type = it.next() orelse return null;
@@ -2479,25 +2668,58 @@ fn provenanceEdgeNextNode(direction: graph_mod.EdgeDirection, current: []const u
     };
 }
 
-fn resolveUniqueGraphEdgeWeight(
+fn resolveUniqueGraphPathEdge(
     alloc: Allocator,
     graph_index: *graph_mod.GraphIndex,
     current: []const u8,
     provenance_edge: ParsedProvenanceEdge,
     direction: graph_mod.EdgeDirection,
-) !?f64 {
+) !?PathEdgeInfo {
     const edges = try graph_index.getEdges(alloc, current, "", direction);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
 
-    var found: ?f64 = null;
+    var found: ?graph_mod.Edge = null;
     for (edges) |edge| {
         if (!std.mem.eql(u8, edge.source, provenance_edge.source)) continue;
         if (!std.mem.eql(u8, edge.target, provenance_edge.target)) continue;
         if (!std.mem.eql(u8, edge.edge_type, provenance_edge.edge_type)) continue;
+        if (!std.mem.eql(u8, edge.edge_id, provenance_edge.edge_id) or !std.mem.eql(u8, edge.owner_document, provenance_edge.owner_document)) continue;
         if (found != null) return null;
-        found = edge.weight;
+        found = edge;
     }
-    return found;
+    const edge = found orelse return null;
+    const traversal_direction: ?graph_mod.EdgeDirection = switch (direction) {
+        .out => .out,
+        .in => .in,
+        .both => if (std.mem.eql(u8, edge.source, edge.target)) null else if (std.mem.eql(u8, current, edge.source)) .out else .in,
+    };
+    return try pathEdgeInfoFromPathEdge(alloc, .{
+        .source = edge.source,
+        .target = edge.target,
+        .edge_type = edge.edge_type,
+        .edge_id = edge.edge_id,
+        .owner_document = edge.owner_document,
+        .weight = edge.weight,
+        .metadata = edge.metadata,
+        .traversal_direction = traversal_direction,
+    });
+}
+
+/// Public provenance is opaque text, never the executor's binary identity.
+/// Reserve the prefix so even a legacy tuple beginning with it is encoded.
+const public_provenance_prefix = "antfly:graph-provenance:v1:";
+fn provenanceLabelNeedsEncoding(label: []const u8) bool {
+    return (label.len > 0 and label[0] == 2) or !std.unicode.utf8ValidateSlice(label) or
+        std.mem.startsWith(u8, label, public_provenance_prefix);
+}
+fn publicProvenanceLabelAlloc(alloc: Allocator, label: []const u8) ![]u8 {
+    if (!provenanceLabelNeedsEncoding(label)) return alloc.dupe(u8, label);
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const length = try std.math.add(usize, public_provenance_prefix.len, encoder.calcSize(label.len));
+    const out = try alloc.alloc(u8, length);
+    @memcpy(out[0..public_provenance_prefix.len], public_provenance_prefix);
+    _ = encoder.encode(out[public_provenance_prefix.len..], label);
+    return out;
 }
 
 fn cloneProvenanceLabelsAlloc(alloc: Allocator, labels: []const []const u8) ![][]u8 {
@@ -2508,7 +2730,7 @@ fn cloneProvenanceLabelsAlloc(alloc: Allocator, labels: []const []const u8) ![][
         alloc.free(out);
     }
     for (labels, 0..) |label, i| {
-        out[i] = try alloc.dupe(u8, label);
+        out[i] = try publicProvenanceLabelAlloc(alloc, label);
         initialized += 1;
     }
     return out;
@@ -2524,6 +2746,8 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const PathEdgeInfo, initialized:
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     alloc.free(edges);
@@ -2544,7 +2768,7 @@ const AlgebraicReachabilityEdges = struct {
     /// The algebraic tensor representation is key-scoped. Cross-table graph
     /// identities therefore require the table-aware traversal implementation.
     has_cross_table_edges: bool = false,
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |edge| {
             alloc.free(edge.from);
             alloc.free(edge.to);
@@ -2624,21 +2848,23 @@ fn collectAlgebraicReachabilityEdges(
         else
             try graph_index.getEdges(alloc, current.key, "", params.direction);
         defer graph_mod.GraphIndex.freeEdges(alloc, graph_edges);
+        var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+        defer table_scratch.deinit();
         if (work_budget) |budget| try budget.consumeMaterializedEdges(graph_edges);
         for (graph_edges) |edge| {
             if (!graphEdgeTypeAllowed(params.edge_types, edge.edge_type)) continue;
             if (!graphEdgeWeightAllowed(params, edge.weight)) continue;
-            const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-            const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                traversal_mod.metadataTargetTable(edge.metadata)
-            else
-                null;
-            // Stop the algebraic probe immediately. Its tensor vertices are
-            // key-only, while this edge names a table-qualified identity.
-            if (target_table != null) {
+            // Tensor vertices cannot represent either endpoint's namespace,
+            // even when only the departure endpoint has an explicit tag.
+            if ((try traversal_mod.metadataSourceTable(&table_scratch, edge.metadata)) != null or
+                (try traversal_mod.metadataTargetTable(&table_scratch, edge.metadata)) != null)
+            {
                 has_cross_table_edges = true;
                 break :scan;
             }
+            const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, null, null, params.direction);
+            if (!endpoint.connected) continue;
+            const next_key = endpoint.key;
             if (std.mem.eql(u8, next_key, start_key)) continue;
             const already_visited = visited.contains(next_key);
             if (!already_visited) {
@@ -2646,7 +2872,7 @@ fn collectAlgebraicReachabilityEdges(
                 if (work_budget) |budget| try budget.consumeNode();
             }
 
-            const provenance_label = try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
+            const provenance_label = try graphEdgeProvenanceLabelAlloc(alloc, edge);
             defer alloc.free(provenance_label);
             const provenance = try algebraic_path_mod.provenanceTokenAlloc(alloc, &.{provenance_label});
             var provenance_owned = true;
@@ -2778,7 +3004,7 @@ const TestCtx = struct {
     sp: [*:0]const u8,
     rp: [*:0]const u8,
 
-    fn deinit(self: *TestCtx) void {
+    pub fn deinit(self: *TestCtx) void {
         self.graph.close();
         self.store.close();
         cleanupTmp(self.sp);
@@ -3002,6 +3228,67 @@ test "traverse preserves table-scoped identities across result dedup and algebra
     }
     try std.testing.expectEqual(@as(usize, 1), local_count);
     try std.testing.expectEqual(@as(usize, 1), external_count);
+}
+
+test "engine execution scope expands through cross-table nodes and canonicalizes self-table tags" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-scope-s", "gq-scope-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    // The autoschema shape: a mention edge into a resolved cross-table
+    // entity, an entity-sourced relation row in THIS index, plus a
+    // self-table tag that must canonicalize instead of splitting identity.
+    try ctx.graph.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    try ctx.graph.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"source_table\":\"entities\",\"target_table\":\"events\"}");
+    try ctx.graph.addEdge("doc:a", "doc:b", "cites", 1.0, 0, 0, "{\"target_table\":\"documents\"}");
+
+    const start_keys: []const []const u8 = &.{"doc:a"};
+    const gq = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .max_depth = 3, .max_results = 0, .deduplicate = true },
+    };
+
+    // Default scope keeps the historical terminal behavior.
+    var terminal_engine = GraphQueryEngine{ .alloc = alloc };
+    var terminal = try terminal_engine.execute(&ctx.graph, gq, start_keys);
+    defer terminal.deinit(alloc);
+    for (terminal.nodes) |node| {
+        try std.testing.expect(!std.mem.eql(u8, node.key, "event/xyz"));
+    }
+
+    // A complete-snapshot scope walks doc -> entity -> event in one
+    // traversal, and the self-table tag neither stops expansion nor
+    // qualifies the node.
+    var engine = GraphQueryEngine{
+        .alloc = alloc,
+        .scope = .{ .owning_table = "documents", .expand_cross_table_local = true },
+    };
+    var result = try engine.execute(&ctx.graph, gq, start_keys);
+    defer result.deinit(alloc);
+
+    var saw_entity = false;
+    var saw_event = false;
+    var saw_doc_b = false;
+    for (result.nodes) |node| {
+        if (std.mem.eql(u8, node.key, "entity/ada")) {
+            try std.testing.expectEqualStrings("entities", node.table.?);
+            saw_entity = true;
+        } else if (std.mem.eql(u8, node.key, "event/xyz")) {
+            try std.testing.expectEqualStrings("events", node.table.?);
+            saw_event = true;
+        } else if (std.mem.eql(u8, node.key, "doc:b")) {
+            try std.testing.expect(node.table == null);
+            saw_doc_b = true;
+        }
+    }
+    try std.testing.expect(saw_entity and saw_event and saw_doc_b);
 }
 
 test "traverse can execute through algebraic provenance semiring path" {
@@ -4014,6 +4301,147 @@ test "graph metric staged columns do not alias qualified node identities" {
     try std.testing.expectEqualSlices(?f64, &.{ null, 7, null }, work.columns[0].?);
 }
 
+test "graph metric personalization requires fresh reads and bounded seed sets" {
+    const seeds = [_][]const u8{"doc:a"};
+    const base = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "g",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+    };
+
+    var published_seeded = base;
+    published_seeded.metrics = &.{.{ .name = "pagerank", .seed_nodes = &seeds }};
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, validateGraphMetricQueryShape(published_seeded));
+
+    var fresh_seeded = base;
+    fresh_seeded.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &seeds, .damping = 0.9 }};
+    try validateGraphMetricQueryShape(fresh_seeded);
+
+    var damping_without_seeds = base;
+    damping_without_seeds.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .damping = 0.9 }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(damping_without_seeds));
+
+    var damping_out_of_range = base;
+    damping_out_of_range.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &seeds, .damping = 1.0 }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(damping_out_of_range));
+
+    var empty_seed_key = base;
+    empty_seed_key.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &.{""} }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(empty_seed_key));
+
+    var too_many_seed_keys: [graph_metric_seed_limit + 1][]const u8 = undefined;
+    for (&too_many_seed_keys) |*seed| seed.* = "doc:a";
+    var too_many_seeds = base;
+    too_many_seeds.metrics = &.{.{ .name = "pagerank", .freshness = .fresh, .seed_nodes = &too_many_seed_keys }};
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphMetricQueryShape(too_many_seeds));
+
+    // A personalized dependency carries no publication policy: its column is
+    // computed fresh rather than read from a published generation.
+    var ordered_fresh = fresh_seeded;
+    ordered_fresh.order_by = &.{.{ .name = "pagerank", .freshness = .fresh }};
+    const plan = try MetricReadPlan.init(ordered_fresh);
+    try std.testing.expect(plan.personalizationFor("pagerank") != null);
+    try std.testing.expect(!plan.policies[0].require_published and !plan.policies[0].require_fresh);
+
+    // Ordering or filtering a personalized metric with published freshness
+    // would mix global and seeded scores; fail closed.
+    var ordered_published = fresh_seeded;
+    ordered_published.order_by = &.{.{ .name = "pagerank", .freshness = .published }};
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, MetricReadPlan.init(ordered_published));
+    var filtered_published = fresh_seeded;
+    filtered_published.where_metric = &.{.{ .name = "pagerank", .op = .gte, .value = 0.1, .freshness = .published }};
+    try std.testing.expectError(error.GraphMetricPersonalizationRequiresFresh, MetricReadPlan.init(filtered_published));
+}
+
+test "graph metric personalized reads fail closed on readers without a seeded kernel" {
+    const alloc = std.testing.allocator;
+    const seeds = [_][]const u8{"a"};
+    const query = GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .metrics = &.{.{ .name = "rank", .freshness = .fresh, .seed_nodes = &seeds }},
+    };
+    const nodes = [_]GraphResultNode{.{ .key = "a", .depth = 0, .distance = 0 }};
+    var work = try GraphQueryEngine.MetricStageWorkspace.init(alloc, try MetricReadPlan.init(query), nodes.len);
+    defer work.deinit();
+    // Models the serverless published-segment reader: readColumns only.
+    const Reader = struct {
+        pub fn readColumns(_: *@This(), _: Allocator, _: []const []const u8, _: []const []const u8, _: []const []?f64) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var reader = Reader{};
+    try std.testing.expectError(error.GraphMetricPersonalizationUnsupported, work.ensure(&reader, &.{"rank"}, &nodes));
+}
+
+test "personalized graph metric reads compute seeded pagerank at query time" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const metrics = [_]graph_mod.GraphMetricConfig{.{ .name = "rank", .kind = .pagerank }};
+    const ctx = try setupGraphWithOptions(alloc, "gq-metric-ppr-s", "gq-metric-ppr-r", &sb, &rb, .{ .metric_configs = &metrics });
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    // Seed cluster A<->B bridged to hub H, which dominates global PageRank.
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "A", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("C", "H", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("D", "H", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("E", "H", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("F", "H", "e", 1.0, 0, 0, "");
+
+    // No published generation exists: the personalized column must be
+    // computed fresh, and absent seeds must be skipped without failing.
+    const seeds = [_][]const u8{ "A", "missing-node" };
+    const reads = [_]GraphMetricRead{.{ .name = "rank", .freshness = .fresh, .seed_nodes = &seeds, .damping = 0.9 }};
+    const start_keys: []const []const u8 = &.{"A"};
+    const query = GraphQuery{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .edge_types = &.{"e"}, .direction = .out, .max_depth = 3, .max_results = 16 },
+        .metrics = &reads,
+    };
+
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    var result = try engine.execute(&ctx.graph, query, start_keys);
+    defer result.deinit(alloc);
+
+    var seed_neighbor_score: ?f64 = null;
+    var hub_score: ?f64 = null;
+    for (result.nodes) |node| {
+        try std.testing.expectEqual(@as(usize, 1), node.metrics.len);
+        if (std.mem.eql(u8, node.key, "B")) seed_neighbor_score = node.metrics[0].score;
+        if (std.mem.eql(u8, node.key, "H")) hub_score = node.metrics[0].score;
+    }
+    // Teleport mass restricted to seed A keeps its one-hop neighbor above the
+    // globally dominant hub.
+    try std.testing.expect(seed_neighbor_score.? > hub_score.?);
+
+    // Deterministic across runs for a fixed seed set.
+    var replay = try engine.execute(&ctx.graph, query, start_keys);
+    defer replay.deinit(alloc);
+    try std.testing.expectEqual(result.nodes.len, replay.nodes.len);
+    for (result.nodes, replay.nodes) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.key, actual.key);
+        try std.testing.expectEqual(expected.metrics[0].score, actual.metrics[0].score);
+    }
+
+    // Direct column read reports how many seeds resolved.
+    var column: [2]?f64 = undefined;
+    const resolution = try ctx.graph.personalizedPageRankColumnInto(alloc, "rank", &seeds, 0.9, &.{ "B", "missing-node" }, &column);
+    try std.testing.expectEqual(@as(usize, 2), resolution.requested);
+    try std.testing.expectEqual(@as(usize, 1), resolution.matched);
+    try std.testing.expectEqual(@as(usize, 1), resolution.skipped());
+    try std.testing.expect(column[0] != null);
+    try std.testing.expectEqual(@as(?f64, null), column[1]);
+}
+
 test "graph metric staged query admits scratch and output and pins publication" {
     const alloc = std.testing.allocator;
     var sb: [256]u8 = undefined;
@@ -4575,6 +5003,135 @@ test "pattern algebraic provenance falls back for ambiguous linear chain" {
     defer fallback_result.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), fallback_result.matches.len);
+}
+
+test "graph algebraic provenance preserves binary relationship identity" {
+    const alloc = std.testing.allocator;
+    const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = "a\x1f", .target = "b", .edge_type = "RELATES_TO", .edge_id = "fact\x00:1", .owner_document = "fact:1", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+    defer alloc.free(label);
+    const parsed = parseProvenanceEdge(label) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fact\x00:1", parsed.edge_id);
+    try std.testing.expectEqualStrings("a\x1f", parsed.source);
+    try std.testing.expectEqualStrings("fact:1", parsed.owner_document);
+}
+
+test "graph algebraic provenance public labels are lossless text at length boundaries" {
+    const alloc = std.testing.allocator;
+    for ([_]usize{ 128, 255, 256, 65536 }) |length| {
+        const source = try alloc.alloc(u8, length);
+        defer alloc.free(source);
+        @memset(source, 'a');
+        const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = source, .target = "b", .edge_type = "R", .edge_id = "fact\xff\x00", .owner_document = "fact", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+        defer alloc.free(label);
+        const text = try publicProvenanceLabelAlloc(alloc, label);
+        defer alloc.free(text);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+        const json = try std.json.Stringify.valueAlloc(alloc, .{ .provenance = &[_][]const u8{text} }, .{});
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(text, parsed.value.object.get("provenance").?.array.items[0].string);
+        const decoder = std.base64.url_safe_no_pad.Decoder;
+        const payload = text[public_provenance_prefix.len..];
+        const decoded = try alloc.alloc(u8, try decoder.calcSizeForSlice(payload));
+        defer alloc.free(decoded);
+        try decoder.decode(decoded, payload);
+        try std.testing.expectEqualSlices(u8, label, decoded);
+        const edge = parseProvenanceEdge(decoded).?;
+        try std.testing.expectEqualStrings(source, edge.source);
+        try std.testing.expectEqualStrings("fact\xff\x00", edge.edge_id);
+    }
+    // Protect the textual namespace from legacy source names using that prefix.
+    const legacy = "antfly:graph-provenance:v1:a\x1fR\x1fb";
+    const escaped = try publicProvenanceLabelAlloc(alloc, legacy);
+    defer alloc.free(escaped);
+    try std.testing.expect(!std.mem.eql(u8, legacy, escaped));
+    for ([_][]const u8{ "a\x1fb", "\x02a" }) |source| {
+        const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = source, .target = "b", .edge_type = "R", .edge_id = "", .owner_document = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+        defer alloc.free(label);
+        const edge = parseProvenanceEdge(label).?;
+        try std.testing.expectEqualStrings(source, edge.source);
+        try std.testing.expectEqualStrings("", edge.edge_id);
+    }
+}
+
+test "graph algebraic provenance traversal and shortest path return textual explicit identities" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-public-provenance-s", "gq-public-provenance-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+    const source = @as([128]u8, @splat('a'));
+    const id = @as([128]u8, @splat('i'));
+    try ctx.graph.batchApply(&.{.{ .source = &source, .target = "b", .edge_type = "R", .edge_id = &id, .owner_document = "fact" }}, &.{});
+    var engine = GraphQueryEngine{ .alloc = alloc };
+    const start_keys: []const []const u8 = &.{&source};
+    for ([_]QueryType{ .traverse, .shortest_path }) |query_type| {
+        for ([_]bool{ false, true }) |include_paths| {
+            var result = try engine.execute(&ctx.graph, .{
+                .query_type = query_type,
+                .index_name = "test",
+                .start_nodes = .{ .keys = start_keys },
+                .target_nodes = .{ .keys = &.{"b"} },
+                .params = .{ .max_depth = 1, .algebraic_semiring = true, .include_paths = include_paths },
+            }, start_keys);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 1), result.nodes.len);
+            const labels = result.nodes[0].provenance.?;
+            try std.testing.expectEqual(@as(usize, 1), labels.len);
+            try std.testing.expect(std.mem.startsWith(u8, labels[0], public_provenance_prefix));
+            const json = try std.json.Stringify.valueAlloc(alloc, .{ .provenance = labels }, .{});
+            defer alloc.free(json);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(labels[0], parsed.value.object.get("provenance").?.array.items[0].string);
+            if (result.nodes[0].path_edges) |edges| try std.testing.expectEqualStrings(&id, edges[0].edge_id);
+        }
+    }
+}
+
+test "graph algebraic provenance public conversion releases partial allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const label = try graphEdgeProvenanceLabelAlloc(alloc, .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact", .owner_document = "fact", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+            defer alloc.free(label);
+            const token = try algebraic_path_mod.provenanceTokenAlloc(alloc, &.{label});
+            defer alloc.free(token);
+            var node = try algebraicTraversalResultNodeAlloc(alloc, .{ .node = @constCast("b"), .depth = 1, .provenance = token });
+            defer node.deinit(alloc);
+            const copy = try cloneProvenanceLabelsAlloc(alloc, &.{ label, "a\x1fR\x1fb", label });
+            defer freeProvenanceLabels(alloc, copy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "graph pattern path conversion releases partial relationship allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const edges = [_]PathEdgeInfo{.{
+                .source = "a",
+                .target = "b",
+                .edge_type = "RELATES_TO",
+                .edge_id = "fact:1",
+                .owner_document = "fact:1",
+                .weight = 2,
+                .metadata = "{\"group_id\":\"g\"}",
+                .traversal_direction = .in,
+            }};
+            const copy = try clonePatternPathEdgesFromInfoAlloc(alloc, &edges);
+            defer {
+                freeGraphPatternPathEdgeItems(alloc, copy);
+                alloc.free(copy);
+            }
+            try std.testing.expectEqualStrings("fact:1", copy[0].edge_id);
+            try std.testing.expectEqual(@as(?graph_mod.EdgeDirection, .in), copy[0].traversal_direction);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "BFS traversal preserves physical edge provenance for distributed paths" {

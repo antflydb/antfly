@@ -289,7 +289,7 @@ pub const Origin = struct {
     }
 
     pub fn build(alloc: Allocator, identity: Identity, set: *const proto.RaBitQuantizedVectorSet) !*Origin {
-        if (@intFromEnum(set.metric) < 0 or @intFromEnum(set.metric) > 2) return error.InvalidPostingRows;
+        if (@backingInt(set.metric) < 0 or @backingInt(set.metric) > 2) return error.InvalidPostingRows;
         const size = try std.math.add(usize, header_len, try std.math.mul(usize, set.centroid.len, 4));
         if (size > max_encoded_bytes) return error.PostingRowBackpressure;
         const bytes = try alloc.alloc(u8, size);
@@ -297,7 +297,7 @@ pub const Origin = struct {
         @memset(bytes, 0);
         writeHeader(bytes, "AFRO", identity);
         put(u64, bytes, 40, set.centroid.len);
-        put(u64, bytes, 48, @intCast(@intFromEnum(set.metric)));
+        put(u64, bytes, 48, @intCast(@backingInt(set.metric)));
         put(u32, bytes, 56, @bitCast(set.centroid_norm));
         @memcpy(bytes[header_len..], std.mem.sliceAsBytes(set.centroid));
         seal(bytes);
@@ -413,7 +413,7 @@ pub const Chunk = struct {
     pub fn buildWithOrigin(alloc: Allocator, origin: *Origin, serial: u64, revision: u64, ids: []const u64, set: *const proto.RaBitQuantizedVectorSet) !*Chunk {
         if (!std.mem.eql(u8, std.mem.sliceAsBytes(origin.centroid), std.mem.sliceAsBytes(set.centroid)) or
             @as(u32, @bitCast(origin.centroid_norm)) != @as(u32, @bitCast(set.centroid_norm)) or
-            origin.metric != @intFromEnum(set.metric)) return error.PostingScoringOriginMismatch;
+            origin.metric != @backingInt(set.metric)) return error.PostingScoringOriginMismatch;
         const count = ids.len;
         const width = @import("antfly_vector").rabitq.codeWidth(origin.centroid.len);
         const omitted = origin.metric == 0 and set.centroid_dot_products.len == 0;
@@ -561,7 +561,7 @@ pub const Snapshot = struct {
     pub fn materialize(self: *const Snapshot, alloc: Allocator) !proto.RaBitQuantizedVectorSet {
         if (self.runs.len == 0) return error.InvalidPostingRows;
         const origin = self.runs[0].chunk.view;
-        var set: proto.RaBitQuantizedVectorSet = .{ .metric = @enumFromInt(origin.metric), .centroid_norm = origin.centroid_norm };
+        var set: proto.RaBitQuantizedVectorSet = .{ .metric = @fromBackingInt(origin.metric), .centroid_norm = origin.centroid_norm };
         errdefer set.deinit(alloc);
         set.centroid = try alloc.dupe(f32, origin.centroid);
         set.codes = .{ .count = @intCast(self.row_count), .width = @intCast(origin.width), .data = try alloc.alloc(u64, self.row_count * origin.width) };
@@ -607,7 +607,7 @@ pub const Snapshot = struct {
         while (next < self.runs.len) {
             if (cancellation) |token| try token.check();
             const chunk = self.runs[next].chunk;
-            if (chunk.view.centroid.len != quantizer.dims or chunk.view.metric != @intFromEnum(quantizer.distance_metric))
+            if (chunk.view.centroid.len != quantizer.dims or chunk.view.metric != @backingInt(quantizer.distance_metric))
                 return error.InvalidPostingRows;
             var count: usize = 0;
             var previous_end: usize = 0;
@@ -835,7 +835,7 @@ pub const Repack = struct {
         if (base.row_count == 0) return .{ .base = pinned, .compact = null };
         const a = base.alloc;
         const origin = base.runs[0].chunk.view;
-        var set: proto.RaBitQuantizedVectorSet = .{ .metric = @enumFromInt(origin.metric), .centroid_norm = origin.centroid_norm };
+        var set: proto.RaBitQuantizedVectorSet = .{ .metric = @fromBackingInt(origin.metric), .centroid_norm = origin.centroid_norm };
         defer set.deinit(a);
         set.centroid = try a.dupe(f32, origin.centroid);
         set.codes = .{ .count = @intCast(base.row_count), .width = @intCast(origin.width), .data = try a.alloc(u64, base.row_count * origin.width) };
@@ -1111,8 +1111,8 @@ test "posting row shared origins remove dimension-scaled chunk duplication" {
     const a = std.testing.allocator;
     var quantizer = try @import("antfly_vector").quantizer.RaBitQuantizer.init(a, 768, 42, .cosine);
     defer quantizer.deinit();
-    const center = [_]f32{0.125} ** 768;
-    const vector = [_]f32{0.25} ** 768;
+    const center = @as([768]f32, @splat(0.125));
+    const vector = @as([768]f32, @splat(0.25));
     var set = try quantizer.quantize(&center, &vector, 1);
     defer set.deinit(a);
     const origin = try Origin.build(a, test_identity, &set);
@@ -1129,7 +1129,7 @@ test "posting row shared origins remove dimension-scaled chunk duplication" {
         new_bytes += chunk.*.bytes.len;
     }
     // Reproduce the prior full-AFQD payload only as a sizing oracle.
-    var previous = try directory.Writer.init(a, 768, @intCast(@intFromEnum(set.metric)));
+    var previous = try directory.Writer.init(a, 768, @intCast(@backingInt(set.metric)));
     defer previous.deinit();
     const ids = [_]u64{1};
     try previous.appendWithMemberBytes(test_identity.leaf, &set, std.mem.sliceAsBytes(&ids));
@@ -1513,7 +1513,7 @@ test "posting row chunks reject origin aliasing and ambiguous physical identitie
 }
 
 test "posting row shared query preparation microbenchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     // A same-binary kernel comparison, not an end-to-end performance result.
     const a = std.testing.allocator;
     const vector = @import("antfly_vector");
@@ -1525,8 +1525,8 @@ test "posting row shared query preparation microbenchmark" {
     for (data, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 31)) / 31;
     var ids: [rows]u64 = undefined;
     for (&ids, 0..) |*id, i| id.* = i + 1;
-    const origin = [_]f32{0.1} ** dims;
-    const query = [_]f32{0.3} ** dims;
+    const origin = @as([dims]f32, @splat(0.1));
+    const query = @as([dims]f32, @splat(0.3));
     var quantizer = try vector.quantizer.RaBitQuantizer.init(a, dims, 42, .cosine);
     defer quantizer.deinit();
     var scratch = try vector.quantizer.RaBitQuantizer.EstimateScratch.init(a, dims);
@@ -1580,7 +1580,7 @@ test "posting row shared query preparation microbenchmark" {
 }
 
 test "posting row representation microbenchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     // Synthetic repeated-leaf work, NOT a 50K/1M corpus, HTTP benchmark or
     // recall qualification. Isolates representation costs using the same leaf,
     // mutation, allocator and query, with reversed arm order in each pair.
@@ -1593,8 +1593,8 @@ test "posting row representation microbenchmark" {
     for (vectors, 0..) |*value, i| value.* = @as(f32, @floatFromInt((i * 13 + i / dims * 7) % 31)) / 31;
     var ids: [rows]u64 = undefined;
     for (&ids, 0..) |*id, i| id.* = i + 1;
-    const origin = [_]f32{0.1} ** dims;
-    const query = [_]f32{0.3} ** dims;
+    const origin = @as([dims]f32, @splat(0.1));
+    const query = @as([dims]f32, @splat(0.3));
     var quantizer = try vector.quantizer.RaBitQuantizer.init(a, dims, 42, .cosine);
     defer quantizer.deinit();
     var set = try quantizer.quantize(&origin, vectors, rows);

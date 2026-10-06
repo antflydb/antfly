@@ -30,7 +30,9 @@ const pattern_filter_contract = @import("../../../search/pattern_filter_contract
 const regex_mod = @import("../../../search/regex.zig");
 const wildcard_mod = @import("../../../search/wildcard.zig");
 const rfc3339 = @import("../../../common/rfc3339.zig");
+const owned_json = @import("../../../common/owned_json.zig");
 const doc_set = @import("../doc_set.zig");
+const member_identity = @import("member_identity.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const JsonView = @import("json_view.zig").View;
@@ -84,6 +86,10 @@ pub const PatternQueryExecutor = struct {
     ctx: ?*anyopaque,
     graph_ctx: ?*anyopaque = null,
     predicate_aware: bool = false,
+    /// Caller-derived local execution scope (owning table name, snapshot
+    /// completeness); rides the vtable because the storage layer knows
+    /// neither its table's name nor its group count.
+    scope: graph_query_mod.ExecutionScope = .{},
     match_pattern: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -91,6 +97,7 @@ pub const PatternQueryExecutor = struct {
         start_key_refs: []const []const u8,
         target_nodes: []const graph_node_identity.Ref,
         budgets: RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch,
     match_conjunctive: ?*const fn (
         ctx: ?*anyopaque,
@@ -98,6 +105,7 @@ pub const PatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]graph_pattern_mod.PatternMatch = null,
     aggregate_conjunctive: ?*const fn (
         ctx: ?*anyopaque,
@@ -105,6 +113,7 @@ pub const PatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         budgets: RequestGraphBudgets,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphAggregateResult = null,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -142,6 +151,10 @@ pub const NonPatternQueryExecutor = struct {
     ctx: ?*anyopaque,
     graph_ctx: ?*anyopaque = null,
     predicate_aware: bool = false,
+    /// Caller-derived local execution scope (owning table name, snapshot
+    /// completeness); rides the vtable because the storage layer knows
+    /// neither its table's name nor its group count.
+    scope: graph_query_mod.ExecutionScope = .{},
     find_shortest_path: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -149,6 +162,7 @@ pub const NonPatternQueryExecutor = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!?types.GraphPath,
     find_k_shortest_paths: *const fn (
         ctx: ?*anyopaque,
@@ -157,6 +171,7 @@ pub const NonPatternQueryExecutor = struct {
         source: []const u8,
         target: []const u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror![]types.GraphPath,
     execute_graph_query: *const fn (
         ctx: ?*anyopaque,
@@ -165,6 +180,7 @@ pub const NonPatternQueryExecutor = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         work_budget: *graph_pattern_mod.WorkBudget,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -223,12 +239,17 @@ pub const SearchGraphExecutor = struct {
     ctx: ?*anyopaque,
     graph_ctx: ?*anyopaque = null,
     predicate_aware: bool = false,
+    /// Caller-derived local execution scope (owning table name, snapshot
+    /// completeness); rides the vtable because the storage layer knows
+    /// neither its table's name nor its group count.
+    scope: graph_query_mod.ExecutionScope = .{},
     execute_graph_query: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        scope: graph_query_mod.ExecutionScope,
     ) anyerror!graph_query_mod.GraphQueryResult,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -275,7 +296,7 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
             .start_nodes = .{ .keys = &.{"doc:a"} },
         },
     };
-    const too_many = [_]types.NamedGraphQuery{item} ** (graph_query_mod.max_named_queries + 1);
+    const too_many = @as([graph_query_mod.max_named_queries + 1]types.NamedGraphQuery, @splat(item));
     try std.testing.expectError(
         error.InvalidQueryRequest,
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many),
@@ -287,8 +308,10 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
         .nodes = &.{.{ .alias = "anchor" }},
         .edges = &.{},
     };
-    const too_many_complete_matches = [_]types.NamedGraphQuery{complete_match} **
-        (graph_query_mod.max_match_queries_per_request + 1);
+    const too_many_complete_matches = @as(
+        [graph_query_mod.max_match_queries_per_request + 1]types.NamedGraphQuery,
+        @splat(complete_match),
+    );
     try std.testing.expectError(
         error.GraphMatchOperationLimitExceeded,
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many_complete_matches),
@@ -309,7 +332,7 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
     defer std.testing.allocator.free(empty_sorted);
     try std.testing.expectEqualSlices(usize, &.{0}, empty_sorted);
 
-    const too_long_name = [_]u8{'q'} ** (graph_query_mod.max_query_name_codepoints + 1);
+    const too_long_name = @as([graph_query_mod.max_query_name_codepoints + 1]u8, @splat('q'));
     var overlong = item;
     overlong.name = &too_long_name;
     const overlong_sorted = try sortGraphQueriesByDependencies(std.testing.allocator, &.{overlong});
@@ -453,6 +476,9 @@ pub fn executeGraphQueriesWithSets(
         alloc.free(results);
     }
 
+    var dependency_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dependency_arena.deinit();
+    const dependency_results = try dependency_arena.allocator().alloc(types.GraphSearchResult, graph_queries.len);
     for (sorted_query_indexes, 0..) |query_index, i| {
         results[i] = executor.func(
             executor.ctx,
@@ -483,17 +509,19 @@ pub fn executeGraphQueriesWithSets(
             return err;
         };
         initialized += 1;
+        dependency_results[i] = try results[i].dependencyView(dependency_arena.allocator(), graph_queries[query_index].query.evaluation_output_limit, req.graph_owning_table);
+        const dependency = &dependency_results[i];
         var resolved_doc_set: ?*const doc_set.ResolvedDocSet = null;
         var resolved_doc_set_complete = false;
         // A source-table doc set cannot represent a qualified graph identity.
         // Canonical dependencies resolve directly from the typed graph result;
         // do not manufacture a key-only compatibility set that can reinterpret
         // `other_table/shared` as `source_table/shared`.
-        if (!graphResultHasQualifiedIdentity(results[i]) and executor.resolve_hits_to_doc_set != null) {
+        if (!graphResultHasQualifiedIdentity(dependency.*) and executor.resolve_hits_to_doc_set != null) {
             const resolve = executor.resolve_hits_to_doc_set.?;
-            if (results[i].nodes.len == results[i].total_hits) {
+            if (dependency.nodes.len == dependency.total_hits) {
                 if (executor.resolve_nodes_to_doc_set) |resolve_nodes| {
-                    resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, results[i].nodes);
+                    resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, dependency.nodes);
                     if (resolved_sets[i]) |*set| {
                         resolved_doc_set = set;
                         resolved_doc_set_complete = true;
@@ -501,20 +529,20 @@ pub fn executeGraphQueriesWithSets(
                 }
             }
             if (resolved_doc_set == null) {
-                resolved_sets[i] = try resolve(executor.ctx, alloc, req, results[i].hits);
+                resolved_sets[i] = try resolve(executor.ctx, alloc, req, dependency.hits);
                 if (resolved_sets[i]) |*set| {
                     resolved_doc_set = set;
-                    resolved_doc_set_complete = @as(u64, results[i].total_hits) <= results[i].hits.len;
+                    resolved_doc_set_complete = @as(u64, dependency.total_hits) <= dependency.hits.len;
                 }
             }
         }
         try available_sets.append(alloc, .{
-            .name = results[i].name,
-            .hits = results[i].hits,
-            .total_hits = results[i].total_hits,
+            .name = dependency.name,
+            .hits = dependency.hits,
+            .total_hits = dependency.total_hits,
             .resolved_doc_set = resolved_doc_set,
             .resolved_doc_set_complete = resolved_doc_set_complete,
-            .graph_result = &results[i],
+            .graph_result = dependency,
         });
     }
 
@@ -523,6 +551,9 @@ pub fn executeGraphQueriesWithSets(
     // into that expired stack frame. Keep their charges consumptive until all
     // named operations have run, then detach only at the ownership boundary.
     for (results[0..initialized]) |*result| result.consumeRetainedState();
+    if (req.graph_physical_scan_observation) |observed| {
+        observed.* = req.graph_execution_limits.max_explored_edges - request_work_budget.remaining_physical_edges;
+    }
     return results;
 }
 
@@ -832,19 +863,11 @@ pub fn cloneNamedSetAsResult(alloc: Allocator, set: NamedResultSet, include_stor
     }
 
     for (set.hits, 0..) |hit, i| {
-        var cloned = types.SearchHit{
-            .id = try alloc.dupe(u8, hit.id),
-            .doc_ordinal = hit.doc_ordinal,
-            .score = hit.score,
-            .distance = hit.distance,
-        };
-        errdefer cloned.deinit(alloc);
-        cloned.source_table = if (hit.source_table) |table| try alloc.dupe(u8, table) else null;
-        cloned.stored_data = if (include_stored and hit.stored_data != null)
-            try alloc.dupe(u8, hit.stored_data.?)
-        else
-            null;
-        hits[i] = cloned;
+        // Keep hit metadata in one canonical clone path as SearchHit evolves.
+        // Stored source selection is independent of ancestor/child hydration.
+        var selected = hit;
+        if (!include_stored) selected.stored_data = null;
+        hits[i] = try selected.clone(alloc);
         initialized += 1;
     }
 
@@ -865,20 +888,42 @@ pub fn fuseNamedSets(
 ) !types.SearchResult {
     var ranked_results = try alloc.alloc(fusion_mod.RankedResult, named_sets.len);
     defer alloc.free(ranked_results);
+    var ranked_initialized: usize = 0;
+    defer for (ranked_results[0..ranked_initialized]) |result| alloc.free(result.hits);
 
-    const ordinal_complete = namedSetsHaveCompleteOrdinals(named_sets);
+    // Member identities include the complete artifact provenance and table.
+    // Intern every member into a private fusion key: public ids and parent
+    // ordinals can both be shared by distinct direct embedding members.
+    const member_mode = req.return_mode == .member or req.return_mode == .chunk;
+    const ordinal_complete = !member_mode and namedSetsHaveCompleteOrdinals(named_sets);
+    var member_entries: MemberFusionMap = .empty;
+    defer {
+        var it = member_entries.valueIterator();
+        while (it.next()) |entry| alloc.free(entry.key);
+        member_entries.deinit(alloc);
+    }
+    var members_by_key = std.StringHashMapUnmanaged(types.SearchHit).empty;
+    defer members_by_key.deinit(alloc);
     var ordinal_fusion_keys = std.AutoHashMapUnmanaged(doc_set.DocOrdinal, OrdinalFusionEntry).empty;
     defer freeOrdinalFusionKeys(alloc, &ordinal_fusion_keys);
     var fusion_key_entries = std.StringHashMapUnmanaged(OrdinalFusionEntry).empty;
     defer fusion_key_entries.deinit(alloc);
     var ordinal_by_id = std.StringHashMapUnmanaged(?doc_set.DocOrdinal).empty;
     defer ordinal_by_id.deinit(alloc);
+    // Ancestor payloads hydrated per-arm (single-arm postprocessing) before
+    // fusion rebuilds hits from scratch; carried forward by fusion key so the
+    // materialized fused hit doesn't silently drop them (issue #930). Values
+    // borrow named_sets' hit memory, which outlives this call.
+    var ancestor_payloads = std.StringHashMapUnmanaged(AncestorPayload).empty;
+    defer ancestor_payloads.deinit(alloc);
 
     for (named_sets, 0..) |set, i| {
         var ranked_hits = try alloc.alloc(fusion_mod.RankedHit, set.hits.len);
         errdefer alloc.free(ranked_hits);
         for (set.hits, 0..) |hit, j| {
-            const ranked_doc_id = if (ordinal_complete) blk: {
+            const ranked_doc_id = if (member_mode)
+                try memberFusionKeyForHit(alloc, &member_entries, &members_by_key, hit)
+            else if (ordinal_complete) blk: {
                 const entry = try ordinalFusionEntryForHit(alloc, &ordinal_fusion_keys, &fusion_key_entries, hit);
                 break :blk entry.key;
             } else blk: {
@@ -892,6 +937,7 @@ pub fn fuseNamedSets(
                 }
                 break :blk hit.id;
             };
+            try recordAncestorPayload(alloc, &ancestor_payloads, ranked_doc_id, hit);
             const raw_score = if (hit.score) |score| score else 0.0;
             ranked_hits[j] = .{
                 .doc_id = ranked_doc_id,
@@ -902,8 +948,8 @@ pub fn fuseNamedSets(
             .index_name = fusionWeightName(set.name),
             .hits = ranked_hits,
         };
+        ranked_initialized += 1;
     }
-    defer for (ranked_results) |result| alloc.free(result.hits);
 
     if (req.merge_config) |config| try validateFusionWeights(config.weights, ranked_results);
 
@@ -935,10 +981,17 @@ pub fn fuseNamedSets(
             fusion_key_entries.get(hit.doc_id) orelse return error.UnsupportedQueryRequest
         else
             null;
-        const output_doc_id = if (representative) |entry| entry.representative_doc_id else hit.doc_id;
+        const member: ?types.SearchHit = if (member_mode)
+            members_by_key.get(hit.doc_id) orelse return error.UnsupportedQueryRequest
+        else
+            null;
+        const output_doc_id = if (member) |original| original.id else if (representative) |entry| entry.representative_doc_id else hit.doc_id;
+        const ancestors = ancestor_payloads.get(hit.doc_id);
         const materialized = blk: {
             const owned_id = try alloc.dupe(u8, output_doc_id);
             errdefer alloc.free(owned_id);
+            const source_table = if (member) |original| (if (original.source_table) |table| try alloc.dupe(u8, table) else null) else null;
+            errdefer if (source_table) |table| alloc.free(table);
             const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             errdefer types.freeIndexScores(alloc, owned_index_scores);
             const stored_data = if (req.include_stored)
@@ -946,12 +999,22 @@ pub fn fuseNamedSets(
             else
                 null;
             errdefer if (stored_data) |value| alloc.free(value);
+            const ancestor_source_data = if (ancestors) |a| (if (a.source) |s| try alloc.dupe(u8, s) else null) else null;
+            errdefer if (ancestor_source_data) |value| alloc.free(value);
+            const ancestor_unit_data = if (ancestors) |a| (if (a.unit) |u| try alloc.dupe(u8, u) else null) else null;
+            errdefer if (ancestor_unit_data) |value| alloc.free(value);
+            var owned_artifact_ref: ?types.ArtifactRef = if (ancestors) |a| (if (a.artifact_ref) |ref| try ref.clone(alloc) else null) else null;
+            errdefer if (owned_artifact_ref) |*ref| ref.deinit(alloc);
             break :blk types.SearchHit{
                 .id = owned_id,
-                .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
+                .source_table = source_table,
+                .doc_ordinal = if (member) |original| original.doc_ordinal else if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
                 .score = @floatCast(hit.score),
                 .index_scores = owned_index_scores,
                 .stored_data = stored_data,
+                .ancestor_source_data = ancestor_source_data,
+                .ancestor_unit_data = ancestor_unit_data,
+                .artifact_ref = owned_artifact_ref,
             };
         };
         hits[i] = materialized;
@@ -977,11 +1040,70 @@ fn fusedTotalHitsRelation(named_sets: []const NamedResultSet) types.TotalHitsRel
     return .exact;
 }
 
+const MemberFusionMap = std.HashMapUnmanaged(
+    member_identity.Identity,
+    struct { key: []u8 },
+    member_identity.Context,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn memberFusionKeyForHit(
+    alloc: Allocator,
+    entries: *MemberFusionMap,
+    by_key: *std.StringHashMapUnmanaged(types.SearchHit),
+    hit: types.SearchHit,
+) ![]const u8 {
+    const identity = member_identity.Identity.fromHit(hit);
+    if (entries.get(identity)) |entry| return entry.key;
+    const key = try std.fmt.allocPrint(alloc, "__member:{d}", .{entries.count()});
+    errdefer alloc.free(key);
+    try entries.put(alloc, identity, .{ .key = key });
+    errdefer _ = entries.remove(identity);
+    try by_key.put(alloc, key, hit);
+    return key;
+}
+
 const OrdinalFusionEntry = struct {
     key: []const u8,
     representative_doc_id: []const u8,
     ordinal: doc_set.DocOrdinal,
 };
+
+/// Ancestor payloads hydrated by single-arm postprocessing
+/// (hydrateDirectChunkAncestors) before fusion runs. Borrowed byte slices
+/// from the source named_sets' hits; fuseNamedSets dupes them into the
+/// materialized fused hit rather than taking ownership here.
+const AncestorPayload = struct {
+    source: ?[]const u8 = null,
+    unit: ?[]const u8 = null,
+    // Borrowed from the source named_sets' hit, same lifetime guarantee as
+    // source/unit above; fuseNamedSets clones it into the materialized fused
+    // hit rather than taking ownership here.
+    artifact_ref: ?types.ArtifactRef = null,
+};
+
+/// Records the ancestor payload and artifact_ref (if any) carried by a
+/// pre-fusion hit under its fusion key, preferring any arm's hit that
+/// actually populated one for this member (issue #930: fusion previously
+/// rebuilt hits from scratch and silently dropped ancestor_source_data/
+/// ancestor_unit_data; artifact_ref -- a chunk/asset member's provenance --
+/// is lost by the same rebuild and needs the same carry-forward).
+fn recordAncestorPayload(
+    alloc: Allocator,
+    map: *std.StringHashMapUnmanaged(AncestorPayload),
+    key: []const u8,
+    hit: types.SearchHit,
+) !void {
+    if (hit.ancestor_source_data == null and hit.ancestor_unit_data == null and hit.artifact_ref == null) return;
+    const gop = try map.getOrPut(alloc, key);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{ .source = hit.ancestor_source_data, .unit = hit.ancestor_unit_data, .artifact_ref = hit.artifact_ref };
+        return;
+    }
+    if (gop.value_ptr.source == null) gop.value_ptr.source = hit.ancestor_source_data;
+    if (gop.value_ptr.unit == null) gop.value_ptr.unit = hit.ancestor_unit_data;
+    if (gop.value_ptr.artifact_ref == null) gop.value_ptr.artifact_ref = hit.artifact_ref;
+}
 
 fn namedSetsHaveCompleteOrdinals(named_sets: []const NamedResultSet) bool {
     for (named_sets, 0..) |set, set_index| {
@@ -1078,12 +1200,18 @@ fn cloneGraphPathEdgeInfo(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
@@ -1123,6 +1251,8 @@ pub fn convertPatternMatchesToGraphMatches(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             if (path.len > 0) alloc.free(path);
@@ -1193,6 +1323,7 @@ pub fn executeSinglePatternQueryWithSets(
                 named,
                 start_key_refs,
                 budgets,
+                executor.scope,
             );
             errdefer {
                 for (aggregates) |*aggregate| aggregate.deinit(alloc);
@@ -1232,6 +1363,7 @@ pub fn executeSinglePatternQueryWithSets(
             named,
             start_key_refs,
             budgets,
+            executor.scope,
         )
     else
         try executor.match_pattern(
@@ -1241,6 +1373,7 @@ pub fn executeSinglePatternQueryWithSets(
             start_key_refs,
             target_nodes,
             budgets,
+            executor.scope,
         );
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1553,6 +1686,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
                 start_keys[0],
                 target_keys[0],
                 budgets.work,
+                executor.scope,
             );
             errdefer if (path) |owned| paths_mod.freePath(alloc, owned);
             if (!executor.predicate_aware and path != null and searchRequestHasGraphPredicates(req) and
@@ -1581,6 +1715,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
                 start_keys[0],
                 target_keys[0],
                 budgets.work,
+                executor.scope,
             );
             errdefer freeOwnedGraphPaths(alloc, paths);
             if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1608,6 +1743,7 @@ pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
         start_key_refs,
         target_keys,
         budgets.work,
+        executor.scope,
     );
     defer graph_result.deinit(alloc);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1691,7 +1827,7 @@ fn buildPathGraphSearchResult(
     };
 }
 
-fn cloneGraphMetricStatusesFromGraph(
+pub fn cloneGraphMetricStatusesFromGraph(
     alloc: Allocator,
     statuses: []const graph_query_mod.GraphMetricStatus,
 ) ![]types.GraphMetricStatus {
@@ -1821,6 +1957,7 @@ fn executeResolvedSearchGraph(
         effective_query,
         start_key_refs,
         target_keys,
+        executor.scope,
     );
     defer result.deinit(alloc);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -2019,7 +2156,7 @@ fn buildPatternDocumentHits(
 
         const documents = if (query.include_documents) blk: {
             if (executor.load_projected_documents) |load_many| {
-                const loaded = try load_many(executor.ctx, alloc, query, keys[0..batch_len]);
+                const loaded = try load_many(executor.ctx, alloc, query.documentRetrievalQuery(), keys[0..batch_len]);
                 if (loaded.len != batch_len) {
                     freeOptionalOwnedBytes(alloc, loaded);
                     return error.InvalidQueryResult;
@@ -2035,7 +2172,7 @@ fn buildPatternDocumentHits(
                 if (loaded.len > 0) alloc.free(loaded);
             }
             for (keys[0..batch_len], 0..) |key, i| {
-                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query, key);
+                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query.documentRetrievalQuery(), key);
                 initialized += 1;
             }
             break :blk loaded;
@@ -2188,6 +2325,8 @@ fn discardGraphResultPaths(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(edges);
@@ -2613,12 +2752,9 @@ pub const PreparedPatternFilter = struct {
         };
         errdefer out.arena.deinit();
         const arena_alloc = out.arena.allocator();
-        const owned_filter_query = try std.json.parseFromValueLeaky(
-            std.json.Value,
-            arena_alloc,
-            filter_query,
-            .{ .allocate = .alloc_always },
-        );
+        // Parsing an existing Value returns it unchanged, even with alloc_always.
+        // Compiled predicates must outlive the caller's JSON parser.
+        const owned_filter_query = try owned_json.clone(arena_alloc, filter_query);
         out.compiled = try compilePatternFilter(arena_alloc, owned_filter_query);
         return out;
     }
@@ -2798,7 +2934,7 @@ test "prepared pattern filters address large authenticated payloads without scra
         .{ .ordinal = 0, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = json } },
         .{ .ordinal = 1, .path = "embedding", .value_type = .bytes_val, .is_dense_vector = true, .value = .{ .bytes_val = vector } },
     };
-    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** relational_row_codec.semantic_hash_len);
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, @as([relational_row_codec.semantic_hash_len]u8, @splat(0)));
     defer alloc.free(encoded);
     var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
     defer layout.deinit();
@@ -2825,7 +2961,7 @@ test "prepared pattern filters preserve dense vector logical array semantics" {
     const cells = [_]relational_row_codec.Cell{
         .{ .ordinal = 0, .path = "embedding", .value_type = .bytes_val, .is_dense_vector = true, .value = .{ .bytes_val = &bytes } },
     };
-    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** relational_row_codec.semantic_hash_len);
+    const encoded = try relational_row_codec.serializeOrdinal(alloc, schema.version, &columns, &cells, @as([relational_row_codec.semantic_hash_len]u8, @splat(0)));
     defer alloc.free(encoded);
     var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
     defer layout.deinit();
@@ -2914,7 +3050,7 @@ test "prepared pattern filters evaluate scalar and nested ordinal cells" {
         schema.version,
         &columns,
         &cells,
-        [_]u8{0x7a} ** relational_row_codec.semantic_hash_len,
+        @as([relational_row_codec.semantic_hash_len]u8, @splat(0x7a)),
     );
     defer alloc.free(encoded);
     var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
@@ -3312,7 +3448,7 @@ const OrdinalEvaluation = struct {
         return view;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         var values = self.parsed_json_cells.valueIterator();
         while (values.next()) |parsed| parsed.deinit();
         self.parsed_json_cells.deinit(self.alloc);
@@ -5607,6 +5743,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return null;
         }
@@ -5618,6 +5755,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return try alloc_inner.alloc(types.GraphPath, 0);
         }
@@ -5629,6 +5767,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             try std.testing.expectEqualStrings("tree_search", named.name);
             try std.testing.expectEqual(@as(usize, 1), start_key_refs.len);
@@ -5803,6 +5942,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             source: []const u8,
             target: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return try makePath(alloc_inner, source, target);
         }
@@ -5814,6 +5954,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             source: []const u8,
             target: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             const paths = try alloc_inner.alloc(types.GraphPath, 1);
             errdefer alloc_inner.free(paths);
@@ -5828,6 +5969,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             _: []const []const u8,
             _: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             return error.TestUnexpectedResult;
         }
@@ -5900,6 +6042,7 @@ test "executeSearchGraphWithSets preserves node ordinals" {
             graph_query: graph_query_mod.GraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             try std.testing.expectEqualStrings("doc_hierarchy", graph_query.index_name);
             try std.testing.expectEqual(@as(usize, 1), start_key_refs.len);
@@ -6003,7 +6146,7 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
     try std.testing.expectEqualStrings("{\"title\":\"A\"}", with_stored.hits[0].stored_data.?);
 }
 
-test "buildPatternDocumentHits preserves resolved binding ordinals" {
+test "decision functions graph hydration fetches hidden inputs and preserves binding ordinals" {
     const alloc = std.testing.allocator;
 
     var bindings = try alloc.alloc(types.GraphPatternBinding, 2);
@@ -6035,6 +6178,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
 
     const Harness = struct {
         batch_loaded: bool = false,
+        full_inputs: bool = false,
         seen_generation: ?u64 = null,
 
         fn matchPattern(
@@ -6044,6 +6188,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
             _: []const []const u8,
             _: []const graph_node_identity.Ref,
             _: RequestGraphBudgets,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]graph_pattern_mod.PatternMatch {
             return error.TestUnexpectedResult;
         }
@@ -6065,9 +6210,11 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
         ) anyerror![]?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             self.batch_loaded = true;
-            try std.testing.expect(!query.include_all_fields);
-            try std.testing.expectEqual(@as(usize, 1), query.fields.len);
-            try std.testing.expectEqualStrings("title", query.fields[0]);
+            try std.testing.expectEqual(self.full_inputs, query.include_all_fields);
+            if (self.full_inputs) try std.testing.expectEqual(@as(usize, 0), query.fields.len) else {
+                try std.testing.expectEqual(@as(usize, 1), query.fields.len);
+                try std.testing.expectEqualStrings("title", query.fields[0]);
+            }
             try std.testing.expectEqual(@as(usize, 2), keys.len);
             try std.testing.expectEqualStrings("doc:a", keys[0]);
             try std.testing.expectEqualStrings("doc:b", keys[1]);
@@ -6129,6 +6276,28 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
     try std.testing.expectEqualStrings("doc:b", hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), hits[1].doc_ordinal);
     try std.testing.expectEqualStrings("{\"title\":\"binding-1\"}", hits[1].stored_data.?);
+
+    harness.full_inputs = true;
+    const decision_hits = try buildPatternDocumentHits(alloc, .{
+        .query_type = .pattern,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+        .defer_document_projection = true,
+    }, 42, &matches, .{
+        .ctx = &harness,
+        .match_pattern = Harness.matchPattern,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_projected_documents = Harness.loadProjectedDocuments,
+        .lookup_doc_ordinal = Harness.lookupOrdinal,
+    });
+    defer {
+        for (decision_hits) |*hit| hit.deinit(alloc);
+        alloc.free(decision_hits);
+    }
+    try std.testing.expectEqual(@as(usize, 2), decision_hits.len);
 
     bindings[1].node.table = try alloc.dupe(u8, "entities");
     try std.testing.expectError(error.UnsupportedQueryRequest, buildPatternDocumentHits(
@@ -6535,6 +6704,73 @@ test "fuseNamedSets preserves fused per-index scores" {
     try std.testing.expectEqualStrings("sparse", result.hits[0].index_scores[1].index_name);
 }
 
+test "fuseNamedSets carries ancestor payloads through fusion (#930)" {
+    const alloc = std.testing.allocator;
+
+    // Only the full-text arm's hit carries the hydrated source ancestor;
+    // fusion must still surface it on the merged member-mode hit rather than
+    // rebuilding a bare {"id": ...} hit from scratch.
+    const text_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .score = 1.0, .ancestor_source_data = @constCast("{\"filename\":\"a.txt\"}") },
+    };
+    const vec_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .score = 0.5 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &text_hits, .total_hits = 1 },
+        .{ .name = "$embeddings_results", .hits = &vec_hits, .total_hits = 1 },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .return_mode = .member,
+        .limit = 5,
+        .include_stored = false,
+    }, &named_sets, .{ .ctx = null, .load_projected_document = Harness.loadProjectedDocument });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("{\"filename\":\"a.txt\"}", result.hits[0].ancestor_source_data.?);
+}
+
+test "fuseNamedSets keeps distinct member-mode chunks sharing a parent ordinal (#931)" {
+    const alloc = std.testing.allocator;
+
+    const text_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .doc_ordinal = 7, .score = 1.0 },
+    };
+    const vec_hits = [_]types.SearchHit{
+        .{ .id = @constCast("chunk:a#0"), .doc_ordinal = 7, .score = 0.9 },
+        .{ .id = @constCast("chunk:a#1"), .doc_ordinal = 7, .score = 0.8 },
+    };
+    const named_sets = [_]NamedResultSet{
+        .{ .name = "$full_text_results", .hits = &text_hits, .total_hits = 1 },
+        .{ .name = "$embeddings_results", .hits = &vec_hits, .total_hits = 2 },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .return_mode = .member,
+        .limit = 5,
+        .include_stored = false,
+    }, &named_sets, .{ .ctx = null, .load_projected_document = Harness.loadProjectedDocument });
+    defer result.deinit();
+
+    // Without the fix this collapses to one hit: both chunks share ordinal 7
+    // and ordinal-keyed fusion (used for non-member modes) would merge them.
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+}
+
 test "executeGraphQueries projects base hits to resolved doc-set for unbounded selectors" {
     const alloc = std.testing.allocator;
 
@@ -6568,6 +6804,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6579,6 +6816,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6590,6 +6828,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6710,6 +6949,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6721,6 +6961,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6732,6 +6973,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6873,6 +7115,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6884,6 +7127,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6895,6 +7139,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -7185,6 +7430,7 @@ test "graph result_ref with limit preserves hit order" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -7196,6 +7442,7 @@ test "graph result_ref with limit preserves hit order" {
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -7207,6 +7454,7 @@ test "graph result_ref with limit preserves hit order" {
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -7353,6 +7601,7 @@ test "db query result shape executeSingleNonPatternQueryWithSets hides metric st
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!?types.GraphPath {
             return null;
         }
@@ -7364,6 +7613,7 @@ test "db query result shape executeSingleNonPatternQueryWithSets hides metric st
             _: []const u8,
             _: []const u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror![]types.GraphPath {
             return try alloc_inner.alloc(types.GraphPath, 0);
         }
@@ -7375,6 +7625,7 @@ test "db query result shape executeSingleNonPatternQueryWithSets hides metric st
             _: []const []const u8,
             _: [][]u8,
             _: *graph_pattern_mod.WorkBudget,
+            _: graph_query_mod.ExecutionScope,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const metric_status = try alloc_inner.alloc(graph_query_mod.GraphMetricStatus, 1);
             metric_status[0] = .{
@@ -7463,4 +7714,112 @@ test "graph metric status clone owns active build worker id" {
     try std.testing.expectEqualStrings("worker-a", cloned[0].build_worker_id);
     try std.testing.expect(cloned[0].build_worker_id.ptr != worker_id.ptr);
     try std.testing.expectEqual(@as(u64, 12345), cloned[0].build_job_id);
+}
+
+test "cloneNamedSetAsResult retains complete member payload under allocation failure" {
+    const AllocationHarness = struct {
+        fn run(alloc: Allocator) !void {
+            const source = [_]types.SearchHit{.{
+                .id = @constCast("chunk:0"),
+                .stored_data = @constCast("{\"text\":true}"),
+                .index_scores = @constCast(&[_]fusion_mod.IndexScore{.{ .index_name = "text", .score = 1.0 }}),
+                .chunk_hits = @constCast(&[_]types.ChunkHit{
+                    .{ .id = @constCast("child:0"), .stored_data = @constCast("{\"child\":true}"), .ancestor_source_data = @constCast("{\"source\":true}"), .artifact_ref = .{ .document_id = @constCast("doc:a"), .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 0 } },
+                    .{ .id = @constCast("child:1"), .ancestor_unit_data = @constCast("{\"unit\":true}") },
+                }),
+                .ancestor_source_data = @constCast("{\"source\":true}"),
+                .ancestor_unit_data = @constCast("{\"unit\":true}"),
+                .artifact_ref = .{
+                    .document_id = @constCast("doc:a"),
+                    .name = @constCast("chunks"),
+                    .kind = .chunk,
+                    .chunk_id = 0,
+                    .unit_id = @constCast("unit:a"),
+                    .source = .{ .kind = .asset, .name = @constCast("units"), .unit_id = @constCast("unit:a") },
+                },
+            }};
+            var result = try cloneNamedSetAsResult(alloc, .{ .name = "only", .hits = &source, .total_hits = 1 }, false);
+            defer result.deinit();
+            try std.testing.expect(result.hits[0].ancestor_source_data != null);
+            try std.testing.expect(result.hits[0].ancestor_unit_data != null);
+            try std.testing.expect(result.hits[0].stored_data == null);
+            try std.testing.expectEqual(@as(usize, 1), result.hits[0].index_scores.len);
+            try std.testing.expect(result.hits[0].artifact_ref != null);
+            try std.testing.expectEqual(@as(usize, 2), result.hits[0].chunk_hits.len);
+            try std.testing.expectEqualStrings(source[0].chunk_hits[0].stored_data.?, result.hits[0].chunk_hits[0].stored_data.?);
+            try std.testing.expectEqualStrings(source[0].chunk_hits[1].ancestor_unit_data.?, result.hits[0].chunk_hits[1].ancestor_unit_data.?);
+            var included = try cloneNamedSetAsResult(alloc, .{ .name = "only", .hits = &source, .total_hits = 1 }, true);
+            defer included.deinit();
+            try std.testing.expectEqualStrings(source[0].stored_data.?, included.hits[0].stored_data.?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationHarness.run, .{});
+}
+
+test "fuseNamedSets preserves complete member identities under allocation failure" {
+    const AllocationHarness = struct {
+        fn run(alloc: Allocator) !void {
+            const first = [_]types.SearchHit{.{
+                .id = @constCast("doc:a"),
+                .source_table = @constCast("table:a"),
+                .doc_ordinal = 7,
+                .score = 0.8,
+                .artifact_ref = .{ .document_id = @constCast("doc:a"), .name = @constCast("first_embedding"), .kind = .embedding },
+            }};
+            const second = [_]types.SearchHit{.{
+                .id = @constCast("doc:a"),
+                .source_table = @constCast("table:a"),
+                .doc_ordinal = 7,
+                .score = 0.9,
+                .artifact_ref = .{ .document_id = @constCast("doc:a"), .name = @constCast("second_embedding"), .kind = .embedding },
+            }};
+            const Harness = struct {
+                fn load(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+                    return null;
+                }
+            };
+            inline for ([_]fusion_mod.FusionStrategy{ .rrf, .rsf }) |strategy| {
+                var result = try fuseNamedSets(alloc, .{ .return_mode = .member, .limit = 10, .include_stored = false, .merge_config = .{ .strategy = strategy } }, &.{
+                    .{ .name = "first", .hits = &first, .total_hits = 1 },
+                    .{ .name = "second", .hits = &second, .total_hits = 1 },
+                    .{ .name = "repeat", .hits = &first, .total_hits = 1 },
+                }, .{ .ctx = null, .load_projected_document = Harness.load });
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+                try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+                for (result.hits) |hit| {
+                    try std.testing.expectEqualStrings("doc:a", hit.id);
+                    try std.testing.expectEqualStrings("table:a", hit.source_table.?);
+                    try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 7), hit.doc_ordinal);
+                    if (std.mem.eql(u8, hit.artifact_ref.?.name, "first_embedding"))
+                        try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+                }
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationHarness.run, .{});
+}
+
+test "fuseNamedSets member identity separates tables and ignores public id aliases" {
+    const alloc = std.testing.allocator;
+    const ref: types.ArtifactRef = .{ .document_id = @constCast("doc:a"), .name = @constCast("embedding"), .kind = .embedding };
+    const first = [_]types.SearchHit{.{ .id = @constCast("doc:a"), .source_table = @constCast("a"), .artifact_ref = ref, .score = 1 }};
+    const alias = [_]types.SearchHit{.{ .id = @constCast("alias"), .source_table = @constCast("a"), .artifact_ref = ref, .score = 1 }};
+    const other = [_]types.SearchHit{.{ .id = @constCast("doc:a"), .source_table = @constCast("b"), .artifact_ref = ref, .score = 1 }};
+    const Harness = struct {
+        fn load(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) anyerror!?[]u8 {
+            return null;
+        }
+    };
+    var result = try fuseNamedSets(alloc, .{ .return_mode = .chunk, .limit = 10, .include_stored = false }, &.{
+        .{ .name = "first", .hits = &first, .total_hits = 1 },
+        .{ .name = "alias", .hits = &alias, .total_hits = 1 },
+        .{ .name = "other", .hits = &other, .total_hits = 1 },
+    }, .{ .ctx = null, .load_projected_document = Harness.load });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    for (result.hits) |hit| {
+        try std.testing.expectEqualStrings("doc:a", hit.id);
+        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, hit.source_table.?, "a")) 2 else 1), hit.index_scores.len);
+    }
 }

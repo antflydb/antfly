@@ -113,8 +113,29 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("hard_cancellation_watchdog.zig");
     _ = @import("models/laya.zig");
+    _ = @import("finetune/laya/graph.zig");
+    _ = @import("bench/antenna_encoder_timing_test.zig");
+    _ = @import("finetune/modern_bert_trunk.zig");
+    _ = @import("finetune/modern_bert_trunk_test.zig");
+    _ = @import("finetune/laya/objective.zig");
+    _ = @import("finetune/laya/training_test.zig");
+    _ = @import("finetune/laya/training_packed_test.zig");
+    _ = @import("finetune/laya/fused_attention_test.zig");
+    _ = @import("ops/segment_training_attention.zig");
+    _ = @import("finetune/laya/data.zig");
+    _ = @import("finetune/laya/job.zig");
+    _ = @import("finetune/laya/evaluate.zig");
     _ = @import("pipelines/laya.zig");
+    _ = @import("pipelines/laya_tree.zig");
+    _ = @import("architectures/laya_trunk_cache.zig");
+    _ = @import("pipelines/laya_packed_test.zig");
+    _ = @import("pipelines/laya_packed_parity_test.zig");
+    _ = @import("pipelines/laya_parity_test.zig");
+    _ = @import("pipelines/gliner_decide_parity_test.zig");
+    _ = @import("pipelines/laya_quantized_test.zig");
+    _ = @import("pipelines/laya_cuda_test.zig");
     _ = @import("pipelines/laya_residency_test.zig");
     _ = @import("extractors/laya.zig");
     _ = backends;
@@ -164,6 +185,8 @@ test {
     _ = @import("ops/deberta_training_attention_test.zig");
     _ = @import("ops/deberta_training_attention_source_test.zig");
     _ = @import("ops/deberta_training_attention_device_test.zig");
+    _ = @import("ops/modernbert_training_attention.zig");
+    _ = @import("ops/modernbert_training_attention_device_test.zig");
     _ = @import("graph/recomputed_training_test.zig");
     _ = @import("finetune/gliner/boundary_replay_bindings.zig");
     _ = @import("finetune/gliner/boundary_recomputed_graph.zig");
@@ -214,6 +237,7 @@ test {
     _ = native_read;
     _ = @import("metal_generated_quant_stats.zig");
     _ = @import("readers/reader.zig");
+    _ = @import("readers/multistage_reader.zig");
     _ = native_extract;
     _ = compare_generate;
     _ = run_options;
@@ -273,7 +297,7 @@ test "non-device-scalar GQA attention never returns generated decode" {
 
     const env_name = "ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE";
     const old_value = std.c.getenv(env_name);
-    const old_value_copy = if (old_value) |value| try std.testing.allocator.dupeZ(u8, std.mem.span(value)) else null;
+    const old_value_copy = if (old_value) |value| try std.testing.allocator.dupeSentinel(u8, std.mem.span(value), 0) else null;
     defer {
         if (old_value_copy) |value| {
             _ = setenv(env_name, value.ptr, 1);

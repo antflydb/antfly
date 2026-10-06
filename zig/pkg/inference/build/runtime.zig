@@ -27,6 +27,7 @@ pub const BackendOptions = struct {
     enable_pjrt: bool = false,
     enable_native: bool = true,
     enable_system_blas: bool = false,
+    enable_runtime_openblas: bool = true,
     blas_root: ?[]const u8 = null,
     enable_wasm: bool = false,
     enable_webgpu: bool = false,
@@ -52,7 +53,7 @@ pub const SharedModules = struct {
     json: ?*std.Build.Module = null,
     httpx: ?*std.Build.Module = null,
     platform: ?*std.Build.Module = null,
-    vellum: ?*std.Build.Module = null,
+    fst: ?*std.Build.Module = null,
     scraping: ?*std.Build.Module = null,
     google: ?*std.Build.Module = null,
     objectstore: ?*std.Build.Module = null,
@@ -86,7 +87,7 @@ pub const SharedModules = struct {
 pub const Config = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: Paths,
     backend: BackendOptions,
     shared: SharedModules,
@@ -94,6 +95,7 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
+    c_bindings: CBindings,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     identities: jit_identity.Modules,
@@ -105,7 +107,7 @@ pub const Graph = struct {
     httpx_mod: *std.Build.Module,
     platform_mod: *std.Build.Module,
     google_mod: *std.Build.Module,
-    vellum_mod: *std.Build.Module,
+    fst_mod: *std.Build.Module,
     scraping_mod: *std.Build.Module,
     objectstore_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
@@ -171,7 +173,7 @@ pub fn create(config: Config) Graph {
         break :blk mod;
     };
     const platform_mod = shared.platform orelse @panic("inference runtime requires a configured antfly_platform module");
-    const vellum_mod = shared.vellum orelse createSharedModule(config, "lib/vellum/src/mod.zig");
+    const fst_mod = shared.fst orelse createSharedModule(config, "lib/fst/src/mod.zig");
     const google_mod = shared.google orelse blk: {
         const mod = createSharedModule(config, "lib/google/src/root.zig");
         mod.addImport("httpx", httpx_mod);
@@ -193,7 +195,7 @@ pub fn create(config: Config) Graph {
     };
     const regex_mod = shared.regex orelse blk: {
         const mod = createSharedModule(config, "lib/regex/src/mod.zig");
-        mod.addImport("antfly_vellum", vellum_mod);
+        mod.addImport("antfly_fst", fst_mod);
         break :blk mod;
     };
     const jsonschema_mod = shared.jsonschema orelse blk: {
@@ -233,13 +235,13 @@ pub fn create(config: Config) Graph {
     const pjrt_mod = if (backend.enable_pjrt) qualification_pjrt_mod else null;
 
     const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, config.register_public_modules, "antfly_generating_openapi", .{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_generating_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
     var shared_with_generating = shared;
     if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     }));
@@ -260,9 +262,9 @@ pub fn create(config: Config) Graph {
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
-    const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_s3_openapi/root.zig");
+    const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig");
     const audio_openapi_mod = shared.audio_openapi orelse blk: {
-        const mod = createSharedModule(config, "pkg/antfly/src/openapi/generated/antfly_audio_openapi/root.zig");
+        const mod = createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_audio_openapi/root.zig");
         mod.addImport("antfly_s3_openapi", s3_openapi_mod);
         break :blk mod;
     };
@@ -303,6 +305,14 @@ pub fn create(config: Config) Graph {
         .optimize = optimize,
     });
 
+    addX86Kernels(
+        b,
+        inference_linalg_mod,
+        b.path(pathJoin(b, paths.shared_lib_root, "lib/linalg")),
+        target,
+        optimize,
+    );
+
     const inference_audio_mod = addOrCreateModule(b, config.register_public_modules, "inference_audio", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/audio/src/mod.zig")),
         .target = target,
@@ -320,12 +330,14 @@ pub fn create(config: Config) Graph {
     inference_chunker_mod.addImport("antfly_image", image_mod);
     inference_chunker_mod.addImport("antfly_hash", hash_mod);
 
+    const c_bindings = createCBindings(b, target, backend, paths);
     const inference_mod = b.createModule(.{
         .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/inference.zig")),
         .target = target,
         .optimize = optimize,
     });
     addInferenceRootImports(inference_mod, .{
+        .c_bindings = c_bindings,
         .build_info_mod = shared.build_info_mod,
         .identities = identities,
         .build_options_mod = build_options_mod,
@@ -383,6 +395,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("onnx_graph", onnx.graph);
     inference_internal_mod.addImport("onnx_data", onnx.data);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
+    applyCBindings(inference_internal_mod, c_bindings);
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
@@ -399,7 +412,7 @@ pub fn create(config: Config) Graph {
         .httpx_mod = httpx_mod,
         .platform_mod = platform_mod,
         .google_mod = google_mod,
-        .vellum_mod = vellum_mod,
+        .fst_mod = fst_mod,
         .scraping_mod = scraping_mod,
         .objectstore_mod = objectstore_mod,
         .regex_mod = regex_mod,
@@ -431,13 +444,54 @@ pub fn create(config: Config) Graph {
         .reader_config_mod = reader_config_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
+        .c_bindings = c_bindings,
     };
 }
 
-pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
+pub const CBindings = struct {
+    onnx: *std.Build.Module,
+    ortgenai: *std.Build.Module,
+};
+
+fn createCBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    backend: BackendOptions,
+    paths: Paths,
+) CBindings {
+    const empty = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/c_empty.zig")),
+        .target = target,
+    });
+    if (!backend.enable_onnx) return .{ .onnx = empty, .ortgenai = empty };
+
+    const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
+    const onnx = b.addTranslateC(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
+        .target = target,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
+    const ortgenai = b.addTranslateC(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
+        .target = target,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    ortgenai.addIncludePath(b.graph.cwdRelativePath(include_dir));
+    return .{ .onnx = onnx.createModule(), .ortgenai = ortgenai.createModule() };
+}
+
+pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
+    module.addImport("onnx_c", bindings.onnx);
+    module.addImport("ortgenai_c", bindings.ortgenai);
+}
+
+pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
-        .max_rss = 7 * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = b.path(pathJoin(b, inference_root, "src/main.zig")),
             .target = target,
@@ -454,6 +508,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
 }
 
 const InferenceRootImports = struct {
+    c_bindings: CBindings,
     build_info_mod: *std.Build.Module,
     identities: jit_identity.Modules,
     build_options_mod: *std.Build.Module,
@@ -483,6 +538,7 @@ const InferenceRootImports = struct {
 };
 
 pub fn addInferenceRootImports(module: *std.Build.Module, imports: InferenceRootImports) void {
+    applyCBindings(module, imports.c_bindings);
     module.addImport("build_info", imports.build_info_mod);
     imports.identities.addImports(module);
     module.addImport("build_options", imports.build_options_mod);
@@ -544,6 +600,7 @@ fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) v
     options.addOption(bool, "enable_pjrt", backend.enable_pjrt);
     options.addOption(bool, "enable_native", backend.enable_native);
     options.addOption(bool, "enable_system_blas", backend.enable_system_blas);
+    options.addOption(bool, "enable_runtime_openblas", backend.enable_runtime_openblas);
     options.addOption(bool, "enable_wasm", backend.enable_wasm);
     options.addOption(bool, "enable_webgpu", backend.enable_webgpu);
     options.addOption(bool, "link_libc", backend.link_libc);
@@ -560,7 +617,7 @@ pub fn addInferenceApiOverride(
 ) ?std.Build.LazyPath {
     const spec = b.option([]const u8, "inference-openapi-spec", "Path to the inference OpenAPI YAML spec used to generate inference_api") orelse return null;
     return openapi_build.addGeneratedDirectory(b, .{
-        .compiler = compiler orelse b.dependency("openapi", .{ .target = b.graph.host, .optimize = .ReleaseSafe }).artifact("openapi-zig"),
+        .compiler = compiler orelse b.dependency("openapi", .{ .target = b.graph.host, .optimize = .safe }).artifact("openapi-zig"),
         .scripts_root = scripts_root,
         .spec = b.path(spec),
         .package_name = "inference_api",
@@ -576,7 +633,7 @@ pub fn addInferenceApiOverride(
 fn addInferenceApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     httpx_mod: *std.Build.Module,
     skip_openapi: bool,
     paths: Paths,
@@ -584,12 +641,12 @@ fn addInferenceApiModule(
     shared: SharedModules,
 ) *std.Build.Module {
     const generating_openapi_mod = shared.generating_openapi orelse addOrCreateModule(b, register_public_modules, "antfly_generating_openapi", .{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_generating_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_generating_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
     if (shared.generating_openapi == null) generating_openapi_mod.addImport("antfly_provider_openapi", b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_provider_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_provider_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     }));
@@ -643,12 +700,12 @@ fn addInferenceApiModule(
 fn addChunkingApiOpenApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: Paths,
     generating_openapi_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_chunking_api_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_chunking_api_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
@@ -659,12 +716,12 @@ fn addChunkingApiOpenApiModule(
 fn addExtractionOpenApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: Paths,
     generating_openapi_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
-        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly/src/openapi/generated/antfly_extraction_openapi/root.zig")),
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "pkg/antfly-embedded/src/openapi/generated/antfly_extraction_openapi/root.zig")),
         .target = target,
         .optimize = optimize,
     });
@@ -722,9 +779,9 @@ pub fn configureSystemBlas(
         return;
     }
     if (blas_root) |root| {
-        module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{root}) });
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
+        module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{root})));
+        module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
+        module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
     }
     module.linkSystemLibrary("openblas", .{});
 }
@@ -738,11 +795,11 @@ pub fn configureOnnxRuntime(
     if (!enable_onnx) return;
     // Declare dependencies on the consuming module. Missing installations fail
     // its compile/link step without blocking configuration of unrelated targets.
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
     if (std.mem.startsWith(u8, onnx_root, "pkg/")) {
-        module.addRPath(.{ .cwd_relative = b.fmt("zig/{s}/lib", .{onnx_root}) });
+        module.addRPath(b.graph.cwdRelativePath(b.fmt("zig/{s}/lib", .{onnx_root})));
     }
     module.linkSystemLibrary("onnxruntime", .{});
     module.linkSystemLibrary("onnxruntime-genai", .{});
@@ -765,16 +822,37 @@ pub fn configureMetal(
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
-        return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // xcrun observes the selected Xcode installation outside configure inputs.
+        b.graph.poisonCache();
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    };
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {
     if (root.len == 0) return relative_path;
     return b.fmt("{s}/{s}", .{ root, relative_path });
+}
+
+/// Keep optional ISA instructions in a distinct object. Importers remain
+/// baseline compatible, including GNU/musl, static binaries, and PIC users.
+pub fn addX86Kernels(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64) return;
+    var query = target.query;
+    query.cpu_model = .baseline;
+    query.cpu_features_add = std.Target.x86.featureSet(&.{ .avx, .avx2, .fma, .f16c });
+    query.cpu_features_sub = .empty;
+    const object = b.addObject(.{
+        .name = "antfly-linalg-avx2",
+        .root_module = b.createModule(.{
+            .root_source_file = root.path(b, "src/x86_avx2.zig"),
+            .target = b.resolveTargetQuery(query),
+            .optimize = optimize,
+            .pic = true,
+        }),
+    });
+    module.addObject(object);
 }

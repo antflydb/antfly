@@ -619,3 +619,16 @@ test "lake range planner creates column chunk reads from external inventory meta
     try std.testing.expectEqualStrings("amount", read.decoded_column_id);
     try std.testing.expectEqualStrings("zstd", read.compression_codec);
 }
+
+/// Immutable range ownership. Legacy providers own allocator bytes; shared
+/// caches pin entries. A lease must be released before its reader is closed.
+pub const RangeLease = struct {
+    bytes: []const u8,
+    owner: union(enum) { allocation: std.mem.Allocator, shared: struct { ptr: *anyopaque, release_fn: *const fn (*anyopaque) void } },
+    pub fn release(self: RangeLease) void {
+        switch (self.owner) {
+            .allocation => |a| a.free(self.bytes),
+            .shared => |v| v.release_fn(v.ptr),
+        }
+    }
+};

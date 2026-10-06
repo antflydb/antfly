@@ -25,6 +25,45 @@ const TypeGenerator = @import("codegen_types.zig").TypeGenerator;
 /// Success status codes to check for response types, in priority order.
 pub const success_status_codes = [_][]const u8{ "200", "201", "202", "2XX" };
 
+pub const SuccessSchema = struct { code: []const u8, schema: types.SchemaOrRef };
+
+/// Keep every distinct-status JSON success response, including wildcards.
+/// Identical named schemas retain the original ApiResponse(T) interface:
+/// status dispatch is necessary only when the payload types actually differ.
+pub fn successSchemas(arena: Allocator, resolver: *Resolver, op: types.Operation) ![]const SuccessSchema {
+    var result: std.ArrayList(SuccessSchema) = .empty;
+    for (try sortedStringKeys(arena, op.responses.keys())) |code| {
+        if (code.len != 3 or code[0] != '2') continue;
+        if (!std.mem.eql(u8, code, "2XX")) _ = std.fmt.parseInt(u16, code, 10) catch continue;
+        const response = try resolver.resolveResponse(op.responses.get(code).?);
+        const media = response.content.get("application/json") orelse continue;
+        try result.append(arena, .{ .code = code, .schema = media.schema orelse continue });
+    }
+    if (result.items.len > 1 and result.items[0].schema == .ref) {
+        const first = result.items[0].schema.ref.ref_string;
+        var identical = true;
+        for (result.items[1..]) |response| {
+            if (response.schema != .ref or !std.mem.eql(u8, first, response.schema.ref.ref_string)) {
+                identical = false;
+                break;
+            }
+        }
+        if (identical) result.items.len = 1;
+    }
+    return result.toOwnedSlice(arena);
+}
+
+pub fn inlineResponseTypeName(arena: Allocator, op_id: []const u8, code: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "OpenApi{s}Response{s}", .{ try naming.toTypeName(arena, op_id), code });
+}
+
+pub fn successSchemaType(arena: Allocator, type_gen: *TypeGenerator, op_id: []const u8, response: SuccessSchema) ![]const u8 {
+    return qualifyType(arena, switch (response.schema) {
+        .ref => try type_gen.zigTypeForSchemaOrRef(response.schema),
+        .schema => try inlineResponseTypeName(arena, op_id, response.code),
+    });
+}
+
 pub fn sortedStringKeys(arena: Allocator, keys: []const []const u8) ![]const []const u8 {
     const sorted = try arena.dupe([]const u8, keys);
     std.sort.pdq([]const u8, sorted, {}, stringLessThan);

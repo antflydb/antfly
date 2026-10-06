@@ -18,13 +18,23 @@ const db_mod = @import("../storage/db/selected_root.zig").db;
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
 
+pub const acknowledge_many_protocol_version = @import("../common/data_raft_protocol.zig").batch_acknowledge_many_protocol_version;
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
+pub const artifact_catalog_protocol_version = internal_batch_forwarding.raft_batch_artifact_catalog_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
 pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.raft_batch_split_delta_predecessor_protocol_version;
 pub const merge_artifacts_protocol_version = internal_batch_forwarding.raft_batch_merge_artifacts_protocol_version;
 pub const merge_copy_attempt_protocol_version = internal_batch_forwarding.raft_batch_merge_copy_attempt_protocol_version;
+pub const merge_retirements_protocol_version = internal_batch_forwarding.raft_batch_merge_retirements_protocol_version;
+pub const merge_page_protocol_version = internal_batch_forwarding.raft_batch_merge_page_protocol_version;
+pub const online_source_protocol_version = internal_batch_forwarding.raft_batch_online_source_protocol_version;
+pub const source_pin_protocol_version = internal_batch_forwarding.raft_batch_source_pin_protocol_version;
+pub const relational_transfer_protocol_version = internal_batch_forwarding.raft_batch_relational_transfer_protocol_version;
+pub const source_scope_protocol_version = internal_batch_forwarding.raft_batch_source_scope_protocol_version;
+pub const merge_chunk_protocol_version = internal_batch_forwarding.raft_batch_merge_chunk_protocol_version;
+pub const merge_proof_adoption_protocol_version = internal_batch_forwarding.raft_batch_merge_proof_adoption_protocol_version;
 
 pub const OwnedStorageOwnerDescriptor = struct {
     descriptor: descriptor_contract.Descriptor,
@@ -36,6 +46,9 @@ pub const OwnedStorageOwnerDescriptor = struct {
     pub fn deinit(self: *OwnedStorageOwnerDescriptor, alloc: std.mem.Allocator) void {
         alloc.free(self.descriptor.schema_json);
         alloc.free(self.descriptor.indexes_json);
+        alloc.free(self.descriptor.restore_bootstrap_json);
+        alloc.free(self.descriptor.initial_child_bootstrap_json);
+        descriptor_contract.freeInitialRange(alloc, self.descriptor.initial_range);
         self.* = undefined;
     }
 };
@@ -111,12 +124,24 @@ fn cloneStorageOwnerDescriptor(
 ) !OwnedStorageOwnerDescriptor {
     const schema_json = try alloc.dupe(u8, descriptor.schema_json);
     errdefer alloc.free(schema_json);
+    const indexes_json = try alloc.dupe(u8, descriptor.indexes_json);
+    errdefer alloc.free(indexes_json);
+    const restore_bootstrap_json = try alloc.dupe(u8, descriptor.restore_bootstrap_json);
+    errdefer alloc.free(restore_bootstrap_json);
+    const initial_child_bootstrap_json = try alloc.dupe(u8, descriptor.initial_child_bootstrap_json);
+    errdefer alloc.free(initial_child_bootstrap_json);
+    const initial_range = try descriptor_contract.cloneInitialRange(alloc, descriptor.initial_range);
     return .{ .descriptor = .{
         .lsm_root_generation = descriptor.lsm_root_generation,
         .identity = descriptor.identity,
         .table_storage = descriptor.table_storage,
         .schema_json = schema_json,
-        .indexes_json = try alloc.dupe(u8, descriptor.indexes_json),
+        .indexes_json = indexes_json,
+        .restore_bootstrap_json = restore_bootstrap_json,
+        .initial_child_bootstrap_json = initial_child_bootstrap_json,
+        .initial_range = initial_range,
+        .restore_cancel_recovery = descriptor.restore_cancel_recovery,
+        .restore_ha_replay = descriptor.restore_ha_replay,
     } };
 }
 
@@ -177,13 +202,45 @@ fn consumerTests() type {
     const test_owner_root = @import("antfly_source_root");
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
+        test "ordered artifact merge adoption uses private raft batch encoding" {
+            const alloc = std.testing.allocator;
+            const request: db_mod.types.BatchRequest = .{ .merge_proof_adoption = .{
+                .transition_id = 7,
+                .attempt = .{ .donor_term = 3, .sequence = 4 },
+                .source_pin = @splat(1),
+                .proof_digest = @splat(2),
+                .record_digest = @splat(3),
+            } };
+            const batch_json = try batch_api.encodeBatchRequest(alloc, request);
+            defer alloc.free(batch_json);
+            try std.testing.expectError(error.InvalidBatchRequest, batch_api.parseBatchRequest(alloc, batch_json));
+            const encoded = try encode(alloc, "docs", request);
+            defer alloc.free(encoded);
+            var decoded = try decode(alloc, encoded);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqualDeep(request.merge_proof_adoption.?, decoded.batch.req.merge_proof_adoption.?);
+            try std.testing.expectError(error.InvalidBatchRequest, encode(alloc, "docs", .{
+                .merge_proof_adoption = request.merge_proof_adoption,
+                .deletes = &.{"doc"},
+            }));
+        }
+
         test "raft protocol barrier is fail closed for legacy batch parsers" {
             try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
             try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
             try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
             try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
-            try std.testing.expectEqual(protocol_version, merge_copy_attempt_protocol_version);
+            try std.testing.expect(merge_retirements_protocol_version > merge_copy_attempt_protocol_version);
+            try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
+            try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
+            // artifact_catalog was the newest feature when this was written;
+            // later versions (acknowledge_many, row_semantics, ...) have
+            // since advanced protocol_version past it, same as the next check.
+            try std.testing.expect(protocol_version >= artifact_catalog_protocol_version);
+            try std.testing.expect(protocol_version >= acknowledge_many_protocol_version);
+            try std.testing.expect(acknowledge_many_protocol_version > source_scope_protocol_version);
+            try std.testing.expectEqual(source_scope_protocol_version, source_pin_protocol_version);
             const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
             defer std.testing.allocator.free(encoded);
 
@@ -201,6 +258,17 @@ fn consumerTests() type {
             defer decoded.deinit(std.testing.allocator);
             try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
             try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
+
+            // Feature activation versions are persisted independently of the
+            // latest advertised decoder version. Keep older barriers readable
+            // as new features advance that maximum.
+            for ([_]u16{ artifact_catalog_protocol_version, merge_proof_adoption_protocol_version, protocol_version }) |version| {
+                const barrier = try encodeProtocolBarrier(std.testing.allocator, "docs", version);
+                defer std.testing.allocator.free(barrier);
+                var feature = try decode(std.testing.allocator, barrier);
+                defer feature.deinit(std.testing.allocator);
+                try std.testing.expectEqual(version, feature.protocol_barrier_version.?);
+            }
         }
 
         test "raft protocol barrier rejects unsupported future versions" {
@@ -432,6 +500,9 @@ fn consumerTests() type {
                 .identity = .{ .table_id = 7, .shard_id = 42, .range_id = 4200 },
                 .schema_json = "{\"fields\":{\"title\":{\"type\":\"string\"}}}",
                 .indexes_json = "{\"title\":{\"type\":\"full_text\"}}",
+                .restore_bootstrap_json = "{\"scope\":\"exact immutable owner proof\"}",
+                .initial_child_bootstrap_json = "{\"plan_id\":\"exact hidden child proof\"}",
+                .restore_cancel_recovery = true,
             };
             const encoded = try encodeWithStorageOwnerDescriptor(
                 std.testing.allocator,
@@ -449,10 +520,29 @@ fn consumerTests() type {
             try std.testing.expectEqualDeep(descriptor.table_storage, actual.descriptor.table_storage);
             try std.testing.expectEqualStrings(descriptor.schema_json, actual.descriptor.schema_json);
             try std.testing.expectEqualStrings(descriptor.indexes_json, actual.descriptor.indexes_json);
+            try std.testing.expectEqualStrings(descriptor.restore_bootstrap_json, actual.descriptor.restore_bootstrap_json);
+            try std.testing.expectEqualStrings(descriptor.initial_child_bootstrap_json, actual.descriptor.initial_child_bootstrap_json);
+            try std.testing.expectEqual(descriptor.restore_cancel_recovery, actual.descriptor.restore_cancel_recovery);
+        }
+
+        test "raft batch round trips binary initial owner range" {
+            const alloc = std.testing.allocator;
+            const descriptor: descriptor_contract.Descriptor = .{
+                .lsm_root_generation = 7,
+                .identity = .{ .table_id = 8, .shard_id = 9, .range_id = 10 },
+                .initial_range = .{ .start = &.{ 0, 128, 255 }, .end = &.{ 1, 0, 255 } },
+            };
+            const encoded = try encodeWithStorageOwnerDescriptor(alloc, "docs", .{}, descriptor);
+            defer alloc.free(encoded);
+            var decoded = try decode(alloc, encoded);
+            defer decoded.deinit(alloc);
+            const actual = decoded.storage_owner_descriptor.?.descriptor.initial_range.?;
+            try std.testing.expectEqualSlices(u8, descriptor.initial_range.?.start, actual.start);
+            try std.testing.expectEqualSlices(u8, descriptor.initial_range.?.end, actual.end);
         }
 
         test "raft batch round trips deterministic transaction begin" {
-            const txn_id: db_mod.types.TxnId = .{1} ** 16;
+            const txn_id: db_mod.types.TxnId = @splat(1);
             const encoded = try encode(std.testing.allocator, "docs", .{
                 .transaction = .{ .begin = .{
                     .txn_id = txn_id,
@@ -473,6 +563,30 @@ fn consumerTests() type {
             try std.testing.expectEqual(txn_id, begin.txn_id);
             try std.testing.expectEqual(@as(u64, 200), begin.created_at_ns);
             try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
+        }
+
+        test "raft batch round trips guarded graph owner replay afterimages" {
+            const alloc = std.testing.allocator;
+            const contract = @import("../storage/graph_cleanup_contract.zig");
+            const key = try contract.ownerJobKeyAlloc(alloc, "owner\x00\xff");
+            defer alloc.free(key);
+            const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7 });
+            defer alloc.free(old);
+            const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7, .phase = .inputs });
+            defer alloc.free(next);
+            const req: db_mod.types.BatchRequest = .{
+                .graph_endpoint_cleanup = true,
+                .graph_endpoint_cleanup_planned = true,
+                .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner\x00\xff", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
+                .merge_artifacts = &.{.{ .key = key, .value = next }},
+            };
+            const bytes = try encode(alloc, "docs", req);
+            defer alloc.free(bytes);
+            var decoded = try decode(alloc, bytes);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqualSlices(u8, next, decoded.batch.req.merge_artifacts[0].value);
+            try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
+            try db_mod.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
         }
     };
     return Suite;

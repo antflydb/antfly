@@ -44,7 +44,7 @@ pub fn encodeAlloc(alloc: Allocator, fragment: row_fragment.Fragment) ![]u8 {
 
     for (fragment.columns) |column| {
         try appendBytes(alloc, &out, column.name);
-        try out.append(alloc, @intFromEnum(column.kind));
+        try out.append(alloc, @backingInt(column.kind));
         try appendU32(alloc, &out, @intCast(column.values.len));
         for (column.values) |value| {
             try encodeCell(alloc, &out, column.kind, value);
@@ -360,7 +360,7 @@ test "row fragment codec bounds vector allocation amplification" {
     try appendU64(alloc, &encoded, 0);
     try appendBytes(alloc, &encoded, "row-a");
     try appendBytes(alloc, &encoded, "embedding");
-    try encoded.append(alloc, @intFromEnum(row_fragment.ColumnKind.vector_f32));
+    try encoded.append(alloc, @backingInt(row_fragment.ColumnKind.vector_f32));
     try appendU32(alloc, &encoded, 1);
     try encoded.append(alloc, cell_present);
     try appendU32(alloc, &encoded, std.math.maxInt(u32));

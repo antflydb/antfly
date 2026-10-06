@@ -23,8 +23,8 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const byte_copy = @import("../../common/byte_copy.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const platform_sync = @import("antfly_platform").sync;
 const storage_io = @import("../lsm_backend/storage_io.zig");
 
@@ -72,7 +72,7 @@ pub const ContainerStorage = struct {
     };
 
     allocator: Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: if (builtin.os.tag == .freestanding) void else std.Io.Threaded,
     path: []u8,
     lock_file: ?std.Io.File = null,
     read_only: bool = false,
@@ -372,10 +372,10 @@ fn parseRecord(raw: []const u8, offset: usize) !ParsedRecord {
     const value = payload[path.len + aux.len ..];
 
     const kind: RecordKind = switch (kind_raw) {
-        @intFromEnum(RecordKind.put) => .put,
-        @intFromEnum(RecordKind.delete) => .delete,
-        @intFromEnum(RecordKind.rename) => .rename,
-        @intFromEnum(RecordKind.delete_tree) => .delete_tree,
+        @backingInt(RecordKind.put) => .put,
+        @backingInt(RecordKind.delete) => .delete,
+        @backingInt(RecordKind.rename) => .rename,
+        @backingInt(RecordKind.delete_tree) => .delete_tree,
         else => return error.InvalidRecordKind,
     };
 
@@ -407,7 +407,7 @@ fn appendEncodedRecord(
     const record = out.items[start..][0..record_len];
 
     @memcpy(record[0..4], record_magic);
-    record[4] = @intFromEnum(kind);
+    record[4] = @backingInt(kind);
     std.mem.writeInt(u32, record[5..9], @intCast(path.len), .little);
     std.mem.writeInt(u32, record[9..13], @intCast(aux.len), .little);
     std.mem.writeInt(u64, record[13..21], value.len, .little);
@@ -774,7 +774,7 @@ const ContainerAtomicWriteSink = struct {
         };
     }
 
-    fn deinit(self: *ContainerAtomicWriteSink) void {
+    pub fn deinit(self: *ContainerAtomicWriteSink) void {
         self.out.deinit(self.allocator);
         self.allocator.free(self.path);
         self.allocator.destroy(self);

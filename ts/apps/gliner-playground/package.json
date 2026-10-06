@@ -9,7 +9,7 @@
     "build": "pnpm prepare:runtime && tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "tsc --noEmit",
-    "test:browser": "node --test test/browser.test.mjs"
+    "test:browser": "node --test --test-concurrency=1 test/browser.test.mjs test/decision-models.test.mjs"
   },
   "dependencies": {
     "@antfly/design-system": "workspace:*",

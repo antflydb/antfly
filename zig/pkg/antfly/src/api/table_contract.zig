@@ -14,7 +14,9 @@
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
+const matcher = @import("antfly_matcher");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
 const coverage_policy = @import("coverage_policy.zig");
@@ -66,6 +68,10 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tables_api.CreateTableRequest {
     if (body.len == 0) return .{ .indexes_json = try coverage_policy.withMissingIncarnationsAlloc(alloc, tables_api.default_indexes_json) };
+    if (try @import("relational_index_mutation.zig").normalizeCreateTableBody(alloc, body)) |normalized| {
+        defer alloc.free(normalized);
+        return parseCreateTableRequest(alloc, normalized);
+    }
 
     // Validate and normalize indexes from the raw request before invoking the
     // generated parser. The generated OpenAPI parser rejects unknown enum
@@ -99,7 +105,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
     // generated IndexConfig struct doesn't capture.
-    var parsed = metadata_openapi.server.parseCreateTableBody(alloc, body) catch {
+    var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch {
         var fallback = try tables_api.parseCreateTableRequest(alloc, body);
         errdefer fallback.deinit(alloc);
         // Raw public fields were validated above. The compatibility parser
@@ -110,6 +116,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
+        try @import("../schema/relational_index_namespace.zig").validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
         return fallback;
     };
     defer parsed.deinit();
@@ -139,11 +146,16 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     }
     try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
 
-    if (raw_root.get("schema")) |schema_value| {
+    // The generated scalar parser and artifact validators use machine
+    // numbers. Extract only schema separately so typed literals retain their
+    // original tokens instead of rounding before schema validation.
+    var exact_schema = try std.json.parseFromSlice(struct { schema: ?std.json.Value = null }, alloc, body, .{ .ignore_unknown_fields = true, .parse_numbers = false });
+    defer exact_schema.deinit();
+    if (exact_schema.value.schema) |schema_value| {
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
-            const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
+            const validated_schema = @import("../schema/table_schema_impl.zig").parseCreateSchemaRequest(alloc, raw_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
@@ -157,6 +169,8 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     if (parsed.value.replication_sources) |replication_sources| {
         req.replication_sources_json = try stringifyJsonAlloc(alloc, replication_sources);
     }
+
+    try @import("../schema/relational_index_namespace.zig").validate(alloc, req.schema_json orelse "", req.indexes_json.?);
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
@@ -362,7 +376,10 @@ pub fn createTableRequestErrorMessage(err: anyerror, body: []const u8) []const u
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    // Typed literal binding must see the caller's exact numeric token. Keep
+    // artifact validation's established numeric representation unchanged.
+    const relational = try @import("relational_index_mutation.zig").isRelational(alloc, body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = !relational });
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |object| object,
@@ -476,6 +493,14 @@ fn normalizeIndexConfigJson(
                 try appendNormalizedInlineEnrichmentsField(alloc, &out, entry.value_ptr.*, &first);
                 continue;
             }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact")) {
+                try appendNormalizedGraphArtifactField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "resolvers")) {
+                try appendNormalizedGraphResolversField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     } else {
@@ -487,11 +512,82 @@ fn normalizeIndexConfigJson(
                 try appendNormalizedInlineEnrichmentsField(alloc, &out, entry.value_ptr.*, &first);
                 continue;
             }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact")) {
+                try appendNormalizedGraphArtifactField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
+            if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "resolvers")) {
+                try appendNormalizedGraphResolversField(alloc, &out, entry.value_ptr.*, &first);
+                continue;
+            }
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn appendNormalizedGraphArtifactField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value, first: *bool) !void {
+    if (value != .object) return appendField(alloc, out, "artifact", value, first);
+    const producer = value.object.get("producer");
+    if (producer == null or producer.? == .null) return appendField(alloc, out, "artifact", value, first);
+    if (value.object.get("producer_json")) |legacy| if (legacy != .null) return error.InvalidCreateIndexRequest;
+    var normalized = std.json.ObjectMap{};
+    defer normalized.deinit(alloc);
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
+        try normalized.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try normalized.put(alloc, "producer_json", producer.?);
+    try appendField(alloc, out, "artifact", .{ .object = normalized }, first);
+}
+
+fn appendNormalizedGraphResolversField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value, first: *bool) !void {
+    if (value != .array) return appendField(alloc, out, "resolvers", value, first);
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try out.appendSlice(alloc, "\"resolvers\":[");
+    for (value.array.items, 0..) |item, i| {
+        if (i != 0) try out.append(alloc, ',');
+        if (item != .object) return error.InvalidCreateIndexRequest;
+        const scorer = item.object.get("scorer");
+        if (scorer == null or scorer.? == .null) {
+            if (item.object.get("scorer_json")) |legacy| {
+                if (legacy != .null) {
+                    if (legacy != .string) return error.InvalidCreateIndexRequest;
+                    // Empty is the legacy spelling for a deterministic
+                    // resolver without a matcher scorer.
+                    if (legacy.string.len > 0) try validateGraphScorerJson(alloc, legacy.string);
+                }
+            }
+            try appendCanonicalPublicValue(alloc, out, item, null);
+            continue;
+        }
+        if (item.object.get("scorer_json")) |legacy| if (legacy != .null) return error.InvalidCreateIndexRequest;
+        try validatePublicCreatedShape(scorer.?, .graph_scorer);
+        const scorer_json = try stringifyJsonAlloc(alloc, scorer.?);
+        defer alloc.free(scorer_json);
+        try validateGraphScorerJson(alloc, scorer_json);
+        var normalized = std.json.ObjectMap{};
+        defer normalized.deinit(alloc);
+        var it = item.object.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key_ptr.*, "scorer")) continue;
+            try normalized.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        try normalized.put(alloc, "scorer_json", .{ .string = scorer_json });
+        try appendCanonicalPublicValue(alloc, out, .{ .object = normalized }, null);
+    }
+    try out.append(alloc, ']');
+}
+
+fn validateGraphScorerJson(alloc: std.mem.Allocator, raw: []const u8) !void {
+    var scorer = matcher.Scorer.parse(alloc, raw) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateIndexRequest,
+    };
+    scorer.deinit();
 }
 
 fn appendNormalizedInlineEnrichmentsField(
@@ -611,6 +707,13 @@ fn validatePublicIndexFieldRelationships(object: anytype, index_type: public_ind
             }
         },
         .algebraic => {},
+        .relational => {
+            const keys = indexObjectGet(object, "keys") orelse return error.InvalidCreateIndexRequest;
+            try validatePublicCreatedShape(keys, .relational_keys);
+            if (indexObjectGet(object, "where")) |conditions| {
+                if (conditions != .null) try validatePublicCreatedShape(conditions, .relational_predicates);
+            }
+        },
     }
 }
 
@@ -721,7 +824,7 @@ fn validatePublicGraphArtifact(value: std.json.Value) !void {
         if (!public_index_contract.isAllowedGraphArtifactRequestField(entry.key_ptr.*))
             return error.InvalidCreateIndexRequest;
         if (entry.value_ptr.* == .null) continue;
-        if (std.mem.eql(u8, entry.key_ptr.*, "producer_json")) {
+        if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") or std.mem.eql(u8, entry.key_ptr.*, "producer")) {
             if (entry.value_ptr.* != .object) return error.InvalidCreateIndexRequest;
         } else if (!public_index_contract.createdFieldValueMatches(.graph_artifact, entry.key_ptr.*, entry.value_ptr.*)) {
             return error.InvalidCreateIndexRequest;
@@ -789,8 +892,17 @@ fn normalizeArtifactEnrichmentConfigJson(
     // carries the same write-only `producer_json` a hand-written request
     // would, and every reader downstream sees one enrichment shape.
     const transcriber = if (@hasField(Object, "map")) object.map.get("transcriber") else object.get("transcriber");
-    const has_producer_json = if (@hasField(Object, "map")) object.map.contains("producer_json") else object.contains("producer_json");
+    const has_producer_json = if (if (@hasField(Object, "map")) object.map.get("producer_json") else object.get("producer_json")) |legacy| legacy != .null else false;
+    const producer = if (@hasField(Object, "map")) object.map.get("producer") else object.get("producer");
     const has_content_type = if (@hasField(Object, "map")) object.map.contains("content_type") else object.contains("content_type");
+    if (producer) |typed| {
+        if (typed != .null) {
+            if (has_producer_json or (transcriber != null and transcriber.? != .null)) return error.InvalidArtifactEnrichmentRequest;
+            const producer_json = try stringifyJsonAlloc(alloc, typed);
+            defer alloc.free(producer_json);
+            try appendField(alloc, &out, "producer_json", .{ .string = producer_json }, &first);
+        }
+    }
     if (transcriber) |shorthand| {
         if (shorthand != .null) {
             const kind = if (@hasField(Object, "map")) object.map.get("kind") else object.get("kind");
@@ -809,7 +921,7 @@ fn normalizeArtifactEnrichmentConfigJson(
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber") or std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
                 const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
@@ -821,7 +933,7 @@ fn normalizeArtifactEnrichmentConfigJson(
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber")) continue;
+            if (std.mem.eql(u8, entry.key_ptr.*, "transcriber") or std.mem.eql(u8, entry.key_ptr.*, "producer")) continue;
             if (std.mem.eql(u8, entry.key_ptr.*, "producer_json") and entry.value_ptr.* == .object) {
                 const producer_json = try stringifyJsonAlloc(alloc, entry.value_ptr.*);
                 defer alloc.free(producer_json);
@@ -853,6 +965,10 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
 fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
     if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
     if (value == .null) return;
+    if (std.mem.eql(u8, field, "producer")) {
+        if (value != .object) return error.InvalidArtifactEnrichmentRequest;
+        return;
+    }
     if (std.mem.eql(u8, field, "producer_json")) {
         if (value != .string and value != .object) return error.InvalidArtifactEnrichmentRequest;
         return;
@@ -862,6 +978,75 @@ fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Valu
     if (std.mem.eql(u8, field, "execution")) {
         validatePublicCreatedShape(value, .execution_policy) catch return error.InvalidArtifactEnrichmentRequest;
     }
+    if (std.mem.eql(u8, field, "neighbor_context")) {
+        validatePublicCreatedShape(value, .enrichment_neighbor_context) catch return error.InvalidArtifactEnrichmentRequest;
+    }
+}
+
+test "typed enrichment producer and graph scorer normalize to legacy storage fields" {
+    const alloc = std.testing.allocator;
+    const enrichment = try parseArtifactEnrichmentRequest(alloc, "units",
+        \\{"name":"units","kind":"asset","field":"url","producer":{"type":"document_extraction","config":{"api_key":"private"}}}
+    );
+    defer alloc.free(enrichment);
+    try std.testing.expect(std.mem.indexOf(u8, enrichment, "\"producer_json\":\"{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enrichment, "\"producer\":") == null);
+    const nullable_legacy = try parseArtifactEnrichmentRequest(alloc, "units",
+        \\{"name":"units","kind":"asset","field":"url","producer":{"type":"document_extraction","config":{}},"producer_json":null}
+    );
+    defer alloc.free(nullable_legacy);
+    try std.testing.expect(std.mem.indexOf(u8, nullable_legacy, "\"producer_json\":\"{") != null);
+    try std.testing.expectError(error.InvalidArtifactEnrichmentRequest, parseArtifactEnrichmentRequest(alloc, "units",
+        \\{"name":"units","kind":"asset","producer":{"type":"document_extraction"},"producer_json":"{}"}
+    ));
+
+    const graph = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","artifact":{"name":"mentions","kind":"asset","source":{"type":"field","value":"body"},"producer":{"type":"document_extraction","config":{"api_key":"private-graph-key"}}},"resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer":{"comparisons":[],"combine":{"bias":1}}}]}
+    , .{});
+    defer graph.deinit();
+    const normalized = try normalizeIndexConfigJson(alloc, graph.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer_json\":\"{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"producer_json\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "private-graph-key") != null);
+    const public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", normalized);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"scorer\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"comparisons\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "scorer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "private-graph-key") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "producer_json") == null);
+    const legacy_scorer = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer_json":"{\"comparisons\":[],\"opaque_secret\":\"hidden-scorer\"}"}]}
+    , .{});
+    defer legacy_scorer.deinit();
+    const legacy_normalized = try normalizeIndexConfigJson(alloc, legacy_scorer.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(legacy_normalized);
+    const legacy_public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", legacy_normalized);
+    defer alloc.free(legacy_public);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_public, "\"comparisons\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, legacy_public, "hidden-scorer") == null);
+    const invalid_scorer = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer":{"comparisons":[{"name":"bad","left":"text","right":"name","levels":[{"when":"unknown > 0.5","weight":1}]}]}}]}
+    , .{});
+    defer invalid_scorer.deinit();
+    try std.testing.expectError(error.InvalidCreateIndexRequest, normalizeIndexConfigJson(alloc, invalid_scorer.value.object, "g", .{ .include_name = true, .default_type = true }));
+}
+
+test "empty legacy graph scorer remains a deterministic resolver" {
+    const alloc = std.testing.allocator;
+    const graph = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"type":"graph","resolvers":[{"name":"r","table":"entities","source_artifact":"mentions","resolution_artifact":"resolved","key_template":"{{text}}","scorer_json":""}]}
+    , .{});
+    defer graph.deinit();
+    const normalized = try normalizeIndexConfigJson(alloc, graph.value.object, "g", .{ .include_name = true, .default_type = true });
+    defer alloc.free(normalized);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"scorer_json\":\"\"") != null);
+    const public = try indexes_api.encodeCreatedIndexConfig(alloc, "g", normalized);
+    defer alloc.free(public);
+    try std.testing.expect(std.mem.indexOf(u8, public, "scorer_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, public, "\"scorer\":") == null);
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {
@@ -1127,7 +1312,7 @@ test "table contract encodes internal create table request back to public json" 
 
     const body = try encodeCreateTableRequest(std.testing.allocator, req);
     defer std.testing.allocator.free(body);
-    var parsed = try metadata_openapi.server.parseCreateTableBody(std.testing.allocator, body);
+    var parsed = try metadata_server_openapi.server.parseCreateTableBody(std.testing.allocator, body);
     defer parsed.deinit();
     var raw = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer raw.deinit();
@@ -1262,12 +1447,20 @@ test "table contract enforces stable graph source identities and numeric targets
     defer std.testing.allocator.free(config_json);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
 
+    const numeric_source_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_graph",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"},\"edge\":{\"edge_id\":\"fact:42\"}}]}",
+    );
+    defer std.testing.allocator.free(numeric_source_json);
+    try std.testing.expect(std.mem.indexOf(u8, numeric_source_json, "\"source\":42") != null);
+
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
         parseCreateIndexRequest(
             std.testing.allocator,
             "document_graph",
-            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"}}]}",
+            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":true,\"target\":\"doc:b\"}}]}",
         ),
     );
 }
@@ -2031,4 +2224,13 @@ test "create table default index incarnation survives the system catalog hop" {
         const incarnation = coverage_policy.incarnation(before.value.object.get("full_text_index_v0").?) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(incarnation, coverage_policy.incarnation(after.value.object.get("full_text_index_v0").?).?);
     }
+}
+
+test "lake SQL public create accepts an unpublished inference draft only for creation" {
+    const a = std.testing.allocator;
+    var draft = try parseCreateTableRequest(a, "{\"schema\":{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"table_id\":\"events\",\"uri\":\"file:///tmp/lake\"}}}");
+    defer draft.deinit(a);
+    try std.testing.expect(draft.schema_json != null);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, tables_api.parseSchemaUpdateRequest(a, draft.schema_json.?));
+    try std.testing.expectError(error.InvalidCreateTableSchemaRequest, parseCreateTableRequest(a, "{\"schema\":{\"storage_mode\":\"relational\"}}"));
 }

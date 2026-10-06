@@ -13,23 +13,32 @@ T = TypeVar("T", bound="ClusterRestoreRequest")
 
 @_attrs_define
 class ClusterRestoreRequest:
-    """
-    Attributes:
-        backup_id (str): Unique identifier of the backup to restore from.
-             Example: cluster-backup-2025-01-15.
-        location (str): Storage location where the backup is stored.
-             Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
-        connection (str): Required configured `external_io` connection with the `restore.read` capability.
-        table_names (list[str] | Unset): Optional list of tables to restore. If omitted, all tables in the backup are
-            restored,
-            up to the cluster restore limit of 4096 tables. Larger backups must be restored
-            in explicit batches of at most 256 tables.
-             Example: ['users', 'products'].
-        restore_mode (ClusterRestoreRequestRestoreMode | Unset): How to handle existing tables:
-            - `fail_if_exists`: Abort if any table already exists (default)
-            - `skip_if_exists`: Skip existing tables, restore others
-            - `overwrite`: Atomically replace existing table generations after staging and validation
-             Default: ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS. Example: skip_if_exists.
+    """Native cohort restores use the existing asynchronous restore job to provision
+    hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+    and publish the dependency-complete target set atomically. Document, relational,
+    and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+    Skipping a live parent cannot substitute it for a parent generation required by
+    a restored child. Overwrite retains the old generation until validation and
+    cutover; cancellation after publication completes publication rather than rollback.
+    Reserved destination authorization is immutable: changing principal requires
+    canceling the old job and creating a new restore.
+
+        Attributes:
+            backup_id (str): Unique identifier of the backup to restore from.
+                 Example: cluster-backup-2025-01-15.
+            location (str): Storage location where the backup is stored.
+                 Example: s3://mybucket/antfly-backups/cluster/2025-01-15.
+            connection (str): Required configured `external_io` connection with the `restore.read` capability.
+            table_names (list[str] | Unset): Optional list of tables to restore. If omitted, all tables in the backup are
+                restored,
+                up to the cluster restore limit of 4096 tables. Larger backups must be restored
+                in explicit batches of at most 256 tables.
+                 Example: ['users', 'products'].
+            restore_mode (ClusterRestoreRequestRestoreMode | Unset): How to handle existing tables:
+                - `fail_if_exists`: Abort if any table already exists (default)
+                - `skip_if_exists`: Skip existing tables, restore others
+                - `overwrite`: Atomically replace existing table generations after staging and validation
+                 Default: ClusterRestoreRequestRestoreMode.FAIL_IF_EXISTS. Example: skip_if_exists.
     """
 
     backup_id: str

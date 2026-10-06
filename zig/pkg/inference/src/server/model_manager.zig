@@ -87,7 +87,7 @@ fn shouldPreferNativeSession(man: manifest_mod.ModelManifest) bool {
     }
     if (man.gliner_model_type.len > 0) return true;
     switch (man.model_type) {
-        .classifier, .recognizer => return true,
+        .classifier, .extractor => return true,
         else => {},
     }
     return switch (man.native_arch_hint) {
@@ -797,7 +797,7 @@ fn policyAllowedBackends(
 }
 
 const ComponentInspection = struct {
-    const backend_count = std.meta.fields(backends.BackendType).len;
+    const backend_count = @typeInfo(backends.BackendType).@"enum".field_names.len;
 
     allocator: std.mem.Allocator,
     base_summary: CompatibilitySummary,
@@ -806,10 +806,10 @@ const ComponentInspection = struct {
     has_native_component: bool = false,
     imported_graph_compatible: bool = true,
     native_backend_summaries: [backend_count]?CompatibilitySummary =
-        [_]?CompatibilitySummary{null} ** backend_count,
+        @as([backend_count]?CompatibilitySummary, @splat(null)),
     dependencies: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *ComponentInspection) void {
+    pub fn deinit(self: *ComponentInspection) void {
         for (self.dependencies.items) |path| self.allocator.free(path);
         self.dependencies.deinit(self.allocator);
         self.* = undefined;
@@ -836,7 +836,7 @@ const ComponentInspection = struct {
         backend: backends.BackendType,
         summary: CompatibilitySummary,
     ) void {
-        const slot = &self.native_backend_summaries[@intFromEnum(backend)];
+        const slot = &self.native_backend_summaries[@backingInt(backend)];
         slot.* = selectWorseCompatibility(slot.*, summary);
     }
 
@@ -862,7 +862,7 @@ const ComponentInspection = struct {
                 .message = "a component ONNX graph cannot be converted and validated by the selected backend",
             };
         }
-        if (self.native_backend_summaries[@intFromEnum(backend)]) |native_summary| {
+        if (self.native_backend_summaries[@backingInt(backend)]) |native_summary| {
             return selectWorseCompatibility(self.base_summary, native_summary);
         }
         return self.base_summary;
@@ -958,10 +958,10 @@ fn componentPlanKey(
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     updateComponentPlanKeySlice(&hash, model_dir);
     hash.update(&.{
-        @intFromEnum(man.model_type),
-        @intFromEnum(man.model_type_origin),
-        @intFromEnum(man.native_arch_hint),
-        @intFromEnum(contract),
+        @backingInt(man.model_type),
+        @backingInt(man.model_type_origin),
+        @backingInt(man.native_arch_hint),
+        @backingInt(contract),
         @intFromBool(policy.allow_unknown),
         @intFromBool(manifestHasNativeAssets(man.*)),
         @intFromBool(man.hasIncompleteGlinerBundle()),
@@ -974,7 +974,7 @@ fn componentPlanKey(
     updateComponentPlanKeySlice(&hash, man.inference_bundle_family);
     const backend_count: u64 = @intCast(preferred_backends.len);
     hash.update(std.mem.asBytes(&backend_count));
-    for (preferred_backends) |backend| hash.update(&.{@intFromEnum(backend)});
+    for (preferred_backends) |backend| hash.update(&.{@backingInt(backend)});
     const component_count: u64 = @intCast(component_paths.len);
     hash.update(std.mem.asBytes(&component_count));
     for (component_paths) |path| {
@@ -1581,7 +1581,7 @@ const LegacyWordPieceMeta = struct {
     sep_token_owned: ?[]u8 = null,
     mask_token_owned: ?[]u8 = null,
 
-    fn deinit(self: *LegacyWordPieceMeta, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *LegacyWordPieceMeta, allocator: std.mem.Allocator) void {
         if (self.unk_token_owned) |buf| allocator.free(buf);
         if (self.pad_token_owned) |buf| allocator.free(buf);
         if (self.cls_token_owned) |buf| allocator.free(buf);
@@ -1657,29 +1657,34 @@ fn appendAddedToken(
 fn loadLegacyWordPieceTokenizerFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !*hf_tokenizer.HfTokenizer {
     const vocab_path = try std.fmt.allocPrint(allocator, "{s}/vocab.txt", .{model_dir});
     defer allocator.free(vocab_path);
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "tokenizer_config.json" });
+    defer allocator.free(config_path);
+    const special_path = try std.fs.path.join(allocator, &.{ model_dir, "special_tokens_map.json" });
+    defer allocator.free(special_path);
+    return loadLegacyWordPieceTokenizer(allocator, vocab_path, config_path, special_path);
+}
+
+fn loadLegacyWordPieceTokenizer(
+    allocator: std.mem.Allocator,
+    vocab_path: []const u8,
+    config_path: ?[]const u8,
+    special_path: ?[]const u8,
+) !*hf_tokenizer.HfTokenizer {
     const vocab_bytes = try c_file.readFile(allocator, vocab_path);
     defer allocator.free(vocab_bytes);
-
     var meta = LegacyWordPieceMeta{};
     defer meta.deinit(allocator);
-    var tokenizer_config_bytes_opt: ?[]u8 = null;
-    defer if (tokenizer_config_bytes_opt) |bytes| allocator.free(bytes);
-    var special_tokens_map_bytes_opt: ?[]u8 = null;
-    defer if (special_tokens_map_bytes_opt) |bytes| allocator.free(bytes);
-
-    const tokenizer_config_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
-    defer allocator.free(tokenizer_config_path);
-    if (c_file.readFile(allocator, tokenizer_config_path)) |tokenizer_config_bytes| {
-        tokenizer_config_bytes_opt = tokenizer_config_bytes;
-        applyLegacyTokenizerJson(&meta, tokenizer_config_bytes, allocator);
-    } else |_| {}
-
-    const special_tokens_map_path = try std.fmt.allocPrint(allocator, "{s}/special_tokens_map.json", .{model_dir});
-    defer allocator.free(special_tokens_map_path);
-    if (c_file.readFile(allocator, special_tokens_map_path)) |special_tokens_map_bytes| {
-        special_tokens_map_bytes_opt = special_tokens_map_bytes;
-        applyLegacyTokenizerJson(&meta, special_tokens_map_bytes, allocator);
-    } else |_| {}
+    var metadata_bytes: [2]?[]u8 = .{ null, null };
+    defer for (metadata_bytes) |bytes| {
+        if (bytes) |data| allocator.free(data);
+    };
+    for ([_]?[]const u8{ config_path, special_path }, 0..) |path, i| {
+        if (path) |selected| {
+            const bytes = c_file.readFile(allocator, selected) catch continue;
+            metadata_bytes[i] = bytes;
+            applyLegacyTokenizerJson(&meta, bytes, allocator);
+        }
+    }
 
     var vocab_entries = std.ArrayListUnmanaged([]const u8).empty;
     defer vocab_entries.deinit(allocator);
@@ -1774,6 +1779,19 @@ pub fn loadHuggingFaceTokenizerFromDirOrGguf(
         return loadHuggingFaceTokenizerFromGguf(allocator, path);
     }
 
+    return error.NoTokenizerFound;
+}
+
+fn loadHuggingFaceTokenizerFromManifest(allocator: std.mem.Allocator, man: *const manifest_mod.ModelManifest) !*hf_tokenizer.HfTokenizer {
+    if (man.tokenizer_json_path) |path| {
+        const bytes = try c_file.readFile(allocator, path);
+        defer allocator.free(bytes);
+        return hf_tokenizer.HfTokenizer.loadFromBytes(allocator, bytes);
+    }
+    if (man.vocab_txt_path) |path| {
+        return loadLegacyWordPieceTokenizer(allocator, path, man.tokenizer_config_path, man.special_tokens_map_path);
+    }
+    if (man.gguf_path) |path| return loadHuggingFaceTokenizerFromGguf(allocator, path);
     return error.NoTokenizerFound;
 }
 
@@ -1898,10 +1916,30 @@ fn unigramTokenizerJsonFromGguf(
         else
             "]},\"pre_tokenizer\":{\"type\":\"Metaspace\",\"replacement\":\"\\u2581\",\"prepend_scheme\":\"never\",\"split\":true},\"added_tokens\":[",
     );
-    // ponytail: precompiled SentencePiece normalization is intentionally left
-    // to a future shared normalizer; ordinary normalized UTF-8 needs no copy.
     try appendSpecialTokensFromMetadata(&tokenizer_json, allocator, parsed, tokens, token_types);
-    try tokenizer_json.appendSlice(allocator, "]}");
+    try tokenizer_json.appendSlice(allocator, "]");
+    if (findMetadataEntry(parsed, "tokenizer.ggml.precompiled_charsmap") != null) {
+        const map = try getRequiredMetadataArray(parsed, "tokenizer.ggml.precompiled_charsmap", .u8);
+        if (map.values.len > 12 * 1024 * 1024) return error.InvalidTokenizerMetadata;
+        if (map.values.len > 0) {
+            const bytes = try allocator.alloc(u8, map.values.len);
+            defer allocator.free(bytes);
+            for (map.values, bytes) |value, *byte| byte.* = switch (value) {
+                .u8 => |v| v,
+                else => return error.InvalidTokenizerMetadata,
+            };
+            const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            defer allocator.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try tokenizer_json.appendSlice(allocator, ",\"normalizer\":{\"type\":\"Sequence\",\"normalizers\":[{\"type\":\"Precompiled\",\"precompiled_charsmap\":");
+            try appendJsonString(&tokenizer_json, allocator, encoded);
+            try tokenizer_json.appendSlice(allocator, "}");
+            if (gguf_metadata.View.init(parsed).getBool("tokenizer.ggml.remove_extra_whitespaces") orelse true)
+                try tokenizer_json.appendSlice(allocator, ",{\"type\":\"Replace\",\"pattern\":{\"Regex\":\" {2,}\"},\"content\":\" \"}");
+            try tokenizer_json.appendSlice(allocator, "]}");
+        }
+    }
+    try tokenizer_json.appendSlice(allocator, "}");
     return tokenizer_json.toOwnedSlice(allocator);
 }
 
@@ -2223,7 +2261,7 @@ const DeclaredOptionalSession = struct {
     path: ?[]const u8,
 };
 
-const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".fields.len;
+const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".field_names.len;
 
 fn declaredOptionalSessions(manifest: *const manifest_mod.ModelManifest) [declared_optional_session_count]DeclaredOptionalSession {
     return .{
@@ -2795,7 +2833,13 @@ pub const LoadedModel = struct {
                 .last => .last,
             },
             .text_prefix = self.manifest.embedding_profile.document.prefix,
+            // Admission wrappers and imported ONNX sessions do not expose the
+            // native architecture vtable. Use declared encoder semantics too,
+            // otherwise a short BGE-M3 request is padded to its full 8K window.
+            // The pipeline still preserves explicitly fixed input dimensions.
             .trim_padding_to_batch_max = isJinaStyleEmbeddingManifest(&self.manifest) or
+                @import("../models/bert.zig").isBertModel(self.manifest.config_model_arch) or
+                self.manifest.bert_model_type == .roberta or
                 generic_encoder != null or
                 session_factory.supportsResidentTextEncoder(self.session),
             .resident_qwen3_embedding = isJinaStyleEmbeddingManifest(&self.manifest),
@@ -2941,10 +2985,16 @@ pub const LoadedModel = struct {
                 .relation_threshold = self.manifest.gliner_relation_threshold,
                 .model_type = self.manifest.gliner_model_type,
                 .capabilities = self.manifest.capabilities,
+                .classification_head = switch (self.manifest.gliner_classification_head) {
+                    .none => .none,
+                    .label_marker_mlp => .label_marker_mlp,
+                },
                 .token_p = self.manifest.gliner_token_p,
                 .token_c = self.manifest.gliner_token_c,
+                .token_l = self.manifest.gliner_token_l,
                 .token_e = self.manifest.gliner_token_e,
                 .token_r = self.manifest.gliner_token_r,
+                .token_sep_struct = self.manifest.gliner_token_sep_struct,
                 .token_sep_text = self.manifest.gliner_token_sep_text,
                 .distributed = runtime.distributed.configFromEnv(),
             },
@@ -3381,7 +3431,7 @@ const LoadTask = struct {
     cache_default_alias: bool,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const allocator = self.manager.allocator;
         allocator.free(self.flight_key);
         allocator.free(self.model_dir);
@@ -3451,7 +3501,7 @@ const CompositeLoadTask = struct {
         return task;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const allocator = self.manager.allocator;
         for (self.paths) |path| allocator.free(path);
         allocator.free(self.paths);
@@ -3624,7 +3674,7 @@ pub const CompositeAssets = struct {
         return false;
     }
 
-    fn deinit(self: *CompositeAssets) void {
+    pub fn deinit(self: *CompositeAssets) void {
         var encoder_scope = if (self.encoder) |managed| managed.session.beginClose() else backends.Session.CloseScope{};
         defer encoder_scope.deinit();
         var decoder_scope = if (self.decoder) |managed| managed.session.beginClose() else backends.Session.CloseScope{};
@@ -3828,7 +3878,7 @@ pub const ModelManager = struct {
         tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
         external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
         tokenizer_cache_budget_shards: [tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard =
-            [_]TokenizerCacheBudgetShard{.{}} ** tokenizer_cache_budget_shard_count,
+            @as([tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard, @splat(.{})),
         references: std.atomic.Value(usize) = .init(1),
         closing: std.atomic.Value(bool) = .init(false),
         managed_mutex: std.atomic.Mutex = .unlocked,
@@ -4505,6 +4555,28 @@ pub const ModelManager = struct {
         return self.acquireRequestsWithEviction(requests);
     }
 
+    /// Borrow reserved generation workspace before charging the remaining
+    /// request bytes. Every failure unwinds the sub-ledgers, including a failed
+    /// draft admission, process cap, live-memory check, or cancellation later.
+    pub fn acquireGenerationResources(
+        self: *ModelManager,
+        requests: []const GenerationAdmissionRequest,
+    ) !GenerationAdmissionLease {
+        if (requests.len == 0 or requests.len > 2) return error.ResourceLimitExceeded;
+        var result = GenerationAdmissionLease{};
+        errdefer result.release();
+        var remaining: [2]runtime.tier.memory.AdmissionRequest = undefined;
+        for (requests, 0..) |request, i| {
+            remaining[i] = request.resources;
+            if (request.session.generation_workspace) |workspace| {
+                result.workspace[i] = try workspace.acquire(&remaining[i].amounts);
+            }
+        }
+        // This call also checks hard caps when all KV/scratch is prepaid.
+        result.resources = try self.acquireRunResourceEstimates(remaining[0..requests.len]);
+        return result;
+    }
+
     pub fn configureAdmissionLimits(
         self: *ModelManager,
         overrides: runtime.tier.memory.Limits,
@@ -4607,7 +4679,7 @@ pub const ModelManager = struct {
                     // lock, which also prevents any new handle acquisition.
                     const amounts = workspace_amounts(model.session);
                     var by_backend: @FieldType(runtime.tier.memory.AdmissionLease, "amounts_by_backend") = @splat(.{});
-                    by_backend[@intFromEnum(runtime.tier.memory.BackendClass.gpu)] = amounts;
+                    by_backend[@backingInt(runtime.tier.memory.BackendClass.gpu)] = amounts;
                     if (!admissionAmountsReclaimRelevant(amounts, by_backend, pressure)) continue;
                 }
             }
@@ -4813,13 +4885,13 @@ pub const ModelManager = struct {
             .shared_unified => admissionAmountsPresent(amounts),
             .live_host => amounts.hostTotalBytes() > 0 or
                 (builtin.os.tag == .macos and amounts.backendTotalBytes() > 0),
-            .domain_host => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].hostTotalBytes() > 0,
-            .domain_backend => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].backendTotalBytes() > 0,
+            .domain_host => |backend_class| amounts_by_backend[@backingInt(backend_class)].hostTotalBytes() > 0,
+            .domain_backend => |backend_class| amounts_by_backend[@backingInt(backend_class)].backendTotalBytes() > 0,
             .domain_combined => |backend_class| admissionAmountsPresent(
-                amounts_by_backend[@intFromEnum(backend_class)],
+                amounts_by_backend[@backingInt(backend_class)],
             ),
-            .domain_kv => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].kvTotalBytes() > 0,
-            .domain_scratch => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].scratchTotalBytes() > 0,
+            .domain_kv => |backend_class| amounts_by_backend[@backingInt(backend_class)].kvTotalBytes() > 0,
+            .domain_scratch => |backend_class| amounts_by_backend[@backingInt(backend_class)].scratchTotalBytes() > 0,
             // The process-owner budget is intentionally opaque. Any resident
             // admission released from the aggregate can potentially satisfy it.
             .external_budget => admissionAmountsPresent(amounts),
@@ -5311,10 +5383,10 @@ pub const ModelManager = struct {
         };
     };
 
-    fn componentPlanIo(self: *ModelManager) std.Io {
+    fn componentPlanIo(self: *ModelManager) !std.Io {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        return self.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.session_manager.io orelse error.MissingIoRuntime;
     }
 
     fn applyCachedComponentPlan(
@@ -5341,7 +5413,7 @@ pub const ModelManager = struct {
         errdefer entry.release();
 
         const signature = try componentDependencySignature(
-            self.componentPlanIo(),
+            try self.componentPlanIo(),
             entry.dependencies,
         );
         if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) {
@@ -5444,7 +5516,7 @@ pub const ModelManager = struct {
             );
             defer inspection.deinit();
             const signature_before = try componentDependencySignature(
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 inspection.dependencies.items,
             );
             try validateComponentNativeArtifacts(
@@ -5460,7 +5532,7 @@ pub const ModelManager = struct {
                 &inspection,
             );
             const signature_after = try componentDependencySignature(
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 inspection.dependencies.items,
             );
             if (!std.mem.eql(
@@ -5513,18 +5585,20 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         model_path: []const u8,
         backend_runtime: backends.BackendRuntime,
+        load_plan_floor: runtime.tier.memory.Limits,
     ) !runtime.tier.memory.Limits {
-        var limits = self.admissionLimitsForBackend(backend_runtime);
+        var limits = runtime.tier.memory.defaultLimitsForBackendWithProcessLimit(
+            admissionBackendClassForRuntime(backend_runtime),
+            self.process_memory_limit_bytes,
+        );
         limits = try session_factory.widenBudgetLimitsForModelPath(
             self.allocator,
             model_path,
             limits,
             backend_runtime.backend,
         );
-        return runtime.tier.memory.applyLimitOverrides(
-            limits,
-            self.admission_limit_overrides,
-        );
+        limits = runtime.tier.memory.maxCompositeLimits(limits, load_plan_floor);
+        return runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides);
     }
 
     /// Architecture sessions may carry a minimum safe cache/workspace floor
@@ -5629,6 +5703,7 @@ pub const ModelManager = struct {
                 admission_limits = self.admissionLimitsForModelPath(
                     model_path,
                     backend_runtime,
+                    admission_plan.limit_floor,
                 ) catch |err| {
                     rememberPreferredLoadError(&first_err, err);
                     continue;
@@ -5891,20 +5966,22 @@ pub const ModelManager = struct {
         _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
-    pub fn attachIo(self: *ModelManager, io: std.Io) void {
+    pub fn attachIo(self: *ModelManager, io: std.Io) std.Io.ConcurrentError!void {
         self.lockLoadedModels();
+        defer self.unlockLoadedModels();
         self.session_manager.io = io;
         var it = self.loaded.iterator();
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
         const start_eviction_loop = self.keep_alive_ms > 0 and
             !self.eviction_loop_started;
         if (start_eviction_loop) {
+            // This loop only ends on cancellation. async may execute inline
+            // when the CPU-bound worker limit is zero or exhausted, hanging
+            // startup. concurrent must either spawn it or report failure.
+            try self.eviction_group.concurrent(io, evictionLoop, .{ self, io });
             self.eviction_loop_started = true;
             self.eviction_io = io;
         }
-        self.unlockLoadedModels();
-        if (start_eviction_loop)
-            self.eviction_group.async(io, evictionLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *ModelManager) void {
@@ -6089,7 +6166,7 @@ pub const ModelManager = struct {
         config_path: []u8,
         generation_config_path: ?[]u8,
 
-        fn deinit(self: *ResolvedWhisperSidecars) void {
+        pub fn deinit(self: *ResolvedWhisperSidecars) void {
             self.allocator.free(self.tokenizer_path);
             self.allocator.free(self.config_path);
             if (self.generation_config_path) |path| self.allocator.free(path);
@@ -6115,7 +6192,7 @@ pub const ModelManager = struct {
 
         var receipt = try managed_receipt.loadValidated(
             self.allocator,
-            self.componentPlanIo(),
+            try self.componentPlanIo(),
             model_dir,
         );
         defer if (receipt) |*validated| validated.deinit();
@@ -6127,7 +6204,7 @@ pub const ModelManager = struct {
         else
             managed_receipt.resolveContainedArtifactPath(
                 self.allocator,
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 model_dir,
                 "generation_config.json",
             ) catch |err| switch (err) {
@@ -6178,7 +6255,7 @@ pub const ModelManager = struct {
             owned_paths.appendAssumeCapacity(path);
             try dependencies.append(self.allocator, path);
         }
-        const direct = try componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        const direct = try componentDependencySignature(try self.componentPlanIo(), dependencies.items);
         if (component_paths.len == 0) return direct;
         // Artifact identity is backend-neutral. Optional graphs participate in
         // invalidation, but must not restrict the backend of the selected pair.
@@ -6196,8 +6273,8 @@ pub const ModelManager = struct {
             var inspection = try inspectComponentArtifacts(self.allocator, &man, component_paths, .multistage_ocr);
             defer inspection.deinit();
             if (inspection.invalid_summary != null) return error.IncompatibleModel;
-            const signature = try componentDependencySignature(self.componentPlanIo(), inspection.dependencies.items);
-            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
+            const signature = try componentDependencySignature(try self.componentPlanIo(), inspection.dependencies.items);
+            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(try self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
             try self.publishComponentPlan(closure_key, signature, &.{}, inspection.dependencies.items);
             break :blk signature;
         };
@@ -6700,18 +6777,22 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         policy: ModelLoadCachePolicy,
     ) ![]u8 {
-        const prefix = if (policy.a4b_request) |request|
+        const a4b_identity = if (policy.a4b_request) |request|
+            try a4bRequestCacheIdentity(self.allocator, request)
+        else
+            null;
+        defer if (a4b_identity) |identity| self.allocator.free(identity);
+        const prefix = if (a4b_identity) |identity|
             try std.fmt.allocPrint(
                 self.allocator,
-                "{d}:{s}:{d}:{d}:{d}:a4b={s}:{d}:",
+                "{d}:{s}:{d}:{d}:{d}:a4b={s}:",
                 .{
                     model_dir.len,
                     model_dir,
                     @intFromBool(cache_default_alias),
                     @intFromBool(policy.accept_default_alias),
                     @intFromBool(policy.require_default_alias_backend_match),
-                    @tagName(request.residency_mode),
-                    request.memory_budget_mb,
+                    identity,
                 },
             )
         else
@@ -6730,7 +6811,7 @@ pub const ModelManager = struct {
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
         @memcpy(key[0..prefix.len], prefix);
         for (preferred_backends, 0..) |backend, idx| {
-            key[prefix.len + idx] = @intCast(@intFromEnum(backend));
+            key[prefix.len + idx] = @intCast(@backingInt(backend));
         }
         return key;
     }
@@ -6921,8 +7002,12 @@ pub const ModelManager = struct {
         if (!backend_runtime.requiresProcessIsolation()) return null;
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        if (!self.session_manager.process_isolation_available)
+        if (!self.session_manager.process_isolation_available) {
+            // In-process hosts accept that a wedged close blocks rather than
+            // being ended by killing the worker.
+            if (execution_control_mod.uninterruptibleInProcessAllowed()) return null;
             return error.ProcessIsolationRequired;
+        }
         if (self.teardown_domain == null) {
             // Stabilize a possible manager-owned offline driver runtime before
             // the independent teardown owner takes its lifetime reference.
@@ -7158,7 +7243,7 @@ pub const ModelManager = struct {
             try tokenizerLoadAdmissionPlan(
                 self.allocator,
                 model_dir,
-                man.gguf_path,
+                &man,
                 tokenizer_type,
             )
         else
@@ -7187,7 +7272,7 @@ pub const ModelManager = struct {
                     // separate pathname check leaves a replacement window.
                     try man.verifyBoundarySidecar("tokenizer.json", bytes);
                     break :blk try hf_tokenizer.HfTokenizer.loadFromBytesWithOptions(self.allocator, bytes, .{ .strict_unigram_normalizer = true });
-                } else try loadHuggingFaceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                } else try loadHuggingFaceTokenizerFromManifest(self.allocator, &man);
                 try hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
                 try hf_tok.?.configureParallelBpe(
                     self.tokenizer_parallel_bpe_config,
@@ -7570,13 +7655,32 @@ fn loadedModelUsesPreferredBackend(
     return false;
 }
 
+fn a4bRequestCacheIdentity(
+    allocator: std.mem.Allocator,
+    request: backend_contracts.A4bInferenceRequest,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "residency={s};memory_mb={d};load_strategy={s};load_workers={d};load_staging_mb={d};prepared_pack={s};drop_host_cache={d}",
+        .{
+            @tagName(request.residency_mode),
+            request.memory_budget_mb,
+            @tagName(request.load_strategy),
+            request.load_workers,
+            request.load_staging_mb,
+            @tagName(request.prepared_pack),
+            @intFromBool(request.drop_host_cache_after_load),
+        },
+    );
+}
+
 const model_backend_quarantine_ns: u64 = 30 * std.time.ns_per_s;
 const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) ModelBackendHealthKey {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(model_dir);
-    hasher.update(&[_]u8{@intFromEnum(backend)});
+    hasher.update(&[_]u8{@backingInt(backend)});
     var digest: ModelBackendHealthKey = undefined;
     hasher.final(&digest);
     return digest;
@@ -7627,14 +7731,15 @@ fn backendVariantCacheKey(
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) ![]u8 {
     if (a4b_request) |request| {
+        const identity = try a4bRequestCacheIdentity(allocator, request);
+        defer allocator.free(identity);
         return std.fmt.allocPrint(
             allocator,
-            "{s}\nbackend={s}\na4b={s}:{d}",
+            "{s}\nbackend={s}\na4b={s}",
             .{
                 model_dir,
                 @tagName(backend),
-                @tagName(request.residency_mode),
-                request.memory_budget_mb,
+                identity,
             },
         );
     }
@@ -7648,28 +7753,56 @@ test "model prewarm defers while max-loaded eviction is pending" {
     try std.testing.expect(!modelCacheHasPublicationCapacity(2, 1));
 }
 
-test "A4B model cache keys isolate residency policies" {
+test "A4B model and load-flight cache keys isolate every load policy field" {
     const allocator = std.testing.allocator;
     const default_key = try backendVariantCacheKey(allocator, "model", .metal, null);
     defer allocator.free(default_key);
-    const streamed_key = try backendVariantCacheKey(
-        allocator,
-        "model",
-        .metal,
-        .{ .residency_mode = .streamed, .memory_budget_mb = 4096 },
-    );
-    defer allocator.free(streamed_key);
-    const resident_key = try backendVariantCacheKey(
-        allocator,
-        "model",
-        .metal,
-        .{ .residency_mode = .resident, .memory_budget_mb = 16384 },
-    );
-    defer allocator.free(resident_key);
+    const request = backend_contracts.A4bInferenceRequest{
+        .residency_mode = .resident,
+        .memory_budget_mb = 16384,
+        .load_strategy = .pipeline,
+        .load_workers = 4,
+        .load_staging_mb = 256,
+        .prepared_pack = .required,
+        .drop_host_cache_after_load = true,
+    };
+    const variants = [_]backend_contracts.A4bInferenceRequest{
+        .{ .residency_mode = .streamed, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 4096, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .legacy, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 6, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 384, .prepared_pack = .required, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .off, .drop_host_cache_after_load = true },
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384, .load_strategy = .pipeline, .load_workers = 4, .load_staging_mb = 256, .prepared_pack = .required, .drop_host_cache_after_load = false },
+    };
 
-    try std.testing.expect(!std.mem.eql(u8, default_key, streamed_key));
-    try std.testing.expect(!std.mem.eql(u8, streamed_key, resident_key));
-    try std.testing.expect(std.mem.endsWith(u8, streamed_key, "a4b=streamed:4096"));
+    const model_key = try backendVariantCacheKey(allocator, "model", .cuda, request);
+    defer allocator.free(model_key);
+    try std.testing.expect(!std.mem.eql(u8, default_key, model_key));
+
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    const flight_key = try manager.loadFlightKey(
+        "model",
+        &.{.cuda},
+        false,
+        inheritedA4bCachePolicy(request, true),
+    );
+    defer allocator.free(flight_key);
+
+    for (variants) |variant| {
+        const variant_model_key = try backendVariantCacheKey(allocator, "model", .cuda, variant);
+        defer allocator.free(variant_model_key);
+        try std.testing.expect(!std.mem.eql(u8, model_key, variant_model_key));
+
+        const variant_flight_key = try manager.loadFlightKey(
+            "model",
+            &.{.cuda},
+            false,
+            inheritedA4bCachePolicy(variant, true),
+        );
+        defer allocator.free(variant_flight_key);
+        try std.testing.expect(!std.mem.eql(u8, flight_key, variant_flight_key));
+    }
 }
 
 test "inherited A4B policy isolates explicit loads but reuses policy-free aliases" {
@@ -8147,7 +8280,7 @@ test "admission eviction selects idle GPU workspace and never reads active works
         readable: bool = true,
         reads: usize = 0,
 
-        fn read(session: backends.Session) runtime.tier.memory.AdmissionAmounts {
+        pub fn read(session: backends.Session) runtime.tier.memory.AdmissionAmounts {
             const self: *@This() = @ptrCast(@alignCast(session.ptr));
             std.debug.assert(self.readable);
             self.reads += 1;
@@ -8376,11 +8509,32 @@ pub const ManagedHfTokenizer = struct {
 
 const LoadedSessionPlan = ManagedSession;
 
+pub const GenerationAdmissionRequest = struct {
+    session: backends.Session,
+    resources: runtime.tier.memory.AdmissionRequest,
+};
+
+pub const GenerationAdmissionLease = struct {
+    resources: ?runtime.tier.memory.AdmissionLease = null,
+    workspace: [2]?runtime.tier.memory.AdmissionLease = .{ null, null },
+
+    pub fn release(self: *@This()) void {
+        if (self.resources) |*lease| lease.release();
+        for (&self.workspace) |*slot| if (slot.*) |*lease| lease.release();
+    }
+};
+
 const ModelLoadAdmissionPlan = struct {
     /// Maximum simultaneous bytes while parsing/importing/repacking.
     peak: runtime.tier.memory.AdmissionAmounts,
     /// Bytes retained by the completed backend session.
     resident: runtime.tier.memory.AdmissionAmounts,
+    /// Minimum serving envelope justified by the same resolved load plan.
+    /// Operator overrides are applied after this floor.
+    limit_floor: runtime.tier.memory.Limits = .{},
+    /// CUDA A4B serving excludes temporary GGUF staging and reuses the
+    /// resident KV/scratch reservation through a bounded session sub-ledger.
+    serving_floor: ?runtime.tier.memory.Limits = null,
 };
 
 fn modelRunWorkspaceAllowance(weight_bytes: usize) usize {
@@ -8399,11 +8553,6 @@ const TokenizerArtifactKind = enum {
     huggingface,
     sentencepiece,
     wordpiece,
-};
-
-const TokenizerArtifactCandidate = struct {
-    name: []const u8,
-    kind: TokenizerArtifactKind,
 };
 
 const tokenizer_fixed_resident_bytes = 16 * 1024 * 1024;
@@ -8459,41 +8608,22 @@ fn tokenizerFileAdmissionPlan(
 fn tokenizerLoadAdmissionPlan(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
-    gguf_path: ?[]const u8,
+    man: *const manifest_mod.ModelManifest,
     tokenizer_type: manifest_mod.TokenizerType,
 ) !ModelLoadAdmissionPlan {
+    // Admission and loading must inspect the same catalog-selected artifacts,
+    // including export-local vocabularies and root metadata fallbacks.
     if (tokenizer_type == .huggingface) {
-        const candidates = [_]TokenizerArtifactCandidate{
-            .{ .name = "tokenizer.json", .kind = .huggingface },
-            .{ .name = "vocab.txt", .kind = .wordpiece },
-        };
-        for (candidates) |candidate| {
-            const path = try std.fs.path.join(allocator, &.{ model_dir, candidate.name });
-            defer allocator.free(path);
-            if (!c_file.fileExists(allocator, path)) continue;
-            var encoded = std.math.cast(
-                usize,
-                try c_file.fileSize(allocator, path),
-            ) orelse return error.ResourceLimitExceeded;
-            // Legacy WordPiece additionally parses these optional JSON maps.
-            if (candidate.kind == .wordpiece) {
-                const sidecars = [_][]const u8{
-                    "tokenizer_config.json",
-                    "special_tokens_map.json",
-                };
-                for (sidecars) |name| {
-                    const sidecar = try std.fs.path.join(allocator, &.{ model_dir, name });
-                    defer allocator.free(sidecar);
-                    if (!c_file.fileExists(allocator, sidecar)) continue;
-                    const size = std.math.cast(
-                        usize,
-                        try c_file.fileSize(allocator, sidecar),
-                    ) orelse return error.ResourceLimitExceeded;
-                    encoded = std.math.add(usize, encoded, size) catch
-                        return error.ResourceLimitExceeded;
+        if (man.tokenizer_json_path) |path| return tokenizerFileAdmissionPlan(allocator, path, .huggingface);
+        if (man.vocab_txt_path) |path| {
+            var encoded: usize = 0;
+            for ([_]?[]const u8{ path, man.tokenizer_config_path, man.special_tokens_map_path }) |candidate| {
+                if (candidate) |selected| {
+                    const size = std.math.cast(usize, try c_file.fileSize(allocator, selected)) orelse return error.ResourceLimitExceeded;
+                    encoded = std.math.add(usize, encoded, size) catch return error.ResourceLimitExceeded;
                 }
             }
-            return tokenizerAdmissionPlan(encoded, candidate.kind);
+            return tokenizerAdmissionPlan(encoded, .wordpiece);
         }
     } else {
         var encoded: usize = 0;
@@ -8521,7 +8651,7 @@ fn tokenizerLoadAdmissionPlan(
             return tokenizerAdmissionPlan(encoded, .sentencepiece);
         }
     }
-    if (gguf_path) |path| {
+    if (man.gguf_path) |path| {
         var region = try c_file.MmapRegion.init(allocator, path);
         defer region.deinit();
         const encoded = try gguf_format.encodedMetadataBytesWithPrefix(
@@ -8574,7 +8704,7 @@ const ComponentArtifactEstimate = union(enum) {
         return .{ .native = try manifest_mod.loadFromDir(allocator, model_path) };
     }
 
-    fn deinit(self: *ComponentArtifactEstimate) void {
+    pub fn deinit(self: *ComponentArtifactEstimate) void {
         switch (self.*) {
             .native => |*man| man.deinit(),
             .disabled, .onnx => {},
@@ -8721,11 +8851,17 @@ fn estimateModelLoadAdmission(
     man: manifest_mod.ModelManifest,
     backend_runtime: backends.BackendRuntime,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
+    laya_packed: bool,
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal) {
+        if (!laya_packed) {
+            if (try session_factory.layaResidentLoadAmounts(man, weights)) |resident| {
+                return .{ .peak = resident.peak, .resident = resident.resident };
+            }
+        }
         if (try session_factory.glinerBoundaryResidentLoadAmounts(man, weights)) |resident| {
             return .{ .peak = resident.peak, .resident = resident.resident };
         }
@@ -8775,7 +8911,24 @@ fn a4bGpuModelLoadAdmission(
     // resident representation. Metal maps the encoded artifact directly and
     // does not retain a second host copy.
     if (backend == .cuda) peak.host_weight_bytes = encoded_artifact_bytes;
-    return .{ .peak = peak, .resident = resident };
+    const host_staging = if (backend == .cuda) encoded_artifact_bytes else 0;
+    return .{
+        .peak = peak,
+        .resident = resident,
+        .limit_floor = .{
+            .host_limit_bytes = host_staging,
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget +| host_staging,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        },
+        .serving_floor = if (backend == .cuda) .{
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        } else null,
+    };
 }
 
 test "A4B GPU admission lease equals the configured memory envelope" {
@@ -8794,6 +8947,155 @@ test "A4B GPU admission lease equals the configured memory envelope" {
     try std.testing.expectEqual(cuda_plan.resident.backendTotalBytes(), cuda_plan.peak.backendTotalBytes());
     try std.testing.expectEqual(@as(usize, 1234), cuda_plan.peak.host_weight_bytes);
     try std.testing.expectEqual(@as(usize, 0), cuda_plan.resident.host_weight_bytes);
+}
+
+test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
+    const memory = runtime.tier.memory;
+    for ([_]?backend_contracts.A4bInferenceRequest{ null, .{ .residency_mode = .resident, .memory_budget_mb = 24 * 1024 } }) |request| {
+        const config = try backend_contracts.buildCudaA4bInferenceConfig(request, backend_contracts.qualified_a4b_geometries[0]);
+        const plan = a4bGpuModelLoadAdmission(config, 4 * 1024 * 1024 * 1024, .cuda);
+        var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
+        defer manager.deinit();
+        try manager.ensureResourceOwnerReady();
+        const controller = manager.admissionController();
+        // No physical GPU allocation or host-capacity dependency in this test.
+        controller.configureSharedLimits(.{});
+        var model_lease = try controller.tryAcquire(.gpu, plan.limit_floor, plan.peak, false);
+        defer model_lease.release();
+        try model_lease.retain(plan.resident);
+        var workspace = memory.ReservedGenerationWorkspace{
+            .floor = plan.serving_floor.?,
+            .capacity = .{ .backend_kv_bytes = plan.resident.backend_kv_bytes, .backend_scratch_bytes = plan.resident.backend_scratch_bytes },
+        };
+        defer workspace.borrowed.deinit();
+        const session = backends.Session{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
+        const limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 1024, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
+        try std.testing.expectEqual(@as(usize, 1024), limits.host_limit_bytes);
+        try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), limits.backend_limit_bytes);
+        try std.testing.expectEqual(limits.host_limit_bytes + limits.backend_limit_bytes, limits.combined_limit_bytes);
+        // Plan a real long prompt before borrowing. The generic scratch cap
+        // permits a chunk larger than the session's retained workspace.
+        const gpt_config = @import("../models/gpt.zig").Config{
+            .family = .gemma,
+            .hidden_size = 2816,
+            .num_hidden_layers = 30,
+            .num_attention_heads = 16,
+            .num_key_value_heads = 1,
+            .vocab_size = 262144,
+            .num_local_experts = 128,
+            .num_experts_per_tok = 8,
+            .num_shared_experts = 1,
+            .expert_intermediate_size = 704,
+        };
+        const components = [_]memory.GptGenerationBudgetComponent{.{
+            .backend = .cuda,
+            .kv_dtype = .f16,
+            .config = gpt_config,
+            .workspace_capacity = session.generationWorkspaceCapacity(),
+        }};
+        var sizing_limits = limits;
+        sizing_limits.scratch_limit_bytes = 384 * 1024 * 1024;
+        var sizing = memory.RunBudget.init(sizing_limits);
+        const prefill = try memory.reserveGptGenerationPrefill(&sizing, &components, 2048, 1, 2048);
+        try std.testing.expect(prefill.max_chunk_rows < 2048);
+        const estimate = try memory.estimateGptGeneration(.cuda, .f16, gpt_config, 2048, 1, prefill.max_chunk_rows);
+        try std.testing.expect(estimate.scratch_bytes <= workspace.capacity.backend_scratch_bytes);
+        var prompt_lease = try manager.acquireGenerationResources(&.{.{
+            .session = session,
+            .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .fromEstimate(estimate) },
+        }});
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        prompt_lease.release();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        const one_byte = memory.AdmissionAmounts{ .backend_scratch_bytes = 1 };
+        // AJ's reproduction: preserving the floor alone still double-charges.
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, one_byte, false));
+        var requests = [_]GenerationAdmissionRequest{.{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = one_byte } }};
+        var ordinary = try manager.acquireGenerationResources(&requests);
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        ordinary.release();
+        // A streaming lifetime can hold the complete KV/scratch allowance;
+        // another borrower cannot spend the same bytes until it releases.
+        requests[0].resources.amounts = workspace.capacity;
+        var streaming = try manager.acquireGenerationResources(&requests);
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+        requests[0].resources.amounts = one_byte;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
+        streaming.release();
+        var retry = try manager.acquireGenerationResources(&requests);
+        retry.release();
+        // Operator caps still apply even when the global request increment is zero.
+        inline for (.{ memory.Limits{ .backend_limit_bytes = limits.backend_limit_bytes - 1 }, memory.Limits{ .combined_limit_bytes = limits.backend_limit_bytes - 1 }, memory.Limits{ .kv_limit_bytes = plan.resident.backend_kv_bytes - 1 }, memory.Limits{ .scratch_limit_bytes = plan.resident.backend_scratch_bytes - 1 } }) |cap| {
+            requests[0].resources.limits = memory.applyLimitOverrides(limits, cap);
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        }
+        requests[0].resources.limits = limits;
+        requests[0].resources.amounts = .{ .backend_kv_bytes = workspace.capacity.backend_kv_bytes + 1 };
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        requests[0].resources.amounts = .{ .backend_scratch_bytes = workspace.capacity.backend_scratch_bytes + 1 };
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        // Host work remains charged; a rejected host request restores credits.
+        requests[0].resources.amounts = .{ .backend_scratch_bytes = 1, .host_weight_bytes = 1025 };
+        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        requests[0].resources.amounts = .{ .backend_scratch_bytes = 1, .host_weight_bytes = 8 };
+        var host = try manager.acquireGenerationResources(&requests);
+        try std.testing.expectEqual(@as(usize, 8), controller.snapshot().host_weight_bytes);
+        host.release();
+        // Target borrowing must unwind if admission of a second session fails.
+        requests[0].resources.amounts = one_byte;
+        const pair = [_]GenerationAdmissionRequest{ requests[0], .{
+            .session = .{ .ptr = &workspace, .vtable = undefined },
+            .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .backend_weight_bytes = 1 } },
+        } };
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&pair));
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
+    }
+}
+
+test "CUDA A4B load plan widens explicit budget above default" {
+    const requested_budget_mb: u64 = 24 * 1024;
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        .{
+            .residency_mode = .resident,
+            .memory_budget_mb = requested_budget_mb,
+        },
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const encoded_artifact_bytes = 4 * 1024 * 1024 * 1024;
+    const plan = a4bGpuModelLoadAdmission(config, encoded_artifact_bytes, .cuda);
+    try std.testing.expectEqual(
+        @as(usize, requested_budget_mb) * 1024 * 1024,
+        plan.limit_floor.backend_limit_bytes,
+    );
+    try std.testing.expectEqual(
+        plan.limit_floor.backend_limit_bytes + encoded_artifact_bytes,
+        plan.limit_floor.combined_limit_bytes,
+    );
+}
+
+test "CUDA A4B operator cap remains authoritative over load-plan floor" {
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        null,
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const plan = a4bGpuModelLoadAdmission(config, 4 * 1024 * 1024 * 1024, .cuda);
+    const capped = runtime.tier.memory.applyLimitOverrides(
+        plan.limit_floor,
+        .{ .backend_limit_bytes = 8 * 1024 * 1024 * 1024 },
+    );
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), capped.backend_limit_bytes);
+    try std.testing.expectEqual(
+        capped.host_limit_bytes + capped.backend_limit_bytes,
+        capped.combined_limit_bytes,
+    );
+    var run_budget = runtime.tier.memory.RunBudget.init(capped);
+    try std.testing.expectError(
+        error.MemoryBudgetExceeded,
+        run_budget.tryReserveWeight(.backend, plan.resident.backendTotalBytes()),
+    );
 }
 
 fn onnxModelLoadAdmission(
@@ -8932,7 +9234,13 @@ fn loadSessionForPreferredBackends(
     // actionable cause: a GGUF whose tensors could not be resolved fails with
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
+    var laya_resident_attempted = false;
+    const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, model_dir);
     for (effective_backends) |backend| {
+        // Once opted-in Metal residency is attempted, preserve its actionable
+        // admission/load error rather than silently publishing a CPU session.
+        if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
+        if (backend == .metal and man.hasCapability("typed_decisions") and !laya_packed and @import("../ops/laya_metal.zig").enabled()) laya_resident_attempted = true;
         if (control) |active| try active.check();
         if (modelBackendIsUnhealthy(manager, model_dir, backend)) {
             rememberPreferredLoadError(&first_err, error.ModelBackendUnhealthy);
@@ -8977,20 +9285,24 @@ fn loadSessionForPreferredBackends(
         defer if (resource_lease) |*lease| lease.release();
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
+        var serving_floor: ?runtime.tier.memory.Limits = null;
         if (manager.admission_enabled) {
             const admission_plan = estimateModelLoadAdmission(
                 model_dir,
                 man,
                 backend_runtime,
                 source_session_manager.a4b_inference_request,
+                laya_packed,
             ) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };
             resident_amounts = admission_plan.resident;
+            serving_floor = admission_plan.serving_floor;
             admission_limits = manager.admissionLimitsForModelPath(
                 model_dir,
                 backend_runtime,
+                admission_plan.limit_floor,
             ) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
@@ -9052,8 +9364,14 @@ fn loadSessionForPreferredBackends(
             defer loaded.deinit();
             if (control) |active| try active.check();
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
+            try session_factory.prepareLayaResident(loaded.session, control);
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
+                if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
+                    &loaded.session,
+                    floor,
+                    resident_amounts,
+                );
                 const session_admission_limits = manager.admissionLimitsForSession(
                     backend_runtime,
                     loaded.session,
@@ -9075,6 +9393,7 @@ fn loadSessionForPreferredBackends(
         }
     }
 
+    if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
     // A missing process boundary is an expected fail-closed policy decision,
     // not an artifact/import failure.
     if (first_err) |err| if (err == error.ProcessIsolationRequired) return err;
@@ -9162,16 +9481,53 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     defer reloaded.release();
     // A late attachment must not move an existing Group to a different Io.
     const owned_io = manager.load_io.?;
-    manager.attachIo(std.testing.io);
+    try manager.attachIo(std.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
 }
 
+test "model eviction attachment returns with zero async workers and cancels on teardown" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer io_impl.deinit();
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureModelCache(1, 0);
+    try manager.attachIo(io_impl.io());
+    try std.testing.expect(manager.eviction_loop_started);
+    try std.testing.expectEqual(io_impl.io().userdata, manager.eviction_io.?.userdata);
+    // Reattachment must not schedule a second infinite task on the one-worker lane.
+    try manager.attachIo(io_impl.io());
+}
+
+test "model eviction attachment failure leaves maintenance retryable" {
+    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer unavailable_io.deinit();
+    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer available_io.deinit();
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureModelCache(1, 0);
+    try std.testing.expectError(error.ConcurrencyUnavailable, manager.attachIo(unavailable_io.io()));
+    try std.testing.expect(!manager.eviction_loop_started);
+    try std.testing.expect(manager.eviction_io == null);
+    try manager.attachIo(available_io.io());
+    try std.testing.expect(manager.eviction_loop_started);
+}
+
 test "cold load coordination reuses an attached runtime without a fallback" {
     var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
     defer manager.deinit();
-    manager.attachIo(std.testing.io);
+    try manager.attachIo(std.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
@@ -10101,7 +10457,7 @@ test "shouldPreferNativeSession prefers native CLIP, Whisper, and Florence weigh
     try std.testing.expect(shouldPreferNativeSession(florence));
 }
 
-test "shouldPreferNativeSession prefers native classifier and recognizer weights" {
+test "shouldPreferNativeSession prefers native classifier and extractor weights" {
     const allocator = std.testing.allocator;
 
     var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
@@ -10110,11 +10466,11 @@ test "shouldPreferNativeSession prefers native classifier and recognizer weights
     classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
     try std.testing.expect(shouldPreferNativeSession(classifier));
 
-    var recognizer = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .recognizer };
-    defer recognizer.deinit();
-    try std.testing.expect(!shouldPreferNativeSession(recognizer));
-    recognizer.safetensors_path = try allocator.dupe(u8, "model.safetensors");
-    try std.testing.expect(shouldPreferNativeSession(recognizer));
+    var extractor = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .extractor };
+    defer extractor.deinit();
+    try std.testing.expect(!shouldPreferNativeSession(extractor));
+    extractor.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+    try std.testing.expect(shouldPreferNativeSession(extractor));
 }
 
 test "effectiveLoadBackends keeps gpu native backends ahead of cpu native before onnx" {
@@ -10760,7 +11116,7 @@ test "component compatibility validates explicit split ONNX graphs" {
     );
     try std.testing.expectEqual(model_compatibility.Level.compatible, multistage_summary.level);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{});
     _ = try manager.componentLoaderForPathsWithContract(
@@ -10831,7 +11187,7 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
     const paths = try encoder_decoder.findEncoderDecoderPaths(allocator, root);
     defer allocator.free(paths.encoder);
     defer allocator.free(paths.decoder);
-    var sessions = backends.SessionManager.init(allocator);
+    var sessions = backends.SessionManager.initWithIo(allocator, std.testing.io);
     sessions.preferred_backends = &.{.native};
     var manager = ModelManager.init(allocator, sessions);
     defer manager.deinit();
@@ -10898,7 +11254,7 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
     const other_root = try std.fs.path.join(allocator, &.{ root, "other" });
     defer allocator.free(other_root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureModelCache(0, 2);
 
@@ -11000,7 +11356,7 @@ test "composite cold load cancellation abandons only the departing waiter" {
     var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
     defer manager.deinit();
     const flight = try std.testing.allocator.create(CompositeAssetsLoadFlight);
-    const key = [_]u8{0} ** 32;
+    const key = @as([32]u8, @splat(0));
     flight.* = .{ .io = std.testing.io, .refs = 3, .load_state = .{ .io = std.testing.io } };
     try std.testing.expect(flight.load_state.tryAddWaiter());
     try manager.in_flight_composite_assets.put(std.testing.allocator, key, flight);
@@ -11023,7 +11379,7 @@ test "failed load flights allow immediate retry before the old task releases" {
     const alloc = std.testing.allocator;
     var manager = ModelManager.init(alloc, backends.SessionManager.init(alloc));
     defer manager.deinit();
-    const key = [_]u8{1} ** 32;
+    const key = @as([32]u8, @splat(1));
     const old = try alloc.create(CompositeAssetsLoadFlight);
     old.* = .{ .io = std.testing.io, .refs = 2, .load_state = .{ .io = std.testing.io } };
     try manager.in_flight_composite_assets.put(alloc, key, old);
@@ -11088,7 +11444,7 @@ test "component compatibility rejects malformed directory-backed native artifact
     try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     // Structurally invalid artifacts remain incompatible even when unknown
     // model contracts are explicitly permitted.
@@ -11132,7 +11488,7 @@ test "component plan invalidates when a referenced safetensors shard changes" {
     );
     defer allocator.free(root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11202,7 +11558,7 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
     );
     defer allocator.free(root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11313,11 +11669,11 @@ test "projector residency follows its request-scoped lifecycle" {
     const projector_bytes: usize = 4096;
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.gguf",
-        .data = &([_]u8{0x31} ** decoder_bytes),
+        .data = &(@as([decoder_bytes]u8, @splat(0x31))),
     });
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "mmproj.gguf",
-        .data = &([_]u8{0x32} ** projector_bytes),
+        .data = &(@as([projector_bytes]u8, @splat(0x32))),
     });
     const root = try std.fs.path.join(
         allocator,
@@ -11388,7 +11744,7 @@ test "directory-backed component admission charges native model artifacts" {
     const weight_bytes = 8192;
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.gguf",
-        .data = &([_]u8{0x5a} ** weight_bytes),
+        .data = &(@as([weight_bytes]u8, @splat(0x5a))),
     });
     const root = try std.fs.path.join(
         allocator,
@@ -11450,7 +11806,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.json",
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -11459,7 +11815,7 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
+        .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
@@ -11634,7 +11990,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "config.json",
         .data =
-        \\{"model_type":"recognizer","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
+        \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
@@ -11643,7 +11999,7 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "model_manifest.json",
-        .data = "{\"type\":\"recognizer\",\"capabilities\":[\"extraction\"]}",
+        .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
@@ -12327,42 +12683,42 @@ fn appendTestString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(
 
 fn appendTestMetadataString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataU32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: u32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.u32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.u32));
     try appendTestLe(u32, allocator, data, value);
 }
 
 fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const i32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
 }
 
 fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }
@@ -12412,7 +12768,7 @@ const TeardownStderrBlocker = struct {
         }
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         self.thread = null;
@@ -12791,4 +13147,124 @@ test "model manager teardown supervised child fixture" {
     }
     std.debug.print("teardown-fixture cleanup-returned\n", .{});
     return error.ExpectedTeardownWatchdogExit;
+}
+
+test "GGUF Unigram tokenizer consumes its embedded normalization map" {
+    const allocator = std.testing.allocator;
+    const bytes = try buildTestGgufWithT5Tokenizer(allocator);
+    defer allocator.free(bytes);
+    var parsed = try gguf_format.parse(allocator, bytes);
+    defer parsed.deinit(allocator);
+    // Minimal Darts map H -> h; the fixture's vocabulary contains 'hello'.
+    var map: [4 + 256 * 4 + 2]u8 = @splat(0);
+    std.mem.writeInt(u32, map[0..4], 256 * 4, .little);
+    std.mem.writeInt(u32, map[4..8], 1 << 10, .little);
+    std.mem.writeInt(u32, map[4 + 73 * 4 ..][0..4], 'H' | (1 << 8) | ((73 ^ 2) << 10), .little);
+    std.mem.writeInt(u32, map[4 + 2 * 4 ..][0..4], 0x80000000, .little);
+    map[4 + 256 * 4] = 'h';
+    const map_values = try allocator.alloc(gguf_format.MetadataValue, map.len);
+    defer allocator.free(map_values);
+    for (map, map_values) |byte, *value| value.* = .{ .u8 = byte };
+    const original = parsed.metadata;
+    const metadata = try allocator.alloc(gguf_format.MetadataEntry, original.len + 1);
+    defer allocator.free(metadata);
+    @memcpy(metadata[0..original.len], original);
+    metadata[original.len] = .{ .key = "tokenizer.ggml.precompiled_charsmap", .value = .{ .array = .{ .element_type = .u8, .values = map_values } } };
+    parsed.metadata = metadata;
+    defer parsed.metadata = original;
+    const tokenizer_json = try unigramTokenizerJsonFromGguf(allocator, &parsed);
+    defer allocator.free(tokenizer_json);
+    const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(allocator, tokenizer_json);
+    defer tok.deinitSelf();
+    const ids = try tok.tokenizer().encode(allocator, "Hello world");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 5 }, ids);
+}
+
+test "ONNX WordPiece loading and admission use export artifacts with root fallback" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |export_vocab| {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.createDirPath(io, "onnx");
+        const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", if (export_vocab) "onnx/vocab.txt" else "vocab.txt", "tokenizer_config.json" };
+        const bodies = [_][]const u8{ "onnx", "{\"model_type\":\"bert\",\"hidden_size\":8}", "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n", "{\"do_lower_case\":true}" };
+        var artifacts: [paths.len]managed_receipt.ArtifactReceipt = undefined;
+        for (paths, bodies, 0..) |path, body, i| {
+            try dir.dir.writeFile(io, .{ .sub_path = path, .data = body });
+            artifacts[i] = .{ .path = path, .size = body.len };
+        }
+        // An unreceipted JSON file must not shadow the selected vocabulary.
+        try dir.dir.writeFile(io, .{ .sub_path = "onnx/tokenizer.json", .data = "not a tokenizer" });
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "owner", .name = "model", .variant = "onnx", .selected_format = "onnx" },
+            .artifacts = &artifacts,
+        }, .{});
+        defer a.free(receipt);
+        try dir.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try dir.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        try std.testing.expectEqual(.huggingface, man.tokenizer_type);
+        try std.testing.expect(man.tokenizer_json_path == null);
+        try std.testing.expect(std.mem.endsWith(u8, man.vocab_txt_path.?, paths[2]));
+        const expected_plan = try tokenizerAdmissionPlan(bodies[2].len + bodies[3].len, .wordpiece);
+        const actual_plan = try tokenizerLoadAdmissionPlan(a, root, &man, .huggingface);
+        try std.testing.expectEqualDeep(expected_plan, actual_plan);
+        const tok = try loadHuggingFaceTokenizerFromManifest(a, &man);
+        defer tok.deinitSelf();
+        var encoded = try tok.tokenizer().encodeForModel(a, "HELLO", 3);
+        defer encoded.deinit();
+        try std.testing.expectEqualSlices(i32, &.{ 2, 5, 3 }, encoded.ids);
+    }
+}
+
+test "ONNX export tokenizer format takes precedence over root JSON" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |export_json| {
+        var dir = std.testing.tmpDir(.{});
+        defer dir.cleanup();
+        try dir.dir.createDirPath(io, "onnx");
+        const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", "onnx/vocab.txt", "tokenizer_config.json", "tokenizer.json" };
+        const bodies = [_][]const u8{ "onnx", "{\"model_type\":\"bert\",\"hidden_size\":8}", "[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\n", "{\"do_lower_case\":true}", "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":1}}}" };
+        var artifacts: [paths.len + 1]managed_receipt.ArtifactReceipt = undefined;
+        for (paths, bodies, 0..) |path, body, i| {
+            try dir.dir.writeFile(io, .{ .sub_path = path, .data = body });
+            artifacts[i] = .{ .path = path, .size = body.len };
+        }
+        const local_json = "{\"model\":{\"type\":\"WordPiece\",\"unk_token\":\"[UNK]\",\"vocab\":{\"[UNK]\":0,\"hello\":7}}}";
+        // An unreceipted JSON file must not shadow the export vocabulary.
+        try dir.dir.writeFile(io, .{ .sub_path = "onnx/tokenizer.json", .data = if (export_json) local_json else "not a tokenizer" });
+        artifacts[paths.len] = .{ .path = "onnx/tokenizer.json", .size = local_json.len };
+        const receipt = try std.json.Stringify.valueAlloc(a, managed_receipt.DownloadReceipt{
+            .version = 2,
+            .source = .{ .owner = "owner", .name = "model", .variant = "onnx", .selected_format = "onnx" },
+            .artifacts = artifacts[0 .. paths.len + @intFromBool(export_json)],
+        }, .{});
+        defer a.free(receipt);
+        try dir.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+        const root = try dir.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        var man = try manifest_mod.loadFromDir(a, root);
+        defer man.deinit();
+        try std.testing.expectEqual(.huggingface, man.tokenizer_type);
+        var listing = try manifest_mod.loadListingFromDir(a, root);
+        defer listing.deinit();
+        try std.testing.expectEqual(export_json, man.tokenizer_json_path != null);
+        try std.testing.expectEqual(export_json, listing.tokenizer_json_path != null);
+        const expected_plan = if (export_json)
+            try tokenizerAdmissionPlan(local_json.len, .huggingface)
+        else
+            try tokenizerAdmissionPlan(bodies[2].len + bodies[3].len, .wordpiece);
+        try std.testing.expectEqualDeep(expected_plan, try tokenizerLoadAdmissionPlan(a, root, &man, .huggingface));
+        const tok = try loadHuggingFaceTokenizerFromManifest(a, &man);
+        defer tok.deinitSelf();
+        const ids = try tok.tokenizer().encode(a, "hello");
+        defer a.free(ids);
+        try std.testing.expectEqualSlices(i32, if (export_json) &.{7} else &.{5}, ids);
+    }
 }

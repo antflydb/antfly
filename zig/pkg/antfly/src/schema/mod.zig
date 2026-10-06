@@ -35,6 +35,20 @@ pub const globMatch = impl.globMatch;
 pub const patternPropertyMatches = impl.patternPropertyMatches;
 pub const shouldIgnoreSchemaValidationField = impl.shouldIgnoreSchemaValidationField;
 pub const pathContainsSchemaIgnoredField = impl.pathContainsSchemaIgnoredField;
+pub const parseTtlDurationNs = impl.parseTtlDurationNs;
+
+fn relationalUuidColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(alloc);
+    if (schema.storage_mode == .relational) {
+        for (schema.document_schemas) |document| {
+            for (document.properties) |property| {
+                if (property.format != null and std.mem.eql(u8, property.format.?, "uuid")) try names.append(alloc, property.name);
+            }
+        }
+    }
+    return names.toOwnedSlice(alloc);
+}
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     return try impl.parseSchemaUpdateRequest(alloc, body);
@@ -73,6 +87,8 @@ pub const CompiledTableValidator = struct {
     physical_fields: []impl.PhysicalFieldValidation,
     execution: impl.CompiledValidationPlan,
     restore: impl.RelationalRestorePlan,
+    /// Borrowed names from the immutable parsed schema; only the slice is owned.
+    uuid_columns: []const []const u8,
     owns_schema: bool,
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
@@ -86,11 +102,14 @@ pub const CompiledTableValidator = struct {
         errdefer freePhysicalFieldValidations(alloc, physical_fields);
         var restore = try impl.RelationalRestorePlan.init(alloc, schema, physical_fields);
         errdefer restore.deinit(alloc);
+        const uuid_columns = try relationalUuidColumns(alloc, schema);
+        errdefer alloc.free(uuid_columns);
         return .{
             .schema = schema,
             .physical_fields = physical_fields,
             .execution = try impl.CompiledValidationPlan.init(alloc, schema),
             .restore = restore,
+            .uuid_columns = uuid_columns,
             .owns_schema = false,
         };
     }
@@ -104,17 +123,67 @@ pub const CompiledTableValidator = struct {
     pub fn deinit(self: *CompiledTableValidator, alloc: std.mem.Allocator) void {
         self.execution.deinit(alloc);
         self.restore.deinit(alloc);
+        alloc.free(self.uuid_columns);
         freePhysicalFieldValidations(alloc, self.physical_fields);
         if (self.owns_schema) self.schema.deinit(alloc);
         self.* = undefined;
     }
 
     pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
+        if (self.schema.external_base_source != null and writes.len != 0) return error.ExternalLakeReadOnly;
         try impl.validateWritesWithPlan(alloc, self.schema, writes, self.physical_fields, &self.execution);
     }
 
     pub fn validateValue(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
         try impl.validateDocumentValueWithPlan(alloc, self.schema, value, self.physical_fields, &self.execution);
+        try self.requireCanonicalUuid(value.*);
+    }
+
+    pub fn prepareValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value) !void {
+        try self.canonicalizeUuid(owned_alloc, value);
+        try impl.prepareDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution);
+        if (self.execution.expressions != null) try self.canonicalizeUuid(owned_alloc, value);
+    }
+
+    pub fn prepareTypedValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !void {
+        if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        try impl.prepareTypedDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        if (self.execution.expressions != null) {
+            if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
+        }
+    }
+
+    fn canonicalizeUuid(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value) !void {
+        if (value.* != .object) return;
+        for (self.uuid_columns) |name| {
+            const cell = value.object.getPtr(name) orelse continue;
+            if (cell.* != .string) continue;
+            const parsed = @import("../common/uuid.zig").parse(cell.string) catch return error.InvalidBatchRequest;
+            const canonical = @import("../common/uuid.zig").format(parsed);
+            if (!std.mem.eql(u8, cell.string, &canonical)) cell.string = try alloc.dupe(u8, &canonical);
+        }
+    }
+
+    fn requireCanonicalUuid(self: CompiledTableValidator, value: std.json.Value) !void {
+        if (value != .object) return;
+        for (self.uuid_columns) |name| {
+            const cell = value.object.get(name) orelse continue;
+            if (cell != .string) continue;
+            const parsed = @import("../common/uuid.zig").parse(cell.string) catch return error.InvalidBatchRequest;
+            const canonical = @import("../common/uuid.zig").format(parsed);
+            if (!std.mem.eql(u8, cell.string, &canonical)) return error.InvalidBatchRequest;
+        }
+    }
+
+    pub fn validateTypedStoredRoot(self: CompiledTableValidator, alloc: std.mem.Allocator, value: *std.json.Value, row: anytype) !void {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(alloc);
+        for (row.table_schema.relational_columns, 0..) |column, ordinal| {
+            if (!column.is_json or column.json_kind != .any) continue;
+            const cell = (try row.findCell(@intCast(ordinal))) orelse continue;
+            if (!cell.is_null and std.mem.eql(u8, cell.value.bytes_val, "null")) try names.append(alloc, column.name);
+        }
+        try self.prepareTypedValue(alloc, alloc, value, names.items, true);
     }
 
     /// The caller must first validate canonical bytes/hash against the runtime
@@ -122,6 +191,8 @@ pub const CompiledTableValidator = struct {
     /// validated rows are published (archive finish checks staged restores).
     pub fn validateRelationalRestoreFields(self: *const CompiledTableValidator, alloc: std.mem.Allocator, row: anytype) !void {
         std.debug.assert(!self.restore.full_root);
+        if (self.execution.expressions) |expressions| try expressions.verifyRow(alloc, row);
+        if (self.execution.checks) |checks| if (try checks.firstViolationRow(alloc, row) != null) return error.RelationalCheckViolation;
         for (self.restore.properties) |index| {
             const property = self.schema.document_schemas[0].properties[index];
             const ordinal = row.ordinalForName(property.name) orelse return error.InvalidBatchRequest;
@@ -129,10 +200,98 @@ pub const CompiledTableValidator = struct {
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const value = try row.materializeCellAlloc(arena.allocator(), cell);
-            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution);
+            try impl.validateRelationalRestoreProperty(alloc, self.schema, index, &value, &self.execution, !cell.is_null and cell.is_json and value == .null);
         }
     }
 };
+
+test "relational UUID preparation canonicalizes before durable row and index extraction" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"{A0EEBC999C0B4EF8BB6D6BB9BD380A11}\"}", .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidBatchRequest, validator.validateValue(alloc, &parsed.value));
+    try validator.prepareValue(parsed.arena.allocator(), alloc, &parsed.value);
+    try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", parsed.value.object.get("id").?.string);
+    try validator.validateValue(alloc, &parsed.value);
+
+    var document_validator = try CompiledTableValidator.init(alloc,
+        \\{"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword","format":"uuid"}},"additionalProperties":false}}}}
+    );
+    defer document_validator.deinit(alloc);
+    var document = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":\"A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11\"}", .{});
+    defer document.deinit();
+    try document_validator.prepareValue(document.arena.allocator(), alloc, &document.value);
+    try std.testing.expectEqualStrings("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", document.value.object.get("id").?.string);
+}
+
+const compiled_check_fixture =
+    \\{"version":1,"storage_mode":"relational","default_type":"row","checks":[{"name":"positive","column":"id","op":"gt","value":"9007199254740992"},{"name":"known","column":"name","op":"is_not_null"},{"name":"active","column":"name","op":"eq","value":"ACTIVE","collation":"ci"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"}},"additionalProperties":false}}}}
+;
+
+test "compiled CHECK validation preserves exact integers NULL and collation" {
+    const alloc = std.testing.allocator;
+    var compiled = try CompiledTableValidator.init(alloc, compiled_check_fixture);
+    defer compiled.deinit(alloc);
+    const cases = [_]struct { json: []const u8, valid: bool }{
+        .{ .json = "{\"id\":9007199254740993,\"name\":\"active\"}", .valid = true },
+        .{ .json = "{\"id\":9007199254740992,\"name\":\"active\"}", .valid = false },
+        .{ .json = "{\"name\":\"Active\"}", .valid = true },
+        .{ .json = "{\"id\":9007199254740993}", .valid = false },
+        .{ .json = "{\"name\":\"inactive\"}", .valid = false },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.json, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        if (case.valid) try compiled.validateValue(alloc, &parsed.value) else try std.testing.expectError(error.RelationalCheckViolation, compiled.validateValue(alloc, &parsed.value));
+    }
+}
+
+test "compiled CHECK preparation and validation clean up every allocation failure" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var compiled = try CompiledTableValidator.init(alloc, compiled_check_fixture);
+            defer compiled.deinit(alloc);
+            const runtime = try deriveRuntimeTableSchema(alloc, compiled.schema);
+            defer storage_schema.freeSchema(alloc, runtime);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "{\"id\":9007199254740993,\"name\":\"active\"}", .{ .parse_numbers = false });
+            defer parsed.deinit();
+            try compiled.validateValue(alloc, &parsed.value);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "compiled CHECK declarations reject malformed and unsupported constraints" {
+    const alloc = std.testing.allocator;
+    const cases = [_][]const u8{
+        "[{\"name\":\"x\",\"column\":\"missing\",\"op\":\"eq\",\"value\":1}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"sideways\",\"value\":1}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"eq\",\"value\":1.5}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"eq\",\"value\":\"9223372036854775808\"}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"is_null\",\"value\":1}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"eq\",\"value\":1,\"validation_state\":\"enforced\"}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"eq\"},{\"name\":\"x\",\"column\":\"id\",\"op\":\"ne\"}]",
+        "[{\"name\":\"x\",\"column\":\"id\",\"op\":\"eq\",\"value\":1,\"collation\":\"ci\"}]",
+    };
+    for (cases) |checks| {
+        const encoded = try std.mem.concat(alloc, u8, &.{
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}},\"checks\":",
+            checks,
+            "}",
+        });
+        defer alloc.free(encoded);
+        var parsed = parseValidatedTableSchema(alloc, encoded) catch |err| {
+            try std.testing.expectEqual(error.InvalidSchemaUpdateRequest, err);
+            continue;
+        };
+        defer parsed.deinit(alloc);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, parsed));
+    }
+}
 
 const compiled_validator_fixture =
     \\{"default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"string","pattern":"^(ab|cd)+$"},"b":{"type":"integer"},"c":{"type":"boolean"},"d":{"type":"string"},"e":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"},"c":{"type":"integer"},"d":{"type":"integer"},"e":{"type":"string","pattern":"^x$"}},"additionalProperties":false}},"patternProperties":{"^tag_":{"type":"string","pattern":"^x$"}},"additionalProperties":false}}}}
@@ -287,7 +446,7 @@ fn appendUniquePhysicalFieldValidation(
     source_field: []const u8,
     field_type: storage_schema.AntflyType,
 ) !void {
-    const type_mask = @as(u16, 1) << @intCast(@intFromEnum(field_type));
+    const type_mask = @as(u16, 1) << @intCast(@backingInt(field_type));
     if (seen_types.getPtr(source_field)) |mask| {
         if (mask.* & type_mask != 0) return;
         const owned_source = try alloc.dupe(u8, source_field);
@@ -319,7 +478,7 @@ fn appendUniquePhysicalFieldValidation(
 fn physicalFieldValidationLessThan(_: void, a: impl.PhysicalFieldValidation, b: impl.PhysicalFieldValidation) bool {
     const order = std.mem.order(u8, a.source_field, b.source_field);
     if (order != .eq) return order == .lt;
-    return @intFromEnum(a.field_type) < @intFromEnum(b.field_type);
+    return @backingInt(a.field_type) < @backingInt(b.field_type);
 }
 
 fn freePhysicalFieldValidations(alloc: std.mem.Allocator, fields: []impl.PhysicalFieldValidation) void {
@@ -369,15 +528,61 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
     errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+    if (schema.unique_constraints != null or schema.foreign_keys != null) {
+        const definitions = try @import("relational_declarations.zig").definitionFingerprints(alloc, schema, .{
+            .version = schema.version,
+            .storage_mode = .relational,
+            .relational_columns = relational_columns,
+        });
+        @import("relational_declarations.zig").freeDefinitions(alloc, definitions);
+    }
+    if (schema.checks) |checks| @import("relational_checks.zig").validateDefinitions(alloc, .{
+        .version = schema.version,
+        .storage_mode = .relational,
+        .relational_columns = relational_columns,
+    }, checks.value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    // Reject unsupported key types/collations before the metadata API accepts
+    // a schema, using the same compiler as physical index publication.
+    if (schema.relational_indexes != null) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const index_schema = storage_schema.TableSchema{ .version = schema.version, .storage_mode = .relational, .relational_columns = relational_columns };
+        var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, index_schema);
+        defer layout.deinit();
+        for ((try schema.relationalIndexDefinitions(arena.allocator())).?) |definition| {
+            var tuple = @import("../storage/db/relational_index_keys.zig").TuplePlan.init(alloc, index_schema, &layout, definition.keys) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidSchemaUpdateRequest,
+            };
+            tuple.deinit();
+            if (definition.where.len != 0) {
+                var condition = @import("../storage/db/relational_index_predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidSchemaUpdateRequest,
+                };
+                condition.deinit();
+            }
+        }
+    }
 
     const index_sort = try deriveRuntimeIndexSort(alloc, schema.index_sort, exact_fields, dynamic_templates);
     errdefer freeRuntimeIndexSort(alloc, index_sort);
+    const default_type = try alloc.dupe(u8, if (schema.default_type.len > 0) schema.default_type else "_default");
+    errdefer alloc.free(default_type);
+    const ttl_field = try alloc.dupe(u8, schema.ttl_field);
+    errdefer alloc.free(ttl_field);
+    const external = if (schema.external_base_source) |source| try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, source) else null;
 
     return .{
         .version = schema.version,
-        .default_type = try alloc.dupe(u8, if (schema.default_type.len > 0) schema.default_type else "_default"),
+        .external_base_source = external,
+        .default_type = default_type,
         .ttl_duration_ns = schema.ttl_duration_ns,
-        .ttl_field = try alloc.dupe(u8, schema.ttl_field),
+        .ttl_field = ttl_field,
         .enforce_types = schema.enforce_types,
         .requires_public_schema = schema.storage_mode == .relational,
         .storage_mode = switch (schema.storage_mode) {
@@ -390,6 +595,18 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .full_text_documents = full_text_documents,
         .relational_columns = relational_columns,
         .index_sort = index_sort,
+    };
+}
+
+/// Reduced immutable layout for typed scalar validation. Compiling CHECKs
+/// does not need another copy of full-text, dynamic or physical index plans.
+pub fn deriveRelationalCheckLayout(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
+    return .{
+        .version = schema.version,
+        .default_type = "",
+        .ttl_field = "",
+        .storage_mode = .relational,
+        .relational_columns = try deriveRuntimeRelationalColumns(alloc, schema),
     };
 }
 
@@ -448,7 +665,7 @@ fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) 
     return false;
 }
 
-fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
+pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.RelationalColumnType {
     if (documentPropertyUsesJsonEncoding(property)) return .json;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;
@@ -457,7 +674,8 @@ fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_schema.
             std.mem.eql(u8, field_type, "string") or
             std.mem.eql(u8, field_type, "text") or
             std.mem.eql(u8, field_type, "html") or
-            std.mem.eql(u8, field_type, "search_as_you_type")) return .string;
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "substring")) return .string;
         if (std.mem.eql(u8, field_type, "blob")) return .blob;
         if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
         if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
@@ -779,14 +997,14 @@ fn declaredFieldLessThan(_: void, a: storage_schema.DeclaredField, b: storage_sc
     const field_order = std.mem.order(u8, a.field, b.field);
     if (field_order != .eq) return field_order == .lt;
     if (a.mapping.field_type != b.mapping.field_type) {
-        return @intFromEnum(a.mapping.field_type) < @intFromEnum(b.mapping.field_type);
+        return @backingInt(a.mapping.field_type) < @backingInt(b.mapping.field_type);
     }
     if (a.mapping.do_index != b.mapping.do_index) return !a.mapping.do_index;
     if (a.mapping.store != b.mapping.store) return !a.mapping.store;
     if (a.mapping.doc_values != b.mapping.doc_values) return !a.mapping.doc_values;
     if (a.mapping.sortable != b.mapping.sortable) return !a.mapping.sortable;
     if (a.mapping.missing_null_policy != b.mapping.missing_null_policy) {
-        return @intFromEnum(a.mapping.missing_null_policy) < @intFromEnum(b.mapping.missing_null_policy);
+        return @backingInt(a.mapping.missing_null_policy) < @backingInt(b.mapping.missing_null_policy);
     }
     if (a.mapping.include_in_all != b.mapping.include_in_all) return !a.mapping.include_in_all;
     return std.mem.order(u8, a.mapping.analyzer, b.mapping.analyzer) == .lt;
@@ -842,7 +1060,7 @@ fn appendShorthandRuntimeDeclaredFields(
     antfly_types: []const []const u8,
 ) !void {
     const has_primary = containsString(antfly_types, "text") or containsString(antfly_types, "html");
-    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type");
+    const has_search_as_you_type = containsString(antfly_types, "search_as_you_type") or containsString(antfly_types, "substring");
 
     for (antfly_types) |type_name| {
         const field_type = parseRuntimeFieldType(type_name);
@@ -1013,6 +1231,7 @@ fn defaultDynamicTemplateAnalyzer(field_type: storage_schema.AntflyType) []const
         .html => "html",
         .keyword, .link => "keyword",
         .search_as_you_type => "search_as_you_type",
+        .substring => "substring",
         else => "standard",
     };
 }
@@ -1041,6 +1260,8 @@ fn freeRuntimeFullTextDocuments(alloc: std.mem.Allocator, docs: []storage_schema
         if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
         for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
         if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+        storage_schema.freeOwnedPaths(alloc, doc.declared_paths);
+        storage_schema.freeOwnedPaths(alloc, doc.unindexed_paths);
     }
     if (docs.len > 0) alloc.free(docs);
 }
@@ -1134,6 +1355,8 @@ fn deriveRuntimeFullTextDocuments(alloc: std.mem.Allocator, schema: ParsedTableS
             if (doc.open_dynamic_paths.len > 0) alloc.free(doc.open_dynamic_paths);
             for (doc.infer_type_dynamic_paths) |infer_path| alloc.free(infer_path);
             if (doc.infer_type_dynamic_paths.len > 0) alloc.free(doc.infer_type_dynamic_paths);
+            storage_schema.freeOwnedPaths(alloc, doc.declared_paths);
+            storage_schema.freeOwnedPaths(alloc, doc.unindexed_paths);
         }
         alloc.free(docs);
     }
@@ -1153,6 +1376,8 @@ fn deriveRuntimeFullTextDocument(
     var dynamic_rules = std.ArrayListUnmanaged(storage_schema.FullTextDynamicRule).empty;
     var open_dynamic_paths = std.ArrayListUnmanaged([]const u8).empty;
     var infer_type_dynamic_paths = std.ArrayListUnmanaged([]const u8).empty;
+    var declared_paths = std.ArrayListUnmanaged([]const u8).empty;
+    var unindexed_paths = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (fields.items) |field| {
             alloc.free(field.path);
@@ -1175,6 +1400,10 @@ fn deriveRuntimeFullTextDocument(
         open_dynamic_paths.deinit(alloc);
         for (infer_type_dynamic_paths.items) |infer_path| alloc.free(infer_path);
         infer_type_dynamic_paths.deinit(alloc);
+        for (declared_paths.items) |declared_path| alloc.free(declared_path);
+        declared_paths.deinit(alloc);
+        for (unindexed_paths.items) |unindexed_path| alloc.free(unindexed_path);
+        unindexed_paths.deinit(alloc);
     }
 
     for (document_schema.properties) |property| {
@@ -1188,6 +1417,7 @@ fn deriveRuntimeFullTextDocument(
         try deriveRuntimeFullTextDynamicProperty(alloc, property.name, property, &dynamic_rules);
         try deriveRuntimeFullTextOpenDynamicProperty(alloc, property.name, property, &open_dynamic_paths);
         try deriveRuntimeFullTextInferTypeDynamicProperty(alloc, property.name, property, &infer_type_dynamic_paths);
+        try deriveRuntimeFullTextDeclaredProperty(alloc, property.name, property, &declared_paths, &unindexed_paths);
     }
     for (document_schema.pattern_properties) |pattern_property| {
         try appendDynamicRuleFromProperty(alloc, "", pattern_property.pattern, pattern_property.property.*, &dynamic_rules);
@@ -1201,13 +1431,57 @@ fn deriveRuntimeFullTextDocument(
         try appendUniqueOwnedPath(alloc, &open_dynamic_paths, "");
     }
 
+    const name = try alloc.dupe(u8, document_schema.name);
+    errdefer alloc.free(name);
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    errdefer fields = .fromOwnedSlice(owned_fields);
+    const owned_rules = try dynamic_rules.toOwnedSlice(alloc);
+    errdefer dynamic_rules = .fromOwnedSlice(owned_rules);
+    const owned_open_paths = try open_dynamic_paths.toOwnedSlice(alloc);
+    errdefer open_dynamic_paths = .fromOwnedSlice(owned_open_paths);
+    const owned_infer_paths = try infer_type_dynamic_paths.toOwnedSlice(alloc);
+    errdefer infer_type_dynamic_paths = .fromOwnedSlice(owned_infer_paths);
+    const owned_declared_paths = try declared_paths.toOwnedSlice(alloc);
+    errdefer declared_paths = .fromOwnedSlice(owned_declared_paths);
+    const owned_unindexed_paths = try unindexed_paths.toOwnedSlice(alloc);
     return .{
-        .name = try alloc.dupe(u8, document_schema.name),
-        .fields = try fields.toOwnedSlice(alloc),
-        .dynamic_rules = try dynamic_rules.toOwnedSlice(alloc),
-        .open_dynamic_paths = try open_dynamic_paths.toOwnedSlice(alloc),
-        .infer_type_dynamic_paths = try infer_type_dynamic_paths.toOwnedSlice(alloc),
+        .name = name,
+        .fields = owned_fields,
+        .dynamic_rules = owned_rules,
+        .open_dynamic_paths = owned_open_paths,
+        .infer_type_dynamic_paths = owned_infer_paths,
+        .declared_paths = owned_declared_paths,
+        .unindexed_paths = owned_unindexed_paths,
     };
+}
+
+/// Record every declared property path and the subtrees whose declaration
+/// disables indexing. Declarations that emit no text field (numeric shorthand,
+/// `blob`, `embedding`, `x-antfly-index: false`, ...) are otherwise invisible
+/// to the runtime, and the dynamic mapper would treat them as undeclared
+/// fields whenever the enclosing object opts into dynamic indexing.
+fn deriveRuntimeFullTextDeclaredProperty(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    property: impl.DocumentProperty,
+    declared_paths: *std.ArrayListUnmanaged([]const u8),
+    unindexed_paths: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    try appendUniqueOwnedPath(alloc, declared_paths, path);
+
+    const item_unindexed = if (property.item) |item| item.antfly_index != null and !item.antfly_index.? else false;
+    if ((property.antfly_index != null and !property.antfly_index.?) or item_unindexed) {
+        // The subtree is excluded wholesale; its children need no entries.
+        try appendUniqueOwnedPath(alloc, unindexed_paths, path);
+        return;
+    }
+
+    const children = if (property.item) |item| item.properties else property.properties;
+    for (children) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        try deriveRuntimeFullTextDeclaredProperty(alloc, child_path, child, declared_paths, unindexed_paths);
+    }
 }
 
 fn deriveRuntimeFullTextProperty(
@@ -1266,23 +1540,34 @@ fn deriveRuntimeFullTextLeaf(
     const has_primary = has_text or has_html;
     const has_keyword = containsString(types, "keyword") or containsString(types, "link");
     const has_search_as_you_type = containsString(types, "search_as_you_type");
+    const has_substring = containsString(types, "substring");
+    // Companion types always sit next to an analyzed root field.
+    const has_companion = has_search_as_you_type or has_substring;
 
     if (has_text and has_html) return;
 
-    if (has_text or (!has_primary and has_search_as_you_type)) {
+    if (has_text or (!has_primary and has_companion)) {
         try appendFullTextField(alloc, fields, path, path, primary_analyzer, should_include_in_all);
     } else if (has_html) {
         try appendFullTextField(alloc, fields, path, path, effectiveAntflyAnalyzer(property, item) orelse "html", should_include_in_all);
     }
 
     if (has_keyword) {
-        const emitted_name = if (has_primary or has_search_as_you_type)
+        const emitted_name = if (has_primary or has_companion)
             try std.fmt.allocPrint(alloc, "{s}.keyword", .{path})
         else
             try alloc.dupe(u8, path);
         defer alloc.free(emitted_name);
-        const include = should_include_in_all and !has_primary and !has_search_as_you_type;
+        const include = should_include_in_all and !has_primary and !has_companion;
         try appendFullTextField(alloc, fields, path, emitted_name, "keyword", include);
+    }
+
+    if (has_substring) {
+        // Suffix-indexed companion answering "contains" queries; see
+        // `analysis.substring_analyzer`.
+        const emitted_substring = try std.fmt.allocPrint(alloc, "{s}._substring", .{path});
+        defer alloc.free(emitted_substring);
+        try appendFullTextField(alloc, fields, path, emitted_substring, "substring", false);
     }
 
     if (has_search_as_you_type) {
@@ -1512,18 +1797,24 @@ fn appendDynamicLeafRule(
     const has_primary = has_text or has_html;
     const has_keyword = containsString(types, "keyword") or containsString(types, "link");
     const has_search_as_you_type = containsString(types, "search_as_you_type");
+    const has_substring = containsString(types, "substring");
+    const has_companion = has_search_as_you_type or has_substring;
 
     if (has_text and has_html) return;
 
-    if (has_text or (!has_primary and has_search_as_you_type)) {
+    if (has_text or (!has_primary and has_companion)) {
         try appendDynamicVariant(alloc, &variants, "", "standard", false);
     } else if (has_html) {
         try appendDynamicVariant(alloc, &variants, "", "html", false);
     }
 
     if (has_keyword) {
-        const suffix = if (has_primary or has_search_as_you_type) ".keyword" else "";
+        const suffix = if (has_primary or has_companion) ".keyword" else "";
         try appendDynamicVariant(alloc, &variants, suffix, "keyword", false);
+    }
+
+    if (has_substring) {
+        try appendDynamicVariant(alloc, &variants, "._substring", "substring", false);
     }
 
     if (has_search_as_you_type) {
@@ -1554,9 +1845,13 @@ fn appendDynamicVariant(
     analyzer: []const u8,
     include_in_all: bool,
 ) !void {
+    const owned_suffix = try alloc.dupe(u8, suffix);
+    errdefer alloc.free(owned_suffix);
+    const owned_analyzer = try alloc.dupe(u8, analyzer);
+    errdefer alloc.free(owned_analyzer);
     try variants.append(alloc, .{
-        .suffix = try alloc.dupe(u8, suffix),
-        .analyzer = try alloc.dupe(u8, analyzer),
+        .suffix = owned_suffix,
+        .analyzer = owned_analyzer,
         .include_in_all = include_in_all,
     });
 }
@@ -1569,10 +1864,16 @@ fn appendFullTextField(
     analyzer: []const u8,
     include_in_all: bool,
 ) !void {
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    const owned_name = try alloc.dupe(u8, emitted_name);
+    errdefer alloc.free(owned_name);
+    const owned_analyzer = try alloc.dupe(u8, analyzer);
+    errdefer alloc.free(owned_analyzer);
     try fields.append(alloc, .{
-        .path = try alloc.dupe(u8, path),
-        .emitted_name = try alloc.dupe(u8, emitted_name),
-        .analyzer = try alloc.dupe(u8, analyzer),
+        .path = owned_path,
+        .emitted_name = owned_name,
+        .analyzer = owned_analyzer,
         .include_in_all = include_in_all,
     });
 }
@@ -1622,6 +1923,7 @@ fn inferAntflyType(field_type: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, field_type, "keyword")) return &.{"keyword"};
     if (std.mem.eql(u8, field_type, "link")) return &.{"link"};
     if (std.mem.eql(u8, field_type, "search_as_you_type")) return &.{"search_as_you_type"};
+    if (std.mem.eql(u8, field_type, "substring")) return &.{"substring"};
     return null;
 }
 
@@ -1652,7 +1954,9 @@ fn appendUniqueOwnedPath(
     for (paths.items) |existing| {
         if (std.mem.eql(u8, existing, value)) return;
     }
-    try paths.append(alloc, try alloc.dupe(u8, value));
+    const owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned);
+    try paths.append(alloc, owned);
 }
 
 fn fieldNameFromPath(path: []const u8) []const u8 {
@@ -1702,6 +2006,117 @@ test "runtime schema materializes default-analyzed search-as-you-type root prefi
     }
     try std.testing.expect(html_index_prefix);
     try std.testing.expect(!html_root_prefix);
+}
+
+test "runtime schema records declared and unindexed paths for the dynamic mapper" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "additionalProperties": true, "properties": {
+        \\      "body": {"type":"string", "x-antfly-types":["text"]},
+        \\      "stored_only": {"type":"string", "x-antfly-index": false},
+        \\      "attachment": {"type":"string", "x-antfly-types":["blob"]},
+        \\      "count": {"type":"integer"},
+        \\      "meta": {"type":"object", "properties": {
+        \\        "label": {"type":"string"},
+        \\        "secret": {"type":"object", "x-antfly-index": false, "properties": {"token": {"type":"string"}}}
+        \\      }},
+        \\      "notes": {"type":"array", "items": {"type":"string", "x-antfly-index": false}},
+        \\      "entries": {"type":"array", "items": {"type":"object", "properties": {"name": {"type":"string"}}}}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const document = runtime.full_text_documents[0];
+
+    // Only `body` and `meta.label` and `entries.name` emit text fields; the rest
+    // is invisible to the mapper unless it is recorded as declared.
+    try std.testing.expectEqual(@as(usize, 3), document.fields.len);
+    try std.testing.expectEqual(@as(usize, 1), document.open_dynamic_paths.len);
+    try std.testing.expectEqualStrings("", document.open_dynamic_paths[0]);
+
+    const expected_declared = [_][]const u8{
+        "body",       "stored_only", "attachment", "count",   "meta",
+        "meta.label", "meta.secret", "notes",      "entries", "entries.name",
+    };
+    try std.testing.expectEqual(expected_declared.len, document.declared_paths.len);
+    for (expected_declared) |path| {
+        try std.testing.expect(storage_schema.containsPath(document.declared_paths, path));
+    }
+    // Children of an unindexed subtree are covered by the subtree entry.
+    try std.testing.expect(!storage_schema.containsPath(document.declared_paths, "meta.secret.token"));
+
+    try std.testing.expectEqual(@as(usize, 3), document.unindexed_paths.len);
+    try std.testing.expect(storage_schema.containsPath(document.unindexed_paths, "stored_only"));
+    try std.testing.expect(storage_schema.containsPath(document.unindexed_paths, "meta.secret"));
+    try std.testing.expect(storage_schema.containsPath(document.unindexed_paths, "notes"));
+
+    // The lists round-trip through the durable runtime schema encoding.
+    const encoded = try storage_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(encoded);
+    const loaded = try storage_schema.deserializeSchema(alloc, encoded);
+    defer storage_schema.freeSchema(alloc, loaded);
+    try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, loaded));
+    try std.testing.expectEqual(document.declared_paths.len, loaded.full_text_documents[0].declared_paths.len);
+    try std.testing.expectEqual(document.unindexed_paths.len, loaded.full_text_documents[0].unindexed_paths.len);
+}
+
+test "runtime schema derives substring companions" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{
+        \\  "document_schemas": {
+        \\    "doc": {"schema": {"type":"object", "properties": {
+        \\      "title": {"type":"string", "x-antfly-types":["text","substring"]},
+        \\      "sku": {"type":"string", "x-antfly-types":["substring","keyword"]},
+        \\      "meta": {"type":"object", "additionalProperties":{"type":"string", "x-antfly-types":["substring"]}},
+        \\      "code": {"type":"substring"},
+        \\      "part": {"type":"string", "x-antfly-field":{"type":"substring"}}
+        \\    }}}
+        \\  }
+        \\}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const fields = runtime.full_text_documents[0].fields;
+
+    const title_root = findFullTextField(fields, "title") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("standard", title_root.analyzer);
+    const title_substring = findFullTextField(fields, "title._substring") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("substring", title_substring.analyzer);
+
+    // A lone substring type still gets an analyzed root, and keyword moves to
+    // its companion name exactly as it does next to search_as_you_type.
+    const sku_root = findFullTextField(fields, "sku") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("standard", sku_root.analyzer);
+    try std.testing.expect(findFullTextField(fields, "sku.keyword") != null);
+    try std.testing.expect(findFullTextField(fields, "sku._substring") != null);
+
+    // The bare schema spelling and the explicit mapping form both emit the
+    // analyzed root plus the companion.
+    try std.testing.expect(findFullTextField(fields, "code") != null);
+    try std.testing.expect(findFullTextField(fields, "code._substring") != null);
+    try std.testing.expect(findFullTextField(fields, "part") != null);
+    try std.testing.expect(findFullTextField(fields, "part._substring") != null);
+
+    var dynamic_substring = false;
+    for (runtime.full_text_documents[0].dynamic_rules) |rule| {
+        if (!std.mem.eql(u8, rule.parent_path, "meta")) continue;
+        for (rule.variants) |variant| {
+            if (std.mem.eql(u8, variant.suffix, "._substring")) {
+                try std.testing.expectEqualStrings("substring", variant.analyzer);
+                dynamic_substring = true;
+            }
+        }
+    }
+    try std.testing.expect(dynamic_substring);
 }
 
 test "runtime schema derives authoritative relational columns" {
@@ -2271,4 +2686,27 @@ test "runtime schema derives and validates index sort metadata" {
     );
     defer id_not_final.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, id_not_final));
+}
+
+test "external lake schema binding survives durable serialization and preserves ownership" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"orders","format":"iceberg","uri":"s3://bucket/orders","credentials":{"ref":"lake","scope":"orders"},"snapshot":{"mode":"snapshot_id","id":"123"},"schema_fingerprint":"schema-v7"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    parsed.deinit(alloc);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const bytes = try storage_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    const restored = try storage_schema.deserializeSchema(alloc, bytes);
+    defer storage_schema.freeSchema(alloc, restored);
+    try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, restored));
+    const source = restored.external_base_source.?.binding;
+    try std.testing.expectEqualStrings("123", source.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("lake", source.credential_ref.?.ref_id);
+    const projection = try storage_schema.serializeTextProjectionSchema(alloc, runtime);
+    defer alloc.free(projection);
+    const text_schema = try storage_schema.deserializeSchema(alloc, projection);
+    defer storage_schema.freeSchema(alloc, text_schema);
+    try std.testing.expect(text_schema.external_base_source == null);
 }

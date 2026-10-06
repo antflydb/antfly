@@ -25,37 +25,7 @@ const table_catalog = @import("table_catalog.zig");
 
 /// A borrowed request budget, including its clock authority. Routers must keep
 /// admission, refresh and endpoint selection within this same budget.
-pub const RouteBudget = struct {
-    clock: table_catalog.RoutingBudget = .{},
-    cancellation: ?@import("../common/cancellation.zig").CancellationToken = null,
-
-    pub fn fromRequest(request: anytype) RouteBudget {
-        return .{
-            .clock = .{
-                .deadline_ns = request.execution_deadline_ns,
-                .io = if (@hasField(@TypeOf(request), "execution_io")) request.execution_io else null,
-            },
-            .cancellation = request.cancellation,
-        };
-    }
-
-    pub fn fromTimeoutMs(timeout_ms: ?u32) RouteBudget {
-        return .{ .clock = .{ .deadline_ns = if (timeout_ms) |ms| @import("antfly_platform").time.monotonicNs() +| @as(u64, ms) * std.time.ns_per_ms else null } };
-    }
-
-    pub fn remainingTimeoutMs(self: RouteBudget) !?u32 {
-        try self.check();
-        const deadline = self.clock.deadline_ns orelse return null;
-        const remaining = deadline -| self.clock.nowNs();
-        if (remaining == 0) return error.Timeout;
-        return @intCast(@min(std.math.maxInt(u32), (remaining +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms));
-    }
-
-    pub fn check(self: RouteBudget) !void {
-        if (self.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-        if (self.clock.deadline_ns) |deadline| if (self.clock.nowNs() >= deadline) return error.Timeout;
-    }
-};
+pub const RouteBudget = @import("routing_budget.zig").RouteBudget;
 
 pub const HostedGroupRouter = struct {
     ptr: *anyopaque,
@@ -687,7 +657,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
             try std.testing.expectError(error.Timeout, resolveGroupRoutes(std.testing.allocator, unused_catalog, router.withBudget(.{ .clock = .{ .deadline_ns = 0 } }), &.{7}, .prefer_leader));
             var canceled = std.atomic.Value(bool).init(true);
-            try std.testing.expectError(error.Cancelled, resolveGroupRoute(std.testing.allocator, unused_catalog, router.withBudget(.{ .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&canceled) }), 7, .prefer_leader));
+            try std.testing.expectError(error.Cancelled, resolveGroupRoute(std.testing.allocator, unused_catalog, router.withBudget(.{ .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&canceled) }), 7, .prefer_leader));
             try std.testing.expectEqual(@as(usize, 4), state.batch_calls);
         }
 

@@ -386,7 +386,7 @@ const FallbackNativeBackend = struct {
         };
     }
 
-    fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *FallbackNativeBackend, allocator: std.mem.Allocator) void {
         self.backend.deinit();
         native_compute.deinitPrefetchQueue(self.weight_store);
         self.weight_store.resident_weights.deinit(allocator);

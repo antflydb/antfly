@@ -59,7 +59,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
-      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      ANTFLY_CI_ZIG_OPTIMIZE: safe
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_ARTIFACT_FULL_TEXT_SCALE: "1"
       ANTFLY_BIN: ./zig-out/bin/antfly
@@ -70,6 +70,8 @@ jobs:
           persist-credentials: false
           submodules: true
 
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Load pinned toolchain policy
         id: toolchain
         uses: ./.github/actions/load-toolchain-policy
@@ -84,7 +86,7 @@ jobs:
           use-cache: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Compute CPU bound
         id: cpus

@@ -195,15 +195,25 @@ export function createIdleAnimation(
     const actionDelay = gsap.utils.random(8, 15); // 8-15 seconds between actions (less frequent)
 
     currentDelayedCall = gsap.delayedCall(actionDelay, () => {
-      if (!schedulerActive || schedulerPaused) return;
+      if (
+        !schedulerActive ||
+        schedulerPaused ||
+        !eyeLeft ||
+        !eyeRight ||
+        !eyeLeftPath ||
+        !eyeRightPath ||
+        !eyeLeftSvg ||
+        !eyeRightSvg
+      )
+        return;
 
       const eyeElements: EyeAnimationElements = {
-        leftEye: eyeLeft!,
-        rightEye: eyeRight!,
-        leftEyePath: eyeLeftPath!,
-        rightEyePath: eyeRightPath!,
-        leftEyeSvg: eyeLeftSvg!,
-        rightEyeSvg: eyeRightSvg!,
+        leftEye: eyeLeft,
+        rightEye: eyeRight,
+        leftEyePath: eyeLeftPath,
+        rightEyePath: eyeRightPath,
+        leftEyeSvg: eyeLeftSvg,
+        rightEyeSvg: eyeRightSvg,
       };
 
       // Pick a random spontaneous action:

@@ -85,6 +85,9 @@ pub const CurrentMetadataState = struct {
     placement_version_fences: []const PlacementVersionFence = &.{},
     tables: []const table_manager.TableRecord = &.{},
     ranges: []const table_manager.RangeRecord = &.{},
+    /// Plan-bound hidden initial child groups from the private provisioning
+    /// projection. Never upsert these tables/ranges into the public catalog.
+    initial_fk_owner_group_ids: []const u64 = &.{},
     stores: []const table_manager.StoreRecord = &.{},
     merged_group_statuses: []const MergedGroupStatus = &.{},
     restore_progresses: []const table_manager.RestoreProgressRecord = &.{},
@@ -109,7 +112,7 @@ pub const MergedGroupStatus = struct {
     voter_count_known: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: table_manager.VoterSetFingerprint = @as([table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
     readiness_from_leader: bool = false,
@@ -180,11 +183,11 @@ const PlacementVersionFenceIndex = struct {
         return index;
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.by_placement.deinit(alloc);
     }
 
-    fn version(
+    pub fn version(
         self: *const @This(),
         group_id: u64,
         local_node_id: u64,
@@ -365,10 +368,53 @@ pub const Reconciler = struct {
         );
         const desired_ranges = try manager.listRanges(self.alloc);
         defer manager.freeRanges(self.alloc, desired_ranges);
+        var private_initial_group_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer private_initial_group_ids.deinit(self.alloc);
+        for (current.initial_fk_owner_group_ids) |group_id| {
+            if (group_id == 0 or private_initial_group_ids.contains(group_id)) return error.InvalidGenerationPublication;
+            try private_initial_group_ids.put(self.alloc, group_id, {});
+        }
+        var private_initial_table_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer private_initial_table_ids.deinit(self.alloc);
+        var private_initial_tables: std.ArrayListUnmanaged(table_manager.TableRecord) = .empty;
+        defer private_initial_tables.deinit(self.alloc);
+        var private_initial_ranges: std.ArrayListUnmanaged(table_manager.RangeRecord) = .empty;
+        defer private_initial_ranges.deinit(self.alloc);
+        var observed_private_groups: usize = 0;
+        for (current.ranges) |range| {
+            if (!private_initial_group_ids.contains(range.group_id)) continue;
+            observed_private_groups += 1;
+            if (findRangeRecord(desired_ranges, range.group_id) != null) continue;
+            const table = findTableRecord(current.tables, range.table_id) orelse return error.InvalidGenerationPublication;
+            try private_initial_ranges.append(self.alloc, range);
+            if (findTableRecord(desired_tables, table.table_id) == null and
+                !private_initial_table_ids.contains(table.table_id))
+            {
+                try private_initial_tables.append(self.alloc, table);
+                try private_initial_table_ids.put(self.alloc, table.table_id, {});
+            }
+        }
+        if (observed_private_groups != current.initial_fk_owner_group_ids.len) return error.InvalidGenerationPublication;
         const desired_splits = try manager.listDesiredSplitTransitions(self.alloc);
         defer manager.freeSplitTransitions(self.alloc, desired_splits);
         const desired_merges = try manager.listDesiredMergeTransitions(self.alloc);
         defer manager.freeMergeTransitions(self.alloc, desired_merges);
+        for (desired_splits) |*record| {
+            if (findSplitRecord(current.split_transitions, record.transition_id) == null) {
+                @import("relational_topology_admission.zig").prepare(self.alloc, &record.table_contract, current.stores) catch |err| switch (err) {
+                    error.RelationalTopologyProtocolUpgradeRequired, error.RelationalTopologyMigrationUnsupported => record.table_contract.integrity_protocol = .none,
+                    else => return err,
+                };
+            }
+        }
+        for (desired_merges) |*record| {
+            if (findMergeRecord(current.merge_transitions, record.transition_id) == null) {
+                @import("relational_topology_admission.zig").prepare(self.alloc, &record.table_contract, current.stores) catch |err| switch (err) {
+                    error.RelationalTopologyProtocolUpgradeRequired, error.RelationalTopologyMigrationUnsupported => record.table_contract.integrity_protocol = .none,
+                    else => return err,
+                };
+            }
+        }
         const split_provisioning_ranges = try allocSplitProvisioningRanges(self.alloc, desired_ranges, desired_splits);
         defer self.alloc.free(split_provisioning_ranges);
 
@@ -410,13 +456,15 @@ pub const Reconciler = struct {
         );
         defer self.alloc.free(protected_placement_groups);
         const desired_placements = if (placement_candidate_node_ids.len > 0)
-            try planner.planAllIntentsWithConstraints(
+            try planner.planAllIntentsWithPrivate(
                 manager,
                 placement_candidate_node_ids,
                 current.placement_intents,
                 candidate_domains,
                 split_provisioning_ranges,
                 protected_placement_groups,
+                private_initial_tables.items,
+                private_initial_ranges.items,
             )
         else
             try self.alloc.alloc(raft_reconciler.PlacementIntent, 0);
@@ -591,6 +639,9 @@ pub const Reconciler = struct {
         for (desired_splits) |desired| {
             const existing = findSplitRecord(current.split_transitions, desired.transition_id);
             if (existing == null) {
+                if (desired.table_contract.integrity_protocol == .none and
+                    (try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.schema_json) or
+                        try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.read_schema_json))) continue;
                 try desired.table_contract.validateForSplit();
                 const current_table = findTableRecord(
                     current.tables,
@@ -645,6 +696,9 @@ pub const Reconciler = struct {
         for (desired_merges) |desired| {
             const existing = findMergeRecord(current.merge_transitions, desired.transition_id);
             if (existing == null) {
+                if (desired.table_contract.integrity_protocol == .none and
+                    (try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.schema_json) or
+                        try @import("relational_topology_admission.zig").coordinated(self.alloc, desired.table_contract.read_schema_json))) continue;
                 desired.table_contract.validateForMerge(
                     desired.allow_doc_identity_reassignment,
                 ) catch continue;
@@ -775,6 +829,7 @@ pub const Reconciler = struct {
             }
         }
         for (current.tables) |record| {
+            if (private_initial_table_ids.contains(record.table_id)) continue;
             if (findTableRecord(desired_tables, record.table_id) == null and
                 active_transition_contracts.get(record.table_id) == null)
             {
@@ -782,6 +837,7 @@ pub const Reconciler = struct {
             }
         }
         for (current.ranges) |record| {
+            if (private_initial_group_ids.contains(record.group_id)) continue;
             if (findRangeRecord(desired_ranges, record.group_id) != null) continue;
             if (active_transition_contracts.rangeMutationFenced(record.group_id))
                 continue;
@@ -1269,7 +1325,7 @@ const AutomaticTransitions = struct {
         };
     }
 
-    fn deinit(self: *AutomaticTransitions, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *AutomaticTransitions, alloc: std.mem.Allocator) void {
         for (self.splits) |intent| freeSplitIntentOwned(alloc, intent);
         if (self.splits.len > 0) alloc.free(self.splits);
         for (self.merges) |intent| freeMergeIntentOwned(alloc, intent);
@@ -1316,8 +1372,8 @@ test "metadata reconciler detects learner membership changes" {
 }
 
 fn snapshotBootstrapEqual(
-    a: ?@import("../raft/catalog.zig").SnapshotBootstrapRecord,
-    b: ?@import("../raft/catalog.zig").SnapshotBootstrapRecord,
+    a: ?@import("../raft/storage/catalog.zig").SnapshotBootstrapRecord,
+    b: ?@import("../raft/storage/catalog.zig").SnapshotBootstrapRecord,
 ) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -1329,7 +1385,7 @@ fn snapshotBootstrapEqual(
 }
 
 test "metadata reconciler normalizes versioned snapshot uri without a new wire tag" {
-    const legacy_wire: @import("../raft/catalog.zig").SnapshotBootstrapRecord = .{
+    const legacy_wire: @import("../raft/storage/catalog.zig").SnapshotBootstrapRecord = .{
         .from_node_id = 7,
         .term = 11,
         .snapshot_id = "snap-91",
@@ -1341,8 +1397,8 @@ test "metadata reconciler normalizes versioned snapshot uri without a new wire t
 }
 
 fn backupRestoreBootstrapEqual(
-    a: ?@import("../raft/catalog.zig").BackupRestoreBootstrapRecord,
-    b: ?@import("../raft/catalog.zig").BackupRestoreBootstrapRecord,
+    a: ?@import("../raft/storage/catalog.zig").BackupRestoreBootstrapRecord,
+    b: ?@import("../raft/storage/catalog.zig").BackupRestoreBootstrapRecord,
 ) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -1425,7 +1481,7 @@ const NativeRestoreCapabilityIndex = struct {
         return index;
     }
 
-    fn deinit(self: *NativeRestoreCapabilityIndex) void {
+    pub fn deinit(self: *NativeRestoreCapabilityIndex) void {
         self.capable_store_ids.deinit(self.alloc);
         self.capable_node_ids.deinit(self.alloc);
         self.groups.deinit(self.alloc);
@@ -1645,7 +1701,7 @@ const StoreEvidenceIndex = struct {
     const PlacementTopology = struct {
         member_count: usize = 0,
         voter_count: usize = 0,
-        voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+        voter_set_fingerprint: table_manager.VoterSetFingerprint = @as([table_manager.voter_set_fingerprint_len]u8, @splat(0)),
         initialized: bool = false,
         ambiguous: bool = false,
     };
@@ -1743,7 +1799,7 @@ const StoreEvidenceIndex = struct {
         return self;
     }
 
-    fn deinit(self: *StoreEvidenceIndex) void {
+    pub fn deinit(self: *StoreEvidenceIndex) void {
         self.stores_by_id.deinit(self.alloc);
         self.stores_by_node.deinit(self.alloc);
         self.reports_by_store_group.deinit(self.alloc);
@@ -2102,7 +2158,7 @@ const MembershipTransitionIndex = struct {
         return self;
     }
 
-    fn deinit(self: *MembershipTransitionIndex) void {
+    pub fn deinit(self: *MembershipTransitionIndex) void {
         self.groups.deinit(self.alloc);
         self.desired_by_member.deinit(self.alloc);
         self.* = undefined;
@@ -2658,7 +2714,7 @@ const AutomaticPlanningIndex = struct {
         return self;
     }
 
-    fn deinit(self: *AutomaticPlanningIndex) void {
+    pub fn deinit(self: *AutomaticPlanningIndex) void {
         self.range_spans_by_table.deinit(self.alloc);
         self.table_by_group.deinit(self.alloc);
         self.active_transitions_by_table.deinit(self.alloc);
@@ -3479,6 +3535,7 @@ const ActiveTransitionContractIndex = struct {
         table_id: u64,
         table_name: []const u8,
         schema_json: []const u8,
+        read_schema_json: []const u8,
         indexes_json: []const u8,
 
         fn fromContract(
@@ -3488,6 +3545,7 @@ const ActiveTransitionContractIndex = struct {
                 .table_id = contract.table_id,
                 .table_name = contract.table_name,
                 .schema_json = contract.schema_json,
+                .read_schema_json = contract.read_schema_json,
                 .indexes_json = contract.indexes_json,
             };
         }
@@ -3496,6 +3554,7 @@ const ActiveTransitionContractIndex = struct {
             return self.table_id == other.table_id and
                 std.mem.eql(u8, self.table_name, other.table_name) and
                 std.mem.eql(u8, self.schema_json, other.schema_json) and
+                std.mem.eql(u8, self.read_schema_json, other.read_schema_json) and
                 std.mem.eql(u8, self.indexes_json, other.indexes_json);
         }
 
@@ -3506,6 +3565,7 @@ const ActiveTransitionContractIndex = struct {
             return table.table_id == self.table_id and
                 std.mem.eql(u8, table.name, self.table_name) and
                 std.mem.eql(u8, table.schema_json, self.schema_json) and
+                std.mem.eql(u8, table.read_schema_json, self.read_schema_json) and
                 std.mem.eql(u8, table.indexes_json, self.indexes_json);
         }
     };
@@ -3590,7 +3650,7 @@ const ActiveTransitionContractIndex = struct {
         return self;
     }
 
-    fn deinit(self: *ActiveTransitionContractIndex) void {
+    pub fn deinit(self: *ActiveTransitionContractIndex) void {
         self.by_table.deinit(self.alloc);
         self.table_by_group.deinit(self.alloc);
         self.range_mutation_fences.deinit(self.alloc);
@@ -3730,6 +3790,7 @@ fn tableMatchesTransitionContract(
     return table.table_id == contract.table_id and
         std.mem.eql(u8, table.name, contract.table_name) and
         std.mem.eql(u8, table.schema_json, contract.schema_json) and
+        std.mem.eql(u8, table.read_schema_json, contract.read_schema_json) and
         std.mem.eql(u8, table.indexes_json, contract.indexes_json);
 }
 
@@ -3813,7 +3874,7 @@ const SchemaMigrationReadiness = struct {
             return self.hosts != 0 and self.missing == 0;
         }
     };
-    fn deinit(self: *SchemaMigrationReadiness) void {
+    pub fn deinit(self: *SchemaMigrationReadiness) void {
         self.arena.deinit();
     }
     fn init(alloc: std.mem.Allocator, current: CurrentMetadataState, desired_tables: []const table_manager.TableRecord) !SchemaMigrationReadiness {
@@ -3853,16 +3914,7 @@ fn maybeFinalizeSchemaMigration(
 
     const state = readiness.tables.get(desired.table_id) orelse return;
     if (!state.ready()) return;
-    const target_version = state.version;
-
-    const read_version = try schemaVersion(alloc, desired.read_schema_json);
-    if (read_version != target_version) {
-        const next_indexes_json = try dropFullTextIndexForVersion(alloc, desired.indexes_json, read_version);
-        alloc.free(desired.indexes_json);
-        desired.indexes_json = next_indexes_json;
-    }
-    alloc.free(desired.read_schema_json);
-    desired.read_schema_json = try alloc.dupe(u8, "");
+    try @import("schema_migration_finalization.zig").apply(alloc, desired);
 }
 
 // Retained solely as the workload equality oracle.
@@ -3886,27 +3938,6 @@ fn schemaMigrationReadyReference(
         if (findSchemaProgress(current.schema_progresses, table_id, node_id, target_version) == null) return false;
     }
     return true;
-}
-
-fn dropFullTextIndexForVersion(
-    alloc: std.mem.Allocator,
-    indexes_json: []const u8,
-    version: u32,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |*object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    var versioned_name_buf: [64]u8 = undefined;
-    const stale_name = if (version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
-    else
-        try std.fmt.bufPrint(&versioned_name_buf, "full_text_index_v{d}", .{version});
-    _ = object.swapRemove(stale_name);
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(parsed.value, .{})});
 }
 
 fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
@@ -4042,6 +4073,9 @@ fn allocSplitProvisioningRanges(
     var out = std.ArrayListUnmanaged(table_manager.RangeRecord).empty;
     errdefer out.deinit(alloc);
     for (splits) |split| {
+        if (split.table_contract.integrity_protocol == .none and
+            (try @import("relational_topology_admission.zig").coordinated(alloc, split.table_contract.schema_json) or
+                try @import("relational_topology_admission.zig").coordinated(alloc, split.table_contract.read_schema_json))) continue;
         if (findRangeRecord(ranges, split.destination_group_id) != null) continue;
         const source = findRangeRecord(ranges, split.source_group_id) orelse continue;
         const split_key = split.split_key orelse continue;
@@ -4065,6 +4099,7 @@ fn cloneMergeRecord(alloc: std.mem.Allocator, record: transition_state.MergeTran
         owned_contract.deinitOwned(alloc);
     }
     return .{
+        .online = record.online,
         .transition_id = record.transition_id,
         .donor_group_id = record.donor_group_id,
         .receiver_group_id = record.receiver_group_id,
@@ -4088,7 +4123,7 @@ fn splitRecordsEqual(a: transition_state.SplitTransitionRecord, b: transition_st
 }
 
 fn mergeRecordsEqual(a: transition_state.MergeTransitionRecord, b: transition_state.MergeTransitionRecord) bool {
-    return a.transition_id == b.transition_id and
+    return std.meta.eql(a.online, b.online) and a.transition_id == b.transition_id and
         a.donor_group_id == b.donor_group_id and
         a.receiver_group_id == b.receiver_group_id and
         a.phase == b.phase and
@@ -4244,6 +4279,39 @@ test "metadata reconciler publishes table contracts before admitting transitions
     try std.testing.expectEqual(@as(u64, 0), admission_plan.split_admissions[0].expected_source_epoch);
     try std.testing.expectEqual(@as(usize, 0), admission_plan.split_upserts.len);
     try std.testing.expectEqual(@as(usize, 1), admission_plan.merge_upserts.len);
+}
+
+test "relational topology admission leaves unavailable transitions pending without blocking catalog work" {
+    const alloc = std.testing.allocator;
+    var manager = table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const constrained: table_manager.TableRecord = .{ .table_id = 10, .name = "rows", .schema_json = "{\"unique_constraints\":[{\"name\":\"pk\"}]}" };
+    const range: table_manager.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "" };
+    try manager.upsertTable(constrained);
+    try manager.upsertTable(.{ .table_id = 11, .name = "unrelated" });
+    try manager.upsertRange(range);
+    try manager.requestSplit(.{ .transition_id = 9001, .table_id = 10, .source_group_id = 101, .destination_group_id = 102, .split_key = "m" });
+    const requested_splits = try manager.listDesiredSplitTransitions(alloc);
+    defer manager.freeSplitTransitions(alloc, requested_splits);
+    const blocked_provisioning = try allocSplitProvisioningRanges(alloc, &.{range}, requested_splits);
+    defer alloc.free(blocked_provisioning);
+    try std.testing.expectEqual(@as(usize, 0), blocked_provisioning.len);
+    var reconciler = Reconciler.init(alloc);
+    var pending = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range} });
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), pending.split_admissions.len);
+    try std.testing.expectEqual(@as(usize, 1), pending.table_upserts.len);
+    const capable: table_manager.StoreRecord = .{ .store_id = 1, .node_id = 1, .reporter_incarnation = 8, .relational_topology_protocol_version = table_manager.relational_topology_protocol_version };
+    var ready = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{constrained}, .ranges = &.{range}, .stores = &.{capable} });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ready.split_admissions.len);
+    try std.testing.expectEqual(.distributed_quiescent_v1, ready.split_admissions[0].record.table_contract.integrity_protocol);
+    var migrating = constrained;
+    migrating.read_schema_json = "{}";
+    try manager.upsertTable(migrating);
+    var migration = try reconciler.computePlan(&manager, &.{}, &.{}, .{ .tables = &.{migrating}, .ranges = &.{range}, .stores = &.{capable} });
+    defer migration.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), migration.split_admissions.len);
 }
 
 test "metadata reconciler provisions split destination without publishing overlapping range" {
@@ -5168,6 +5236,57 @@ test "metadata reconciler forced reallocation can place replicas on newly added 
         findPlacementIntent(forced_plan.placement_upserts, 2101, 4) != null or
             findPlacementIntent(forced_plan.placement_upserts, 2102, 4) != null,
     );
+}
+
+test "hidden initial FK owner receives placement without public topology publication" {
+    const alloc = std.testing.allocator;
+    var manager = table_manager.TableManager.initProvisioning(alloc);
+    defer manager.deinit();
+    const hidden_table: table_manager.TableRecord = .{ .table_id = 701, .name = "hidden-child", .desired_replica_count = 1 };
+    const hidden_range: table_manager.RangeRecord = .{ .group_id = 1701, .table_id = 701, .start_key = "" };
+    const candidates = [_]@import("state.zig").CandidatePlacementInfo{.{ .node_id = 9, .store_id = 9, .role = "data", .failure_domain = "rack-a" }};
+    var reconciler = Reconciler.init(alloc);
+    defer reconciler.deinit();
+    var pending = try reconciler.computePlan(&manager, &.{9}, &candidates, .{
+        .tables = &.{hidden_table},
+        .ranges = &.{hidden_range},
+        .initial_fk_owner_group_ids = &.{hidden_range.group_id},
+    });
+    defer pending.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pending.placement_upserts.len);
+    try std.testing.expectEqual(hidden_range.group_id, pending.placement_upserts[0].record.group_id);
+    try std.testing.expectEqual(@as(usize, 0), pending.table_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.range_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.table_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), pending.range_removals.len);
+
+    const placed = [_]raft_reconciler.PlacementIntent{.{
+        .record = .{ .group_id = hidden_range.group_id, .replica_id = 1, .local_node_id = 9, .metadata_version = 1 },
+        .store_id = 9,
+        .peer_node_ids = &.{9},
+    }};
+    var terminal = try reconciler.computePlan(&manager, &.{9}, &candidates, .{
+        .placement_intents = &placed,
+        .placement_version_fences = &.{.{ .group_id = hidden_range.group_id, .local_node_id = 9, .version = 1 }},
+    });
+    defer terminal.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), terminal.placement_removals.len);
+    try std.testing.expectEqual(hidden_range.group_id, terminal.placement_removals[0].group_id);
+
+    // Publication transfers the same group into public topology. Existing
+    // placement remains routable; it must not be retired and reprovisioned.
+    try manager.upsertTable(hidden_table);
+    try manager.upsertRange(hidden_range);
+    var published = try reconciler.computePlan(&manager, &.{9}, &candidates, .{
+        .tables = &.{hidden_table},
+        .ranges = &.{hidden_range},
+        .placement_intents = &placed,
+        .placement_version_fences = &.{.{ .group_id = hidden_range.group_id, .local_node_id = 9, .version = 1 }},
+    });
+    defer published.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), published.placement_removals.len);
+    try std.testing.expectEqual(@as(usize, 0), published.table_upserts.len);
+    try std.testing.expectEqual(@as(usize, 0), published.range_upserts.len);
 }
 
 test "metadata reconciler serializes forced placement movement behind split provisioning" {
@@ -9650,8 +9769,8 @@ test "metadata reconciler marks restore-active placements with fetch_snapshot un
     try std.testing.expectEqual(@as(usize, 2), plan.placement_upserts.len);
     const first = findPlacementIntent(plan.placement_upserts, 4901, 1).?;
     const second = findPlacementIntent(plan.placement_upserts, 4901, 2).?;
-    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
-    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/storage/catalog.zig").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/storage/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
     try std.testing.expect(second.record.backup_restore_bootstrap != null);
     try std.testing.expectEqualStrings("snap1", second.record.backup_restore_bootstrap.?.backup_id);
     try std.testing.expectEqualStrings("file:///tmp/backups", second.record.backup_restore_bootstrap.?.location);

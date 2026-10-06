@@ -242,7 +242,7 @@ fn testVersionChain(alloc: Allocator, count: usize) !void {
     }
     try std.testing.expect(root.?.height < 2 * (std.math.log2_int(usize, count) + 1));
     for (0..count) |i| try std.testing.expectEqual(@as(u64, i + 1), Node.lookup(root, "ordered", hash, i + 1).?.source_sequence);
-    var shards = [_]std.ArrayListUnmanaged(Record){.empty} ** 4;
+    var shards = @as([4]std.ArrayListUnmanaged(Record), @splat(.empty));
     defer for (&shards) |*shard| shard.deinit(alloc);
     try Node.collectByShard(root, alloc, &shards);
     try std.testing.expectEqual(@as(usize, 1), shards[hash & 3].items.len);

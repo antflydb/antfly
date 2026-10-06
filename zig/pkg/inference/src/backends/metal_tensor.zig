@@ -38,6 +38,20 @@ pub const StorageMode = enum(c_int) {
 pub const DType = enum(u8) {
     f32 = 0,
     i32 = 1,
+    i64 = 2,
+    i8 = 3,
+    i16 = 4,
+    u8 = 5,
+    bool_ = 6,
+
+    pub fn byteSize(self: DType) usize {
+        return switch (self) {
+            .f32, .i32 => 4,
+            .i64 => 8,
+            .i16 => 2,
+            .i8, .u8, .bool_ => 1,
+        };
+    }
 };
 
 const DeviceBufferRef = struct {
@@ -81,6 +95,25 @@ pub const MemoryStats = struct {
     to_host_device_calls: u64 = 0,
 };
 
+/// Request-thread transfer audit. GPU execution is asynchronous, but all
+/// host copies/accesses enter these synchronous APIs on the dispatch thread.
+/// Independent sessions on other threads cannot contaminate these counters.
+pub const TransferAudit = struct {
+    upload_bytes: u64 = 0,
+    download_bytes: u64 = 0,
+    host_accesses: u64 = 0,
+    upload_calls: u64 = 0,
+    download_calls: u64 = 0,
+};
+threadlocal var transfer_audit: ?*TransferAudit = null;
+pub fn beginTransferAudit(audit: *TransferAudit) !void {
+    if (transfer_audit != null) return error.MetalTransferAuditAlreadyActive;
+    transfer_audit = audit;
+}
+pub fn endTransferAudit() void {
+    transfer_audit = null;
+}
+
 var memory_stats = MemoryStats{};
 var to_host_trace_count: usize = 0;
 var owned_alloc_trace_count: usize = 0;
@@ -90,10 +123,10 @@ const owned_peak_snapshot_label_len: usize = 96;
 const OwnedAllocationRecord = struct {
     handle: ?*anyopaque = null,
     bytes: usize = 0,
-    dims: [max_dims]i32 = [_]i32{0} ** max_dims,
+    dims: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     rank: u8 = 0,
     seq: u64 = 0,
-    label: [owned_peak_snapshot_label_len]u8 = [_]u8{0} ** owned_peak_snapshot_label_len,
+    label: [owned_peak_snapshot_label_len]u8 = @as([owned_peak_snapshot_label_len]u8, @splat(0)),
     label_len: u8 = 0,
     active: bool = false,
 
@@ -102,7 +135,7 @@ const OwnedAllocationRecord = struct {
     }
 };
 
-var owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
+var owned_allocation_records = @as([owned_peak_snapshot_capacity]OwnedAllocationRecord, @splat(.{}));
 var owned_allocation_next_slot: usize = 0;
 var owned_allocation_sequence: u64 = 0;
 var owned_allocation_live_record_count: usize = 0;
@@ -112,7 +145,7 @@ var owned_alloc_context: []const u8 = "";
 
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
-    const c = @cImport(@cInclude("stdlib.h"));
+    const c = std.c;
     const value = c.getenv(name) orelse return null;
     const slice = std.mem.span(value);
     if (slice.len == 0) return null;
@@ -200,11 +233,11 @@ fn noteOwnedAllocationRecord(handle: *anyopaque, byte_len: usize, dims: []const 
         owned_allocation_lost_record_count += 1;
         return;
     };
-    var dims_buf = [_]i32{0} ** max_dims;
+    var dims_buf = @as([max_dims]i32, @splat(0));
     const rank = @min(dims.len, max_dims);
     for (dims[0..rank], 0..) |dim, axis| dims_buf[axis] = dim;
     owned_allocation_sequence += 1;
-    var label_buf = [_]u8{0} ** owned_peak_snapshot_label_len;
+    var label_buf = @as([owned_peak_snapshot_label_len]u8, @splat(0));
     const label_len = copyLabel(&label_buf, owned_alloc_context);
     owned_allocation_records[idx] = .{
         .handle = handle,
@@ -249,7 +282,7 @@ fn printOwnedPeakSnapshot() void {
     if (owned_peak_snapshot_print_count >= ownedPeakSnapshotLimit()) return;
     owned_peak_snapshot_print_count += 1;
 
-    var top = [_]OwnedAllocationRecord{.{}} ** 32;
+    var top = @as([32]OwnedAllocationRecord, @splat(.{}));
     var used: usize = 0;
     var live_bytes: u64 = 0;
     for (owned_allocation_records) |record| {
@@ -375,7 +408,7 @@ pub fn resetMemoryStats() void {
     owned_allocation_lost_record_count = 0;
     owned_alloc_context = "";
     owned_allocation_recording_enabled_cache = null;
-    owned_allocation_records = [_]OwnedAllocationRecord{.{}} ** owned_peak_snapshot_capacity;
+    owned_allocation_records = @as([owned_peak_snapshot_capacity]OwnedAllocationRecord, @splat(.{}));
 }
 
 pub const DeviceStorage = struct {
@@ -429,7 +462,7 @@ extern fn termite_metal_buffer_copy(
 ) c_int;
 
 pub const MetalTensor = struct {
-    shape_buf: [max_dims]i32 = [_]i32{0} ** max_dims,
+    shape_buf: [max_dims]i32 = @as([max_dims]i32, @splat(0)),
     shape_len: u8 = 0,
     dtype: DType = .f32,
 
@@ -602,7 +635,7 @@ pub const MetalTensor = struct {
         mode: StorageMode,
         dims: []const i32,
     ) !MetalTensor {
-        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, false);
+        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, false, .f32);
     }
 
     /// Strict allocation variant: admit and allocate the ownership record
@@ -616,7 +649,17 @@ pub const MetalTensor = struct {
         mode: StorageMode,
         dims: []const i32,
     ) !MetalTensor {
-        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true);
+        return deviceAllocateChecked(allocator, runtime, byte_len, mode, dims, true, .f32);
+    }
+
+    /// Allocate physical storage without converting or narrowing the dtype.
+    pub fn deviceAllocateTyped(allocator: std.mem.Allocator, runtime: *anyopaque, dtype: DType, mode: StorageMode, dims: []const i32) !MetalTensor {
+        var count: usize = 1;
+        for (dims) |extent| {
+            if (extent < 0) return error.InvalidTensorShape;
+            count = try std.math.mul(usize, count, @intCast(extent));
+        }
+        return deviceAllocateChecked(allocator, runtime, try std.math.mul(usize, count, dtype.byteSize()), mode, dims, false, dtype);
     }
 
     fn deviceAllocateChecked(
@@ -626,14 +669,15 @@ pub const MetalTensor = struct {
         mode: StorageMode,
         dims: []const i32,
         fresh: bool,
+        dtype: DType,
     ) !MetalTensor {
-        if (dims.len > max_dims or byte_len == 0) return error.InvalidTensorShape;
+        if (dims.len > max_dims) return error.InvalidTensorShape;
         var elements: usize = 1;
         for (dims) |axis_dim| {
-            if (axis_dim <= 0) return error.InvalidTensorShape;
+            if (axis_dim < 0) return error.InvalidTensorShape;
             elements = std.math.mul(usize, elements, @intCast(axis_dim)) catch return error.InvalidTensorShape;
         }
-        if ((std.math.mul(usize, elements, 4) catch return error.InvalidTensorShape) != byte_len)
+        if ((std.math.mul(usize, elements, dtype.byteSize()) catch return error.InvalidTensorShape) != byte_len)
             return error.InvalidTensorShape;
         const ref = try allocator.create(DeviceBufferRef);
         if (comptime !@import("build_options").enable_metal) {
@@ -641,9 +685,9 @@ pub const MetalTensor = struct {
             return error.MetalUnavailable;
         }
         const handle = (if (fresh)
-            termite_metal_buffer_alloc_fresh(runtime, byte_len, @intFromEnum(mode))
+            termite_metal_buffer_alloc_fresh(runtime, @max(byte_len, 1), @backingInt(mode))
         else
-            termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode))) orelse {
+            termite_metal_buffer_alloc(runtime, @max(byte_len, 1), @backingInt(mode))) orelse {
             allocator.destroy(ref);
             return error.MetalBufferAllocFailed;
         };
@@ -656,7 +700,7 @@ pub const MetalTensor = struct {
             .release_on_drop = true,
             .allocator = allocator,
         };
-        var result = deviceView(ref, 0, byte_len, dims, .f32);
+        var result = deviceView(ref, 0, byte_len, dims, dtype);
         noteDeviceOwnedCreate(handle, byte_len, dims);
         errdefer result.deinit();
         try result.retainForActiveFrame();
@@ -671,9 +715,9 @@ pub const MetalTensor = struct {
         fresh: bool,
     ) !MetalTensor {
         const handle = (if (fresh)
-            termite_metal_buffer_alloc_fresh(runtime, byte_len, @intFromEnum(mode))
+            termite_metal_buffer_alloc_fresh(runtime, byte_len, @backingInt(mode))
         else
-            termite_metal_buffer_alloc(runtime, byte_len, @intFromEnum(mode))) orelse
+            termite_metal_buffer_alloc(runtime, byte_len, @backingInt(mode))) orelse
             return error.MetalBufferAllocFailed;
         var tensor = deviceOwned(runtime, handle, 0, byte_len, dims);
         errdefer tensor.deinit();
@@ -751,7 +795,7 @@ pub const MetalTensor = struct {
     ) !MetalTensor {
         if (self.device) |d| {
             if (byte_offset_delta + byte_len > d.byte_len) return error.InvalidTensorShape;
-            const copied = termite_metal_buffer_alloc(d.ref.runtime, byte_len, @intFromEnum(StorageMode.private)) orelse
+            const copied = termite_metal_buffer_alloc(d.ref.runtime, byte_len, @backingInt(StorageMode.private)) orelse
                 return error.MetalBufferAllocFailed;
             errdefer termite_metal_buffer_release(copied);
             if (termite_metal_buffer_copy(d.ref.runtime, d.ref.handle, d.byte_offset + byte_offset_delta, copied, 0, byte_len) != 0) {
@@ -794,10 +838,9 @@ pub const MetalTensor = struct {
         return self.shape_len;
     }
 
-    /// Element count (f32 slots). For device-only tensors this reports the
-    /// device byte length in f32 units even before a host mirror exists.
+    /// Logical element count, using the physical dtype width for device storage.
     pub fn elemCount(self: *const MetalTensor) usize {
-        if (self.device) |d| return d.byte_len / @sizeOf(f32);
+        if (self.device) |d| return d.byte_len / self.dtype.byteSize();
         return self.len;
     }
 
@@ -889,6 +932,10 @@ pub const MetalTensor = struct {
             byte_len,
         );
         if (rc != 0) return error.MetalBufferUploadFailed;
+        if (transfer_audit) |audit| {
+            audit.upload_bytes += byte_len;
+            audit.upload_calls += 1;
+        }
     }
 
     /// Explicit bounded readback into caller-owned memory. No persistent host
@@ -907,6 +954,10 @@ pub const MetalTensor = struct {
         if (termite_metal_decode_runtime_flush_active_frame(dev.ref.runtime) != 0) return error.MetalFrameSyncFailed;
         if (termite_metal_buffer_download(dev.ref.runtime, dev.ref.handle, dev.byte_offset, @ptrCast(output.ptr), dev.byte_len) != 0)
             return error.MetalBufferDownloadFailed;
+        if (transfer_audit) |audit| {
+            audit.download_bytes += output.len;
+            audit.download_calls += 1;
+        }
     }
 
     pub fn uploadBytes(self: *MetalTensor, input: []const u8) !void {
@@ -916,6 +967,10 @@ pub const MetalTensor = struct {
         self.invalidateHostMirror();
         if (termite_metal_buffer_upload(dev.ref.runtime, dev.ref.handle, dev.byte_offset, input.ptr, input.len) != 0)
             return error.MetalBufferUploadFailed;
+        if (transfer_audit) |audit| {
+            audit.upload_bytes += input.len;
+            audit.upload_calls += 1;
+        }
     }
 
     /// Return a host-backed `[]f32` view. For pure host tensors this is
@@ -923,6 +978,9 @@ pub const MetalTensor = struct {
     /// if present, otherwise aliases the Shared-storage contents pointer
     /// when available, or allocates + downloads from Private storage.
     pub fn toHostSlice(self: *MetalTensor) ![]f32 {
+        if (self.isDevice()) if (transfer_audit) |audit| {
+            audit.host_accesses += 1;
+        };
         if (self.dtype != .f32) return error.UnsupportedTensorType;
         memory_stats.to_host_calls += 1;
         if (self.device == null) return self.data[0..self.len];

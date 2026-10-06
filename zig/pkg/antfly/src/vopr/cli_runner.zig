@@ -17,8 +17,8 @@ export fn antflyVoprProcessInit() *const anyopaque {
 pub fn main(init: std.process.Init.Minimal) void {
     @disableInstrumentation();
 
-    std.testing.allocator_instance = .{};
-    defer if (std.testing.allocator_instance.deinit() == .leak) {
+    std.testing.allocator_instance = .init(std.heap.page_allocator, .{});
+    defer if (std.testing.allocator_instance.deinit() != 0) {
         std.debug.print("VOPR command leaked memory\n", .{});
         std.process.exit(1);
     };

@@ -91,7 +91,7 @@ if not args.binary:
             "zig",
             "build",
             "antfly",
-            "-Doptimize=ReleaseFast",
+            "-Doptimize=fast",
             "--prefix",
             str(prefix),
             "-j" + str(args.jobs),

@@ -24,6 +24,7 @@ pub const table = @import("table.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
+pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
@@ -72,6 +73,16 @@ pub fn isHelpArg(arg: []const u8) bool {
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "sql")) return
+    \\usage: antfly sql --statement '<SQL>' [--parameters '<JSON array>']
+    \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>]
+    \\       antfly sql --interactive [--database <name>] [--namespace <name>]
+    \\  Interactive mode accepts one statement per line; \q rolls back and exits.
+    \\  Parameters bind as typed values; quote SQL to prevent shell expansion of $1.
+    \\  Limit is a result admission cap, not an implicit SQL LIMIT. No automatic retries.
+    \\  Scope defaults use ANTFLY_DATABASE / ANTFLY_NAMESPACE or default/public.
+    \\
+    ;
     if (std.mem.eql(u8, command, "query")) return
     \\usage: antfly query --table <table> [search options]
     \\
@@ -87,6 +98,7 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\  --pruner <json>                   Result pruner configuration
     \\  --limit <n>                       Result limit
     \\  --offset <n>                      Result offset
+    \\  --wait-ready-ms <n>               Wait for this query to serve within n milliseconds
     \\
     ;
     if (std.mem.eql(u8, command, "load")) return
@@ -147,13 +159,19 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\
     ;
     if (std.mem.eql(u8, command, "agents")) return
-    \\usage: antfly agents <retrieval|query-builder> [options]
+    \\usage: antfly agents <retrieval|research|query-builder> [options]
     \\
-    \\  agents retrieval --table <table> (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
+    \\  agents retrieval [--table <table>] [--web-search-connection <name>] (--intent <text>|--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
     \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
     \\                            --max-context-tokens <n> --streaming|--no-streaming
     \\                            --classify --reasoning --generate --followup --confidence
     \\                            --max-internal-iterations <0..20> (default: 8 for intent; 0 for explicit queries)
+    \\  agents research --query <text> --generator <json> (--table <table>|--web-search-connection <name>) [options]
+    \\  agents research options: --full-text-search <query> --semantic-search <text> --indexes <names> --fields <names> --limit <n>
+    \\                           --fetch-allowed-hosts <hosts> --agent-knowledge <text> --outline <headings> --instructions <text>
+    \\                           --max-rounds <1..5> --max-sub-questions <1..8> --max-parallel <1..4> --researcher-iterations <1..20>
+    \\                           --max-llm-calls <n> --deadline-ms <ms> --verify --streaming|--no-streaming
+    \\                           --job (durable job, advanced phase by phase) | --resume-job <id>
     \\  agents query-builder --intent <text> --generator <json> [--table <table>]
     \\                       [--fields <names>] [--mode <mode>] [--max-internal-iterations <0..20>]
     \\                       [--execute] [--streaming|--no-streaming] (delegate to the retrieval workflow)
@@ -162,7 +180,15 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
-    if (std.mem.eql(u8, command, "internal")) return "usage: antfly internal metadata status\n";
+    if (std.mem.eql(u8, command, "internal")) return
+    \\usage: antfly internal metadata status
+    \\       antfly internal store-root proof --replica-root-dir <dir> --metadata-incarnation <32-char lowercase hex> --node-id <id> --store-id <id>
+    \\       antfly internal store-root enroll --file <proof.json>
+    \\       antfly internal store-root status --file <proof.json>
+    \\Generate the proof on the data node, then enroll it with a cluster-admin token.
+    \\If enroll returns an ambiguous error, check status before any manual retry.
+    \\
+    ;
     return null;
 }
 
@@ -276,6 +302,7 @@ test "cli mod compiles" {
     _ = index;
     _ = artifact;
     _ = query;
+    _ = sql;
     _ = data;
     _ = backup;
     _ = agents;

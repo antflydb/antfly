@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+pub const laya = @import("laya.zig");
 pub const tasks = @import("tasks.zig");
 pub const documents = @import("documents.zig");
 pub const adapters = @import("adapters.zig");

@@ -20,7 +20,7 @@ const Allocator = std.mem.Allocator;
 const wire = @import("packed.zig");
 const artifacts = @import("../artifacts/store.zig");
 const refs = @import("../manifest/artifact_ref.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const page_graph = @import("page_graph.zig");
 const page_store = @import("page_store.zig");
 const page_tree = @import("page_tree.zig");
@@ -57,7 +57,7 @@ const Reader = struct {
         return bytes;
     }
 
-    fn read(self: @This(), offset: u64, len: u64) ![]u8 {
+    pub fn read(self: @This(), offset: u64, len: u64) ![]u8 {
         try self.cancellation.check();
         if (offset > self.source.byte_len or len > self.source.byte_len - offset) return error.InvalidGraphSegment;
         return self.store.getVerifiedRangeAllocWithBudget(self.alloc, self.source.artifact_id, self.source.byte_len, self.source.checksum, offset, std.math.cast(usize, len) orelse return error.GraphMetricBuildBudgetExceeded, self.cancellation, self.remaining) catch |err| switch (err) {

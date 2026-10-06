@@ -12,12 +12,20 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const replication_record = @import("replication_record.zig");
+pub const replication_record = @import("../db/replication_record.zig");
+pub const metadata_effects = @import("metadata_effects.zig");
+pub const metadata_effect_chunks = @import("metadata_effect_chunks.zig");
+pub const replay_floor = @import("replay_floor.zig");
+pub const restore_owner_contract = @import("restore_owner_contract.zig");
+pub const restore_owner_registry = @import("restore_owner_registry.zig");
+pub const restore_terminal_ledger = @import("restore_terminal_ledger.zig");
 pub const replication_log = @import("replication_log.zig");
 pub const slot_store = @import("slot_store.zig");
 pub const standby = @import("standby.zig");
 pub const primary = @import("primary.zig");
 pub const session = @import("session.zig");
+pub const sync_wait = @import("sync_wait.zig");
+pub const db_commit = @import("db_commit.zig");
 pub const backup_manifest = @import("backup_manifest.zig");
 pub const seed_artifact = @import("seed_artifact.zig");
 pub const seed_namespace_control = @import("seed_namespace_control.zig");
@@ -28,7 +36,7 @@ pub const seed_materialization = @import("seed_materialization.zig");
 pub const seed_capture = @import("seed_capture.zig");
 pub const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 pub const local_generation_gc = @import("local_generation_gc.zig");
-pub const mutation_barrier = @import("mutation_barrier.zig");
+pub const mutation_barrier = @import("antfly_runtime_abi").mutation_barrier;
 pub const mutation_inventory = @import("mutation_inventory.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const status = @import("status.zig");

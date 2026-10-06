@@ -822,6 +822,108 @@ class ReleasePromotionTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "cannot move backward"):
             channel.begin_promotion(store, older, None)
 
+    def test_unpublished_abort_is_exact_and_prevents_reservation_replay(self) -> None:
+        channel = load_module("release_channel_abort_test", "release_channel_state.py")
+
+        class MemoryStore:
+            def __init__(self, document: dict) -> None:
+                self.document = document
+                self.etag = "1"
+
+            def load(self):
+                return channel.StoredState(
+                    json.loads(json.dumps(self.document)), self.etag
+                )
+
+            def compare_and_swap(self, previous, document: dict) -> None:
+                if previous.etag != self.etag:
+                    raise AssertionError("stale channel state")
+                self.document = json.loads(json.dumps(document))
+                self.etag = "2"
+
+        current = channel.release_identity("v1.2.3", COMMIT, "1" * 64)
+        pending = channel.release_identity(
+            "v1.2.4", "2" * 40, "3" * 64, container_digest=f"sha256:{'4' * 64}"
+        )
+        successor = channel.release_identity("v1.2.5", "5" * 40, "6" * 64)
+        store = MemoryStore(
+            {
+                "schema_version": 1,
+                "channel": "stable",
+                "current": current,
+                "pending": pending,
+            }
+        )
+        with self.assertRaisesRegex(SystemExit, "no exact pending identity"):
+            channel.abort_promotion(store, {**pending, "ledger_sha256": "7" * 64}, 42)
+        self.assertEqual(store.document["pending"], pending)
+        channel.abort_promotion(
+            store, pending, 42, now=datetime(2026, 9, 28, tzinfo=timezone.utc)
+        )
+        self.assertIsNone(store.document["pending"])
+        self.assertEqual(
+            store.document["aborted"],
+            [{**pending, "cancelled_run": 42, "aborted_at": "2026-09-28T00:00:00Z"}],
+        )
+        with self.assertRaisesRegex(SystemExit, "was aborted"):
+            channel.preflight_promotion(store, pending, "v1.2.3")
+        with self.assertRaisesRegex(SystemExit, "was aborted"):
+            channel.begin_promotion(store, pending, "v1.2.3")
+        channel.begin_promotion(store, successor, "v1.2.3")
+        self.assertEqual(store.document["pending"], successor)
+        self.assertEqual(store.document["aborted"][0]["tag"], "v1.2.4")
+
+    def test_unpublished_abort_requires_empty_publication_steps(self) -> None:
+        recovery = load_module("release_v024_abort_test", "abort_unpublished_v024.py")
+        run = {
+            "name": "Release promotion",
+            "status": "completed",
+            "conclusion": "cancelled",
+            "event": "workflow_run",
+            "head_sha": "9234abce4836b2c83325954eebee854ee89df2d1",
+            "run_attempt": 1,
+        }
+        jobs = [
+            {
+                "name": name,
+                "status": "completed",
+                "conclusion": "cancelled",
+                "steps": [],
+            }
+            for name in recovery.PUBLICATION_JOBS
+        ]
+        jobs.append(
+            {"name": "Reserve complete release identity", "conclusion": "success"}
+        )
+        with (
+            mock.patch.object(
+                recovery, "github_api", side_effect=[run, {"jobs": jobs}]
+            ),
+        ):
+            recovery.verify_cancelled_run("token")
+        jobs[0]["steps"] = [{"name": "possibly published"}]
+        with (
+            mock.patch.object(
+                recovery, "github_api", side_effect=[run, {"jobs": jobs}]
+            ),
+            self.assertRaisesRegex(SystemExit, "may have run"),
+        ):
+            recovery.verify_cancelled_run("token")
+
+    def test_unpublished_abort_rejects_other_active_promotions(self) -> None:
+        recovery = load_module(
+            "release_v024_abort_active_test", "abort_unpublished_v024.py"
+        )
+        with (
+            mock.patch.object(
+                recovery,
+                "github_api",
+                return_value={"workflow_runs": [{"id": 99, "status": "in_progress"}]},
+            ),
+            self.assertRaisesRegex(SystemExit, "still active"),
+        ):
+            recovery.verify_no_active_promotions("token")
+
     def test_channel_preflight_is_read_only_and_enforces_precedence(self) -> None:
         channel = load_module(
             "release_channel_preflight_test", "release_channel_state.py"

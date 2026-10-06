@@ -4,7 +4,8 @@ Antfly has separate packages for SDKs and CLI installation:
 
 - Python SDK: `antfly-sdk`
 - TypeScript SDK: `@antfly/sdk`
-- Go Antfly Lite binding: `github.com/antflydb/antfly/go/pkg/antflylite`
+- Antfly Lite bindings: Go `github.com/antflydb/antfly/go/pkg/lite`, Python
+  `antfly-lite`, Rust `antfly-lite`, and TypeScript `@antfly/lite`
 - Python CLI installer: `antfly-cli`
 - npm CLI installer: `@antfly/cli`
 
@@ -24,13 +25,14 @@ LICENSE
 ```
 
 `lib/` contains the platform-specific `libantfly` shared library. Language
-bindings that embed Lite, including the Go `antflylite` binding, link against
+bindings that embed Lite, including the Go, Python, Rust, and TypeScript Lite
+bindings, link against
 that library and include `include/antfly.h`.
 
 The Python, npm, and Homebrew CLI installer packages preserve the same Lite C
 ABI files from the native archive. Consumers that need embedded Lite can install
 one of those packages or unpack the native runtime archive, then point their
-language binding at the packaged `libantfly` library. The Go `antflylite`
+language binding at the packaged `libantfly` library. The Go `lite`
 module carries a matching header copy for standalone builds, but the release
 packages and archives also keep `include/antfly.h` available for direct C
 consumers.
@@ -149,6 +151,17 @@ and GitHub `latest` channels move only forward. An interrupted promotion leaves
 a journaled pending identity and only that exact tag, source commit,
 release-ledger digest, and container digest may resume it. A published GitHub
 release is never changed back to draft.
+
+The cancelled v0.2.4 stable promotion is a one-time exception because its
+reservation succeeded before any publication job ran. The manually dispatched
+`Abort unpublished v0.2.4 promotion` workflow checks the cancelled run, draft
+GitHub release, absent npm and PyPI versions, and unchanged stable projections.
+It also requires every other release-promotion run to be complete.
+Its apply job repeats those checks under the release storage lock after
+`release-promotion` environment approval, then conditionally clears only the
+exact v0.2.4 reservation. The journal retains an abort record that prevents
+v0.2.4 from being reserved again. Never use this workflow for a partially
+published release.
 
 Nightly recovery uses the general channel event because nightlies deliberately
 have no GitHub Release. Supply its exact source commit and ledger digest; the

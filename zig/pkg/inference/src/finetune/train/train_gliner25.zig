@@ -165,17 +165,17 @@ test "GLiNER25 training CLI redirected streaming events preserve all JSON lines"
 }
 
 test "GLiNER25 training CLI config fingerprint binds exact bytes pause and grace" {
-    const base = contractFingerprint(42, .{3} ** 32, null, 30);
+    const base = contractFingerprint(42, @splat(3), null, 30);
     const variants = [_][32]u8{
-        contractFingerprint(43, .{3} ** 32, null, 30),
-        contractFingerprint(42, .{4} ** 32, null, 30),
-        contractFingerprint(42, .{3} ** 32, 0, 30),
-        contractFingerprint(42, .{3} ** 32, 1, 30),
-        contractFingerprint(42, .{3} ** 32, null, 31),
+        contractFingerprint(43, @splat(3), null, 30),
+        contractFingerprint(42, @splat(4), null, 30),
+        contractFingerprint(42, @splat(3), 0, 30),
+        contractFingerprint(42, @splat(3), 1, 30),
+        contractFingerprint(42, @splat(3), null, 31),
     };
     for (variants, 0..) |variant, index| {
         try std.testing.expect(!std.mem.eql(u8, &base, &variant));
         for (variants[index + 1 ..]) |other| try std.testing.expect(!std.mem.eql(u8, &variant, &other));
     }
-    try std.testing.expectEqual(base, contractFingerprint(42, .{3} ** 32, null, 30));
+    try std.testing.expectEqual(base, contractFingerprint(42, @splat(3), null, 30));
 }

@@ -50,6 +50,10 @@ pub const ClientGenerator = struct {
                     needs_raw = true;
                 }
                 const op_id = op.operation_id orelse continue;
+                if (!shared.isStreamingOrBinaryResponse(op)) {
+                    const responses = try shared.successSchemas(self.arena, self.resolver, op);
+                    if (responses.len > 1) try self.generateSuccessUnion(op_id, responses);
+                }
                 const params = try shared.collectParameters(self.arena, self.resolver, path_item.parameters, op.parameters);
                 if (params.query.len > 0) {
                     try shared.generateQueryParamsStruct(self.arena, self.w, op_id, params.query);
@@ -146,7 +150,8 @@ pub const ClientGenerator = struct {
         try self.w.line("if (resp.status.code == 204 or resp.status.code == 205) return .{{ .status_code = resp.status.code, .allocator = allocator }};", .{});
         try self.w.line("if (resp.body) |body| {{", .{});
         self.w.indent();
-        try self.w.line("const parsed = std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) catch |err| {{", .{});
+        try self.w.line("const parse_result = if (comptime @typeInfo(T) == .@\"union\" and @hasDecl(T, \"parseResponse\")) T.parseResponse(allocator, resp.status.code, body) else std.json.parseFromSlice(T, allocator, body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }});", .{});
+        try self.w.line("const parsed = parse_result catch |err| {{", .{});
         self.w.indent();
         try self.w.line("return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;", .{});
         self.w.dedent();
@@ -234,7 +239,10 @@ pub const ClientGenerator = struct {
         const is_negotiated = shared.hasNegotiatedResponse(op);
 
         // Determine response type
-        const response_type = if (is_raw) null else try shared.getSuccessResponseType(self.arena, self.resolver, self.type_gen, op);
+        const response_type = if (is_raw) null else if ((try shared.successSchemas(self.arena, self.resolver, op)).len > 1)
+            try std.fmt.allocPrint(self.arena, "{s}Response", .{try naming.toTypeName(self.arena, op_id)})
+        else
+            try shared.getSuccessResponseType(self.arena, self.resolver, self.type_gen, op);
 
         // Doc comment
         if (op.summary) |summary| try self.w.docComment(summary);
@@ -328,34 +336,35 @@ pub const ClientGenerator = struct {
 
         // Make request
         const headers_expr = if (params.header.len > 0) "request_headers.items" else "self.authHeaders()";
+        const policy_options = try requestPolicyOptions(self.arena, op.client_request_policy);
         if (is_binary_request) {
             if (is_body_required) {
-                try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("var resp = try self.http.{s}(url, .{{ .body = body, .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
             } else {
                 try self.w.line("var resp = if (body) |value|", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .body = value, .headers = {s} }})", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .body = value, .headers = {s}{s} }})", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
                 try self.w.line("else", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
             }
         } else if (body_type != null) {
             if (is_body_required) {
-                try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("var resp = try self.http.{s}(url, .{{ .json = json_body, .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
             } else {
                 try self.w.line("var resp = if (json_body) |value|", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .json = value, .headers = {s} }})", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .json = value, .headers = {s}{s} }})", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
                 try self.w.line("else", .{});
                 self.w.indent();
-                try self.w.line("try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+                try self.w.line("try self.http.{s}(url, .{{ .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
                 self.w.dedent();
             }
         } else {
-            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = {s} }});", .{ http_method, headers_expr });
+            try self.w.line("var resp = try self.http.{s}(url, .{{ .headers = {s}{s} }});", .{ http_method, headers_expr, policy_options });
         }
 
         // Return response
@@ -374,6 +383,42 @@ pub const ClientGenerator = struct {
     }
 
     /// Generate query parameter append code.
+    fn generateSuccessUnion(self: *ClientGenerator, op_id: []const u8, responses: []const shared.SuccessSchema) !void {
+        try self.w.line("/// Success payload selected by HTTP status, never by trial-decoding another status's schema.", .{});
+        try self.w.line("pub const {s}Response = union(enum) {{", .{try naming.toTypeName(self.arena, op_id)});
+        self.w.indent();
+        for (responses) |response| {
+            try self.w.line("status_{s}: {s},", .{ response.code, try shared.successSchemaType(self.arena, self.type_gen, op_id, response) });
+        }
+        try self.w.line("pub fn parseResponse(allocator: std.mem.Allocator, status: u16, body: []const u8) !std.json.Parsed(@This()) {{", .{});
+        self.w.indent();
+        try self.w.line("const arena = try allocator.create(std.heap.ArenaAllocator);", .{});
+        try self.w.line("errdefer allocator.destroy(arena);", .{});
+        try self.w.line("arena.* = std.heap.ArenaAllocator.init(allocator);", .{});
+        try self.w.line("errdefer arena.deinit();", .{});
+        try self.w.line("const value: @This() = switch (status) {{", .{});
+        self.w.indent();
+        var wildcard: ?shared.SuccessSchema = null;
+        for (responses) |response| {
+            if (std.mem.eql(u8, response.code, "2XX")) {
+                wildcard = response;
+                continue;
+            }
+            try self.w.line("{s} => .{{ .status_{s} = try std.json.parseFromSliceLeaky({s}, arena.allocator(), body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) }},", .{ response.code, response.code, try shared.successSchemaType(self.arena, self.type_gen, op_id, response) });
+        }
+        if (wildcard) |response| {
+            try self.w.line("else => if (status >= 200 and status < 300) .{{ .status_2XX = try std.json.parseFromSliceLeaky({s}, arena.allocator(), body, .{{ .allocate = .alloc_always, .ignore_unknown_fields = true }}) }} else return error.InvalidApiResponse,", .{try shared.successSchemaType(self.arena, self.type_gen, op_id, response)});
+        } else try self.w.line("else => return error.InvalidApiResponse,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.line("return .{{ .arena = arena, .value = value }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.blank();
+    }
+
     fn generateQueryParamAppend(self: *ClientGenerator, query_params: []const types.Parameter) !void {
         try self.w.line("var query_buf = std.ArrayListUnmanaged(u8).empty;", .{});
         try self.w.line("defer query_buf.deinit(self.allocator);", .{});
@@ -488,6 +533,45 @@ fn methodBody(generated: []const u8, signature: []const u8) []const u8 {
 fn encodedPathParamName(allocator: Allocator, name: []const u8) ![]u8 {
     const prefixed = try std.fmt.allocPrint(allocator, "encoded_{s}", .{name});
     return naming.zigFieldName(allocator, prefixed);
+}
+
+fn requestPolicyOptions(arena: Allocator, policy: ?types.ClientRequestPolicy) ![]const u8 {
+    const value = policy orelse return "";
+    var rendered = std.Io.Writer.Allocating.init(arena);
+    defer rendered.deinit();
+    if (value.max_retries) |limit| try rendered.writer.print(", .max_retries = {d}", .{limit});
+    if (value.follow_redirects) |allowed| try rendered.writer.print(", .follow_redirects = {}", .{allowed});
+    if (value.cookies_enabled) |allowed| try rendered.writer.print(", .cookies_enabled = {}", .{allowed});
+    if (value.max_response_size) |limit| try rendered.writer.print(", .max_response_size = {d}", .{limit});
+    return rendered.toOwnedSlice();
+}
+
+test "client operation policy disables replay independent of operation name and body shape" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var doc = types.OpenApiDoc{ .openapi = "3.0.3", .info = .{ .title = "Test", .version = "1.0" } };
+    const policy: types.ClientRequestPolicy = .{ .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216 };
+    for ([_][]const u8{ "application/json", "application/octet-stream" }, 0..) |mime, i| {
+        var content = std.StringArrayHashMapUnmanaged(types.MediaType){};
+        try content.put(arena, mime, .{ .schema = .{ .schema = .{ .schema_type = .{ .single = "string" } } } });
+        for ([_]bool{ false, true }) |required| {
+            const name = try std.fmt.allocPrint(arena, "body{d}{}", .{ i, required });
+            const path = try std.fmt.allocPrint(arena, "/{s}", .{name});
+            try doc.paths.put(arena, path, .{ .post = .{ .operation_id = name, .request_body = .{ .request_body = .{ .required = required, .content = content } }, .client_request_policy = policy } });
+        }
+    }
+    try doc.paths.put(arena, "/no-body", .{ .post = .{ .operation_id = "withoutBody", .client_request_policy = policy } });
+    try doc.paths.put(arena, "/ambient", .{ .get = .{ .operation_id = "ambient" } });
+    var resolver = Resolver.init(arena, &doc);
+    var writer = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &writer, &resolver);
+    var generator = ClientGenerator.init(arena, &writer, &resolver, &type_gen);
+    try generator.generate(&doc);
+    // Each optional body has two branches; all seven calls must be bounded.
+    const suffix = ".max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .max_response_size = 16777216";
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(u8, writer.toSlice(), suffix));
+    try std.testing.expect(std.mem.indexOf(u8, writer.toSlice(), "self.http.get(url, .{ .headers = self.authHeaders() });") != null);
 }
 
 fn encodedQueryParamValueName(allocator: Allocator, field_name: []const u8) ![]u8 {

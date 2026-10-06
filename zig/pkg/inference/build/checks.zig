@@ -30,16 +30,12 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_codegen_main.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
         }),
     });
     const quant_kernel_codegen_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
-    if (ctx.args) |args| {
-        quant_kernel_codegen_check.addArgs(args);
-    } else {
-        quant_kernel_codegen_check.addArg("--check");
-    }
+    quant_kernel_codegen_check.addPassthruArgs();
     const quant_kernel_codegen_test_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
     quant_kernel_codegen_test_check.addArg("--check");
     return .{
@@ -66,7 +62,8 @@ pub fn createMetalRuntimeTests(ctx: Context) CreateMetalRuntimeTestsResult {
         .filters = &.{"quant kernel metal runtime"},
     });
     const run_quant_kernel_metal_runtime_check_tests = ctx.addRunArtifact(quant_kernel_metal_runtime_check_tests);
-    run_quant_kernel_metal_runtime_check_tests.step.max_rss = 64 * 1024 * 1024;
+    // The ReleaseFast source-validation test peaks at 103 MB on macOS arm64.
+    run_quant_kernel_metal_runtime_check_tests.step.max_rss = 128 * 1024 * 1024;
     return .{
         .run_quant_kernel_metal_runtime_check_tests = run_quant_kernel_metal_runtime_check_tests,
     };

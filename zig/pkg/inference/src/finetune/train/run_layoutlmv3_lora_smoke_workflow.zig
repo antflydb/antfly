@@ -91,9 +91,9 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(training_report_path);
     const run_status_path = try std.fs.path.join(allocator, &.{ output_root, "run_status.json" });
     defer allocator.free(run_status_path);
-    try compat.cwd().createDirPath(compat.io(), output_root);
+    try std.Io.Dir.cwd().createDirPath(init.io, output_root);
 
-    try artifact_writer.writeJsonFile(allocator, training_config_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, training_config_path, .{
         .contract_version = run_contract.training_config_version,
         .artifact_family_version = finetune.artifact_family_version,
         .task = "layoutlmv3_lora_smoke_workflow",
@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
             .layer_name = layer_name,
         },
     });
-    try artifact_writer.writeJsonFile(allocator, run_status_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, run_status_path, .{
         .contract_version = run_contract.run_status_version,
         .status = "running",
         .task = "layoutlmv3_lora_smoke_workflow",
@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
             .final = materialized_dir,
         },
     });
-    errdefer artifact_writer.writeJsonFile(allocator, run_status_path, .{
+    errdefer artifact_writer.writeJsonFile(allocator, init.io, run_status_path, .{
         .contract_version = run_contract.run_status_version,
         .status = "failed",
         .task = "layoutlmv3_lora_smoke_workflow",
@@ -197,7 +197,7 @@ pub fn main(init: std.process.Init) !void {
 
         var bundle = try finetune.loadLoRABundle(allocator, base_model_dir, bootstrap_dir);
         defer bundle.deinit();
-        maybe_sequence = try finetune.trainEvalSequenceLoRABundle(allocator, &bundle, train_examples, val_examples, label_vocab, trained_dir, .{
+        maybe_sequence = try finetune.trainEvalSequenceLoRABundle(allocator, init.io, &bundle, train_examples, val_examples, label_vocab, trained_dir, .{
             .max_train_examples = max_train_examples,
             .max_val_examples = max_val_examples,
             .epochs = epochs,
@@ -215,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
 
         var bundle = try finetune.loadLoRABundle(allocator, base_model_dir, bootstrap_dir);
         defer bundle.deinit();
-        maybe_token = try finetune.trainEvalTokenLoRABundle(allocator, &bundle, train_examples, val_examples, label_vocab, trained_dir, .{
+        maybe_token = try finetune.trainEvalTokenLoRABundle(allocator, init.io, &bundle, train_examples, val_examples, label_vocab, trained_dir, .{
             .max_train_examples = max_train_examples,
             .max_val_examples = max_val_examples,
             .epochs = epochs,
@@ -265,14 +265,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer freeWorkflowSummary(allocator, &summary);
 
-    try artifact_writer.writeJsonFile(allocator, workflow_report_path, summary);
-    try artifact_writer.writeJsonFile(allocator, training_report_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, workflow_report_path, summary);
+    try artifact_writer.writeJsonFile(allocator, init.io, training_report_path, .{
         .contract_version = run_contract.training_report_version,
         .artifact_family_version = finetune.artifact_family_version,
         .task = "layoutlmv3_lora_smoke_workflow",
         .summary = summary,
     });
-    try artifact_writer.writeJsonFile(allocator, run_status_path, .{
+    try artifact_writer.writeJsonFile(allocator, init.io, run_status_path, .{
         .contract_version = run_contract.run_status_version,
         .status = "completed",
         .task = "layoutlmv3_lora_smoke_workflow",

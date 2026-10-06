@@ -42,9 +42,12 @@ pub const SnapshotRef = struct {
 pub const SchemaField = struct {
     id: i32,
     name: []u8,
+    type_name: []u8 = &.{},
+    required: bool = false,
 
     pub fn deinit(self: *SchemaField, alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.type_name.len != 0) alloc.free(self.type_name);
         self.* = undefined;
     }
 };
@@ -201,10 +204,10 @@ pub fn parseMetadataPlanAlloc(
         if (requested_snapshot_id != null) return error.IcebergSnapshotMismatch;
         return error.InvalidIcebergMetadata;
     };
-    const got_schema_id = target_schema_id orelse if (target_is_table_current)
-        table_current_schema_id orelse return error.InvalidIcebergMetadata
+    const got_schema_id = if (requested_snapshot_id == null)
+        table_current_schema_id orelse target_schema_id orelse return error.InvalidIcebergMetadata
     else
-        return error.InvalidIcebergMetadata;
+        target_schema_id orelse if (target_is_table_current) table_current_schema_id orelse return error.InvalidIcebergMetadata else return error.InvalidIcebergMetadata;
     const metadata_uri_copy = try alloc.dupe(u8, metadata_uri);
     errdefer alloc.free(metadata_uri_copy);
     const table_uuid_copy = try alloc.dupe(u8, table_uuid);
@@ -278,7 +281,7 @@ fn snapshotIdStringAlloc(alloc: Allocator, snapshot_id: i64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{d}", .{snapshot_id});
 }
 
-fn schemaFingerprintAlloc(
+pub fn schemaFingerprintAlloc(
     alloc: Allocator,
     root: std.json.ObjectMap,
     schema_id: i64,
@@ -315,7 +318,7 @@ fn schemaValueForId(schemas_value: std.json.Value, schema_id: i64) !std.json.Val
     return found orelse error.InvalidIcebergMetadata;
 }
 
-fn schemaFieldsForIdAlloc(
+pub fn schemaFieldsForIdAlloc(
     alloc: Allocator,
     root: std.json.ObjectMap,
     schema_id: i64,
@@ -345,10 +348,10 @@ fn schemaFieldsForIdAlloc(
         };
         const field_id_i64 = try requiredI64(field_object, "id");
         const field_id = std.math.cast(i32, field_id_i64) orelse return error.InvalidIcebergMetadata;
-        fields[idx] = .{
-            .id = field_id,
-            .name = try alloc.dupe(u8, try requiredString(field_object, "name")),
-        };
+        const name = try alloc.dupe(u8, try requiredString(field_object, "name"));
+        errdefer alloc.free(name);
+        const type_name = try alloc.dupe(u8, try requiredString(field_object, "type"));
+        fields[idx] = .{ .id = field_id, .name = name, .type_name = type_name, .required = try requiredBool(field_object, "required") };
         initialized += 1;
     }
 

@@ -8,6 +8,7 @@
 //! caller's lease, even when a waiting capture has closed reader admission.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 
 pub const SnapshotAdmission = struct {
@@ -80,6 +81,14 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Distributed capture never waits for another owner while retaining a
+    /// partial set of fences. The coordinator releases all acquired leases
+    /// before parking/retrying when any owner cannot admit capture immediately.
+    pub fn tryAcquireCapture(self: *@This()) ?CaptureLease {
+        if (!self.lock.tryLockExclusive()) return null;
+        return .{ .admission = self };
+    }
+
     pub fn acquireCaptureIo(self: *@This(), io: std.Io, cancellation: anytype) !CaptureLease {
         try self.lock.lockExclusiveIo(io, cancellation);
         return .{ .admission = self };
@@ -108,7 +117,7 @@ test "storage.db snapshot admission capture explicitly lends maintenance permiss
     try std.testing.expect(!admission.lock.tryLockShared());
 }
 
-const AdmissionVoprHarness = struct {
+const AdmissionVoprHarness = if (builtin.is_test) struct {
     const vopr = @import("vopr");
     runtime: *vopr.vopr_io.VoprIo,
 
@@ -143,7 +152,7 @@ const AdmissionVoprHarness = struct {
         }
         return error.AdmissionTasksDidNotComplete;
     }
-};
+} else struct {};
 
 test "storage.db snapshot admission VOPR capture excludes another task and cancellation retires its waiter" {
     const Work = struct {

@@ -67,6 +67,7 @@ type ExtractionV2Response struct {
 	} `json:"usage"`
 }
 type ExtractionV2Object struct {
+	Decisions         []oapi.ExtractionDecision                  `json:"decisions,omitempty"`
 	ID                *string                                    `json:"id,omitempty"`
 	OffsetUnit        oapi.ExtractionOffsetUnit                  `json:"offset_unit"`
 	Entities          []ExtractionV2Entity                       `json:"entities,omitempty"`

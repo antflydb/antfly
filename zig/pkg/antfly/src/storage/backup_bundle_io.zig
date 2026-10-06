@@ -23,7 +23,7 @@
 const std = @import("std");
 const backup_codec = @import("backup_codec.zig");
 const bundle = @import("backup_bundle.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const native_backup = @import("db/native_backup.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -36,7 +36,7 @@ const SourceFile = struct {
     sha256_hex: [Sha256.digest_length * 2]u8,
     stat: std.Io.File.Stat,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.logical_path);
         self.* = undefined;
     }
@@ -57,7 +57,7 @@ const NativeDigestInventory = struct {
 
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         var keys = self.entries.keyIterator();
         while (keys.next()) |key| alloc.free(key.*);
         self.entries.deinit(alloc);
@@ -98,7 +98,7 @@ const CountingOutput = struct {
 };
 
 pub const PackOptions = struct {
-    header_backup_id: [16]u8 = [_]u8{0} ** 16,
+    header_backup_id: [16]u8 = @as([16]u8, @splat(0)),
     backup_id: []const u8 = "",
     table_name: []const u8 = "",
     created_at_unix_ns: i64 = 0,

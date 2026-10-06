@@ -120,7 +120,7 @@ class CudaContractTests(unittest.TestCase):
             "dtype": "float32",
             "threads": 1,
             "qualification": False,
-            "build_mode": "ReleaseFast",
+            "build_mode": "fast",
             "scheduler": "serial_io",
             "cases_sha256": "hash",
             "backend": "native",

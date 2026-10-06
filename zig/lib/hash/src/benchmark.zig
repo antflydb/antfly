@@ -19,7 +19,7 @@ const crc64 = @import("crc64.zig");
 const adler = @import("adler32.zig");
 
 test "checksum throughput microbenchmark" {
-    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+    if (builtin.mode != .fast) return error.SkipZigTest;
     const bytes = try std.testing.allocator.alloc(u8, 1024 * 1024);
     defer std.testing.allocator.free(bytes);
     var random = std.Random.DefaultPrng.init(0x593);
@@ -29,7 +29,7 @@ test "checksum throughput microbenchmark" {
     });
     inline for (.{
         .{ "crc32", std.hash.Crc32, crc32.Crc32 },
-        .{ "crc32c", std.hash.crc.Crc32Iscsi, crc32.Crc32c },
+        .{ "crc32c", std.hash.crc.@"CRC-32/ISCSI", crc32.Crc32c },
         .{ "crc64nvme", crc64.Oracle, crc64.Crc64Nvme },
         .{ "adler32", std.hash.Adler32, adler.Adler32 },
     }) |case| {

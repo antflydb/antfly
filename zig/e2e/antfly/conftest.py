@@ -48,10 +48,11 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
 
 import pytest
@@ -144,6 +145,7 @@ def annotate_metadata_table_names(
 
 
 E2E_BACKUP_CONNECTION = "e2e-backups"
+AUTH_BOOTSTRAP_PASSWORD = "e2e-bootstrap-password"
 ANTFLY_PUBLIC_API_ROOT = "/db/v1"
 ANTFLY_INTERNAL_API_ROOT = "/internal/v1"
 INFERENCE_PUBLIC_API_ROOT = "/ai/v1"
@@ -166,6 +168,11 @@ os.environ.setdefault(
     "antfly-e2e-dedicated-internal-service-secret-v1",
 )
 os.environ.setdefault("ANTFLY_INTERNAL_SERVICE_ISSUER", "antfly-e2e")
+os.environ.setdefault(
+    "ANTFLY_SETTING_AUTHORITY_SECRET",
+    "antfly-e2e-setting-authority-secret-v1",
+)
+os.environ.setdefault("ANTFLY_SETTING_AUTHORITY_ISSUER", "antfly-e2e")
 
 
 def internal_service_headers() -> dict[str, str]:
@@ -322,15 +329,21 @@ def wait_for_server(
     *,
     allow_unauthorized: bool = False,
     processes: list[tuple[str, subprocess.Popen[Any]]] | None = None,
+    listener_ready: Callable[[], bool] | None = None,
 ) -> bool:
     deadline = time.monotonic() + timeout
     consecutive_successes = 0
     while time.monotonic() < deadline:
         if _dead_process_statuses(processes):
             return False
+        if listener_ready is not None and not listener_ready():
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+            continue
         try:
             request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
             resp = requests.get(f"{url}{path}", timeout=request_timeout)
+            if _dead_process_statuses(processes):
+                return False
             if resp.ok:
                 consecutive_successes += 1
                 if consecutive_successes >= 2:
@@ -719,7 +732,8 @@ def _wait_for_restore_job(
             )
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f"restore job {job_id} did not complete within {timeout_s}s: {job}"
+                f"restore job {job_id} did not complete within {timeout_s}s: {job}\n"
+                f"{_bounded_failure_log_tail(debug_logs()) if debug_logs else ''}"
             )
         time.sleep(0.1)
 
@@ -808,6 +822,13 @@ def _server_processes(server_ref: Any) -> list[tuple[str, subprocess.Popen[Any]]
     return processes
 
 
+def _log_contains_since(path: Path, offset: int, message: str) -> bool:
+    """Read only this process incarnation's startup output."""
+    with path.open("rb") as log:
+        log.seek(offset)
+        return message.encode() in log.read()
+
+
 def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     if not path.exists():
         return ""
@@ -817,12 +838,25 @@ def _read_log_tail(path: Path, *, limit: int = 200000) -> str:
     return data[-limit:]
 
 
-def _write_remote_content_e2e_config(root: Path) -> Path:
+def _write_remote_content_e2e_config(
+    root: Path, *, pgwire_port: int | None = None
+) -> Path:
     config_path = root / "antfly-e2e.json"
     config_path.write_text(
         json.dumps(
             {
                 "remote_content": {"security": {"block_private_ips": False}},
+                **(
+                    {
+                        "pgwire": {
+                            "enabled": True,
+                            "bind_host": "127.0.0.1",
+                            "bind_port": pgwire_port,
+                        }
+                    }
+                    if pgwire_port is not None
+                    else {}
+                ),
                 "connections": {
                     E2E_BACKUP_CONNECTION: {
                         "kind": "external_io",
@@ -879,7 +913,7 @@ class AntflyServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Server failed to start at {self.url}\n{out}")
@@ -935,7 +969,7 @@ class PublicAntflyServer:
         except BaseException:
             self.stop()
             raise
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(
@@ -973,7 +1007,7 @@ class PublicAntflyServer:
                 cwd=self.root,
             ),
         )
-        if not wait_for_server(self.url):
+        if not wait_for_server(self.url, processes=[("server", self.proc)]):
             out = _read_log_tail(self.log_path)
             self.stop()
             raise RuntimeError(
@@ -1044,13 +1078,13 @@ def _legacy_stateful_command(
 
 
 def _standalone_stateful_command(
-    binary: str, *, host: str, port: int, root: Path
+    binary: str, *, host: str, port: int, root: Path, pgwire_port: int | None = None
 ) -> list[str]:
     return [
         binary,
         "standalone",
         "--config",
-        str(_write_remote_content_e2e_config(root)),
+        str(_write_remote_content_e2e_config(root, pgwire_port=pgwire_port)),
         "--host",
         host,
         "--port",
@@ -1238,6 +1272,14 @@ class StatefulAntflyServer:
             (self.port, self.data_raft_port),
             lambda: subprocess.Popen(
                 data_command,
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.auth_enabled
+                    else None
+                ),
                 stdout=self.data_log_file,
                 stderr=subprocess.STDOUT,
                 cwd=self.root,
@@ -1338,7 +1380,7 @@ def require_standalone_storage_headroom(root: Path) -> None:
 
 
 class StandaloneAntflyServer:
-    def __init__(self, binary: str, host: str, port: int):
+    def __init__(self, binary: str, host: str, port: int, *, pgwire: bool = False):
         self.binary = binary
         self.host = host
         with ExitStack() as setup:
@@ -1346,6 +1388,7 @@ class StandaloneAntflyServer:
             setup.callback(self.port_reservations.close)
             port = self.port_reservations.reserve_requested(port)
             self.port = port
+            self.pgwire_port = self.port_reservations.reserve() if pgwire else None
             self.url = f"http://{host}:{port}"
             self.api_url = antfly_public_api_url(self.url, binary=binary)
             self.tempdir = tempfile.TemporaryDirectory(
@@ -1369,21 +1412,45 @@ class StandaloneAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
+        log_start = self.log_path.stat().st_size
         command = _standalone_stateful_command(
-            self.binary, host=self.host, port=self.port, root=self.root
+            self.binary,
+            host=self.host,
+            port=self.port,
+            root=self.root,
+            pgwire_port=self.pgwire_port,
         )
+        if self.pgwire_port is not None:
+            command.extend(["--auth", "true"])
         self.proc = self.port_reservations.handoff_to(
-            (self.port,),
+            (self.port,) if self.pgwire_port is None else (self.port, self.pgwire_port),
             lambda: subprocess.Popen(
                 command,
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if self.pgwire_port is not None
+                    else None
+                ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,
                 cwd=self.root,
             ),
         )
-        if not wait_for_server(self.api_url):
-            self.stop()
+        if not wait_for_server(
+            self.api_url,
+            allow_unauthorized=self.pgwire_port is not None,
+            processes=[("server", self.proc)],
+            listener_ready=lambda: _log_contains_since(
+                self.log_path,
+                log_start,
+                f"standalone public api listening on {self.url}",
+            ),
+        ):
             out = _read_log_tail(self.log_path)
+            self.stop()
             raise RuntimeError(
                 f"Standalone API server failed to start at {self.api_url}\n{out}"
             )
@@ -1427,6 +1494,8 @@ class StandaloneAntflyServer:
     def pause(self) -> None:
         self._stop_process()
         self.port_reservations.ensure_reserved(self.port)
+        if self.pgwire_port is not None:
+            self.port_reservations.ensure_reserved(self.pgwire_port)
 
     def resume(self) -> None:
         self._start_process(truncate_logs=False)
@@ -1801,19 +1870,32 @@ class OpenAiEmbeddingServer:
         response_delay_s: float = 0.0,
         rate_limit_after_requests: int | None = None,
     ):
-        port = find_free_port()
-        self.url = f"http://{host}:{port}"
         self.response_delay_s = response_delay_s
         self.rate_limit_after_requests = rate_limit_after_requests
         self.rate_limit_input_substring: str | None = None
         self._request_count = 0
         self._request_lock = threading.Lock()
+        self._accepted_requests = 0
+        self._completed_requests = 0
+        self._active_requests: dict[int, float] = {}
         self._allow_rate_limited_requests = threading.Event()
 
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:  # noqa: N802
+                with outer._request_lock:
+                    outer._accepted_requests += 1
+                    request_id = outer._accepted_requests
+                    outer._active_requests[request_id] = time.monotonic()
+                try:
+                    self._embedding_response()
+                finally:
+                    with outer._request_lock:
+                        outer._active_requests.pop(request_id, None)
+                        outer._completed_requests += 1
+
+            def _embedding_response(self) -> None:
                 if self.path != "/v1/embeddings":
                     self.send_error(404)
                     return
@@ -1894,7 +1976,8 @@ class OpenAiEmbeddingServer:
                 _ = format
                 _ = args
 
-        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server = ThreadingHTTPServer((host, 0), Handler)
+        self.url = f"http://{host}:{self._server.server_port}"
         self._thread = start_http_server(self._server)
         if not wait_for_listener(self.url):
             raise RuntimeError(f"OpenAI embedding server failed to start at {self.url}")
@@ -1925,6 +2008,20 @@ class OpenAiEmbeddingServer:
 
     def allow_rate_limited_requests(self) -> None:
         self._allow_rate_limited_requests.set()
+
+    def stats(self) -> dict[str, object]:
+        with self._request_lock:
+            now = time.monotonic()
+            return {
+                "accepted_requests": self._accepted_requests,
+                "decoded_requests": self._request_count,
+                "completed_requests": self._completed_requests,
+                "active_request_ages_s": [
+                    round(now - started, 3)
+                    for started in self._active_requests.values()
+                ],
+                "rate_limit_after_requests": self.rate_limit_after_requests,
+            }
 
     def stop(self) -> None:
         self.allow_rate_limited_requests()
@@ -3181,7 +3278,12 @@ def stateful_api(request: pytest.FixtureRequest):
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3190,6 +3292,8 @@ def stateful_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(
@@ -3607,9 +3711,11 @@ def backup_api(request: pytest.FixtureRequest):
             # snapshots preserve source-vector reference closure.
             payload: dict[str, object] = {
                 "num_shards": num_shards,
-                "storage": storage
-                if storage is not None
-                else {"dense_embeddings": "primary_lsm"},
+                "storage": (
+                    storage
+                    if storage is not None
+                    else {"dense_embeddings": "primary_lsm"}
+                ),
             }
             if description is not None:
                 payload["description"] = description
@@ -3807,7 +3913,12 @@ def backup_api(request: pytest.FixtureRequest):
                 self._raise_request_error(err)
 
         def cluster_backup(
-            self, *, backup_id: str, location: str, table_names: list[str] | None = None
+            self,
+            *,
+            backup_id: str,
+            location: str,
+            table_names: list[str] | None = None,
+            backup_format: str | None = None,
         ) -> dict:
             payload: dict[str, object] = {
                 "backup_id": backup_id,
@@ -3816,6 +3927,8 @@ def backup_api(request: pytest.FixtureRequest):
             }
             if table_names is not None:
                 payload["table_names"] = table_names
+            if backup_format is not None:
+                payload["format"] = backup_format
             try:
                 with self._request_lock:
                     return self._check(

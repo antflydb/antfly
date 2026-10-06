@@ -13,6 +13,8 @@
 // limitations under the License.
 
 pub const lora = @import("lora.zig");
+pub const laya_job = @import("laya/job.zig");
+pub const laya_evaluate = @import("laya/evaluate.zig");
 pub const command_registry = @import("command_registry.zig");
 pub const peft = @import("peft.zig");
 pub const graph_bridge = @import("graph_bridge.zig");
@@ -30,6 +32,8 @@ pub const gliner_boundary_peft_graph = @import("gliner/boundary_peft_graph.zig")
 pub const gliner_boundary_adapter = @import("gliner/boundary_adapter.zig");
 pub const gliner_boundary_adapter_layout = @import("gliner/boundary_adapter_layout.zig");
 pub const gliner_boundary_train_step = @import("gliner/boundary_train_step.zig");
+pub const gliner_boundary_distillation = @import("gliner/boundary_distillation.zig");
+pub const gliner_boundary_distillation_fit = @import("gliner/boundary_distillation_fit.zig");
 pub const gliner2_data = @import("gliner2_data.zig");
 pub const gliner2_run_validation = @import("gliner2_run_validation.zig");
 pub const gliner2_boundary = @import("gliner2_boundary.zig");
@@ -68,6 +72,7 @@ pub const fused_chunker_splade = @import("fused_chunker_splade.zig");
 pub const fused_chunker_train = @import("fused_chunker_train.zig");
 pub const preference_loss = @import("preference_loss.zig");
 pub const preference_harness = @import("preference_harness.zig");
+pub const preference_optimizer = @import("preference_optimizer.zig");
 pub const grpo = @import("grpo.zig");
 pub const lora_adapter_set = @import("lora_adapter_set.zig");
 pub const tokenizer_batch = @import("tokenizer_batch.zig");
@@ -95,6 +100,8 @@ test {
     _ = @import("seeded_device_transaction.zig");
     _ = @import("gliner/boundary_training_backend_test.zig");
     _ = gliner_boundary_targets;
+    _ = gliner_boundary_distillation;
+    _ = gliner_boundary_distillation_fit;
     _ = gliner_boundary_selection;
     _ = gliner_boundary_matching;
     _ = gliner_boundary_record_loss;
@@ -106,6 +113,7 @@ test {
     _ = gliner_boundary_adapter_layout;
     _ = gliner_boundary_train_step;
     _ = @import("gliner/boundary_train_step_test.zig");
+    _ = @import("gliner/boundary_modernbert_test.zig");
     _ = gliner2_data;
     _ = gliner2_run_validation;
     _ = gliner2_boundary;
@@ -148,6 +156,7 @@ test {
     _ = fused_chunker_train;
     _ = preference_loss;
     _ = preference_harness;
+    _ = preference_optimizer;
     _ = grpo;
     _ = lora_adapter_set;
     _ = tokenizer_batch;

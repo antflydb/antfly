@@ -30,6 +30,7 @@ class TestRunnerSelection(unittest.TestCase):
             'test "timed body" { try std.testing.io.sleep(.fromMilliseconds(20), .awake); }\n'
             'test "progress body" { try std.testing.io.sleep(.fromSeconds(2), .awake); }\n'
             'test "error logging" { std.log.err("visible error", .{}); }\n'
+            'test "environment unavailable" { return error.SkipZigTest; }\n'
         )
         cls.binary = root / "tests"
         subprocess.run(
@@ -63,6 +64,54 @@ class TestRunnerSelection(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_required_execution_rejects_skips_but_inventory_still_lists(self):
+        for required, expected in ((False, 0), (True, 1)):
+            args = [str(self.binary), "--test-filter", "environment unavailable"]
+            if required:
+                args.append("--require-no-skips")
+            result = subprocess.run(args, text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertIn("1 skipped", result.stderr)
+        result = subprocess.run(
+            args + ["--list-tests", "--timeout-ms=1"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("TEST\tselection.test.environment unavailable", result.stderr)
+        result = subprocess.run(
+            [
+                str(self.binary),
+                "--test-filter",
+                "does not exist",
+                "--allow-empty-test-filter",
+                "--require-no-skips",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("matched no runnable tests", result.stderr)
+
+    def test_execution_budget_excludes_compilation_and_bounds_a_stuck_test(self):
+        for limit, expected in ((20, 124), (5000, 0)):
+            result = subprocess.run(
+                [
+                    str(self.binary),
+                    "--test-filter",
+                    "progress body",
+                    f"--timeout-ms={limit}",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=7,
+            )
+            self.assertEqual(result.returncode, expected, result.stderr)
+            if expected:
+                self.assertIn("test execution timed out", result.stderr)
 
     def test_timings_measure_body_and_cleanup(self):
         result = subprocess.run(

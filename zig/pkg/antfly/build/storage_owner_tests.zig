@@ -10,6 +10,7 @@ pub const test_sources = [_][]const u8{
     "kernel_owner_test.zig",
     "kernel_owner_provisioned_source_test.zig",
     "enrichment_compute_test.zig",
+    "kernel_owner_handoff_reopen_test.zig",
 };
 
 /// Exercise the same storage archive linked by serving and embedded consumers.
@@ -19,10 +20,11 @@ pub const Result = struct { runs: [3]*std.Build.Step.Run, benchmark: *std.Build.
 pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     imports: AntflyRootImports,
     vopr: *std.Build.Module,
-    artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
+    lmdb_engine: *std.Build.Module,
+    artifacts: [@typeInfo(runtime.RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile,
 ) Result {
     const owner_filter = b.option([]const u8, "storage-owner-test-filter", "Compile and run one matching storage owner test subset");
     const source_filter = b.option([]const u8, "storage-owner-source-test-filter", "Compile and run matching provisioned storage owner tests");
@@ -62,6 +64,9 @@ pub fn add(
                         "compiled structural reconciliation publishes",
                         "api.kernel_owner_source.",
                         "compiled startup catch-up retains exact retries",
+                        "compiled owner coordinated ttl admission",
+                        "source owner deadlines normalize executor clock epochs",
+                        "distributed txn native lookup read-index rejects leader loss before storage execution",
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
@@ -69,15 +74,11 @@ pub fn add(
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
-            if (index == 0)
-                b.step("antfly-storage-owner-test", "Run tests through the compiled storage owner boundary").dependOn(&runs[index].step);
-            if (index == 1)
-                b.step("antfly-storage-owner-source-test", "Run provisioned storage owner boundary tests").dependOn(&runs[index].step);
             if (index == 2) {
-                tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+                tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {
                 inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-                    tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+                    tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
             }
         } else {
             test_metadata.link(module);
@@ -85,8 +86,30 @@ pub fn add(
         }
         if (index == 3) {
             inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-                module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+                module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
+    const physical_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/storage_kernel_owner_physical_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    physical_module.addImport("vopr", vopr);
+    var physical_imports = imports;
+    physical_imports.boundary_profile = .owner;
+    physical_imports.configureStorage(b, physical_module, true);
+    @import("storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
+    physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
+    const handoff_tests = @import("linked_tests.zig").add(b, .{
+        .name = "storage-owner-handoff-reopen-tests",
+        .root_module = physical_module,
+        .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    handoff_tests.executable.root_module.addObject(test_metadata.object);
+    inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+        handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
+    b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
+        .dependOn(&handoff_tests.run(b).step);
     return .{ .runs = runs, .benchmark = benchmark };
 }

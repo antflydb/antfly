@@ -224,6 +224,9 @@ pub const State = struct {
     revision: u64 = 0,
     next_id: u64 = 3,
     resources: []const Resource = &.{},
+    settings: []const @import("settings.zig").Record = &.{},
+    policies: []const @import("policies.zig").Record = &.{},
+    policy_publications: []const @import("policies.zig").Publication = &.{},
 
     pub fn find(self: @This(), kind: Kind, parent_id: u64, name: []const u8) ?Resource {
         for (self.resources) |r| if (r.kind == kind and r.parent_id == parent_id and std.mem.eql(u8, r.name, name)) return r;
@@ -258,7 +261,7 @@ pub const StateIndex = struct {
     const Name = struct { kind: Kind, parent: u64, name: []const u8 };
     const NameContext = struct {
         pub fn hash(_: @This(), key: Name) u64 {
-            var h = std.hash.Wyhash.init(@intFromEnum(key.kind));
+            var h = std.hash.Wyhash.init(@backingInt(key.kind));
             h.update(std.mem.asBytes(&key.parent));
             h.update(key.name);
             return h.final();
@@ -419,11 +422,60 @@ pub const IndexedState = struct {
 /// transaction reserves indexes and clones only changed records before apply.
 /// Readers borrow it under the metadata mutex. Undo and commit cannot allocate.
 pub const MutableState = struct {
+    pub const OwnedSettings = std.json.Parsed([]const @import("settings.zig").Record);
+    pub const OwnedPolicies = std.json.Parsed([]const @import("policies.zig").Record);
+    pub const OwnedPublications = std.json.Parsed([]const @import("policies.zig").Publication);
     alloc: std.mem.Allocator,
     value: State,
     index: StateIndex,
     rows: std.ArrayListUnmanaged(Resource),
     positions: std.AutoHashMapUnmanaged(StateIndex.Id, usize),
+    // Settings in imported snapshots are normally backed by a temporary JSON
+    // arena. Keep an independent copy for the lifetime of the writer state.
+    owned_settings: ?OwnedSettings = null,
+    owned_policies: ?OwnedPolicies = null,
+    owned_publications: ?OwnedPublications = null,
+
+    pub fn clonePublications(alloc: std.mem.Allocator, publications: []const @import("policies.zig").Publication) !OwnedPublications {
+        if (publications.len > 1024) return error.RowPolicyLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, publications, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("policies.zig").Publication, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |publication, i| {
+            try publication.validateShape();
+            for (owned.value[0..i]) |prior| if (prior.table_id == publication.table_id) return error.InvalidRowPolicyPublication;
+        }
+        return owned;
+    }
+
+    pub fn clonePolicies(alloc: std.mem.Allocator, records: []const @import("policies.zig").Record) !OwnedPolicies {
+        if (records.len > 1024) return error.RowPolicyLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("policies.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |policy, i| {
+            try policy.validateShape();
+            for (owned.value[0..i]) |prior| if (prior.id == policy.id or (prior.table_id == policy.table_id and std.ascii.eqlIgnoreCase(prior.name, policy.name))) return error.InvalidRowPolicyRecord;
+        }
+        return owned;
+    }
+
+    pub fn cloneSettings(alloc: std.mem.Allocator, records: []const @import("settings.zig").Record) !OwnedSettings {
+        if (records.len > 1024) return error.SettingLimitExceeded;
+        const bytes = try std.json.Stringify.valueAlloc(alloc, records, .{});
+        defer alloc.free(bytes);
+        var owned = try std.json.parseFromSlice([]const @import("settings.zig").Record, alloc, bytes, .{ .allocate = .alloc_always });
+        errdefer owned.deinit();
+        for (owned.value, 0..) |setting, i| {
+            try setting.validate();
+            for (owned.value[0..i]) |prior| {
+                if (prior.identity.id == setting.identity.id or std.ascii.eqlIgnoreCase(prior.name, setting.name)) return error.InvalidSettingRecord;
+            }
+        }
+        return owned;
+    }
 
     pub fn clone(alloc: std.mem.Allocator, state: State) !MutableState {
         var self = MutableState{ .alloc = alloc, .value = state, .index = .{}, .rows = .empty, .positions = .empty };
@@ -443,12 +495,27 @@ pub const MutableState = struct {
             self.positions.putAssumeCapacity(.{ .kind = r.kind, .id = r.id }, self.rows.items.len);
             self.rows.appendAssumeCapacity(owned);
         }
+        if (state.settings.len != 0) {
+            self.owned_settings = try cloneSettings(alloc, state.settings);
+            self.value.settings = self.owned_settings.?.value;
+        }
+        if (state.policies.len != 0) {
+            self.owned_policies = try clonePolicies(alloc, state.policies);
+            self.value.policies = self.owned_policies.?.value;
+        }
+        if (state.policy_publications.len != 0) {
+            self.owned_publications = try clonePublications(alloc, state.policy_publications);
+            self.value.policy_publications = self.owned_publications.?.value;
+        }
         self.value.resources = self.rows.items;
         self.index = try StateIndex.init(alloc, self.value);
         return self;
     }
     pub fn deinit(self: *MutableState) void {
         self.index.deinit(self.alloc);
+        if (self.owned_settings) |*settings| settings.deinit();
+        if (self.owned_policies) |*policies| policies.deinit();
+        if (self.owned_publications) |*publications| publications.deinit();
         for (self.rows.items) |r| freeResource(self.alloc, r);
         self.rows.deinit(self.alloc);
         self.positions.deinit(self.alloc);
@@ -559,6 +626,12 @@ pub const PhysicalTable = struct { id: u64, name: []const u8 };
 /// Planning uses a transaction-pinned reader. Point mutations touch only their
 /// dependencies; dropping a database enumerates only that database's children.
 pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation) !Delta {
+    return planWithTopology(alloc, reader, next, request, false);
+}
+
+/// Physical table deletion is admitted only alongside an atomic topology
+/// mutation. Its identity is resolved by the authority, never the caller.
+pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, request: Mutation, dropping_table: bool) !Delta {
     try validateResourceName(request.kind, request.name);
     try validateName(request.database);
     try validateName(request.namespace);
@@ -642,7 +715,10 @@ pub fn planWithReader(alloc: std.mem.Allocator, reader: anytype, next: u64, requ
                         },
                         .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
-                        .table => return error.CatalogTableTopologyRequired,
+                        .table => {
+                            if (!dropping_table) return error.CatalogTableTopologyRequired;
+                            if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
+                        },
                     }
                     try removes.append(alloc, existing);
                 }
@@ -769,7 +845,10 @@ pub const Request = struct {
 };
 
 pub const ResolveMany = struct {
-    targets: []const Target,
+    targets: []const Target = &.{},
+    /// Internal reverse lookup for dependency authorization and schema output.
+    /// Captured with forward bindings in the same immutable catalog read.
+    storage_names: []const []const u8 = &.{},
     include_query_definitions: bool = false,
     expected_revision: ?u64 = null,
 };
@@ -777,12 +856,33 @@ pub const ResolveMany = struct {
 pub const ResolvedMany = struct {
     revision: u64,
     tables: []const ?ResolvedTable,
+    logical_names: []const ?[]const u8 = &.{},
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         for (self.tables) |table| if (table) |value| value.deinit(alloc);
         alloc.free(self.tables);
+        for (self.logical_names) |name| if (name) |value| alloc.free(value);
+        alloc.free(self.logical_names);
     }
 };
+
+/// The reverse index makes dependency authorization O(dependencies), not
+/// O(catalog size). Returned names are owned independently of the read view.
+pub fn logicalNamesAlloc(alloc: std.mem.Allocator, reader: anytype, names: []const []const u8) ![]?[]const u8 {
+    const out = try alloc.alloc(?[]const u8, names.len);
+    @memset(out, null);
+    errdefer {
+        for (out) |name| if (name) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (names, out) |name, *slot| {
+        const table = (try reader.bindingForStorage(name)) orelse continue;
+        const namespace = (try reader.byId(.namespace, table.parent_id)) orelse return error.InvalidCatalogRecord;
+        const database = (try reader.byId(.database, namespace.parent_id)) orelse return error.InvalidCatalogRecord;
+        slot.* = try (Target{ .database = database.name, .namespace = namespace.name, .table = table.name }).resourceNameAlloc(alloc);
+    }
+    return out;
+}
 
 pub const Read = struct {
     kind: Kind,
@@ -839,33 +939,26 @@ pub const TableStatusTarget = union(enum) {
     }
 };
 
-pub const Call = union(enum) {
-    list_tables: TableList,
-    export_snapshot: void,
-    read: Read,
-    snapshot: void,
-    resolve: Target,
-    resolve_many: ResolveMany,
-    query_definition: []const u8,
-    mutate: Request,
-    // A distinct operation makes older peers reject unsupported point reads.
-    table_status: TableStatusTarget,
-    write_validation: []const u8,
-    write_validation_revision: void,
-};
-
 pub fn httpStatus(err: anyerror) u16 {
     return switch (err) {
         error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.TableNotFound => 404,
-        error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
-        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
-        error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge => 413,
-        error.TableTopologyProtocolUpgradeRequired => 426,
+        error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.GenerationPublicationChanged, error.GenerationPublicationNotFound, error.ForeignKeyGenerationPublicationRequired, error.RowPolicyCatalogChanged, error.RowPolicyInstallationPending, error.RowPolicyReadersActive, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.TableAlreadyExists => 409,
+        error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidGenerationPublication, error.InvalidInitialFkRetirementPage, error.InvalidRowPolicyPublication, error.InvalidRowPolicyRecord, error.InvalidSettingRecord, error.InvalidSettingValue, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.InvalidCreateTableRequest => 400,
+        error.CatalogCommandTooLarge, error.CreateTableRequestTooLarge, error.RowPolicyLimitExceeded => 413,
+        error.TableTopologyProtocolUpgradeRequired, error.RowPolicyUnsupported => 426,
         error.Forbidden => 403,
+        error.InvalidInitialFkRetirementSignature, error.InitialFkRetirementSigningKeyUnavailable => 403,
+        error.StoreRootEnrollmentChanged => 409,
+        error.InvalidStoreRootEnrollment, error.InvalidInitialFkRetirementAck => 400,
+        error.InitialChildRootReceiptChanged, error.InitialFkRetirementReporterChanged, error.InitialFkRetirementWorkChanged, error.InitialFkRetirementPublicationChanged, error.InitialFkRetirementReservationChanged => 409,
         error.UnsupportedOperation, error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation, error.MetadataIncarnationMismatch, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ResourceTemporarilyUnavailable => 503,
-        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
+        error.MetadataMutationOutcomeUnknown, error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.Timeout, error.Cancelled, error.Canceled, error.DeadlineExceeded => 503,
         else => 500,
     };
+}
+
+test "invalid initial FK retirement page is a client error" {
+    try std.testing.expectEqual(@as(u16, 400), httpStatus(error.InvalidInitialFkRetirementPage));
 }
 
 /// Only trusted native ingress constructs these immutable routing identities.
@@ -970,6 +1063,21 @@ pub fn cloneStateAlloc(alloc: std.mem.Allocator, state: State) !std.json.Parsed(
     return std.json.parseFromSlice(State, alloc, bytes, .{ .allocate = .alloc_always });
 }
 
+test "standalone mutable catalog owns imported setting defaults" {
+    const alloc = std.testing.allocator;
+    var imported = try cloneStateAlloc(alloc, .{ .settings = &.{.{
+        .identity = .{ .id = 3, .generation = 1 },
+        .name = "app.tenant",
+        .kind = .string,
+        .default = .{ .string = "global" },
+        .role_defaults = &.{.{ .principal = "alice", .database = "main", .value = .{ .string = "private" } }},
+    }} });
+    var state = try MutableState.clone(alloc, imported.value);
+    imported.deinit();
+    defer state.deinit();
+    try std.testing.expectEqualStrings("private", state.value.settings[0].effective("alice", "main").role_default.?.string);
+}
+
 pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta) !std.json.Parsed(State) {
     var resources = std.ArrayListUnmanaged(Resource).empty;
     defer resources.deinit(alloc);
@@ -983,7 +1091,7 @@ pub fn applyDeltaStateAlloc(alloc: std.mem.Allocator, state: State, delta: Delta
         if (!replaced.contains(.{ .kind = resource.kind, .id = resource.id })) try resources.append(alloc, resource);
     }
     try resources.appendSlice(alloc, delta.upserts);
-    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items });
+    return cloneStateAlloc(alloc, .{ .revision = try std.math.add(u64, state.revision, 1), .next_id = delta.next_id, .resources = resources.items, .settings = state.settings, .policies = state.policies });
 }
 
 pub fn tableResourceMatches(grant: []const u8, target: []const u8) bool {
@@ -1132,6 +1240,29 @@ test "system catalog tenant churn reclaims committed and rolled back parent buck
         try std.testing.expectEqual(initial, state.index.children.count());
         try std.testing.expectEqual(@as(usize, 2), state.value.resources.len);
     }
+}
+
+test "mutable catalog owns publication owner cuts beyond imported snapshot lifetime" {
+    const alloc = std.testing.allocator;
+    const publications = [_]@import("policies.zig").Publication{.{
+        .table_id = 7,
+        .schema_version = 2,
+        .schema_digest = @splat(0xab),
+        .generation = 1,
+        .catalog_epoch = 3,
+        .phase = .pending_install,
+        .required_owners = &.{.{ .group_id = 11, .descriptor_digest = @splat(0xcd) }},
+        .acknowledged_owners = &.{},
+    }};
+    const bytes = try std.json.Stringify.valueAlloc(alloc, publications, .{});
+    defer alloc.free(bytes);
+    var imported = try std.json.parseFromSlice([]const @import("policies.zig").Publication, alloc, bytes, .{ .allocate = .alloc_always });
+    var mutable = try MutableState.clone(alloc, .{ .policy_publications = imported.value });
+    defer mutable.deinit();
+    imported.deinit();
+    try std.testing.expectEqual(@as(u64, 7), mutable.value.policy_publications[0].table_id);
+    try std.testing.expectEqual(@as(u64, 11), mutable.value.policy_publications[0].required_owners[0].group_id);
+    try std.testing.expectEqual(@as(u8, 0xcd), mutable.value.policy_publications[0].required_owners[0].descriptor_digest[0]);
 }
 
 pub const Meta = struct {

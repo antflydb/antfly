@@ -25,10 +25,26 @@ pub const Envelope = struct {
     table_name: []const u8,
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
+    /// The coordinator proved the table has exactly one group and admitted
+    /// the graph queries for local execution: the remote group's snapshot
+    /// holds the graph index's complete row set, so its local graph
+    /// executors may expand through cross-table tagged nodes (see
+    /// SearchRequest.graph_index_complete_snapshot). Old peers ignore the
+    /// field and keep the terminal behavior.
+    graph_index_complete_snapshot: bool = false,
+    /// Coordinator-selected expiration time for the whole graph request.
+    graph_ttl_now_ns: u64 = 0,
 };
 pub fn encode(alloc: std.mem.Allocator, table: []const u8, req: types.SearchRequest) !?[]u8 {
     if (req.prepared_read_table_id == 0) return null;
-    return try std.json.Stringify.valueAlloc(alloc, Envelope{ .table_id = req.prepared_read_table_id, .table_name = table, .index_name = req.index_name, .primary_text_index_name = req.primary_text_index_name }, .{});
+    return try std.json.Stringify.valueAlloc(alloc, Envelope{
+        .table_id = req.prepared_read_table_id,
+        .table_name = table,
+        .index_name = req.index_name,
+        .primary_text_index_name = req.primary_text_index_name,
+        .graph_index_complete_snapshot = req.graph_index_complete_snapshot,
+        .graph_ttl_now_ns = req.graph_ttl_now_ns,
+    }, .{});
 }
 pub fn apply(alloc: std.mem.Allocator, table: []const u8, encoded: ?[]const u8, fence_json: ?[]const u8, req: *types.SearchRequest) !bool {
     const bytes = encoded orelse return false;
@@ -50,6 +66,13 @@ pub fn apply(alloc: std.mem.Allocator, table: []const u8, encoded: ?[]const u8, 
     req.primary_text_index_name = primary;
     if (index) |name| req.index_name = name;
     req.prepared_read_table_id = value.table_id;
+    req.graph_ttl_now_ns = value.graph_ttl_now_ns;
+    if (value.graph_index_complete_snapshot) {
+        req.graph_index_complete_snapshot = true;
+        // The handler's table name outlives the request; the fence above
+        // already proved it matches the envelope's identity.
+        req.graph_owning_table = table;
+    }
     return true;
 }
 
@@ -72,6 +95,27 @@ test "prepared query routing requires matching identity and preserves legacy fal
     try std.testing.expectEqualStrings("full_text_index_v2", req.primary_text_index_name.?);
     try std.testing.expectEqualStrings("full_text_index_v2", req.index_name.?);
     try std.testing.expectEqual(@as(u64, 7), req.prepared_read_table_id);
+    // An envelope without the completeness claim never sets the scope.
+    try std.testing.expect(!req.graph_index_complete_snapshot);
+    try std.testing.expectEqual(@as(usize, 0), req.graph_owning_table.len);
+}
+
+test "prepared query routing carries the graph complete-snapshot scope" {
+    const alloc = std.testing.allocator;
+    const fence: metadata.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 4, .table_id = 7, .topology_epoch = 9, .route = .{ .group_id = 11, .range_id = 1, .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 } } };
+    const fence_json = try std.json.Stringify.valueAlloc(alloc, fence, .{});
+    defer alloc.free(fence_json);
+    const encoded = (try encode(alloc, "docs", .{
+        .prepared_read_table_id = 7,
+        .graph_index_complete_snapshot = true,
+        .graph_ttl_now_ns = 5_000_000_000,
+    })).?;
+    defer alloc.free(encoded);
+    var req: types.SearchRequest = .{};
+    try std.testing.expect(try apply(alloc, "docs", encoded, fence_json, &req));
+    try std.testing.expect(req.graph_index_complete_snapshot);
+    try std.testing.expectEqualStrings("docs", req.graph_owning_table);
+    try std.testing.expectEqual(@as(u64, 5_000_000_000), req.graph_ttl_now_ns);
 }
 
 test "prepared query routing keeps a vector worker's selected retrieval index" {

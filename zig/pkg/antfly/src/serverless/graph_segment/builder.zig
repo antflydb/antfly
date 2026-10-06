@@ -16,14 +16,14 @@
 //! of degree; only integer edges survive between input documents/batches.
 const std = @import("std");
 const wire = @import("packed.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const edge_type = @import("../../graph/edge_type.zig");
 const Allocator = std.mem.Allocator;
 
 const Dictionary = struct {
     values: std.StringArrayHashMapUnmanaged(bool) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.values.keys()) |key| alloc.free(key);
         self.values.deinit(alloc);
     }

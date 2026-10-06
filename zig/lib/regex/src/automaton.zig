@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! NFA-based regex engine implementing the vellum Automaton interface.
+//! NFA-based regex engine implementing the `fst.Automaton` interface.
 //!
 //! Uses Thompson's NFA construction for regex → NFA, then on-the-fly
 //! DFA construction (powerset/subset construction) for efficient FST
@@ -34,7 +34,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 
 const dead_state = std.math.maxInt(usize);
 const transition_unknown = dead_state - 1;
@@ -62,7 +62,7 @@ const NFAState = struct {
 /// Character class definition.
 const CharClass = struct {
     /// Bitmap of which bytes match.
-    bytes: [256]bool = [_]bool{false} ** 256,
+    bytes: [256]bool = @as([256]bool, @splat(false)),
     negated: bool = false,
 
     fn matches(self: *const CharClass, b: u8) bool {
@@ -126,8 +126,8 @@ pub const RegexAutomaton = struct {
         self.dfa_cache_transitions.deinit(self.alloc);
     }
 
-    /// Get a vellum.Automaton interface for FST traversal.
-    pub fn automaton(self: *RegexAutomaton) vellum.Automaton {
+    /// Get an fst.Automaton interface for FST traversal.
+    pub fn automaton(self: *RegexAutomaton) fst.Automaton {
         return .{
             .ptr = @ptrCast(self),
             .vtable = &.{
@@ -141,7 +141,7 @@ pub const RegexAutomaton = struct {
     }
 
     fn epsilonClosure(self: *const RegexAutomaton, initial: StateBitSet) StateBitSet {
-        var result = StateBitSet.initEmpty();
+        var result = StateBitSet.empty;
         var it = initial.iterator(.{});
         while (it.next()) |idx| {
             result.setUnion(self.epsilon_closures[idx]);
@@ -150,7 +150,7 @@ pub const RegexAutomaton = struct {
     }
 
     fn stepNFA(self: *const RegexAutomaton, state_set: StateBitSet, b: u8) StateBitSet {
-        var next = StateBitSet.initEmpty();
+        var next = StateBitSet.empty;
         var it = state_set.iterator(.{});
         while (it.next()) |idx| {
             const s = self.states[idx];
@@ -196,7 +196,7 @@ pub const RegexAutomaton = struct {
         // Build start state from epsilon closure of NFA start
         if (self.dfa_cache_keys.items.len > 0) return 0;
 
-        var initial = StateBitSet.initEmpty();
+        var initial = StateBitSet.empty;
         initial.set(self.start_state);
         const start_set = self.epsilonClosure(initial);
         _ = self.lookupOrInsert(start_set) catch return dead_state;
@@ -308,7 +308,7 @@ const ByteClassInfo = struct {
 
 fn buildByteClasses(states: []const NFAState, char_classes: []const CharClass) ByteClassInfo {
     var classes: [256]u8 = undefined;
-    var representatives = [_]u8{0} ** 256;
+    var representatives = @as([256]u8, @splat(0));
     var count: u16 = 0;
 
     for (0..256) |byte_idx| {
@@ -355,7 +355,7 @@ fn precomputeEpsilonClosures(alloc: Allocator, states: []const NFAState) ![]Stat
 }
 
 fn computeSingleStateEpsilonClosure(states: []const NFAState, start_idx: usize) StateBitSet {
-    var closure = StateBitSet.initEmpty();
+    var closure = StateBitSet.empty;
     var stack: [max_nfa_states]u16 = undefined;
     var stack_len: usize = 0;
 

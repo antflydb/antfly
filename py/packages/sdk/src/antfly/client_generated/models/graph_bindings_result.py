@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.graph_bindings_result_kind import GraphBindingsResultKind
+from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_bindings_result_computed_item import GraphBindingsResultComputedItem
     from ..models.graph_result_row import GraphResultRow
     from ..models.graph_result_stats import GraphResultStats
 
@@ -24,11 +26,14 @@ class GraphBindingsResult:
             kind (GraphBindingsResultKind): Stable discriminator for the graph result shape.
             rows (list[GraphResultRow]):
             stats (GraphResultStats): Completion statistics for a bounded graph result.
+            computed (list[GraphBindingsResultComputedItem] | Unset): Evaluated values parallel to returned rows, when
+                decision evaluation was requested.
     """
 
     kind: GraphBindingsResultKind
     rows: list[GraphResultRow]
     stats: GraphResultStats
+    computed: list[GraphBindingsResultComputedItem] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         kind = self.kind.value
@@ -40,6 +45,13 @@ class GraphBindingsResult:
 
         stats = self.stats.to_dict()
 
+        computed: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.computed, Unset):
+            computed = []
+            for computed_item_data in self.computed:
+                computed_item = computed_item_data.to_dict()
+                computed.append(computed_item)
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -49,11 +61,14 @@ class GraphBindingsResult:
                 "stats": stats,
             }
         )
+        if computed is not UNSET:
+            field_dict["computed"] = computed
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_bindings_result_computed_item import GraphBindingsResultComputedItem
         from ..models.graph_result_row import GraphResultRow
         from ..models.graph_result_stats import GraphResultStats
 
@@ -69,10 +84,20 @@ class GraphBindingsResult:
 
         stats = GraphResultStats.from_dict(d.pop("stats"))
 
+        _computed = d.pop("computed", UNSET)
+        computed: list[GraphBindingsResultComputedItem] | Unset = UNSET
+        if _computed is not UNSET:
+            computed = []
+            for computed_item_data in _computed:
+                computed_item = GraphBindingsResultComputedItem.from_dict(computed_item_data)
+
+                computed.append(computed_item)
+
         graph_bindings_result = cls(
             kind=kind,
             rows=rows,
             stats=stats,
+            computed=computed,
         )
 
         return graph_bindings_result

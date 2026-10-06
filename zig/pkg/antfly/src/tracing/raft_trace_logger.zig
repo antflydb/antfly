@@ -23,6 +23,7 @@ const core = raft_engine.core;
 pub const RaftNdjsonTraceLogger = struct {
     mutex: std.atomic.Mutex = .unlocked,
     writer: *std.Io.Writer,
+    shared_mutex: ?*std.atomic.Mutex = null,
     /// Indices of self-ack messages pending receipt (sent but not yet received).
     /// Each Replicate (noop or client) pushes the post-append last_index;
     /// the next Ready-as-leader pops them as ReceiveAppendEntriesResponse events.
@@ -60,8 +61,9 @@ pub const RaftNdjsonTraceLogger = struct {
         if (event.event_type == .become_pre_candidate) return;
 
         const self: *RaftNdjsonTraceLogger = @ptrCast(@alignCast(ptr));
-        platform_sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
+        const mutex = self.shared_mutex orelse &self.mutex;
+        platform_sync.lockYielding(mutex);
+        defer mutex.unlock();
 
         // Pre-event synthesis: events that must appear BEFORE the main event.
         if (event.event_type == .become_leader and self.needs_self_vote_receive) {

@@ -326,7 +326,7 @@ const TargetedIndexAuthority = struct {
     // incarnation cannot fence its same-name replacement.
     convergence_requirements: std.AutoHashMapUnmanaged(u64, ConvergenceRequirement) = .empty,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.handoff_groups.deinit(alloc);
         self.terminal_failures.deinit(alloc);
         self.expected_handoff_groups.deinit(alloc);
@@ -424,7 +424,7 @@ const TargetAcknowledgementCapacityPreparation = struct {
         self.installed = true;
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.items[0..self.initialized]) |*item| item.replacement.deinit(alloc);
         if (self.items.len > 0) alloc.free(self.items);
         self.* = undefined;
@@ -460,7 +460,7 @@ const IndexObservationLookup = struct {
         }
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.by_name.deinit(alloc);
         self.* = undefined;
     }
@@ -512,7 +512,7 @@ const IndexDeltaMergeWorkspace = struct {
         return out;
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.previous_lookup.deinit(alloc);
         if (self.installed) {
             for (self.retired_indexes[0..self.retired_count]) |item|
@@ -673,12 +673,12 @@ pub const TableRuntimeSnapshotCache = struct {
         }
 
         fn storeTerminalFailure(self: *@This(), failure: ?IndexActivationFailureCode) void {
-            self.terminal_failure_code.store(if (failure) |code| @intFromEnum(code) else 0, .release);
+            self.terminal_failure_code.store(if (failure) |code| @backingInt(code) else 0, .release);
         }
 
         fn terminalFailure(self: *const @This()) ?IndexActivationFailureCode {
             const raw = self.terminal_failure_code.load(.acquire);
-            return if (raw == 0) null else @enumFromInt(raw);
+            return if (raw == 0) null else @fromBackingInt(raw);
         }
     };
 
@@ -687,7 +687,7 @@ pub const TableRuntimeSnapshotCache = struct {
         indexes: []ReadIndexAuthority,
         index_by_name: std.StringHashMapUnmanaged(usize) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.index_by_name.deinit(alloc);
             alloc.free(self.indexes);
             self.* = undefined;
@@ -808,7 +808,7 @@ pub const TableRuntimeSnapshotCache = struct {
         name: []const u8,
         view: *ReadView,
 
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
             alloc.free(@constCast(self.name));
             self.view.release(alloc);
         }
@@ -920,7 +920,7 @@ pub const TableRuntimeSnapshotCache = struct {
         // O(historical index names), when no structural transition is active.
         active_index_transition_count: usize = 0,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             var it = self.groups.valueIterator();
             while (it.next()) |status| status.deinit(alloc);
             self.groups.deinit(alloc);
@@ -3933,17 +3933,17 @@ fn stabilizePhysicalDurationTelemetry(value: anytype) void {
     const pointer = @typeInfo(@TypeOf(value)).pointer;
     const T = pointer.child;
     switch (@typeInfo(T)) {
-        .@"struct" => inline for (std.meta.fields(T)) |field| {
-            if (comptime physicalDurationField(field.name)) {
-                @field(value.*, field.name) = 0;
+        .@"struct" => inline for (comptime std.meta.fieldNames(T)) |reflected_name| {
+            if (comptime physicalDurationField(reflected_name)) {
+                @field(value.*, reflected_name) = 0;
             } else {
-                stabilizePhysicalDurationTelemetry(&@field(value.*, field.name));
+                stabilizePhysicalDurationTelemetry(&@field(value.*, reflected_name));
             }
         },
         .array => for (value) |*item| stabilizePhysicalDurationTelemetry(item),
         .optional => if (value.*) |*item| stabilizePhysicalDurationTelemetry(item),
         .pointer => |child_pointer| {
-            if (child_pointer.size == .slice and !child_pointer.is_const) {
+            if (child_pointer.size == .slice and !child_pointer.attrs.@"const") {
                 for (value.*) |*item| stabilizePhysicalDurationTelemetry(item);
             }
         },
@@ -5292,13 +5292,13 @@ fn testSourceReplayStatsClone(alloc: std.mem.Allocator) !void {
 fn seedSnapshotValues(value: anytype) @TypeOf(value) {
     var result = value;
     switch (@typeInfo(@TypeOf(value))) {
-        .@"struct" => |info| inline for (info.fields) |field| {
-            @field(result, field.name) = seedSnapshotValues(@field(value, field.name));
+        .@"struct" => |info| inline for (info.field_names) |reflected_name| {
+            @field(result, reflected_name) = seedSnapshotValues(@field(value, reflected_name));
         },
         .bool => result = !value,
         .int => result = if (value == 0) 1 else 0,
         .float => result = 1,
-        .@"enum" => |info| result = @enumFromInt(info.fields[info.fields.len - 1].value),
+        .@"enum" => |info| result = @fromBackingInt(@intCast(info.field_values[info.field_values.len - 1])),
         else => {},
     }
     return result;
@@ -5605,11 +5605,11 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
 // an explicit ownership decision here instead of silently borrowing its storage.
 fn copySnapshotWithOverrides(value: anytype, overrides: anytype) @TypeOf(value) {
     var result = value;
-    inline for (std.meta.fields(@TypeOf(value))) |field| {
-        if (@hasField(@TypeOf(overrides), field.name)) {
-            @field(result, field.name) = @field(overrides, field.name);
-        } else if (comptime snapshotHasPointers(field.type)) {
-            @compileError("snapshot ownership must be explicit for " ++ @typeName(@TypeOf(value)) ++ "." ++ field.name);
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+        if (@hasField(@TypeOf(overrides), reflected_name)) {
+            @field(result, reflected_name) = @field(overrides, reflected_name);
+        } else if (comptime snapshotHasPointers(field_type)) {
+            @compileError("snapshot ownership must be explicit for " ++ @typeName(@TypeOf(value)) ++ "." ++ reflected_name);
         }
     }
     return result;
@@ -5621,7 +5621,7 @@ fn snapshotHasPointers(comptime T: type) bool {
         .optional => |info| snapshotHasPointers(info.child),
         .array => |info| snapshotHasPointers(info.child),
         .@"struct", .@"union" => blk: {
-            for (std.meta.fields(T)) |field| if (snapshotHasPointers(field.type)) break :blk true;
+            for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |_, field_type| if (snapshotHasPointers(field_type)) break :blk true;
             break :blk false;
         },
         else => false,
@@ -5632,7 +5632,7 @@ fn snapshotHasPointers(comptime T: type) bool {
 // through their owning enums before the parser buffer is released. Unknown
 // peer-version values stay explicit instead of becoming a false healthy state.
 fn stableStatusLabel(comptime T: type, value: []const u8, comptime extra: []const []const u8) []const u8 {
-    if (@typeInfo(T).@"enum".fields.len > 0) {
+    if (@typeInfo(T).@"enum".field_names.len > 0) {
         if (std.meta.stringToEnum(T, value)) |tag| return @tagName(tag);
     }
     inline for (extra) |label| if (std.mem.eql(u8, value, label)) return label;
@@ -5646,7 +5646,7 @@ fn stableProjectionStatus(value: []const u8) []const u8 {
 fn cloneEnrichmentStats(stats: db_mod.types.EnrichmentStats) db_mod.types.EnrichmentStats {
     var cloned = stats;
     cloned.projection_checkpoint_status = stableProjectionStatus(stats.projection_checkpoint_status);
-    cloned.active_phase = stableStatusLabel(@import("../inference/execution_context.zig").Phase, stats.active_phase, &.{"idle"});
+    cloned.active_phase = stableStatusLabel(@import("antfly_inference_execution_context").Phase, stats.active_phase, &.{"idle"});
     cloned.stall_reason = stableStatusLabel(enum {}, stats.stall_reason, &.{ "", "worker_missing", "model_loading", "publishing_overdue", "embedding_overdue" });
     return cloned;
 }
@@ -6552,13 +6552,13 @@ fn consumerTests() type {
         }
 
         test "table runtime snapshot cache clones stored status diagnostic wire bounds" {
-            const maximum = [_]u8{'E'} ** 256;
+            const maximum = @as([256]u8, @splat('E'));
             const json = try std.json.Stringify.valueAlloc(std.testing.allocator, &maximum, .{});
             defer std.testing.allocator.free(json);
             const decoded = try std.json.parseFromSlice(db_mod.types.RuntimeErrorName, std.testing.allocator, json, .{});
             defer decoded.deinit();
             try std.testing.expectEqualStrings(&maximum, decoded.value.slice());
-            const too_long = [_]u8{'E'} ** 257;
+            const too_long = @as([257]u8, @splat('E'));
             const invalid = try std.json.Stringify.valueAlloc(std.testing.allocator, &too_long, .{});
             defer std.testing.allocator.free(invalid);
             try std.testing.expectError(error.Overflow, std.json.parseFromSlice(db_mod.types.RuntimeErrorName, std.testing.allocator, invalid, .{}));

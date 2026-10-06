@@ -297,7 +297,6 @@ components:
       required:
         - model
         - query
-        - prompts
       properties:
         model:
           type: string
@@ -307,18 +306,26 @@ components:
           type: string
           description: Search query for relevance scoring
           example: "machine learning applications"
-        prompts:
+        documents:
           type: array
           items:
-            type: string
+            $ref: "#/components/schemas/ChatMessageContent"
           description: |
-            Pre-rendered document texts to rerank. The client is responsible for extracting
-            and rendering document fields/templates before calling this endpoint.
+            Documents to rerank. Each entry is a string or an array of text and image
+            content parts. Exactly one of `documents` and `prompts` is required.
           example:
             [
               "Introduction to machine learning...",
               "Deep learning fundamentals...",
             ]
+        prompts:
+          type: array
+          deprecated: true
+          items:
+            type: string
+          description: |
+            Deprecated text-only form of `documents`. Accepted so older clients keep
+            working; send `documents` instead.
 
     RerankResponse:
       type: object
@@ -1119,6 +1126,7 @@ components:
 
     ModelRef:
       type: object
+      additionalProperties: false
       description: |
         Model reference used by startup preload and model-loading configuration.
         When a preload selects an explicit backend, that warmed session also
@@ -1585,28 +1593,22 @@ paths:
 
   /rerank:
     post:
-      summary: Rerank prompts by relevance
+      summary: Rerank documents by relevance
       description: |
-        Re-scores pre-rendered text prompts based on relevance to a query using ONNX reranking models.
+        Re-scores documents by relevance to a text query. Returns one score per
+        document, in request order.
 
-        ## Client Responsibilities
-
-        The client must:
-        1. Extract relevant fields from documents
-        2. Render any templates
-        3. Send pre-rendered text strings as `prompts`
-
-        This design keeps Antfly inference stateless and allows clients to customize rendering logic.
+        Each entry in `documents` is either a string or an array of text and image
+        content parts, in the same format that generation and embedding use. The client
+        renders document fields or templates to text before calling this endpoint.
+        Documents with images require a multimodal reranker (ColQwen-style
+        late-interaction, or Qwen3-VL with its GGUF vision projector).
 
         ## Models
 
         - Models are auto-discovered from `models_dir/rerankers/`
-        - Supports quantized models (`model_quantized.onnx`)
         - Automatically prefers quantized variants if available
-
-        For document-based reranking with field extraction, use the client-side
-        `lib/reranking` package which handles rendering before calling this endpoint.
-      operationId: rerankPrompts
+      operationId: rerankDocuments
       requestBody:
         required: true
         content:
@@ -1615,7 +1617,7 @@ paths:
               $ref: "#/components/schemas/RerankRequest"
       responses:
         "200":
-          description: Prompts reranked successfully
+          description: Documents reranked successfully
           content:
             application/json:
               schema:

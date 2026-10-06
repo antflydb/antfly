@@ -16,9 +16,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 var freestanding_counter: u64 = 0;
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 
 pub fn sleepNs(ns: u64) void {
-    if (comptime builtin.os.tag == .freestanding) return;
+    if (comptime is_hostless) return;
 
     var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -32,11 +33,12 @@ pub fn sleepNs(ns: u64) void {
 }
 
 pub fn yieldBriefly() void {
-    if (comptime builtin.os.tag == .freestanding) return;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const protection = io.swapCancelProtection(.blocked);
-    defer _ = io.swapCancelProtection(protection);
-    io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
+    if (comptime builtin.os.tag != .freestanding) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
+    }
 }
 
 /// Scheduler handoff for synchronous compatibility APIs with no borrowed Io.
@@ -45,16 +47,23 @@ pub fn yieldBriefly() void {
 pub fn yieldNow() void {
     if (comptime builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
-        return;
+    } else {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        io.sleep(.zero, .awake) catch unreachable;
     }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const protection = io.swapCancelProtection(.blocked);
-    defer _ = io.swapCancelProtection(protection);
-    io.sleep(.zero, .awake) catch unreachable;
+}
+
+/// Borrowed native runtimes retain their awake-clock authority. Freestanding
+/// hosts have no native Io vtable and use the platform monotonic clock.
+pub fn awakeNs(io: std.Io) u64 {
+    if (comptime builtin.os.tag == .freestanding) return monotonicNs();
+    return @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds));
 }
 
 pub fn monotonicNs() u64 {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime is_hostless) {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
@@ -83,7 +92,7 @@ pub fn authorityNs() u64 {
 }
 
 pub fn realtimeNs() u64 {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime is_hostless) {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
@@ -118,7 +127,7 @@ test "thread CPU clock is monotonic where supported" {
 }
 
 pub fn residentBytes() usize {
-    if (comptime builtin.os.tag == .freestanding) return 0;
+    if (comptime is_hostless) return 0;
 
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     if (usage.maxrss <= 0) return 0;

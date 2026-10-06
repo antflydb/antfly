@@ -459,10 +459,11 @@ fn makeTrainerInputForExampleWeighted(
     for (0..@min(example.labels.len, rows)) |i| {
         const label = example.labels[i];
         if (label < 0) continue;
+        if (i == 0) return error.InvalidCausalLabelPosition;
         const idx: usize = @intCast(label);
         if (idx >= vocab_size) return error.LabelOutOfRange;
         const row_scale = if (token_scales) |scales| scales[supervised_idx] else default_row_scale;
-        targets[i * vocab_size + idx] = row_scale;
+        targets[(i - 1) * vocab_size + idx] = row_scale;
         supervised_idx += 1;
     }
 
@@ -601,6 +602,42 @@ pub fn sampleCompletionRanked(
     if (out_tokens.items.len == 0) return error.EmptyCompletion;
 }
 
+/// Draw a completion from the policy softmax and record the exact behavior
+/// log-probability used by GRPO's importance ratio.
+pub fn sampleCompletion(
+    allocator: std.mem.Allocator,
+    trainer: *real_autodiff.RealAutodiffTrainer,
+    ctx: *Qwen2AutodiffCtx,
+    prompt: []const i32,
+    seq_len: u32,
+    max_completion_tokens: usize,
+    seed: u64,
+    eos_token_id: ?i32,
+    out_tokens: *std.ArrayList(i32),
+    out_logps: *std.ArrayList(f32),
+) !void {
+    if (prompt.len == 0) return error.EmptyPrompt;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    var seq = std.ArrayList(i32).empty;
+    defer seq.deinit(allocator);
+    try seq.appendSlice(allocator, prompt);
+
+    var step: usize = 0;
+    while (step < max_completion_tokens and seq.items.len < seq_len) : (step += 1) {
+        const logits = try executeLogitsForInputIds(allocator, trainer, ctx, seq.items, seq_len);
+        defer allocator.free(logits);
+        const vocab_size: usize = @intCast(ctx.graph_config.arch.vocab_size);
+        const row = logits[(seq.items.len - 1) * vocab_size ..][0..vocab_size];
+        const token_id = try sampleToken(row, random);
+        try out_tokens.append(allocator, @intCast(token_id));
+        try out_logps.append(allocator, logProbAtToken(row, token_id));
+        try seq.append(allocator, @intCast(token_id));
+        if (eos_token_id) |eos_id| if (token_id == @as(usize, @intCast(eos_id))) break;
+    }
+    if (out_tokens.items.len == 0) return error.EmptyCompletion;
+}
+
 pub fn saveTrainerAsQwenAdapterDir(
     allocator: std.mem.Allocator,
     trainer: *const real_autodiff.RealAutodiffTrainer,
@@ -611,7 +648,7 @@ pub fn saveTrainerAsQwenAdapterDir(
     var adapter_inspect = try colqwen2.inspectCheckpoint(allocator, adapter_model_dir);
     defer colqwen2.freeInspectionSummary(allocator, &adapter_inspect);
 
-    try compat.cwd().createDirPath(compat.io(), out_dir);
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), out_dir);
     const adapter_checkpoint_path = try std.fs.path.join(allocator, &.{ out_dir, colqwen2.adapter_checkpoint_file_name });
     defer allocator.free(adapter_checkpoint_path);
     const adapter_config_path = try std.fs.path.join(allocator, &.{ out_dir, colqwen2.adapter_config_file_name });
@@ -797,6 +834,25 @@ fn selectRankedToken(allocator: std.mem.Allocator, row: []const f32, rank: usize
     return ranked[@min(rank, ranked.len - 1)].token_id;
 }
 
+fn sampleToken(logits: []const f32, random: std.Random) !usize {
+    if (logits.len == 0) return error.InvalidLogits;
+    var max_logit = logits[0];
+    for (logits) |value| {
+        if (!std.math.isFinite(value)) return error.InvalidLogits;
+        max_logit = @max(max_logit, value);
+    }
+    var total: f64 = 0.0;
+    for (logits) |value| total += @exp(@as(f64, value - max_logit));
+    if (!std.math.isFinite(total) or total <= 0.0) return error.InvalidLogits;
+    const threshold = random.float(f64) * total;
+    var cumulative: f64 = 0.0;
+    for (logits, 0..) |value, idx| {
+        cumulative += @exp(@as(f64, value - max_logit));
+        if (cumulative >= threshold) return idx;
+    }
+    return logits.len - 1;
+}
+
 const WriteTensorF32 = struct {
     name: []const u8,
     shape: []const usize,
@@ -839,18 +895,18 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
     for (tensors) |tensor| {
         for (tensor.data) |item| {
             const bits: u32 = @bitCast(item);
             var bits_buf: [4]u8 = undefined;
             std.mem.writeInt(u32, &bits_buf, bits, .little);
-            try file.writeStreamingAll(compat.io(), &bits_buf);
+            try file.writeStreamingAll(compat.testingIo(), &bits_buf);
         }
     }
 }
@@ -873,7 +929,7 @@ fn writeAdapterConfigJson(
         .lora_alpha = alpha,
         .target_modules = target_modules,
     }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 fn copySupportingArtifactIfPresent(
@@ -887,5 +943,5 @@ fn copySupportingArtifactIfPresent(
     defer allocator.free(contents);
     const dst_path = try std.fs.path.join(allocator, &.{ out_dir, file_name });
     defer allocator.free(dst_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dst_path, .data = contents });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = dst_path, .data = contents });
 }

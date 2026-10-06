@@ -4,10 +4,10 @@
 //! Production-mode conformance probe for the independently code-generated
 //! inference archive. This executable deliberately imports only the ABI
 //! declarations and resolves the exported function table from the linked
-//! archive; it cannot inline or directly call inference_host.zig.
+//! archive; it cannot inline or directly call pkg/inference/src/host/host.zig.
 
 const std = @import("std");
-const bridge = @import("standalone/inference_bridge.zig");
+const bridge = @import("antfly_inference_bridge");
 
 pub fn main() !void {
     const table = bridge.antfly_standalone_inference_get_function_table();
@@ -47,7 +47,7 @@ pub fn main() !void {
     const invoke_context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = handle.?,
-        .operation = @intFromEnum(bridge.ProviderOperation.read_encoded_images),
+        .operation = @backingInt(bridge.ProviderOperation.read_encoded_images),
         .request_json = bridge.String.init(request_json),
         .deadline_ns = 0,
         .has_deadline = 0,
@@ -69,7 +69,7 @@ pub fn main() !void {
     const embedding_context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = handle.?,
-        .operation = @intFromEnum(bridge.ProviderOperation.embed_dense_parts),
+        .operation = @backingInt(bridge.ProviderOperation.embed_dense_parts),
         .request_json = bridge.String.init(embedding_request_json),
         .deadline_ns = 0,
         .has_deadline = 0,
@@ -91,7 +91,7 @@ pub fn main() !void {
     const chunk_context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = handle.?,
-        .operation = @intFromEnum(bridge.ProviderOperation.chunk_input),
+        .operation = @backingInt(bridge.ProviderOperation.chunk_input),
         .request_json = bridge.String.init(chunk_request_json),
         .deadline_ns = 0,
         .has_deadline = 0,

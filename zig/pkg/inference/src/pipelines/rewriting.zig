@@ -113,7 +113,7 @@ pub const RewritingPipeline = struct {
                     self_job.err = err;
                 };
             }
-            fn deinit(self_job: *@This()) void {
+            pub fn deinit(self_job: *@This()) void {
                 if (self_job.output) |*output| output.deinit();
                 std.heap.smp_allocator.free(self_job.ids);
                 std.heap.smp_allocator.free(self_job.mask);
@@ -379,8 +379,8 @@ fn testRewriteScheduling(io: std.Io, wait_us: u64, inline_only: bool) !void {
     probe.identify = true;
     probe.encoder_cells = 0;
     pipeline.config.max_length = 512;
-    const long = [_]u8{'a'} ** 512;
-    const short = [_]u8{'a'} ** 16;
+    const long = @as([512]u8, @splat('a'));
+    const short = @as([16]u8, @splat('a'));
     const mixed = try pipeline.rewriteBatch(io, &.{ &short, &long, &short, &short, &short, &short, &short, &short });
     defer {
         for (mixed) |*result| result.deinit();

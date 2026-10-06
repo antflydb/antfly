@@ -107,7 +107,7 @@ pub const Job = struct {
         return self.base.at(if (i < self.plan.source_len) self.plan.sourceIndex(i) else self.plan.targetIndex(i - self.plan.source_len));
     }
 
-    fn admitNames(self: *Job, bytes: usize) !void {
+    fn admitNames(self: *Job, bytes: u64) !void {
         if (self.reservation) |*lease| try lease.growBoundedOversized(bytes, 1);
     }
 
@@ -570,7 +570,7 @@ test "compaction publication uses the borrowed clock for bounded preparation" {
 }
 
 test "compaction publication atomic fence scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     const allocator = std.heap.smp_allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

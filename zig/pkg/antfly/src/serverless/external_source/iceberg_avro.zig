@@ -104,10 +104,14 @@ pub const DataFileEntry = struct {
     partition_field_count: u32 = 0,
     partition_values: []PartitionValue = &.{},
     equality_ids: []i32 = &.{},
+    lower_bounds: []@import("types.zig").FieldMetric = &.{},
+    upper_bounds: []@import("types.zig").FieldMetric = &.{},
     record_count: u64,
     file_size_in_bytes: u64,
 
     pub fn deinit(self: *DataFileEntry, alloc: Allocator) void {
+        @import("types.zig").FieldMetric.freeAll(alloc, self.lower_bounds);
+        @import("types.zig").FieldMetric.freeAll(alloc, self.upper_bounds);
         alloc.free(self.file_path);
         alloc.free(self.file_format);
         for (self.partition_values) |*partition| partition.deinit(alloc);
@@ -357,7 +361,7 @@ const OcfMetadata = struct {
     schema_json: []u8,
     codec: AvroCodec = .null,
 
-    fn deinit(self: *OcfMetadata, alloc: Allocator) void {
+    pub fn deinit(self: *OcfMetadata, alloc: Allocator) void {
         alloc.free(self.schema_json);
         self.* = undefined;
     }
@@ -367,7 +371,7 @@ const DecodedBlock = struct {
     bytes: []const u8,
     owned: ?[]u8 = null,
 
-    fn deinit(self: DecodedBlock, alloc: Allocator) void {
+    pub fn deinit(self: DecodedBlock, alloc: Allocator) void {
         if (self.owned) |owned| alloc.free(owned);
     }
 };
@@ -586,8 +590,9 @@ fn primitiveForName(name: []const u8) !AvroPrimitive {
 }
 
 fn knownFieldForName(name: []const u8) KnownField {
-    inline for (@typeInfo(KnownField).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(KnownField).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return .unknown;
 }
@@ -607,7 +612,7 @@ const EntryScratch = struct {
     existing_rows_count: u64 = 0,
     deleted_rows_count: u64 = 0,
 
-    fn deinit(self: *EntryScratch, alloc: Allocator) void {
+    pub fn deinit(self: *EntryScratch, alloc: Allocator) void {
         if (self.manifest_path) |path| alloc.free(path);
         self.* = undefined;
     }
@@ -720,7 +725,7 @@ const DataManifestScratch = struct {
     file_sequence_number: ?i64 = null,
     data_file: ?DataFileScratch = null,
 
-    fn deinit(self: *DataManifestScratch, alloc: Allocator) void {
+    pub fn deinit(self: *DataManifestScratch, alloc: Allocator) void {
         if (self.data_file) |*file| file.deinit(alloc);
         self.* = undefined;
     }
@@ -733,10 +738,14 @@ const DataFileScratch = struct {
     partition_field_count: u32 = 0,
     partition_values: []PartitionValue = &.{},
     equality_ids: []i32 = &.{},
+    lower_bounds: []@import("types.zig").FieldMetric = &.{},
+    upper_bounds: []@import("types.zig").FieldMetric = &.{},
     record_count: u64 = 0,
     file_size_in_bytes: u64 = 0,
 
-    fn deinit(self: *DataFileScratch, alloc: Allocator) void {
+    pub fn deinit(self: *DataFileScratch, alloc: Allocator) void {
+        @import("types.zig").FieldMetric.freeAll(alloc, self.lower_bounds);
+        @import("types.zig").FieldMetric.freeAll(alloc, self.upper_bounds);
         if (self.file_path) |path| alloc.free(path);
         if (self.file_format) |format| alloc.free(format);
         for (self.partition_values) |*partition| partition.deinit(alloc);
@@ -785,6 +794,10 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
     data_file.partition_values = &.{};
     const equality_ids = data_file.equality_ids;
     data_file.equality_ids = &.{};
+    const lower_bounds = data_file.lower_bounds;
+    const upper_bounds = data_file.upper_bounds;
+    data_file.lower_bounds = &.{};
+    data_file.upper_bounds = &.{};
     var entry = DataFileEntry{
         .status = status,
         .snapshot_id = scratch.snapshot_id,
@@ -796,6 +809,8 @@ fn readDataManifestEntryAlloc(alloc: Allocator, reader: *Reader, schema: std.jso
         .partition_field_count = data_file.partition_field_count,
         .partition_values = partition_values,
         .equality_ids = equality_ids,
+        .lower_bounds = lower_bounds,
+        .upper_bounds = upper_bounds,
         .record_count = data_file.record_count,
         .file_size_in_bytes = data_file.file_size_in_bytes,
     };
@@ -830,6 +845,12 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
         } else if (std.mem.eql(u8, name, "equality_ids")) {
             if (scratch.equality_ids.len != 0) return error.InvalidIcebergDataManifest;
             scratch.equality_ids = try readJsonAvroIntArrayAlloc(alloc, reader, field_type);
+        } else if (std.mem.eql(u8, name, "lower_bounds")) {
+            if (scratch.lower_bounds.len != 0) return error.InvalidIcebergDataManifest;
+            scratch.lower_bounds = try readFieldMetrics(alloc, reader, field_type);
+        } else if (std.mem.eql(u8, name, "upper_bounds")) {
+            if (scratch.upper_bounds.len != 0) return error.InvalidIcebergDataManifest;
+            scratch.upper_bounds = try readFieldMetrics(alloc, reader, field_type);
         } else if (std.mem.eql(u8, name, "record_count")) {
             scratch.record_count = try nonNegativeDataU64(try readJsonAvroLong(reader, field_type));
         } else if (std.mem.eql(u8, name, "file_size_in_bytes")) {
@@ -840,6 +861,56 @@ fn readDataFileRecordAlloc(alloc: Allocator, reader: *Reader, schema: std.json.V
     }
 
     return scratch;
+}
+
+fn readFieldMetrics(a: Allocator, reader: *Reader, schema: std.json.Value) ![]@import("types.zig").FieldMetric {
+    const Metric = @import("types.zig").FieldMetric;
+    const value_schema = try readJsonUnionTagForValue(reader, schema) orelse return &.{};
+    const object = try jsonObject(value_schema);
+    if (!jsonTypeNameEql(value_schema, "array")) return error.InvalidIcebergDataManifest;
+    const fields = try recordFields(object.get("items") orelse return error.InvalidIcebergDataManifest);
+    var out: std.ArrayList(Metric) = .empty;
+    errdefer {
+        for (out.items) |metric| a.free(metric.value);
+        out.deinit(a);
+    }
+    while (true) {
+        var count = try reader.readLong();
+        if (count == 0) break;
+        var block_end: ?usize = null;
+        if (count < 0) {
+            if (count == std.math.minInt(i64)) return error.InvalidIcebergDataManifest;
+            count = -count;
+            const size = try reader.readLong();
+            if (size < 0 or size > reader.bytes.len - reader.offset) return error.InvalidIcebergDataManifest;
+            block_end = reader.offset + @as(usize, @intCast(size));
+        }
+        if (count > reader.bytes.len - reader.offset or count > 100_000 -| out.items.len) return error.InvalidIcebergDataManifest;
+        for (0..@as(usize, @intCast(count))) |_| {
+            var id: ?i32 = null;
+            var bytes: ?[]const u8 = null;
+            for (fields.items) |field| {
+                const field_object = try jsonObject(field);
+                const name = try jsonRequiredString(field_object, "name");
+                const field_type = field_object.get("type") orelse return error.InvalidIcebergDataManifest;
+                if (std.mem.eql(u8, name, "key")) {
+                    id = try readJsonAvroInt(reader, field_type);
+                } else if (std.mem.eql(u8, name, "value")) {
+                    const actual = try readJsonUnionTagForValue(reader, field_type) orelse return error.InvalidIcebergDataManifest;
+                    if (!jsonTypeNameEql(actual, "bytes")) return error.InvalidIcebergDataManifest;
+                    bytes = try reader.readBytes();
+                } else try skipJsonAvroValue(reader, field_type);
+            }
+            const field_id = id orelse return error.InvalidIcebergDataManifest;
+            if (field_id < 0) return error.InvalidIcebergDataManifest;
+            const owned = try a.dupe(u8, bytes orelse return error.InvalidIcebergDataManifest);
+            errdefer a.free(owned);
+            try out.append(a, .{ .field_id = field_id, .value = owned });
+        }
+        if (block_end) |end| if (reader.offset != end) return error.InvalidIcebergDataManifest;
+    }
+    Metric.normalize(out.items) catch return error.InvalidIcebergDataManifest;
+    return out.toOwnedSlice(a);
 }
 
 const PartitionRecord = struct {
@@ -1426,7 +1497,7 @@ fn appendManifestRecord(
     try appendString(alloc, out, path);
     try appendLong(alloc, out, 111);
     try appendLong(alloc, out, 3);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, sequence_number);
     try appendLong(alloc, out, 1);
@@ -1604,14 +1675,14 @@ fn appendDataManifestRecord(
     record_count: i64,
     file_size_in_bytes: i64,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 123);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 44);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 45);
-    try appendLong(alloc, out, @intFromEnum(DataFileContent.data));
+    try appendLong(alloc, out, @backingInt(DataFileContent.data));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, file_format);
     try appendString(alloc, out, "us-west");
@@ -1633,14 +1704,14 @@ fn appendDataManifestRecordWithContentAndEqualityIds(
     file_size_in_bytes: i64,
     equality_ids: []const i32,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 123);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 44);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 45);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, file_format);
     try appendString(alloc, out, "us-west");
@@ -1672,4 +1743,27 @@ fn appendArrayLongs(alloc: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
     try appendLong(alloc, out, 4);
     try appendLong(alloc, out, 2048);
     try appendLong(alloc, out, 0);
+}
+
+test "iceberg manifest binary field bounds decode Avro logical maps without rounding" {
+    const a = std.testing.allocator;
+    var encoded: std.ArrayListUnmanaged(u8) = .empty;
+    defer encoded.deinit(a);
+    try appendLong(a, &encoded, 1);
+    try appendLong(a, &encoded, 7);
+    try appendLong(a, &encoded, 8);
+    var value: [8]u8 = undefined;
+    std.mem.writeInt(i64, &value, 9007199254740993, .little);
+    try encoded.appendSlice(a, &value);
+    try appendLong(a, &encoded, 0);
+    const schema = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"type":"array","items":{"type":"record","name":"bounds","fields":[{"name":"key","type":"int"},{"name":"value","type":"bytes"}]}}
+    , .{});
+    defer schema.deinit();
+    var reader = Reader.init(encoded.items);
+    const metrics = try readFieldMetrics(a, &reader, schema.value);
+    defer @import("types.zig").FieldMetric.freeAll(a, metrics);
+    try std.testing.expectEqual(@as(i32, 7), metrics[0].field_id);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), std.mem.readInt(i64, metrics[0].value[0..8], .little));
+    try std.testing.expect(reader.eof());
 }

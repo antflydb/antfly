@@ -35,7 +35,7 @@ const ExpertState = struct {
 const LayerState = struct {
     experts: []ExpertState = &.{},
 
-    fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
         allocator.free(self.experts);
         self.* = .{};
     }

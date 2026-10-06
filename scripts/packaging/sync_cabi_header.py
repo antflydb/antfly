@@ -10,7 +10,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_HEADER = REPO_ROOT / "zig" / "pkg" / "antfly" / "include" / "antfly.h"
-GO_HEADER = REPO_ROOT / "go" / "pkg" / "antflylite" / "include" / "antfly.h"
+GO_HEADER = REPO_ROOT / "go" / "pkg" / "lite" / "include" / "antfly.h"
 
 
 def parse_args() -> argparse.Namespace:

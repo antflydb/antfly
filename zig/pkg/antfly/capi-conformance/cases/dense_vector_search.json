@@ -1,0 +1,18 @@
+{
+  "name": "dense_vector_search",
+  "description": "Caller-supplied embeddings against an external dense vector index, with no inference runtime.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "add_index", "config": {"name": "dv_embedding_v1", "kind": "dense_vector",
+      "config_json": "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}"}},
+    {"op": "batch", "timestamp": 1, "writes": [
+      {"key": "doc:east", "value": {"title": "east", "_embeddings": {"dv_embedding_v1": [1.0, 0.0]}}},
+      {"key": "doc:north", "value": {"title": "north", "_embeddings": {"dv_embedding_v1": [0.0, 1.0]}}}
+    ]},
+    {"op": "run_until_idle"},
+    {"op": "search", "request": {"embeddings": {"dv_embedding_v1": [0.9, 0.1]}, "indexes": ["dv_embedding_v1"], "limit": 1},
+      "expect": {"contains": ["doc:east"], "not_contains": ["doc:north"]}},
+    {"op": "search", "request": {"embeddings": {"dv_embedding_v1": [0.1, 0.9]}, "indexes": ["dv_embedding_v1"], "limit": 1},
+      "expect": {"contains": ["doc:north"], "not_contains": ["doc:east"]}}
+  ]
+}

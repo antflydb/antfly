@@ -30,7 +30,10 @@ class EnrichmentRuntimeStatus:
         processed_requests (int):
         error_count (int):
         retryable_error_count (int):
-        fatal_error_count (int):
+        fatal_error_count (int): Durable count of enrichment requests parked with a non-retryable (terminal)
+            disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document
+            terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document
+            diagnostics by the artifact repair issue listing.
         consecutive_retry_count (int): Consecutive durable worker retries for the current failed request window.
         next_retry_at_ms (int): Unix epoch time in milliseconds when the current durable retry becomes eligible. Zero
             when not retrying.

@@ -31,9 +31,8 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
 
     const target_tokens = if (cfg.target_tokens > 0) cfg.target_tokens else 500;
     const overlap_tokens = cfg.overlap_tokens;
-    const max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else 50;
+    const max_chunks = cfg.max_chunks; // 0 = unlimited (chunk the whole unit)
     const separator = if (cfg.separator.len > 0) cfg.separator else "\n\n";
-    if (overlap_tokens >= target_tokens) return error.InvalidChunkOverlap;
 
     var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
     defer tokenizer.deinitSelf();
@@ -66,7 +65,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
             try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
             previous_start = current.items[0].start;
             chunk_id += 1;
-            if (chunks.items.len >= max_chunks) return try chunks.toOwnedSlice(alloc);
+            if (max_chunks != 0 and chunks.items.len >= max_chunks) return try chunks.toOwnedSlice(alloc);
 
             previous_text = chunks.items[chunks.items.len - 1].text.?;
             current.clearRetainingCapacity();
@@ -95,7 +94,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: types.FixedTextConfig)
         });
     }
 
-    if (current.items.len > 0 and chunks.items.len < max_chunks) {
+    if (current.items.len > 0 and (max_chunks == 0 or chunks.items.len < max_chunks)) {
         try chunks.append(alloc, buildChunk(text, current.items, chunk_id));
     }
 
@@ -324,6 +323,15 @@ fn buildChunk(full_text: []const u8, sections: []const PositionedSection, chunk_
     return types.Chunk.initText(chunk_id, full_text[start..end], start, end);
 }
 
+/// Token count of `text` under the fixed chunker's own tokenizer, the same
+/// measure `target_tokens` is applied against.
+pub fn countTextTokens(alloc: Allocator, text: []const u8) !usize {
+    if (text.len == 0) return 0;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    return countTokens(alloc, tokenizer, text);
+}
+
 fn countTokens(alloc: Allocator, tokenizer: *HfTokenizer, text: []const u8) !usize {
     const ids = try tokenizer.tokenizer().encode(alloc, text);
     defer alloc.free(ids);
@@ -368,12 +376,46 @@ test "fixed text chunker splits by token target" {
     try std.testing.expectEqual(@as(?u32, 0), chunks[0].start_char);
 }
 
+test "fixed text chunker has no implicit max_chunks cap" {
+    const alloc = std.testing.allocator;
+    // 120 short paragraphs; at target_tokens=4 this produced exactly 50
+    // chunks (and silently dropped the rest) before the fix.
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    for (0..120) |i| {
+        try buf.print(alloc, "para{d} alpha beta gamma\n\n", .{i});
+    }
+    const chunks = try chunkText(alloc, buf.items, .{ .target_tokens = 4, .overlap_tokens = 0 });
+    defer alloc.free(chunks);
+    try std.testing.expect(chunks.len > 50);
+    // last chunk must reach (or nearly reach) the end of input — nothing silently dropped.
+    try std.testing.expect(chunks[chunks.len - 1].end_char.? > buf.items.len - 64);
+}
+
+test "fixed text chunker still honors an explicit max_chunks cap" {
+    const alloc = std.testing.allocator;
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(alloc);
+    for (0..120) |i| try buf.print(alloc, "para{d} alpha beta gamma\n\n", .{i});
+    const chunks = try chunkText(alloc, buf.items, .{ .target_tokens = 4, .overlap_tokens = 0, .max_chunks = 10 });
+    defer alloc.free(chunks);
+    try std.testing.expectEqual(@as(usize, 10), chunks.len);
+}
+
 test "fixed text chunker rejects invalid overlap" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidChunkOverlap, chunkText(alloc, "alpha beta", .{
+    try std.testing.expectError(error.InvalidChunkOverlapTokens, chunkText(alloc, "alpha beta", .{
         .target_tokens = 4,
         .overlap_tokens = 4,
     }));
+}
+
+test "fixed text token count measures unspaced CJK per character" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 0), try countTextTokens(alloc, ""));
+    try std.testing.expectEqual(@as(usize, 3), try countTextTokens(alloc, "alpha beta gamma"));
+    // Three CJK ideographs are three tokens, not one whitespace-delimited word.
+    try std.testing.expectEqual(@as(usize, 3), try countTextTokens(alloc, "東京館"));
 }
 
 test "token window fallback clamps to source bounds" {
@@ -398,7 +440,7 @@ test "fixed text overlap advances bounded chunks through mixed source text" {
     var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
     defer tokenizer.deinitSelf();
     const paragraph = "Korean HISTORY: Major Events (1950–1953), Seoul! Café, 日本語. Repeated WORDS; punctuation changes.\n\n";
-    const text = paragraph ** 80;
+    const text = z17RepeatString(paragraph, 80);
     const chunks = try chunkText(alloc, text, .{ .target_tokens = 200, .overlap_tokens = 25, .max_chunks = 200 });
     defer alloc.free(chunks);
     try std.testing.expect(chunks.len > 1 and chunks.len < 200);
@@ -518,5 +560,38 @@ test "fixed text chunker omits tokenizer empty sections" {
             try std.testing.expectEqual(@as(usize, 1), try countTokens(alloc, tokenizer, chunk.text.?));
             try std.testing.expectEqualStrings(text[chunk.start_char.?..chunk.end_char.?], chunk.text.?);
         }
+    }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
+}
+
+test "fixed text chunker counts unspaced CJK paragraphs per character" {
+    const alloc = std.testing.allocator;
+    var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
+    defer tokenizer.deinitSelf();
+    // #933: before the fix, a paragraph with no ASCII whitespace/punctuation
+    // was one giant "word" and became a single [UNK] token regardless of
+    // length, so 20 such paragraphs fit in one "256-token" chunk.
+    const para = "東京の図書館で本を読みました。今日は晴れています。";
+    var text = std.ArrayListUnmanaged(u8).empty;
+    defer text.deinit(alloc);
+    for (0..20) |i| {
+        if (i > 0) try text.appendSlice(alloc, "\n\n");
+        try text.appendSlice(alloc, para);
+    }
+    const chunks = try chunkText(alloc, text.items, .{ .target_tokens = 256, .overlap_tokens = 32, .max_chunks = 1000 });
+    defer alloc.free(chunks);
+    try std.testing.expect(chunks.len >= 3);
+    for (chunks) |chunk| {
+        try std.testing.expect(try countTokens(alloc, tokenizer, chunk.text.?) <= 256);
     }
 }

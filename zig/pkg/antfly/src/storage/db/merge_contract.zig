@@ -50,12 +50,23 @@ pub const State = struct {
     }
 };
 
+/// One native apply-lock snapshot, served only through the authenticated,
+/// metadata-scoped transition read-index boundary.
+pub const CopyReceipt = struct {
+    namespace: doc_identity.Namespace,
+    range: db_types.ByteRange,
+    state: ?State,
+    /// Positive native proof: document rows with no independently authored
+    /// artifacts or coordinated constraints. Missing proof never permits reuse.
+    row_derived_document: bool = false,
+};
+
 pub fn encode(
     list: *std.ArrayListUnmanaged(u8),
     alloc: std.mem.Allocator,
     state: State,
 ) !void {
-    try list.append(alloc, @intFromEnum(state.phase));
+    try list.append(alloc, @backingInt(state.phase));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.donor_group_id)));
     try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.receiver_group_id)));
     const start_len: u32 = @intCast(state.receiver_base_range.start.len);
@@ -98,8 +109,8 @@ pub fn encode(
 pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
     if (data.len < 1 + 8 + 8 + 4 + 4) return error.InvalidMergeState;
     var pos: usize = 0;
-    if (data[pos] > @intFromEnum(Phase.rolled_back)) return error.InvalidMergeState;
-    const phase: Phase = @enumFromInt(data[pos]);
+    if (data[pos] > @backingInt(Phase.rolled_back)) return error.InvalidMergeState;
+    const phase: Phase = @fromBackingInt(data[pos]);
     pos += 1;
     const donor_group_id = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += 8;
@@ -218,6 +229,9 @@ pub fn decodeAlloc(alloc: std.mem.Allocator, data: []const u8) !State {
 pub const ApplyPlan = struct {
     state: State,
     range: db_types.ByteRange,
+    /// Only an admitted transition may apply checkpoint side effects. Replayed
+    /// or fenced controls retain the receipt without changing derived metadata.
+    applies_checkpoint: bool = true,
     owned_retired_ids: ?[]u64 = null,
 
     pub fn deinit(self: ApplyPlan, alloc: std.mem.Allocator) void {
@@ -294,7 +308,7 @@ pub fn planCheckpointApply(
 
     const prior = existing.?;
     if (isRetired(prior.*, checkpoint.transition_id))
-        return .{ .state = prior.*, .range = current_range };
+        return .{ .state = prior.*, .range = current_range, .applies_checkpoint = false };
     // Both terminal outcomes release the receiver for a fresh transition.
     // Retain retired identities so delayed accepts cannot resurrect them.
     if ((prior.phase == .rolled_back or prior.phase == .finalized) and
@@ -345,14 +359,14 @@ pub fn planCheckpointApply(
         if (checkpoint.copy_attempt.donor_term == 0 or checkpoint.copy_attempt.sequence == 0)
             return error.InvalidMergeCheckpoint;
         if (prior.phase != .accepting or checkpoint.copy_attempt.order(prior.copy_attempt) != .gt)
-            return .{ .state = prior.*, .range = current_range };
+            return .{ .state = prior.*, .range = current_range, .applies_checkpoint = false };
         return .{
             .state = advanceState(prior, checkpoint, .accepting, false, 0),
             .range = merged,
         };
     }
     if (checkpoint.kind != .accept and checkpoint.copy_attempt.order(prior.copy_attempt) != .eq)
-        return .{ .state = prior.*, .range = current_range };
+        return .{ .state = prior.*, .range = current_range, .applies_checkpoint = false };
 
     switch (checkpoint.kind) {
         .begin_copy => unreachable,
@@ -508,7 +522,7 @@ fn preserveAdvanced(
         .start = checkpoint.merged_start,
         .end = checkpoint.merged_end,
     };
-    return .{ .state = state, .range = range };
+    return .{ .state = state, .range = range, .applies_checkpoint = false };
 }
 
 fn optionalNamespaceEqual(

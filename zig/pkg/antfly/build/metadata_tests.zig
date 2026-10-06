@@ -39,6 +39,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const backup_cohort_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "backup cohort", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-backup-cohort-test", "Run durable backup cohort admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, backup_cohort_tests).step);
+    const restore_staging_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "relational integrity restore staging", "restore staging authority", "graph retirement digest", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-restore-staging-test", "Run atomic hidden restore target publication contracts").dependOn(&addFilteredTestRunArtifact(b, restore_staging_tests).step);
+    const relational_topology_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "relational integrity metadata topology", "relational topology admission", "metadata raft apply store transition codec", "initializes one durable snapshotted cluster incarnation", "metadata incarnation rejects unsupported", "fences transition identity and active removal", "metadata reconciler publishes table contracts", "atomically fences table replacement during a range transition", "metadata.table storage extension", "standalone metadata", "metadata table topology protocol", "store-root enrollment status is an admin-bound read", "metadata lifecycle reconciles hidden generation", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-relational-topology-test", "Run distributed integrity topology capability and admission contracts").dependOn(&addFilteredTestRunArtifact(b, relational_topology_tests).step);
+    const store_root_signing_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{
+            "store-root readiness returns only an exact durable v17 activation",
+            "store registration preserves physical replica root identity",
+            "store root readiness accepts only authenticated complete decoder proof",
+            "store-root enrollment status is a body-bound admin read and preserves absent identity",
+            "metadata server can expose admin listener endpoints",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-metadata-store-root-signing-test", "Run v18 store-root signing decoder, registration, and readiness admission contracts").dependOn(&addFilteredTestRunArtifact(b, store_root_signing_tests).step);
 
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = antfly_test_mod,
@@ -101,6 +131,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "metadata VOPR merge runtime records doc identity reassignment opt-in",
         "metadata VOPR http cluster drives table placement convergence",
         "metadata VOPR http cluster drives split intent through the control loop",
+        "metadata VOPR recovery skips an isolated candidate",
     };
     const lib_metadata_vopr_virtual_smoke_tests = b.addTest(.{
         .root_module = antfly_test_mod,

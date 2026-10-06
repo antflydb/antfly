@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const rowsource = @import("../../storage/rowsource/types.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const SidecarKind = enum(u8) {
     text = 1,
@@ -39,7 +39,7 @@ pub const RowRefKind = enum(u8) {
 pub const RowRefContext = struct {
     pub fn hash(_: RowRefContext, row_ref: rowsource.RowRef) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        const tag: u8 = @intFromEnum(std.meta.activeTag(row_ref));
+        const tag: u8 = @backingInt(std.meta.activeTag(row_ref));
         hasher.update(std.mem.asBytes(&tag));
         switch (row_ref) {
             .relational_key => |key| hashBytes(&hasher, key),

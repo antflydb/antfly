@@ -105,7 +105,7 @@ const ScratchBudget = struct {
     max_bytes: usize,
     live_bytes: std.atomic.Value(usize) = .init(0),
     peak_bytes: std.atomic.Value(usize) = .init(0),
-    rejections: std.atomic.Value(u64) = .init(0),
+    rejections: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     fn reserve(self: *ScratchBudget, bytes: usize) bool {
         var observed = self.live_bytes.load(.acquire);
@@ -262,13 +262,13 @@ pub const Executor = struct {
     space_available: Io.Condition = .init,
     scratch_budget: ScratchBudget,
     retained_scratch_bytes_per_worker: usize,
-    submitted_jobs: std.atomic.Value(u64) = .init(0),
-    completed_jobs: std.atomic.Value(u64) = .init(0),
+    submitted_jobs: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    completed_jobs: @import("antfly_platform").atomic.Value(u64) = .init(0),
     peak_queued_jobs: std.atomic.Value(usize) = .init(0),
     active_jobs: std.atomic.Value(usize) = .init(0),
     peak_active_jobs: std.atomic.Value(usize) = .init(0),
-    scratch_resets: std.atomic.Value(u64) = .init(0),
-    job_scratch_limit_rejections: std.atomic.Value(u64) = .init(0),
+    scratch_resets: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    job_scratch_limit_rejections: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: Allocator, options: Options) !*Executor {
         if (options.worker_count == 0 or options.queue_capacity == 0 or
@@ -490,8 +490,8 @@ test "bounded worker lane caps aggregate scratch and handles concurrent submitte
     var capture = Capture{};
     const caller_count = 4;
     const jobs_per_caller = 4;
-    var contexts = [_]*anyopaque{@ptrCast(&capture)} ** jobs_per_caller;
-    var failures = [_]?anyerror{null} ** caller_count;
+    var contexts = @as([jobs_per_caller]*anyopaque, @splat(@ptrCast(&capture)));
+    var failures = @as([caller_count]?anyerror, @splat(null));
     var threads: [caller_count]std.Thread = undefined;
     for (&threads, &failures) |*thread, *failure| thread.* = try std.Thread.spawn(.{}, struct {
         fn run(target: *Executor, items: []const *anyopaque, result: *?anyerror) void {
@@ -563,12 +563,12 @@ test "bounded worker lane drains partial enqueue before reporting close" {
         fn run(context: *anyopaque, _: Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             _ = self.started.fetchAdd(1, .monotonic);
-            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
             _ = self.completed.fetchAdd(1, .monotonic);
         }
     };
     var capture = Capture{};
-    var contexts = [_]*anyopaque{@ptrCast(&capture)} ** 32;
+    var contexts = @as([32]*anyopaque, @splat(@ptrCast(&capture)));
     var failure: ?anyerror = null;
     const submitter = try std.Thread.spawn(.{}, struct {
         fn run(target: *Executor, items: []const *anyopaque, result: *?anyerror) void {
@@ -578,7 +578,7 @@ test "bounded worker lane drains partial enqueue before reporting close" {
             };
         }
     }.run, .{ executor, &contexts, &failure });
-    while (capture.started.load(.acquire) == 0) std.Thread.yield() catch {};
+    while (capture.started.load(.acquire) == 0) @import("antfly_platform").time.yieldNow();
     executor.close();
     capture.release.store(true, .release);
     submitter.join();

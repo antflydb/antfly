@@ -24,7 +24,7 @@ fn check(step: *std.Build.Step, visited: *std.AutoHashMap(*std.Build.Step, void)
                 @panic("VOPR command build includes unrelated unit tests");
         }
     }
-    if (step.id == .compile or step.id == .run) {
+    if (step.tag == .compile or step.tag == .run) {
         if (step.max_rss == 0) std.debug.panic("unbudgeted VOPR work: {s}", .{step.name});
         if (step.max_rss > 22 * 1024 * 1024 * 1024)
             std.debug.panic("VOPR work exceeds workflow memory cap: {s}", .{step.name});

@@ -86,10 +86,10 @@ fn lockStore(store: *docstore.Store) void {
     platform_sync.lockYielding(&store.mutex);
 }
 
-fn pinCheckpoint(store: *docstore.Store) native.CheckpointSlot {
-    lockStore(store);
-    defer store.mutex.unlock();
-    return store.file.activeCheckpoint();
+fn pinSnapshot(store: *docstore.Store) !docstore.Txn {
+    // The generation lock fences replacement; this pin additionally fences
+    // in-place reuse for the entire metadata/value read or cursor traversal.
+    return store.beginRead();
 }
 
 fn pathContains(prefix: []const u8, path: []const u8) bool {
@@ -119,7 +119,9 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     return (try self.docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(allocator, path, max_bytes, checkpoint)) orelse error.FileNotFound;
 }
@@ -130,7 +132,9 @@ fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, o
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     return (try self.docs.file.getIndexCatalogRecordRangeAtCheckpointAlloc(allocator, path, offset, len, checkpoint)) orelse return error.FileNotFound;
 }
@@ -141,7 +145,9 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     return @intCast(size);
@@ -153,7 +159,9 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
 
     const size = (try self.docs.file.getIndexCatalogRecordSizeAtCheckpoint(path, checkpoint)) orelse return error.FileNotFound;
     if (size < len) return error.EndOfStream;
@@ -252,7 +260,7 @@ const CatalogDeleteBatch = struct {
         self.key_bytes = 0;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.clear();
         self.mutations.deinit(self.allocator);
     }
@@ -305,7 +313,9 @@ fn listFileNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8) !
     const io = self.docs.file.runtime();
     self.docs.generation_lock.lockSharedUncancelable(io);
     defer self.docs.generation_lock.unlockShared(io);
-    const checkpoint = pinCheckpoint(self.docs);
+    var snapshot = try pinSnapshot(self.docs);
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
     const prefix = if (std.mem.eql(u8, directory, "/"))
         try allocator.dupe(u8, "/")
     else
@@ -410,7 +420,7 @@ const NativeAtomicWriteSink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn deinit(self: *NativeAtomicWriteSink) void {
+    pub fn deinit(self: *NativeAtomicWriteSink) void {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
         if (self.tmp_path) |path| {
@@ -461,27 +471,45 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
+        var zig017_return_error: ?anyerror = null;
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.failure) |err| return err;
-        if (bytes.len > std.math.maxInt(u32) - len(ptr)) return error.RecordTooLarge;
-        errdefer |err| self.failure = err;
+        if (bytes.len > std.math.maxInt(u32) - len(ptr)) return zig017_failure: {
+            zig017_return_error = error.RecordTooLarge;
+            break :zig017_failure error.RecordTooLarge;
+        };
+        errdefer {
+            if (zig017_return_error) |err| self.failure = err;
+        }
         var offset: usize = 0;
         while (offset < bytes.len) {
             const n = @min(self.buffer.len - self.buffered, bytes.len - offset);
             @memcpy(self.buffer[self.buffered..][0..n], bytes[offset..][0..n]);
             self.buffered += n;
             offset += n;
-            if (self.buffered == self.buffer.len) try self.flush();
+            if (self.buffered == self.buffer.len) (self.flush() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
+        var zig017_return_error: ?anyerror = null;
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.failure) |err| return err;
-        if (offset > len(ptr) or bytes.len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
-        errdefer |err| self.failure = err;
+        if (offset > len(ptr) or bytes.len > len(ptr) - offset) return zig017_failure: {
+            zig017_return_error = error.InvalidAtomicWriteOffset;
+            break :zig017_failure error.InvalidAtomicWriteOffset;
+        };
+        errdefer {
+            if (zig017_return_error) |err| self.failure = err;
+        }
         const on_disk = if (offset < self.persisted) @min(bytes.len, self.persisted - offset) else 0;
-        if (on_disk > 0) try self.file.?.writePositionalAll(self.storage.docs.file.runtime(), bytes[0..on_disk], offset);
+        if (on_disk > 0) (self.file.?.writePositionalAll(self.storage.docs.file.runtime(), bytes[0..on_disk], offset) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (on_disk < bytes.len) @memcpy(self.buffer[offset + on_disk - self.persisted ..][0 .. bytes.len - on_disk], bytes[on_disk..]);
     }
 
@@ -490,18 +518,30 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        var zig017_return_error: ?anyerror = null;
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.failure) |err| return err;
-        if (offset > len(ptr) or range_len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
-        errdefer |err| self.failure = err;
+        if (offset > len(ptr) or range_len > len(ptr) - offset) return zig017_failure: {
+            zig017_return_error = error.InvalidAtomicWriteOffset;
+            break :zig017_failure error.InvalidAtomicWriteOffset;
+        };
+        errdefer {
+            if (zig017_return_error) |err| self.failure = err;
+        }
         var crc = Crc32.init();
         var scratch: [buffer_size]u8 = undefined;
         var pos = offset;
         const end = offset + range_len;
         while (pos < @min(end, self.persisted)) {
             const n = @min(scratch.len, @min(end, self.persisted) - pos);
-            if (try self.file.?.readPositionalAll(self.storage.docs.file.runtime(), scratch[0..n], pos) != n)
-                return error.EndOfStream;
+            if ((self.file.?.readPositionalAll(self.storage.docs.file.runtime(), scratch[0..n], pos) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            }) != n)
+                return zig017_failure: {
+                    zig017_return_error = error.EndOfStream;
+                    break :zig017_failure error.EndOfStream;
+                };
             crc.update(scratch[0..n]);
             pos += n;
         }
@@ -554,6 +594,8 @@ test "lite native repeated WAL reset does not publish unchanged control records"
     defer allocator.free(path);
     var docs = try docstore.Store.create(allocator, path, true);
     defer docs.close();
+    // Isolate WAL publication from independent allocator service checkpoints.
+    docs.maintenance_cancel.request();
     var indexes = Store.init(allocator, &docs);
     const storage = indexes.storage();
     const root = "/indexes/test";
@@ -769,7 +811,7 @@ test "lite native index storage handles large files rename and delete tree" {
     defer allocator.free(large);
     for (large, 0..) |*byte, i| byte.* = @intCast(i % 251);
 
-    var docs = try docstore.Store.create(allocator, path, true);
+    var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .reclamation = .{ .page_reuse = false } });
     defer docs.close();
     var index_store = Store.init(allocator, &docs);
     const storage = index_store.storage();
@@ -915,7 +957,7 @@ test "lite native index storage recovers previous checkpoint after interrupted u
     defer allocator.free(path);
 
     {
-        var docs = try docstore.Store.create(allocator, path, true);
+        var docs = try docstore.Store.createWithOptions(allocator, path, .{ .exclusive = true, .reclamation = .{ .page_reuse = false } });
         defer docs.close();
         var index_store = Store.init(allocator, &docs);
         const storage = index_store.storage();
@@ -979,8 +1021,10 @@ test "lite native directory operations seek bounded prefixes independent of cata
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");
     defer alloc.free(path);
-    var docs = try docstore.Store.create(alloc, path, true);
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .exclusive = true, .reclamation = .{ .retirement_work_pages = 1 } });
     defer docs.close();
+    // Isolate query I/O from background retirement; foreground reuse stays on.
+    docs.maintenance_cancel.request();
     var indexes = Store.init(alloc, &docs);
     const storage = indexes.storage();
     for (0..1000) |i| {
@@ -1013,7 +1057,7 @@ test "lite native directory operations seek bounded prefixes independent of cata
     try std.testing.expectError(error.FileNotFound, storage.fileSize("/a/sub/two"));
     try std.testing.expectEqual(@as(u64, 8), try storage.fileSize("/a-other/keep"));
     try std.testing.expectEqual(@as(u64, 1), try storage.fileSize("/unrelated/00000000"));
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 test "lite native staged atomic writes bound heap and survive concurrent commits and vacuum" {
@@ -1027,7 +1071,7 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     for (expected, 0..) |*byte, i| byte.* = @intCast(i % 251);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = alloc, .limit = 512 * 1024 };
     {
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
@@ -1080,7 +1124,7 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
         try std.testing.expectEqualSlices(u8, expected, actual);
         // Full integrity checking maintains a separate page reachability set.
         budget.limit = std.math.maxInt(usize);
-        try std.testing.expect((try docs.file.check()).valid);
+        try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     var reopened = try docstore.Store.open(alloc, path, true);
@@ -1134,7 +1178,7 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
     const value = try storage.readFileAlloc(alloc, "/stable", bytes.len);
     defer alloc.free(value);
     try std.testing.expectEqualSlices(u8, &bytes, value);
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
 
 test "lite native atomic writes spill with long database basenames" {
@@ -1143,7 +1187,7 @@ test "lite native atomic writes spill with long database basenames" {
     defer tmp.cleanup();
     // Valid under NAME_MAX=255, including the writer lock's .lock suffix.
     // Appending the former 50-byte staging suffix would exceed that limit.
-    const name = "x" ** 213 ++ ".aflite";
+    const name = z17RepeatString("x", 213) ++ ".aflite";
     const path = try testPath(alloc, tmp, name);
     defer alloc.free(path);
     const bytes: [128 * 1024 + 17]u8 = @splat('s');
@@ -1196,7 +1240,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         defer hot_pages.deinit(alloc);
         var cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
+            if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
         }
         try std.testing.expect(hot_pages.items.len > 0);
 
@@ -1215,7 +1259,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
             cached = docs.file.page_cache.pages.iterator();
             var payload_pages: usize = 0;
             while (cached.next()) |entry| {
-                if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+                if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
             try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
@@ -1233,7 +1277,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         var payload_pages: usize = 0;
         cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+            if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
         }
         try std.testing.expect(payload_pages > hot_pages.items.len);
         for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
@@ -1270,7 +1314,9 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
         for ([_][]const u8{ "/a", "/a/sub", "/a/sub.", "/a/sub0", "/a/submarine", "/a/other0", "/a/z", "/top" }) |key|
             try mutations.append(scratch, .{ .key = key, .value = "direct" });
         try docs.file.putIndexCatalogBatch(mutations.items);
-        const pinned = docs.file.activeCheckpoint();
+        var snapshot = try docs.beginRead();
+        defer snapshot.abort();
+        const pinned = snapshot.checkpoint;
         const reads = docs.file.test_page_reads.load(.monotonic);
         const names = try storage.listFileNamesAlloc(alloc, "/a/");
         defer StorageIo.freeFileNames(alloc, names);
@@ -1316,7 +1362,7 @@ test "lite native atomic imports batch writes and preserve publication on failed
     defer alloc.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1445,6 +1491,8 @@ test "lite index read limits reject from pinned metadata before payload allocati
     defer a.free(path);
     var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
     defer docs.close();
+    // Isolate query I/O accounting from background reclamation; foreground reuse remains enabled.
+    docs.maintenance_cancel.request();
     docs.file.page_cache_enabled.store(false, .monotonic);
     const large = try a.alloc(u8, 4 * 1024 * 1024);
     defer a.free(large);
@@ -1462,7 +1510,9 @@ test "lite index read limits reject from pinned metadata before payload allocati
     budget.allocator().free(empty);
     try std.testing.expectEqual(@as(usize, 0), budget.peak);
     try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 16);
-    const checkpoint = docs.file.activeCheckpoint();
+    var snapshot = try docs.beginRead();
+    defer snapshot.abort();
+    const checkpoint = snapshot.checkpoint;
     try docs.file.putIndexCatalogRecord("/scope/large", "short");
     try std.testing.expectError(error.FileTooBig, docs.file.getIndexCatalogRecordLimitedAtCheckpointAlloc(budget.allocator(), "/scope/large", 1024, checkpoint));
     budget.limit = std.math.maxInt(usize);
@@ -1487,7 +1537,7 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-delete.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1522,7 +1572,7 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         const neighbor = (try docs.file.getIndexCatalogRecordAlloc(a, "/scope-other/keep")).?;
         defer a.free(neighbor);
         try std.testing.expectEqualStrings("neighbor", neighbor);
-        try std.testing.expect((try docs.file.check()).valid);
+        try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
 }
 
@@ -1532,7 +1582,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delete-rollback.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
     defer docs.close();
     docs.file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1553,7 +1603,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
     try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
     try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
     const retained = (try docs.file.getIndexCatalogRecordAlloc(a, mutations[0].key)).?;
     defer a.free(retained);
     try std.testing.expectEqualStrings("original", retained);
@@ -1568,12 +1618,23 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
         try std.testing.expectError(error.OutOfMemory, result);
         try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
         try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
-        try std.testing.expect((try docs.file.check()).valid);
+        try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
     try store.storage().deleteTree("/scope");
     try std.testing.expectEqual(pinned.commit_sequence + 1, docs.file.activeCheckpoint().commit_sequence);
     var cursor = try docs.file.indexCatalogCursor(docs.file.activeCheckpoint(), "/scope/");
     defer cursor.deinit();
     try std.testing.expect((try cursor.next()) == null);
-    try std.testing.expect((try docs.file.check()).valid);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

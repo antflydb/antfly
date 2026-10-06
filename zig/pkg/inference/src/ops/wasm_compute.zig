@@ -231,7 +231,7 @@ const WasmBuf = struct {
         return buf;
     }
 
-    fn deinit(self: *WasmBuf) void {
+    pub fn deinit(self: *WasmBuf) void {
         if (self.owned or self.owned_weight_data) {
             self.allocator.free(self.data);
         }
@@ -374,7 +374,7 @@ const DotGpuInput = struct {
         return .{ .id = id, .owned = true };
     }
 
-    fn deinit(self: DotGpuInput, gpu: anytype) void {
+    pub fn deinit(self: DotGpuInput, gpu: anytype) void {
         if (self.owned) gpu.freeBuffer(self.id);
     }
 };
@@ -417,7 +417,7 @@ const GpuWeightStore = struct {
         };
     }
 
-    fn deinit(self: *GpuWeightStore) void {
+    pub fn deinit(self: *GpuWeightStore) void {
         var it = self.buffers.valueIterator();
         while (it.next()) |gpu_buf| {
             wasm_extern.freeBuffer(gpu_buf.*);
@@ -524,7 +524,7 @@ const GpuTensor = struct {
         wasm_extern.download(self.id, @as([*]u8, @ptrCast(out.ptr))[0..byte_len]);
     }
 
-    fn deinit(self: *GpuTensor) void {
+    pub fn deinit(self: *GpuTensor) void {
         wasm_extern.freeBuffer(self.id);
         self.id = 0;
     }
@@ -548,7 +548,7 @@ const GpuInputTensor = struct {
         return .{ .id = tensor.detach(), .owned = true };
     }
 
-    fn deinit(self: *GpuInputTensor) void {
+    pub fn deinit(self: *GpuInputTensor) void {
         if (self.owned) {
             wasm_extern.freeBuffer(self.id);
         }
@@ -691,7 +691,7 @@ fn isGpuReduceCompatible(axes: []const u8, input_shape: []const i64) bool {
     for (input_shape) |dim| {
         if (dim <= 0) return false;
     }
-    var seen = [_]bool{false} ** 8;
+    var seen = @as([8]bool, @splat(false));
     for (axes) |ax| {
         if (ax >= rank or seen[ax]) return false;
         seen[ax] = true;
@@ -707,7 +707,7 @@ fn isGpuBroadcastInDimCompatible(target_shape: []const i64, broadcast_axes: []co
     const out_rank = target_shape.len;
     const in_rank = input_shape.len;
     if (out_rank == 0 or out_rank > 8 or in_rank > 8 or broadcast_axes.len != in_rank) return false;
-    var seen = [_]bool{false} ** 8;
+    var seen = @as([8]bool, @splat(false));
     for (target_shape) |dim| {
         if (dim <= 0) return false;
     }
@@ -1108,6 +1108,13 @@ pub const WasmCompute = struct {
             .F16 => {
                 buf.f16_data = try self.allocator.alloc(f16, count);
                 @memcpy(std.mem.sliceAsBytes(buf.f16_data.?), raw);
+            },
+            .BF16 => {
+                // CPU fallback for current OpenDecider imports. Preserve the
+                // exact BF16 value in F32; no lossy conversion through F16.
+                buf.data = try self.allocator.alloc(f32, count);
+                buf.owned_weight_data = true;
+                for (buf.data, 0..) |*value, i| value.* = @bitCast(@as(u32, std.mem.readInt(u16, raw[i * 2 ..][0..2], .little)) << 16);
             },
             .Q8_0, .Q4_0, .Q4_K => {
                 buf.quant_raw = try self.allocator.dupe(u8, raw);
@@ -4082,13 +4089,13 @@ pub const WasmCompute = struct {
     ) GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
-        var input_u32 = [_]u32{1} ** 8;
-        var output_u32 = [_]u32{1} ** 8;
-        var reduced = [_]u32{0} ** 8;
-        var in_strides = [_]u32{1} ** 8;
-        var out_strides = [_]u32{1} ** 8;
-        var kept_axes = [_]u32{0} ** 8;
-        var reduced_axes = [_]u32{0} ** 8;
+        var input_u32 = @as([8]u32, @splat(1));
+        var output_u32 = @as([8]u32, @splat(1));
+        var reduced = @as([8]u32, @splat(0));
+        var in_strides = @as([8]u32, @splat(1));
+        var out_strides = @as([8]u32, @splat(1));
+        var kept_axes = @as([8]u32, @splat(0));
+        var reduced_axes = @as([8]u32, @splat(0));
 
         for (input_shape, 0..) |dim, i| input_u32[i] = @intCast(dim);
         for (out_shape, 0..) |dim, i| output_u32[i] = @intCast(dim);
@@ -4133,11 +4140,11 @@ pub const WasmCompute = struct {
     ) GpuTensor {
         if (!build_options.enable_webgpu) unreachable;
 
-        var target_u32 = [_]u32{1} ** 8;
-        var input_u32 = [_]u32{1} ** 8;
-        var axes_u32 = [_]u32{0} ** 8;
-        var out_strides = [_]u32{1} ** 8;
-        var in_strides = [_]u32{1} ** 8;
+        var target_u32 = @as([8]u32, @splat(1));
+        var input_u32 = @as([8]u32, @splat(1));
+        var axes_u32 = @as([8]u32, @splat(0));
+        var out_strides = @as([8]u32, @splat(1));
+        var in_strides = @as([8]u32, @splat(1));
 
         for (target_shape, 0..) |dim, i| target_u32[i] = @intCast(dim);
         for (input_shape, 0..) |dim, i| input_u32[i] = @intCast(dim);
@@ -4525,13 +4532,8 @@ pub const WasmCompute = struct {
             var out_gpu = gpuUnary(a_gpu.id, output, .erf);
             return fromBuf(try copyBufShape(WasmBuf.fromSliceWithGpu(self.allocator, output, true, out_gpu.detach(), true), a_buf));
         }
-        // Abramowitz & Stegun approximation (max error ~1.5e-7)
         for (a_data, 0..) |v, i| {
-            const x = @abs(v);
-            const t = 1.0 / (1.0 + 0.3275911 * x);
-            const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-            const result = 1.0 - poly * @exp(-x * x);
-            output[i] = if (v >= 0) result else -result;
+            output[i] = erfApprox(v);
         }
         return fromBuf(try copyBufShape(WasmBuf.fromSlice(self.allocator, output, true), a_buf));
     }
@@ -4623,7 +4625,7 @@ pub const WasmCompute = struct {
         // Compute output shape (remove reduced axes).
         var out_shape_buf: [8]i64 = undefined;
         var out_rank: usize = 0;
-        var is_reduced = [_]bool{false} ** 8;
+        var is_reduced = @as([8]bool, @splat(false));
         for (axes) |ax| is_reduced[ax] = true;
         for (0..rank) |d| {
             if (!is_reduced[d]) {
@@ -5198,9 +5200,21 @@ pub const WasmCompute = struct {
 
     fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
-        const a_data = toBuf(a).data;
-        const b_data = toBuf(b).data;
         const rank = a_shape.len;
+        if (rank == 0 or rank > 8 or b_shape.len != rank or axis >= rank) return error.InvalidTensorShape;
+        for (a_shape, b_shape, 0..) |left, right, d| {
+            if (left < 0 or right < 0 or (d != axis and left != right)) return error.InvalidTensorShape;
+        }
+        // Packed Laya joins its FP16 type embedding with F32 activations.
+        // A packed weight has no `.data`; resolve its precision (and any GPU
+        // readback) before indexing, without changing the retained weight.
+        const a_view = try toBuf(a).viewF32(self.allocator);
+        defer if (a_view.allocated) self.allocator.free(a_view.data);
+        const b_view = try toBuf(b).viewF32(self.allocator);
+        defer if (b_view.allocated) self.allocator.free(b_view.data);
+        const a_data = a_view.data;
+        const b_data = b_view.data;
+        if (a_data.len != shapeNumel(a_shape) or b_data.len != shapeNumel(b_shape)) return error.InvalidTensorShape;
 
         // Compute output shape.
         var out_shape: [8]i64 = undefined;
@@ -5423,7 +5437,7 @@ pub const WasmCompute = struct {
 
 test {
     _ = @import("wasm_compute_test.zig");
-    _ = @import("wasm_e2e_test.zig");
+    _ = @import("wasm_integration_test.zig");
 }
 
 test "wasm_compute: acquired weights preserve independent identity and shared residency" {
@@ -5692,8 +5706,8 @@ test "wasm_compute: activation dot GPU ignores stale mirrors and reused RHS iden
     defer gpu.freeBuffer(a_id);
     const b_id = gpu.put(&.{ 1, 0, -1, 2, 1, 0 });
     defer gpu.freeBuffer(b_id);
-    var a_mirror = [_]f32{std.math.nan(f32)} ** 6;
-    var b_mirror = [_]f32{std.math.nan(f32)} ** 6;
+    var a_mirror = @as([6]f32, @splat(std.math.nan(f32)));
+    var b_mirror = @as([6]f32, @splat(std.math.nan(f32)));
     var a = WasmBuf{ .allocator = allocator, .data = &a_mirror, .len = 6, .owned = false, .gpu_tensor = a_id, .host_data_valid = false };
     var b = WasmBuf{ .allocator = allocator, .data = &b_mirror, .len = 6, .owned = false, .gpu_tensor = b_id, .host_data_valid = false };
     const plan = try Dot2D.init(&.{ 2, 3 }, &.{ 2, 3 }, 1, 1, 6, 6);
@@ -5729,7 +5743,7 @@ test "wasm_compute: activation dot temporary uploads roll back device allocation
     var gpu = DotTestGpu{};
     const a_id = gpu.put(&.{ 1, 2, 3, 4, 5, 6 });
     defer gpu.freeBuffer(a_id);
-    var a_mirror = [_]f32{std.math.nan(f32)} ** 6;
+    var a_mirror = @as([6]f32, @splat(std.math.nan(f32)));
     var rhs_values = [_]f32{ 1, 2, 0, 1, -1, 0 };
     var a = WasmBuf{ .allocator = allocator, .data = &a_mirror, .len = 6, .owned = false, .gpu_tensor = a_id, .host_data_valid = false };
     var b = WasmBuf{ .allocator = allocator, .data = &rhs_values, .len = 6, .owned = false };
@@ -5808,4 +5822,18 @@ test "wasm_compute: ModernBERT CPU fallbacks reject unavailable host mirrors" {
     try std.testing.expectError(error.HostTensorUnavailable, WasmCompute.ropeOp(&compute, input, 1, 2, 2, 10000, 1, 0, false));
     try std.testing.expectError(error.HostTensorUnavailable, WasmCompute.scaledDotProductAttentionOp(&compute, input, input, input, &.{1}, null, 1, 1, 1, 2));
     try std.testing.expectError(error.HostTensorUnavailable, WasmCompute.linearNoBiasOp(&compute, input, input, 1, 2, 1));
+}
+
+fn erfApprox(x: f32) f32 {
+    const a1: f32 = 0.254829592;
+    const a2: f32 = -0.284496736;
+    const a3: f32 = 1.421413741;
+    const a4: f32 = -1.453152027;
+    const a5: f32 = 1.061405429;
+    const p: f32 = 0.3275911;
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + p * ax);
+    const poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t;
+    return sign * (1.0 - poly * @exp(-ax * ax));
 }

@@ -25,7 +25,9 @@ T = TypeVar("T", bound="QueryBuilderResult")
 class QueryBuilderResult:
     """
     Attributes:
-        query (QueryBuilderResultQuery): Generated search query in native Bleve format.
+        query (QueryBuilderResultQuery): Generated search query in Antfly's native full-text query format (a Bleve-
+            compatible
+            JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
             Can be used directly in QueryRequest.full_text_search or filter_query.
              Example: {'conjuncts': [{'match': 'machine learning', 'field': 'content'}, {'term': 'published', 'field':
             'status'}]}.

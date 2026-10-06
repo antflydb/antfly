@@ -83,6 +83,7 @@ pub const TransitionDriver = struct {
         runtime: TransitionRuntime,
         record: *transition_state.MergeTransitionRecord,
     ) !StepResult {
+        if (record.online != null) return error.OnlineMergeUnavailable;
         const observation = try runtime.observeMerge(record.*);
         return try stepMergeObserved(runtime, record, observation);
     }
@@ -92,6 +93,7 @@ pub const TransitionDriver = struct {
         record: *transition_state.MergeTransitionRecord,
         observation: transition_state.MergeObservation,
     ) !StepResult {
+        if (record.online != null) return error.OnlineMergeUnavailable;
         const decision = transition_controller.TransitionController.planMerge(record.*, observation);
         try runtime.execute(decision.action);
         record.phase = decision.next_phase;
@@ -110,7 +112,7 @@ test "metadata transition driver steps split and merge through runtime interface
         merge_phase: transition_state.TransitionPhase = .prepare,
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }

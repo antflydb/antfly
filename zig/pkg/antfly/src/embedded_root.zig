@@ -37,6 +37,7 @@ pub const query = @import("api/query.zig");
 pub const query_contract = @import("api/query_contract.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
+pub const full_text_index_defaults = @import("common/full_text_index_defaults.zig");
 
 test {
     _ = backend_adapter;
@@ -61,7 +62,11 @@ test {
     _ = query_contract;
     _ = backup_codec;
     _ = portable_backup;
+    _ = full_text_index_defaults;
 }
 
 /// Implementation source choices for this compilation root.
-pub const antfly_sources = @import("source_owner_physical.zig");
+pub const antfly_sources = if (@import("builtin").os.tag == .freestanding)
+    @import("source_owner_embedded_db.zig")
+else
+    @import("source_owner_storage.zig");

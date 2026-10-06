@@ -51,6 +51,7 @@ pub const Update = struct {
         if (self.telemetry_only and (self.base == null or self.report.group_statuses.len != 0 or self.report.runtime_statuses.len != 0 or self.removed_groups.len != 0)) return error.InvalidStoreReporterFence;
         if (self.version != 1 or self.sequence == 0 or self.report.reporter_incarnation == 0 or self.report.runtime_reference) return error.InvalidStoreReporterFence;
         if (self.report.store_id == 0) return error.InvalidNodeID;
+        if (self.report.relational_topology_protocol_version > metadata.relational_topology_protocol_version) return error.InvalidStoreReporterFence;
         if (!metadata.reporterFenceValid(self.report.reporter_incarnation, self.report.status_generation) or
             !metadata.embeddingActivityReportValid(self.report.reporter_incarnation, self.report.embedding_activity_protocol_version, self.report.embedding_activity_sequence) or
             !metadata.embeddingActivitySamplesValid(self.report.embedding_activity_protocol_version, self.report.runtime_statuses) or
@@ -144,8 +145,8 @@ fn diff(a: std.mem.Allocator, previous: *const Publisher, next: metadata.StoreSt
 
 pub fn asReport(record: metadata.StoreRecord) metadata.StoreStatusReport {
     var report: metadata.StoreStatusReport = .{ .store_id = record.store_id };
-    inline for (std.meta.fields(metadata.StoreStatusReport)) |field| {
-        if (comptime @hasField(metadata.StoreRecord, field.name)) @field(report, field.name) = @field(record, field.name);
+    inline for (comptime std.meta.fieldNames(metadata.StoreStatusReport)) |reflected_name| {
+        if (comptime @hasField(metadata.StoreRecord, reflected_name)) @field(report, reflected_name) = @field(record, reflected_name);
     }
     return report;
 }
@@ -722,7 +723,7 @@ test "store report workload benchmark retained heartbeat" {
         defer a.free(groups);
         const runtimes = try a.alloc(metadata.RuntimeGroupStatusReport, count);
         defer a.free(runtimes);
-        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "tenant_search", .kind = "full_text" }} ** 32;
+        var indexes = @as([32]metadata.RuntimeIndexStatusReport, @splat(.{ .name = "tenant_search", .kind = "full_text" }));
         for (groups, runtimes, 0..) |*group, *runtime, i| {
             group.* = .{ .group_id = i + 100, .raft_term = 1 };
             runtime.* = .{ .group_id = i + 100, .table_id = i + 1, .indexes = &indexes };
@@ -790,7 +791,7 @@ test "store report workload benchmark acknowledged runtime cache leases" {
     for ([_]usize{ 1000, 10000 }) |count| {
         const runtimes = try a.alloc(metadata.RuntimeGroupStatusReport, count);
         defer a.free(runtimes);
-        var indexes = [_]metadata.RuntimeIndexStatusReport{.{ .name = "tenant_search", .kind = "full_text" }} ** 32;
+        var indexes = @as([32]metadata.RuntimeIndexStatusReport, @splat(.{ .name = "tenant_search", .kind = "full_text" }));
         for (runtimes, 0..) |*runtime, i| runtime.* = .{ .group_id = i + 100, .indexes = &indexes };
         const report: metadata.StoreStatusReport = .{ .store_id = 20, .reporter_incarnation = 77, .runtime_statuses = runtimes };
         var publisher: Publisher = .{};

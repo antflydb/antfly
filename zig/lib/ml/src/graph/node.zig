@@ -64,6 +64,7 @@ pub const PrimitiveOp = enum(u8) {
     concat,
     range,
     shape_of,
+    size_of,
 
     // Data movement
     gather,
@@ -74,6 +75,7 @@ pub const PrimitiveOp = enum(u8) {
 
     // Convolution
     conv_general,
+    average_pool,
 
     // Type conversion
     convert_dtype,
@@ -125,7 +127,7 @@ pub const FusedOp = enum(u8) {
 // ── Op Attributes ──────────────────────────────────────────────────────
 
 pub const ReduceAttrs = struct {
-    axes: [max_rank]u8 = .{0} ** max_rank,
+    axes: [max_rank]u8 = @splat(0),
     num_axes: u8 = 0,
 };
 
@@ -144,25 +146,25 @@ pub const ReshapeAttrs = struct {
 };
 
 pub const TransposeAttrs = struct {
-    perm: [max_rank]u8 = .{0} ** max_rank,
+    perm: [max_rank]u8 = @splat(0),
     num_axes: u8 = 0,
 };
 
 pub const BroadcastAttrs = struct {
     target_shape: Shape,
-    broadcast_axes: [max_rank]u8 = .{0} ** max_rank,
+    broadcast_axes: [max_rank]u8 = @splat(0),
     num_axes: u8 = 0,
 };
 
 pub const SliceAttrs = struct {
-    starts: [max_rank]i64 = .{0} ** max_rank,
-    limits: [max_rank]i64 = .{0} ** max_rank,
-    strides: [max_rank]i64 = .{1} ** max_rank,
+    starts: [max_rank]i64 = @splat(0),
+    limits: [max_rank]i64 = @splat(0),
+    strides: [max_rank]i64 = @splat(1),
     num_axes: u8 = 0,
     /// ONNX Slice can derive starts/limits from runtime shape subgraphs.
     /// When either flag is set, node inputs are [data, starts, limits] and
     /// bound_axes maps those compact input tensors onto the full-rank attrs.
-    bound_axes: [max_rank]u8 = .{0} ** max_rank,
+    bound_axes: [max_rank]u8 = @splat(0),
     num_bound_axes: u8 = 0,
     runtime_starts: bool = false,
     runtime_limits: bool = false,
@@ -201,10 +203,10 @@ pub const ScatterAddAttrs = struct {
 };
 
 pub const DotGeneralAttrs = struct {
-    lhs_contracting: [max_rank]u8 = .{0} ** max_rank,
-    rhs_contracting: [max_rank]u8 = .{0} ** max_rank,
-    lhs_batch: [max_rank]u8 = .{0} ** max_rank,
-    rhs_batch: [max_rank]u8 = .{0} ** max_rank,
+    lhs_contracting: [max_rank]u8 = @splat(0),
+    rhs_contracting: [max_rank]u8 = @splat(0),
+    lhs_batch: [max_rank]u8 = @splat(0),
+    rhs_batch: [max_rank]u8 = @splat(0),
     num_contracting: u8 = 0,
     num_batch: u8 = 0,
     /// Explicit target profile: differentiate supported matrix contractions
@@ -213,18 +215,58 @@ pub const DotGeneralAttrs = struct {
 };
 
 pub const ConvAttrs = struct {
-    strides: [4]u32 = .{1} ** 4,
-    padding: [4][2]i32 = .{.{0} ** 2} ** 4,
+    strides: [4]u32 = @splat(1),
+    /// Signed [begin, end] padding for each spatial axis.
+    padding: [4][2]i32 = @splat(@splat(0)),
+    dilations: [4]u32 = @splat(1),
+    output_padding: [4]u32 = @splat(0),
     num_spatial: u8 = 0,
     groups: u32 = 1,
-    /// Per-spatial-axis tap spacing (ONNX `dilations`). Executors that
-    /// only implement dense kernels expand the weight with inserted zeros,
-    /// which is exactly equivalent.
-    dilations: [4]u32 = .{1} ** 4,
+    /// Selects ONNX ConvTranspose weight layout [Cin, Cout/groups, kernel...].
+    transposed: bool = false,
 
     pub fn hasDilation(self: ConvAttrs) bool {
         for (self.dilations[0..self.num_spatial]) |d| if (d > 1) return true;
         return false;
+    }
+};
+
+/// NCHW sliding-window mean. Ceil-mode pooling is rejected by the importer;
+/// unsupported window semantics must not become a global reduction.
+pub const AveragePoolAttrs = struct {
+    pub const max_spatial = max_rank - 2;
+
+    pub const AutoPad = enum { explicit, valid, same_upper, same_lower };
+
+    kernel: [max_spatial]u32 = @splat(1),
+    strides: [max_spatial]u32 = @splat(1),
+    dilations: [max_spatial]u32 = @splat(1),
+    padding: [max_spatial][2]u32 = @splat(.{ 0, 0 }),
+    num_spatial: u8 = 0,
+    auto_pad: AutoPad = .explicit,
+    count_include_pad: bool = false,
+
+    pub fn spatialOutput(self: *const AveragePoolAttrs, axis: usize, input: usize) ?struct { size: usize, pad_before: usize } {
+        if (axis >= self.num_spatial or axis >= max_spatial or input == 0) return null;
+        const kernel = self.kernel[axis];
+        const stride = self.strides[axis];
+        const dilation = self.dilations[axis];
+        if (kernel == 0 or stride == 0 or dilation == 0) return null;
+        const effective = std.math.add(usize, std.math.mul(usize, kernel - 1, dilation) catch return null, 1) catch return null;
+        if (self.auto_pad == .same_upper or self.auto_pad == .same_lower) {
+            const size = (input - 1) / stride + 1;
+            const extent = std.math.add(usize, std.math.mul(usize, size - 1, stride) catch return null, effective) catch return null;
+            const total_pad = extent -| input;
+            return .{
+                .size = size,
+                .pad_before = total_pad / 2 + if (self.auto_pad == .same_lower) total_pad % 2 else @as(usize, 0),
+            };
+        }
+        const before = if (self.auto_pad == .explicit) self.padding[axis][0] else 0;
+        const after = if (self.auto_pad == .explicit) self.padding[axis][1] else 0;
+        const padded = std.math.add(usize, std.math.add(usize, input, before) catch return null, after) catch return null;
+        if (padded < effective) return null;
+        return .{ .size = (padded - effective) / stride + 1, .pad_before = before };
     }
 };
 
@@ -259,7 +301,7 @@ pub const LinearAttrs = struct {
     /// concatenated weight. Backends that don't dispatch a grouped
     /// kernel can ignore these — the op semantics are unchanged
     /// (still a regular matmul of `(input × combined_weight)`).
-    projection_out_dims: [4]u32 = .{0} ** 4,
+    projection_out_dims: [4]u32 = @splat(0),
     num_projections: u8 = 0,
 };
 
@@ -465,6 +507,125 @@ pub const DebertaTrainingAttentionAttrs = struct {
     }
 };
 
+/// Version-1 flash-style training attention for Laya's segment (tree) and
+/// sliding-window visibility, without materializing a `[tokens, tokens]`
+/// score or probability tensor. Unlike `DebertaTrainingAttentionAttrs` there
+/// is no disentangled relative-position term; visibility is `ranges` (up to
+/// three contiguous key ranges per query, ancestor-segment style, see
+/// `laya_tree.Row.visible` and `ops.SegmentAttention`) intersected with an
+/// optional logical `window`. A plain dense global or local-window layer is
+/// the degenerate case where every query's one range is `[0, seq_len)`.
+///
+/// Forward leaves are packed `[Q;K;V]` (token-major, `[3*batch*seq_len,
+/// num_heads*head_dim]`) and physical i32 control: six seed/microbatch/
+/// replica limbs (as `DebertaTrainingAttentionAttrs`), `batch*seq_len`
+/// logical positions, then `batch*seq_len*6` range bounds. Dropout addresses
+/// `((b*heads+h)*seq_len+q)*seq_len+k`, replayed identically by the backward
+/// op, which recomputes scores per tile rather than reading a saved
+/// probability tensor.
+pub const SegmentTrainingAttentionAttrs = struct {
+    batch: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32 = std.math.maxInt(u32),
+    dropout_probability: f32,
+    dropout_stream_id: u64,
+
+    pub const Layout = struct {
+        batch_tokens: i64,
+        hidden: i64,
+        qkv_rows: i64,
+        control_elements: i64,
+        gradient_rows: i64,
+
+        pub fn qkvShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.qkv_rows, self.hidden });
+        }
+        pub fn controlShape(self: Layout) Shape {
+            return Shape.init(.i32, &.{self.control_elements});
+        }
+        pub fn outputShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.batch_tokens, self.hidden });
+        }
+        pub fn gradientShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.gradient_rows, self.hidden });
+        }
+    };
+
+    /// Shape validation only. Each backend must separately admit physical
+    /// bytes, scratch, and dispatch work (which is now proportional to the
+    /// keys each query can see, not `seq_len^2`).
+    pub fn layout(self: SegmentTrainingAttentionAttrs) !Layout {
+        for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim }) |dim|
+            if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidSegmentTrainingAttentionShape;
+        if (!std.math.isFinite(self.dropout_probability) or self.dropout_probability < 0 or self.dropout_probability >= 1)
+            return error.InvalidSegmentTrainingAttentionShape;
+        const batch_tokens = try std.math.mul(i64, self.batch, self.seq_len);
+        const hidden = try std.math.mul(i64, self.num_heads, self.head_dim);
+        const qkv_rows = try std.math.mul(i64, 3, batch_tokens);
+        const ranges_elements = try std.math.mul(i64, batch_tokens, 6);
+        // 6 replay limbs (seed, micro_batch, replica) + 1 `apply_dropout`
+        // flag (see `segment_training_attention.zig`'s `ControlView`) +
+        // positions + ranges.
+        const control_elements = try std.math.add(i64, 7, try std.math.add(i64, batch_tokens, ranges_elements));
+        // Reject element-count overflow before Shape.numElements or VJP
+        // slicing can encounter a malformed manually assembled graph.
+        _ = try std.math.mul(i64, qkv_rows, hidden);
+        return .{ .batch_tokens = batch_tokens, .hidden = hidden, .qkv_rows = qkv_rows, .control_elements = control_elements, .gradient_rows = qkv_rows };
+    }
+};
+
+/// Training attention for the ModernBERT trunk without a materialized score
+/// tensor. Query row `i` (of `batch*seq_len`) may see key row `k` only when
+/// `k` lies in one of its three half-open ranges and, unless `window` is
+/// `maxInt(u32)`, `|position[i] - position[k]| <= window`. Ranges stay inside
+/// the query's own batch row, so padding, sliding windows and tree-packed
+/// segments share one contract (the inference `SegmentAttention` semantics).
+///
+/// Forward leaves are packed [Q;K;V] rows after RoPE and a physical i32
+/// control of `batch*seq_len*6` range bounds followed by `batch*seq_len`
+/// logical positions. A row with no visible key outputs zero. The scale is
+/// `1/sqrt(head_dim)`. The backward replays the softmax statistics instead of
+/// saving them, and returns the packed [dQ;dK;dV] gradient.
+pub const ModernBertTrainingAttentionAttrs = struct {
+    batch: u32,
+    seq_len: u32,
+    num_heads: u32,
+    head_dim: u32,
+    window: u32 = std.math.maxInt(u32),
+
+    pub const Layout = struct {
+        tokens: i64,
+        hidden: i64,
+        qkv_rows: i64,
+        control_elements: i64,
+
+        pub fn qkvShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.qkv_rows, self.hidden });
+        }
+        pub fn controlShape(self: Layout) Shape {
+            return Shape.init(.i32, &.{self.control_elements});
+        }
+        pub fn outputShape(self: Layout) Shape {
+            return Shape.init(.f32, &.{ self.tokens, self.hidden });
+        }
+    };
+
+    /// Shape validation only; backends validate the control contents.
+    pub fn layout(self: ModernBertTrainingAttentionAttrs) !Layout {
+        for ([_]u32{ self.batch, self.seq_len, self.num_heads, self.head_dim }) |dim|
+            if (dim == 0 or dim > std.math.maxInt(i32)) return error.InvalidModernBertTrainingAttentionShape;
+        const tokens = try std.math.mul(i64, self.batch, self.seq_len);
+        const hidden = try std.math.mul(i64, self.num_heads, self.head_dim);
+        const qkv_rows = try std.math.mul(i64, 3, tokens);
+        const control_elements = try std.math.mul(i64, 7, tokens);
+        if (qkv_rows > std.math.maxInt(i32) or control_elements > std.math.maxInt(i32)) return error.InvalidModernBertTrainingAttentionShape;
+        _ = try std.math.mul(i64, qkv_rows, hidden);
+        return .{ .tokens = tokens, .hidden = hidden, .qkv_rows = qkv_rows, .control_elements = control_elements };
+    }
+};
+
 pub const RopeAttrs = struct {
     seq_len: u32,
     head_dim: u32,
@@ -591,6 +752,15 @@ pub const MaskedBceWithLogitsAttrs = struct {
     reduction: MaskedBceReduction = .mean,
 };
 
+/// Two-row projection through a frozen tied language-model head. The backend
+/// preserves the resident BF16 projection contract while avoiding a
+/// vocabulary-wide output. Only d_hidden is defined by the custom VJP.
+pub const SelectedTiedHeadAttrs = struct {
+    in_dim: u32,
+    vocab_size: u32,
+    frozen_weight: bool = false,
+};
+
 // ── Node ───────────────────────────────────────────────────────────────
 
 /// Discriminated union of all ops in the graph IR.
@@ -617,6 +787,7 @@ pub const OpCode = union(enum) {
     reduce_sum: ReduceAttrs,
     reduce_max: ReduceAttrs,
     reduce_mean: ReduceAttrs,
+    cumulative_sum: struct { axis: u8, exclusive: bool = false, reverse: bool = false },
     argmax: ArgReduceAttrs,
     reshape: ReshapeAttrs,
     transpose: TransposeAttrs,
@@ -625,10 +796,12 @@ pub const OpCode = union(enum) {
     concat_prim: ConcatAttrs,
     range: void,
     shape_of: ShapeOfAttrs,
+    size_of: void,
     gather: GatherAttrs,
     scatter_add: ScatterAddAttrs,
     dot_general: DotGeneralAttrs,
     conv_general: ConvAttrs,
+    average_pool: AveragePoolAttrs,
     convert_dtype: ConvertDTypeAttrs,
 
     // Fused ops (matching ComputeBackend VTable)
@@ -666,6 +839,10 @@ pub const OpCode = union(enum) {
     fused_disentangled_attention_backward: AttentionAttrs,
     fused_deberta_training_attention_v1: DebertaTrainingAttentionAttrs,
     fused_deberta_training_attention_backward_v1: DebertaTrainingAttentionAttrs,
+    fused_modernbert_training_attention_v1: ModernBertTrainingAttentionAttrs,
+    fused_modernbert_training_attention_backward_v1: ModernBertTrainingAttentionAttrs,
+    fused_segment_training_attention_v1: SegmentTrainingAttentionAttrs,
+    fused_segment_training_attention_backward_v1: SegmentTrainingAttentionAttrs,
     fused_relative_position_bias: RelativePositionBiasAttrs,
     fused_rope: RopeAttrs,
     fused_conv1d: Conv1dAttrs,
@@ -685,6 +862,8 @@ pub const OpCode = union(enum) {
     fused_argmax_last_row: ArgmaxAttrs,
     fused_softmax: SoftmaxAttrs,
     fused_log_softmax: SoftmaxAttrs,
+    fused_selected_tied_head_logits: SelectedTiedHeadAttrs,
+    fused_selected_tied_head_backward: SelectedTiedHeadAttrs,
     fused_masked_bce_with_logits_loss: MaskedBceWithLogitsAttrs,
     fused_masked_bce_with_logits_backward: MaskedBceWithLogitsAttrs,
     /// Identity in forward execution, with no gradient through its input.
@@ -715,7 +894,7 @@ pub const Node = struct {
     output_shape: Shape,
 
     /// Up to 4 inputs stored inline. Most ML ops take 1-3 inputs.
-    inputs: [4]NodeId = .{null_node} ** 4,
+    inputs: [4]NodeId = @splat(null_node),
     num_inputs: u8 = 0,
 
     /// Points to the root of a decomposed primitive subgraph that computes

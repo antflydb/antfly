@@ -1035,7 +1035,7 @@ test "hyper head weights use flat stream RMS rsqrt" {
     };
     const hc_base = [_]f32{ 0.0, 0.0 };
     const hc_scale = [_]f32{1.0};
-    var weights = [_]f32{0.0} ** 4;
+    var weights = @as([4]f32, @splat(0.0));
 
     hyperHeadWeightsRows(&weights, &streams, &hc_fn, &hc_base, &hc_scale, shape, 1e-6, 0.0);
 
@@ -1057,8 +1057,8 @@ test "hyper head collapse reduces repeated hc streams per hidden column" {
     };
     const hc_base = [_]f32{ 0.0, @log(@as(f32, 3.0)) };
     const hc_scale = [_]f32{1.0};
-    var scratch = [_]f32{0.0} ** 2;
-    var output = [_]f32{0.0} ** 3;
+    var scratch = @as([2]f32, @splat(0.0));
+    var output = @as([3]f32, @splat(0.0));
 
     hyperHeadCollapseRows(&output, &scratch, &streams, &hc_fn, &hc_base, &hc_scale, shape, 0.0, 1e-6);
 
@@ -1075,7 +1075,7 @@ test "sum stream reduce collapses persistent streams without weights" {
         3.0,  4.0,
         30.0, 40.0,
     };
-    var output = [_]f32{0.0} ** 4;
+    var output = @as([4]f32, @splat(0.0));
 
     sumStreamReduceRows(&output, &streams, shape);
 
@@ -1111,13 +1111,13 @@ test "hyper connection update persists mixed stream state" {
     const update = [_]f32{ 3.0, 4.0 };
     const mix_dim = 8;
     const flat_dim = 4;
-    const fn_data = [_]f32{0.0} ** (mix_dim * flat_dim);
-    const base_data = [_]f32{0.0} ** mix_dim;
+    const fn_data = @as([(mix_dim * flat_dim)]f32, @splat(0.0));
+    const base_data = @as([mix_dim]f32, @splat(0.0));
     const scale_data = [_]f32{ 1.0, 1.0, 1.0 };
-    var scratch_next = [_]f32{0.0} ** flat_dim;
-    var scratch_comb = [_]f32{0.0} ** 4;
-    var scratch_pre = [_]f32{0.0} ** 2;
-    var scratch_post = [_]f32{0.0} ** 2;
+    var scratch_next = @as([flat_dim]f32, @splat(0.0));
+    var scratch_comb = @as([4]f32, @splat(0.0));
+    var scratch_pre = @as([2]f32, @splat(0.0));
+    var scratch_post = @as([2]f32, @splat(0.0));
 
     hyperConnectionUpdateRows(
         &streams,
@@ -1233,7 +1233,7 @@ test "gated chunk compression applies projection position bias and normalization
     };
     const gate_projection = [_]f32{ 0.0, 0.0 };
     const position_bias = [_]f32{ 0.0, @log(@as(f32, 3.0)) };
-    var output = [_]f32{0.0} ** 4;
+    var output = @as([4]f32, @splat(0.0));
 
     gatedChunkCompressRows(&output, &input, &projection, &gate_projection, &position_bias, shape, 0.0, true);
 
@@ -1245,7 +1245,7 @@ test "gated chunk compression applies projection position bias and normalization
 
 test "top-k indices feed weighted gather rows" {
     const scores = [_]f32{ 0.1, 2.0, 1.5, 2.0 };
-    var indices = [_]u32{0} ** 3;
+    var indices = @as([3]u32, @splat(0));
     selectTopKIndices(&scores, &indices);
 
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -1326,7 +1326,7 @@ test "grouped output projection sums per group packed weights" {
         .out_dim = 2,
     };
     const input = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
-    var weights = [_]f32{0.0} ** 8;
+    var weights = @as([8]f32, @splat(0.0));
     weights[shape.packedWeightIndex(0, 0, 0)] = 1.0;
     weights[shape.packedWeightIndex(0, 1, 1)] = 1.0;
     weights[shape.packedWeightIndex(1, 0, 0)] = 10.0;
@@ -1346,8 +1346,8 @@ test "packed moe experts apply gate up and down projections over f32 buffers" {
         .num_experts = 2,
     };
     const input = [_]f32{ 1.0, 2.0 };
-    var gate_up = [_]f32{0.0} ** 16;
-    var down = [_]f32{0.0} ** 8;
+    var gate_up = @as([16]f32, @splat(0.0));
+    var down = @as([8]f32, @splat(0.0));
 
     gate_up[shape.gateUpWeightIndex(0, 0, 0, 0)] = 1.0;
     gate_up[shape.gateUpWeightIndex(0, 0, 1, 1)] = 1.0;
@@ -1361,7 +1361,7 @@ test "packed moe experts apply gate up and down projections over f32 buffers" {
     down[shape.downWeightIndex(1, 0, 0)] = 7.0;
     down[shape.downWeightIndex(1, 1, 0)] = 11.0;
 
-    var scratch = [_]f32{0.0} ** 4;
+    var scratch = @as([4]f32, @splat(0.0));
     var output = [_]f32{ 100.0, 100.0 };
     const experts = [_]u32{ 0, 1 };
     const weights = [_]f32{ 0.25, 0.5 };

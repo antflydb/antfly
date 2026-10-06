@@ -144,11 +144,13 @@ None currently tracked as active full-suite failures.
   - [ ] distributed shuffle semantics where needed
   - [ ] CDC-backed foreign join depth
 - [ ] Broaden retrieval agent behavior:
-  - [ ] planner depth beyond the current bounded loop
+  - [x] planner depth beyond the current bounded loop (research agent: plan,
+    parallel researchers, reflect, cited report; see `DEEP_RESEARCH.md`)
   - [ ] deeper tree / RAG strategy coverage
   - [ ] remote-content parity
   - [ ] broader provider matrix / built-in provider parity
-  - [ ] evaluation/reporting behavior
+  - [ ] evaluation/reporting behavior (research evaluators exist in evalaf;
+    retrieval judge metrics are still heuristic)
   - [ ] session/conversation carry-forward semantics once JSON and SSE contracts
     are stable
 - [ ] Keep graph query depth current as the distributed graph implementation

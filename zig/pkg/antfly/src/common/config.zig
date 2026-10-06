@@ -75,11 +75,12 @@ pub const Config = struct {
     admission: AdmissionConfig = .{},
     graph_execution: graph_work_budget.Limits = .{},
     mcp: McpConfig = .{},
+    pgwire: ?PgwireConfig = null,
     backup: BackupConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
-    ha: ?HAConfig = null,
+    ha: ?HotStandbyConfig = null,
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
@@ -102,6 +103,14 @@ pub const Config = struct {
         max_tool_result_bytes: u32 = default_mcp_max_tool_result_bytes,
     };
 
+    pub const PgwireConfig = struct {
+        enabled: bool = false,
+        bind_host: ?[]const u8 = null,
+        bind_port: u16 = 5432,
+        max_connections: u16 = 32,
+        externally_protected_transport: bool = false,
+    };
+
     pub const BackupConfig = struct {
         /// End-to-end execution ceiling for one table or cluster backup. The
         /// durable writer lease remains a separate cleanup safety envelope.
@@ -111,9 +120,9 @@ pub const Config = struct {
     fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
         const config = value orelse return .{};
         var limits: graph_work_budget.Limits = .{};
-        inline for (std.meta.fields(graph_work_budget.Limits)) |field| {
-            if (@field(config, field.name)) |configured| {
-                @field(limits, field.name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
+        inline for (comptime std.meta.fieldNames(graph_work_budget.Limits)) |reflected_name| {
+            if (@field(config, reflected_name)) |configured| {
+                @field(limits, reflected_name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
             }
         }
         try limits.validate();
@@ -129,7 +138,7 @@ pub const Config = struct {
         orchestration_urls: []NodeUrl = &.{},
         raft_urls: []NodeUrl = &.{},
 
-        fn deinit(self: *MetadataConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *MetadataConfig, alloc: std.mem.Allocator) void {
             for (self.orchestration_urls) |entry| alloc.free(entry.url);
             if (self.orchestration_urls.len > 0) alloc.free(self.orchestration_urls);
             for (self.raft_urls) |entry| alloc.free(entry.url);
@@ -142,7 +151,7 @@ pub const Config = struct {
         cert: ?[]u8 = null,
         key: ?[]u8 = null,
 
-        fn deinit(self: *TlsConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *TlsConfig, alloc: std.mem.Allocator) void {
             if (self.cert) |value| alloc.free(value);
             if (self.key) |value| alloc.free(value);
             self.* = undefined;
@@ -166,7 +175,7 @@ pub const Config = struct {
         object_prefix: ?[]u8 = null,
         object_lanes: ObjectStorageLanes = .{},
 
-        fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
             if (self.lite_path) |value| alloc.free(value);
             if (self.local_base_dir) |value| alloc.free(value);
             if (self.object_connection) |value| alloc.free(value);
@@ -182,7 +191,7 @@ pub const Config = struct {
         bucket: ?[]u8 = null,
         prefix: ?[]u8 = null,
 
-        fn deinit(self: *ObjectStorageLocation, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ObjectStorageLocation, alloc: std.mem.Allocator) void {
             if (self.connection) |value| alloc.free(value);
             if (self.bucket) |value| alloc.free(value);
             if (self.prefix) |value| alloc.free(value);
@@ -197,7 +206,7 @@ pub const Config = struct {
         progress: ObjectStorageLocation = .{},
         catalog: ObjectStorageLocation = .{},
 
-        fn deinit(self: *ObjectStorageLanes, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ObjectStorageLanes, alloc: std.mem.Allocator) void {
             self.artifacts.deinit(alloc);
             self.manifests.deinit(alloc);
             self.wal.deinit(alloc);
@@ -223,7 +232,7 @@ pub const Config = struct {
     /// the node's HA state and admin endpoint. Enum-valued sync fields are kept
     /// as strings and parsed by the runtime's flag parsers so both surfaces
     /// accept exactly the same spellings.
-    pub const HAConfig = struct {
+    pub const HotStandbyConfig = struct {
         admin_url: ?[]const u8 = null,
         admin_token_env: ?[]const u8 = null,
         cluster_id: ?u64 = null,
@@ -251,15 +260,15 @@ pub const Config = struct {
         fence_wal: ?[]const u8 = null,
         former_primary_log: ?[]const u8 = null,
 
-        pub fn wantsPrimary(self: HAConfig) bool {
+        pub fn wantsPrimary(self: HotStandbyConfig) bool {
             return self.primary_log != null or self.primary_slots != null;
         }
 
-        pub fn wantsStandby(self: HAConfig) bool {
+        pub fn wantsStandby(self: HotStandbyConfig) bool {
             return self.standby_log != null or self.standby_progress != null;
         }
 
-        fn deinit(self: *HAConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *HotStandbyConfig, alloc: std.mem.Allocator) void {
             inline for (.{
                 "admin_url",       "admin_token_env",      "primary_log",  "primary_slots",
                 "primary_node_id", "seed_capture_root",    "standby_log",  "standby_progress",
@@ -299,7 +308,7 @@ pub const Config = struct {
                     return error.InvalidKernelJitCacheBudget;
             }
 
-            fn deinit(self: *KernelJitConfig, alloc: std.mem.Allocator) void {
+            pub fn deinit(self: *KernelJitConfig, alloc: std.mem.Allocator) void {
                 if (self.cache_dir) |value| alloc.free(value);
                 self.* = undefined;
             }
@@ -333,7 +342,7 @@ pub const Config = struct {
             residency_mode: ?ResidencyMode = null,
             memory_budget_mb: ?u32 = null,
 
-            fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
+            pub fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
                 alloc.free(self.kind);
                 alloc.free(self.name);
                 if (self.backend) |value| alloc.free(value);
@@ -353,9 +362,25 @@ pub const Config = struct {
         kernel_jit: KernelJitConfig = .{},
         prompt_cache: PromptCacheConfig = .{},
         keep_alive: ?[]u8 = null,
+        // `keep_alive_ms` is not part of the shared openapi inference schema
+        // (only the `keep_alive` duration string is); it exists solely so
+        // `antfly inference run`'s config loader (parseRunConfig in
+        // inference_runtime/runtime.zig) can accept the operator's flat
+        // integer-millisecond spelling. Never populated by the generic
+        // `Config.parseFromSlice` openapi path.
+        keep_alive_ms: ?u64 = null,
+        // True only when `antfly inference run`'s merged config (nested
+        // `inference.prompt_cache` or the operator's flat top-level
+        // `prompt_cache`) explicitly set a `prompt_cache` object.
+        // `PromptCacheConfig.enabled` defaults to false once that object is
+        // present, but the run server's own built-in default is enabled=true;
+        // this flag lets callers keep that default when the key is absent
+        // entirely. Never populated by the generic `Config.parseFromSlice`
+        // openapi path.
+        prompt_cache_configured: bool = false,
         max_loaded_models: ?i64 = null,
 
-        fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
@@ -375,6 +400,7 @@ pub const Config = struct {
 
     pub const CorsConfig = struct {
         enabled: ?bool = null,
+        /// Omitted or empty origins deny cross-origin access; "*" is explicit opt-in.
         allowed_origins: ?[]const []u8 = null,
         allowed_methods: ?[]const []u8 = null,
         allowed_headers: ?[]const []u8 = null,
@@ -382,7 +408,7 @@ pub const Config = struct {
         allow_credentials: ?bool = null,
         max_age: ?u32 = null,
 
-        fn deinit(self: *CorsConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *CorsConfig, alloc: std.mem.Allocator) void {
             if (self.allowed_origins) |values| freeOwnedStringSlice(alloc, values);
             if (self.allowed_methods) |values| freeOwnedStringSlice(alloc, values);
             if (self.allowed_headers) |values| freeOwnedStringSlice(alloc, values);
@@ -428,7 +454,7 @@ pub const Config = struct {
         session_name: ?[]u8 = null,
         sts_endpoint: ?[]u8 = null,
 
-        fn deinit(self: *AwsCredentialConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *AwsCredentialConfig, alloc: std.mem.Allocator) void {
             if (self.access_key_id) |value| alloc.free(value);
             if (self.secret_access_key) |value| alloc.free(value);
             if (self.session_token) |value| alloc.free(value);
@@ -449,7 +475,7 @@ pub const Config = struct {
         credentials_path: ?[]u8 = null,
         scope: ?[]u8 = null,
 
-        fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
             if (self.bearer_token) |value| alloc.free(value);
             if (self.service_account_json) |value| alloc.free(value);
             if (self.credentials_path) |value| alloc.free(value);
@@ -468,7 +494,7 @@ pub const Config = struct {
         external_io: ?ExternalIoConnectionConfig = null,
         cdc: ?CdcConnectionConfig = null,
 
-        fn deinit(self: *ConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.display_name) |value| alloc.free(value);
             if (self.provider) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.capabilities);
@@ -491,7 +517,7 @@ pub const Config = struct {
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
-        fn deinit(self: *InferenceConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *InferenceConnectionConfig, alloc: std.mem.Allocator) void {
             alloc.free(self.provider);
             if (self.url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
@@ -524,7 +550,7 @@ pub const Config = struct {
         include_domains: []const []u8 = &.{},
         exclude_domains: []const []u8 = &.{},
 
-        fn deinit(self: *WebSearchConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *WebSearchConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.service) |value| alloc.free(value);
             if (self.language) |value| alloc.free(value);
             if (self.region) |value| alloc.free(value);
@@ -558,7 +584,7 @@ pub const Config = struct {
         root: ?[]u8 = null,
         use_ssl: ?bool = null,
 
-        fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.endpoint) |value| alloc.free(value);
             if (self.region) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.buckets);
@@ -638,7 +664,7 @@ pub const Config = struct {
         slot_name: ?[]u8 = null,
         publication_name: ?[]u8 = null,
 
-        fn deinit(self: *CdcConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *CdcConnectionConfig, alloc: std.mem.Allocator) void {
             alloc.free(self.provider);
             if (self.dsn) |value| alloc.free(value);
             if (self.table_name) |value| alloc.free(value);
@@ -819,7 +845,32 @@ pub const Config = struct {
         else
             Config.InferenceConfig.KernelJitConfig{};
         errdefer kernel_jit.deinit(alloc);
+        var pgwire: ?PgwireConfig = null;
+        if (root.get("pgwire")) |value| {
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            const object = switch (value) {
+                .object => |object| object,
+                else => return error.InvalidConfig,
+            };
+            const port = try optionalU32Field(object, "bind_port") orelse 5432;
+            const connections_count = try optionalU32Field(object, "max_connections") orelse 32;
+            if (port == 0 or port > 65535 or connections_count == 0 or connections_count > 65535) return error.InvalidConfig;
+            const host = if (object.get("bind_host")) |host| switch (host) {
+                .string => |string| string,
+                else => return error.InvalidConfig,
+            } else null;
+            if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            pgwire = .{
+                .enabled = try optionalBoolField(object, "enabled") orelse false,
+                .bind_port = @intCast(port),
+                .max_connections = @intCast(connections_count),
+                .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
+                .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
+            };
+        }
+        errdefer if (pgwire) |wire| if (wire.bind_host) |host| alloc.free(host);
         return .{
+            .pgwire = pgwire,
             .registry = registry,
             .transcribers = transcribers,
             .readers = reader_registry,
@@ -875,7 +926,7 @@ pub const Config = struct {
             // `hot_standby` is the current config key; `ha` is accepted for one
             // minor release as a deprecated alias. If both are set, `hot_standby`
             // wins and `ha` is silently ignored (no conflict error).
-            .ha = try haConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
+            .ha = try hotStandbyConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url) |url| (if (url.len > 0) try alloc.dupe(u8, url) else null) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
@@ -976,9 +1027,9 @@ pub const Config = struct {
         return @intCast(raw);
     }
 
-    fn haConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HAConfig {
+    fn hotStandbyConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HotStandbyConfig {
         const cfg = value orelse return null;
-        var out = HAConfig{};
+        var out = HotStandbyConfig{};
         errdefer out.deinit(alloc);
         if (cfg.admin) |admin| {
             out.admin_url = try optionalOwnedString(alloc, admin.url);
@@ -1101,6 +1152,7 @@ pub const Config = struct {
     }
 
     pub fn deinit(self: *Config) void {
+        if (self.pgwire) |wire| if (wire.bind_host) |host| self.registry.allocator.free(host);
         if (self.tls) |*tls| tls.deinit(self.registry.allocator);
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
@@ -1186,12 +1238,7 @@ pub fn resolveLocalBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config) ![]u8 
     return try defaultLocalBaseDir(alloc);
 }
 
-pub fn defaultLocalBaseDir(alloc: std.mem.Allocator) ![]u8 {
-    const home_var = if (builtin.os.tag == .windows) "USERPROFILE" else "HOME";
-    const home = platform.env.getenv(home_var) orelse return try alloc.dupe(u8, "antflydb");
-    if (home.len == 0) return try alloc.dupe(u8, "antflydb");
-    return try std.fs.path.join(alloc, &.{ home, ".antfly" });
-}
+pub const defaultLocalBaseDir = @import("local_paths.zig").defaultLocalBaseDir;
 
 fn parseMetadataConfig(
     alloc: std.mem.Allocator,
@@ -1293,9 +1340,10 @@ fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
 fn deploymentModeFromObject(root: std.json.ObjectMap, expected: ?DeploymentMode) !DeploymentMode {
     if (root.get("deployment_mode")) |value| {
         if (value != .string) return error.InvalidConfig;
-        inline for (std.meta.fields(DeploymentMode)) |field| {
-            if (std.mem.eql(u8, value.string, field.name)) {
-                const configured: DeploymentMode = @enumFromInt(field.value);
+        const info = @typeInfo(DeploymentMode).@"enum";
+        inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+            if (std.mem.eql(u8, value.string, reflected_name)) {
+                const configured: DeploymentMode = @fromBackingInt(@intCast(field_value));
                 if (expected) |required| if (configured != required) return error.DeploymentModeMismatch;
                 return configured;
             }
@@ -2265,6 +2313,8 @@ pub fn parseInferencePreloadModels(
             .object => |entry| entry,
             else => return error.InvalidConfig,
         };
+        if (!objectContainsOnly(model_object, &.{ "kind", "name", "backend", "format", "quantization", "residency_mode", "memory_budget_mb" }))
+            return error.InvalidConfig;
         // Include the partially parsed entry in error cleanup as soon as any
         // owned fields can be allocated (e.g. a missing name after kind).
         out[i] = .{ .kind = &.{}, .name = &.{} };
@@ -2363,6 +2413,8 @@ const SecretResolutionContext = enum {
     connections,
     connection,
     external_io,
+    inference_connection,
+    inference_root,
     normal,
 };
 
@@ -2386,15 +2438,25 @@ fn resolveSecretReferencesInValue(
         .object => |*obj| {
             var it = obj.iterator();
             while (it.next()) |entry| {
+                // These subtrees are parsed from raw configuration and resolve
+                // operational credentials at use time, after native startup.
+                if (context == .config_root) {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "secrets") or std.mem.eql(u8, key, "generators") or
+                        std.mem.eql(u8, key, "embedders") or std.mem.eql(u8, key, "rerankers") or std.mem.eql(u8, key, "deciders") or
+                        std.mem.eql(u8, key, "remote_content")) continue;
+                }
                 // External-I/O credentials are operational secrets: retain
                 // references in the immutable node config and resolve them at
                 // each backup, restore, or probe. This makes rotation effective
                 // without weakening bucket/prefix authorization. Other config
                 // secrets keep their established startup-resolution behavior.
                 const child_context: SecretResolutionContext = switch (context) {
-                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else .normal,
+                    .config_root => if (std.mem.eql(u8, entry.key_ptr.*, "connections")) .connections else if (std.mem.eql(u8, entry.key_ptr.*, "inference")) .inference_root else .normal,
                     .connections => .connection,
-                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else .normal,
+                    .connection => if (std.mem.eql(u8, entry.key_ptr.*, "external_io")) .external_io else if (std.mem.eql(u8, entry.key_ptr.*, "inference") or std.mem.eql(u8, entry.key_ptr.*, "web_search")) .inference_connection else .normal,
+                    .inference_connection => if (std.mem.eql(u8, entry.key_ptr.*, "api_key")) continue else .normal,
+                    .inference_root => if (std.mem.eql(u8, entry.key_ptr.*, "api_key") or std.mem.eql(u8, entry.key_ptr.*, "s3_credentials")) continue else .normal,
                     .external_io => if (std.mem.eql(u8, entry.key_ptr.*, "credentials")) continue else .normal,
                     .normal => .normal,
                 };
@@ -2641,6 +2703,24 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
     try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
+}
+
+test "common config rejects model-specific and unknown preload tuning fields" {
+    const fields = .{
+        .{ "load_strategy", "\"pipeline\"" },
+        .{ "load_workers", "6" },
+        .{ "load_staging_mb", "384" },
+        .{ "prepared_pack", "\"required\"" },
+        .{ "drop_host_cache_after_load", "true" },
+        .{ "startup_strategy", "\"prefetch\"" },
+        .{ "prepared_pak", "\"required\"" },
+    };
+    inline for (fields) |field| {
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(
+            std.testing.allocator,
+            "{\"inference\":{\"preload\":[{\"kind\":\"generator\",\"name\":\"gemma-a4b\",\"" ++ field[0] ++ "\":" ++ field[1] ++ "}]}}",
+        ));
+    }
 }
 
 test "common config rejects invalid prompt cache policy" {
@@ -3611,6 +3691,24 @@ test "common config parses the hot_standby section and the deprecated ha alias" 
     );
     defer both.deinit();
     try std.testing.expectEqual(@as(u64, 2), both.ha.?.cluster_id.?);
+}
+
+test "common config parses bounded pgwire listener policy" {
+    var config = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"enabled":true,"bind_host":"127.0.0.1","bind_port":15432,"max_connections":8}}
+    );
+    defer config.deinit();
+    try std.testing.expect(config.pgwire.?.enabled);
+    try std.testing.expectEqualStrings("127.0.0.1", config.pgwire.?.bind_host.?);
+    try std.testing.expectEqual(@as(u16, 15432), config.pgwire.?.bind_port);
+    try std.testing.expect(!config.pgwire.?.externally_protected_transport);
+    for ([_][]const u8{
+        \\{"pgwire":{"max_connections":0}}
+        ,
+        \\{"pgwire":{"bind_port":65536}}
+        ,
+        \\{"pgwire":{"allow_insecure":true}}
+    }) |raw| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, raw));
 }
 
 test "common config parses bounded transaction session policy" {

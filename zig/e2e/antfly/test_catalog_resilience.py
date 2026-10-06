@@ -29,11 +29,15 @@ from catalog_baseline import (
     plan_baseline,
     post_baseline,
 )
+from catalog_mutations import mutate_owned_resource
+from catalog_readiness import wait_for_catalog_protocol
 from conftest import DEFAULT_ANTFLY_BIN, internal_service_headers
+from e2e_scheduler import e2e_resource
 from test_scaling import MultiNodeScalingCluster, _insert_docs
 
 
 @pytest.fixture
+@e2e_resource("antfly_process")
 def catalog_cluster(request):
     binary = Path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))).resolve()
     if not binary.exists():
@@ -43,14 +47,18 @@ def catalog_cluster(request):
     cluster = MultiNodeScalingCluster(
         str(binary), initial_data_node_count=3, tick_ms=None
     )
+    setup_complete = False
     try:
+        wait_for_catalog_protocol(cluster)
+        setup_complete = True
         yield cluster
     finally:
         report = getattr(request.node, "rep_call", None)
-        if report and report.failed:
+        failed = not setup_complete or bool(report and report.failed)
+        if failed:
             for path in cluster.log_paths:
                 print(f"[{path.name}]\n{path.read_text(errors='replace')[-8192:]}")
-        cluster.stop(test_failed=bool(report and report.failed))
+        cluster.stop(test_failed=failed)
 
 
 def post_report(cluster, path, body):
@@ -260,20 +268,48 @@ def test_large_inventory_uses_bounded_control_and_diagnostic_transfers(catalog_c
             timeout=5,
         )
         assert released.status_code == 204
-    table_path = c.data_api_urls[0] + "/tables/large_inventory_docs"
-    response = requests.post(table_path, json={}, timeout=30)
-    require_success(response)
-    response = requests.delete(table_path, timeout=30)
-    require_success(response)
-    # The original regression killed the real data nodes on their next control
-    # rounds. Exercise multiple rounds and actual writes, not just process start.
-    for i in range(12):
-        response = requests.post(
-            c.data_api_urls[0] + f"/databases/large_{i}", json={}, timeout=15
+
+    def assert_alive():
+        assert all(p.poll() is None for p in c.metadata_procs + c.data_procs), (
+            c.debug_logs()
         )
-        require_success(response)
-        assert all(p.poll() is None for p in c.data_procs), c.debug_logs()
-        time.sleep(1)
+
+    def verify_table(value):
+        assert value["name"] == "large_inventory_docs"
+        assert len(value["shards"]) == 1
+        assert not value.get("description")
+
+    table_path = c.data_api_urls[0] + "/tables/large_inventory_docs"
+    with requests.Session() as session:
+        for method in ("POST", "DELETE"):
+            mutate_owned_resource(
+                session,
+                table_path,
+                method=method,
+                verify=verify_table,
+                assert_alive=assert_alive,
+            )
+        # The original regression killed the real data nodes on their next
+        # control rounds. Verify completed writes across multiple rounds while
+        # respecting failover non-admission and uncertain-outcome contracts.
+        for i in range(12):
+            name = f"large_{i}"
+
+            def verify_database(value):
+                assert value["name"] == name
+                assert value["database_id"] > 0
+                assert value.get("settings_json", "{}") == "{}"
+                assert value.get("tablespace_name") is None
+
+            mutate_owned_resource(
+                session,
+                c.data_api_urls[0] + f"/databases/{name}",
+                method="POST",
+                verify=verify_database,
+                assert_alive=assert_alive,
+            )
+            assert_alive()
+            time.sleep(1)
 
 
 def test_telemetry_batches_do_not_issue_raft_read_barriers(catalog_cluster):
@@ -726,11 +762,13 @@ def test_skewed_schema_migrations_keep_foreground_traffic_available(catalog_clus
         while True:
             response = requests.post(
                 f"{api}/tables/{table}/query",
-                json={"full_text_search": {"match_all": {}}, "limit": 1},
+                json={"full_text_search": {"match_all": {}}, "count": True},
                 timeout=10,
             )
             response.raise_for_status()
-            total = response.json()["responses"][0]["hits"]["total"]["value"]
+            hits_total = response.json()["responses"][0]["hits"]["total"]
+            assert hits_total["relation"] == "exact", response.json()
+            total = hits_total["value"]
             if total == expected:
                 break
             assert time.monotonic() < deadline, (table, total, expected)

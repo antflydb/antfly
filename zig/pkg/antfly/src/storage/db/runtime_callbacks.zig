@@ -80,7 +80,9 @@ pub const EntityUpsert = struct {
     table: []const u8,
     storage_table: ?[]const u8 = null,
     key: []const u8,
-    doc_json: []const u8,
+    doc_json: []const u8 = "",
+    /// Remove a prior pinned physical copy during an atomic destination move.
+    delete: bool = false,
 };
 
 pub const MissingSinkPolicy = enum {
@@ -110,7 +112,7 @@ pub const EntitySink = struct {
     pub fn upsertBatch(self: EntitySink, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
         if (self.vtable.upsert_batch) |f| return f(self.ptr, allocator, entries);
         for (entries) |e| {
-            if (e.storage_table != null) return error.EntityPromotionAtomicCommitUnavailable;
+            if (e.storage_table != null or e.delete) return error.EntityPromotionAtomicCommitUnavailable;
         }
         for (entries) |e| {
             try self.upsert(allocator, e.table, e.key, e.doc_json);

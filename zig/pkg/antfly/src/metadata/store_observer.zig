@@ -43,6 +43,7 @@ pub fn applyObservation(
         updated.status_generation = observation.status_generation;
         updated.artifact_sources_protocol_version = observation.artifact_sources_protocol_version;
         updated.dense_native_storage_protocol_version = observation.dense_native_storage_protocol_version;
+        updated.relational_topology_protocol_version = observation.relational_topology_protocol_version;
     }
     updated.live = observation.live;
     updated.health_class = observation.health_class;
@@ -211,7 +212,7 @@ const RepairLookup = struct {
         }
         return out;
     }
-    fn deinit(self: *RepairLookup, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *RepairLookup, alloc: std.mem.Allocator) void {
         self.groups.deinit(alloc);
         self.exact.deinit(alloc);
         self.names.deinit(alloc);
@@ -324,6 +325,7 @@ fn observationChangesRecordWithLookup(
             existing.status_generation != observation.status_generation) or
         existing.artifact_sources_protocol_version != observation.artifact_sources_protocol_version or
         existing.dense_native_storage_protocol_version != observation.dense_native_storage_protocol_version or
+        existing.relational_topology_protocol_version != observation.relational_topology_protocol_version or
         existing.capacity_bytes != observation.capacity_bytes or
         existing.available_bytes != observation.available_bytes or
         existing.lease_pressure != observation.lease_pressure or
@@ -512,6 +514,7 @@ pub fn reportsDurablyEqual(
         lhs.reporter_incarnation == rhs.reporter_incarnation and
         lhs.artifact_sources_protocol_version == rhs.artifact_sources_protocol_version and
         lhs.dense_native_storage_protocol_version == rhs.dense_native_storage_protocol_version and
+        lhs.relational_topology_protocol_version == rhs.relational_topology_protocol_version and
         lhs.live == rhs.live and
         std.mem.eql(u8, lhs.health_class, rhs.health_class) and
         lhs.capacity_bytes == rhs.capacity_bytes and
@@ -626,15 +629,15 @@ fn runtimeEnrichmentStatusEqual(
     lhs: table_manager.RuntimeEnrichmentStatusReport,
     rhs: table_manager.RuntimeEnrichmentStatusReport,
 ) bool {
-    inline for (std.meta.fields(table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status") or
-            std.mem.eql(u8, field.name, "stall_reason") or
-            std.mem.eql(u8, field.name, "active_phase") or
-            std.mem.eql(u8, field.name, "active_model") or
-            std.mem.eql(u8, field.name, "active_backend"))
+    inline for (comptime std.meta.fieldNames(table_manager.RuntimeEnrichmentStatusReport)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "projection_checkpoint_status") or
+            std.mem.eql(u8, reflected_name, "stall_reason") or
+            std.mem.eql(u8, reflected_name, "active_phase") or
+            std.mem.eql(u8, reflected_name, "active_model") or
+            std.mem.eql(u8, reflected_name, "active_backend"))
         {
-            if (!std.mem.eql(u8, @field(lhs, field.name), @field(rhs, field.name))) return false;
-        } else if (@field(lhs, field.name) != @field(rhs, field.name)) {
+            if (!std.mem.eql(u8, @field(lhs, reflected_name), @field(rhs, reflected_name))) return false;
+        } else if (@field(lhs, reflected_name) != @field(rhs, reflected_name)) {
             return false;
         }
     }

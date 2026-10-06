@@ -17,12 +17,16 @@
 //! catalog validation and generation admission remain in distributed control.
 
 const std = @import("std");
-const cancellation = @import("../common/cancellation.zig");
+const cancellation = @import("antfly_cancellation");
 
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const backup_contract = @import("backup_contract.zig");
 
 pub const PrepareRequest = struct {
+    /// Trusted compiled raw-store handle. Native snapshots prepare both stores
+    /// from the same unpublished checkpoint extraction before publication.
+    projection_store: ?*anyopaque = null,
+    expected_applied_index: u64 = 0,
     path: []const u8,
     table_name: []const u8,
     group_id: u64,
@@ -34,7 +38,7 @@ pub const PrepareRequest = struct {
 };
 
 pub const RestoreRequest = struct {
-    cancellation: @import("../common/cancellation.zig").CancellationToken = .none,
+    cancellation: @import("antfly_cancellation").CancellationToken = .none,
     path: []const u8,
     table_name: []const u8,
     group_id: u64,

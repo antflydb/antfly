@@ -67,6 +67,8 @@ jobs:
           ref: ${{ inputs.promotion_controller_commit }}
           fetch-depth: 0
 
+      - name: Sample ARC runner disk use
+        uses: ./.github/actions/runner-disk-audit
       - name: Revalidate trusted caller and release identity
         env:
           RELEASE_TAG: ${{ inputs.tag_name }}

@@ -16,7 +16,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const aggregate_math = algebraic_segment.aggregate_math;
 const artifact_ref = @import("../manifest/artifact_ref.zig");
@@ -626,7 +626,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         if (self.bytes) |bytes| self.alloc.free(bytes);
         self.* = undefined;
     }
@@ -649,7 +649,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         if (!std.mem.eql(u8, artifact_id, "mem:algebraic-sidecar")) return error.ArtifactNotFound;
         const bytes = self.bytes orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, bytes);

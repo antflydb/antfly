@@ -6,6 +6,7 @@ class IndexType(StrEnum):
     EMBEDDINGS = "embeddings"
     FULL_TEXT = "full_text"
     GRAPH = "graph"
+    RELATIONAL = "relational"
 
     def __str__(self) -> str:
         return str(self.value)

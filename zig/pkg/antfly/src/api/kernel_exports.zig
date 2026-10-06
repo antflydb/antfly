@@ -23,14 +23,16 @@ const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
+const hot_standby_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const usermgr_openapi = @import("antfly_usermgr_openapi");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
+const usermgr_server_openapi = @import("antfly_usermgr_server_openapi");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 
 pub const CreateContext = abi.CreateContext;
 pub const CallContext = abi.CallContext;
@@ -183,7 +185,12 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
-    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(&state.server.incoming_graph_routes);
+    state.server.startPgwire() catch |err| {
+        std.log.err("API pgwire listener startup failed: error.{s}", .{@errorName(err)});
+        state.server.deinit();
+        return fail(err);
+    };
+    if (reads.*) |read_source| read_source.bindIncomingGraphRoutes(@ptrCast(&state.server.incoming_graph_routes));
     state.request_alloc_abi = .fromStd(&state.server.alloc);
     context.out_handle.* = state;
     context.out_request_alloc.* = &state.request_alloc_abi;
@@ -228,9 +235,9 @@ pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
-pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(?ha_http_operation.Executor, void, context)) |failure| return failure;
-    serverState(context).server.setHAInternalExecutor(input(?ha_http_operation.Executor, context).*);
+pub fn setHotStandbyExecutor(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(?hot_standby_http_operation.Executor, void, context)) |failure| return failure;
+    serverState(context).server.setHotStandbyInternalExecutor(input(?hot_standby_http_operation.Executor, context).*);
     return .ok;
 }
 
@@ -246,13 +253,21 @@ pub fn attachReplicatedRestoreStore(
     server_handle: *anyopaque,
     persistence_opaque: *const anyopaque,
 ) callconv(.c) abi.Status {
-    if (validateVersion(abi_version)) |failure| return failure;
+    if (validateVersion(abi_version)) |failure| {
+        std.log.warn("restore job attachment API ABI mismatch: caller={d} owner={d}", .{ abi_version, abi.abi_version });
+        return failure;
+    }
     const persistence: *const restore_jobs.ReplicatedPersistence = @ptrCast(@alignCast(persistence_opaque));
-    if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version)
+    if (persistence.version != restore_jobs.ReplicatedPersistence.abi_version) {
+        std.log.warn("restore job persistence ABI mismatch: provider={d} consumer={d}", .{ persistence.version, restore_jobs.ReplicatedPersistence.abi_version });
         return fail(error.UnsupportedVersion);
+    }
     const state: *ServerState = @ptrCast(@alignCast(server_handle));
-    state.server.attachReplicatedRestoreJobStore(persistence.*) catch |err|
-        return fail(err);
+    state.server.attachReplicatedRestoreJobStore(persistence.*) catch |err| {
+        const status = fail(err);
+        std.log.warn("restore job persistence load failed after ABI validation: version={d} code={d} detail={d}", .{ persistence.version, status.code, status.detail });
+        return status;
+    };
     return .ok;
 }
 
@@ -534,7 +549,7 @@ const function_table: abi.FunctionTable = .{
     .query_admission_stats = &queryAdmissionStats,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
-    .set_ha_executor = &setHAExecutor,
+    .set_ha_executor = &setHotStandbyExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
     .resume_restore_jobs = &resumeRestoreJobs,
@@ -641,7 +656,7 @@ fn routeMetadata(method: abi.HttpMethod, path: []const u8) RouteMetadata {
         .delete => "DELETE",
         .patch => "PATCH",
     };
-    inline for (.{ metadata_openapi.server.routes, usermgr_openapi.server.routes }) |routes| {
+    inline for (.{ metadata_server_openapi.server.routes, usermgr_server_openapi.server.routes }) |routes| {
         for (routes) |route| {
             if (std.mem.eql(u8, route.method, method_name) and metadataPathMatches(route.path, path)) {
                 return .{
@@ -773,7 +788,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     api_server.* = server_mod.ApiHttpServer.init(
         alloc,
         .{
-            .ha_failover_safe_mutations_only = true,
+            .hot_standby_failover_safe_mutations_only = true,
             .internal_service_secret = "kernel-ingress-test-internal-secret-v1",
             .internal_service_issuer = "kernel-ingress-test",
         },
@@ -857,7 +872,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     // Linked dispatch starts the transaction deadline before policy work, but
     // malformed metadata must not let an unauthenticated caller distinguish
     // an internal route. Validation runs only after service authentication.
-    api_server.cfg.ha_failover_safe_mutations_only = false;
+    api_server.cfg.hot_standby_failover_safe_mutations_only = false;
     const invalid_deadline_headers = [_]abi.HeaderView{.{
         .name = abi.Bytes.init(distributed_txn_contract.pre_decision_remaining_ms_header),
         .value = abi.Bytes.init("5001"),
@@ -986,46 +1001,52 @@ test "API kernel failed fallible create releases unpublished state" {
     file.close(std.testing.io);
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/not-a-directory/store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var accounting = std.testing.FailingAllocator.init(arena.allocator(), .{});
-    var allocator = accounting.allocator();
-    const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
-    const cfg: server_mod.ApiHttpServerConfig = .{ .session_store_path = path };
-    var token: u8 = 0;
-    const Stub = struct {
-        fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
-            return error.UnsupportedOperation;
-        }
-    };
-    const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
-    const reads: ?table_reads.TableReadSource = null;
-    const writes: ?table_writes.TableWriteSource = null;
-    var handle: ?*anyopaque = null;
-    var request_alloc: ?*const abi.memory_abi.Allocator = null;
-    @import("../test_error_logs.zig").expectErrorLogs(1);
-    const result = create(&.{
-        .abi_version = abi.abi_version,
-        .owner_alloc = &owner_alloc,
-        .cfg = &cfg,
-        .cfg_contract = .of(server_mod.ApiHttpServerConfig),
-        .source = &source,
-        .source_contract = .of(server_mod.StatusSource),
-        .table_reads = &reads,
-        .table_reads_contract = .of(?table_reads.TableReadSource),
-        .table_writes = &writes,
-        .table_writes_contract = .of(?table_writes.TableWriteSource),
-        .flags = CreateContext.fallible_init,
-        .out_handle = &handle,
-        .out_request_alloc = &request_alloc,
-    });
-    defer if (handle) |created| destroy(created);
-    try std.testing.expect(!result.isOk());
-    try std.testing.expect(handle == null);
-    try std.testing.expect(request_alloc == null);
-    try std.testing.expect(accounting.allocated_bytes > 0);
-    std.debug.print("API_CREATE_CLEANUP expects all owner bytes freed\n", .{});
-    try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+    // Listener startup can fail after server initialization too. Both paths
+    // must release the unpublished API owner and leave outputs untouched.
+    for ([_]server_mod.ApiHttpServerConfig{
+        .{ .session_store_path = path },
+        .{ .pgwire = .{ .enabled = true } },
+    }) |cfg| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var accounting = std.testing.FailingAllocator.init(arena.allocator(), .{});
+        var allocator = accounting.allocator();
+        const owner_alloc = abi.memory_abi.Allocator.fromStd(&allocator);
+        var token: u8 = 0;
+        const Stub = struct {
+            fn status(_: *anyopaque) anyerror!metadata_api.MetadataStatus {
+                return error.UnsupportedOperation;
+            }
+        };
+        const source: server_mod.StatusSource = .{ .ptr = &token, .vtable = &.{ .status = Stub.status } };
+        const reads: ?table_reads.TableReadSource = null;
+        const writes: ?table_writes.TableWriteSource = null;
+        var handle: ?*anyopaque = null;
+        var request_alloc: ?*const abi.memory_abi.Allocator = null;
+        @import("../test_error_logs.zig").expectErrorLogs(1);
+        const result = create(&.{
+            .abi_version = abi.abi_version,
+            .owner_alloc = &owner_alloc,
+            .cfg = &cfg,
+            .cfg_contract = .of(server_mod.ApiHttpServerConfig),
+            .source = &source,
+            .source_contract = .of(server_mod.StatusSource),
+            .table_reads = &reads,
+            .table_reads_contract = .of(?table_reads.TableReadSource),
+            .table_writes = &writes,
+            .table_writes_contract = .of(?table_writes.TableWriteSource),
+            .flags = CreateContext.fallible_init,
+            .out_handle = &handle,
+            .out_request_alloc = &request_alloc,
+        });
+        defer if (handle) |created| destroy(created);
+        try std.testing.expect(!result.isOk());
+        try std.testing.expect(handle == null);
+        try std.testing.expect(request_alloc == null);
+        try std.testing.expect(accounting.allocated_bytes > 0);
+        std.debug.print("API_CREATE_CLEANUP expects all owner bytes freed\n", .{});
+        try std.testing.expectEqual(accounting.allocated_bytes, accounting.freed_bytes);
+    }
 }
 
 test "API kernel runtime I/O receivers validate capability layout and domains" {
@@ -1119,17 +1140,17 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
     try std.testing.expect(handle == null);
     borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
     const Dispatch = @FieldType(abi.native_abi.IoBorrow, "dispatch");
-    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".params;
+    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
     const Forward = struct {
         var owner_dispatch: Dispatch = undefined;
 
         fn dispatch(
-            owner: Parameters[0].type.?,
-            operation: Parameters[1].type.?,
-            arguments: Parameters[2].type.?,
-            out_value: Parameters[3].type.?,
-            reader: Parameters[4].type.?,
-            error_names: Parameters[5].type.?,
+            owner: Parameters[0].?,
+            operation: Parameters[1].?,
+            arguments: Parameters[2].?,
+            out_value: Parameters[3].?,
+            reader: Parameters[4].?,
+            error_names: Parameters[5].?,
         ) callconv(.c) void {
             owner_dispatch(owner, operation, arguments, out_value, reader, error_names);
         }

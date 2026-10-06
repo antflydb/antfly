@@ -435,6 +435,21 @@ pub fn readEncodedWithConfigReported(
     return try state.readEncodedReported(alloc, request);
 }
 
+fn encodeReadRequestAlloc(alloc: Allocator, request: inference_api.ReadRequest) ![]u8 {
+    // Data URI bodies need one exact allocation: allocating-writer growth can
+    // exceed the invocation budget even when the complete request fits.
+    var buffer: [256]u8 = undefined;
+    var counter = std.Io.Writer.Discarding.init(&buffer);
+    try std.json.Stringify.value(request, .{}, &counter.writer);
+    const size = std.math.cast(usize, counter.fullCount()) orelse return error.OutOfMemory;
+    const body = try alloc.alloc(u8, size);
+    errdefer alloc.free(body);
+    var writer: std.Io.Writer = .fixed(body);
+    try std.json.Stringify.value(request, .{}, &writer);
+    std.debug.assert(writer.end == body.len);
+    return body;
+}
+
 const AntflyReaderState = struct {
     alloc: Allocator,
     http: *httpx.Client,
@@ -486,7 +501,7 @@ const AntflyReaderState = struct {
         return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.api_url);
         self.alloc.free(self.model);
@@ -503,7 +518,7 @@ const AntflyReaderState = struct {
         self.auth_header = .{ "Authorization", try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}) };
     }
 
-    fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+    pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
         return (try readReported(ptr, alloc, req)).items;
     }
 
@@ -513,7 +528,7 @@ const AntflyReaderState = struct {
         defer alloc.free(images);
         for (req.images, 0..) |image, i| images[i] = .{ .url = image };
 
-        const body = try httpx.json.Json.stringify(alloc, inference_api.ReadRequest{
+        const body = try encodeReadRequestAlloc(alloc, inference_api.ReadRequest{
             .model = self.model,
             .images = images,
             .prompt = req.prompt orelse self.prompt,
@@ -852,7 +867,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             }
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             self.deinitState();
             self.alloc.destroy(self);
@@ -879,7 +894,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             }
         }
 
-        fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+        pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return switch (provider) {
                 .openai => try self.readOpenAi(alloc, req),
@@ -1085,6 +1100,33 @@ fn dupOpt(alloc: Allocator, value: ?[]const u8) !?[]const u8 {
 
 fn freeOpt(alloc: Allocator, value: ?[]const u8) void {
     if (value) |v| alloc.free(v);
+}
+
+test "reader encodes a large inline image within one request buffer budget" {
+    const alloc = std.testing.allocator;
+    const image_url = try alloc.alloc(u8, 1 << 20);
+    defer alloc.free(image_url);
+    @memset(image_url, 'A');
+    const prefix = "data:image/png;base64,";
+    @memcpy(image_url[0..prefix.len], prefix);
+    const images = [_]inference_api.ImageURL{.{ .url = image_url }};
+    const prompt = "total: \"123.45\"\nprès";
+
+    const storage = try alloc.alloc(u8, image_url.len + 1024);
+    defer alloc.free(storage);
+    var bounded = std.heap.FixedBufferAllocator.init(storage);
+    const body = try encodeReadRequestAlloc(bounded.allocator(), .{
+        .model = "reader",
+        .images = &images,
+        .prompt = prompt,
+        .max_tokens = 17,
+    });
+    defer bounded.allocator().free(body);
+
+    var parsed = try std.json.parseFromSlice(inference_api.ReadRequest, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(image_url, parsed.value.images[0].url);
+    try std.testing.expectEqualStrings(prompt, parsed.value.prompt.?);
 }
 
 test "reader registry preserves named providers" {

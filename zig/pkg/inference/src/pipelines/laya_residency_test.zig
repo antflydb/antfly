@@ -59,7 +59,7 @@ test "laya resident Metal released checkpoint parity and warm latency" {
             }
             if (iteration > 0) times[iteration - 1] = elapsed;
             for (decision.probabilities, row.probabilities) |actual, expected| max_error = @max(max_error, @abs(actual - expected));
-            try std.testing.expectApproxEqAbs(row.act_probability, decision.act_probability, 5e-5);
+            try std.testing.expectApproxEqAbs(row.act_probability, decision.act_probability.?, 5e-5);
             try std.testing.expect(max_error < 5e-5);
         }
         std.mem.sort(u64, &times, {}, std.sort.asc(u64));

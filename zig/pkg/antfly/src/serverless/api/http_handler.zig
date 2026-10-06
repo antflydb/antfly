@@ -54,6 +54,7 @@ const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const relationship_filter = @import("../../graph/relationship_filter.zig");
 const graph_work_budget_mod = @import("../../graph/work_budget.zig");
 const graph_node_admission = @import("../../graph/node_admission.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
@@ -107,7 +108,7 @@ const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
 const parseJsonPathValueAlloc = json_helpers.parseJsonPathValueAlloc;
 const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const common_config = @import("../../common/config.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_operation = @import("../../api/operation.zig");
 const request_admission = @import("../../common/request_admission.zig");
 const RequestAdmission = request_admission.RequestAdmission;
@@ -125,7 +126,7 @@ const SearchExecution = struct {
     requested_limit: usize,
     profile_requested: bool,
 
-    fn deinit(self: *SearchExecution, alloc: Allocator) void {
+    pub fn deinit(self: *SearchExecution, alloc: Allocator) void {
         query_mod.freeSearchHits(alloc, self.hits);
         if (self.session) |*session| session.deinit();
         self.status.deinit(alloc);
@@ -145,7 +146,7 @@ const ServerlessAggregationComputation = struct {
     requests: []const db_mod.aggregations.SearchAggregationRequest = &.{},
     results: []db_mod.aggregations.SearchAggregationResult,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         query_api.freeAggregationRequests(alloc, self.requests);
         db_mod.aggregations.deinitResults(alloc, self.results);
         self.* = undefined;
@@ -155,7 +156,7 @@ const ServerlessAggregationComputation = struct {
 const ServerlessAggregationContextOwned = struct {
     ctx: db_mod.aggregations.Context = .{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         distributed_stats_mod.deinitTextFieldStats(alloc, self.ctx.distributed_text_stats);
         db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, self.ctx.distributed_background_text_stats);
         self.* = undefined;
@@ -166,7 +167,7 @@ const SignificantTermFieldSet = struct {
     field: []u8,
     terms: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.field);
         for (self.terms.items) |term| alloc.free(term);
         self.terms.deinit(alloc);
@@ -757,6 +758,11 @@ pub const HttpHandler = struct {
         if (try self.requireMutableRoute()) |resp| return resp;
         var req = parseEnsureTableRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid table request");
         defer req.deinit(self.alloc);
+        @import("../catalog/storage_capabilities.zig").requireDefinition(self.alloc, req.schema_json orelse "", req.read_schema_json orelse "", req.indexes_json orelse "") catch |err| switch (err) {
+            error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational tables and constraints require the native storage-owner runtime"),
+            error.OutOfMemory => return err,
+            else => return try textResponse(self.alloc, 400, "invalid table definition"),
+        };
         const policy = req.policy orelse catalog_mod.NamespacePolicy{};
         const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(self.alloc, indexes_json) catch |err| switch (err) {
@@ -784,12 +790,15 @@ pub const HttpHandler = struct {
             if (has_definition_update) {
                 var table = (try self.catalog.getTableAlloc(self.alloc, table_name)) orelse return try textResponse(self.alloc, 404, "not found");
                 defer table.deinit(self.alloc);
-                _ = try self.catalog.setTableDefinition(
+                _ = self.catalog.setTableDefinition(
                     table_name,
                     req.schema_json orelse table.schema_json,
                     req.read_schema_json orelse table.read_schema_json,
-                    indexes_json,
-                );
+                    req.indexes_json orelse table.indexes_json,
+                ) catch |err| switch (err) {
+                    error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational tables and constraints require the native storage-owner runtime"),
+                    else => return err,
+                };
             }
             return try jsonResponse(self.alloc, 200, struct {}{});
         }
@@ -933,7 +942,7 @@ pub const HttpHandler = struct {
                             .ready => .ready,
                             .rejected => .rejected,
                         };
-                        status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
+                        status.rejection_reason = @fromBackingInt(@backingInt(metric_ref.graph_metric_rejection_reason));
                     }
                 }
                 statuses[initialized] = status;
@@ -1012,6 +1021,7 @@ pub const HttpHandler = struct {
     fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
+            error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
             error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
             else => return try textResponse(self.alloc, 500, "write admission failed"),
         };
@@ -1032,6 +1042,7 @@ pub const HttpHandler = struct {
     fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
             error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
             else => return try textResponse(self.alloc, 500, "write admission failed"),
@@ -3040,6 +3051,7 @@ pub const HttpHandler = struct {
         }
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
+            .parse_numbers = false,
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = parsed_request.value;
@@ -3049,9 +3061,25 @@ pub const HttpHandler = struct {
             return err;
         };
         defer public_graph_query.freeNamedGraphQueries(self.alloc, graph_queries);
+        for (graph_queries) |named| try validatePublishedRelationshipFilters(named);
 
         var metric_requests = try query_api.parseGraphMetricRequestsAlloc(self.alloc, body);
         defer metric_requests.deinit(self.alloc);
+        // Serverless serves immutable published metric segments and cannot
+        // compute query-seeded personalized PageRank from a live edge
+        // snapshot. Fail closed rather than silently returning global scores.
+        for (metric_requests.queries) |named| {
+            if (named.query.seed_nodes.len != 0) {
+                graph_query_diagnostic.record("$request", "graph_metric", .request_control_not_supported);
+                return error.UnsupportedQueryRequest;
+            }
+        }
+        if (metric_requests.rerank) |rerank| {
+            if (rerank.seed_nodes.len != 0) {
+                graph_query_diagnostic.record("$request", "graph_metric_rerank", .request_control_not_supported);
+                return error.UnsupportedQueryRequest;
+            }
+        }
 
         var req: db_types.SearchRequest = .{
             .count_only = request.count == true,
@@ -3063,8 +3091,8 @@ pub const HttpHandler = struct {
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
         };
-        if (graph_request) |canonical_operations| {
-            req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
+        if (request.graph_queries) |canonical_operations| {
+            req.graph_query_transport = graph_wire_envelope.captureTypedCanonicalOperationsAlloc(
                 self.alloc,
                 canonical_operations,
                 graph_queries,
@@ -3267,7 +3295,7 @@ pub const HttpHandler = struct {
     const PublicGraphMetricColumns = struct {
         columns: []query_mod.graph_metric_reader.ScoreColumn,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.columns) |*column| column.deinit(alloc);
             if (self.columns.len > 0) alloc.free(self.columns);
             self.* = undefined;
@@ -4471,6 +4499,7 @@ pub const HttpHandler = struct {
                 .direction = named_query.query.params.direction,
                 .edge_types = named_query.query.params.edge_types,
                 .max_depth = named_query.query.params.max_depth,
+                .edge_filter = named_query.query.params.edge_filter,
                 .min_weight = named_query.query.params.min_weight,
                 .max_weight = named_query.query.params.max_weight,
                 .max_results = traversal_limit,
@@ -4587,6 +4616,7 @@ pub const HttpHandler = struct {
             .edge_types = named_query.query.params.edge_types,
             .direction = named_query.query.params.direction,
             .max_depth = named_query.query.params.max_depth,
+            .edge_filter = named_query.query.params.edge_filter,
             .min_weight = named_query.query.params.min_weight,
             .max_weight = named_query.query.params.max_weight,
             .node_admission = admission,
@@ -5835,6 +5865,7 @@ pub const HttpHandler = struct {
 
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
+            error.RelationalStorageUnavailable => return error.MethodNotAllowed,
             error.ExternalTableReadOnly => return error.MethodNotAllowed,
             else => {
                 std.log.err("serverless public table batch write admission failed table={s} err={}", .{ table_name, err });
@@ -5944,7 +5975,9 @@ pub const HttpHandler = struct {
             const build_result = self.catalog.buildTableWithCancellation(table_name, sync_cancellation) catch |err| switch (err) {
                 error.Canceled => return error.CommittedPending,
                 error.NamespaceNotFound => return error.CommittedRepairRequired,
-                error.HeadChanged => null,
+                // Background publication may own or take over the lease.
+                // Observe its progress and retry within the same sync deadline.
+                error.HeadChanged, error.WorkLeaseLost => null,
                 else => {
                     std.log.err("serverless public table batch build failed table={s} sync_level={} err={}", .{ table_name, sync_level, err });
                     return error.CommittedRepairRequired;
@@ -6243,6 +6276,8 @@ pub const HttpHandler = struct {
             return error.InvalidIndexRequest;
         };
         defer alloc.free(index_json);
+        if (@import("../../api/relational_index_mutation.zig").isRelational(alloc, index_json) catch return error.InvalidIndexRequest) return error.MethodNotAllowed;
+        if (@import("../../api/relational_index_mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.Conflict;
         tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch {
             return error.InvalidIndexRequest;
         };
@@ -6314,6 +6349,7 @@ pub const HttpHandler = struct {
         if (self.runtime_status.role == .query_only) return error.MethodNotAllowed;
         var table = (self.catalog.getTableAlloc(self.alloc, table_name) catch return error.InternalFailure) orelse return error.NotFound;
         defer table.deinit(self.alloc);
+        if (@import("../../api/relational_index_mutation.zig").contains(alloc, table.schema_json, index_name) catch return error.InternalFailure) return error.MethodNotAllowed;
 
         const next_indexes_json = (indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse {
             return error.NotFound;
@@ -6492,7 +6528,7 @@ const BudgetedMutationOverlay = struct {
     items: []query_materializer.Mutation,
     lease: graph_work_budget_mod.RetainedLease,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         freeMaterializerMutations(alloc, self.items);
         self.lease.deinit();
         self.* = undefined;
@@ -6516,7 +6552,7 @@ const PublicDocumentRef = struct {
     last_lsn: u64,
     last_timestamp_ns: u64,
 
-    fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
+    pub fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
         switch (self.body) {
             .owned => |body| {
                 alloc.free(self.doc_id);
@@ -6570,7 +6606,7 @@ const PublicGraphRequestCache = struct {
         };
     }
 
-    fn deinit(self: *PublicGraphRequestCache) void {
+    pub fn deinit(self: *PublicGraphRequestCache) void {
         if (self.facts_reader) |reader| {
             const alloc = self.facts_allocation.allocator();
             var bodies = self.facts_bodies.iterator();
@@ -6869,7 +6905,11 @@ const PublicGraphRequestCache = struct {
         var application_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, application_peak_bytes);
         defer application_lease.deinit();
 
-        var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
+        var slots = std.ArrayListUnmanaged(PublicDocumentRef){
+            .items = base,
+            .capacity = base.len,
+            .pointer_stability = .{},
+        };
         base = &.{};
         defer {
             for (slots.items) |*slot| slot.deinit(self.handler.alloc);
@@ -7424,6 +7464,50 @@ const PublicEdgeCursor = struct {
         return try out.toOwnedSlice(a);
     }
 };
+
+// Published lake sidecars contain only physical endpoints, type, and weight.
+// Validate once at admission rather than synthesizing absent fact data during
+// traversal, which would make null/temporal predicates silently succeed.
+fn validatePublishedRelationshipFilter(operation: []const u8, filter: relationship_filter.Filter) !void {
+    if (filter.valid_at_ns != null or filter.known_at_ns != null) {
+        graph_query_diagnostic.record(operation, "edge_filter", .request_control_not_supported);
+        return error.UnsupportedQueryRequest;
+    }
+    for (filter.properties) |predicate| {
+        const supported = std.mem.eql(u8, predicate.field, "/source") or
+            std.mem.eql(u8, predicate.field, "/target") or
+            std.mem.eql(u8, predicate.field, "/type") or
+            std.mem.eql(u8, predicate.field, "/weight");
+        if (!supported) {
+            graph_query_diagnostic.record(operation, "edge_filter", .request_control_not_supported);
+            return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validatePublishedMatchEdges(operation: []const u8, edges: []const graph_pattern_mod.MatchEdge) !void {
+    for (edges) |edge| try validatePublishedRelationshipFilter(operation, edge.step.edge_filter);
+}
+
+fn validatePublishedMatchPredicates(operation: []const u8, predicates: []const graph_pattern_mod.MatchPredicate) !void {
+    for (predicates) |predicate| switch (predicate) {
+        .not_equal => {},
+        .not_exists => |edges| try validatePublishedMatchEdges(operation, edges),
+    };
+}
+
+fn validatePublishedRelationshipFilters(named: db_types.NamedGraphQuery) !void {
+    try validatePublishedRelationshipFilter(named.name, named.query.params.edge_filter);
+    for (named.query.pattern) |step| try validatePublishedRelationshipFilter(named.name, step.edge.edge_filter);
+    if (named.query.match_pattern) |pattern| {
+        try validatePublishedMatchEdges(named.name, pattern.edges);
+        try validatePublishedMatchPredicates(named.name, pattern.predicates);
+        for (pattern.optional) |optional| {
+            try validatePublishedMatchEdges(named.name, optional.edges);
+            try validatePublishedMatchPredicates(named.name, optional.predicates);
+        }
+    }
+}
 
 const ServerlessTraversalEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
@@ -9025,7 +9109,7 @@ const ServerlessGraphMetricStatus = struct {
     materializer_fingerprint: u64 = 0,
     published_generation: u64 = 0,
 
-    fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
+    pub fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
         alloc.free(self.index_name);
         alloc.free(self.metric_name);
         self.* = undefined;
@@ -9322,6 +9406,10 @@ fn serverlessIndexStatus(
         .embeddings => "embeddings",
         .graph => "graph",
         .algebraic => "algebraic",
+        // Relational definitions belong to the schema catalog, not the
+        // artifact publication journal. Never infer their readiness from a
+        // full-text/vector WAL head if corrupt metadata puts one here.
+        .relational => return error.InvalidTableIndexMetadata,
     };
 
     const has_documents = status.enrichment_total_document_count != 0 or status.latest_wal_lsn != 0;
@@ -10046,7 +10134,7 @@ const OwnedJsonValueSlice = struct {
     alloc: Allocator,
     values: []std.json.Value,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.values) |*value| deinitJsonValue(self.alloc, value);
         self.alloc.free(self.values);
     }
@@ -13087,6 +13175,29 @@ test "http handler accepts structured table updates for metadata-only republish 
     defer parsed_semantic_index.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_semantic_index.value.status.head_publication_action.?);
     try std.testing.expectEqual(@as(?bool, false), parsed_semantic_index.value.status.materialization_blocked);
+
+    var before_partial = (try catalog.getTableAlloc(alloc, "docs")).?;
+    defer before_partial.deinit(alloc);
+    var partial = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = "{\"schema\":{\"version\":3}}" });
+    defer partial.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), partial.status);
+    var after_partial = (try catalog.getTableAlloc(alloc, "docs")).?;
+    defer after_partial.deinit(alloc);
+    try std.testing.expectEqualStrings(before_partial.indexes_json, after_partial.indexes_json);
+
+    // Retained unsupported metadata must return an actionable capability error,
+    // not mutate the table or silently discard its indexes during a partial PUT.
+    try std.testing.expect(try catalog_store.setTableDefinition("docs", "{}", "{\"storage_mode\":\"relational\"}", after_partial.indexes_json));
+    var unavailable = try handler.handle(.{ .method = .put, .path = "/tables/docs", .body = "{\"schema\":{\"version\":4}}" });
+    defer unavailable.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), unavailable.status);
+    var unchanged = (try catalog.getTableAlloc(alloc, "docs")).?;
+    defer unchanged.deinit(alloc);
+    try std.testing.expectEqualStrings("{}", unchanged.schema_json);
+    var refused = try handler.handle(.{ .method = .put, .path = "/tables/unsupported", .body = "{\"schema\":{\"storage_mode\":\"relational\"}}" });
+    defer refused.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 405), refused.status);
+    try std.testing.expect((try catalog.getTableAlloc(alloc, "unsupported")) == null);
 }
 
 test "http handler query publication exposes vector compaction targets" {
@@ -13364,9 +13475,42 @@ test "http handler honors public serverless sync levels on table batch writes" {
     var manifest_store = fs_manifests.manifestStore();
     defer manifest_store.deinit();
 
-    var fs_progress = try @import("../catalog/fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
-    var progress_store = fs_progress.progressStore();
+    const ContendedProgress = struct {
+        const FsProgressStore = @import("../catalog/fs_progress_store.zig").FsProgressStore;
+        const Lease = build_mod.work_lease;
+
+        fs: FsProgressStore,
+        lease_vtable: Lease.Provider.VTable = undefined,
+        denied_acquisitions: usize = 0,
+
+        fn leaseProvider(ptr: *anyopaque) Lease.Provider {
+            const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("fs", fs);
+            return .{ .ptr = ptr, .vtable = &self.lease_vtable };
+        }
+
+        fn acquire(ptr: *anyopaque, namespace: []const u8, owner: []const u8, now: u64, ttl: u64) !?Lease.Acquisition {
+            const fs: *FsProgressStore = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @fieldParentPtr("fs", fs);
+            if (self.denied_acquisitions > 0) {
+                self.denied_acquisitions -= 1;
+                return null;
+            }
+            var base = fs.progressStore();
+            const provider = try base.workLeaseProvider();
+            return provider.acquire(namespace, owner, now, ttl);
+        }
+    };
+    var progress_fixture = ContendedProgress{
+        .fs = try ContendedProgress.FsProgressStore.init(alloc, std.mem.span(manifest_root)),
+    };
+    var progress_store = progress_fixture.fs.progressStore();
     defer progress_store.deinit();
+    progress_fixture.lease_vtable = (try progress_store.workLeaseProvider()).vtable.*;
+    progress_fixture.lease_vtable.acquire = ContendedProgress.acquire;
+    var progress_vtable = progress_store.vtable.*;
+    progress_vtable.work_lease_provider = ContendedProgress.leaseProvider;
+    progress_store.vtable = &progress_vtable;
 
     var fs_wal = try @import("../wal/mod.zig").FsStore.init(alloc, std.mem.span(wal_root));
     var wal_store = fs_wal.walStore();
@@ -13399,6 +13543,9 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer create_docs.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), create_docs.status);
 
+    // A background publisher owns the lease during the first two attempts.
+    // The batch must wait for publication instead of returning repair_required.
+    progress_fixture.denied_acquisitions = 2;
     var full_text_batch = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/batch",
@@ -13408,6 +13555,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
     });
     defer full_text_batch.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), full_text_batch.status);
+    try std.testing.expectEqual(@as(usize, 0), progress_fixture.denied_acquisitions);
 
     var search = try handler.handle(.{
         .method = .post,
@@ -13694,7 +13842,7 @@ test "serverless graph index status exposes disabled publication as terminal" {
     try std.testing.expect(!metric.get("retryable").?.bool);
 }
 
-test "http handler serves published graph query endpoints" {
+test "serverless http handler serves published graph query endpoints" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -13974,6 +14122,95 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
+
+    // Exercise actual public admission and execution: rejected edges must not
+    // enter traversal, path ranking, or MATCH, and literals remain lossless.
+    const filtered_cases = [_]struct { body: []const u8, count: usize, path_len: usize = 0 }{
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"max_depth":1,"edge_filter":{"properties":[{"field":"/weight","op":"gt","value":1}]}}}}}
+        , .count = 1, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"max_depth":1,"edge_filter":{"properties":[{"field":"/weight","op":"eq","value":1.5000000000000001}]}}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gte","value":1}]},"objective":"min_weight_sum"}}}}
+        , .count = 1, .path_len = 3 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gte","value":1}]},"k":2,"objective":"min_weight_sum"}}}}
+        , .count = 1, .path_len = 3 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gt","value":10000}]},"objective":"min_weight_sum"}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gt","value":10000}]},"k":2,"objective":"min_weight_sum"}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"],"edge_filter":{"properties":[{"field":"/weight","op":"eq","value":1.5000000000000001}]}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"],"edge_filter":{"properties":[{"field":"/weight","op":"eq","value":1.5}]}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        , .count = 1, .path_len = 0 },
+    };
+    // The response sidecar is built from the same typed contract as execution,
+    // rather than the rounded raw tree used only for feature routing.
+    var precise_request = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, filtered_cases[1].body, .{ .parse_numbers = false });
+    defer precise_request.deinit();
+    const expected_names = [_]struct { name: []const u8 }{.{ .name = "filtered" }};
+    var precise_transport = try graph_wire_envelope.captureTypedCanonicalOperationsAlloc(alloc, precise_request.value.graph_queries.?, &expected_names);
+    defer precise_transport.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, precise_transport.operations_json, "1.5000000000000001") != null);
+    const wrong_names = [_]struct { name: []const u8 }{.{ .name = "other" }};
+    try std.testing.expectError(error.InvalidGraphWireEnvelope, graph_wire_envelope.captureTypedCanonicalOperationsAlloc(alloc, precise_request.value.graph_queries.?, &wrong_names));
+
+    for (filtered_cases) |case| {
+        var response = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body = case.body });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, response.body);
+        defer parsed.deinit();
+        const result = parsed.value.responses.?[0].graph_results.?.map.get("filtered").?;
+        switch (result) {
+            .graph_nodes_result => |nodes| try std.testing.expectEqual(case.count, nodes.nodes.len),
+            .graph_paths_result => |paths| {
+                try std.testing.expectEqual(case.count, paths.paths.len);
+                if (case.path_len != 0) {
+                    try std.testing.expectEqual(case.path_len, paths.paths[0].path.nodes.len);
+                    try std.testing.expectEqual(@as(f64, 3.5), paths.paths[0].path.weight_sum);
+                }
+            },
+            .graph_bindings_result => |bindings| try std.testing.expectEqual(case.count, bindings.rows.len),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Unsupported fact data must fail before any graph reads, including when
+    // the predicate is buried in optional or negative pattern clauses.
+    const unsupported_filters = [_][]const u8{
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"max_depth":1,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"known_at":"2022-01-01T00:00:00Z"}}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/edge_id","op":"is_null"}]},"k":2}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"],"edge_filter":{"properties":[{"field":"/metadata/score","op":"is_null"}]}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}],"where":{"not_exists":{"edges":[{"from":"a","to":"b","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]}}},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}],"optional":[{"nodes":{"c":{}},"edges":[{"from":"a","to":"c","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}],"optional":[{"nodes":{"c":{}},"edges":[{"from":"b","to":"c"}],"where":{"not_exists":{"edges":[{"from":"a","to":"c","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]}}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+    };
+    for (unsupported_filters) |body| {
+        var response = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body = body });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 422), response.status);
+        var parsed = try parseJsonTestBody(metadata_openapi.GraphQueryUnsupportedError, alloc, response.body);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("filtered", parsed.value.operation);
+        try std.testing.expectEqualStrings("edge_filter", parsed.value.feature);
+        try std.testing.expectEqualStrings("request_control_not_supported", parsed.value.reason);
+    }
 
     var from_fused = try handler.handle(.{
         .method = .post,

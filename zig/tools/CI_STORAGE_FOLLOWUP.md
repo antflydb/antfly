@@ -271,7 +271,7 @@ From `zig/`, run the storage unit gate with timing artifacts:
 ```sh
 ANTFLY_TEST_TIMINGS=1 ANTFLY_TEST_LOG_DIR=/tmp/storage-followup-suites \
   python3 tools/run_bounded_zig_build.py --max-rss-cap 25769803776 -- \
-  build unit-storage-test -Doptimize=Debug -Dmetal=false -Dcuda=false -j2 --summary all
+  build unit-storage-test -Doptimize=debug -Dmetal=false -Dcuda=false -j2 --summary all
 ```
 
 Set `ANTFLY_TEST_WORK_PROFILE=1` when running an already compiled test binary

@@ -10,8 +10,8 @@
 //! ABI, and allocator ownership uses runtime_memory_abi at explicit owner ABIs.
 
 const std = @import("std");
-const error_abi = @import("runtime_error_abi.zig");
-const native_abi = @import("runtime_native_abi.zig");
+const error_abi = @import("antfly_runtime_abi").error_abi;
+const native_abi = @import("antfly_runtime_abi").native_abi;
 
 pub const CallbackDispatch = *const fn (
     contract: *const native_abi.CallContract,
@@ -90,19 +90,21 @@ fn BoundaryImpl(comptime VTable: type) type {
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
+            @setEvalBranchQuota(64 * @typeInfo(VTable).@"struct".field_names.len);
             if (contract.version != native_abi.abi_version)
                 return error_abi.statusFromError(error.UnsupportedVersion);
-            inline for (std.meta.fields(VTable)) |field| {
-                if (contract.method_id == native_abi.stableId(field.name)) {
-                    if (comptime isCallbackField(field.type)) {
-                        const Callback = callbackType(field.type);
+            const info = @typeInfo(VTable).@"struct";
+            inline for (info.field_names, info.field_types) |reflected_name, Field| {
+                if (contract.method_id == native_abi.stableId(reflected_name)) {
+                    if (comptime isCallbackField(Field)) {
+                        const Callback = callbackType(Field);
                         const Function = functionType(Callback);
                         const Args = std.meta.ArgsTuple(Function);
                         const Payload = payloadType(Callback);
-                        const expected = native_abi.CallContract.of(field.name, Callback, Args, Payload);
+                        const expected = native_abi.CallContract.of(reflected_name, Callback, Args, Payload);
                         if (!contract.matches(expected))
                             return error_abi.statusFromError(error.InvalidArgument);
-                        return invoke(field.name, field.type, callback, args, output);
+                        return invoke(reflected_name, Field, callback, args, output);
                     }
                     return error_abi.statusFromError(error.InvalidArgument);
                 }
@@ -229,6 +231,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
             return error.ReadIndexTimeout;
         }
 
+        fn noRowPolicy(_: *u32) anyerror!void {
+            return error.RowPolicyCatalogChanged;
+        }
+
         fn storageBusy(_: *u32) anyerror!void {
             return error.StorageBusy;
         }
@@ -239,6 +245,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
 
         fn storageReadUnavailable(_: *u32) anyerror!void {
             return error.StorageReadTemporarilyUnavailable;
+        }
+
+        fn concurrencyUnavailable(_: *u32) anyerror!void {
+            return error.ConcurrencyUnavailable;
         }
 
         fn topologyUpgradeRequired(_: *u32) anyerror!void {
@@ -305,6 +315,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
         TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.readIndexTimeout, .{&base}),
     );
     try std.testing.expectError(
+        error.RowPolicyCatalogChanged,
+        TestBoundary.call("fail", &callbacks.foreignDispatch, &callbacks.noRowPolicy, .{&base}),
+    );
+    try std.testing.expectError(
         error.StorageBusy,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageBusy, .{&base}),
     );
@@ -315,6 +329,10 @@ test "boundary dispatcher preserves local calls and maps cross-unit calls" {
     try std.testing.expectError(
         error.StorageReadTemporarilyUnavailable,
         TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.storageReadUnavailable, .{&base}),
+    );
+    try std.testing.expectError(
+        error.ConcurrencyUnavailable,
+        TestBoundary.call("retryable_fail", &callbacks.foreignDispatch, &callbacks.concurrencyUnavailable, .{&base}),
     );
     try std.testing.expectError(
         error.TableTopologyProtocolUpgradeRequired,

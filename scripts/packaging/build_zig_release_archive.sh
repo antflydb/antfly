@@ -38,7 +38,7 @@ archive_name=
 out_dir=
 metal=false
 system_blas=false
-optimize=ReleaseFast
+optimize=fast
 strip=true
 jobs=
 
@@ -104,10 +104,10 @@ if [ -n "$jobs" ] && ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 case "$optimize" in
-  Debug|ReleaseSafe|ReleaseFast|ReleaseSmall) ;;
+  debug|safe|fast|small) ;;
   *)
     usage
-    echo "--optimize must be one of Debug, ReleaseSafe, ReleaseFast, ReleaseSmall; got: $optimize" >&2
+    echo "--optimize must be one of debug, safe, fast, small; got: $optimize" >&2
     exit 2
     ;;
 esac
@@ -229,14 +229,14 @@ run_zig_build_steps_with_retry() {
 
   # Zig 0.16 can fail a first ARM64 release compile in LLVM's allocation path
   # even though the runner has ample available memory. This has occurred in the
-  # historical Linux ReleaseSmall build and in the current Linux and macOS
-  # ReleaseFast builds. A replay retains completed work in the local cache and
+  # historical Linux small build and in the current Linux and macOS
+  # fast builds. A replay retains completed work in the local cache and
   # starts LLVM in a fresh process. Limit the retry to those observed production
   # combinations and allocation signatures so unrelated errors fail immediately.
   case "$target:$optimize" in
-    aarch64-linux-musl:ReleaseSmall | \
-    aarch64-linux-musl:ReleaseFast | \
-    aarch64-macos:ReleaseFast) ;;
+    aarch64-linux-musl:small | \
+    aarch64-linux-musl:fast | \
+    aarch64-macos:fast) ;;
     *) return "$status" ;;
   esac
   if ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"; then

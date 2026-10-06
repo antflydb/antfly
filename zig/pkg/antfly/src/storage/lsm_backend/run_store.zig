@@ -82,7 +82,7 @@ const Payload = struct {
     bytes: u64,
 
     fn destroy(header: *@import("repository.zig").RunOwner, allocator: std.mem.Allocator) void {
-        const payload: *Payload = @fieldParentPtr("owner", header);
+        const payload: *Payload = @alignCast(@fieldParentPtr("owner", header));
         if (payload.parent) |parent| {
             if (payload.run.owns_bloom_filter) if (payload.run.bloom_filter) |*filter| filter.deinit(allocator);
             if (payload.run.table_index) |*index| index.deinit(allocator);
@@ -377,7 +377,7 @@ pub const Store = struct {
 };
 
 test "writer owner narrow publication scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const allocator = std.heap.smp_allocator;
     const clock = @import("antfly_platform").time;
     for ([_]usize{ 1000, 10000, 100000 }) |count_runs| {

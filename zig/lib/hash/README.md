@@ -50,9 +50,9 @@ libc-free ARM64 startup paths.
 From `zig/`:
 
 ```sh
-zig build lib-hash-test lib-image-png-test -Doptimize=Debug
-zig build lib-hash-test -Dcpu=baseline -Doptimize=ReleaseSafe
-zig build lib-hash-test -Doptimize=ReleaseFast -- throughput
+zig build lib-hash-test lib-image-png-test -Doptimize=debug
+zig build lib-hash-test -Dcpu=baseline -Doptimize=safe
+zig build lib-hash-test -Doptimize=fast -- throughput
 ```
 
 On Linux x86-64, CI also runs `zig test lib/hash/src/mod.zig -O Debug

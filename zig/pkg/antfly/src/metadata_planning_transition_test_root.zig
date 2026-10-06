@@ -9,6 +9,7 @@ const control_loop = @import("metadata/control_loop.zig");
 const table_manager = @import("metadata/table_manager.zig");
 const table_workflow = @import("metadata/table_workflow.zig");
 const transition_state = @import("metadata/transition_state.zig");
+const relational_topology_admission = @import("metadata/relational_topology_admission.zig");
 const transition_actions = @import("metadata/transition_actions.zig");
 const transition_controller = @import("metadata/transition_controller.zig");
 const transition_driver = @import("metadata/transition_driver.zig");
@@ -19,9 +20,12 @@ test {
     _ = table_manager;
     _ = table_workflow;
     _ = transition_state;
+    _ = relational_topology_admission;
     _ = transition_actions;
     _ = transition_controller;
     _ = transition_driver;
+    _ = @import("metadata/online_merge.zig");
+    _ = @import("metadata/online_merge_driver.zig");
 }
 
 /// Implementation source choices for this compilation root.

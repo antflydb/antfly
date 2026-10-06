@@ -72,6 +72,13 @@ pub fn lower(allocator: std.mem.Allocator, graph: *const Graph) !LowerResult {
         // A materialized alternate would discard replay/control semantics and
         // reintroduce quadratic owners. These versioned kernels have a VJP.
         if (n.op == .fused_deberta_training_attention_v1 or n.op == .fused_deberta_training_attention_backward_v1) continue;
+        if (n.op == .fused_modernbert_training_attention_v1 or n.op == .fused_modernbert_training_attention_backward_v1) continue;
+        // Flash-style segment (tree/local/global) training attention: same
+        // reasoning as Deberta above -- a materialized alternate would
+        // discard `ranges`/`window`/replay semantics and reintroduce the
+        // quadratic `[tokens, tokens]` tensor this op exists to avoid.
+        // Differentiated by the custom VJP in `autodiff.zig`, not lowering.
+        if (n.op == .fused_segment_training_attention_v1 or n.op == .fused_segment_training_attention_backward_v1) continue;
         if (n.op.isFused() and n.vjp_alternate != null_node) {
             if (n.vjp_alternate == i) return error.CyclicGraph;
             redirect[i] = n.vjp_alternate;
@@ -285,8 +292,8 @@ test "lower replaces fused linear with primitives" {
         try std.testing.expect(n.op.isPrimitive());
     }
 
-    // Should have: 3 params + transpose + matmul + add = 6 nodes
-    try std.testing.expectEqual(@as(u32, 6), lowered.graph.nodeCount());
+    // Should have: 3 params + direct dot_general + add = 5 nodes.
+    try std.testing.expectEqual(@as(u32, 5), lowered.graph.nodeCount());
 
     // Output should be the add node
     try std.testing.expectEqual(@as(usize, 1), lowered.graph.outputs.items.len);

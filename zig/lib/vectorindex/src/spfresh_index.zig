@@ -43,7 +43,7 @@ pub const FlatCentroidBlock = struct {
     shadowed_posting_bits: []const u64 = &.{},
     owned: bool = true,
 
-    fn deinit(self: *FlatCentroidBlock, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FlatCentroidBlock, alloc: std.mem.Allocator) void {
         if (!self.owned) {
             self.* = undefined;
             return;
@@ -122,7 +122,7 @@ pub const FlatCentroidDirectory = struct {
         alloc.destroy(self);
     }
 
-    fn deinit(self: *FlatCentroidDirectory, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FlatCentroidDirectory, alloc: std.mem.Allocator) void {
         const accounting_context = self.accounting_context;
         const release_accounting = self.release_accounting;
         const accounted_bytes = self.accounted_bytes;
@@ -1612,7 +1612,10 @@ fn acquireFlatCentroidDirectory(
         var build_flight_open = (snapshot_is_current or generation_cache) and comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
         var build_outcome: FlatCentroidBuildOutcome = .retry;
         defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, build_outcome);
-        errdefer |err| build_outcome = flatCentroidBuildFailureOutcome(err);
+        // Zig 0.17 no longer exposes the active error payload to errdefer.
+        // Treat an interrupted owner as retryable; callers will preserve and
+        // return the original error while the next waiter may retry the build.
+        errdefer build_outcome = .retry;
 
         var build_reservation: FlatCentroidBuildReservation = .{};
         if (comptime @hasDecl(Index, "reserveFlatCentroidDirectoryBuildBytes")) {

@@ -18,7 +18,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const runtime_http_bridge = @import("../runtime_http_bridge.zig");
+const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
@@ -27,7 +27,7 @@ const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
+const hot_standby_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const internal_routes = @import("../internal/routes.zig");
 
@@ -92,6 +92,16 @@ const OpaqueApiHttpServer = struct {
             @panic("API kernel allocation failed");
     }
 
+    pub fn initWithProcessRequestAllocatorFallible(
+        owner_alloc: std.mem.Allocator,
+        cfg: server_mod.ApiHttpServerConfig,
+        source: server_mod.StatusSource,
+        read_source: ?table_reads.TableReadSource,
+        write_source: ?table_writes.TableWriteSource,
+    ) !OpaqueApiHttpServer {
+        return createOpaqueServer(owner_alloc, cfg, source, read_source, write_source, false);
+    }
+
     pub fn deinit(self: *OpaqueApiHttpServer) void {
         const boundary_allocator = self.boundary_allocator;
         const allocator = boundary_allocator.allocator;
@@ -129,9 +139,9 @@ const OpaqueApiHttpServer = struct {
         callInfallible(?managed_embedder.AntflyProvider, void, self.functions.set_provider, self.opaque_handle, &input, null);
     }
 
-    pub fn setHAInternalExecutor(self: *OpaqueApiHttpServer, executor_value: ?ha_http_operation.Executor) void {
+    pub fn setHotStandbyInternalExecutor(self: *OpaqueApiHttpServer, executor_value: ?hot_standby_http_operation.Executor) void {
         var input = executor_value;
-        callInfallible(?ha_http_operation.Executor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
+        callInfallible(?hot_standby_http_operation.Executor, void, self.functions.set_ha_executor, self.opaque_handle, &input, null);
     }
 
     pub fn attachRestoreJobRuntimeStore(self: *OpaqueApiHttpServer, store: *backend_erased.Store) !void {
@@ -423,13 +433,20 @@ const OpaqueHttpxHandler = struct {
             };
             try self.runtime_routes.append(alloc, route);
             errdefer _ = self.runtime_routes.pop();
-            try server.routeWithData(switch (entry.method) {
+            const method: httpx.Method = switch (entry.method) {
                 .get => .GET,
                 .post => .POST,
                 .put => .PUT,
                 .delete => .DELETE,
                 .patch => .PATCH,
-            }, path, runtimeApiHttpHandler, route);
+            };
+            if (method == .POST) {
+                if (@import("http_routes.zig").publicPostBodyLimit(path)) |limit| {
+                    try server.routeWithDataAndBodyLimit(method, path, runtimeApiHttpHandler, route, limit);
+                    continue;
+                }
+            }
+            try server.routeWithData(method, path, runtimeApiHttpHandler, route);
         }
     }
 
@@ -446,11 +463,11 @@ const OpaqueHttpxHandler = struct {
 fn requiresHostInternalServicePrincipal(path: []const u8) bool {
     const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
         std.mem.startsWith(u8, path, internal_routes.base ++ "/");
-    const ha_exempt = std.mem.eql(u8, path, internal_routes.standby) or
+    const hot_standby_exempt = std.mem.eql(u8, path, internal_routes.standby) or
         std.mem.startsWith(u8, path, internal_routes.standby ++ "/") or
         std.mem.eql(u8, path, internal_routes.legacy_standby) or
         std.mem.startsWith(u8, path, internal_routes.legacy_standby ++ "/");
-    return in_internal_namespace and !ha_exempt;
+    return in_internal_namespace and !hot_standby_exempt;
 }
 
 const RuntimeRoute = struct {

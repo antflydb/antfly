@@ -20,7 +20,8 @@ const kernel_jit_mod = @import("../graph/kernel_jit.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
-const Interruption = @import("../execution_control.zig").Interruption;
+const execution_control = @import("../execution_control.zig");
+const Interruption = execution_control.Interruption;
 
 pub const Session = @import("session.zig").Session;
 pub const Tensor = @import("tensor.zig").Tensor;
@@ -47,6 +48,22 @@ pub const BackendType = enum {
     cuda,
     pjrt,
     wasm,
+
+    pub fn parse(value: []const u8) ?BackendType {
+        if (std.mem.eql(u8, value, "native")) return .native;
+        if (std.mem.eql(u8, value, "onnx")) return .onnx;
+        if (std.mem.eql(u8, value, "metal")) return .metal;
+        if (std.mem.eql(u8, value, "cuda")) return .cuda;
+        if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
+        if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+        return null;
+    }
+
+    pub fn parseOptional(value: ?[]const u8) !?BackendType {
+        const raw = value orelse return null;
+        if (std.mem.eql(u8, raw, "auto")) return null;
+        return parse(raw) orelse error.InvalidArguments;
+    }
 
     pub fn available(self: BackendType) bool {
         return switch (self) {
@@ -217,7 +234,7 @@ test "embedded session policy fails before selecting an uninterruptible backend"
     );
 }
 
-const backend_order_capacity = std.meta.fields(BackendType).len;
+const backend_order_capacity = std.meta.fieldNames(BackendType).len;
 
 const RequiredBackendConfig = struct {
     backend: ?BackendType = null,
@@ -251,6 +268,13 @@ pub const SessionManager = struct {
     /// this explicitly so embedded database runtimes cannot even load a
     /// backend whose driver requires process-level recovery.
     process_isolation_available: bool = true,
+
+    /// Backends whose execution can only be stopped by killing the process run
+    /// in a supervised worker, or in-process when the host accepted that they
+    /// cannot be interrupted (see `execution_control.allowUninterruptibleInProcess`).
+    pub fn processRequiredBackendsAllowed(self: *const SessionManager) bool {
+        return self.process_isolation_available or execution_control.uninterruptibleInProcessAllowed();
+    }
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         const required = requiredBackendFromEnv();
@@ -295,7 +319,7 @@ pub const SessionManager = struct {
         if (!backend.available() or !backend.supportsDirectSessionLoad())
             return error.RequiredBackendUnavailable;
         const backend_runtime = try self.resolveBackendRuntime(backend);
-        if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required)
+        if (!self.processRequiredBackendsAllowed() and backend_runtime.executionInterruption() == .process_required)
             return error.ProcessIsolationRequired;
     }
 
@@ -384,7 +408,7 @@ pub const SessionManager = struct {
                 first_err = first_err orelse err;
                 continue;
             };
-            if (!self.process_isolation_available and backend_runtime.executionInterruption() == .process_required) {
+            if (!self.processRequiredBackendsAllowed() and backend_runtime.executionInterruption() == .process_required) {
                 first_err = first_err orelse error.ProcessIsolationRequired;
                 continue;
             }
@@ -1150,4 +1174,15 @@ test "effective backend order prefers native layoutlmv3 before onnx" {
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
     try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native, .onnx }, effective);
+}
+
+test "backend names parse canonical values aliases and optional auto" {
+    inline for (.{ "native", "onnx", "metal", "cuda", "pjrt", "wasm" }) |name|
+        try std.testing.expectEqual(std.meta.stringToEnum(BackendType, name).?, BackendType.parse(name).?);
+    try std.testing.expectEqual(BackendType.pjrt, BackendType.parse("xla").?);
+    try std.testing.expectEqual(BackendType.wasm, BackendType.parse("webgpu").?);
+    try std.testing.expect(BackendType.parse("unknown") == null);
+    try std.testing.expect(try BackendType.parseOptional(null) == null);
+    try std.testing.expect(try BackendType.parseOptional("auto") == null);
+    try std.testing.expectError(error.InvalidArguments, BackendType.parseOptional("unknown"));
 }

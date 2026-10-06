@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resource_manager_mod = @import("../../resource_manager.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const derived_worker = @import("derived_worker.zig");
@@ -63,12 +64,12 @@ pub const RecoverableRetryStats = struct {
 };
 
 pub const RecoverableRetryCounters = struct {
-    total: std.atomic.Value(u64) = .init(0),
-    writer_locked: std.atomic.Value(u64) = .init(0),
-    resource_budget: std.atomic.Value(u64) = .init(0),
-    replay_document_not_visible: std.atomic.Value(u64) = .init(0),
-    artifact_repair_required: std.atomic.Value(u64) = .init(0),
-    not_found: std.atomic.Value(u64) = .init(0),
+    total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    writer_locked: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resource_budget: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
@@ -147,6 +148,8 @@ pub const Policy = struct {
     max_items_per_window: usize = 0,
     max_chunk_bytes: u64 = replay_default_window_bytes,
     estimated_dense_vector_bytes: u64 = 0,
+    max_work_chunk_bytes: u64 = 0,
+    dense_replay_working_set_factor: u64 = 1,
     force_persist_applied_sequence: bool = false,
     not_found_is_recoverable: bool = false,
 };
@@ -182,6 +185,8 @@ pub fn sessionIdleMaxWaitNs(policy: Policy, recent_tail_records: u64) u64 {
 pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: ?*resource_manager_mod.ResourceManager) Policy {
     return switch (index_ref.kind) {
         .dense_vector => blk: {
+            const estimate = denseReplayVectorEstimate(index_ref, environmentValue("ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES"));
+            const limits = denseReplayWindowLimits(resource_manager, estimate.factor, environmentValue("ANTFLY_DENSE_REPLAY_MAX_WINDOW_BYTES"));
             var policy: Policy = .{
                 .coalesce_min_records = denseReplayCoalesceMinRecords(),
                 .coalesce_delay_ns = denseReplayCoalesceDelayNs(),
@@ -190,8 +195,10 @@ pub fn forIndex(index_ref: index_manager_mod.ManagedIndexRef, resource_manager: 
                 .cursor_refresh_records = replayCursorRefreshRecords(),
                 .max_windows_per_publish = replayMaxWindowsPerPublish(),
                 .max_items_per_window = denseReplayMaxItemsPerWindow(),
-                .max_chunk_bytes = denseReplayMaxWindowBytes(resource_manager),
-                .estimated_dense_vector_bytes = denseReplayEstimatedVectorBytes(index_ref),
+                .max_chunk_bytes = limits.working_set_bytes,
+                .max_work_chunk_bytes = if (estimate.factor > 1) limits.work_bytes else 0,
+                .estimated_dense_vector_bytes = estimate.bytes,
+                .dense_replay_working_set_factor = estimate.factor,
                 .force_persist_applied_sequence = true,
                 .not_found_is_recoverable = true,
             };
@@ -223,12 +230,17 @@ pub fn coalescedDensePolicy(original: Policy, resource_manager: ?*resource_manag
     const manager = resource_manager orelse return original;
     if (manager.shouldDeferOptionalMaintenanceForForegroundTraffic()) return original;
     if (original.max_windows_per_publish != 1) return original;
-    const windows = @min(@as(u64, 4), original.max_chunk_bytes / (16 * 1024 * 1024));
+    const work_bytes = if (original.max_work_chunk_bytes != 0)
+        @min(original.max_chunk_bytes, original.max_work_chunk_bytes)
+    else
+        original.max_chunk_bytes;
+    const windows = @min(@as(u64, 4), work_bytes / (16 * 1024 * 1024));
     if (windows < 2) return original;
     var result = original;
     result.max_windows_per_publish = @intCast(windows);
     result.max_call_bytes = original.max_chunk_bytes;
     result.max_chunk_bytes /= windows;
+    if (result.max_work_chunk_bytes != 0) result.max_work_chunk_bytes = @max(@as(u64, 1), result.max_work_chunk_bytes / windows);
     result.max_call_ns = std.time.ns_per_s;
     return result;
 }
@@ -293,12 +305,26 @@ fn replayMaxItemsPerWindow() usize {
     return envUsize("ANTFLY_DERIVED_REPLAY_MAX_ITEMS_PER_WINDOW", replay_default_max_items_per_window);
 }
 
-fn denseReplayEstimatedVectorBytes(index_ref: index_manager_mod.ManagedIndexRef) u64 {
+fn environmentValue(name: [:0]const u8) ?[]const u8 {
+    return if (getenv(name)) |raw| std.mem.span(raw) else null;
+}
+
+fn denseReplayVectorEstimate(index_ref: index_manager_mod.ManagedIndexRef, override: ?[]const u8) struct { bytes: u64, factor: u64 } {
+    const factor = @max(@as(u64, 1), index_ref.dense_replay_working_set_factor);
     const fallback = if (index_ref.estimated_dense_vector_bytes > 0)
         index_ref.estimated_dense_vector_bytes
     else
-        derived_worker.dense_replay_estimated_vector_bytes_default;
-    return envU64("ANTFLY_DENSE_REPLAY_ESTIMATED_VECTOR_BYTES", fallback);
+        derived_worker.dense_replay_estimated_vector_bytes_default *| factor;
+    if (override) |raw| {
+        if (raw.len != 0) {
+            if (std.fmt.parseUnsigned(u64, raw, 10)) |bytes| {
+                // An explicit estimate is already in the operator's chosen
+                // units. Do not enlarge its work ceiling using catalog data.
+                return .{ .bytes = bytes, .factor = 1 };
+            } else |_| {}
+        }
+    }
+    return .{ .bytes = fallback, .factor = factor };
 }
 
 fn replayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager) u64 {
@@ -313,15 +339,25 @@ fn replayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager
     return budget;
 }
 
-fn denseReplayMaxWindowBytes(resource_manager: ?*resource_manager_mod.ResourceManager) u64 {
-    if (getenv("ANTFLY_DENSE_REPLAY_MAX_WINDOW_BYTES")) |raw_z| {
-        const raw = std.mem.span(raw_z);
-        if (raw.len > 0) return std.fmt.parseUnsigned(u64, raw, 10) catch dense_replay_default_window_bytes;
+fn denseReplayWindowLimits(resource_manager: ?*resource_manager_mod.ResourceManager, working_set_factor: u64, override: ?[]const u8) resource_manager_mod.DenseReplayWindowLimits {
+    const factor = @max(@as(u64, 1), working_set_factor);
+    if (override) |raw| {
+        if (raw.len > 0) {
+            if (std.fmt.parseUnsigned(u64, raw, 10)) |bytes| {
+                return .{ .work_bytes = bytes, .working_set_bytes = bytes };
+            } else |_| {
+                return .{ .work_bytes = dense_replay_default_window_bytes, .working_set_bytes = dense_replay_default_window_bytes *| factor };
+            }
+        }
     }
-    const manager = resource_manager orelse return dense_replay_default_window_bytes;
-    return manager.denseReplayWindowBudget(.{
+    const manager = resource_manager orelse return .{
+        .work_bytes = dense_replay_default_window_bytes,
+        .working_set_bytes = dense_replay_default_window_bytes *| factor,
+    };
+    return manager.denseReplayWindowLimits(.{
         .default_bytes = dense_replay_default_window_bytes,
         .max_bytes = dense_replay_max_window_bytes,
+        .working_set_factor = factor,
     });
 }
 
@@ -400,4 +436,68 @@ test "dense replay policy uses the index dimensions for its byte estimate" {
         .estimated_dense_vector_bytes = 1536 * @sizeOf(f32),
     }, null);
     try std.testing.expectEqual(@as(u64, 1536 * @sizeOf(f32)), policy.estimated_dense_vector_bytes);
+}
+
+test "dense replay working-set factor scales the estimate and the unbudgeted window together" {
+    const raw = forIndex(.{
+        .name = "dense",
+        .kind = .dense_vector,
+        .estimated_dense_vector_bytes = 1536 * @sizeOf(f32),
+    }, null);
+    const scaled = forIndex(.{
+        .name = "dense",
+        .kind = .dense_vector,
+        .estimated_dense_vector_bytes = 8 * 1536 * @sizeOf(f32),
+        .dense_replay_working_set_factor = 8,
+    }, null);
+    // Without a memory budget the window holds the same number of vectors.
+    try std.testing.expectEqual(dense_replay_default_window_bytes, raw.max_chunk_bytes);
+    try std.testing.expectEqual(
+        raw.max_chunk_bytes / raw.estimated_dense_vector_bytes,
+        scaled.max_chunk_bytes / scaled.estimated_dense_vector_bytes,
+    );
+
+    // A real slice limit is physical memory: the scaled ceiling cannot lift
+    // the window above it.
+    var options = resource_manager_mod.Options{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 };
+    var manager = resource_manager_mod.ResourceManager.init(options);
+    defer manager.deinit(std.testing.allocator);
+    const budgeted = denseReplayWindowLimits(&manager, 8, null);
+    try std.testing.expect(budgeted.working_set_bytes <= 64 * 1024 * 1024);
+    try std.testing.expect(budgeted.work_bytes <= budgeted.working_set_bytes);
+}
+
+test "dense replay explicit estimates preserve the original work ceiling" {
+    const ref: index_manager_mod.ManagedIndexRef = .{ .name = "dense", .kind = .dense_vector, .estimated_dense_vector_bytes = 8 * 6144, .dense_replay_working_set_factor = 8 };
+    const explicit = denseReplayVectorEstimate(ref, "6144");
+    try std.testing.expectEqual(@as(u64, 1), explicit.factor);
+    const limits = denseReplayWindowLimits(null, explicit.factor, null);
+    try std.testing.expectEqual(dense_replay_default_window_bytes, limits.working_set_bytes);
+    try std.testing.expectEqual(@as(u64, 10922), limits.working_set_bytes / explicit.bytes);
+    const fallback = denseReplayVectorEstimate(ref, "invalid");
+    try std.testing.expectEqual(@as(u64, 8), fallback.factor);
+    try std.testing.expectEqual(ref.estimated_dense_vector_bytes, fallback.bytes);
+    const window_override = denseReplayWindowLimits(null, 8, "1048576");
+    try std.testing.expectEqual(@as(u64, 1048576), window_override.work_bytes);
+    try std.testing.expectEqual(window_override.work_bytes, window_override.working_set_bytes);
+}
+
+test "dense replay adapts work independently from working-set units" {
+    var options = resource_manager_mod.Options{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] = .{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_routing_working_set)] = .{};
+    var manager = resource_manager_mod.ResourceManager.init(options);
+    defer manager.deinit(std.testing.allocator);
+    const native = denseReplayWindowLimits(&manager, 1, null);
+    const lite = denseReplayWindowLimits(&manager, 8, null);
+    // A change of storage estimate keeps the adaptive state in work units,
+    // rather than silently shrinking or expanding it by eight.
+    try std.testing.expect(lite.work_bytes < native.work_bytes * 2);
+    try std.testing.expectEqual(lite.work_bytes * 8, lite.working_set_bytes);
+    const combined = coalescedDensePolicy(.{ .max_chunk_bytes = 512 * 1024 * 1024, .max_work_chunk_bytes = 64 * 1024 * 1024 }, &manager);
+    try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), combined.max_work_chunk_bytes * combined.max_windows_per_publish);
+    const small_work = Policy{ .max_chunk_bytes = 64 * 1024 * 1024, .max_work_chunk_bytes = 8 * 1024 * 1024 };
+    try std.testing.expectEqual(small_work, coalescedDensePolicy(small_work, &manager));
 }

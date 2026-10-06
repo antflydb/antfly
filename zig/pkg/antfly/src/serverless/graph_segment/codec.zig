@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const graph_types = @import("types.zig");
 const graph_edge_type = @import("../../graph/edge_type.zig");
 pub const compact = @import("packed.zig");
@@ -37,7 +37,7 @@ pub fn decodeAllocWithCancellation(alloc: Allocator, data: []const u8, cancellat
 }
 
 test "lake graph segment codec rejects forged adjacency counts before allocation" {
-    var payload = [_]u8{0} ** header_len;
+    var payload = @as([header_len]u8, @splat(0));
     @memcpy(payload[0..4], wire_magic);
     std.mem.writeInt(u16, payload[4..6], wire_version, .little);
     std.mem.writeInt(u32, payload[6..10], 0, .little);
@@ -137,7 +137,7 @@ test "serverless graph segment codec rejects invalid edge types" {
 
     try std.testing.expectError(error.InvalidGraphSegment, encodeAlloc(alloc, segment));
     alloc.free(segment.adjacencies[0].out_edges[0].edge_type);
-    segment.adjacencies[0].out_edges[0].edge_type = try alloc.dupe(u8, "x" ** (graph_edge_type.max_bytes + 1));
+    segment.adjacencies[0].out_edges[0].edge_type = try alloc.dupe(u8, &@as([graph_edge_type.max_bytes + 1]u8, @splat('x')));
     try std.testing.expectError(error.InvalidGraphSegment, encodeAlloc(alloc, segment));
     alloc.free(segment.adjacencies[0].out_edges[0].edge_type);
     segment.adjacencies[0].out_edges[0].edge_type = try alloc.dupe(u8, "\xff");

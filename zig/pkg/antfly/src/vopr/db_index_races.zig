@@ -44,7 +44,10 @@ pub const Fixture = struct {
             // allocator's stack-capture path. Give those fibers the same
             // headroom as the production-shaped DataServer campaign instead
             // of relying on VoprIo's deliberately small generic default.
-            .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+            // 8 MiB overflowed under Debug codegen on the equivalent
+            // single-DataServer Raft-merge campaign; use 32 MiB like the
+            // other production-shaped VOPR configs.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         });
         errdefer sim.deinit();
         var backend = try background_runtime.BackendRuntimeHandle.init(allocator, .{
@@ -717,7 +720,9 @@ const ManagedReadinessFixture = struct {
         sim.* = try vopr.vopr_io.VoprIo.init(.{
             .seed = 0x4d41_4e41_4745_4452,
             .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
-            .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+            // Same production-shaped DataServer headroom as the other
+            // VoprIo configs in this file; see the comment above.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024 },
         });
         errdefer sim.deinit();
         var backend = try background_runtime.BackendRuntimeHandle.init(allocator, .{
@@ -757,7 +762,7 @@ const ManagedReadinessFixture = struct {
         self.db = try self.openDb();
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.db.close();
         self.allocator.destroy(self.embedder);
         self.repair_storage.deinit();
@@ -783,7 +788,7 @@ const managed_readiness_atomic_config =
 
 pub const ManagedReadinessScenario = struct {
     pub const name: []const u8 = "managed-index-readiness";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const fail_closed_id = vopr.id.stable(name, "atomic-and-initial-publication-fail-closed");
     const progressive_id = vopr.id.stable(name, "progressive-checkpoint-is-queryable");
@@ -845,6 +850,9 @@ pub const ManagedReadinessScenario = struct {
         final_hits: u32 = 0,
         replay_converged: bool = false,
         cleanup_sound: bool = false,
+        step_running: bool = false,
+        step_task: ?std.Io.Future(void) = null,
+        step_failure: ?anyerror = null,
 
         fn modeValue(self: *@This()) Mode {
             return self.mode.?;
@@ -1035,7 +1043,7 @@ pub const ManagedReadinessScenario = struct {
             self.stage = .finalize;
         }
 
-        fn finalize(self: *@This()) !void {
+        pub fn finalize(self: *@This()) !void {
             var repaired = false;
             for (0..64) |_| {
                 const result = try self.fixture.db.advanceIndexRepairIntent(
@@ -1069,6 +1077,13 @@ pub const ManagedReadinessScenario = struct {
             self.stage = .complete;
         }
 
+        fn runStep(self: *@This()) void {
+            defer self.step_running = false;
+            self.executeStep() catch |err| {
+                self.step_failure = err;
+            };
+        }
+
         fn executeStep(self: *@This()) !void {
             switch (self.stage) {
                 .choose, .complete => return error.InvalidManagedIndexReadinessStage,
@@ -1099,6 +1114,7 @@ pub const ManagedReadinessScenario = struct {
     }
 
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
+        if (world.state.step_task) |*task| task.cancel(world.state.fixture.sim.io());
         world.state.fixture.deinit();
         allocator.destroy(world.state.fixture);
         allocator.destroy(world.state);
@@ -1107,6 +1123,10 @@ pub const ManagedReadinessScenario = struct {
 
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
         const state = world.state;
+        if (state.step_running) {
+            try state.fixture.sim.scheduler().enumerateReady(list, allocator);
+            return;
+        }
         if (state.stage == .complete) return;
         if (state.stage == .choose) {
             inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, transition_name| try list.append(allocator, .{
@@ -1129,26 +1149,36 @@ pub const ManagedReadinessScenario = struct {
 
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
         const state = world.state;
+        if (state.step_running) {
+            try state.fixture.sim.scheduler().executeReady(selected.id, events, allocator);
+            if (!state.step_running) if (state.step_task) |*task| {
+                task.await(state.fixture.sim.io());
+                state.step_task = null;
+            };
+            if (state.step_failure) |err| return err;
+            return .applied();
+        }
         if (state.stage == .choose) {
             inline for (std.meta.tags(Mode), mode_ids) |mode, id| {
                 if (selected.id == id) {
                     state.mode = mode;
                     state.stage = .seed;
-                    try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(mode));
+                    try events.emitNamed(allocator, .domain, selected.name, @backingInt(mode));
                     return .applied();
                 }
             }
             return error.InvalidManagedIndexReadinessMode;
         }
         if (selected.id != step_id) return error.InvalidManagedIndexReadinessTransition;
-        try state.executeStep();
+        state.step_running = true;
+        state.step_task = state.fixture.sim.io().async(State.runStep, .{state});
         try events.emitNamed(allocator, .state_change, @tagName(state.stage), state.progress);
         return .applied();
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".stage", @intFromEnum(state.stage));
+        try builder.addNamed(allocator, name ++ ".stage", @backingInt(state.stage));
         try builder.addNamed(allocator, name ++ ".progress", @intCast(state.progress));
         try builder.addNamed(allocator, name ++ ".initial-fail-closed", @intFromBool(state.initial_fail_closed));
         try builder.addNamed(allocator, name ++ ".partial-queryable", @intFromBool(state.progressive_partial_queryable));
@@ -1241,19 +1271,11 @@ fn runAdmissionMode(allocator: std.mem.Allocator, mode_id: u64) !void {
 }
 
 fn runManagedReadinessMode(allocator: std.mem.Allocator, mode_id: u64) !void {
-    var script = [_]u64{ManagedReadinessScenario.step_id} ** 9;
-    script[0] = mode_id;
-    const script_len: usize = if (mode_id == ManagedReadinessScenario.mode_ids[0])
-        9
-    else if (mode_id == ManagedReadinessScenario.mode_ids[1])
-        7
-    else
-        8;
-    var scripted = vopr.choice.Scripted{ .selections = script[0..script_len] };
+    var scripted = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4d41_4e41);
     var artifact = try vopr.runner.run(ManagedReadinessScenario, allocator, scripted.source(), .{
         .system = "antfly",
-        .transition_budget = 12,
-        .source_revision = "managed-index-readiness-vopr-v2",
+        .transition_budget = 1024,
+        .source_revision = "managed-index-readiness-vopr-v3",
         .target = "native",
         .optimize = @tagName(builtin.mode),
     });

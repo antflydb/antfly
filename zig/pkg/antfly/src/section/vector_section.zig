@@ -12,11 +12,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! RaBitQ Vector Index Section - zapx-compatible segment format.
+//! RaBitQ Vector Index Section.
 //!
-//! Replaces FAISS with RaBitQ quantization for the vector index section.
-//! Binary layout matches zapx's section framework so Go code can read
-//! segments written by Zig and vice versa.
+//! Uses RaBitQ quantization for the vector index section of a segment.
+//! Binary layout follows the shared segment section framework.
 //!
 //! On-disk format per field:
 //!   [docvalue marker 1]     uvarint = 0xFFFFFFFFFFFFFFFF (fieldNotUninverted)
@@ -46,7 +45,6 @@ const quantizer_mod = @import("antfly_vector").quantizer;
 const proto = @import("antfly_vector").proto;
 
 /// Sentinel value for "field not uninverted" (no doc values).
-/// Matches zapx's fieldNotUninverted = math.MaxUint64.
 const field_not_uninverted: u64 = 0xFFFFFFFFFFFFFFFF;
 
 /// Index type identifiers (written as uvarint in section header).
@@ -139,7 +137,7 @@ pub const VectorIndexContent = struct {
 // Section Writer
 // ============================================================================
 
-/// Writes a RaBitQ vector index section in zapx-compatible format.
+/// Writes a RaBitQ vector index section.
 pub fn writeVectorSection(
     alloc: Allocator,
     content: *const VectorIndexContent,
@@ -150,14 +148,14 @@ pub fn writeVectorSection(
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(alloc);
 
-    // --- Section header (zapx-compatible) ---
+    // --- Section header ---
 
     // Doc value markers (fieldNotUninverted × 2)
     writeUvarint(&buf, alloc, field_not_uninverted);
     writeUvarint(&buf, alloc, field_not_uninverted);
 
     // Optimization type
-    writeUvarint(&buf, alloc, @intFromEnum(content.optimization));
+    writeUvarint(&buf, alloc, @backingInt(content.optimization));
 
     // Number of vectors
     writeUvarint(&buf, alloc, @intCast(nvecs));
@@ -171,7 +169,7 @@ pub fn writeVectorSection(
     }
 
     // Index type: rabitq = 1
-    writeUvarint(&buf, alloc, @intFromEnum(IndexType.rabitq));
+    writeUvarint(&buf, alloc, @backingInt(IndexType.rabitq));
 
     // --- Build RaBitQ index data ---
     const index_data = try buildRaBitQIndex(alloc, content, seed);
@@ -243,18 +241,18 @@ fn buildRaBitQIndex(
     try blob.append(alloc, rabitq_version);
 
     // Dims (u32 LE)
-    const dims_le: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, @intCast(dims)));
+    const dims_le: [4]u8 = @bitCast(@as(u32, @intCast(dims)));
     try blob.appendSlice(alloc, &dims_le);
 
     // Metric (u8)
-    try blob.append(alloc, @as(u8, @intCast(@intFromEnum(content.metric))));
+    try blob.append(alloc, @as(u8, @intCast(@backingInt(content.metric))));
 
     // Seed (u64 LE)
-    const seed_le: [8]u8 = @bitCast(std.mem.nativeToLittle(u64, seed));
+    const seed_le: [8]u8 = @bitCast(@as(u64, seed));
     try blob.appendSlice(alloc, &seed_le);
 
     // Num vectors (u32 LE)
-    const nvecs_le: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, @intCast(nvecs)));
+    const nvecs_le: [4]u8 = @bitCast(@as(u32, @intCast(nvecs)));
     try blob.appendSlice(alloc, &nvecs_le);
 
     // Raw vectors (for reconstruction during merges)
@@ -262,7 +260,7 @@ fn buildRaBitQIndex(
     try blob.appendSlice(alloc, raw_bytes);
 
     // Quantized set (protobuf)
-    const qs_size_le: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, @intCast(qs_bytes.len)));
+    const qs_size_le: [4]u8 = @bitCast(@as(u32, @intCast(qs_bytes.len)));
     try blob.appendSlice(alloc, &qs_size_le);
     try blob.appendSlice(alloc, qs_bytes);
 
@@ -448,10 +446,10 @@ pub fn readSectionHeader(alloc: Allocator, data: []const u8) !VectorSectionHeade
     const index_data = data[pos..][0..@intCast(index_size)];
 
     return .{
-        .optimization = @enumFromInt(@as(u8, @intCast(opt))),
+        .optimization = @fromBackingInt(@intCast(@as(u8, @intCast(opt)))),
         .num_vecs = @intCast(nvecs),
         .vec_doc_ids = vec_doc_ids,
-        .index_type = @enumFromInt(@as(u8, @intCast(index_type))),
+        .index_type = @fromBackingInt(@intCast(@as(u8, @intCast(index_type)))),
         .index_data = index_data,
     };
 }
@@ -478,7 +476,7 @@ pub fn readRaBitQIndex(alloc: Allocator, data: []const u8, vec_doc_ids: []u32) !
     pos += 4;
 
     // Metric
-    const metric: vec.DistanceMetric = @enumFromInt(data[pos]);
+    const metric: vec.DistanceMetric = @fromBackingInt(@intCast(data[pos]));
     pos += 1;
 
     // Seed

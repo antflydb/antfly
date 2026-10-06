@@ -19,7 +19,31 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def run_process(command, *, stdout, timeout=13800, grace=30):
+def stop_process_group(process, grace):
+    """Give every group member time to clean up, even if its parent exits first."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while True:
+        # Reap our direct child so it cannot keep an otherwise empty group alive.
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.05, remaining))
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def run_process(command, *, stdout, timeout=13800, grace=30, clean_descendants=False):
     """Reserve time for evidence upload, including when a child ignores TERM."""
     started = time.monotonic()
     previous = {}
@@ -53,22 +77,13 @@ def run_process(command, *, stdout, timeout=13800, grace=30):
             # A second cancellation must not interrupt shutdown and reaping.
             for signum in previous:
                 signal.signal(signum, signal.SIG_IGN)
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=grace)
-            except subprocess.TimeoutExpired:
-                pass
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            finally:
-                process.wait()
+            stop_process_group(process, grace)
+            process.wait()
             code = 124 if status == "timeout" else 130
     finally:
+        if clean_descendants and process is not None and status == "exited":
+            # Also stop descendants left behind by a normally exited parent.
+            stop_process_group(process, grace)
         for signum, handler in previous.items():
             signal.signal(signum, handler)
     result = subprocess.CompletedProcess(command, code)
@@ -347,7 +362,7 @@ def main():
     run = commands.add_parser("run")
     run.add_argument(
         "--scenario",
-        choices=("standby", "raft", "distributed-data", "standby-scaling"),
+        choices=("standby", "raft", "distributed-data", "standby-scaling", "secrets"),
         required=True,
     )
     run.add_argument("--seed", type=lambda value: int(value, 0), required=True)

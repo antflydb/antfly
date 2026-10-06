@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const artifacts = @import("store.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub fn exercise(store: *artifacts.ArtifactStore) !void {
     const a = std.testing.allocator;

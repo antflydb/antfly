@@ -190,11 +190,13 @@ pub fn plan(config: *const boundary.Config, prepared: *const processor.PreparedB
         encoder.num_attention_heads == 0 or encoder.hidden_size % encoder.num_attention_heads != 0 or
         encoder.intermediate_size == 0 or encoder.intermediate_size > std.math.maxInt(i32) or
         encoder.num_hidden_layers == 0 or encoder.vocab_size == 0 or
-        encoder.max_position_embeddings == 0 or encoder.position_buckets == 0 or
+        encoder.max_position_embeddings == 0 or (encoder.family == .deberta and encoder.position_buckets == 0) or
         !std.math.isFinite(encoder.layer_norm_eps) or encoder.layer_norm_eps <= 0 or config.max_len == 0)
         return error.InvalidGlinerBoundaryConfig;
     const b = prepared.samples.len;
     const s = prepared.sequence_length;
+    // RoPE encoders are not used past their pretraining length.
+    if (encoder.family == .modern_bert and s > encoder.max_position_embeddings) return error.ResourceLimitExceeded;
     const limits = options.limits;
     if (b == 0 or s == 0) return error.InvalidInputShape;
     if (b > limits.max_batch or b > std.math.maxInt(i32) or
@@ -366,6 +368,7 @@ pub fn encodeNative(cb: *const compute.ComputeBackend, allocator: Allocator, con
     // The host encoder contract is also implemented by WasmCompute. Device
     // admission/qualification remains the responsibility of the caller.
     if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
+    if (config.encoder.family != .deberta) return error.UnsupportedGlinerBoundaryEncoder;
     try cb.checkExecutionControl();
     const checked = try plan(config, prepared, options);
     if (options.scope) |scope| scope.enter(scope.ptr);
@@ -527,8 +530,8 @@ pub const TestBatch = struct {
 
     pub fn prepared(self: *TestBatch) processor.PreparedBatch {
         self.samples = .{
-            .{ .original_text = "a", .schema_fingerprint = .{0} ** 32, .input_ids = self.ids[0..12], .words = &self.words, .groups = &self.groups, .queries = &self.queries, .classification_labels = &self.classifications, .enum_choices = &.{}, .prefix_word_count = 1, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
-            .{ .original_text = "b", .schema_fingerprint = .{0} ** 32, .input_ids = self.ids[12..19], .words = &self.other_words, .groups = &self.other_groups, .queries = self.queries[0..1], .classification_labels = &self.other_classifications, .enum_choices = &.{}, .prefix_word_count = 0, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
+            .{ .original_text = "a", .schema_fingerprint = @splat(0), .input_ids = self.ids[0..12], .words = &self.words, .groups = &self.groups, .queries = &self.queries, .classification_labels = &self.classifications, .enum_choices = &.{}, .prefix_word_count = 1, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
+            .{ .original_text = "b", .schema_fingerprint = @splat(0), .input_ids = self.ids[12..19], .words = &self.other_words, .groups = &self.other_groups, .queries = self.queries[0..1], .classification_labels = &self.other_classifications, .enum_choices = &.{}, .prefix_word_count = 0, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
         };
         return .{
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),

@@ -436,16 +436,7 @@ pub fn stripErrorDirectives(alloc: Allocator, text: []const u8) ![]const u8 {
 // <<<dotprompt:media:url ...>>> and <<<error:...>>> directives.
 // Matches Go ai.TextToParts from lib/ai/utils.go.
 
-pub const ContentPart = union(enum) {
-    text: []const u8,
-    media_url: []const u8, // URL or data URI
-    binary: BinaryContent, // parsed data URI
-
-    pub const BinaryContent = struct {
-        mime_type: []const u8,
-        data: []const u8, // raw bytes (decoded from base64)
-    };
-};
+pub const ContentPart = @import("antfly_template_content").ContentPart;
 
 /// Parse a rendered template string into content parts.
 /// Splits on <<<dotprompt:media:url ...>>> directives.
@@ -1019,7 +1010,7 @@ test "transcribeAudio helper uses active transcribing runtime" {
             };
         }
 
-        fn deinit(_: *anyopaque) void {}
+        pub fn deinit(_: *anyopaque) void {}
     };
 
     var runtime = transcribing.Runtime.init(alloc);

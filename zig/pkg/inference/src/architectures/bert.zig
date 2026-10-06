@@ -72,11 +72,11 @@ fn metalEncoderFrameEnabled() bool {
 }
 
 fn bertLinearSlot(layer: usize, kind: BertLinearSlotKind) usize {
-    return layer * bert_linear_specs.len + @intFromEnum(kind);
+    return layer * bert_linear_specs.len + @backingInt(kind);
 }
 
 fn bertLayerNormSlot(layer: usize, kind: BertLayerNormSlotKind) usize {
-    return layer * bert_layer_norm_specs.len + @intFromEnum(kind);
+    return layer * bert_layer_norm_specs.len + @backingInt(kind);
 }
 
 fn bertEmbeddingLayerNormSlot(layer_count: usize) usize {
@@ -581,9 +581,9 @@ fn buildPositionIds(
                 for (0..seq_len) |sequence_index| {
                     const index = batch_index * seq_len + sequence_index;
                     if (input_ids[index] == config.pad_token_id) {
-                        pos_ids[index] = config.pad_token_id;
+                        pos_ids[index] = @max(0, config.pad_token_id - @as(i64, config.position_embedding_offset));
                     } else {
-                        pos_ids[index] = next;
+                        pos_ids[index] = next - @as(i64, config.position_embedding_offset);
                         next = std.math.add(i64, next, 1) catch return error.InvalidShape;
                     }
                 }
@@ -902,8 +902,8 @@ const MetalEncoderPreparedProbe = struct {
         const self: *MetalEncoderPreparedProbe = @ptrCast(@alignCast(ctx));
         self.linear_calls += 1;
         if (self.missing_linear_slot == slot) return false;
-        const kind: BertLinearSlotKind = @enumFromInt(slot % bert_linear_specs.len);
-        const spec = bert_linear_specs[@intFromEnum(kind)];
+        const kind: BertLinearSlotKind = @fromBackingInt(@intCast(slot % bert_linear_specs.len));
+        const spec = bert_linear_specs[@backingInt(kind)];
         const expected_in_dim: usize = if (spec.input_intermediate) 8 else 4;
         const expected_out_dim: usize = if (spec.output_intermediate) 8 else 4;
         return in_dim == expected_in_dim and out_dim == expected_out_dim;
@@ -1070,4 +1070,18 @@ test "BGE-M3 exact geometry admits the F32 rollback ceiling" {
     var wrong_geometry = config;
     wrong_geometry.hidden_size = 768;
     try std.testing.expect(!isBgeM3DenseConfig(wrong_geometry));
+}
+
+test "RoBERTa cropped GGUF positions preserve padding and full context" {
+    const allocator = std.testing.allocator;
+    const config = Config{
+        .position_id_mode = .roberta_padding,
+        .pad_token_id = 1,
+        .position_embedding_offset = 2,
+        .max_position_embeddings = 4,
+    };
+    try std.testing.expectEqual(@as(u32, 4), config.maxSequenceLength());
+    const ids = try buildPositionIds(allocator, config, &.{ 0, 4, 5, 2, 1, 0, 2, 1 }, 8, 4);
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2, 3, 0, 0, 1, 0 }, ids);
 }

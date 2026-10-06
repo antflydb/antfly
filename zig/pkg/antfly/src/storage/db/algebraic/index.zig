@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
 const cylinder = @import("cylinder.zig");
@@ -2123,7 +2124,7 @@ const MeasureValue = struct {
     raw: []u8,
     support_token: []u8,
 
-    fn deinit(self: MeasureValue, alloc: Allocator) void {
+    pub fn deinit(self: MeasureValue, alloc: Allocator) void {
         alloc.free(self.raw);
         alloc.free(self.support_token);
     }
@@ -2134,7 +2135,7 @@ const AdaptiveFactProjection = struct {
     buckets: []?[]u8 = &.{},
     measures: []MeasureValue = &.{},
 
-    fn deinit(self: *AdaptiveFactProjection, alloc: Allocator) void {
+    pub fn deinit(self: *AdaptiveFactProjection, alloc: Allocator) void {
         fact_mod.freeAxisTuples(alloc, self.axes);
         for (self.buckets) |bucket| if (bucket) |value| alloc.free(value);
         if (self.buckets.len > 0) alloc.free(self.buckets);
@@ -2149,7 +2150,7 @@ const MinMaxCandidate = struct {
     raw: []u8,
     value: f64,
 
-    fn deinit(self: *MinMaxCandidate, alloc: Allocator) void {
+    pub fn deinit(self: *MinMaxCandidate, alloc: Allocator) void {
         alloc.free(self.support_token);
         alloc.free(self.raw);
         self.* = undefined;
@@ -2160,7 +2161,7 @@ const QueryShapeStat = struct {
     count: u64 = 0,
     last_reason: []u8,
 
-    fn deinit(self: *QueryShapeStat, alloc: Allocator) void {
+    pub fn deinit(self: *QueryShapeStat, alloc: Allocator) void {
         alloc.free(self.last_reason);
         self.* = undefined;
     }
@@ -2190,7 +2191,7 @@ const PersistedObservationUpdate = struct {
     key: []u8,
     observation: PersistedQueryObservation,
 
-    fn deinit(self: *PersistedObservationUpdate, alloc: Allocator) void {
+    pub fn deinit(self: *PersistedObservationUpdate, alloc: Allocator) void {
         alloc.free(self.key);
         self.observation.deinit(alloc);
         self.* = undefined;
@@ -2292,7 +2293,7 @@ const AdaptiveMaterializationSpec = struct {
     path_promotion_kind: ?pathfact_mod.Kind = null,
     path_promotion_reason: ?[]u8 = null,
 
-    fn deinit(self: *AdaptiveMaterializationSpec, alloc: Allocator) void {
+    pub fn deinit(self: *AdaptiveMaterializationSpec, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.recommendation);
         if (self.measure) |value| alloc.free(value);
@@ -2338,7 +2339,7 @@ const AdaptiveMaterializationSpec = struct {
 const ReadyAdaptiveSpecCache = struct {
     specs: []AdaptiveMaterializationSpec = &.{},
 
-    fn deinit(self: *ReadyAdaptiveSpecCache, alloc: Allocator) void {
+    pub fn deinit(self: *ReadyAdaptiveSpecCache, alloc: Allocator) void {
         for (self.specs) |*spec| spec.deinit(alloc);
         if (self.specs.len > 0) alloc.free(self.specs);
         self.* = .{};
@@ -2352,7 +2353,7 @@ const BatchMaintenanceContext = struct {
     tensor_accumulator: AppendOnlyAccumulator = .{},
     coalesce_tensor_deltas: bool = false,
 
-    fn deinit(self: *BatchMaintenanceContext, alloc: Allocator) void {
+    pub fn deinit(self: *BatchMaintenanceContext, alloc: Allocator) void {
         for (self.ready_specs) |*spec| spec.deinit(alloc);
         if (self.ready_specs.len > 0) alloc.free(self.ready_specs);
         var disabled_it = self.disabled_recommendations.keyIterator();
@@ -2394,7 +2395,7 @@ const AdaptiveBackfillTick = struct {
     cursor_key: []u8 = &.{},
     reached_end: bool = false,
 
-    fn deinit(self: *AdaptiveBackfillTick, alloc: Allocator) void {
+    pub fn deinit(self: *AdaptiveBackfillTick, alloc: Allocator) void {
         if (self.cursor_key.len > 0) alloc.free(self.cursor_key);
         self.* = .{};
     }
@@ -2416,7 +2417,7 @@ const PrefixCost = struct {
 const ProjectedFact = struct {
     parts: [][]u8,
 
-    fn deinit(self: *ProjectedFact, alloc: Allocator) void {
+    pub fn deinit(self: *ProjectedFact, alloc: Allocator) void {
         for (self.parts) |part| alloc.free(part);
         if (self.parts.len > 0) alloc.free(self.parts);
         self.* = undefined;
@@ -2559,7 +2560,7 @@ const EncodedDerivedConstraint = struct {
     field: []const u8,
     scalar: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.scalar);
         self.* = undefined;
     }
@@ -2642,7 +2643,7 @@ fn ordinalComponent(ordinal: doc_set.DocOrdinal) [4]u8 {
 const SymbolCache = struct {
     entries: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *SymbolCache, alloc: Allocator) void {
+    pub fn deinit(self: *SymbolCache, alloc: Allocator) void {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
@@ -2699,7 +2700,7 @@ const FoldValue = union(enum) {
 const DerivedJoinFoldAccumulator = struct {
     values: std.StringHashMapUnmanaged(FoldValue) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         var it = self.values.iterator();
         while (it.next()) |entry| {
             alloc.free(entry.key_ptr.*);
@@ -2785,7 +2786,7 @@ const PendingSlot = struct {
     law_id: law_mod.Id,
     delta: []u8,
 
-    fn deinit(self: *PendingSlot, alloc: Allocator) void {
+    pub fn deinit(self: *PendingSlot, alloc: Allocator) void {
         alloc.free(self.delta);
         self.* = undefined;
     }
@@ -2796,7 +2797,7 @@ const PendingRow = struct {
     law_ids: []law_mod.Id,
     row: ?[]u8 = null,
 
-    fn deinit(self: *PendingRow, alloc: Allocator) void {
+    pub fn deinit(self: *PendingRow, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.law_ids.len > 0) alloc.free(self.law_ids);
         if (self.row) |bytes| alloc.free(bytes);
@@ -2840,7 +2841,7 @@ const PendingSupport = struct {
     key: []u8,
     row: ?[]u8 = null,
 
-    fn deinit(self: *PendingSupport, alloc: Allocator) void {
+    pub fn deinit(self: *PendingSupport, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.row) |bytes| alloc.free(bytes);
         self.* = undefined;
@@ -2886,7 +2887,7 @@ const AppendOnlyAccumulator = struct {
         return total;
     }
 
-    fn deinit(self: *AppendOnlyAccumulator, alloc: Allocator) void {
+    pub fn deinit(self: *AppendOnlyAccumulator, alloc: Allocator) void {
         var expression_it = self.expression_rows.iterator();
         while (expression_it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.expression_rows.deinit(alloc);
@@ -2947,7 +2948,7 @@ const StoredJoinFact = struct {
     join_id: []u8,
     payload: []u8,
 
-    fn deinit(self: *StoredJoinFact, alloc: Allocator) void {
+    pub fn deinit(self: *StoredJoinFact, alloc: Allocator) void {
         if (self.ref_key) |bytes| alloc.free(bytes);
         alloc.free(self.key);
         alloc.free(self.join_id);
@@ -2979,7 +2980,7 @@ const JoinScanBounds = struct {
     start: []u8,
     max_time_key: ?[]u8 = null,
 
-    fn deinit(self: JoinScanBounds, alloc: Allocator) void {
+    pub fn deinit(self: JoinScanBounds, alloc: Allocator) void {
         alloc.free(self.prefix);
         alloc.free(self.start);
         if (self.max_time_key) |value| alloc.free(value);
@@ -3072,7 +3073,7 @@ pub const Index = struct {
     hll_observation_mutex: std.atomic.Mutex = .unlocked,
     hll_pending_observations: std.StringHashMapUnmanaged(u64) = .empty,
     hll_pending_observation_bytes: usize = 0,
-    hll_dropped_observations: std.atomic.Value(u64) = .init(0),
+    hll_dropped_observations: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Coalesces dirty notifications into at most one queued/running maintenance
     // job. The persisted dirty/progress keys remain the source of truth.
     hll_maintenance_scheduled: std.atomic.Value(bool) = .init(false),
@@ -3154,7 +3155,7 @@ pub const Index = struct {
         lock: *apply_rw_lock_mod.ApplyRwLock,
         items: []const HllCardinalityConfig,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.lock.unlockShared();
             self.* = undefined;
         }
@@ -3170,7 +3171,7 @@ pub const Index = struct {
         lock: *apply_rw_lock_mod.ApplyRwLock,
         items: []const HllCardinalityConfig,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.lock.unlockExclusive();
             self.* = undefined;
         }
@@ -3302,7 +3303,7 @@ pub const Index = struct {
                 };
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 var cached_keys = self.prior_value_lengths.keyIterator();
                 while (cached_keys.next()) |key| self.index.alloc.free(key.*);
                 self.prior_value_lengths.deinit(self.index.alloc);
@@ -3413,7 +3414,7 @@ pub const Index = struct {
     const StorageAccountingScope = struct {
         index: *Index,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.index.storage_accounting_mutex.unlock();
             self.* = undefined;
         }
@@ -5143,7 +5144,7 @@ pub const Index = struct {
             field: []const u8,
             scalar: []u8,
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.scalar);
                 item.* = undefined;
             }
@@ -5468,7 +5469,7 @@ pub const Index = struct {
                 try item.doc_ids.append(alloc, owned_doc_id);
             }
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.axis);
                 for (item.doc_ids.items) |doc_id| alloc.free(doc_id);
                 item.doc_ids.deinit(alloc);
@@ -5646,7 +5647,7 @@ pub const Index = struct {
                 try item.doc_ids.append(alloc, owned_doc_id);
             }
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.axis);
                 for (item.doc_ids.items) |doc_id| alloc.free(doc_id);
                 item.doc_ids.deinit(alloc);
@@ -5762,7 +5763,7 @@ pub const Index = struct {
                 try item.doc_ids.append(alloc, owned_doc_id);
             }
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.axis);
                 for (item.doc_ids.items) |doc_id| alloc.free(doc_id);
                 item.doc_ids.deinit(alloc);
@@ -5915,7 +5916,7 @@ pub const Index = struct {
                 try item.doc_ids.append(alloc, owned_doc_id);
             }
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.axis);
                 for (item.doc_ids.items) |doc_id| alloc.free(doc_id);
                 item.doc_ids.deinit(alloc);
@@ -6070,7 +6071,7 @@ pub const Index = struct {
     const ChildCardinalityIndex = struct {
         by_doc: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]u8)) = .empty,
 
-        fn deinit(self: *ChildCardinalityIndex, alloc: Allocator) void {
+        pub fn deinit(self: *ChildCardinalityIndex, alloc: Allocator) void {
             var it = self.by_doc.iterator();
             while (it.next()) |entry| {
                 for (entry.value_ptr.items) |value_key| alloc.free(value_key);
@@ -6117,7 +6118,7 @@ pub const Index = struct {
         indexes: []ChildCardinalityIndex,
         cache_allocator: *CardinalityCacheAllocator,
 
-        fn deinit(self: *ChildCardinalityIndexes, index: *Index) void {
+        pub fn deinit(self: *ChildCardinalityIndexes, index: *Index) void {
             const cache_alloc = self.cache_allocator.allocator();
             for (self.indexes) |*child_index| child_index.deinit(cache_alloc);
             cache_alloc.free(self.indexes);
@@ -6838,7 +6839,7 @@ pub const Index = struct {
             return .{ .set = set, .active = true };
         }
 
-        fn deinit(self: *DocIdConstraintSet, alloc: Allocator) void {
+        pub fn deinit(self: *DocIdConstraintSet, alloc: Allocator) void {
             self.set.deinit(alloc);
             self.* = .{};
         }
@@ -8024,7 +8025,7 @@ pub const Index = struct {
         relation: []const u8,
         polygons: []const []const geo_mod.GeoPoint,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.polygons) |polygon| {
                 if (polygon.len > 0) alloc.free(@constCast(polygon));
             }
@@ -9116,7 +9117,7 @@ pub const Index = struct {
         kind: pathfact_mod.Kind,
         scalar: []u8,
 
-        fn deinit(self: *const PathScalarPredicate, alloc: Allocator) void {
+        pub fn deinit(self: *const PathScalarPredicate, alloc: Allocator) void {
             alloc.free(self.scalar);
         }
     };
@@ -9125,7 +9126,7 @@ pub const Index = struct {
         path: []const u8,
         values: []PathScalarPredicate,
 
-        fn deinit(self: *const PathTermsPredicate, alloc: Allocator) void {
+        pub fn deinit(self: *const PathTermsPredicate, alloc: Allocator) void {
             for (self.values) |*value| value.deinit(alloc);
             if (self.values.len > 0) alloc.free(self.values);
         }
@@ -11870,7 +11871,7 @@ pub const Index = struct {
         kind: pathfact_mod.Kind,
         value: []u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.value);
             self.* = undefined;
         }
@@ -11879,7 +11880,7 @@ pub const Index = struct {
     const DecodedPathFactPrefixConstraint = struct {
         prefix: []u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.prefix);
             self.* = undefined;
         }
@@ -11888,7 +11889,7 @@ pub const Index = struct {
     const DecodedPathFactAnyConstraint = struct {
         values: []DecodedPathFactConstraint,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.values) |*value| value.deinit(alloc);
             if (self.values.len > 0) alloc.free(self.values);
             self.* = undefined;
@@ -11898,7 +11899,7 @@ pub const Index = struct {
     const DecodedPathFactMatchConstraint = struct {
         text: []u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.text);
             self.* = undefined;
         }
@@ -11907,7 +11908,7 @@ pub const Index = struct {
     const DecodedPathFactWildcardConstraint = struct {
         pattern: []u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.pattern);
             self.* = undefined;
         }
@@ -11917,7 +11918,7 @@ pub const Index = struct {
         pattern: []u8,
         compiled: regex_mod.RegexAutomaton,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.compiled.deinit();
             alloc.free(self.pattern);
             self.* = undefined;
@@ -11929,7 +11930,7 @@ pub const Index = struct {
         literal_prefix: []u8,
         max_edits: u8,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.folded_term);
             alloc.free(self.literal_prefix);
             self.* = undefined;
@@ -11949,7 +11950,7 @@ pub const Index = struct {
         inclusive_min: bool,
         inclusive_max: bool,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.min) |value| alloc.free(value);
             if (self.max) |value| alloc.free(value);
             self.* = undefined;
@@ -11984,7 +11985,7 @@ pub const Index = struct {
         relation: []u8,
         polygons: []const []const geo_mod.GeoPoint,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.relation);
             for (self.polygons) |polygon| {
                 if (polygon.len > 0) alloc.free(@constCast(polygon));
@@ -14219,7 +14220,7 @@ pub const Index = struct {
             key: []u8,
             payload: []u8,
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.key);
                 alloc.free(item.payload);
                 item.* = undefined;
@@ -14333,7 +14334,7 @@ pub const Index = struct {
             value: []u8,
             doc_key: []u8,
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.key);
                 alloc.free(item.kind);
                 alloc.free(item.value);
@@ -14549,7 +14550,7 @@ pub const Index = struct {
             join_id: []u8,
             payload: []u8,
 
-            fn deinit(item: *@This(), alloc: Allocator) void {
+            pub fn deinit(item: *@This(), alloc: Allocator) void {
                 alloc.free(item.key);
                 alloc.free(item.join_id);
                 alloc.free(item.payload);
@@ -18721,7 +18722,7 @@ pub const Index = struct {
         key: []u8,
         payload: []u8,
 
-        fn deinit(self: *HllBackfillFact, alloc: Allocator) void {
+        pub fn deinit(self: *HllBackfillFact, alloc: Allocator) void {
             alloc.free(self.key);
             alloc.free(self.payload);
             self.* = undefined;
@@ -19030,7 +19031,7 @@ pub const Index = struct {
         name: []u8,
         precision: u6,
 
-        fn deinit(self: *HllCardinalityReadSpec, alloc: Allocator) void {
+        pub fn deinit(self: *HllCardinalityReadSpec, alloc: Allocator) void {
             alloc.free(self.name);
             self.* = undefined;
         }
@@ -19303,7 +19304,7 @@ pub const Index = struct {
         payload: []u8,
         ordinal_key: ?[]u8 = null,
 
-        fn deinit(self: *PreparedJoinFact, alloc: Allocator) void {
+        pub fn deinit(self: *PreparedJoinFact, alloc: Allocator) void {
             alloc.free(self.join_id);
             alloc.free(self.key);
             alloc.free(self.payload);
@@ -22503,7 +22504,7 @@ test "algebraic HLL cardinality rebuilds after deletes via maintenance lane" {
     defer alloc.free(west_group);
 
     const westEstimate = struct {
-        fn read(index: *Index, doc_store: *docstore_mod.DocStore, group: []const u8, allocator: Allocator) !?u64 {
+        pub fn read(index: *Index, doc_store: *docstore_mod.DocStore, group: []const u8, allocator: Allocator) !?u64 {
             const entries = try index.approxCardinalityEntriesAlloc(doc_store, "customers_by_region");
             defer {
                 for (entries) |*entry| entry.deinit(allocator);
@@ -25538,7 +25539,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_cached_spec_count);
     var resource_stats = resource_manager.snapshot();
-    var algebraic_accumulator_stats = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
+    var algebraic_accumulator_stats = resource_stats.slices[@backingInt(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
     try std.testing.expectEqual(@as(u64, 0), algebraic_accumulator_stats.used_bytes);
     try std.testing.expect(algebraic_accumulator_stats.peak_bytes > 0);
 
@@ -25561,7 +25562,7 @@ test "algebraic bulk ingest maintains ready adaptive aggregate tensors" {
     try std.testing.expectEqual(@as(u64, 1), idx.adaptive_maintenance_plan_build_count);
     try std.testing.expectEqual(@as(u64, 2), idx.adaptive_maintenance_cached_spec_count);
     resource_stats = resource_manager.snapshot();
-    algebraic_accumulator_stats = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
+    algebraic_accumulator_stats = resource_stats.slices[@backingInt(resource_manager_mod.Slice.algebraic_tensor_accumulators)];
     try std.testing.expectEqual(@as(u64, 0), algebraic_accumulator_stats.used_bytes);
     try std.testing.expect(algebraic_accumulator_stats.peak_bytes > 0);
 }

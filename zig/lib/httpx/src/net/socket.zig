@@ -234,13 +234,35 @@ pub const Socket = struct {
 
     /// Closes the socket.
     pub fn close(self: *Self) void {
-        self.io.vtable.netClose(self.io.userdata, @ptrCast((&self.handle)[0..1]));
+        const socket: net.Socket = .{ .handle = self.handle, .address = undefined };
+        self.io.vtable.netClose(self.io.userdata, (&socket)[0..1]);
     }
 
     /// Shuts down reads and writes without releasing the handle. This is used
     /// to wake a blocking connection fiber before its owner performs close.
     pub fn shutdown(self: *Self) void {
         self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
+    }
+
+    /// Wake an abandoned HTTP/1 request without first sending an orderly FIN.
+    /// Its owner still closes the descriptor after the request task unwinds;
+    /// zero linger makes that close a reset the peer can observe as cancellation.
+    pub fn abortRequest(self: *Self) void {
+        // Cleanup must still wake the owner when its parent task is cancelled.
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        if (isThreadedNetworkIo(self.io)) {
+            const Linger = if (is_windows) std.os.windows.ws2_32.linger else posix.linger;
+            const linger = Linger{ .onoff = 1, .linger = 0 };
+            setSocketOption(self.handle, posix.SOL.SOCKET, posix.SO.LINGER, std.mem.asBytes(&linger)) catch {
+                self.shutdown();
+                return;
+            };
+            self.io.vtable.netShutdown(self.io.userdata, self.handle, .recv) catch {};
+        } else {
+            // Custom Io handles are not necessarily native descriptors.
+            self.shutdown();
+        }
     }
 
     /// Half-closes the write side while keeping the read side available for a
@@ -256,11 +278,23 @@ pub const Socket = struct {
         while (true) {
             try self.checkRequestCancellation();
             const wait = try self.operationWait(operation_deadline_ms);
-            const sent = self.netWriteWithTimeout(data, wait.timeout_ms) catch |err| {
+            // Abortive cancellation shuts down reads without sending FIN.
+            // A blocked native send must also wake to observe cancellation;
+            // unlike reads, writes can safely retry after a polling timeout.
+            const poll_cancellation = self.native_timeouts and !is_windows and self.request_cancel_cb != null;
+            const timeout_ms = if (poll_cancellation)
+                @min(wait.timeout_ms orelse 25, 25)
+            else
+                wait.timeout_ms;
+            const sent = self.netWriteWithTimeout(data, timeout_ms) catch |err| {
                 if (err == error.Canceled) self.io.recancel();
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
+                    if (poll_cancellation) {
+                        _ = try self.operationWait(operation_deadline_ms);
+                        continue;
+                    }
                     return error.Timeout;
                 }
                 return error.SendFailed;
@@ -394,11 +428,11 @@ pub const Socket = struct {
 
     fn netRead(self: *Self, buffer: []u8) net.Stream.Reader.Error!usize {
         var bufs = [_][]u8{buffer};
-        return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs);
+        return (try (try self.io.operate(.{ .net_read = .{ .socket_handle = self.handle, .data = &bufs } })).net_read).data_len;
     }
 
     fn netWrite(self: *Self, data: []const u8) net.Stream.Writer.Error!usize {
-        return self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1);
+        return try (try self.io.operate(.{ .net_write = .{ .socket_handle = self.handle, .data = &.{data} } })).net_write;
     }
 
     fn netReadTask(self: *Self, buffer: []u8, result: *net.Stream.Reader.Error!usize) void {
@@ -507,7 +541,7 @@ pub const Socket = struct {
 
     /// Sets the send timeout in milliseconds.
     pub fn setSendTimeout(self: *Self, ms: u64) !void {
-        if (self.native_timeouts) return self.setNativeTimeout(posix.SO.SNDTIMEO, ms);
+        if (self.native_timeouts) try self.setNativeTimeout(posix.SO.SNDTIMEO, ms);
         self.send_timeout_ms = if (ms == 0) null else ms;
     }
 
@@ -780,10 +814,15 @@ pub const SocketIoWriter = struct {
             p.socket.sendAll(buffered) catch return error.WriteFailed;
             return w.consumeAll();
         }
-        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch |err| {
+        const n = (p.socket.io.operate(.{ .net_write = .{
+            .socket_handle = p.socket.handle,
+            .header = w.buffered(),
+            .data = bufs,
+            .splat = splat,
+        } }) catch |err| {
             if (err == error.Canceled) p.socket.io.recancel();
             return error.WriteFailed;
-        };
+        }).net_write catch return error.WriteFailed;
         return w.consume(n);
     }
 
@@ -898,6 +937,9 @@ pub const PrefixedReader = struct {
 pub const ContentLengthReader = struct {
     inner: *Io.Reader,
     remaining: usize,
+    // Io.Reader exposes only ReadFailed/EndOfStream. Preserve the actual
+    // transport failure for callers that must decide whether replay is safe.
+    read_error: ?anyerror = null,
     reader_iface: Io.Reader,
 
     pub fn init(inner: *Io.Reader, limit: usize, buffer: []u8) ContentLengthReader {
@@ -917,6 +959,10 @@ pub const ContentLengthReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
+    pub fn checkReadError(self: *const ContentLengthReader) !void {
+        if (self.read_error) |err| return err;
+    }
+
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
         const p = parent(r);
         if (p.remaining == 0) return error.EndOfStream;
@@ -928,9 +974,9 @@ pub const ContentLengthReader = struct {
         bufs[entry.index] = orig_buf[0..clamped_len];
         defer bufs[entry.index] = orig_buf; // restore original slice for caller
 
-        const n = readVecOnce(p.inner, bufs[entry.index]) catch |err| switch (err) {
-            error.EndOfStream => return error.ReadFailed,
-            error.ReadFailed => return error.ReadFailed,
+        const n = readVecOnce(p.inner, bufs[entry.index]) catch |err| {
+            p.read_error = if (err == error.EndOfStream) error.UnexpectedEof else err;
+            return error.ReadFailed;
         };
         p.remaining -= n;
         return n;
@@ -948,6 +994,7 @@ pub const ContentLengthReader = struct {
 /// parsing chunk-size lines and inter-chunk delimiters.
 pub const ChunkedBodyReader = struct {
     inner: *Io.Reader,
+    read_error: ?anyerror = null,
     chunk_remaining: usize = 0,
     state: ChunkState = .chunk_size,
     line_buf: [32]u8 = undefined,
@@ -1020,7 +1067,20 @@ pub const ChunkedBodyReader = struct {
         return p.ahead_end - p.ahead_start;
     }
 
+    pub fn checkReadError(self: *const ChunkedBodyReader) !void {
+        if (self.read_error) |err| return err;
+    }
+
     fn readVec(r: *Io.Reader, bufs: [][]u8) Io.Reader.Error!usize {
+        const p = parent(r);
+        return readVecInner(r, bufs) catch |err| {
+            if (err == error.EndOfStream and p.state == .done) return error.EndOfStream;
+            p.read_error = if (err == error.EndOfStream) error.UnexpectedEof else err;
+            return error.ReadFailed;
+        };
+    }
+
+    fn readVecInner(r: *Io.Reader, bufs: [][]u8) !usize {
         const p = parent(r);
         var iovecs_buffer: [8][]u8 = undefined;
         const dest_n, const data_size = try r.writableVector(&iovecs_buffer, bufs);
@@ -1040,7 +1100,7 @@ pub const ChunkedBodyReader = struct {
                             // Accumulate line content (excluding \r and \n) into line_buf.
                             for (buffered[0..nl_pos]) |byte| {
                                 if (byte == '\r') continue;
-                                if (p.line_len >= p.line_buf.len) return error.ReadFailed;
+                                if (p.line_len >= p.line_buf.len) return error.InvalidResponse;
                                 p.line_buf[p.line_len] = byte;
                                 p.line_len += 1;
                             }
@@ -1050,7 +1110,7 @@ pub const ChunkedBodyReader = struct {
                         // No newline yet — accumulate all buffered bytes into line_buf.
                         for (buffered) |byte| {
                             if (byte == '\r') continue;
-                            if (p.line_len >= p.line_buf.len) return error.ReadFailed;
+                            if (p.line_len >= p.line_buf.len) return error.InvalidResponse;
                             p.line_buf[p.line_len] = byte;
                             p.line_len += 1;
                         }
@@ -1065,7 +1125,7 @@ pub const ChunkedBodyReader = struct {
                     p.line_len = 0;
                     const hex_end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
                     const hex = std.mem.trim(u8, line[0..hex_end], " \t");
-                    p.chunk_remaining = std.fmt.parseInt(usize, hex, 16) catch return error.ReadFailed;
+                    p.chunk_remaining = std.fmt.parseInt(usize, hex, 16) catch return error.InvalidResponse;
 
                     if (p.chunk_remaining == 0) {
                         // Terminal chunk. Consume trailer lines until empty line.
@@ -1118,9 +1178,9 @@ pub const ChunkedBodyReader = struct {
                     const b1 = p.readOneByte() catch |err| return err;
                     if (b1 == '\r') {
                         const b2 = p.readOneByte() catch |err| return err;
-                        if (b2 != '\n') return error.ReadFailed;
+                        if (b2 != '\n') return error.InvalidResponse;
                     } else if (b1 != '\n') {
-                        return error.ReadFailed;
+                        return error.InvalidResponse;
                     }
                     p.state = .chunk_size;
                     continue;
@@ -1237,7 +1297,7 @@ fn addressToPosix(address: Address, storage: *PosixAddress) posix.socklen_t {
         .ip4 => |ip4| {
             storage.in = .{
                 .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
+                .addr = std.mem.bytesToValue(u32, &ip4.bytes),
             };
             return @sizeOf(posix.sockaddr.in);
         },
@@ -1257,7 +1317,7 @@ fn addressFromPosix(storage: *const PosixAddress) Address {
     return switch (storage.any.family) {
         posix.AF.INET => .{ .ip4 = .{
             .port = std.mem.bigToNative(u16, storage.in.port),
-            .bytes = @bitCast(storage.in.addr),
+            .bytes = std.mem.toBytes(storage.in.addr),
         } },
         posix.AF.INET6 => .{ .ip6 = .{
             .port = std.mem.bigToNative(u16, storage.in6.port),
@@ -1277,7 +1337,7 @@ fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.S
     const socket_flags = posix.SOCK.STREAM |
         if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
     const socket_fd: posix.socket_t = socket: while (true) {
-        const rc = posix.system.socket(family, socket_flags, @intFromEnum(net.Protocol.tcp));
+        const rc = posix.system.socket(family, socket_flags, @backingInt(net.Protocol.tcp));
         switch (posix.errno(rc)) {
             .SUCCESS => break :socket @intCast(rc),
             .INTR => continue,
@@ -1615,6 +1675,58 @@ test "Socket cancellation polling preserves the configured receive timeout" {
     try sender.await(io);
 }
 
+test "Socket abort interrupts a backpressured native send" {
+    if (is_windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var sender = try Socket.connect(listener.getLocalAddress(), io);
+    defer sender.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    const send_buffer: u32 = 4096;
+    try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
+    try sender.setSendTimeout(5);
+    var payload: [64 * 1024]u8 = @splat(0xa5);
+    for (0..1024) |_| {
+        _ = sender.send(&payload) catch |err| {
+            try std.testing.expectEqual(error.Timeout, err);
+            break;
+        };
+    } else return error.TestUnexpectedResult;
+    try sender.setSendTimeout(0);
+    var cancelled = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    sender.setRequestCancellation(struct {
+        fn check(raw: ?*anyopaque) bool {
+            const signal: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            return signal.load(.acquire);
+        }
+    }.check, &cancelled);
+    var writer = try io.concurrent(struct {
+        fn run(socket: *Socket, data: []const u8, completed: *std.atomic.Value(bool)) anyerror!void {
+            defer completed.store(true, .release);
+            while (true) try socket.sendAll(data);
+        }
+    }.run, .{ &sender, &payload, &done });
+    defer {
+        sender.shutdown();
+        writer.cancel(io) catch {};
+    }
+    try io.sleep(.fromMilliseconds(100), .awake);
+    cancelled.store(true, .release);
+    sender.abortRequest();
+    for (0..250) |_| {
+        if (done.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const prompt = done.load(.acquire);
+    // Bound failure cleanup even if cancellation cannot wake a native send.
+    sender.shutdown();
+    try std.testing.expectError(error.Canceled, writer.await(io));
+    try std.testing.expect(prompt);
+}
+
 test "Socket send timeout reports backpressure without panicking" {
     if (is_windows) return;
 
@@ -1630,6 +1742,12 @@ test "Socket send timeout reports backpressure without panicking" {
     const send_buffer: u32 = 4096;
     try Socket.setSocketOption(sender.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&send_buffer));
     try sender.setSendTimeout(5);
+    // Cancellation polling must retain the configured native write deadline.
+    sender.setRequestCancellation(struct {
+        fn check(_: ?*anyopaque) bool {
+            return false;
+        }
+    }.check, null);
 
     var payload: [64 * 1024]u8 = @splat(0xa5);
     var attempts: usize = 0;
@@ -1703,6 +1821,7 @@ test "ContentLengthReader reports premature EOF as ReadFailed" {
 
     var out: [8]u8 = undefined;
     try std.testing.expectError(error.ReadFailed, limited.reader_iface.readSliceShort(out[0..4]));
+    try std.testing.expectError(error.UnexpectedEof, limited.checkReadError());
 }
 
 test "ChunkedBodyReader skips leading empty buffers" {
@@ -1853,4 +1972,32 @@ test "timed fallback denied write sends no bytes" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     try TimedFallbackTest.denied(true, 0);
     try TimedFallbackTest.denied(true, 1);
+}
+
+test "ChunkedBodyReader preserves truncation versus invalid framing at every phase" {
+    const Case = struct { wire: []const u8, expected: anyerror };
+    for ([_]Case{
+        .{ .wire = "", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r\nhel", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r\nhello\r", .expected = error.UnexpectedEof },
+        .{ .wire = "5\r\nhello\r\n", .expected = error.UnexpectedEof },
+        .{ .wire = "0\r\nTrailer: value\r\n", .expected = error.UnexpectedEof },
+        .{ .wire = "z\r\n", .expected = error.InvalidResponse },
+        .{ .wire = "1\r\nx!", .expected = error.InvalidResponse },
+    }) |case| {
+        var inner = Io.Reader.fixed(case.wire);
+        var buffer: [32]u8 = undefined;
+        var chunked = ChunkedBodyReader.init(&inner, &buffer);
+        var output: [32]u8 = undefined;
+        try std.testing.expectError(error.ReadFailed, chunked.reader_iface.readSliceShort(&output));
+        try std.testing.expectError(case.expected, chunked.checkReadError());
+    }
+    var inner = Io.Reader.fixed("5\r\nhello\r\n0\r\nTrailer: value\r\n\r\n");
+    var buffer: [32]u8 = undefined;
+    var chunked = ChunkedBodyReader.init(&inner, &buffer);
+    var output: [32]u8 = undefined;
+    const n = try chunked.reader_iface.readSliceShort(&output);
+    try std.testing.expectEqualStrings("hello", output[0..n]);
+    try chunked.checkReadError();
 }

@@ -19,6 +19,7 @@
 //! can close the standby without leaving request paths with borrowed pointers.
 
 const std = @import("std");
+const storage_contract = @import("../db/replication_contract.zig");
 const platform_time = @import("antfly_platform").time;
 const primary_mod = @import("primary.zig");
 const read_gate = @import("read_gate.zig");
@@ -39,21 +40,46 @@ pub const Role = enum(u8) {
 };
 
 pub const State = struct {
-    role: std.atomic.Value(u8) = .init(@intFromEnum(Role.disabled)),
-    generation: std.atomic.Value(u64) = .init(1),
-    progress_sequence: std.atomic.Value(u64) = .init(0),
-    received_lsn: std.atomic.Value(u64) = .init(0),
-    applied_lsn: std.atomic.Value(u64) = .init(0),
-    safe_read_lsn: std.atomic.Value(u64) = .init(0),
+    pub fn storageWriteState(self: *const State) storage_contract.PublishedWriteState {
+        return .{ .ptr = self, .vtable = &storage_write_vtable };
+    }
+
+    const storage_write_vtable: storage_contract.PublishedWriteState.VTable = .{
+        .check = checkStorageWrite,
+        .generation = storageGeneration,
+        .allows_background_work = storageAllowsBackgroundWork,
+    };
+
+    fn checkStorageWrite(ptr: *const anyopaque, generation: ?u64) !void {
+        const self: *const State = @ptrCast(@alignCast(ptr));
+        try self.checkWrite(generation);
+    }
+
+    fn storageGeneration(ptr: *const anyopaque) u64 {
+        const self: *const State = @ptrCast(@alignCast(ptr));
+        return self.currentGeneration();
+    }
+
+    fn storageAllowsBackgroundWork(ptr: *const anyopaque) bool {
+        const self: *const State = @ptrCast(@alignCast(ptr));
+        return !self.isStandbyRole();
+    }
+
+    role: std.atomic.Value(u8) = .init(@backingInt(Role.disabled)),
+    generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    progress_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    received_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    applied_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    safe_read_lsn: @import("antfly_platform").atomic.Value(u64) = .init(0),
     external_authority_required: std.atomic.Value(bool) = .init(false),
     external_authority_granted: std.atomic.Value(bool) = .init(false),
-    external_authority_deadline_ns: std.atomic.Value(u64) = .init(0),
+    external_authority_deadline_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     primary: ?*const primary_mod.Primary = null,
     monotonic_now_fn: *const fn () u64 = platform_time.authorityNs,
 
     pub fn configureStandby(self: *State, progress: standby_mod.Progress) void {
         self.publishStandbyProgress(progress);
-        self.role.store(@intFromEnum(Role.standby), .release);
+        self.role.store(@backingInt(Role.standby), .release);
     }
 
     pub fn configurePrimary(
@@ -74,7 +100,7 @@ pub const State = struct {
     }
 
     pub fn beginPromotion(self: *State) void {
-        self.role.store(@intFromEnum(Role.transitioning), .release);
+        self.role.store(@backingInt(Role.transitioning), .release);
     }
 
     pub fn publishPrimary(
@@ -88,17 +114,17 @@ pub const State = struct {
 
     pub fn publishPrimaryFence(self: *State, fenced: bool) void {
         if (fenced) {
-            self.role.store(@intFromEnum(Role.fenced_primary), .release);
+            self.role.store(@backingInt(Role.fenced_primary), .release);
             return;
         }
 
         var current = self.role.load(.acquire);
-        while (current != @intFromEnum(Role.fenced_primary)) {
+        while (current != @backingInt(Role.fenced_primary)) {
             const desired = if (self.external_authority_required.load(.acquire) and
                 !self.external_authority_granted.load(.acquire))
-                @intFromEnum(Role.transitioning)
+                @backingInt(Role.transitioning)
             else
-                @intFromEnum(Role.primary);
+                @backingInt(Role.primary);
             current = self.role.cmpxchgWeak(
                 current,
                 desired,
@@ -114,7 +140,7 @@ pub const State = struct {
     pub fn requireExternalAuthority(self: *State) void {
         self.external_authority_granted.store(false, .release);
         self.external_authority_required.store(true, .release);
-        if (self.currentRole() == .primary) self.role.store(@intFromEnum(Role.transitioning), .release);
+        if (self.currentRole() == .primary) self.role.store(@backingInt(Role.transitioning), .release);
     }
 
     pub fn publishExternalAuthority(self: *State, granted: bool) void {
@@ -127,7 +153,7 @@ pub const State = struct {
         self.external_authority_granted.store(granted, .release);
         if (!granted) return;
         if (self.primary != null and self.currentRole() == .transitioning) {
-            self.role.store(@intFromEnum(Role.primary), .release);
+            self.role.store(@backingInt(Role.primary), .release);
         }
     }
 
@@ -230,7 +256,7 @@ pub const State = struct {
     }
 
     pub fn currentRole(self: *const State) Role {
-        return @enumFromInt(self.role.load(.acquire));
+        return @fromBackingInt(@intCast(self.role.load(.acquire)));
     }
 
     fn standbyProgress(self: *const State) standby_mod.Progress {

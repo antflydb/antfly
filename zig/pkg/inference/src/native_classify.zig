@@ -31,7 +31,7 @@ const Options = struct {
     entailment_index: ?usize = null,
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
 
-    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
         self.labels.deinit(allocator);
     }

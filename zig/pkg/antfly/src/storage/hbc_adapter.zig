@@ -33,16 +33,26 @@ const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
+
+fn atomicLoadU64(value: *const u64, comptime order: std.builtin.AtomicOrder) u64 {
+    if (comptime builtin.cpu.arch == .wasm32) return value.*;
+    return @atomicLoad(u64, value, order);
+}
+
+fn atomicFetchAddU64(value: *u64, operand: u64, comptime order: std.builtin.AtomicOrder) u64 {
+    if (comptime builtin.cpu.arch == .wasm32) {
+        const previous = value.*;
+        value.* +%= operand;
+        return previous;
+    }
+    return @atomicRmw(u64, value, .Add, operand, order);
+}
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
 const hbc_backend = @import("hbc_backend.zig");
 const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
-const supports_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
-const lmdb = if (supports_lmdb) @import("lmdb.zig") else struct {
-    pub const Error = error{NotFound};
-};
 const lsm_backend = @import("lsm_backend/mod.zig");
 const platform_time = @import("antfly_platform").time;
 const vec = @import("antfly_vector").vector;
@@ -187,7 +197,7 @@ fn nowNsI128() i128 {
 }
 
 fn isNotFound(err: anyerror) bool {
-    return err == error.NotFound or (supports_lmdb and err == lmdb.Error.NotFound);
+    return err == error.NotFound;
 }
 
 // ============================================================================
@@ -216,7 +226,7 @@ pub const SplitRebuildWork = vectorindex_types.SplitRebuildWork;
 const DeferredNodeValue = struct {
     value: ?[]u8 = null,
 
-    fn deinit(self: *DeferredNodeValue, alloc: Allocator) void {
+    pub fn deinit(self: *DeferredNodeValue, alloc: Allocator) void {
         if (self.value) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -282,8 +292,8 @@ const HbcPhysicalAccounting = struct {
     mutex: std.atomic.Mutex = .unlocked,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     current_bytes: u64 = 0,
-    published_bytes: std.atomic.Value(u64) = .init(0),
-    pinned_bytes: std.atomic.Value(u64) = .init(0),
+    published_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    pinned_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     fn attach(self: *HbcPhysicalAccounting, manager: *resource_manager_mod.ResourceManager) void {
         lockAtomic(&self.mutex);
@@ -366,7 +376,7 @@ const HbcNamespacePinnedAccounting = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *HbcNamespacePinnedAccounting) void {
+    pub fn deinit(self: *HbcNamespacePinnedAccounting) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.bytes.deinit(self.alloc);
@@ -745,8 +755,8 @@ fn snapshotHbcKindStats(stored: *HbcCacheKindStats) HbcCacheKindStats {
     return .{
         .used_bytes = stored.used_bytes,
         .peak_bytes = stored.peak_bytes,
-        .hits = @atomicLoad(u64, &stored.hits, .monotonic),
-        .misses = @atomicLoad(u64, &stored.misses, .monotonic),
+        .hits = platform.atomic.load(u64, &stored.hits, .monotonic),
+        .misses = platform.atomic.load(u64, &stored.misses, .monotonic),
         .insertions = stored.insertions,
         .replacements = stored.replacements,
         .sampled_admissions = stored.sampled_admissions,
@@ -806,7 +816,7 @@ fn noteHbcKindAdmissionSkip(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).admission_skips += 1;
 }
 
-fn cacheFillEpochCurrent(fill_epoch: ?*const std.atomic.Value(u64), expected_epoch: u64) bool {
+fn cacheFillEpochCurrent(fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64), expected_epoch: u64) bool {
     const epoch = fill_epoch orelse return true;
     return expected_epoch & 1 == 0 and epoch.load(.acquire) == expected_epoch;
 }
@@ -843,7 +853,7 @@ const CacheRwLock = struct {
     // ownership lets independent lookups proceed without modifying the same
     // global reader-count word. Structural writers fence every stripe before
     // mutating the authoritative hash map.
-    vector_read_stripes: [vector_read_stripe_count]std.atomic.Mutex = .{.unlocked} ** vector_read_stripe_count,
+    vector_read_stripes: [vector_read_stripe_count]std.atomic.Mutex = @as([vector_read_stripe_count]std.atomic.Mutex, @splat(.unlocked)),
     exclusive_lock_calls: AtomicU64 = .init(0),
     exclusive_contended_calls: AtomicU64 = .init(0),
     exclusive_wait_ns: AtomicU64 = .init(0),
@@ -1032,24 +1042,24 @@ pub const Cache = struct {
     reclaimer_identity: u64 = 0,
     physical_accounting: HbcPhysicalAccounting = .{},
     namespace_pinned_accounting: HbcNamespacePinnedAccounting,
-    admission_target_bytes: std.atomic.Value(u64) = .init(0),
+    admission_target_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     concurrent_vector_admission_stride: std.atomic.Value(u32) = .init(1),
-    concurrent_vector_admission_counter: std.atomic.Value(u64) = .init(0),
+    concurrent_vector_admission_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Counts live query-level decoded-residency leases across namespaces.
     // Serial cold starts fill eagerly; only genuinely overlapping fills use
     // the normal-pressure sampling doorkeeper.
-    decoded_query_active_leases: std.atomic.Value(u64) = .init(0),
-    decoded_query_reserved_bytes: std.atomic.Value(u64) = .init(0),
+    decoded_query_active_leases: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    decoded_query_reserved_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     // Query leases claim logical capacity before their primary-store batch is
     // read, then atomically transfer that entitlement to physical precharge.
     // This prevents concurrent cold-start requests from all observing the
     // same free bytes without charging the full request up front.
-    decoded_query_entitled_bytes: std.atomic.Value(u64) = .init(0),
-    decoded_query_replacement_entitled_bytes: std.atomic.Value(u64) = .init(0),
+    decoded_query_entitled_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    decoded_query_replacement_entitled_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// Coalesce duplicate exact-vector publication and keep cloning outside
     /// the global map/admission lock. These locks do not guard visibility;
     /// the map lock plus HBC's mutation epoch remain authoritative.
-    vector_fill_mutexes: [shared_vector_fill_stripe_count]std.atomic.Mutex = .{.unlocked} ** shared_vector_fill_stripe_count,
+    vector_fill_mutexes: [shared_vector_fill_stripe_count]std.atomic.Mutex = @splat(.unlocked),
     global_stats: HbcCacheStats = .{},
     namespace_stats: std.AutoHashMapUnmanaged(u64, HbcCacheStats) = .empty,
     node_cache: std.AutoHashMapUnmanaged(HbcSharedCacheKey, *NodeCacheEntry) = .empty,
@@ -1067,7 +1077,7 @@ pub const Cache = struct {
     // Lookup counters follow the same ownership stripes as vector reads. This
     // avoids recreating one globally written cache line solely for telemetry.
     vector_lookup_stats: [CacheRwLock.vector_read_stripe_count]std.AutoHashMapUnmanaged(u64, HbcVectorLookupStats) =
-        .{std.AutoHashMapUnmanaged(u64, HbcVectorLookupStats).empty} ** CacheRwLock.vector_read_stripe_count,
+        @as([CacheRwLock.vector_read_stripe_count]std.AutoHashMapUnmanaged(u64, HbcVectorLookupStats), @splat(.empty)),
     metadata_cache: std.AutoHashMapUnmanaged(HbcSharedCacheKey, *MetadataCacheEntry) = .empty,
     metadata_slots: std.AutoHashMapUnmanaged(HbcSharedCacheKey, usize) = .empty,
     metadata_clock: std.ArrayListUnmanaged(HbcSharedClockEntry) = .empty,
@@ -1339,8 +1349,8 @@ pub const Cache = struct {
         stats.vector.misses = 0;
         for (&self.vector_lookup_stats) |*lookup_stats| {
             if (lookup_stats.getPtr(namespace)) |stored| {
-                stats.vector.hits +|= @atomicLoad(u64, &stored.hits, .monotonic);
-                stats.vector.misses +|= @atomicLoad(u64, &stored.misses, .monotonic);
+                stats.vector.hits +|= platform.atomic.load(u64, &stored.hits, .monotonic);
+                stats.vector.misses +|= platform.atomic.load(u64, &stored.misses, .monotonic);
             }
         }
         stats.pinned_bytes = self.namespace_pinned_accounting.current(namespace);
@@ -1351,16 +1361,16 @@ pub const Cache = struct {
     fn noteLookupLocked(self: *Cache, kind: HbcCacheKind, namespace: u64, hit: bool) void {
         const global = hbcKindStats(&self.global_stats, kind);
         if (hit) {
-            _ = @atomicRmw(u64, &global.hits, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &global.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &global.misses, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &global.misses, 1, .monotonic);
         }
         if (self.namespace_stats.getPtr(namespace)) |stats| {
             const counters = hbcKindStats(stats, kind);
             if (hit) {
-                _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
+                _ = platform.atomic.fetchAdd(u64, &counters.hits, 1, .monotonic);
             } else {
-                _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+                _ = platform.atomic.fetchAdd(u64, &counters.misses, 1, .monotonic);
             }
         }
     }
@@ -1368,9 +1378,9 @@ pub const Cache = struct {
     fn noteVectorLookupStriped(self: *Cache, stripe: usize, namespace: u64, hit: bool) void {
         const stats = self.vector_lookup_stats[stripe].getPtr(namespace) orelse return;
         if (hit) {
-            _ = @atomicRmw(u64, &stats.hits, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &stats.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &stats.misses, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &stats.misses, 1, .monotonic);
         }
     }
 
@@ -1379,8 +1389,7 @@ pub const Cache = struct {
         // so stripe zero is the allocation-free fast-path sentinel after the
         // first registration or successful vector admission.
         if (self.vector_lookup_stats[0].contains(namespace)) return;
-        var created: [CacheRwLock.vector_read_stripe_count]bool =
-            .{false} ** CacheRwLock.vector_read_stripe_count;
+        var created: [CacheRwLock.vector_read_stripe_count]bool = @splat(false);
         errdefer for (&self.vector_lookup_stats, 0..) |*lookup_stats, stripe| {
             if (created[stripe]) std.debug.assert(lookup_stats.remove(namespace));
         };
@@ -1646,7 +1655,7 @@ pub const Cache = struct {
         self: *Cache,
         namespace: u64,
         node: *const Node,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
     ) !bool {
         const cloned = try node.clone(self.alloc);
@@ -1691,7 +1700,7 @@ pub const Cache = struct {
         namespace: u64,
         node_id: u64,
         qs: *const QuantizedSet,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
     ) !bool {
         var cloned = try qs.clone(self.alloc);
@@ -1775,7 +1784,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         vector_data: []const f32,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
         must_cache: bool,
         precharged: bool,
@@ -1864,7 +1873,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         metadata: []const u8,
-        fill_epoch: ?*const std.atomic.Value(u64),
+        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
         expected_epoch: u64,
     ) ![]const u8 {
         const copied = try self.alloc.dupe(u8, metadata);
@@ -2565,7 +2574,7 @@ const ExperimentalPostingPatchCacheShard = struct {
     mutex: std.atomic.Mutex = .unlocked,
     values: std.AutoHashMapUnmanaged(u128, *PostingPatchEntry) = .empty,
 
-    fn deinit(self: *ExperimentalPostingPatchCacheShard, alloc: Allocator) void {
+    pub fn deinit(self: *ExperimentalPostingPatchCacheShard, alloc: Allocator) void {
         var values = self.values.valueIterator();
         while (values.next()) |value| value.*.release();
         self.values.deinit(alloc);
@@ -2577,7 +2586,7 @@ const ExperimentalPostingResolvedValue = struct {
     bytes: []const u8,
     owned: ?[]u8 = null,
 
-    fn deinit(self: *ExperimentalPostingResolvedValue, alloc: Allocator) void {
+    pub fn deinit(self: *ExperimentalPostingResolvedValue, alloc: Allocator) void {
         if (self.owned) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
@@ -2688,7 +2697,7 @@ const ExperimentalPostingReadState = struct {
     // touches them. Sharding avoids serializing cold concurrent queries, and
     // cached allocations remain stable for the lifetime of this leased root.
     patch_cache: [experimental_posting_patch_cache_shards]ExperimentalPostingPatchCacheShard =
-        [_]ExperimentalPostingPatchCacheShard{.{}} ** experimental_posting_patch_cache_shards,
+        @as([experimental_posting_patch_cache_shards]ExperimentalPostingPatchCacheShard, @splat(.{})),
     patch_cache_bytes: std.atomic.Value(usize) = .init(0),
     patch_cache_accounting: HbcPhysicalAccounting = .{},
     patch_cache_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -2696,7 +2705,7 @@ const ExperimentalPostingReadState = struct {
     compact_subgroup_budget: ?resource_manager_mod.BudgetedAllocator = null,
     compact_subgroups: ?CompactSubgroups.Cache = null,
 
-    fn deinit(self: *ExperimentalPostingReadState) void {
+    pub fn deinit(self: *ExperimentalPostingReadState) void {
         if (self.compact_subgroup_budget) |*budget| {
             if (self.compact_subgroups) |*cache| cache.deinit();
             budget.deinit();
@@ -3158,7 +3167,7 @@ const ExperimentalPostingReadState = struct {
         }
         var materialized = self.materialized.keyIterator();
         while (materialized.next()) |key| {
-            const kind: vectorindex_posting_wal.RecordKind = @enumFromInt(@as(u8, @truncate(key.*)));
+            const kind: vectorindex_posting_wal.RecordKind = @fromBackingInt(@as(u8, @truncate(key.*)));
             if (experimentalPostingKindAffectsLeafScan(kind))
                 try changed.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
         }
@@ -3386,13 +3395,13 @@ const ExperimentalPostingReadState = struct {
             .mutation => {
                 if (record.payload.len < 6) return error.CorruptedPostingPatch;
                 const target: vectorindex_posting_wal.RecordKind = switch (record.payload[5]) {
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.base) => .base,
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.node_range) => .node_range,
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.vector_leaf) => .vector_leaf,
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.vector_metadata) => .vector_metadata,
-                    @intFromEnum(vectorindex_posting_wal.RecordKind.index_metadata) => .index_metadata,
+                    @backingInt(vectorindex_posting_wal.RecordKind.base) => .base,
+                    @backingInt(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
+                    @backingInt(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
+                    @backingInt(vectorindex_posting_wal.RecordKind.node_range) => .node_range,
+                    @backingInt(vectorindex_posting_wal.RecordKind.vector_leaf) => .vector_leaf,
+                    @backingInt(vectorindex_posting_wal.RecordKind.vector_metadata) => .vector_metadata,
+                    @backingInt(vectorindex_posting_wal.RecordKind.index_metadata) => .index_metadata,
                     else => return error.InvalidPostingPatchTarget,
                 };
                 // Recovery borrows or temporarily reconstructs one base; it
@@ -3710,7 +3719,7 @@ const NativePostingRowResolver = struct {
     origins: std.AutoHashMapUnmanaged(u64, *posting_rows.Origin) = .empty,
     redirects: std.AutoHashMapUnmanaged(u64, ?[]u8) = .empty,
 
-    fn deinit(self: *NativePostingRowResolver) void {
+    pub fn deinit(self: *NativePostingRowResolver) void {
         var values = self.chunks.valueIterator();
         while (values.next()) |chunk| chunk.*.release();
         self.chunks.deinit(self.alloc);
@@ -3839,18 +3848,18 @@ const ExperimentalPostingReadGeneration = struct {
     /// Highest source-journal sequence durably represented by this immutable
     /// generation. This comes from the posting checkpoint/WAL commit boundary,
     /// not from the projection metadata value stored inside the generation.
-    covered_source_sequence: std.atomic.Value(u64),
+    covered_source_sequence: @import("antfly_platform").atomic.Value(u64),
     /// Exact durable WAL boundary represented by this logical generation.
     /// Source sequences alone are insufficient because multiple ordered
     /// derived batches may commit at the same source sequence.
-    wal_generation: std.atomic.Value(u64),
-    wal_committed_bytes: std.atomic.Value(u64),
+    wal_generation: @import("antfly_platform").atomic.Value(u64),
+    wal_committed_bytes: @import("antfly_platform").atomic.Value(u64),
     /// Query-visible topology owned by this exact immutable posting
     /// generation. It is initialized before publication and never changes.
     search_view: SearchViewToken = .{},
     scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     // Scheduling-only observations, isolated by immutable generation/filter mode.
-    scan_prediction: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) },
+    scan_prediction: [2]@import("antfly_platform").atomic.Value(u64) = .{ .init(0), .init(0) },
     /// Number of immutable in-memory delta maps above the mmap root. This is
     /// bounded by allocation-free ownership transfer when no query lease is
     /// active; foreground readers never trigger a cloned aggregate.
@@ -4384,7 +4393,7 @@ const ExperimentalPostingReadGeneration = struct {
 };
 
 fn experimentalPostingValueKey(posting_id: u64, kind: vectorindex_posting_wal.RecordKind) u128 {
-    return (@as(u128, posting_id) << 8) | @intFromEnum(kind);
+    return (@as(u128, posting_id) << 8) | @backingInt(kind);
 }
 
 fn experimentalPostingValueKeyId(key: u128) u64 {
@@ -4590,8 +4599,8 @@ const ExperimentalVectorOverride = struct {
     }
 
     fn compare(lhs: ExperimentalVectorOverride, rhs: ExperimentalVectorOverride) std.math.Order {
-        const lhs_kind = @intFromEnum(lhs.kind);
-        const rhs_kind = @intFromEnum(rhs.kind);
+        const lhs_kind = @backingInt(lhs.kind);
+        const rhs_kind = @backingInt(rhs.kind);
         if (lhs_kind < rhs_kind) return .lt;
         if (lhs_kind > rhs_kind) return .gt;
         return std.math.order(lhs.id, rhs.id);
@@ -4707,14 +4716,14 @@ const ExperimentalVectorRowIterator = struct {
 
 fn experimentalPostingValueKeyKind(key: u128) !vectorindex_posting_wal.RecordKind {
     return switch (@as(u8, @truncate(key))) {
-        @intFromEnum(vectorindex_posting_wal.RecordKind.row_chunk) => .row_chunk,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.base) => .base,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.node_range) => .node_range,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.vector_leaf) => .vector_leaf,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.vector_metadata) => .vector_metadata,
-        @intFromEnum(vectorindex_posting_wal.RecordKind.index_metadata) => .index_metadata,
+        @backingInt(vectorindex_posting_wal.RecordKind.row_chunk) => .row_chunk,
+        @backingInt(vectorindex_posting_wal.RecordKind.base) => .base,
+        @backingInt(vectorindex_posting_wal.RecordKind.quantized_checkpoint) => .quantized_checkpoint,
+        @backingInt(vectorindex_posting_wal.RecordKind.posting_state) => .posting_state,
+        @backingInt(vectorindex_posting_wal.RecordKind.node_range) => .node_range,
+        @backingInt(vectorindex_posting_wal.RecordKind.vector_leaf) => .vector_leaf,
+        @backingInt(vectorindex_posting_wal.RecordKind.vector_metadata) => .vector_metadata,
+        @backingInt(vectorindex_posting_wal.RecordKind.index_metadata) => .index_metadata,
         else => error.InvalidPostingPatchTarget,
     };
 }
@@ -4829,7 +4838,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     staging_store: posting_segment_store_mod.Store,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     io: std.Io,
-    owned_io: ?std.Io.Threaded = null,
+    owned_io: ?(if (builtin.os.tag == .freestanding) void else std.Io.Threaded) = null,
     projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource = null,
     projection_revision: u64 = 0,
     /// Hard recovery-debt enforcement and graceful close can promote an
@@ -4858,7 +4867,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     lock_deferrals_at_start: u64 = 0,
 
     fn allocator() Allocator {
-        return platform.allocator.processAllocator(std.heap.smp_allocator);
+        return platform.allocator.processAllocator(platform.allocator.concurrentFallback());
     }
 
     fn run(self: *ExperimentalPostingCheckpointBuild) void {
@@ -5042,9 +5051,11 @@ const ExperimentalPostingCheckpointBuild = struct {
         return .{ .result = result, .staged = staged };
     }
 
-    fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
+    pub fn deinit(self: *ExperimentalPostingCheckpointBuild) void {
         self.awaitCompletion();
-        if (self.owned_io) |*io_impl| io_impl.deinit();
+        if (comptime builtin.os.tag != .freestanding) {
+            if (self.owned_io) |*io_impl| io_impl.deinit();
+        }
         if (self.staged_rebase) |generation| generation.release();
         if (self.rebase_source) |generation| generation.release();
         if (self.staged_readers) |readers| readers.release();
@@ -5225,7 +5236,6 @@ pub const HBCIndex = struct {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.root_dir,
             .native => |backend| backend.root_dir,
-            .lmdb => null,
         };
     }
 
@@ -5252,7 +5262,7 @@ pub const HBCIndex = struct {
     native_acceleration_retry: NativeAccelerationRetry = .{},
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
     experimental_posting_capture_started_ns: u64 = 0,
-    posting_publication_lock_deferrals: std.atomic.Value(u64) = .init(0),
+    posting_publication_lock_deferrals: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// Native authority can become durable while an opportunistic checkpoint
     /// still borrows storage owned by the compatibility LSM. Record the
     /// retirement request explicitly and drain it only at a boundary where no
@@ -5314,7 +5324,7 @@ pub const HBCIndex = struct {
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
     /// unchanged, advances this from even -> odd -> even.
-    published_mutation_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    published_mutation_epoch: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     // Optional refresh state is protected by the index mutation owner. It is
     // deliberately volatile: reopen verifies the durable postings again.
     posting_refresh_next_node: u64 = 1,
@@ -5322,7 +5332,7 @@ pub const HBCIndex = struct {
     // Odd epochs are never clean. This atomic certificate lets operational
     // status observe bounded maintenance without traversing the tree or
     // racing the mutation owner's scan cursor. Reopen starts uncertified.
-    posting_refresh_clean_epoch: std.atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    posting_refresh_clean_epoch: @import("antfly_platform").atomic.Value(u64) = .init(std.math.maxInt(u64)),
     posting_refresh_scan_changed: bool = false,
     /// Publication commits may include durable I/O. Readers of an odd
     /// generation retain the active flight and sleep on its runtime event
@@ -5332,7 +5342,7 @@ pub const HBCIndex = struct {
     published_spare_flight: ?*PublishedSearchStateFlight = null,
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
-    complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+    complete_coverage_generation: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(std.math.maxInt(u64)),
     /// Short state lock for the generation validation flight. Long waits use
     /// CompleteCoverageFlight.ready on the backend runtime's std.Io; they never
     /// spin on an OS-thread mutex or retain a search transaction/workspace.
@@ -5390,13 +5400,13 @@ pub const HBCIndex = struct {
     // rerank batch can therefore admit vectors read from one primary snapshot
     // with a single cache lock without repopulating an entry invalidated by a
     // concurrent update.
-    vector_cache_epoch: std.atomic.Value(u64),
+    vector_cache_epoch: @import("antfly_platform").atomic.Value(u64),
     // A striped seqlock fences cache fills against uncommitted vector writes
     // without retaining one version record per vector. A dirty stripe is odd;
     // commit/abort publication returns it to even. Existing keys in the same
     // stripe remain usable because only miss admission consults this fence.
-    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** vector_cache_fill_stripe_count,
-    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]std.atomic.Value(u64) = .{std.atomic.Value(u64).init(0)} ** vector_cache_fill_dirty_word_count,
+    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]@import("antfly_platform").atomic.Value(u64) = @splat(@import("antfly_platform").atomic.Value(u64).init(0)),
+    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]@import("antfly_platform").atomic.Value(u64) = @splat(@import("antfly_platform").atomic.Value(u64).init(0)),
     hbc_cache_bytes_accounted: u64 = 0,
     detached_hbc_accounting: HbcPhysicalAccounting = .{},
     search_workspace_bytes_accounted: u64 = 0,
@@ -5409,7 +5419,7 @@ pub const HBCIndex = struct {
     deferred_node_key_value_bytes: u64 = 0,
     deferred_oversized_leaves_peak: u64 = 0,
     bulk_split_vector_workspace: SplitVectorWorkspace = .{},
-    hbc_cache_kind_stats: [hbc_cache_kind_count]HbcCacheKindStats = .{HbcCacheKindStats{}} ** hbc_cache_kind_count,
+    hbc_cache_kind_stats: [hbc_cache_kind_count]HbcCacheKindStats = @splat(HbcCacheKindStats{}),
     deferred_quantized_nodes: std.AutoHashMapUnmanaged(u64, void),
     deferred_node_keys: std.AutoHashMapUnmanaged(u128, DeferredNodeValue),
     deferred_oversized_leaves: std.AutoHashMapUnmanaged(u64, void),
@@ -5687,7 +5697,7 @@ pub const HBCIndex = struct {
             self.replacements_since_rebuild = 0;
         }
 
-        fn deinit(self: *SplitVectorWorkspace, alloc: Allocator) void {
+        pub fn deinit(self: *SplitVectorWorkspace, alloc: Allocator) void {
             self.map.deinit(alloc);
             self.vectors.deinit(alloc);
             self.ids.deinit(alloc);
@@ -5730,7 +5740,7 @@ pub const HBCIndex = struct {
             }
         }
 
-        fn deinit(self: *PostingCommitWorkspace, alloc: Allocator) void {
+        pub fn deinit(self: *PostingCommitWorkspace, alloc: Allocator) void {
             self.reset(alloc);
             self.touched_keys.deinit(alloc);
             self.records.deinit(alloc);
@@ -5813,7 +5823,7 @@ pub const HBCIndex = struct {
             if (self.competitive.len < capacity) self.competitive = try alloc.realloc(self.competitive, capacity);
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.estimate.deinit(alloc);
             alloc.free(self.child_ids);
             alloc.free(self.distances);
@@ -5858,7 +5868,7 @@ pub const HBCIndex = struct {
     }
 
     const NativeStoreShell = struct {
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn beginRead(_: Allocator, _: *anyopaque) anyerror!vectorindex_store.NamespaceReadTxn {
             return error.HbcNativeGenerationRequired;
         }
@@ -5906,35 +5916,35 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmWriteStats(self: *const HBCIndex) ?LsmWriteStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotWriteStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *const HBCIndex) ?LsmMaintenanceStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotOpenStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
         switch (self.env_owner) {
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
-            .lmdb, .native => {},
+            .native => {},
         }
     }
 
     pub fn pinNativeCheckpoint(self: *HBCIndex) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.env_owner) {
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-            .lmdb, .native => error.Unsupported,
+            .native => error.Unsupported,
         };
     }
 
@@ -5948,7 +5958,7 @@ pub const HBCIndex = struct {
         wal_committed_bytes: u64,
 
         sealed_wal_count: u8 = 0,
-        sealed_wals: [vectorindex_posting_wal.Checkpoint.max_sealed_wals]vectorindex_posting_wal.Checkpoint.SealedWal = [_]vectorindex_posting_wal.Checkpoint.SealedWal{.{}} ** vectorindex_posting_wal.Checkpoint.max_sealed_wals,
+        sealed_wals: [vectorindex_posting_wal.Checkpoint.max_sealed_wals]vectorindex_posting_wal.Checkpoint.SealedWal = @as([vectorindex_posting_wal.Checkpoint.max_sealed_wals]vectorindex_posting_wal.Checkpoint.SealedWal, @splat(.{})),
 
         pub fn deinit(self: *NativeBackupGeneration) void {
             self.alloc.free(self.root_dir);
@@ -6003,42 +6013,42 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn lsmMaintenanceScore(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceScore(),
-            .lmdb, .native => 0,
+            .native => 0,
         };
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
-            .lmdb, .native => 0,
+            .native => 0,
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
-            .lmdb, .native => null,
+            .native => null,
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *HBCIndex) void {
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
-            .lmdb, .native => {},
+            .native => {},
         }
     }
 
     pub fn runLsmMaintenanceStep(self: *HBCIndex) !bool {
         return switch (self.env_owner) {
             .lsm => |handle| try handle.backend.runMaintenanceStep(),
-            .lmdb, .native => false,
+            .native => false,
         };
     }
 
@@ -6057,7 +6067,7 @@ pub const HBCIndex = struct {
                 }
                 break :blk try handle.backend.runMaintenanceStepBestEffort();
             },
-            .lmdb, .native => false,
+            .native => false,
         };
     }
 
@@ -6091,7 +6101,6 @@ pub const HBCIndex = struct {
     fn writeSessionFinishNeedsExplicitDurableSync(self: *const HBCIndex) bool {
         if (self.nativeHbcAuthoritative()) return false;
         return switch (self.env_owner) {
-            .lmdb => self.config.no_sync or self.config.no_meta_sync,
             .lsm => |handle| handle.backend.options.backend.durability != .full,
             .native => false,
         };
@@ -6103,7 +6112,7 @@ pub const HBCIndex = struct {
         }
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| return err,
-            .lmdb, .native => {},
+            .native => {},
         };
         const opening_outermost = self.write_session_depth == 0;
         if (opening_outermost) {
@@ -6129,7 +6138,7 @@ pub const HBCIndex = struct {
                 self.write_session_kind = null;
                 switch (self.env_owner) {
                     .lsm => |handle| handle.backend.abortBulkIngestSession(),
-                    .lmdb, .native => {},
+                    .native => {},
                 }
                 return err;
             };
@@ -6253,7 +6262,7 @@ pub const HBCIndex = struct {
                 }
                 return err;
             },
-            .lmdb, .native => {},
+            .native => {},
         };
         if (finishing_outermost and expected_kind == .streaming_replay) self.endStreamingSplitVectorWorkspace();
         self.write_session_depth -= 1;
@@ -6297,7 +6306,7 @@ pub const HBCIndex = struct {
         if (self.write_session_depth == 0 or self.write_session_kind != expected_kind) return;
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.abortBulkIngestSession(),
-            .lmdb, .native => {},
+            .native => {},
         };
         self.write_session_depth -= 1;
         if (self.write_session_depth == 0) {
@@ -6376,7 +6385,7 @@ pub const HBCIndex = struct {
                 },
                 .mutation => {
                     if (record.payload.len < 6 or
-                        record.payload[5] != @intFromEnum(vectorindex_posting_wal.RecordKind.index_metadata)) continue;
+                        record.payload[5] != @backingInt(vectorindex_posting_wal.RecordKind.index_metadata)) continue;
                     const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(alloc, record.payload, current_bytes);
                     if (owned) |bytes| alloc.free(bytes);
                     owned = decoded.replacement;
@@ -6420,7 +6429,7 @@ pub const HBCIndex = struct {
                             .leaf_size = config.leaf_size,
                             .use_quantization = config.use_quantization,
                             .quantizer_seed = config.quantizer_seed,
-                            .metric = @as(u8, @intCast(@intFromEnum(config.metric))),
+                            .metric = @as(u8, @intCast(@backingInt(config.metric))),
                         };
 
                         var meta_buf: [IndexMetadata.encoded_size]u8 = undefined;
@@ -6455,9 +6464,9 @@ pub const HBCIndex = struct {
         if (metadata.dims != config.dims) return error.DimensionMismatch;
 
         const stored_metric: vec.DistanceMetric = switch (metadata.metric) {
-            @intCast(@intFromEnum(vec.DistanceMetric.l2_squared)) => .l2_squared,
-            @intCast(@intFromEnum(vec.DistanceMetric.inner_product)) => .inner_product,
-            @intCast(@intFromEnum(vec.DistanceMetric.cosine)) => .cosine,
+            @intCast(@backingInt(vec.DistanceMetric.l2_squared)) => .l2_squared,
+            @intCast(@backingInt(vec.DistanceMetric.inner_product)) => .inner_product,
+            @intCast(@backingInt(vec.DistanceMetric.cosine)) => .cosine,
             else => return error.Corrupted,
         };
         if (stored_metric != config.metric) return error.DistanceMetricMismatch;
@@ -6600,7 +6609,7 @@ pub const HBCIndex = struct {
             .deferred_node_key_value_bytes = 0,
             .deferred_oversized_leaves_peak = 0,
             .bulk_split_vector_workspace = .{},
-            .hbc_cache_kind_stats = .{HbcCacheKindStats{}} ** hbc_cache_kind_count,
+            .hbc_cache_kind_stats = @splat(HbcCacheKindStats{}),
             .deferred_quantized_nodes = .empty,
             .deferred_node_keys = .empty,
             .deferred_oversized_leaves = .empty,
@@ -6898,7 +6907,10 @@ pub const HBCIndex = struct {
     }
 
     fn runtimeIo(self: *const HBCIndex) std.Io {
-        return self.runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.runtime_io orelse if (comptime builtin.os.tag == .freestanding)
+            .failing
+        else
+            std.Io.Threaded.global_single_threaded.io();
     }
 
     fn releaseCompleteCoverageFlightRef(self: *HBCIndex, flight: *CompleteCoverageFlight) void {
@@ -8079,15 +8091,15 @@ pub const HBCIndex = struct {
     }
 
     fn refreshHbcCacheKindBytes(self: *HBCIndex) u64 {
-        var bytes: [hbc_cache_kind_count]u64 = .{0} ** hbc_cache_kind_count;
+        var bytes: [hbc_cache_kind_count]u64 = @splat(0);
         var node_it = self.node_cache.iterator();
-        while (node_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.node)] +|= estimateNodeCacheBytes(&entry.value_ptr.*.node);
+        while (node_it.next()) |entry| bytes[@backingInt(HbcCacheKind.node)] +|= estimateNodeCacheBytes(&entry.value_ptr.*.node);
         var quantized_it = self.quantized_cache.iterator();
-        while (quantized_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.quantized)] +|= estimateQuantizedCacheBytes(&entry.value_ptr.*.quantized);
+        while (quantized_it.next()) |entry| bytes[@backingInt(HbcCacheKind.quantized)] +|= estimateQuantizedCacheBytes(&entry.value_ptr.*.quantized);
         var vector_it = self.vector_cache.iterator();
-        while (vector_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.vector)] +|= estimateVectorCacheBytes(entry.value_ptr.*.vector);
+        while (vector_it.next()) |entry| bytes[@backingInt(HbcCacheKind.vector)] +|= estimateVectorCacheBytes(entry.value_ptr.*.vector);
         var metadata_it = self.metadata_cache.iterator();
-        while (metadata_it.next()) |entry| bytes[@intFromEnum(HbcCacheKind.metadata)] +|= estimateMetadataCacheBytes(entry.value_ptr.*.metadata);
+        while (metadata_it.next()) |entry| bytes[@backingInt(HbcCacheKind.metadata)] +|= estimateMetadataCacheBytes(entry.value_ptr.*.metadata);
 
         var total: u64 = 0;
         for (bytes, 0..) |used_bytes, i| {
@@ -8108,24 +8120,24 @@ pub const HBCIndex = struct {
     }
 
     fn noteHbcCacheInsertion(self: *HBCIndex, kind: HbcCacheKind) void {
-        self.hbc_cache_kind_stats[@intFromEnum(kind)].insertions += 1;
+        self.hbc_cache_kind_stats[@backingInt(kind)].insertions += 1;
     }
 
     fn noteHbcCacheLookup(self: *HBCIndex, kind: HbcCacheKind, hit: bool) void {
-        const counters = &self.hbc_cache_kind_stats[@intFromEnum(kind)];
+        const counters = &self.hbc_cache_kind_stats[@backingInt(kind)];
         if (hit) {
-            _ = @atomicRmw(u64, &counters.hits, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &counters.hits, 1, .monotonic);
         } else {
-            _ = @atomicRmw(u64, &counters.misses, .Add, 1, .monotonic);
+            _ = platform.atomic.fetchAdd(u64, &counters.misses, 1, .monotonic);
         }
     }
 
     fn noteHbcCacheAdmissionSkip(self: *HBCIndex, kind: HbcCacheKind) void {
-        self.hbc_cache_kind_stats[@intFromEnum(kind)].admission_skips += 1;
+        self.hbc_cache_kind_stats[@backingInt(kind)].admission_skips += 1;
     }
 
     fn noteHbcCacheEviction(self: *HBCIndex, kind: HbcCacheKind) void {
-        self.hbc_cache_kind_stats[@intFromEnum(kind)].evictions += 1;
+        self.hbc_cache_kind_stats[@backingInt(kind)].evictions += 1;
     }
 
     pub fn hbcCacheStats(self: *HBCIndex) HbcCacheStats {
@@ -8137,10 +8149,10 @@ pub const HBCIndex = struct {
             .total_bytes = total_bytes,
             .accounted_bytes = self.hbc_cache_bytes_accounted +| self.detached_hbc_accounting.current(),
             .pinned_bytes = self.detached_hbc_accounting.pinned_bytes.load(.monotonic),
-            .node = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.node)],
-            .quantized = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.quantized)],
-            .vector = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.vector)],
-            .metadata = self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.metadata)],
+            .node = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.node)],
+            .quantized = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.quantized)],
+            .vector = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.vector)],
+            .metadata = self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.metadata)],
         };
     }
 
@@ -8579,14 +8591,14 @@ pub const HBCIndex = struct {
         while (current) |item| : (current = item.parent) {
             var values = item.values.keyIterator();
             while (values.next()) |key| {
-                if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                if (@as(u8, @truncate(key.*)) == @backingInt(vectorindex_posting_wal.RecordKind.base)) {
                     try ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
                 }
             }
             if (item.root) |root| {
                 var materialized = root.materialized.keyIterator();
                 while (materialized.next()) |key| {
-                    if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                    if (@as(u8, @truncate(key.*)) == @backingInt(vectorindex_posting_wal.RecordKind.base)) {
                         try ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
                     }
                 }
@@ -8651,13 +8663,13 @@ pub const HBCIndex = struct {
         var count: usize = 0;
         var count_it = generation.values.keyIterator();
         while (count_it.next()) |key| {
-            count += @intFromBool(@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base));
+            count += @intFromBool(@as(u8, @truncate(key.*)) == @backingInt(vectorindex_posting_wal.RecordKind.base));
         }
         const ids = try self.alloc.alloc(u64, count);
         var index: usize = 0;
         var it = generation.values.keyIterator();
         while (it.next()) |key| {
-            if (@as(u8, @truncate(key.*)) != @intFromEnum(vectorindex_posting_wal.RecordKind.base)) continue;
+            if (@as(u8, @truncate(key.*)) != @backingInt(vectorindex_posting_wal.RecordKind.base)) continue;
             ids[index] = experimentalPostingValueKeyId(key.*);
             index += 1;
         }
@@ -8763,7 +8775,7 @@ pub const HBCIndex = struct {
         const maybe_encoded = root.segments[0].getValue(0, .centroid_directory) catch return null;
         const encoded = maybe_encoded orelse return null;
         const reader = vectorindex_centroid_directory.Reader.init(encoded) catch return null;
-        if (reader.dims != self.config.dims or reader.metric != @intFromEnum(self.config.metric)) return null;
+        if (reader.dims != self.config.dims or reader.metric != @backingInt(self.config.metric)) return null;
 
         const shadowed_ids = try self.experimentalPostingBaseOverrideIdsAlloc(generation);
         var shadowed_ids_owned = true;
@@ -8779,14 +8791,14 @@ pub const HBCIndex = struct {
             while (current) |item| : (current = item.parent) {
                 var values = item.values.keyIterator();
                 while (values.next()) |key| {
-                    if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                    if (@as(u8, @truncate(key.*)) == @backingInt(vectorindex_posting_wal.RecordKind.base)) {
                         try live_base_ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
                     }
                 }
                 if (item.root) |root_item| {
                     var materialized = root_item.materialized.keyIterator();
                     while (materialized.next()) |key| {
-                        if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                        if (@as(u8, @truncate(key.*)) == @backingInt(vectorindex_posting_wal.RecordKind.base)) {
                             try live_base_ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
                         }
                     }
@@ -8807,7 +8819,7 @@ pub const HBCIndex = struct {
                 if (try root.segments[segment_index].getValue(0, .centroid_directory)) |delta_encoded| {
                     const delta_reader = vectorindex_centroid_directory.Reader.init(delta_encoded) catch null;
                     if (delta_reader) |delta| {
-                        if (delta.dims == self.config.dims and delta.metric == @intFromEnum(self.config.metric)) {
+                        if (delta.dims == self.config.dims and delta.metric == @backingInt(self.config.metric)) {
                             valid_delta_directory = true;
                             var blocks = delta.blocks();
                             while (try blocks.next()) |block| {
@@ -9488,7 +9500,6 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
-            .lmdb => return error.UnsupportedStorageBackend,
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
@@ -9502,7 +9513,6 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
-            .lmdb => return error.UnsupportedStorageBackend,
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
@@ -9641,17 +9651,23 @@ pub const HBCIndex = struct {
             else
                 null,
         };
-        build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch fallback: {
-            // Embedded/single-threaded callers may provide an I/O runtime
-            // without a concurrent lane. Keep ownership in std.Io by creating
-            // one bounded task runtime instead of an unmanaged OS thread.
-            build.owned_io = std.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
-            build.io = build.owned_io.?.io();
-            break :fallback build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch |fallback_err| {
-                build.deinit();
-                return fallback_err;
+        if (comptime builtin.os.tag == .freestanding) {
+            // The browser has one execution thread; captured immutable inputs
+            // keep the same publication protocol with synchronous preparation.
+            ExperimentalPostingCheckpointBuild.run(build);
+        } else {
+            build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch fallback: {
+                // Embedded/single-threaded callers may provide an I/O runtime
+                // without a concurrent lane. Keep ownership in std.Io by creating
+                // one bounded task runtime instead of an unmanaged OS thread.
+                build.owned_io = std.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
+                build.io = build.owned_io.?.io();
+                break :fallback build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch |fallback_err| {
+                    build.deinit();
+                    return fallback_err;
+                };
             };
-        };
+        }
         self.experimental_posting_checkpoint_build = build;
         build.lock_deferrals_at_start = self.posting_publication_lock_deferrals.load(.monotonic);
         std.log.info("dense posting checkpoint build started generation={} sequence={} wal_prefix_bytes={} kind={s} chain_deltas={} obsolete_scan_bytes={}", .{
@@ -11137,9 +11153,9 @@ pub const HBCIndex = struct {
         try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
 
         const metric: vec.DistanceMetric = switch (metadata.metric) {
-            @intFromEnum(vec.DistanceMetric.l2_squared) => .l2_squared,
-            @intFromEnum(vec.DistanceMetric.inner_product) => .inner_product,
-            @intFromEnum(vec.DistanceMetric.cosine) => .cosine,
+            @backingInt(vec.DistanceMetric.l2_squared) => .l2_squared,
+            @backingInt(vec.DistanceMetric.inner_product) => .inner_product,
+            @backingInt(vec.DistanceMetric.cosine) => .cosine,
             else => return error.DistanceMetricMismatch,
         };
         var centroid_directory = try vectorindex_centroid_directory.Writer.init(
@@ -11395,9 +11411,9 @@ pub const HBCIndex = struct {
         try writer.appendValueAt(sink, 0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
 
         const metric: vec.DistanceMetric = switch (metadata.metric) {
-            @intFromEnum(vec.DistanceMetric.l2_squared) => .l2_squared,
-            @intFromEnum(vec.DistanceMetric.inner_product) => .inner_product,
-            @intFromEnum(vec.DistanceMetric.cosine) => .cosine,
+            @backingInt(vec.DistanceMetric.l2_squared) => .l2_squared,
+            @backingInt(vec.DistanceMetric.inner_product) => .inner_product,
+            @backingInt(vec.DistanceMetric.cosine) => .cosine,
             else => return error.DistanceMetricMismatch,
         };
         var centroid_directory = try vectorindex_centroid_directory.Writer.init(
@@ -12105,9 +12121,9 @@ pub const HBCIndex = struct {
         const centroid_scratch = try alloc.alloc(f32, if (metadata) |value| value.dims else 0);
         defer alloc.free(centroid_scratch);
         const centroid_metric: ?vec.DistanceMetric = if (metadata) |value| switch (value.metric) {
-            @intFromEnum(vec.DistanceMetric.l2_squared) => .l2_squared,
-            @intFromEnum(vec.DistanceMetric.inner_product) => .inner_product,
-            @intFromEnum(vec.DistanceMetric.cosine) => .cosine,
+            @backingInt(vec.DistanceMetric.l2_squared) => .l2_squared,
+            @backingInt(vec.DistanceMetric.inner_product) => .inner_product,
+            @backingInt(vec.DistanceMetric.cosine) => .cosine,
             else => return error.DistanceMetricMismatch,
         } else null;
         var it = latest.iterator();
@@ -12920,13 +12936,13 @@ pub const HBCIndex = struct {
         if (key.len != 12) return null;
         if (key[0] != 'n' or key[1] != ':' or key[10] != ':') return null;
         const suffix: Suffix = switch (key[11]) {
-            @intFromEnum(Suffix.header) => .header,
-            @intFromEnum(Suffix.centroid) => .centroid,
-            @intFromEnum(Suffix.children) => .children,
-            @intFromEnum(Suffix.members) => .members,
-            @intFromEnum(Suffix.packed_node) => .packed_node,
-            @intFromEnum(Suffix.range) => .range,
-            @intFromEnum(Suffix.posting) => .posting,
+            @backingInt(Suffix.header) => .header,
+            @backingInt(Suffix.centroid) => .centroid,
+            @backingInt(Suffix.children) => .children,
+            @backingInt(Suffix.members) => .members,
+            @backingInt(Suffix.packed_node) => .packed_node,
+            @backingInt(Suffix.range) => .range,
+            @backingInt(Suffix.posting) => .posting,
             else => return null,
         };
         return .{
@@ -12937,19 +12953,19 @@ pub const HBCIndex = struct {
 
     fn stagedNodeKeyId(key: []const u8) ?u128 {
         const decoded = decodeNodeKey(key) orelse return null;
-        return (@as(u128, decoded.id) << 8) | @as(u128, @intFromEnum(decoded.suffix));
+        return (@as(u128, decoded.id) << 8) | @as(u128, @backingInt(decoded.suffix));
     }
 
     fn stagedNodeKeyParts(staged_key: u128) struct { id: u64, suffix: Suffix } {
         const suffix_byte: u8 = @intCast(staged_key & 0xff);
         const suffix: Suffix = switch (suffix_byte) {
-            @intFromEnum(Suffix.header) => .header,
-            @intFromEnum(Suffix.centroid) => .centroid,
-            @intFromEnum(Suffix.children) => .children,
-            @intFromEnum(Suffix.members) => .members,
-            @intFromEnum(Suffix.packed_node) => .packed_node,
-            @intFromEnum(Suffix.range) => .range,
-            @intFromEnum(Suffix.posting) => .posting,
+            @backingInt(Suffix.header) => .header,
+            @backingInt(Suffix.centroid) => .centroid,
+            @backingInt(Suffix.children) => .children,
+            @backingInt(Suffix.members) => .members,
+            @backingInt(Suffix.packed_node) => .packed_node,
+            @backingInt(Suffix.range) => .range,
+            @backingInt(Suffix.posting) => .posting,
             else => unreachable,
         };
         return .{
@@ -13455,7 +13471,7 @@ pub const HBCIndex = struct {
             report(ptr, "get", namespace, key);
             return error.HbcNativeUnownedKey;
         }
-        fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, _: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: Namespace, keys: []const []const u8, _: []?[]const u8) anyerror!void {
             report(ptr, "get_many_sorted", namespace, if (keys.len > 0) keys[0] else &.{});
             return error.HbcNativeUnownedKey;
         }
@@ -13750,7 +13766,7 @@ pub const HBCIndex = struct {
     fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
         return switch (self.env_owner) {
             .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
-            .lmdb, .native => hbcRuntimeBatchMode(in_bulk_session, null),
+            .native => hbcRuntimeBatchMode(in_bulk_session, null),
         };
     }
 
@@ -14511,7 +14527,7 @@ pub const HBCIndex = struct {
         }
         _ = try self.cacheVectorLocalLocked(vector_id, vector_data);
         self.noteHbcCacheInsertion(.vector);
-        if (replaced) self.hbc_cache_kind_stats[@intFromEnum(HbcCacheKind.vector)].replacements += 1;
+        if (replaced) self.hbc_cache_kind_stats[@backingInt(HbcCacheKind.vector)].replacements += 1;
         admission.commit();
         self.refreshAndEnforceHbcCacheUsage(.one(.vector, vector_id));
         return vector_data;
@@ -17405,7 +17421,7 @@ pub const HBCIndex = struct {
         // nativeLeafScanView; fall back to canonical reconstruction here.
         if (view.subgroup_plan != null) return null;
         const dims: usize = @intCast(self.config.dims);
-        if (view.metric != @intFromEnum(self.config.metric) or
+        if (view.metric != @backingInt(self.config.metric) or
             view.centroid.len != dims or
             view.count != expected_count or
             view.width != rabitq.codeWidth(dims))
@@ -17460,7 +17476,7 @@ pub const HBCIndex = struct {
 
     fn nativeLeafScanView(self: *HBCIndex, view: vectorindex_quantized_directory.View) !vectorindex_hbc_runtime.NativeLeafScanView {
         const dims: usize = @intCast(self.config.dims);
-        if (view.metric != @intFromEnum(self.config.metric) or
+        if (view.metric != @backingInt(self.config.metric) or
             view.centroid.len != dims or
             view.member_ids.len != view.count or
             view.width != rabitq.codeWidth(dims))
@@ -17562,7 +17578,7 @@ pub const HBCIndex = struct {
             return self;
         }
 
-        fn deinit(self: *@This(), index: *HBCIndex) void {
+        pub fn deinit(self: *@This(), index: *HBCIndex) void {
             index.releaseApplyWorkspaceBytes(self.accounted_bytes);
             self.map.deinit(index.alloc);
             self.* = undefined;
@@ -18206,6 +18222,40 @@ pub const HBCIndex = struct {
         if (!self.nativeHbcAuthoritative() or self.publicationMutationActive()) return null;
         const generation = self.acquireExperimentalPostingReadGeneration() orelse return null;
         return .{ .generation = generation, .source_sequence = generation.covered_source_sequence.load(.acquire) };
+    }
+
+    /// The immutable posting generation is the query and restart authority.
+    /// Mutable HBC metadata may already describe the next source capture,
+    /// before its posting WAL transaction has committed.
+    pub const NativeServingSnapshot = struct {
+        active_count: u64,
+        node_count: u64,
+        root_node: u64,
+        source_sequence: u64,
+        publish_generation: u64,
+    };
+
+    pub fn nativeServingSnapshot(self: *HBCIndex) ?NativeServingSnapshot {
+        if (!self.nativeHbcAuthoritative()) return null;
+        const generation = self.acquireExperimentalPostingReadGeneration() orelse return null;
+        defer generation.release();
+        return .{
+            .active_count = generation.search_view.active_count,
+            .node_count = generation.search_view.node_count,
+            .root_node = generation.search_view.root_node,
+            .source_sequence = generation.covered_source_sequence.load(.acquire),
+            .publish_generation = generation.search_view.publish_generation,
+        };
+    }
+
+    /// Checkpoint sidecars must describe the same generation queries serve.
+    /// A missing native reader cannot be replaced with mutable HBC metadata.
+    pub fn servingActiveCountForCheckpoint(self: *HBCIndex) ?u64 {
+        if (self.experimentalPostingWalAuthoritative()) {
+            const snapshot = self.nativeServingSnapshot() orelse return null;
+            return snapshot.active_count;
+        }
+        return self.stats().active_count;
     }
 
     /// Caller-owned, synchronous query scope. Catalog lifetime and primary
@@ -19181,7 +19231,7 @@ pub const HBCIndex = struct {
         vector_base_generation: u64,
         vector_wal_mutation_sequence: u64,
     ) !bool {
-        return self.metadata.topology_rebuild_algorithm == @intFromEnum(algorithm) and
+        return self.metadata.topology_rebuild_algorithm == @backingInt(algorithm) and
             self.metadata.topology_vector_base_generation == vector_base_generation and
             self.metadata.topology_vector_wal_mutation_sequence == vector_wal_mutation_sequence;
     }
@@ -19312,7 +19362,7 @@ pub const HBCIndex = struct {
         for (old_nodes) |node| try self.deleteNode(&batch, node.id);
         self.metadata.root_node = built.node_id;
         self.metadata.active_count = active_count_u64;
-        self.metadata.topology_rebuild_algorithm = @intFromEnum(algorithm);
+        self.metadata.topology_rebuild_algorithm = @backingInt(algorithm);
         self.metadata.topology_vector_base_generation = vector_base_generation;
         self.metadata.topology_vector_wal_mutation_sequence = vector_wal_mutation_sequence;
         try self.flushMetadataNow(&batch);
@@ -21354,7 +21404,7 @@ test "hbc shared cache rejects node quantized and metadata fills from an older p
     var cache = Cache.init(alloc);
     defer cache.deinit();
     const namespace = hbcCacheNamespace("/tmp/hbc-publication-fill-guard");
-    var epoch = std.atomic.Value(u64).init(0);
+    var epoch = @import("antfly_platform").atomic.Value(u64).init(0);
 
     var current_centroid = [_]f32{ 9, 9 };
     const current_node = Node{
@@ -21417,7 +21467,7 @@ test "hbc shared cache rejects node quantized and metadata fills from an older p
 test "hbc shared cache evicts across namespaces under one resource budget" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -21441,7 +21491,7 @@ test "hbc shared cache evicts across namespaces under one resource budget" {
 test "hbc shared cache keeps CLOCK slots compact across churn" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 3 * vector_bytes,
         .hard_limit_bytes = 3 * vector_bytes,
     };
@@ -21493,7 +21543,7 @@ test "hbc shared cache bounds one CLOCK victim search" {
 test "hbc shared cache CLOCK refreshes recency on borrowed vector hits" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 2 * vector_bytes,
         .hard_limit_bytes = 2 * vector_bytes,
     };
@@ -21547,7 +21597,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
             ready: *std.atomic.Value(u32),
             start: *std.atomic.Value(bool),
             stop: *std.atomic.Value(bool),
-            borrows: *std.atomic.Value(u64),
+            borrows: *@import("antfly_platform").atomic.Value(u64),
             failed: *std.atomic.Value(bool),
         ) void {
             const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
@@ -21578,7 +21628,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
     var stop = std.atomic.Value(bool).init(false);
-    var borrows = std.atomic.Value(u64).init(0);
+    var borrows = @import("antfly_platform").atomic.Value(u64).init(0);
     var failed = std.atomic.Value(bool).init(false);
     var readers: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
@@ -21828,7 +21878,7 @@ test "hbc resource reclaimer never waits for an active cache owner" {
 test "hbc concurrent vector admission samples at a full steady target" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -21859,7 +21909,7 @@ test "hbc decoded residency lease reserves a complete query and bypasses mid-que
     const second = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
     const vector_bytes = estimateVectorCacheBytes(&first);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 2,
         .hard_limit_bytes = vector_bytes * 2,
     };
@@ -21914,7 +21964,7 @@ test "hbc sequential cold-start leases fill eagerly and sample replacement at ca
     const fill_count = 4;
     const target_bytes = vector_bytes * fill_count;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = target_bytes,
         .hard_limit_bytes = target_bytes,
     };
@@ -21970,7 +22020,7 @@ test "hbc overlapping cold-start leases activate the admission doorkeeper" {
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const vector_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 16,
         .hard_limit_bytes = vector_bytes * 16,
     };
@@ -22019,7 +22069,7 @@ test "hbc concurrent cold-start lease acquisition remains bounded" {
     const worker_count = 8;
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 32,
         .hard_limit_bytes = vector_bytes * 32,
     };
@@ -22083,7 +22133,7 @@ test "hbc sampled decoded residency evolves a full resident set within its byte 
     const replacement = [_]f32{ 9.0, 10.0, 11.0, 12.0 };
     const vector_bytes = estimateVectorCacheBytes(&first);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 2,
         .hard_limit_bytes = vector_bytes * 2,
     };
@@ -22125,7 +22175,7 @@ test "hbc decoded residency fails closed when pinned entries prevent precharge" 
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const vector_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -22195,7 +22245,7 @@ test "hbc exact-route vector admission samples outside the search epoch" {
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const vector_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -22240,13 +22290,13 @@ test "hbc shared cache reclaims exact vectors before protected routing nodes" {
         .children = children[0..],
         .members = &.{},
     };
-    const vector = [_]f32{1.0} ** 64;
+    const vector = @as([64]f32, @splat(1.0));
     const node_bytes = estimateNodeCacheBytes(&node_one);
     const vector_bytes = estimateVectorCacheBytes(&vector);
     try std.testing.expect(vector_bytes >= node_bytes);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = node_bytes + vector_bytes,
         .hard_limit_bytes = node_bytes + vector_bytes,
     };
@@ -22269,10 +22319,10 @@ test "hbc shared cache reclaims exact vectors before protected routing nodes" {
 }
 
 test "hbc shared cache reclaims an over-quota namespace for a borrowing peer" {
-    const vector = [_]f32{1.0} ** 64;
+    const vector = @as([64]f32, @splat(1.0));
     const entry_bytes = estimateVectorCacheBytes(&vector);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = entry_bytes * 4,
         .hard_limit_bytes = entry_bytes * 4,
     };
@@ -22920,7 +22970,7 @@ test "hbc shared cache writer progresses under continuous striped reads" {
             ready: *std.atomic.Value(u32),
             start: *std.atomic.Value(bool),
             stop: *std.atomic.Value(bool),
-            reads: *std.atomic.Value(u64),
+            reads: *@import("antfly_platform").atomic.Value(u64),
         ) void {
             _ = ready.fetchAdd(1, .release);
             while (!start.load(.acquire)) std.atomic.spinLoopHint();
@@ -22944,7 +22994,7 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
     var stop = std.atomic.Value(bool).init(false);
-    var reads = std.atomic.Value(u64).init(0);
+    var reads = @import("antfly_platform").atomic.Value(u64).init(0);
     var writer_acquired = std.atomic.Value(bool).init(false);
     var readers: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
@@ -23343,7 +23393,8 @@ test "hbc index close does not clear shared namespace bytes" {
     defer cache.deinit();
 
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
-    defer idx.close();
+    var idx_open = true;
+    defer if (idx_open) idx.close();
     idx.attachSharedCache(&cache);
     idx.setRetainedVectorCacheEnabled(true);
 
@@ -23351,9 +23402,13 @@ test "hbc index close does not clear shared namespace bytes" {
     const namespace = idx.cache_namespace;
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
 
-    var second = try HBCIndex.open(alloc, path, .{ .dims = 4, .max_cached_vectors = 8 });
-    second.attachSharedCache(&cache);
-    second.close();
+    // LSM permits one writer for a root. Register a second cache owner
+    // directly to exercise shared namespace lifetime without opening a
+    // second writer for the same path.
+    try std.testing.expect(cache.registerNamespacePath(namespace, std.mem.span(path)));
+    defer cache.unregisterNamespacePath(namespace, std.mem.span(path));
+    idx.close();
+    idx_open = false;
 
     try std.testing.expect(cache.namespaceStats(namespace).total_bytes > 0);
     try std.testing.expect(cache.namespaceStats(namespace).vector.used_bytes > 0);
@@ -23377,18 +23432,14 @@ test "hbc shared cache releases unused namespace path registrations" {
     const namespace = first.cache_namespace;
     try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
 
-    var second = try HBCIndex.open(alloc, path, .{ .dims = 4 });
-    var second_open = true;
-    defer if (second_open) second.close();
-    second.attachSharedCache(&cache);
+    try std.testing.expect(cache.registerNamespacePath(namespace, std.mem.span(path)));
     try std.testing.expectEqual(@as(usize, 2), cache.namespace_paths.get(namespace).?.active_owners);
 
     first.close();
     first_open = false;
     try std.testing.expectEqual(@as(usize, 1), cache.namespace_paths.get(namespace).?.active_owners);
 
-    second.close();
-    second_open = false;
+    cache.unregisterNamespacePath(namespace, std.mem.span(path));
     try std.testing.expect(!cache.namespace_paths.contains(namespace));
     try std.testing.expect(!cache.namespace_stats.contains(namespace));
 }
@@ -23424,7 +23475,7 @@ test "hbc cache reports byte usage to resource manager" {
     defer tp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 256,
     };
@@ -23438,14 +23489,14 @@ test "hbc cache reports byte usage to resource manager" {
     _ = try idx.cacheVector(1, &.{ 1.0, 2.0, 3.0, 4.0 });
     _ = try idx.cacheMetadata(1, "doc:1");
     var stats = resource_manager.snapshot();
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes > 0);
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].soft_limit_events > 0);
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes > 0);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].soft_limit_events > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections);
 
     idx.invalidateVectorCache(1);
     idx.invalidateMetadataCache(1);
     stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
 }
 
 test "hbc retains a bounded pool of concurrent search scratch" {
@@ -23555,7 +23606,7 @@ test "missing optional projections preserve immutable scan admission and shadow 
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    const centroid = [_]f32{0} ** 64;
+    const centroid = @as([64]f32, @splat(0));
     const members = [_]u64{ 1, 2 };
     var packed_node: [vectorindex_hbc.packedNodeValueSize(@sizeOf(@TypeOf(centroid)), @sizeOf(@TypeOf(members)))]u8 = undefined;
     const base = try vectorindex_hbc.encodePackedNodeValue(
@@ -23574,7 +23625,7 @@ test "missing optional projections preserve immutable scan admission and shadow 
         .quantized_dot_products = @constCast(&[_]f32{ 0, 0 }),
         .centroid_dot_products = @constCast(&[_]f32{}),
     };
-    var writer = try vectorindex_quantized_directory.Writer.init(alloc, 64, @intFromEnum(vec.DistanceMetric.l2_squared));
+    var writer = try vectorindex_quantized_directory.Writer.init(alloc, 64, @backingInt(vec.DistanceMetric.l2_squared));
     defer writer.deinit();
     try writer.appendWithMemberBytes(11, &quantized, std.mem.sliceAsBytes(&members));
     const directory_bytes = try writer.build();
@@ -23664,7 +23715,7 @@ test "native flat admission sums authenticated selected leaf costs" {
     var directory_writer = try vectorindex_quantized_directory.Writer.init(
         alloc,
         2,
-        @intFromEnum(vec.DistanceMetric.l2_squared),
+        @backingInt(vec.DistanceMetric.l2_squared),
     );
     defer directory_writer.deinit();
     try directory_writer.appendWithMemberBytes(11, &small, std.mem.sliceAsBytes(&[_]u64{ 1, 2 }));
@@ -23981,7 +24032,7 @@ test "hbc admission follows and pins the current immutable generation" {
     idx.installExperimentalPostingReadGeneration(expensive_generation);
 
     var expensive_lease = try idx.acquireSearchAdmission(100, 51, .{
-        .query = &([_]f32{0} ** 64),
+        .query = &(@as([64]f32, @splat(0))),
         .k = 1,
     });
     defer idx.releaseSearchAdmission(&expensive_lease);
@@ -24004,7 +24055,7 @@ test "hbc admission follows and pins the current immutable generation" {
     // current generation in an admission retry loop.
     _ = idx.published_generation.fetchAdd(2, .acq_rel);
     var broad_epoch_lease = try idx.acquireSearchAdmission(100, 51, .{
-        .query = &([_]f32{0} ** 64),
+        .query = &(@as([64]f32, @splat(0))),
         .k = 1,
     });
     try std.testing.expect(broad_epoch_lease.generation == expensive_generation);
@@ -24028,7 +24079,7 @@ test "hbc admission follows and pins the current immutable generation" {
     // New requests immediately use the compact generation's lower bound; no
     // process-lifetime high-water survives an obsolete bootstrap generation.
     var compact_lease = try idx.acquireSearchAdmission(100, 51, .{
-        .query = &([_]f32{0} ** 64),
+        .query = &(@as([64]f32, @splat(0))),
         .k = 1,
     });
     defer idx.releaseSearchAdmission(&compact_lease);
@@ -24040,7 +24091,7 @@ test "hbc admission follows and pins the current immutable generation" {
     // and the topology returned to search.
     idx.releaseSearchAdmission(&compact_lease);
     compact_lease = try idx.acquireSearchAdmission(1, 1, .{
-        .query = &([_]f32{0} ** 64),
+        .query = &(@as([64]f32, @splat(0))),
         .k = 1,
     });
     try std.testing.expectEqual(@as(u64, 128), compact_lease.bandwidth.bytes);
@@ -24114,7 +24165,7 @@ test "hbc queued admission rebinds topology and reservation to the current gener
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             self.lease = self.index.acquireSearchAdmission(100, 51, .{
-                .query = &([_]f32{0} ** 64),
+                .query = &(@as([64]f32, @splat(0))),
                 .k = 1,
             }) catch {
                 self.failed.store(true, .release);
@@ -24263,7 +24314,7 @@ test "hbc opportunistic vector cache skips instead of overcommitting resource bu
     defer tp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 2,
     };
@@ -24279,8 +24330,8 @@ test "hbc opportunistic vector cache skips instead of overcommitting resource bu
     try std.testing.expectEqual(@intFromPtr(input[0..].ptr), @intFromPtr(returned.ptr));
 
     const stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
-    try std.testing.expect(stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections > 0);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].used_bytes);
+    try std.testing.expect(stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)].hard_limit_rejections > 0);
     try std.testing.expectEqual(@as(u64, 1), idx.hbcCacheStats().vector.admission_skips);
 }
 
@@ -24421,7 +24472,7 @@ test "cold flat centroid build preadmits transient and retained memory" {
         @max(idx.config.leaf_size, idx.config.branching_factor),
     );
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .hard_limit_bytes = projection.retained_bytes - 1,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -24504,7 +24555,7 @@ test "flat centroid reservation handoff does not double count retained bytes" {
 
     const directory_bytes: u64 = @sizeOf(vectorindex_spfresh_index.FlatCentroidDirectory);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .hard_limit_bytes = directory_bytes,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -24564,7 +24615,7 @@ test "exhaustive search workspace is admitted before growth and released after r
     idx.releaseSearchScratch(&scratch_handle);
     const baseline_bytes = idx.search_workspace_bytes_accounted;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = baseline_bytes + 1,
         .hard_limit_bytes = baseline_bytes + 1,
     };
@@ -24682,7 +24733,7 @@ test "flat block scoring workspace is included in exhaustive pre-admission" {
     try std.testing.expect(complete_flat > frontier_only);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = frontier_only,
         .hard_limit_bytes = frontier_only,
     };
@@ -24762,7 +24813,7 @@ test "resource pressure reclaims retained flat search scratch" {
     try std.testing.expect(retained_before > baseline_bytes);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .hard_limit_bytes = baseline_bytes,
     };
     var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -24822,12 +24873,12 @@ test "hbc cache shrinks to resource budget under pressure" {
 
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_action = .shrink_cache,
         .hard_action = .shrink_cache,
     };
@@ -24977,7 +25028,7 @@ test "posting WAL recovery reconstructs patch bases without pinning the serving 
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    const original = [_]u8{7} ** 4096;
+    const original = @as([4096]u8, @splat(7));
     var middle = original;
     middle[2048] = 9;
     var final = middle;
@@ -25021,7 +25072,7 @@ test "posting capture value leases release reconstructed patches at transaction 
     defer tp.cleanup();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
     defer idx.close();
-    const original = [_]u8{7} ** 4096;
+    const original = @as([4096]u8, @splat(7));
     var replacement = original;
     replacement[2048] = 9;
     const base = try buildTestExperimentalPostingSegment(alloc, 41, .base, 1, &original);
@@ -25057,7 +25108,7 @@ test "posting patch cache eviction retains request values and physical accountin
     const alloc = allocator_state.allocator();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
-    const original = [_]u8{7} ** 4096;
+    const original = @as([4096]u8, @splat(7));
     var replacement = original;
     replacement[2048] = 9;
     const base = try buildTestExperimentalPostingSegment(alloc, 41, .base, 1, &original);
@@ -25252,7 +25303,7 @@ test "quantized patches resolve their logical base from a native full checkpoint
         const replacement_bytes = try replacement.encode(alloc);
         defer alloc.free(replacement_bytes);
 
-        var directory_writer = try vectorindex_quantized_directory.Writer.init(alloc, 2, @intCast(@intFromEnum(original.metric)));
+        var directory_writer = try vectorindex_quantized_directory.Writer.init(alloc, 2, @intCast(@backingInt(original.metric)));
         defer directory_writer.deinit();
         try directory_writer.append(id, &original);
         const directory_bytes = try directory_writer.build();
@@ -25417,7 +25468,7 @@ test "immutable posting delta embeds exact centroid replacements" {
         .dims = 2,
         .branching_factor = 2,
         .leaf_size = 8,
-        .metric = @intFromEnum(vec.DistanceMetric.cosine),
+        .metric = @backingInt(vec.DistanceMetric.cosine),
     };
     const built = try HBCIndex.buildExperimentalPostingDeltaFromGeneration(alloc, overlay, metadata, 2, null, null);
     defer alloc.free(built.segment_bytes);
@@ -28466,7 +28517,7 @@ test "searchWithRequest tolerates concurrent readers with runtime caches enabled
     };
 
     var failed = std.atomic.Value(u8).init(0);
-    var workers = [_]Worker{.{ .idx = &idx, .failed = &failed }} ** 8;
+    var workers = @as([8]Worker, @splat(.{ .idx = &idx, .failed = &failed }));
     var threads: [workers.len]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
@@ -29247,42 +29298,6 @@ test "streaming replay finish establishes durability for relaxed backend" {
     var read = try reopened.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(.meta, bulk_publish_state_key));
-}
-
-test "streaming replay finish establishes explicit durability for lmdb no_sync" {
-    if (!supports_lmdb) return error.SkipZigTest;
-    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
-    defer allocator_state.deinit();
-    const alloc = allocator_state.allocator();
-    var path: TestPath = .{};
-    const tmp_path = path.init();
-    defer path.cleanup();
-    const config: HBCConfig = .{
-        .dims = 2,
-        .storage_backend = .lmdb,
-        .no_sync = true,
-        .no_meta_sync = true,
-    };
-    var idx = try HBCIndex.open(alloc, tmp_path, config);
-    try idx.beginStreamingReplaySession();
-    try idx.batchInsertWithMetadataOptions(&.{
-        .{ .vector_id = 1, .vector = &[_]f32{ 1, 0 }, .metadata = "doc:1" },
-    }, .{
-        .assume_absent_ids = true,
-        .bulk_ingest = true,
-    });
-    // The logical LMDB commit runs with no_sync, so the streaming finish must
-    // perform the explicit forced sync before a caller can publish its applied
-    // sequence.
-    try idx.finishStreamingReplaySessionWithOptions(.{});
-    idx.close();
-
-    var reopened = try HBCIndex.open(alloc, tmp_path, config);
-    defer reopened.close();
-    try std.testing.expectEqual(@as(u64, 1), reopened.stats().active_count);
-    const metadata = (try reopened.getMetadata(1)) orelse return error.TestUnexpectedResult;
-    defer alloc.free(metadata);
-    try std.testing.expectEqualStrings("doc:1", metadata);
 }
 
 test "interrupted bulk publication remains quarantined" {
@@ -34101,8 +34116,8 @@ test "bulk split workspace reuses transformed external vectors and reports apply
     }
 
     const ids = [_]u64{ 1, 2, 3 };
-    var matrix: [6]f32 = .{0} ** 6;
-    var matrix_again: [6]f32 = .{0} ** 6;
+    var matrix: [6]f32 = @splat(0);
+    var matrix_again: [6]f32 = @splat(0);
 
     const baseline_apply_bytes = resource_manager.sliceStats(.dense_apply_working_set).used_bytes;
     idx.beginBulkSplitVectorWorkspace();
@@ -34290,7 +34305,7 @@ test "streaming split vector workspace leaves dense apply budget headroom" {
     defer idx.close();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] = .{
         .soft_limit_bytes = 768,
         .hard_limit_bytes = 1024,
     };
@@ -35401,7 +35416,7 @@ test "prepared posting refresh releases denied scratch and deletes empty payload
     try idx.insert(1, &.{ 1, 0 });
     try idx.markNodePostingDirtyForTest(idx.metadata.root_node);
     var options: resource_manager_mod.Options = .{};
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)].hard_limit_bytes = 65536;
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)].hard_limit_bytes = 65536;
     var manager = resource_manager_mod.ResourceManager.init(options);
     defer manager.deinit(alloc);
     idx.resource_manager = &manager;

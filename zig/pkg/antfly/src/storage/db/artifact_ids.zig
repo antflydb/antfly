@@ -38,6 +38,16 @@ pub const EmbeddingArtifactIdentity = struct {
     unit_id: ?[]u8 = null,
     chunk_id: ?u32 = null,
 
+    pub const DocumentKeys = struct { doc_key: []u8, parent_doc_key: ?[]u8 };
+
+    /// Move independently owned document keys; remaining metadata stays with self.
+    pub fn takeDocumentKeys(self: *EmbeddingArtifactIdentity) DocumentKeys {
+        const keys: DocumentKeys = .{ .doc_key = self.doc_key, .parent_doc_key = self.parent_doc_key };
+        self.doc_key = &.{};
+        self.parent_doc_key = null;
+        return keys;
+    }
+
     pub fn deinit(self: *EmbeddingArtifactIdentity, alloc: Allocator) void {
         alloc.free(self.embedding_name);
         alloc.free(self.doc_key);
@@ -80,20 +90,14 @@ pub fn resolvePublicArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !Pu
 pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !?EmbeddingArtifactIdentity {
     if (internal_keys.isDerivedEmbeddingArtifactKey(key)) {
         const base_key = (try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, key)) orelse return null;
-        errdefer alloc.free(base_key);
+        // Establish one owner immediately, including partially initialized state.
+        var identity = EmbeddingArtifactIdentity{ .embedding_name = &.{}, .doc_key = base_key };
+        errdefer identity.deinit(alloc);
         if (base_key.len >= key.len or key[base_key.len] != internal_keys.derived_embedding_kind) return error.InvalidInternalUserKey;
         const embedding_name_component = (try decodeInternalKeyComponentAlloc(alloc, key, base_key.len + 1)) orelse return error.InvalidInternalUserKey;
-        errdefer alloc.free(embedding_name_component.value);
+        identity.embedding_name = embedding_name_component.value;
         if (embedding_name_component.next != key.len) return error.InvalidInternalUserKey;
-        const parent_doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, base_key)) orelse return error.InvalidInternalUserKey;
-        errdefer alloc.free(parent_doc_key);
-
-        var identity = EmbeddingArtifactIdentity{
-            .embedding_name = embedding_name_component.value,
-            .doc_key = base_key,
-            .parent_doc_key = parent_doc_key,
-        };
-        errdefer identity.deinit(alloc);
+        identity.parent_doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, base_key)) orelse return error.InvalidInternalUserKey;
 
         if (try decodeChunkArtifactSourceAlloc(alloc, base_key)) |source| {
             identity.source_artifact_name = source.name;
@@ -110,7 +114,7 @@ pub fn decodeEmbeddingArtifactIdentityAlloc(alloc: Allocator, key: []const u8) !
 
     var identity = EmbeddingArtifactIdentity{
         .embedding_name = try alloc.dupe(u8, artifact_ref.name),
-        .doc_key = undefined,
+        .doc_key = &.{},
     };
     errdefer identity.deinit(alloc);
 
@@ -140,7 +144,7 @@ const DecodedChunkArtifactSource = struct {
     chunk_id: ?u32 = null,
     unit_id: ?[]u8 = null,
 
-    fn deinit(self: *DecodedChunkArtifactSource, alloc: Allocator) void {
+    pub fn deinit(self: *DecodedChunkArtifactSource, alloc: Allocator) void {
         alloc.free(self.name);
         if (self.unit_id) |unit_id| alloc.free(unit_id);
         self.* = undefined;
@@ -312,10 +316,15 @@ pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?
     const document_raw = parts.next() orelse return error.InvalidArgument;
     const name_raw = parts.next() orelse return error.InvalidArgument;
 
-    var artifact_ref = types.ArtifactRef{
-        .document_id = try decodeBase64UrlComponentAlloc(alloc, document_raw),
-        .name = try decodeBase64UrlComponentAlloc(alloc, name_raw),
-        .kind = try decodeArtifactKind(kind_raw),
+    var artifact_ref: types.ArtifactRef = blk: {
+        const kind = try decodeArtifactKind(kind_raw);
+        const document_id = try decodeBase64UrlComponentAlloc(alloc, document_raw);
+        errdefer alloc.free(document_id);
+        break :blk .{
+            .document_id = document_id,
+            .name = try decodeBase64UrlComponentAlloc(alloc, name_raw),
+            .kind = kind,
+        };
     };
     errdefer artifact_ref.deinit(alloc);
 
@@ -680,4 +689,42 @@ test "decode embedding artifact identity for document unit chunk embedding" {
     try std.testing.expectEqualStrings("doc:a", identity.parent_doc_key.?);
     try std.testing.expectEqualStrings("document_chunks_v1", identity.source_artifact_name.?);
     try std.testing.expectEqual(@as(u32, 3), identity.chunk_id.?);
+}
+
+fn embeddingIdentityFailureSweep(alloc: Allocator, key: []const u8, transfer: bool) !void {
+    var identity = (try decodeEmbeddingArtifactIdentityAlloc(alloc, key)).?;
+    defer identity.deinit(alloc);
+    if (transfer) {
+        const doc_ptr = identity.doc_key.ptr;
+        const parent = identity.parent_doc_key;
+        const keys = identity.takeDocumentKeys();
+        defer alloc.free(keys.doc_key);
+        defer if (keys.parent_doc_key) |value| alloc.free(value);
+        try std.testing.expectEqual(doc_ptr, keys.doc_key.ptr);
+        if (parent) |value| try std.testing.expectEqual(value.ptr, keys.parent_doc_key.?.ptr);
+        try std.testing.expectEqual(@as(usize, 0), identity.doc_key.len);
+        try std.testing.expect(identity.parent_doc_key == null);
+    }
+}
+
+test "embedding artifact identity cleanup and transfer survive every allocation failure" {
+    const alloc = std.testing.allocator;
+    const doc = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc\x00id", "dense\x00name");
+    defer alloc.free(doc);
+    const chunk = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc\x00id", "chunks", 3);
+    defer alloc.free(chunk);
+    const unit_chunk = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc\x00id", "chunks", "page\x00id", 3);
+    defer alloc.free(unit_chunk);
+    const derived_chunk = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "dense");
+    defer alloc.free(derived_chunk);
+    const derived_unit = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, unit_chunk, "dense");
+    defer alloc.free(derived_unit);
+    const stored_doc = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "caption");
+    defer alloc.free(stored_doc);
+    const derived_doc = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, stored_doc, "dense");
+    defer alloc.free(derived_doc);
+    for ([_][]const u8{ doc, derived_chunk, derived_unit, derived_doc }) |key| {
+        for ([_]bool{ false, true }) |transfer|
+            try std.testing.checkAllAllocationFailures(alloc, embeddingIdentityFailureSweep, .{ key, transfer });
+    }
 }

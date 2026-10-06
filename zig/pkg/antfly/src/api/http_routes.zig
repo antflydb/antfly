@@ -14,6 +14,14 @@
 
 const std = @import("std");
 
+pub const sql_max_request_body_bytes: usize = 4 << 20;
+
+/// Transport admission shared by native and linked-kernel registrars. Resolve
+/// before buffering so a SQL request cannot consume the much larger batch cap.
+pub fn publicPostBodyLimit(path: []const u8) ?usize {
+    return if (std.mem.eql(u8, path, "/db/v1/sql") or std.mem.startsWith(u8, path, "/db/v1/sql/prepared")) sql_max_request_body_bytes else null;
+}
+
 pub const Routes = struct {
     pub const healthz = "/healthz";
     pub const readyz = "/readyz";
@@ -32,6 +40,8 @@ pub const Routes = struct {
     pub const global_query = "/query";
     pub const agents_query_builder = "/agents/query-builder";
     pub const agents_retrieval = "/agents/retrieval";
+    pub const agents_research = "/agents/research";
+    pub const agents_research_jobs = "/agents/research/jobs";
     pub const mcp_v1 = "/mcp/v1";
     pub const mcp_v1_prefix = "/mcp/v1/";
     pub const mcp_v1_extensions = "/mcp/v1/extensions";
@@ -88,6 +98,12 @@ pub const Routes = struct {
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const backup_shard_suffix = "/backup-shard";
+    pub const restore_owner_suffix = "/restore-owner";
+    pub const restore_parent_activation_suffix = "/restore-parent-activation";
+    pub const fk_generation_parent_suffix = "/fk-generation-parent";
+    pub const fk_generation_source_suffix = "/fk-generation-source";
+    pub const fk_initial_child_suffix = "/fk-initial-child";
+    pub const row_policy_install_suffix = "/row-policy-install";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";
@@ -108,7 +124,9 @@ pub const Routes = struct {
     pub const txn_prepare_suffix = "/txn-prepare";
     pub const txn_resolve_suffix = "/txn-resolve";
     pub const txn_status_suffix = "/txn-status";
+    pub const online_merge_io_suffix = "/online-merge-io";
     pub const txn_acknowledge_suffix = "/txn-acknowledge";
+    pub const txn_acknowledge_many_suffix = "/txn-acknowledge-many";
     pub const corrupt_embedding_artifact_suffix = "/corrupt-embedding-artifact";
     pub const group_db_median_key_suffix = "/db/median-key";
     pub const group_db_index_activation_suffix = "/db/index-activation";
@@ -492,6 +510,29 @@ pub const Routes = struct {
         return .{ .table_name = table_name };
     }
 
+    pub fn matchRelationalRowsQuery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/query");
+    }
+
+    pub fn matchRelationalRowsMutation(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/rows/mutate");
+    }
+
+    pub fn matchRelationalConstraintStatus(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/status");
+    }
+
+    pub fn matchRelationalConstraintRecovery(path: []const u8) ?TableScan {
+        return matchRelationalRowsPath(path, "/constraints/repair") orelse matchRelationalRowsPath(path, "/constraints/retry") orelse matchRelationalRowsPath(path, "/constraints/retire");
+    }
+
+    fn matchRelationalRowsPath(path: []const u8, suffix: []const u8) ?TableScan {
+        if (!std.mem.startsWith(u8, path, tables_prefix) or !std.mem.endsWith(u8, path, suffix)) return null;
+        const name = path[tables_prefix.len .. path.len - suffix.len];
+        if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        return .{ .table_name = name };
+    }
+
     pub fn matchTableQuery(path: []const u8) ?TableQuery {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, query_suffix)) return null;
@@ -653,6 +694,13 @@ pub const Routes = struct {
             .table_name = table_name,
             .index_name = index_name,
         };
+    }
+
+    pub fn matchTableIndexMaintenance(path: []const u8) ?TableIndex {
+        const suffix: []const u8 = if (std.mem.endsWith(u8, path, "/retry")) "/retry" else if (std.mem.endsWith(u8, path, "/repair")) "/repair" else return null;
+        const index = matchTableIndex(path[0 .. path.len - suffix.len]) orelse return null;
+        if (std.mem.indexOfScalar(u8, index.table_name, '/') != null) return null;
+        return index;
     }
 
     pub fn matchTableGraphMetricAction(path: []const u8) ?TableGraphMetricAction {

@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const raft_engine = @import("raft_engine");
 const platform_time = @import("antfly_platform").time;
 const wal_mod = @import("../../storage/wal_runtime.zig");
@@ -26,17 +26,17 @@ const storage_iface = raft_engine.runtime.storage_iface;
 const magic: u32 = 0x41524654; // ARFT
 const legacy_inline_snapshot_version: u32 = 2;
 const legacy_external_snapshot_version: u32 = 3;
-// Version 4 checkpoints persist the Raft log compaction boundary separately
-// from the transferable state snapshot metadata.
-const version: u32 = 4;
+// Version 5 also persists state-machine completion separately from snapshot
+// persistence. Older checkpoints have no completion proof.
+const version: u32 = 5;
 const delta_magic: u32 = 0x4152444c; // ARDL
 // Delta versions 1 and 2 embed snapshot payloads. Version 1 predates the
 // optional ready-level ConfState tail; version 3 externalizes payloads.
 const legacy_inline_delta_version: u32 = 2;
 const delta_version: u32 = 3;
 const applied_watermark_magic: u32 = 0x4152574d; // ARWM
-const applied_watermark_version: u32 = 2;
-const applied_watermark_payload_len = 20;
+const applied_watermark_version: u32 = 3;
+const applied_watermark_payload_len = 28;
 const max_conf_state_nodes: usize = 1024;
 const min_encoded_entry_len = 8 + 8 + 1 + 4;
 
@@ -51,6 +51,7 @@ pub const WalReplicaStateConfig = struct {
 
 pub const WalReplicaStateStats = struct {
     persist_ready_calls: u64 = 0,
+    commit_only_ready_calls: u64 = 0,
     applied_index_updates: u64 = 0,
     conf_state_updates: u64 = 0,
     ready_persist_calls: u64 = 0,
@@ -108,6 +109,14 @@ pub const WalReplicaState = struct {
     store: raft_engine.core.MemoryStorage,
     applied_index: raft_engine.core.types.Index = 0,
     durable_applied_index: raft_engine.core.types.Index = 0,
+    completed_applied_index: raft_engine.core.types.Index = 0,
+    durable_completed_applied_index: raft_engine.core.types.Index = 0,
+    durable_hard_state: raft_engine.core.types.HardState = .{},
+    durable_last_index: raft_engine.core.types.Index = 0,
+    append_in_progress: bool = false,
+    async_enabled: bool = false,
+    cleanup_snapshot: ?SnapshotIdentity = null,
+    asynchronous_failure: ?anyerror = null,
     last_compacted_index: raft_engine.core.types.Index = 0,
     delta_records_since_checkpoint: usize = 0,
     delta_bytes_since_checkpoint: usize = 0,
@@ -128,7 +137,7 @@ pub const WalReplicaState = struct {
         var wal_dir_owned = true;
         errdefer if (wal_dir_owned) alloc.free(wal_dir);
         try fs_paths.createDirPathPortable(io_impl.io(), wal_dir);
-        const wal_dir_z = try alloc.dupeZ(u8, wal_dir);
+        const wal_dir_z = try alloc.dupeSentinel(u8, wal_dir, 0);
         var wal_dir_z_owned = true;
         errdefer if (wal_dir_z_owned) alloc.free(wal_dir_z);
         const applied_watermark_path = try std.fmt.allocPrint(alloc, "{s}/applied-watermark.bin", .{layout.log_dir});
@@ -211,11 +220,15 @@ pub const WalReplicaState = struct {
                 .compact_snapshot = compactSnapshot,
                 .compact_snapshot_artifact = compactSnapshotArtifact,
                 .persist_ready_diagnostics = persistReadyWithDiagnostics,
+                .begin_ready = beginReady,
+                .begin_maintenance = beginMaintenance,
+                .begin_compact_snapshot = beginCompactSnapshot,
             },
         };
     }
 
     pub fn setConfState(self: *WalReplicaState, conf_state: raft_engine.core.ConfState) !void {
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
         try self.store.setConfState(conf_state);
         self.stats.conf_state_updates += 1;
         try self.persistConfStateDelta();
@@ -243,6 +256,11 @@ pub const WalReplicaState = struct {
         return self.applied_index;
     }
 
+    /// Snapshot persistence is deliberately not state-machine completion.
+    pub fn completedAppliedIndex(self: *const WalReplicaState) u64 {
+        return self.completed_applied_index;
+    }
+
     pub fn statsSnapshot(self: *const WalReplicaState) WalReplicaStateStats {
         var stats = self.stats;
         stats.replay_debt_records = self.delta_records_since_checkpoint;
@@ -252,6 +270,8 @@ pub const WalReplicaState = struct {
     }
 
     pub fn flushForShutdown(self: *WalReplicaState) !void {
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
+        if (self.asynchronous_failure) |err| return err;
         if (self.delta_records_since_checkpoint > 0 or self.delta_bytes_since_checkpoint > 0) {
             try self.persistCheckpoint();
             self.delta_records_since_checkpoint = 0;
@@ -262,11 +282,18 @@ pub const WalReplicaState = struct {
     }
 
     pub fn setAppliedIndex(self: *WalReplicaState, index: raft_engine.core.types.Index) !void {
-        if (index <= self.applied_index) return;
-        self.applied_index = index;
+        if (index <= self.completed_applied_index) return;
+        const previous_completed = self.completed_applied_index;
+        errdefer self.completed_applied_index = previous_completed;
+        self.completed_applied_index = index;
+        self.applied_index = @max(self.applied_index, index);
         self.stats.applied_index_updates += 1;
-        if (self.shouldPersistAppliedWatermark(index)) try self.persistAppliedWatermark();
-        try self.persistCheckpointIfNeeded();
+        // The next host pass admits deferred maintenance even when no new
+        // Ready exists. Application never competes with the WAL worker.
+        if (!self.async_enabled) {
+            if (self.shouldPersistAppliedWatermark(index)) try self.persistAppliedWatermark();
+            if (!self.append_in_progress) try self.persistCheckpointIfNeeded();
+        }
     }
 
     fn persistReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready) !void {
@@ -284,9 +311,227 @@ pub const WalReplicaState = struct {
         try self.persistReadyInternal(group_id, ready, diagnostics);
     }
 
+    const AppendTask = struct {
+        owner: *WalReplicaState,
+        encoded: []u8,
+        has_conf_state: bool = false,
+        checkpoint: bool = false,
+        snapshot: ?raft_engine.core.types.Snapshot = null,
+        compact_index: ?u64 = null,
+        artifact: ?storage_iface.SnapshotArtifact = null,
+        borrowed_snapshot: bool = false,
+        cleanup: ?SnapshotIdentity = null,
+        watermark: bool = false,
+        applied: u64 = 0,
+        completed_applied: u64 = 0,
+        future: ?std.Io.Future(void) = null,
+        done: std.atomic.Value(bool) = .init(false),
+        failure: ?anyerror = null,
+        elapsed_ns: u64 = 0,
+        snapshot_ns: u64 = 0,
+        append_ns: u64 = 0,
+        truncate_ns: u64 = 0,
+        watermark_ns: u64 = 0,
+        published: bool = false,
+        wake: ?storage_iface.PersistenceWake,
+
+        fn run(task: *@This()) void {
+            defer if (task.wake) |wake| wake.notify(wake.ptr);
+            const started = nowNs();
+            task.persist() catch |err| {
+                task.failure = err;
+            };
+            task.elapsed_ns = elapsedSince(started);
+            task.done.store(true, .release);
+        }
+
+        fn persist(task: *@This()) !void {
+            const owner = task.owner;
+            if (task.snapshot) |snapshot| {
+                const started = nowNs();
+                defer task.snapshot_ns = elapsedSince(started);
+                if (task.artifact) |artifact| {
+                    try snapshot_payload_store.writeArtifactAtomically(owner.alloc, owner.io_impl.io(), owner.layout.snapshot_dir, snapshot.metadata.index, snapshot.metadata.term, artifact);
+                } else try owner.publishSnapshotPayload(snapshot);
+            }
+            if (task.encoded.len != 0) {
+                const lsn = blk: {
+                    const started = nowNs();
+                    defer task.append_ns = elapsedSince(started);
+                    break :blk try owner.wal.append(task.encoded);
+                };
+                // A checkpoint supersedes only the prefix captured before its
+                // worker started. No other WAL writer runs until completion.
+                if (task.checkpoint and lsn > 1) {
+                    const started = nowNs();
+                    defer task.truncate_ns = elapsedSince(started);
+                    try owner.wal.truncate(lsn - 1);
+                }
+            }
+            if (task.watermark) {
+                const started = nowNs();
+                defer task.watermark_ns = elapsedSince(started);
+                try owner.writeAppliedWatermark(task.applied, task.completed_applied);
+            }
+            if (task.cleanup) |previous| {
+                snapshot_payload_store.delete(owner.alloc, owner.io_impl.io(), owner.layout.snapshot_dir, previous.index, previous.term);
+            }
+        }
+
+        fn isComplete(ptr: *anyopaque) bool {
+            const task: *@This() = @ptrCast(@alignCast(ptr));
+            return task.done.load(.acquire);
+        }
+
+        fn complete(ptr: *anyopaque) !void {
+            const task: *@This() = @ptrCast(@alignCast(ptr));
+            if (!task.done.load(.acquire)) return error.PersistenceNotComplete;
+            if (task.failure) |err| return err;
+            if (task.published) return;
+            const owner = task.owner;
+            const previous_snapshot = snapshotIdentity(owner.store.snapshot_state.metadata);
+            if (task.checkpoint) {
+                if (task.compact_index) |index| {
+                    try owner.store.compactToSnapshot(metadataOnlySnapshot(task.snapshot.?), index);
+                    owner.last_compacted_index = index;
+                    owner.stats.storage_compactions += 1;
+                }
+                // Do not decode an older applied cursor over application that
+                // completed while this immutable checkpoint was being written.
+                owner.stats.checkpoint_persist_calls += 1;
+                owner.delta_records_since_checkpoint = 0;
+                owner.delta_bytes_since_checkpoint = 0;
+                owner.durable_applied_index = task.applied;
+                owner.durable_completed_applied_index = task.completed_applied;
+            } else if (task.encoded.len != 0) {
+                try owner.decodeDeltaIntoStore(task.encoded);
+                owner.stats.persist_ready_calls += 1;
+                owner.stats.ready_persist_calls += 1;
+                owner.deltaRecordsPersisted(task.encoded.len);
+            }
+            if (task.watermark) {
+                owner.durable_applied_index = @max(owner.durable_applied_index, task.applied);
+                owner.durable_completed_applied_index = @max(owner.durable_completed_applied_index, task.completed_applied);
+                owner.stats.applied_index_persist_calls += 1;
+                owner.stats.applied_watermark_bytes += applied_watermark_payload_len;
+            }
+            if (task.cleanup != null) owner.cleanup_snapshot = null;
+            if (task.snapshot) |snapshot| {
+                const current = snapshotIdentity(snapshot.metadata);
+                if (previous_snapshot.index != 0 and (previous_snapshot.index != current.index or previous_snapshot.term != current.term)) owner.cleanup_snapshot = previous_snapshot;
+            }
+            owner.durable_hard_state = owner.store.hard_state;
+            owner.durable_last_index = try owner.store.storage().lastIndex();
+            owner.stats.encoded_bytes += task.encoded.len;
+            owner.stats.wal_append_ns += task.append_ns;
+            owner.stats.wal_truncate_ns += task.truncate_ns;
+            owner.stats.applied_watermark_persist_ns += task.watermark_ns;
+            if (task.compact_index != null) {
+                owner.stats.storage_compaction_ns += task.snapshot_ns;
+                owner.stats.max_storage_compaction_ns = @max(owner.stats.max_storage_compaction_ns, task.snapshot_ns);
+            }
+            owner.stats.persist_ns += task.elapsed_ns;
+            if (task.elapsed_ns >= 500 * std.time.ns_per_ms) {
+                std.log.warn("raft persistence slow async=true checkpoint={} snapshot={} elapsed_ms={d} snapshot_ms={d} append_ms={d} truncate_ms={d} watermark_ms={d} encoded_bytes={d}", .{ task.checkpoint, task.snapshot != null, task.elapsed_ns / std.time.ns_per_ms, task.snapshot_ns / std.time.ns_per_ms, task.append_ns / std.time.ns_per_ms, task.truncate_ns / std.time.ns_per_ms, task.watermark_ns / std.time.ns_per_ms, task.encoded.len });
+            }
+            if (task.has_conf_state) {
+                owner.stats.conf_state_updates += 1;
+                owner.stats.conf_state_persist_calls += 1;
+            }
+            task.published = true;
+            owner.append_in_progress = false;
+        }
+
+        fn start(task: *@This()) !storage_iface.PendingReadyPersistence {
+            task.future = try task.owner.io_impl.io().concurrent(run, .{task});
+            task.owner.append_in_progress = true;
+            return .{ .ptr = task, .durable_term = task.owner.durable_hard_state.current_term, .durable_vote = task.owner.durable_hard_state.voted_for, .durable_index = task.owner.durable_last_index, .owned_bytes = task.encoded.len +| @sizeOf(AppendTask), .vtable = &.{ .is_complete = isComplete, .complete = complete, .deinit = AppendTask.deinit } };
+        }
+
+        pub fn deinit(ptr: *anyopaque) void {
+            const task: *@This() = @ptrCast(@alignCast(ptr));
+            const owner = task.owner;
+            if (task.future) |*future| future.await(owner.io_impl.io());
+            if (task.future != null) {
+                complete(task) catch |err| {
+                    owner.asynchronous_failure = err;
+                };
+                owner.append_in_progress = false;
+            }
+            if (!task.borrowed_snapshot) if (task.snapshot) |*snapshot| snapshot.deinit(owner.alloc);
+            owner.alloc.free(task.encoded);
+            owner.alloc.destroy(task);
+        }
+    };
+
+    fn beginReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready, wake: ?storage_iface.PersistenceWake) !?storage_iface.PendingReadyPersistence {
+        _ = group_id;
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        self.async_enabled = true;
+        if (self.asynchronous_failure) |err| return err;
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
+        if (ready.snapshot == null and ready.entries.len == 0 and ready.conf_state == null) {
+            const hard_state = ready.hard_state orelse return null;
+            if (hard_state.current_term == self.durable_hard_state.current_term and hard_state.voted_for == self.durable_hard_state.voted_for) return null;
+        }
+        const task = try self.alloc.create(AppendTask);
+        task.* = .{ .owner = self, .encoded = &.{}, .has_conf_state = ready.conf_state != null, .cleanup = self.cleanup_snapshot, .wake = wake };
+        errdefer AppendTask.deinit(task);
+        task.encoded = try self.encodeReadyDelta(ready);
+        if (ready.snapshot) |snapshot| task.snapshot = try snapshot.clone(self.alloc);
+        return try task.start();
+    }
+
+    fn beginMaintenance(ptr: *anyopaque, group_id: u64, admission: *storage_iface.PersistenceAdmission, wake: ?storage_iface.PersistenceWake) !?storage_iface.PendingReadyPersistence {
+        _ = group_id;
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        self.async_enabled = true;
+        if (self.asynchronous_failure) |err| return err;
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
+        const checkpoint = self.checkpointNeeded();
+        const watermark = self.shouldPersistAppliedWatermark(self.completed_applied_index);
+        if (!checkpoint and !watermark and self.cleanup_snapshot == null) return null;
+        const task = try self.alloc.create(AppendTask);
+        task.* = .{ .owner = self, .encoded = &.{}, .checkpoint = checkpoint, .watermark = watermark, .applied = self.applied_index, .completed_applied = self.completed_applied_index, .cleanup = self.cleanup_snapshot, .wake = wake };
+        errdefer AppendTask.deinit(task);
+        if (checkpoint) task.encoded = try self.encodeCurrentState();
+        if (!admission.admits(task.encoded.len +| @sizeOf(AppendTask))) {
+            AppendTask.deinit(task);
+            return null;
+        }
+        return try task.start();
+    }
+
+    fn beginCompactSnapshot(ptr: *anyopaque, group_id: u64, metadata: raft_engine.core.types.SnapshotMetadata, payload: storage_iface.SnapshotMaterialization, compact_index: u64, admission: *storage_iface.PersistenceAdmission, wake: ?storage_iface.PersistenceWake) !?storage_iface.PendingReadyPersistence {
+        _ = group_id;
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        if (!self.async_enabled) return null;
+        if (self.asynchronous_failure) |err| return err;
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
+        if (metadata.index < self.store.snapshot_state.metadata.index) return error.SnapshotOutOfDate;
+        if (compact_index > metadata.index or compact_index < self.store.compactedIndex()) return error.InvalidCompactionBoundary;
+        if (try self.store.storage().term(metadata.index) != metadata.term) return error.SnapshotTermMismatch;
+        const task = try self.alloc.create(AppendTask);
+        task.* = .{ .owner = self, .encoded = &.{}, .checkpoint = true, .borrowed_snapshot = true, .compact_index = compact_index, .snapshot = .{ .metadata = metadata, .data = switch (payload) {
+            .bytes => |bytes| bytes,
+            .artifact => &.{},
+        } }, .artifact = switch (payload) {
+            .artifact => |artifact| artifact,
+            .bytes => null,
+        }, .applied = self.applied_index, .completed_applied = self.completed_applied_index, .cleanup = self.cleanup_snapshot, .wake = wake };
+        errdefer AppendTask.deinit(task);
+        task.encoded = try self.encodeCheckpoint(metadata, compact_index);
+        if (!admission.admits(task.encoded.len +| @sizeOf(AppendTask))) {
+            AppendTask.deinit(task);
+            return null;
+        }
+        return try task.start();
+    }
+
     fn compactSnapshot(ptr: *anyopaque, group_id: u64, snapshot: raft_engine.core.types.Snapshot, compact_index: u64) !void {
         _ = group_id;
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
         const started_ns = nowNs();
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         try self.publishSnapshotPayload(snapshot);
@@ -311,6 +556,7 @@ pub const WalReplicaState = struct {
     ) !void {
         _ = group_id;
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         const started_ns = nowNs();
         try snapshot_payload_store.writeArtifactAtomically(
@@ -340,7 +586,29 @@ pub const WalReplicaState = struct {
         diagnostics: ?*storage_iface.ReadyPersistenceDiagnostics,
     ) !void {
         _ = group_id;
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
         self.stats.persist_ready_calls += 1;
+        // Commit is a quorum observation, not a new local durability promise.
+        // Entries and term/vote must reach the WAL before Raft acknowledges
+        // them; moving commit across those already durable entries needs no
+        // second fsync. A later log record/checkpoint folds in the cursor, and
+        // a durable applied watermark proves the minimum commit on recovery.
+        // Configuration and snapshot changes always retain their own barrier.
+        if (ready.hard_state) |hard_state| {
+            const previous = self.store.hard_state;
+            if (ready.entries.len == 0 and ready.snapshot == null and
+                ready.conf_state == null and
+                hard_state.current_term == self.durable_hard_state.current_term and
+                hard_state.voted_for == self.durable_hard_state.voted_for and
+                hard_state.commit_index >= previous.commit_index and
+                hard_state.commit_index <= self.durable_last_index)
+            {
+                self.store.setHardState(hard_state);
+                self.stats.commit_only_ready_calls += 1;
+                if (diagnostics) |diag| diag.skipped_no_durable_state = true;
+                return;
+            }
+        }
         var previous_snapshot: ?SnapshotIdentity = null;
 
         const storage_apply_started_ns = if (diagnostics != null) nowNs() else 0;
@@ -360,6 +628,8 @@ pub const WalReplicaState = struct {
         if (diagnostics) |diag| diag.storage_apply_elapsed_ns += elapsedSince(storage_apply_started_ns);
 
         try self.persistReadyDelta(ready, diagnostics);
+        self.durable_hard_state = self.store.hard_state;
+        self.durable_last_index = try self.store.storage().lastIndex();
         if (previous_snapshot) |previous| {
             self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(ready.snapshot.?.metadata));
         }
@@ -392,7 +662,17 @@ pub const WalReplicaState = struct {
             try self.decodeWalRecord(entry.data);
         }
         try self.loadAppliedWatermark();
+        // Application completion and an installed snapshot each prove a
+        // committed prefix even if the last commit-only Ready was not logged.
+        // Reject an unbound/corrupt watermark instead of manufacturing log
+        // entries or acknowledging a prefix that is absent from durable WAL.
+        const proven_commit = @max(self.completed_applied_index, self.store.snapshot_state.metadata.index);
+        if (self.applied_index > try self.store.storage().lastIndex()) return error.InvalidReplicaState;
+        self.store.hard_state.commit_index = @max(self.store.hard_state.commit_index, proven_commit);
+        self.durable_hard_state = self.store.hard_state;
+        self.durable_last_index = try self.store.storage().lastIndex();
         self.durable_applied_index = self.applied_index;
+        self.durable_completed_applied_index = self.completed_applied_index;
         try self.refreshLastCompactedIndex();
         if (requires_migration) {
             // Validate the sidecar before retiring any self-contained legacy
@@ -524,6 +804,10 @@ pub const WalReplicaState = struct {
     }
 
     fn encodeCurrentState(self: *WalReplicaState) ![]u8 {
+        return self.encodeCheckpoint(null, null);
+    }
+
+    fn encodeCheckpoint(self: *WalReplicaState, snapshot_override: ?raft_engine.core.types.SnapshotMetadata, compact_override: ?u64) ![]u8 {
         var buffer = std.ArrayListUnmanaged(u8).empty;
         errdefer buffer.deinit(self.alloc);
 
@@ -537,9 +821,13 @@ pub const WalReplicaState = struct {
         if (initial_state.hard_state.voted_for) |voted_for| try appendInt(u64, self.alloc, &buffer, voted_for);
         try appendInt(u64, self.alloc, &buffer, initial_state.hard_state.commit_index);
         try appendInt(u64, self.alloc, &buffer, self.applied_index);
-        try encodeConfState(self.alloc, &buffer, initial_state.conf_state);
+        try appendInt(u64, self.alloc, &buffer, self.completed_applied_index);
+        try encodeConfState(self.alloc, &buffer, if (snapshot_override) |metadata| metadata.conf_state else initial_state.conf_state);
 
-        const snapshot = try self.store.storage().snapshot(self.alloc);
+        const snapshot = if (snapshot_override) |metadata|
+            try (raft_engine.core.types.Snapshot{ .metadata = metadata, .data = &.{} }).clone(self.alloc)
+        else
+            try self.store.storage().snapshot(self.alloc);
         defer {
             var owned = snapshot;
             owned.deinit(self.alloc);
@@ -547,10 +835,10 @@ pub const WalReplicaState = struct {
         const has_snapshot = snapshot.metadata.index != 0 or snapshot.metadata.term != 0 or snapshot.data.len > 0 or snapshot.metadata.conf_state.voters.len > 0;
         try appendBool(self.alloc, &buffer, has_snapshot);
         if (has_snapshot) try encodeSnapshot(self.alloc, &buffer, snapshot);
-        try appendInt(u64, self.alloc, &buffer, self.store.compactedIndex());
-        try appendInt(u64, self.alloc, &buffer, self.store.compactedTerm());
+        try appendInt(u64, self.alloc, &buffer, compact_override orelse self.store.compactedIndex());
+        try appendInt(u64, self.alloc, &buffer, if (compact_override) |index| try self.store.storage().term(index) else self.store.compactedTerm());
 
-        const first_index = try self.store.storage().firstIndex();
+        const first_index = if (compact_override) |index| index + 1 else try self.store.storage().firstIndex();
         const last_index = try self.store.storage().lastIndex();
         const persisted_entries = if (last_index + 1 > first_index)
             try self.store.storage().entries(self.alloc, first_index, last_index + 1, 0)
@@ -624,12 +912,16 @@ pub const WalReplicaState = struct {
         self.delta_bytes_since_checkpoint +|= encoded_len;
     }
 
-    fn persistCheckpointIfNeeded(self: *WalReplicaState) !void {
+    fn checkpointNeeded(self: *const WalReplicaState) bool {
         const records_over_threshold = self.cfg.checkpoint_replay_records_threshold > 0 and
             self.delta_records_since_checkpoint >= self.cfg.checkpoint_replay_records_threshold;
         const bytes_over_threshold = self.cfg.checkpoint_replay_bytes_threshold > 0 and
             self.delta_bytes_since_checkpoint >= self.cfg.checkpoint_replay_bytes_threshold;
-        if (!records_over_threshold and !bytes_over_threshold) return;
+        return records_over_threshold or bytes_over_threshold;
+    }
+
+    fn persistCheckpointIfNeeded(self: *WalReplicaState) !void {
+        if (!self.checkpointNeeded()) return;
         try self.persistCheckpoint();
         self.delta_records_since_checkpoint = 0;
         self.delta_bytes_since_checkpoint = 0;
@@ -637,29 +929,43 @@ pub const WalReplicaState = struct {
 
     fn persistCheckpoint(self: *WalReplicaState) !void {
         try self.persist(.checkpoint);
+        self.durable_hard_state = self.store.hard_state;
+        self.durable_last_index = try self.store.storage().lastIndex();
         self.durable_applied_index = self.applied_index;
+        self.durable_completed_applied_index = self.completed_applied_index;
     }
 
     fn persistAppliedWatermark(self: *WalReplicaState) !void {
         self.stats.applied_index_persist_calls += 1;
         const started_ns = nowNs();
+        try self.writeAppliedWatermark(self.applied_index, self.completed_applied_index);
+        self.durable_applied_index = self.applied_index;
+        self.durable_completed_applied_index = self.completed_applied_index;
+        self.stats.applied_watermark_persist_ns += elapsedSince(started_ns);
+        self.stats.applied_watermark_bytes += applied_watermark_payload_len;
+    }
+
+    fn writeAppliedWatermark(self: *WalReplicaState, applied: u64, completed: u64) !void {
         var payload: [applied_watermark_payload_len]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], applied_watermark_magic, .little);
         std.mem.writeInt(u32, payload[4..8], applied_watermark_version, .little);
-        std.mem.writeInt(u64, payload[8..16], self.applied_index, .little);
-        std.mem.writeInt(u32, payload[16..20], Crc32.hash(payload[0..16]), .little);
+        std.mem.writeInt(u64, payload[8..16], applied, .little);
+        std.mem.writeInt(u64, payload[16..24], completed, .little);
+        std.mem.writeInt(u32, payload[24..28], Crc32.hash(payload[0..24]), .little);
         try writeFileAtomically(self.io_impl.io(), self.applied_watermark_path, &payload);
-        self.durable_applied_index = self.applied_index;
-        self.stats.applied_watermark_persist_ns += elapsedSince(started_ns);
-        self.stats.applied_watermark_bytes += payload.len;
     }
 
     fn shouldPersistAppliedWatermark(self: *const WalReplicaState, index: raft_engine.core.types.Index) bool {
-        if (index <= self.durable_applied_index) return false;
-        if (self.durable_applied_index == 0) return true;
+        if (index <= self.durable_completed_applied_index) return false;
+        if (self.durable_completed_applied_index == 0) return true;
+        // A persisted snapshot may already have advanced the general cursor.
+        // Certify its separate installation at this existing completion-write
+        // boundary; ordinary log progress retains the configured batching.
+        const snapshot_index = self.store.snapshot_state.metadata.index;
+        if (self.durable_completed_applied_index < snapshot_index and index >= snapshot_index) return true;
         const interval = self.cfg.applied_watermark_persist_interval;
         if (interval == 0) return false;
-        return index - self.durable_applied_index >= interval;
+        return index - self.durable_completed_applied_index >= interval;
     }
 
     fn loadAppliedWatermark(self: *WalReplicaState) !void {
@@ -668,21 +974,28 @@ pub const WalReplicaState = struct {
             else => return err,
         };
         defer file.close(self.io_impl.io());
-        if (try file.length(self.io_impl.io()) != applied_watermark_payload_len)
+        const payload_len = try file.length(self.io_impl.io());
+        if (payload_len != applied_watermark_payload_len and payload_len != 20)
             return error.InvalidReplicaState;
 
         var reader = file.reader(self.io_impl.io(), &.{});
         var payload: [applied_watermark_payload_len]u8 = undefined;
-        try reader.interface.readSliceAll(&payload);
+        try reader.interface.readSliceAll(payload[0..@intCast(payload_len)]);
 
         const file_magic = std.mem.readInt(u32, payload[0..4], .little);
         if (file_magic != applied_watermark_magic) return error.InvalidReplicaState;
         const file_version = std.mem.readInt(u32, payload[4..8], .little);
-        if (file_version != applied_watermark_version) return error.UnsupportedReplicaStateVersion;
-        if (std.mem.readInt(u32, payload[16..20], .little) != Crc32.hash(payload[0..16]))
+        if (file_version != 2 and file_version != applied_watermark_version) return error.UnsupportedReplicaStateVersion;
+        if (payload_len != (if (file_version == 2) @as(u64, 20) else applied_watermark_payload_len))
+            return error.InvalidReplicaState;
+        const checksum_offset: usize = @intCast(payload_len - 4);
+        if (std.mem.readInt(u32, payload[checksum_offset..][0..4], .little) != Crc32.hash(payload[0..checksum_offset]))
             return error.InvalidReplicaState;
         const watermark = std.mem.readInt(u64, payload[8..16], .little);
+        const completed = if (file_version >= 3) std.mem.readInt(u64, payload[16..24], .little) else 0;
+        if (completed > watermark) return error.InvalidReplicaState;
         if (watermark > self.applied_index) self.applied_index = watermark;
+        self.completed_applied_index = @max(completed, self.completed_applied_index);
     }
 
     fn refreshLastCompactedIndex(self: *WalReplicaState) !void {
@@ -726,6 +1039,8 @@ pub const WalReplicaState = struct {
             try readInt(u64, bytes, &cursor)
         else
             self.store.hard_state.commit_index;
+        self.completed_applied_index = if (file_version >= 5) try readInt(u64, bytes, &cursor) else 0;
+        if (self.completed_applied_index > self.applied_index) return error.InvalidReplicaState;
 
         var conf_state = try decodeConfState(self.alloc, bytes, &cursor);
         defer conf_state.deinit(self.alloc);
@@ -767,10 +1082,13 @@ pub const WalReplicaState = struct {
 
         try appendInt(u32, self.alloc, &buffer, delta_magic);
         try appendInt(u32, self.alloc, &buffer, delta_version);
-        try buffer.append(self.alloc, @intFromEnum(DeltaRecordKind.ready));
+        try buffer.append(self.alloc, @backingInt(DeltaRecordKind.ready));
 
-        try appendBool(self.alloc, &buffer, ready.hard_state != null);
-        if (ready.hard_state) |hard_state| {
+        // Carry a deferred commit cursor even when this Ready changes only
+        // entries or configuration and RawNode omits its unchanged HardState.
+        try appendBool(self.alloc, &buffer, true);
+        {
+            const hard_state = ready.hard_state orelse self.store.hard_state;
             try appendInt(u64, self.alloc, &buffer, hard_state.current_term);
             try appendBool(self.alloc, &buffer, hard_state.voted_for != null);
             if (hard_state.voted_for) |voted_for| try appendInt(u64, self.alloc, &buffer, voted_for);
@@ -795,7 +1113,7 @@ pub const WalReplicaState = struct {
 
         try appendInt(u32, self.alloc, &buffer, delta_magic);
         try appendInt(u32, self.alloc, &buffer, delta_version);
-        try buffer.append(self.alloc, @intFromEnum(DeltaRecordKind.conf_state));
+        try buffer.append(self.alloc, @backingInt(DeltaRecordKind.conf_state));
 
         var initial_state = try self.store.storage().initialState(self.alloc);
         defer initial_state.deinit(self.alloc);
@@ -814,8 +1132,8 @@ pub const WalReplicaState = struct {
         const kind_tag = if (cursor < bytes.len) bytes[cursor] else return error.InvalidReplicaState;
         cursor += 1;
         const kind: DeltaRecordKind = switch (kind_tag) {
-            @intFromEnum(DeltaRecordKind.ready) => .ready,
-            @intFromEnum(DeltaRecordKind.conf_state) => .conf_state,
+            @backingInt(DeltaRecordKind.ready) => .ready,
+            @backingInt(DeltaRecordKind.conf_state) => .conf_state,
             else => return error.InvalidReplicaState,
         };
 
@@ -1046,7 +1364,7 @@ pub const WalReplicaState = struct {
     fn encodeEntry(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: raft_engine.core.Entry) !void {
         try appendInt(u64, alloc, out, entry.term);
         try appendInt(u64, alloc, out, entry.index);
-        try out.append(alloc, @intFromEnum(entry.entry_type));
+        try out.append(alloc, @backingInt(entry.entry_type));
         try appendBytes(alloc, out, entry.data);
     }
 
@@ -1056,9 +1374,9 @@ pub const WalReplicaState = struct {
         const entry_type_tag = if (cursor.* < bytes.len) bytes[cursor.*] else return error.InvalidReplicaState;
         cursor.* += 1;
         const entry_type: raft_engine.core.types.EntryType = switch (entry_type_tag) {
-            @intFromEnum(raft_engine.core.types.EntryType.normal) => .normal,
-            @intFromEnum(raft_engine.core.types.EntryType.conf_change) => .conf_change,
-            @intFromEnum(raft_engine.core.types.EntryType.conf_change_v2) => .conf_change_v2,
+            @backingInt(raft_engine.core.types.EntryType.normal) => .normal,
+            @backingInt(raft_engine.core.types.EntryType.conf_change) => .conf_change,
+            @backingInt(raft_engine.core.types.EntryType.conf_change_v2) => .conf_change_v2,
             else => return error.InvalidReplicaState,
         };
         const data = try readBytes(alloc, bytes, cursor);
@@ -1126,7 +1444,7 @@ fn encodeLegacyWalReadyDeltaForTest(alloc: std.mem.Allocator, file_version: u32)
 
     try WalReplicaState.appendInt(u32, alloc, &buffer, delta_magic);
     try WalReplicaState.appendInt(u32, alloc, &buffer, file_version);
-    try buffer.append(alloc, @intFromEnum(DeltaRecordKind.ready));
+    try buffer.append(alloc, @backingInt(DeltaRecordKind.ready));
     try WalReplicaState.appendBool(alloc, &buffer, true);
     try WalReplicaState.appendInt(u64, alloc, &buffer, 7);
     try WalReplicaState.appendBool(alloc, &buffer, true);
@@ -1165,7 +1483,7 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
         const wal_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/state-wal", .{layout.log_dir});
         defer std.testing.allocator.free(wal_dir);
         try fs_paths.createDirPathPortable(std.testing.io, wal_dir);
-        const wal_dir_z = try std.testing.allocator.dupeZ(u8, wal_dir);
+        const wal_dir_z = try std.testing.allocator.dupeSentinel(u8, wal_dir, 0);
         defer std.testing.allocator.free(wal_dir_z);
 
         const inline_payload = if (file_version <= legacy_inline_snapshot_version) "checkpoint-snapshot" else "";
@@ -1203,6 +1521,7 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
             var state = try WalReplicaState.init(std.testing.allocator, layout, .{});
             defer state.deinit();
             try std.testing.expectEqual(@as(u64, 6), state.appliedIndex());
+            try std.testing.expectEqual(@as(u64, 0), state.completedAppliedIndex());
             try std.testing.expectEqual(@as(u64, 7), try state.storage().firstIndex());
             try std.testing.expectEqual(@as(u64, 7), try state.storage().lastIndex());
             var snapshot = try state.storage().snapshot(std.testing.allocator);
@@ -1430,6 +1749,80 @@ test "wal replica state persists applied watermark in sidecar and replays only u
     }
 }
 
+test "wal replica completion survives checkpoint and pending snapshot reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completed-wal", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 79, 4);
+    defer layout.deinit(alloc);
+    const cfg = WalReplicaStateConfig{ .checkpoint_replay_records_threshold = 1 };
+    {
+        var state = try WalReplicaState.init(alloc, layout, cfg);
+        defer state.deinit();
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 5 },
+            .snapshot = .{ .metadata = .{ .index = 5, .term = 2 }, .data = @constCast("five") },
+        });
+        try state.setAppliedIndex(5);
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 10 },
+            .snapshot = .{ .metadata = .{ .index = 10, .term = 2 }, .data = @constCast("ten") },
+        });
+        try std.testing.expectEqual(@as(u64, 10), state.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+    }
+    {
+        var state = try WalReplicaState.init(alloc, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 5), state.completedAppliedIndex());
+        const writes = state.statsSnapshot().applied_index_persist_calls;
+        try state.setAppliedIndex(10);
+        try std.testing.expectEqual(writes + 1, state.statsSnapshot().applied_index_persist_calls);
+    }
+    {
+        var state = try WalReplicaState.init(alloc, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 10), state.completedAppliedIndex());
+        try state.persistCheckpoint();
+        // Checkpoint remains authoritative even without the optional batched
+        // watermark file, as after WAL compaction or a stale sidecar.
+        try std.Io.Dir.cwd().deleteFile(std.testing.io, state.applied_watermark_path);
+    }
+    var state = try WalReplicaState.init(alloc, layout, cfg);
+    defer state.deinit();
+    try std.testing.expectEqual(@as(u64, 10), state.completedAppliedIndex());
+}
+
+test "wal replica completion never infers native completion from legacy watermark" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-completed-wal", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 79, 4);
+    defer layout.deinit(alloc);
+    {
+        var state = try WalReplicaState.init(alloc, layout, .{});
+        defer state.deinit();
+        try state.groupStorage().persistReady(79, .{
+            .hard_state = .{ .current_term = 2, .commit_index = 1 },
+            .entries = &.{.{ .term = 2, .index = 1, .data = @constCast("one") }},
+        });
+        var legacy: [20]u8 = undefined;
+        std.mem.writeInt(u32, legacy[0..4], applied_watermark_magic, .little);
+        std.mem.writeInt(u32, legacy[4..8], 2, .little);
+        std.mem.writeInt(u64, legacy[8..16], 1, .little);
+        std.mem.writeInt(u32, legacy[16..20], Crc32.hash(legacy[0..16]), .little);
+        try WalReplicaState.writeFileAtomically(std.testing.io, state.applied_watermark_path, &legacy);
+    }
+    var state = try WalReplicaState.init(alloc, layout, .{});
+    defer state.deinit();
+    try std.testing.expectEqual(@as(u64, 1), state.appliedIndex());
+    try std.testing.expectEqual(@as(u64, 0), state.completedAppliedIndex());
+}
+
 test "wal replica state tracks persist reasons separately" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1584,6 +1977,120 @@ test "wal replica state checkpoints and compacts delta records when replay debt 
         defer raw.deinit();
 
         try std.testing.expect(!raw.hasReady());
+    }
+}
+
+test "wal replica state async append publishes on completion and retirement preserves durable log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-async-append", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 192, 1);
+    defer layout.deinit(std.testing.allocator);
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, .{
+            .wal = .{ .backend = .lsm, .artificial_sync_delay_ns = 25 * std.time.ns_per_ms },
+        });
+        defer state.deinit();
+        const begin = state.groupStorage().vtable.begin_ready.?;
+        const operation = (try begin(&state, 192, .{
+            .hard_state = .{ .current_term = 2, .voted_for = 1 },
+            .entries = &.{.{ .term = 2, .index = 1, .data = @constCast("immutable") }},
+        }, null)).?;
+        try std.testing.expectEqual(@as(u64, 0), try state.storage().lastIndex());
+        try std.testing.expectError(error.ReplicaPersistenceBusy, state.flushForShutdown());
+        // Retirement joins I/O and publishes a completed append to the owner
+        // before its shutdown checkpoint can supersede the WAL tail.
+        operation.deinit();
+        try std.testing.expectEqual(@as(u64, 1), try state.storage().lastIndex());
+        try state.flushForShutdown();
+    }
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, .{});
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 1), try state.storage().lastIndex());
+        const entries = try state.storage().entries(std.testing.allocator, 1, 2, 0);
+        defer raft_engine.core.types.freeEntries(std.testing.allocator, entries);
+        try std.testing.expectEqualStrings("immutable", entries[0].data);
+        const begin = state.groupStorage().vtable.begin_ready.?;
+        const operation = (try begin(&state, 192, .{ .entries = &.{.{ .term = 2, .index = 2 }} }, null)).?;
+        defer operation.deinit();
+        const deadline = WalReplicaState.nowNs() + 5 * std.time.ns_per_s;
+        while (!operation.isComplete() and WalReplicaState.nowNs() < deadline) {
+            try std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake);
+        }
+        try std.testing.expect(operation.isComplete());
+        try std.testing.expectEqual(@as(u64, 1), try state.storage().lastIndex());
+        try operation.complete();
+        try operation.complete();
+        try std.testing.expectEqual(@as(u64, 2), try state.storage().lastIndex());
+    }
+}
+
+test "wal replica state commit-only Ready avoids sync and recovers only proven commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-commit-only", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 193, 1);
+    defer layout.deinit(std.testing.allocator);
+    const cfg = WalReplicaStateConfig{
+        .checkpoint_replay_records_threshold = 0,
+        .checkpoint_replay_bytes_threshold = 0,
+        .applied_watermark_persist_interval = 1,
+    };
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, cfg);
+        defer state.deinit();
+        try state.groupStorage().persistReady(193, .{
+            .hard_state = .{ .current_term = 3, .voted_for = 1 },
+            .entries = &.{ .{ .term = 3, .index = 1 }, .{ .term = 3, .index = 2 } },
+        });
+        const before = state.wal.statsSnapshot();
+        var diagnostics = storage_iface.ReadyPersistenceDiagnostics{};
+        try state.groupStorage().persistReadyWithDiagnostics(193, .{
+            .hard_state = .{ .current_term = 3, .voted_for = 1, .commit_index = 1 },
+        }, &diagnostics);
+        try std.testing.expect(diagnostics.skipped_no_durable_state);
+        try std.testing.expectEqual(before.physical_commits, state.wal.statsSnapshot().physical_commits);
+        try std.testing.expectEqual(@as(u64, 1), state.stats.commit_only_ready_calls);
+        try state.setAppliedIndex(1);
+        // A crash loses an un-applied commit observation, but not application
+        // completion. Neither mutation invokes graceful shutdown/checkpoint.
+        try state.groupStorage().persistReady(193, .{
+            .hard_state = .{ .current_term = 3, .voted_for = 1, .commit_index = 2 },
+        });
+    }
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 1), state.appliedIndex());
+        try std.testing.expectEqual(@as(u64, 1), state.store.hard_state.commit_index);
+        try std.testing.expectEqual(@as(u64, 2), try state.storage().lastIndex());
+        var raw = try raft_engine.core.RawNode.init(std.testing.allocator, .{
+            .id = 1,
+            .group_id = 193,
+            .peers = &.{1},
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .applied = state.appliedIndex(),
+        }, state.storage());
+        defer raw.deinit();
+        try std.testing.expect(!raw.hasReady());
+        // A new entry folds in the deferred cursor even without HardState in
+        // the Ready; term and vote changes still require physical commits.
+        try state.groupStorage().persistReady(193, .{ .entries = &.{.{ .term = 3, .index = 3 }} });
+        const before = state.wal.statsSnapshot();
+        try state.groupStorage().persistReady(193, .{ .hard_state = .{ .current_term = 4, .voted_for = 2, .commit_index = 1 } });
+        try std.testing.expectEqual(before.physical_commits + 1, state.wal.statsSnapshot().physical_commits);
+    }
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, cfg);
+        defer state.deinit();
+        try std.testing.expectEqual(@as(u64, 4), state.store.hard_state.current_term);
+        try std.testing.expectEqual(@as(?u64, 2), state.store.hard_state.voted_for);
+        try std.testing.expectEqual(@as(u64, 1), state.store.hard_state.commit_index);
+        try std.testing.expectEqual(@as(u64, 3), try state.storage().lastIndex());
     }
 }
 
@@ -2162,4 +2669,94 @@ test "wal replica state flush for shutdown checkpoints outstanding replay debt" 
 
         try std.testing.expect(!raw.hasReady());
     }
+}
+fn awaitPersistence(operation: storage_iface.PendingReadyPersistence) !void {
+    const deadline = WalReplicaState.nowNs() + 5 * std.time.ns_per_s;
+    while (!operation.isComplete() and WalReplicaState.nowNs() < deadline) try std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake);
+    try std.testing.expect(operation.isComplete());
+    try operation.complete();
+}
+
+test "wal replica state async maintenance bounds debt and preserves newer application across checkpoint completion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-async-maintenance", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 919, 1);
+    defer layout.deinit(std.testing.allocator);
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, .{
+            .wal = .{ .backend = .lsm, .artificial_sync_delay_ns = 25 * std.time.ns_per_ms },
+            .checkpoint_replay_records_threshold = 1,
+            .applied_watermark_persist_interval = 1,
+        });
+        defer state.deinit();
+        const storage = state.groupStorage();
+        var admission = storage_iface.PersistenceAdmission{ .max_bytes = 1024 * 1024 };
+        try storage.persistReady(919, .{ .hard_state = .{ .current_term = 1, .voted_for = 1, .commit_index = 2 }, .entries = &.{ .{ .term = 1, .index = 1 }, .{ .term = 1, .index = 2 } }, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } });
+        const append = (try storage.vtable.begin_ready.?(&state, 919, .{ .entries = &.{.{ .term = 1, .index = 3 }} }, null)).?;
+        try state.setAppliedIndex(1);
+        try std.testing.expectEqual(@as(u64, 0), state.durable_completed_applied_index);
+        try awaitPersistence(append);
+        append.deinit();
+        // There is no further committed Ready to trigger a checkpoint. The
+        // explicit idle maintenance hook must discharge the deferred debt.
+        const checkpoint = (try storage.vtable.begin_maintenance.?(&state, 919, &admission, null)).?;
+        try state.setAppliedIndex(2);
+        try awaitPersistence(checkpoint);
+        checkpoint.deinit();
+        try std.testing.expectEqual(@as(u64, 2), state.completedAppliedIndex());
+        try std.testing.expectEqual(@as(u64, 1), state.durable_completed_applied_index);
+        try std.testing.expectEqual(@as(u64, 0), state.statsSnapshot().replay_debt_records);
+        const watermark = (try storage.vtable.begin_maintenance.?(&state, 919, &admission, null)).?;
+        try awaitPersistence(watermark);
+        watermark.deinit();
+        try std.testing.expectEqual(@as(u64, 2), state.durable_completed_applied_index);
+        var payload = storage_iface.SnapshotMaterialization{ .bytes = @constCast("immutable-snapshot") };
+        const compaction = (try storage.vtable.begin_compact_snapshot.?(&state, 919, .{ .index = 2, .term = 1, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, payload, 1, &admission, null)).?;
+        try std.testing.expectEqual(@as(u64, 0), state.store.snapshot_state.metadata.index);
+        try std.testing.expectError(error.ReplicaPersistenceBusy, state.flushForShutdown());
+        // Retirement must join and publish before the payload owner is released.
+        compaction.deinit();
+        payload = undefined;
+        try std.testing.expectEqual(@as(u64, 2), state.store.snapshot_state.metadata.index);
+        try std.testing.expectEqual(@as(u64, 1), state.store.compactedIndex());
+    }
+    var reopened = try WalReplicaState.init(std.testing.allocator, layout, .{});
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 2), reopened.completedAppliedIndex());
+    try std.testing.expectEqual(@as(u64, 3), try reopened.storage().lastIndex());
+    var snapshot = try reopened.storage().snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("immutable-snapshot", snapshot.data);
+}
+
+test "wal replica state async incoming snapshot owns payload and gates installation proof" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-async-snapshot", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 920, 1);
+    defer layout.deinit(std.testing.allocator);
+    {
+        var state = try WalReplicaState.init(std.testing.allocator, layout, .{});
+        defer state.deinit();
+        var bytes = "snapshot".*;
+        const operation = (try state.groupStorage().vtable.begin_ready.?(&state, 920, .{
+            .hard_state = .{ .current_term = 2, .voted_for = 1, .commit_index = 5 },
+            .snapshot = .{ .metadata = .{ .index = 5, .term = 2, .conf_state = .{ .voters = @constCast(&[_]u64{1}) } }, .data = &bytes },
+        }, null)).?;
+        bytes[0] = 'X';
+        try std.testing.expectEqual(@as(u64, 0), try state.storage().lastIndex());
+        try awaitPersistence(operation);
+        operation.deinit();
+        try std.testing.expectEqual(@as(u64, 5), try state.storage().lastIndex());
+        try std.testing.expectEqual(@as(u64, 0), state.completedAppliedIndex());
+    }
+    var reopened = try WalReplicaState.init(std.testing.allocator, layout, .{});
+    defer reopened.deinit();
+    var snapshot = try reopened.storage().snapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("snapshot", snapshot.data);
+    try std.testing.expectEqual(@as(u64, 0), reopened.completedAppliedIndex());
 }

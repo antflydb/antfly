@@ -1,0 +1,32 @@
+[package]
+name = "antfly-lite-sys"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Raw FFI declarations for libantfly, the embedded Antfly C ABI (hand-written, no bindgen)"
+links = "antfly"
+build = "build.rs"
+
+[lib]
+name = "antfly_lite_sys"
+path = "src/lib.rs"
+
+[features]
+# Actually link against libantfly. Off by default so plain `cargo build`/
+# `cargo test` (as rlib, or pure tests) never requires the dylib to be
+# present. Test binaries that call into the library must be gated on this
+# feature with `required-features` (see tests/).
+libantfly = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[[test]]
+name = "header_drift"
+path = "tests/header_drift.rs"
+
+[[test]]
+name = "abi_sizes"
+path = "tests/abi_sizes.rs"
+required-features = ["libantfly"]

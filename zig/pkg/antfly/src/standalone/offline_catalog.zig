@@ -10,20 +10,47 @@ const erased = @import("../storage/backend_erased.zig");
 const files = @import("../common/migration_files.zig");
 const domain = @import("../system_catalog/domain.zig");
 const format = @import("catalog_format.zig");
+const NativeCatalog = @import("../metadata/storage/mod.zig").RaftApplyStore;
+const metadata_group = @import("../common/group_ids.zig").main_metadata_group_id;
 
 pub const Catalog = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     lock: std.Io.File,
-    backend: lsm.BackendHandle,
-    store: erased.Store,
+    backend: ?lsm.BackendHandle = null,
+    store: ?erased.Store = null,
+    native: ?NativeCatalog = null,
+    revision: u64 = 0,
     document: std.json.Parsed(std.json.Value),
     head: ?std.json.Parsed(std.json.Value),
 
     pub fn open(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !Catalog {
         const lock = try files.lockCatalog(alloc, io, path);
         errdefer lock.close(io);
+        const native_root = try std.fmt.allocPrint(alloc, "{s}/local-state", .{std.fs.path.dirname(path) orelse "."});
+        defer alloc.free(native_root);
+        const native_exists = blk: {
+            std.Io.Dir.cwd().access(io, native_root, .{}) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (native_exists) {
+            var native = try NativeCatalog.init(alloc, .{ .root_dir = native_root });
+            var retained = false;
+            defer if (!retained) native.deinit();
+            if (try native.loadStandaloneCatalogSnapshot(alloc)) |raw| {
+                defer alloc.free(raw);
+                var document = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+                errdefer document.deinit();
+                const epoch = document.value.object.get("epoch") orelse return error.InvalidCatalogRecord;
+                const revision = try std.json.parseFromValueLeaky(u64, document.arena.allocator(), epoch, .{});
+                retained = true;
+                return .{ .alloc = alloc, .io = io, .path = path, .lock = lock, .native = native, .revision = revision, .document = document, .head = null };
+            }
+        }
         const root = try std.fmt.allocPrint(alloc, "{s}.store", .{path});
         defer alloc.free(root);
         var backend = try lsm.BackendHandle.open(alloc, root, .{ .wal_sync_on_commit = true });
@@ -84,8 +111,9 @@ pub const Catalog = struct {
     pub fn deinit(self: *Catalog) void {
         self.document.deinit();
         if (self.head) |*head| head.deinit();
-        self.store.deinit();
-        self.backend.close();
+        if (self.store) |*store| store.deinit();
+        if (self.backend) |*backend| backend.close();
+        if (self.native) |*native| native.deinit();
         self.lock.close(self.io);
     }
 
@@ -112,6 +140,13 @@ pub const Catalog = struct {
     }
 
     pub fn publish(self: *Catalog, table: std.json.Value) !void {
+        if (self.native) |*native| {
+            var row = try std.json.parseFromValue(@import("../metadata/table_manager.zig").TableRecord, self.alloc, table, .{ .ignore_unknown_fields = true });
+            defer row.deinit();
+            try native.updateStandaloneCatalog(metadata_group, self.revision, .{ .tables = &.{row.value} });
+            self.revision += 1;
+            return;
+        }
         if (self.head) |*head| {
             const a = head.arena.allocator();
             const epoch = head.value.object.getPtr("epoch") orelse return error.InvalidCatalogRecord;
@@ -122,7 +157,7 @@ pub const Catalog = struct {
             const key = try std.fmt.allocPrint(a, format.row_prefix ++ "table/{s}", .{encoded_id});
             const row = try std.json.Stringify.valueAlloc(a, .{ .table = table }, .{});
             const header = try std.json.Stringify.valueAlloc(a, head.value, .{});
-            var txn = try self.store.beginWrite();
+            var txn = try self.store.?.beginWrite();
             var open_txn = true;
             defer if (open_txn) txn.abort();
             try txn.put(key, row);

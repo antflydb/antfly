@@ -27,7 +27,7 @@ verify_generated_tc="${ANTFLY_GLINER2_VERIFY_GENERATED_TC:-0}"
 verify_materialized_auto="${ANTFLY_GLINER2_VERIFY_MATERIALIZED_AUTO:-auto}"
 cuda_artifacts="${ANTFLY_CUDA_ARTIFACTS:-fatbin}"
 cuda_libraries="${ANTFLY_CUDA_LIBS:-auto}"
-optimize="${ANTFLY_CUDA_VERIFY_OPTIMIZE:-ReleaseFast}"
+optimize="${ANTFLY_CUDA_VERIFY_OPTIMIZE:-fast}"
 zig_global_cache_dir="${ZIG_GLOBAL_CACHE_DIR:-${TMPDIR:-/tmp}/antfly-zig-global-cache}"
 
 resolve_zig() {
@@ -35,8 +35,8 @@ resolve_zig() {
     printf '%s\n' "$ZIG"
   elif command -v zig >/dev/null 2>&1; then
     command -v zig
-  elif [[ -x "../../../.tools/zig-x86_64-linux-0.16.0/zig" ]]; then
-    printf '%s\n' "../../../.tools/zig-x86_64-linux-0.16.0/zig"
+  elif [[ -x "../../../.tools/zig-x86_64-linux-0.17.0/zig" ]]; then
+    printf '%s\n' "../../../.tools/zig-x86_64-linux-0.17.0/zig"
   else
     echo "zig not found; set ZIG=/path/to/zig" >&2
     return 1

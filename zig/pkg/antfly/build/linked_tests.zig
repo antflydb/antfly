@@ -65,9 +65,9 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
     for (consumer.object.filters) |filter| filters.put(b.allocator, filter, {}) catch @panic("OOM");
     implementation.filters = b.allocator.dupe([]const u8, filters.keys()) catch @panic("OOM");
     const audit = b.addSystemCommand(&.{"python3"});
-    audit.addFileArg(b.path("tools/audit_test_selection.py"));
+    audit.addFileArg2(b.path("tools/audit_test_selection.py"), .{ .make_absolute = true });
     for (consumer.object.filters) |filter| audit.addArgs(&.{ "--filter", filter });
-    const args = b.args orelse &.{};
+    const args = buildArguments(b) orelse &.{};
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "--allow-empty-test-filter")) {
@@ -84,8 +84,10 @@ pub fn runPair(b: *std.Build, consumer: Artifact, implementation: *std.Build.Ste
         const inventory = b.addRunArtifact(artifact);
         inventory.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
         audit.addArg("--inventory");
-        audit.addFileArg(inventory.captureStdErr(.{}));
+        audit.addFileArg2(inventory.captureStdErr(.{}), .{ .make_absolute = true });
     }
+    audit.addArg("--");
+    audit.addPassthruArgs();
     const implementation_run = @import("test_support.zig").addFilteredTestRunArtifactWithRuntimeFilters(b, implementation, consumer.object.filters);
     implementation_run.addArg("--allow-empty-test-filter");
     implementation_run.step.dependOn(&audit.step);
@@ -135,4 +137,19 @@ fn splitNativeSources(
     for (original.import_table.keys(), original.import_table.values()) |key, dependency|
         copy.addImport(key, splitNativeSources(b, dependency, final, name, clones));
     return copy;
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

@@ -62,6 +62,8 @@ fn executeSearch(
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
     const alloc = std.heap.c_allocator;
+    if (request.dialect == .public) query_api.validateStoragePublicQueryRequest(alloc, request.request_json.slice()) catch |err|
+        return fail(err, parseOperation(request.dialect), out_failure);
     var owned = switch (request.dialect) {
         .internal => query_api.parseQueryRequest(
             alloc,
@@ -147,6 +149,15 @@ fn executeSearch(
     return .ok;
 }
 
+/// Aggregation sub-queries share the owner's read lease and generation.
+const LeaseSearcher = struct {
+    lease: *db_mod.DB.QueryReadLease,
+
+    pub fn search(self: LeaseSearcher, alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) !db_mod.types.SearchResult {
+        return (try self.lease.search(alloc, req)).result;
+    }
+};
+
 fn applyAggregations(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -160,8 +171,7 @@ fn applyAggregations(
     var aggregation_req = req;
     const selected = if (aggregation_plan.aggregationCanUseCurrentResult(req, result)) result else blk: {
         aggregation_req = try aggregation_plan.aggregationFullResultRequest(req, result, "local-owner");
-        full = (try lease.search(alloc, aggregation_req)).result;
-        try aggregation_plan.requireCompleteAggregationFullResult(aggregation_req, full.?, "local-owner");
+        full = try aggregation_plan.collectAggregationFullResult(alloc, req, aggregation_req, LeaseSearcher{ .lease = lease }, "local-owner");
         break :blk full.?;
     };
     const requests = try query_api.parseAggregationRequestsJson(alloc, aggregation_req.aggregations_json);
@@ -331,7 +341,7 @@ fn fail(
         err,
         .local_query,
         abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }

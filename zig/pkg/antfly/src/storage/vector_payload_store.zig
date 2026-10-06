@@ -17,6 +17,34 @@ const time = @import("antfly_platform").time;
 const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
+// Metadata grows with records that actually need appending. Keep superseded
+// buffers out of the payload decode arena and preserve cross-session deduplication.
+const PreparationMetadata = struct {
+    alloc: Allocator,
+    records: std.ArrayListUnmanaged(native.BatchRecord) = .empty,
+    seen: std.AutoHashMapUnmanaged(payload.Digest, void) = .empty,
+
+    fn deinit(self: *@This()) void {
+        self.records.deinit(self.alloc);
+        self.seen.deinit(self.alloc);
+    }
+
+    fn claim(self: *@This(), digest: payload.Digest) !bool {
+        // getOrPut grows before probing when the map is full. Check existing
+        // keys at that boundary so duplicates never trigger a needless grow.
+        const limit = @as(u64, self.seen.capacity()) * std.hash_map.default_max_load_percentage / 100;
+        if (self.seen.count() >= limit and self.seen.contains(digest)) return false;
+        return !(try self.seen.getOrPut(self.alloc, digest)).found_existing;
+    }
+
+    fn append(self: *@This(), digest: payload.Digest, record: native.BatchRecord) !bool {
+        if (!try self.claim(digest)) return false;
+        errdefer _ = self.seen.remove(digest);
+        try self.records.append(self.alloc, record);
+        return true;
+    }
+};
+
 pub const Stats = payload.Stats;
 
 // Filled only by the deterministic interleaving test below.
@@ -29,7 +57,7 @@ const MarkInterleaving = if (@import("builtin").is_test) struct {
 
     fn pause(_: *Store) void {
         entered.store(true, .release);
-        while (!resume_scan.load(.acquire)) std.Thread.yield() catch {};
+        while (!resume_scan.load(.acquire)) @import("antfly_platform").time.yieldNow();
     }
     fn scan(source: *Store) void {
         source.advanceMarkingSnapshot() catch |err| {
@@ -45,7 +73,7 @@ const MarkInterleaving = if (@import("builtin").is_test) struct {
         const start = time.monotonicNs();
         while (!flag.load(.acquire)) {
             if (time.monotonicNs() -| start > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
     }
 } else void;
@@ -76,8 +104,8 @@ pub const Store = struct {
     /// Candidate references are protected by the durable migration job until
     /// all primary rows and their final reference coverage have been verified.
     migration_retention: std.atomic.Value(bool) = .init(false),
-    migration_disk_reserve: std.atomic.Value(u64) = .init(0),
-    migration_temporary_limit: std.atomic.Value(u64) = .init(0),
+    migration_disk_reserve: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    migration_temporary_limit: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -91,8 +119,8 @@ pub const Store = struct {
     checkpoint_write_waiters: std.atomic.Value(usize) = .init(0),
     checkpoint_epoch: std.atomic.Value(u32) = .init(0),
     checkpoint_test_hook: if (@import("builtin").is_test) ?*const fn (*Store, CheckpointPhase) anyerror!void else void = if (@import("builtin").is_test) null else {},
-    active_sessions: std.atomic.Value(u64) = .init(0),
-    session_start_epoch: std.atomic.Value(u64) = .init(0),
+    active_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    session_start_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
     read_stats: ReadStats = .{},
     opened: native.Opened,
     stats: Stats = .{},
@@ -154,7 +182,7 @@ pub const Store = struct {
     prepare_head: ?*PrepareRequest = null,
     prepare_tail: ?*PrepareRequest = null,
     prepare_running: bool = false,
-    prepare_requests: std.atomic.Value(u64) = .init(0),
+    prepare_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     directory: ?*@import("source_location_directory.zig").Directory = null,
 
@@ -202,11 +230,11 @@ pub const Store = struct {
     }
 
     const ReadStats = struct {
-        resolved_payloads: std.atomic.Value(u64) = .init(0),
-        resolved_bytes: std.atomic.Value(u64) = .init(0),
-        snapshot_read_ns: std.atomic.Value(u64) = .init(0),
-        catalog_metadata_bytes_shared: std.atomic.Value(u64) = .init(0),
-        catalog_metadata_bytes_copied: std.atomic.Value(u64) = .init(0),
+        resolved_payloads: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        resolved_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        snapshot_read_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_shared: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_copied: @import("antfly_platform").atomic.Value(u64) = .init(0),
     };
 
     const ReadView = struct {
@@ -231,7 +259,7 @@ pub const Store = struct {
     }
 
     fn lockPublication(self: *Store) void {
-        while (!self.publication_mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.publication_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
 
     // Allocate before durability. Publication itself cannot fail and never
@@ -317,7 +345,7 @@ pub const Store = struct {
         bytes: u64 = 0,
         initialized: bool = false,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.counts.deinit(alloc);
             self.wal.deinit(alloc);
             self.wal_events.deinit(alloc);
@@ -380,7 +408,7 @@ pub const Store = struct {
                 self.wal_head = 0;
             }
         }
-        fn sync(self: *@This(), alloc: Allocator, previous: ?*const native.Opened, next: *const native.Opened, rows: *u64) !void {
+        pub fn sync(self: *@This(), alloc: Allocator, previous: ?*const native.Opened, next: *const native.Opened, rows: *u64) !void {
             // Any partial cache edit is discarded. A failed post-publication
             // install must reopen durable authority before accepting writes.
             errdefer self.deinit(alloc);
@@ -667,7 +695,7 @@ pub const Store = struct {
         retired_view: ?*ReadView = null,
         retirement: ?native.Store.PreparedPublication = null,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             std.debug.assert(!self.validation_running);
             if (self.retirement) |*prepared| {
                 prepared.reclaimObsolete();
@@ -748,7 +776,7 @@ pub const Store = struct {
             } else _ = self.tail.remove(digest);
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             std.debug.assert(!self.running);
             if (self.segment_stats) |stats| alloc.free(stats);
             self.source.deinit();
@@ -807,7 +835,11 @@ pub const Store = struct {
     fn verifyLiveLocation(source: *const native.Opened, digest: payload.Digest, dims: u32) !void {
         const found = try source.locateHashed(&digest, vector_block.keyHash(&digest), std.math.maxInt(u64), 1);
         if (found != .vector) return error.MissingCommittedVectorPayload;
-        switch (found.vector) {
+        try verifyLiveLocatedValue(found.vector, dims);
+    }
+
+    fn verifyLiveLocatedValue(found: native.LocatedValue, dims: u32) !void {
+        switch (found) {
             .wal => |value| {
                 if (value.dims != dims) return error.MissingCommittedVectorPayload;
                 if (value.encoding != .float32 or value.bytes.len != try vector_block.encodedVectorBytesLen(.float32, dims))
@@ -1167,7 +1199,7 @@ pub const Store = struct {
             if (self.marking) |marking| {
                 if (marking.running) {
                     self.mutex.unlock();
-                    std.Thread.yield() catch {};
+                    @import("antfly_platform").time.yieldNow();
                     continue;
                 }
                 marking.deinit(self.alloc);
@@ -1496,7 +1528,7 @@ pub const Store = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn lock(self: *Store) void {
-        while (!self.mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
     fn retain(ptr: *anyopaque) void {
         const self = cast(ptr);
@@ -1561,6 +1593,12 @@ pub const Store = struct {
                     if (self.prepare_head == null) self.prepare_tail = null;
                     self.prepare_queue_mutex.unlock();
                     const outcome: ?anyerror = batch: {
+                        // Waiters retain their inputs until they are notified.
+                        // A lone request needs no combined array or copy.
+                        if (requests == 1) {
+                            self.prepareBatch(first.prepared) catch |err| break :batch err;
+                            break :batch null;
+                        }
                         const items = self.preparation_alloc.alloc(payload.Prepared, count) catch |err| break :batch err;
                         defer self.preparation_alloc.free(items);
                         var pos: usize = 0;
@@ -1588,13 +1626,13 @@ pub const Store = struct {
                     return;
                 },
                 2 => return if (request.err) |err| err else {},
-                else => std.Thread.yield() catch {},
+                else => @import("antfly_platform").time.yieldNow(),
             }
         }
     }
 
     fn queueLock(self: *Store) void {
-        while (!self.prepare_queue_mutex.tryLock()) std.Thread.yield() catch {};
+        while (!self.prepare_queue_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
 
     /// Cancelling unpublished work retains every preparation in the WAL.
@@ -1619,12 +1657,17 @@ pub const Store = struct {
         return true;
     }
 
-    fn reservePreparationLocked(self: *Store, prepared: []const payload.Prepared) !?resources.BudgetedAllocator.ScratchReservation {
+    fn reservePreparationLocked(self: *Store, record_count: usize, payload_bytes: u64) !?resources.BudgetedAllocator.ScratchReservation {
         const budget = self.budget orelse return null;
-        // Decode/encode, immutable WAL successor and metadata coexist until
-        // append succeeds. Maintenance needs a page plus directory scratch.
-        var bytes: usize = 2 * 1024 * 1024;
-        for (prepared) |item| bytes = try std.math.add(usize, bytes, try std.math.add(usize, try std.math.mul(usize, item.reference.dims, 12), 2048));
+        // Eligibility already totals float32 payload bytes. Reuse that total
+        // instead of scanning every record again. This is the same admission
+        // bound: three payload copies, per-record metadata, and maintenance.
+        const payload_size = std.math.cast(usize, payload_bytes) orelse return error.Overflow;
+        const bytes = try std.math.add(usize, 2 * 1024 * 1024, try std.math.add(
+            usize,
+            try std.math.mul(usize, payload_size, 3),
+            try std.math.mul(usize, record_count, 2048),
+        ));
         return budget.reserveScratch(bytes) catch |err| {
             if (err != error.ResourceBudgetExceeded or !self.discardCollectionForPressureLocked()) return err;
             if (self.checkpoint_running) self.waitCheckpointLocked();
@@ -1650,6 +1693,64 @@ pub const Store = struct {
         return self.opened.store.wal_has_mutations and self.opened.store.wal_committed_bytes >= limit;
     }
 
+    fn collectPreparationLocked(
+        self: *Store,
+        prepared: []const payload.Prepared,
+        decoded: ?[][]const f32,
+        eligibility_alloc: Allocator,
+        scratch: Allocator,
+        metadata: *PreparationMetadata,
+        bytes: *u64,
+        added_payloads: *u64,
+        added_bytes: *u64,
+    ) !void {
+        const records = &metadata.records;
+        for (prepared, 0..) |*item, item_index| {
+            // Eligibility proves identity and exact-payload availability under
+            // this Opened lease; it is not an integrity scrub. Avoid touching
+            // immutable payload bytes just to reuse a durable identity. Reads
+            // and GC copies still verify payload/residual CRCs before use.
+            const found = try self.opened.locateHashed(&item.reference.digest, vector_block.keyHash(&item.reference.digest), std.math.maxInt(u64), null);
+            if (found == .vector) {
+                verifyLiveLocatedValue(found.vector, item.reference.dims) catch |err| {
+                    if (err == error.MissingCommittedVectorPayload) return error.VectorReferenceIdentityMismatch;
+                    return err;
+                };
+                // A retry can select an orphan omitted from the initial mark.
+                // Re-append it once after the cut so base+WAL retains it.
+                if (self.collection) |collection| {
+                    if (collection.live.contains(item.reference.digest) or collection.tail.contains(item.reference.digest)) continue;
+                } else if (self.marking) |marking| {
+                    if (marking.tail.contains(item.reference.digest) or (!marking.running and marking.live.contains(item.reference.digest))) continue;
+                    if (self.rescue_reappends) {
+                        if (marking.rescued.contains(item.reference.digest)) continue;
+                        // Rescue receipts are rebuildable state. Grow only for
+                        // a unique rescue, before any durable append.
+                        try marking.rescued.put(eligibility_alloc, item.reference.digest, item.reference.dims);
+                        self.stats.deduplicated_reappend_payloads += 1;
+                        self.stats.deduplicated_reappend_bytes += @as(u64, item.reference.dims) * 4;
+                        continue;
+                    }
+                } else continue;
+            }
+            if (!try metadata.claim(item.reference.digest)) continue;
+            errdefer _ = metadata.seen.remove(item.reference.digest);
+            const vector = if (decoded) |vectors| vectors[item_index] else (try codec.denseEmbeddingVectorView(item.artifact)) orelse try codec.decodeDenseEmbeddingAlloc(scratch, item.artifact);
+            try records.append(metadata.alloc, .{
+                .kind = .upsert,
+                .key = &item.reference.digest,
+                .source_sequence = 0, // Assigned after admission/checkpoint.
+                .revision = 1,
+                .vector = vector,
+            });
+            bytes.* = try std.math.add(u64, bytes.*, try std.math.mul(u64, vector.len, 4));
+            if (found != .vector) {
+                added_payloads.* += 1;
+                added_bytes.* += vector.len * 4;
+            }
+        }
+    }
+
     fn prepareBatch(self: *Store, prepared: []const payload.Prepared) !void {
         if (self.read_only) return error.ReadOnly;
         const reserve = self.migration_disk_reserve.load(.acquire);
@@ -1669,7 +1770,11 @@ pub const Store = struct {
         var decode_arena = std.heap.ArenaAllocator.init(if (local_budget) |*budget| budget.allocator() else self.preparation_alloc);
         defer decode_arena.deinit();
         const decode_started = time.monotonicNs();
-        const decoded = if (self.group_commit) try decode_arena.allocator().alloc([]const f32, prepared.len) else null;
+        var view_buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+        var view_buffer: std.heap.BufferFirstAllocator = .init(&view_buffer_storage, if (local_budget) |*budget| budget.allocator() else self.preparation_alloc);
+        const view_alloc = view_buffer.allocator();
+        const decoded = if (self.group_commit) try view_alloc.alloc([]const f32, prepared.len) else null;
+        defer if (decoded) |vectors| view_alloc.free(vectors);
         if (decoded) |vectors| for (prepared, vectors) |item, *vector| {
             vector.* = (try codec.denseEmbeddingVectorView(item.artifact)) orelse try codec.decodeDenseEmbeddingAlloc(decode_arena.allocator(), item.artifact);
         };
@@ -1689,71 +1794,93 @@ pub const Store = struct {
         if (self.group_commit) self.stats.decode_outside_lock_ns += lock_started -| decode_started;
         self.stats.prepare_batches += 1;
         defer self.stats.preparation_ns += time.monotonicNs() -| started;
-        // The checkpoint threshold is a bound during marking as well. A mark
-        // is retryable from a newer cut; an ever-growing resident WAL is not.
-        if (self.walAtCheckpointTarget() and (self.marking != null or self.collection != null)) {
-            if (!self.discardCollectionForPressureLocked()) {
-                // The scanner rejoins without DB.apply. Give it one bounded
-                // suffix window to cancel; do not wait under a primary write
-                // transaction or reject ordinary overlap at the soft bound.
-                const hard_wal_limit = self.wal_admission_bytes + @max(16 * 1024, self.wal_admission_bytes / 4);
-                if (self.opened.store.wal_committed_bytes >= hard_wal_limit) return error.ResourceBudgetExceeded;
-            }
-        }
-        const scratch_reservation = try self.reservePreparationLocked(prepared);
-        defer if (scratch_reservation) |reservation| reservation.release();
-        if (self.walNeedsAdmissionCheckpoint()) try self.checkpointLocked();
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        var failure_tracker: ?resources.BudgetedAllocator.FailureTrackingAllocator = if (self.budget) |budget|
+            if (self.alloc.ptr == @as(*anyopaque, @ptrCast(budget))) .{ .owner = budget } else null
+        else
+            null;
+        const eligibility_alloc = if (failure_tracker) |*tracker| tracker.allocator() else self.alloc;
+        var arena = std.heap.ArenaAllocator.init(eligibility_alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var records = std.ArrayListUnmanaged(native.BatchRecord).empty;
-        var seen = std.AutoHashMap(payload.Digest, void).init(scratch);
-        const sequence = try std.math.add(u64, self.opened.store.covered_source_sequence, 1);
+        var metadata_buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+        var metadata_buffer: std.heap.BufferFirstAllocator = .init(&metadata_buffer_storage, eligibility_alloc);
+        const metadata_alloc = metadata_buffer.allocator();
+        var metadata: PreparationMetadata = .{ .alloc = metadata_alloc };
+        defer metadata.deinit();
+        const records = &metadata.records;
         var bytes: u64 = 0;
         var added_payloads: u64 = 0;
         var added_bytes: u64 = 0;
-        if (self.collection) |collection| try collection.tail.ensureUnusedCapacity(@intCast(prepared.len));
+        var scratch_reservation: ?resources.BudgetedAllocator.ScratchReservation = null;
+        defer if (scratch_reservation) |reservation| reservation.release();
+        var retried_pressure = false;
+        eligibility: while (true) {
+            bytes = 0;
+            added_payloads = 0;
+            added_bytes = 0;
+            records.clearRetainingCapacity();
+            metadata.seen.clearRetainingCapacity();
+            _ = arena.reset(.retain_capacity);
+            if (failure_tracker) |*tracker| tracker.last_failure = null;
+            const collected = self.collectPreparationLocked(prepared, decoded, eligibility_alloc, scratch, &metadata, &bytes, &added_payloads, &added_bytes);
+            collected catch |err| {
+                const admission_denied = if (failure_tracker) |tracker| tracker.last_failure == .admission else false;
+                if (err != error.OutOfMemory or !admission_denied) return err;
+                if (retried_pressure or !self.discardCollectionForPressureLocked()) return error.ResourceBudgetExceeded;
+                retried_pressure = true;
+                // Return staged capacity and spare credits before one fresh
+                // attempt. A running scanner is cancelled without freeing it.
+                metadata.deinit();
+                metadata_buffer.fixed_buffer_allocator.reset();
+                metadata = .{ .alloc = metadata_alloc };
+                _ = arena.reset(.free_all);
+                _ = self.budget.?.releaseUnusedCreditThreadSafe();
+                continue :eligibility;
+            };
+            if (records.items.len == 0) return;
+            // Eligibility metadata and decoded vectors are already charged by
+            // self.alloc. Admit encoding/publication only for unique writes; a
+            // durable-only retry does not need checkpoint or publication scratch.
+            // The checkpoint threshold is a bound during marking as well. A mark
+            // is retryable from a newer cut; an ever-growing resident WAL is not.
+            if (self.walAtCheckpointTarget() and (self.marking != null or self.collection != null)) {
+                if (!self.discardCollectionForPressureLocked()) {
+                    // The scanner rejoins without DB.apply. Give it one bounded
+                    // suffix window to cancel; do not wait under a primary write
+                    // transaction or reject ordinary overlap at the soft bound.
+                    const hard_wal_limit = self.wal_admission_bytes + @max(16 * 1024, self.wal_admission_bytes / 4);
+                    if (self.opened.store.wal_committed_bytes >= hard_wal_limit) return error.ResourceBudgetExceeded;
+                }
+            }
+            // Admission can wait for or perform an unlocked checkpoint. Rebuild
+            // eligibility if another writer/publication changed the source while
+            // SourceLock was released; counts and rescue decisions must reflect
+            // the authoritative view that will receive this append.
+            const prior_sequence = self.opened.store.covered_source_sequence;
+            const prior_generation = self.opened.store.manifest.?.latest_generation;
+            const prior_epoch = self.checkpoint_epoch.load(.acquire);
+            scratch_reservation = try self.reservePreparationLocked(records.items.len, bytes);
+            if (self.walNeedsAdmissionCheckpoint()) try self.checkpointLocked();
+            if (self.opened.store.covered_source_sequence != prior_sequence or
+                self.opened.store.manifest.?.latest_generation != prior_generation or
+                self.checkpoint_epoch.load(.acquire) != prior_epoch)
+            {
+                if (scratch_reservation) |reservation| reservation.release();
+                scratch_reservation = null;
+                continue;
+            }
+            break;
+        }
+        const sequence = try std.math.add(u64, self.opened.store.covered_source_sequence, 1);
+        for (records.items) |*record| record.source_sequence = sequence;
+        // Post-append updates must remain infallible. Reserve from the actual
+        // eligible unique records, after durable/duplicate short-circuiting.
+        const additions = std.math.cast(u32, records.items.len) orelse return error.Overflow;
+        if (self.collection) |collection| try collection.tail.ensureUnusedCapacity(additions);
         if (self.marking) |marking| {
-            try marking.tail.ensureUnusedCapacity(@intCast(prepared.len));
-            if (self.rescue_reappends) try marking.rescued.ensureUnusedCapacity(self.alloc, @intCast(prepared.len));
-            if (marking.running) try marking.pending_tail.ensureUnusedCapacity(self.alloc, prepared.len);
+            try marking.tail.ensureUnusedCapacity(additions);
+            if (marking.running) try marking.pending_tail.ensureUnusedCapacity(self.alloc, records.items.len);
         }
-        for (prepared, 0..) |*item, item_index| {
-            // A retry can reuse an already durable immutable payload.
-            const found = try self.opened.get(&item.reference.digest, std.math.maxInt(u64), null);
-            if (found == .vector) {
-                // A retry can select an orphan omitted from the initial mark.
-                // Re-append it once after the cut so base+WAL retains it.
-                if (self.collection) |collection| {
-                    if (collection.live.contains(item.reference.digest) or collection.tail.contains(item.reference.digest)) continue;
-                } else if (self.marking) |marking| {
-                    if (marking.tail.contains(item.reference.digest) or (!marking.running and marking.live.contains(item.reference.digest))) continue;
-                    if (self.rescue_reappends) {
-                        if (marking.rescued.contains(item.reference.digest)) continue;
-                        if (found.vector.dims != item.reference.dims) return error.VectorReferenceIdentityMismatch;
-                        marking.rescued.putAssumeCapacity(item.reference.digest, item.reference.dims);
-                        self.stats.deduplicated_reappend_payloads += 1;
-                        self.stats.deduplicated_reappend_bytes += @as(u64, item.reference.dims) * 4;
-                        continue;
-                    }
-                } else continue;
-            }
-            if ((try seen.getOrPut(item.reference.digest)).found_existing) continue;
-            const vector = if (decoded) |vectors| vectors[item_index] else (try codec.denseEmbeddingVectorView(item.artifact)) orelse try codec.decodeDenseEmbeddingAlloc(scratch, item.artifact);
-            try records.append(scratch, .{
-                .kind = .upsert,
-                .key = &item.reference.digest,
-                .source_sequence = sequence,
-                .revision = 1,
-                .vector = vector,
-            });
-            bytes += vector.len * 4;
-            if (found != .vector) {
-                added_payloads += 1;
-                added_bytes += vector.len * 4;
-            }
-        }
-        if (records.items.len == 0) return;
         var encoded = try self.opened.store.encodeBatch(try self.opened.store.nextBatchId(), records.items, sequence);
         defer encoded.deinit();
         var successor = try self.opened.prepareWalSuccessor(self.alloc, &encoded, true);
@@ -1904,8 +2031,8 @@ pub const Store = struct {
         timings.bytes = vectors.len * @sizeOf(f32);
         timings.positional_batches = 1;
         timings.positional_bytes = physical.physical_bytes;
-        inline for (std.meta.fields(native.ReadDispatchStats)) |field| {
-            @field(timings, "read_" ++ field.name) = @field(physical.dispatch, field.name);
+        inline for (comptime std.meta.fieldNames(native.ReadDispatchStats)) |reflected_name| {
+            @field(timings, "read_" ++ reflected_name) = @field(physical.dispatch, reflected_name);
         }
         return timings;
     }
@@ -2145,8 +2272,8 @@ pub const Store = struct {
     fn statsLocked(self: *Store) Stats {
         var stats = self.stats;
         stats.active_sessions = self.active_sessions.load(.acquire);
-        inline for (std.meta.fields(ReadStats)) |field| {
-            @field(stats, field.name) += @field(self.read_stats, field.name).load(.monotonic);
+        inline for (comptime std.meta.fieldNames(ReadStats)) |reflected_name| {
+            @field(stats, reflected_name) += @field(self.read_stats, reflected_name).load(.monotonic);
         }
         stats.prepare_requests = self.prepare_requests.load(.monotonic);
         stats.source_segments = self.opened.readers.len;
@@ -2359,7 +2486,7 @@ pub const Store = struct {
         // DB.apply merely to avoid a scan. Startup and explicit collection
         // require the complete proof and cannot trust this process-local lease.
         const now = time.monotonicNs();
-        const ann_digest = if (!self.checkpoint_receipts) [_]u8{0} ** 32 else if (background) self.annScopeDigest() else try self.annAuthorityDigest();
+        const ann_digest = if (!self.checkpoint_receipts) @as([32]u8, @splat(0)) else if (background) self.annScopeDigest() else try self.annAuthorityDigest();
         if (self.receipt) |receipt| {
             const hint_valid = !background or (self.last_mark_completed_ns != 0 and
                 now -| self.last_mark_completed_ns < 5 * std.time.ns_per_min);
@@ -3190,7 +3317,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     if (positional) try std.testing.expect(source.opened.shared_catalog != null);
     const copied_before_reads = source.statsSnapshot().catalog_metadata_bytes_copied;
     const shared_before_reads = source.statsSnapshot().catalog_metadata_bytes_shared;
-    const repeated = [_][]const u8{key} ** 70;
+    const repeated = @as([70][]const u8, @splat(key));
     var values: [70]?[]const u8 = undefined;
     const stats = try old.consumeDenseManySorted(alloc, &repeated, &values, 3, sink.sink());
     try std.testing.expectEqual(@as(u64, 3), stats.batches);
@@ -3214,7 +3341,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     try std.testing.expectEqual(@as(u64, 2), low_memory.vectors);
     {
         var budgets = resources.Options.defaultBudgets();
-        budgets[@intFromEnum(resources.Slice.dense_apply_working_set)] = .{ .soft_limit_bytes = 24, .hard_limit_bytes = 24 };
+        budgets[@backingInt(resources.Slice.dense_apply_working_set)] = .{ .soft_limit_bytes = 24, .hard_limit_bytes = 24 };
         var manager = resources.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         // Model an already-full cache/scratch claim. Optional batching must
@@ -3230,7 +3357,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     }
     if (positional and encoding == .float32) {
         var budgets = resources.Options.defaultBudgets();
-        budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
+        budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
         var manager = resources.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         var resident = try manager.reserve(.dense_source_payload_state, 1);
@@ -4408,7 +4535,7 @@ test "source vector payloads group commit batches waiting preparations without a
         source.prepare_queue_mutex.unlock();
         if (queued == 8) break;
         if (time.monotonicNs() > deadline) return error.TestUnexpectedResult;
-        std.Thread.yield() catch {};
+        @import("antfly_platform").time.yieldNow();
     }
     for (&contexts) |*ctx| try std.testing.expect(!ctx.done.load(.acquire));
     source.queueLock();
@@ -4738,7 +4865,20 @@ test "source vector payloads elapsed marking budget yields before the row cap an
             };
             try MarkInterleaving.awaitFlag(&MarkInterleaving.entered);
             const wal_before = source.statsSnapshot().wal_bytes_written;
-            try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+            const tail_capacity = source.marking.?.tail.capacity();
+            const pending_capacity = source.marking.?.pending_tail.capacity;
+            const repeats = @as([256]payload.Prepared, @splat(.{ .reference = ref, .artifact = artifact }));
+            // A durable-only retry must not cancel a scanner merely because
+            // its existing WAL is above the admission checkpoint threshold.
+            const saved_wal_limit = source.wal_admission_bytes;
+            source.wal_admission_bytes = 1;
+            defer source.wal_admission_bytes = saved_wal_limit;
+            try Store.prepare(&source, &repeats);
+            try std.testing.expect(!source.marking.?.cancel_requested);
+            source.wal_admission_bytes = saved_wal_limit;
+            try std.testing.expectEqual(tail_capacity, source.marking.?.tail.capacity());
+            try std.testing.expectEqual(pending_capacity, source.marking.?.pending_tail.capacity);
+            try std.testing.expect(source.marking.?.rescued.capacity() <= 8);
             try std.testing.expectEqual(wal_before, source.statsSnapshot().wal_bytes_written);
             MarkInterleaving.resume_scan.store(true, .release);
             thread.join();
@@ -4822,7 +4962,12 @@ test "source vector payloads rescued preparations cannot certify an unchanged pr
         }
         try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
         const bytes = source.stats.wal_bytes_written;
-        try Store.prepare(&source, &.{.{ .reference = ref, .artifact = old }});
+        const tail_capacity = source.marking.?.tail.capacity();
+        const repeats = @as([256]payload.Prepared, @splat(.{ .reference = ref, .artifact = old }));
+        try Store.prepare(&source, &repeats);
+        try std.testing.expectEqual(tail_capacity, source.marking.?.tail.capacity());
+        try std.testing.expectEqual(@as(usize, 1), source.marking.?.rescued.count());
+        try std.testing.expect(source.marking.?.rescued.capacity() <= 8);
         try std.testing.expectEqual(bytes, source.stats.wal_bytes_written);
         // Do not commit the prepared reference. It remains conservatively live
         // for this cut; a clean receipt for the old epoch would leak it forever.
@@ -5085,7 +5230,7 @@ test "source vector payloads mark workspace admission releases snapshots and res
         defer raw.deinit();
         var budgets = resources.Options.defaultBudgets();
         const limit = 16 * 1024 * 1024;
-        budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+        budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
         var manager = resources.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         var source = try Store.openManaged(alloc, &manager, memory.storage(), "/mark-admission", false);
@@ -5200,7 +5345,7 @@ fn testPublicationMemoryPressure(selective: bool) !void {
     defer raw.deinit();
     var budgets = resources.Options.defaultBudgets();
     const limit = 32 * 1024 * 1024;
-    budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+    budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
     var manager = resources.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var source = try Store.openManaged(alloc, &manager, memory.storage(), "/publication-memory", false);
@@ -5223,7 +5368,7 @@ fn testPublicationMemoryPressure(selective: bool) !void {
     try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
     while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
     const prefix_bytes = source.marking.?.boundary.committed_bytes;
-    const vector = [_]f32{1} ** 256;
+    const vector = @as([256]f32, @splat(1));
     const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 3, &vector);
     defer alloc.free(artifact);
     for (0..1024) |i| {
@@ -5395,7 +5540,7 @@ test "source vector payloads WAL admission cancels unpublished marks and retains
     defer alloc.free(value);
     try store.put(key, value);
     try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
-    const vector = [_]f32{2} ** 2048;
+    const vector = @as([2048]f32, @splat(2));
     const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &vector);
     defer alloc.free(artifact);
     MarkInterleaving.entered.store(false, .release);
@@ -5619,8 +5764,8 @@ test "source vector payloads delta inventory retires only cut WAL events and pre
     const alloc = allocator_state.allocator();
     var inventory: Store.Inventory = .{ .delta = true };
     defer inventory.deinit(alloc);
-    const first: payload.Digest = [_]u8{1} ** 32;
-    const second: payload.Digest = [_]u8{2} ** 32;
+    const first: payload.Digest = @as([32]u8, @splat(1));
+    const second: payload.Digest = @as([32]u8, @splat(2));
     // Batch zero is real. Reappearance in a later batch must keep the single
     // WAL contribution when an earlier occurrence crosses the checkpoint cut.
     try inventory.addWal(alloc, &first, 2, 0);
@@ -6065,7 +6210,7 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         fn hook(_: *Store, current: Store.CheckpointPhase) !void {
             if (current != phase) return;
             entered.store(true, .release);
-            while (!resume_work.load(.acquire)) std.Thread.yield() catch {};
+            while (!resume_work.load(.acquire)) @import("antfly_platform").time.yieldNow();
         }
         fn run(source: *Store) void {
             source.lock();
@@ -6148,12 +6293,12 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         const wait_started = time.monotonicNs();
         while (source.checkpoint_write_waiters.load(.acquire) == 0) {
             if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
         // A blocked writer releases SourceLock so publication can finish.
         while (!source.mutex.tryLock()) {
             if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            std.Thread.yield() catch {};
+            @import("antfly_platform").time.yieldNow();
         }
         source.mutex.unlock();
     } else {
@@ -6384,7 +6529,7 @@ test "source vector payloads GC scan preserves snapshots without admitting prima
         errdefer txn.abort();
         for (0..96) |i| {
             var buf: [32]u8 = undefined;
-            try txn.put(try std.fmt.bufPrint(&buf, "scalar-{d:0>8}", .{i}), "x" ** 1024);
+            try txn.put(try std.fmt.bufPrint(&buf, "scalar-{d:0>8}", .{i}), z17RepeatString("x", 1024));
         }
         try txn.commit();
     }
@@ -6408,7 +6553,7 @@ test "source vector payloads GC scan preserves snapshots without admitting prima
     try std.testing.expectEqual(@as(u64, 0), source.stats.retained_payloads);
 }
 
-test "source vector payloads GC liveness defers payload checksums but reads and copies reject corruption" {
+test "source vector payloads durable retries and GC liveness defer checksums but reads and copies reject corruption" {
     const a = std.testing.allocator;
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
@@ -6440,6 +6585,19 @@ test "source vector payloads GC liveness defers payload checksums but reads and 
         bytes[offset] ^= 1;
         defer bytes[offset] ^= 1;
         const generation = source.currentGeneration();
+        const before_wal = source.opened.store.wal_committed_bytes;
+        const before_prepared = source.stats.prepared_payloads;
+        for ([_]bool{ false, true }) |group_commit| {
+            source.group_commit = group_commit;
+            // A durable retry does not consume/republish the damaged bytes.
+            // Keep integrity validation on reads and copy plans below.
+            try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+            var wrong = ref;
+            wrong.dims += 1;
+            try std.testing.expectError(error.VectorReferenceIdentityMismatch, Store.prepare(&source, &.{.{ .reference = wrong, .artifact = artifact }}));
+        }
+        try std.testing.expectEqual(before_wal, source.opened.store.wal_committed_bytes);
+        try std.testing.expectEqual(before_prepared, source.stats.prepared_payloads);
         try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
         try std.testing.expectEqual(generation, source.currentGeneration());
         try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
@@ -6460,8 +6618,8 @@ test "source vector payloads GC identity validation rejects missing tombstone di
     var writer = try native.Store.open(a, memory.storage(), "/gc-identities");
     defer writer.deinit();
     try writer.publishEmptyBase(1, 0, .{ .shard_count = 16, .encoding = .float32 });
-    const digest = [_]u8{1} ** 32;
-    const missing = [_]u8{2} ** 32;
+    const digest = @as([32]u8, @splat(1));
+    const missing = @as([32]u8, @splat(2));
     try writer.appendBatch(1, &.{.{ .kind = .upsert, .key = &digest, .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2, 3 } }}, 1, .{});
     var old = try native.Store.openReadOnlyWithBlocks(a, memory.storage(), "/gc-identities");
     defer old.deinit();
@@ -6714,4 +6872,313 @@ test "source vector payloads detached reader failure retains authority and retri
     while (!try source.collectStep(&raw, 1)) {}
     try source.advanceCollectionReaders();
     try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
+}
+
+fn preparationMetadataFailures(alloc: Allocator) !void {
+    var buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var buffer: std.heap.BufferFirstAllocator = .init(&buffer_storage, alloc);
+    var metadata: PreparationMetadata = .{ .alloc = buffer.allocator() };
+    defer metadata.deinit();
+    for (0..128) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        try std.testing.expect(try metadata.append(digest, .{ .kind = .upsert, .key = "key", .source_sequence = 1, .revision = 1 }));
+        try std.testing.expect(!try metadata.append(digest, .{ .kind = .upsert, .key = "duplicate", .source_sequence = 2, .revision = 2 }));
+    }
+    try std.testing.expectEqual(@as(usize, 128), metadata.records.items.len);
+}
+
+test "source vector payloads preparation metadata grows only with eligible unique records" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var buffer: std.heap.BufferFirstAllocator = .init(&buffer_storage, failing.allocator());
+    var metadata: PreparationMetadata = .{ .alloc = buffer.allocator() };
+    defer metadata.deinit();
+    try std.testing.expect(try metadata.append(@splat(0), .{ .kind = .upsert, .key = "one", .source_sequence = 1, .revision = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), metadata.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preparationMetadataFailures, .{});
+}
+
+test "source vector payloads mixed retry appends only missing records and deduplicates grouped requests" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/mixed-preparation", false);
+    defer store.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 17, &.{ 0.5, 0.25 });
+    defer alloc.free(artifact);
+    var prepared: [130]payload.Prepared = undefined;
+    for (prepared[0..129], 0..) |*item, i| {
+        var name: [32]u8 = undefined;
+        const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&name, "document-{d}", .{i}), "model");
+        defer alloc.free(key);
+        item.* = .{ .reference = try payload.Reference.forArtifact(key, artifact), .artifact = artifact };
+    }
+    try store.prepareBatch(prepared[1..129]);
+    const previous = store.stats.prepared_payloads;
+    prepared[129] = prepared[0];
+    try store.prepareBatch(&prepared);
+    try std.testing.expectEqual(previous + 1, store.stats.prepared_payloads);
+    try store.prepareBatch(&prepared);
+    try std.testing.expectEqual(previous + 1, store.stats.prepared_payloads);
+    for (&prepared) |item| {
+        const found = try store.opened.get(&item.reference.digest, std.math.maxInt(u64), null);
+        try std.testing.expect(found == .vector);
+        try std.testing.expectEqual(@as(u32, 2), found.vector.dims);
+    }
+}
+
+test "source vector payloads duplicate metadata at its load limit does not grow" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var metadata: PreparationMetadata = .{ .alloc = failing.allocator() };
+    defer metadata.deinit();
+    try metadata.seen.ensureTotalCapacity(metadata.alloc, 1);
+    const capacity = metadata.seen.capacity();
+    const limit = @as(usize, capacity) * std.hash_map.default_max_load_percentage / 100;
+    var first: payload.Digest = @splat(0);
+    for (0..limit) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        if (i == 0) first = digest;
+        try std.testing.expect(try metadata.claim(digest));
+    }
+    const allocations = failing.alloc_index;
+    for (0..256) |_| try std.testing.expect(!try metadata.claim(first));
+    try std.testing.expectEqual(capacity, metadata.seen.capacity());
+    try std.testing.expectEqual(allocations, failing.alloc_index);
+}
+
+test "source vector payloads durable retries bypass write scratch under admission pressure" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var budgets = resources.Options.defaultBudgets();
+    const limit = 16 * 1024 * 1024;
+    budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var source = try Store.openManaged(alloc, &manager, memory.storage(), "/retry-admission", false);
+    defer source.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    const ref = try payload.Reference.forArtifact("doc", artifact);
+    try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+    _ = source.budget.?.releaseUnusedCredit();
+    const used = manager.sliceStats(.dense_source_payload_state).used_bytes;
+    var held = try manager.reserve(.dense_source_payload_state, limit - used - 64 * 1024);
+    defer held.release();
+    const before_wal = source.opened.store.wal_committed_bytes;
+    const prepared = @as([256]payload.Prepared, @splat(.{ .reference = ref, .artifact = artifact }));
+    for ([_]bool{ false, true }) |group_commit| {
+        source.group_commit = group_commit;
+        try Store.prepare(&source, &prepared);
+        try std.testing.expectEqual(before_wal, source.opened.store.wal_committed_bytes);
+    }
+    // A real write still requires admission and must fail before durability,
+    // preserving the already-committed payload and WAL on rejection.
+    const fresh = try payload.Reference.forArtifact("fresh", artifact);
+    try std.testing.expectError(error.ResourceBudgetExceeded, Store.prepare(&source, &.{.{ .reference = fresh, .artifact = artifact }}));
+    try std.testing.expectEqual(before_wal, source.opened.store.wal_committed_bytes);
+    try std.testing.expect(!source.poisoned);
+    const resolved = try Store.resolve(&source, alloc, "doc", ref);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, artifact, resolved);
+}
+
+test "source vector payloads duplicate fresh writes reserve only unique publication scratch" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var budgets = resources.Options.defaultBudgets();
+    const limit = 16 * 1024 * 1024;
+    budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var source = try Store.openManaged(alloc, &manager, memory.storage(), "/unique-admission", false);
+    defer source.deinit();
+    source.group_commit = false;
+    _ = source.budget.?.releaseUnusedCredit();
+    const used = manager.sliceStats(.dense_source_payload_state).used_bytes;
+    var held = try manager.reserve(.dense_source_payload_state, limit - used - 3 * 1024 * 1024);
+    defer held.release();
+    const vector = @as([128]f32, @splat(1));
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &vector);
+    defer alloc.free(artifact);
+    const ref = try payload.Reference.forArtifact("doc", artifact);
+    const prepared = @as([1024]payload.Prepared, @splat(.{ .reference = ref, .artifact = artifact }));
+    try Store.prepare(&source, &prepared);
+    try std.testing.expectEqual(@as(u64, 1), source.stats.prepared_payloads);
+    const resolved = try Store.resolve(&source, alloc, "doc", ref);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, artifact, resolved);
+}
+
+test "source vector payloads preparation rechecks eligibility after unlocked checkpoint overlap" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/eligibility-overlap", false);
+    defer source.deinit();
+    source.group_commit = false;
+    source.unlocked_checkpoint = true;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    const initial = try payload.Reference.forArtifact("initial", artifact);
+    const next = try payload.Reference.forArtifact("next", artifact);
+    try Store.prepare(&source, &.{.{ .reference = initial, .artifact = artifact }});
+    const Hook = struct {
+        var item: payload.Prepared = undefined;
+        var called: bool = false;
+        fn run(store: *Store, phase: Store.CheckpointPhase) !void {
+            if (phase != .stage or called) return;
+            called = true;
+            // The checkpoint has released SourceLock. Model an overlapping
+            // writer committing the same digest selected by the outer writer.
+            try store.prepareBatch(&.{item});
+        }
+    };
+    Hook.item = .{ .reference = next, .artifact = artifact };
+    Hook.called = false;
+    source.checkpoint_test_hook = Hook.run;
+    defer source.checkpoint_test_hook = null;
+    source.wal_admission_bytes = 1;
+    try Store.prepare(&source, &.{Hook.item});
+    try std.testing.expect(Hook.called);
+    try std.testing.expectEqual(@as(u64, 2), source.stats.prepared_payloads);
+    try std.testing.expectEqual(@as(u64, 2), source.stats.retained_payloads);
+    const resolved = try Store.resolve(&source, alloc, "next", next);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, artifact, resolved);
+}
+
+fn testPreparationMetadataPressure(mode: enum { reclaimable, protected, backing }) !void {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var budgets = resources.Options.defaultBudgets();
+    const limit = 16 * 1024 * 1024;
+    budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var source = try Store.openManaged(alloc, &manager, memory.storage(), "/review-collection", false);
+    defer source.deinit();
+    source.group_commit = false;
+    const collection = try source.alloc.create(Store.Collection);
+    collection.* = .{
+        .input = try source.opened.clone(source.alloc),
+        .live = LiveSet.init(source.alloc),
+        .tail = .init(source.alloc),
+        .items = try source.alloc.alloc(Store.CollectionItem, 0),
+        .shards = 16,
+        .generation = source.currentGeneration() + 1,
+        .boundary = source.opened.store.walPrefixBoundary(),
+        .total_live_bytes = 0,
+        .marked_live_bytes = 0,
+        .primary_epoch = 0,
+        .ann = @as([32]u8, @splat(0)),
+    };
+    source.collection = collection;
+    try collection.scratch.ensureTotalCapacity(source.alloc, 1024 * 1024);
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var prepared: [128]payload.Prepared = undefined;
+    for (&prepared, 0..) |*item, i| {
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, i, .little);
+        item.* = .{ .reference = try payload.Reference.forArtifact(&identity, artifact), .artifact = artifact };
+    }
+    _ = source.budget.?.releaseUnusedCredit();
+    const used = manager.sliceStats(.dense_source_payload_state).used_bytes;
+    var held: ?resources.Reservation = if (mode == .backing) null else try manager.reserve(.dense_source_payload_state, limit - used);
+    defer if (held) |*reservation| reservation.release();
+    if (mode == .protected) {
+        collection.validation_running = true;
+        defer collection.validation_running = false;
+        try std.testing.expectError(error.ResourceBudgetExceeded, Store.prepare(&source, &prepared));
+        try std.testing.expect(source.collection == collection);
+        try std.testing.expectEqual(@as(u64, 0), source.stats.prepared_payloads);
+    } else if (mode == .backing) {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        const original = source.budget.?.backing;
+        source.budget.?.backing = failing.allocator();
+        defer source.budget.?.backing = original;
+        try std.testing.expectError(error.OutOfMemory, Store.prepare(&source, &prepared));
+        try std.testing.expect(source.collection == collection);
+        try std.testing.expectEqual(@as(u64, 0), source.stats.prepared_payloads);
+    } else {
+        try Store.prepare(&source, &prepared);
+        try std.testing.expect(source.collection == null);
+        try std.testing.expectEqual(@as(u64, 128), source.stats.prepared_payloads);
+    }
+}
+
+test "source vector payloads preparation metadata pressure reclaims only cancellable GC and preserves backing OOM" {
+    try testPreparationMetadataPressure(.reclaimable);
+    try testPreparationMetadataPressure(.protected);
+    try testPreparationMetadataPressure(.backing);
+}
+
+test "source vector payloads lone group request and small view descriptors need no preparation heap" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/group-inline", false);
+    defer source.deinit();
+    source.group_commit = true;
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var prepared: [128]payload.Prepared = undefined;
+    for (&prepared, 0..) |*item, i| {
+        var key: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key, i, .little);
+        item.* = .{ .reference = try payload.Reference.forArtifact(&key, artifact), .artifact = artifact };
+    }
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    source.preparation_alloc = failing.allocator();
+    try Store.prepare(&source, &prepared);
+    try Store.prepare(&source, &prepared);
+    try std.testing.expectEqual(@as(u64, 128), source.stats.prepared_payloads);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "source vector payloads session duplicate insertion at capacity does not grow metadata" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/session-duplicate", false);
+    defer source.deinit();
+    const session = try payload.Session.create(alloc, source.interface());
+    defer session.release();
+    try session.prepared.ensureTotalCapacity(alloc, 16);
+    const capacity = session.prepared.capacity();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    const first = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, "first", "model");
+    defer alloc.free(first);
+    _ = try session.put(first, artifact);
+    for (1..capacity) |i| {
+        var name: [32]u8 = undefined;
+        const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&name, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        _ = try session.put(key, artifact);
+    }
+    try std.testing.expectEqual(capacity, session.prepared.count());
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    session.alloc = failing.allocator();
+    defer session.alloc = alloc;
+    for (0..256) |_| _ = try session.put(first, artifact);
+    try std.testing.expectEqual(capacity, session.prepared.capacity());
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
 }

@@ -67,7 +67,7 @@ const Reader = struct {
     outer: Crc32 = Crc32.init(),
     inner: ?Crc32 = null,
 
-    fn read(self: *Reader, out: []u8) !void {
+    pub fn read(self: *Reader, out: []u8) !void {
         if (out.len > self.size - self.offset) return error.InvalidManifest;
         if (self.remaining) |remaining| {
             if (out.len > remaining) return error.InvalidManifest;
@@ -361,7 +361,7 @@ test "streaming replay validates large records with bounded reads and allocation
 }
 
 test "streaming manifest replay churn benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const allocator = std.heap.smp_allocator;
     const time = @import("antfly_platform").time;
     for ([_]usize{ 64, 256, 1024 }) |edits| {

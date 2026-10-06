@@ -31,7 +31,7 @@ export class ExtractionSession {
     const metadata = { config: bundle.architecture === 'laya' ? JSON.stringify(bundle.config) : await read('config.json'), encoder_config: bundle.architecture === 'laya' ? JSON.stringify(bundle.encoderConfig) : await read('encoder_config/config.json'), tokenizer_config: await read('tokenizer_config.json'), precision: bundle.precision };
     const directories = [];
     for (const path of bundle.weights) directories.push(await tensorDirectory(bundle.files.get(path), path.endsWith('.gguf') ? 'gguf' : 'safetensors'));
-    if (bundle.architecture === 'laya' && directories[0].some(t => ![0, 1].includes(t.kind) || bundle.precision === 'fp32' && t.kind !== 0)) throw new Error('Laya tensor precision does not match the selected dense precision');
+    if (bundle.architecture === 'laya' && directories[0].some(t => ![0, 1, 30].includes(t.kind) || bundle.precision === 'fp32' && t.kind !== 0 || bundle.precision === 'fp16' && t.kind === 30)) throw new Error('Laya tensor precision does not match the selected dense precision');
     try {
       this.handle = this.check(this.text(JSON.stringify(metadata), (ptr, len) => this.wasm.extraction_create(ptr, len)));
       const tokenizer = new Uint8Array(await bundle.files.get('tokenizer.json').arrayBuffer());
@@ -55,7 +55,7 @@ export class ExtractionSession {
           const bytes = new Uint8Array(await file.slice(t.start, t.end).arrayBuffer());
           // Split encoder GGUF uses unprefixed names; boundary GGUF retains
           // the canonical encoder namespace. Never strip boundary names.
-          const name = bundle.architecture === 'span' && bundle.weights.length === 2 && index === 0 ? `encoder.${t.name}` : t.name;
+          const name = ['span', 'decide'].includes(bundle.architecture) && bundle.weights.length === 2 && index === 0 ? `encoder.${t.name}` : t.name;
           this.check(this.text(JSON.stringify({ name, shape: t.shape, kind: t.kind }), (meta, metaLen) => this.bytes(bytes, (ptr, len) => this.wasm.extraction_weight(this.handle, meta, metaLen, ptr, len))));
           progress({ stage: 'weights', file: path, loaded: i + 1, total: directories[index].length });
         }

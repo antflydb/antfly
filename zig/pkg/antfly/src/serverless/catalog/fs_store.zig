@@ -15,7 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
 
@@ -40,7 +40,7 @@ const TableBinding = struct {
     read_schema_json: []u8,
     indexes_json: []u8,
 
-    fn deinit(self: *TableBinding, alloc: Allocator) void {
+    pub fn deinit(self: *TableBinding, alloc: Allocator) void {
         alloc.free(self.table_name);
         alloc.free(self.namespace);
         alloc.free(self.schema_json);

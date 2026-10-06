@@ -31,13 +31,29 @@ pub fn modelSupportsCapability(
     capability: []const u8,
 ) bool {
     // String-only listings do not carry a consumed artifact identity or an
-    // actual backend; even a future family flag/table cannot qualify them.
-    if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type)) return false;
+    // actual backend, so while the family has no reviewed production row at
+    // all, withhold every gliner2.5 capability outright regardless of what
+    // strings are passed in. Once a row exists, a declared capability is
+    // trusted here exactly like any other model's: registry.zig's pull-time
+    // boundaryIdentityIsQualified check is the only place that ever writes a
+    // non-empty capabilities list for a specific gliner2.5 artifact, and the
+    // live session still independently re-checks the exact weight/sidecar
+    // identity, backend, feature set, and geometry via
+    // gliner_boundary_qualification.require() before any request executes.
+    if (std.mem.eql(u8, gliner_model_type, gliner_boundary.model_type) and !gliner_boundary.runtime_available) return false;
     if (hasCapability(capabilities, capability)) return true;
+    // A recognized serving capability list is authoritative. This lets a
+    // GLiNER span artifact expose only its reviewed decision head without
+    // inheriting the legacy family's entity and relation capabilities.
+    for (capabilities) |declared| {
+        if (std.mem.eql(u8, declared, "classification") or
+            std.mem.eql(u8, declared, "relations") or
+            std.mem.eql(u8, declared, "extraction")) return false;
+    }
     if (std.mem.eql(u8, model_kind, "classifier")) {
         return std.mem.eql(u8, capability, "classification");
     }
-    if (!std.mem.eql(u8, model_kind, "recognizer")) return false;
+    if (!std.mem.eql(u8, model_kind, "extractor")) return false;
     if (!std.mem.eql(u8, gliner_model_type, "gliner2")) return false;
     return std.mem.eql(u8, capability, "classification") or
         std.mem.eql(u8, capability, "relations") or
@@ -83,7 +99,6 @@ pub fn modelKindAcceptsInput(
     return std.mem.eql(u8, model_kind, "chunker") or
         std.mem.eql(u8, model_kind, "reranker") or
         std.mem.eql(u8, model_kind, "generator") or
-        std.mem.eql(u8, model_kind, "recognizer") or
         std.mem.eql(u8, model_kind, "classifier") or
         std.mem.eql(u8, model_kind, "rewriter") or
         std.mem.eql(u8, model_kind, "extractor") or
@@ -94,21 +109,28 @@ pub fn modelKindAcceptsInput(
 test "modelSupportsCapability infers gliner2 extraction and classification" {
     try std.testing.expect(modelSupportsCapability("classifier", "", &.{}, "classification"));
     try std.testing.expect(!modelSupportsCapability("classifier", "", &.{}, "extraction"));
-    try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "classification"));
-    try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "relations"));
-    try std.testing.expect(modelSupportsCapability("recognizer", "gliner2", &.{"labels"}, "extraction"));
-    try std.testing.expect(!modelSupportsCapability("recognizer", "", &.{"labels"}, "extraction"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "classification"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "relations"));
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", &.{"labels"}, "extraction"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "", &.{"labels"}, "extraction"));
+}
+
+test "explicit GLiNER serving capabilities do not gain family capabilities" {
+    const decision_capabilities = &.{"classification"};
+    try std.testing.expect(modelSupportsCapability("extractor", "gliner2", decision_capabilities, "classification"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "relations"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2", decision_capabilities, "extraction"));
 }
 
 test "modelKindAcceptsInput infers text and image modalities" {
-    try std.testing.expect(modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "text"));
-    try std.testing.expect(!modelKindAcceptsInput("recognizer", "gliner2", &.{}, false, false, "image"));
+    try std.testing.expect(modelKindAcceptsInput("extractor", "gliner2", &.{}, false, false, "text"));
+    try std.testing.expect(!modelKindAcceptsInput("extractor", "gliner2", &.{}, false, false, "image"));
     try std.testing.expect(modelKindAcceptsInput("reader", "", &.{}, false, false, "image"));
     try std.testing.expect(!modelKindAcceptsInput("reader", "", &.{}, false, false, "text"));
     try std.testing.expect(modelKindAcceptsInput("embedder", "", &.{}, true, false, "image"));
     try std.testing.expect(modelKindAcceptsInput("transcriber", "", &.{}, false, false, "audio"));
-    try std.testing.expect(modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "image"));
-    try std.testing.expect(!modelKindAcceptsInput("recognizer", "", &.{"image"}, false, false, "text"));
+    try std.testing.expect(modelKindAcceptsInput("extractor", "", &.{"image"}, false, false, "image"));
+    try std.testing.expect(!modelKindAcceptsInput("extractor", "", &.{"image"}, false, false, "text"));
 }
 
 /// Artifact compatibility for a non-decoder model class.
@@ -135,13 +157,29 @@ pub fn modelClassCompatibility(man: *const manifest_mod.ModelManifest) Compatibi
     return compatibility_mod.assess(man, man.config_model_arch).level;
 }
 
-test "gliner boundary capabilities wait for an implemented runtime" {
+test "gliner boundary capability trust follows the reviewed family runtime, never model-class dispatch" {
+    // modelClassCompatibility is a separate, still-permanently-closed gate
+    // (ModelManifest.hasSupportedGlinerRuntime never inherits qualification
+    // from the family-wide flag; see its doc comment) from
+    // modelSupportsCapability's declared-capability trust below.
     var boundary = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     boundary.gliner_architecture = .boundary;
     try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&boundary));
-    for ([_][]const u8{ "classification", "relations", "extraction", "labels" }) |capability| {
-        try std.testing.expect(!modelSupportsCapability("recognizer", "gliner2.5", &.{capability}, capability));
+
+    try std.testing.expect(gliner_boundary.runtime_available);
+    // A reviewed family trusts a gliner2.5 model's own declared capabilities
+    // exactly like any other model kind's -- registry.zig's pull-time
+    // boundaryIdentityIsQualified check is what limits which specific
+    // artifacts ever get a non-empty capabilities list in the first place.
+    for ([_][]const u8{ "classification", "relations", "extraction" }) |capability| {
+        try std.testing.expect(modelSupportsCapability("extractor", "gliner2.5", &.{capability}, capability));
     }
+    // An undeclared capability, or an artifact with none declared (the
+    // correct on-disk state for an unqualified digest/variant), is still
+    // denied -- there is no inference bonus for gliner2.5 the way there is
+    // for the legacy "gliner2" span family below.
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2.5", &.{}, "extraction"));
+    try std.testing.expect(!modelSupportsCapability("extractor", "gliner2.5", &.{"extraction"}, "relations"));
 }
 
 test "clipclap stays compatible while standalone clip and clap do not" {

@@ -180,7 +180,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
     },
     "stream": false,
     "steps": {
-      "generation": {"enabled": true}
+      "generation": {}
     }
   }'
 ```
@@ -189,7 +189,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/agents/retrieval \
 
 The response carries `generation`, the answer in markdown with the article ids it drew on, and `hits`, the articles that survived pruning. Render the answer, link the hits as sources. Streaming is the default: drop `"stream": false` (or `--no-streaming`) and the answer arrives as server-sent events instead of one JSON body.
 
-The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
+The generator here is Ollama on the same machine. Gemini, Vertex, OpenAI, OpenRouter, and Antfly Inference work the same way; the [Quickstart](/docs/guides/quickstart#rag-with-alternative-providers) shows each config.
 
 ## Tradeoffs
 

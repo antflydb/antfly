@@ -20,9 +20,10 @@
 //! instead of writing through the standby receive/apply object.
 
 const std = @import("std");
+const storage_contract = @import("../db/replication_contract.zig");
 const fencing = @import("fencing.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;
@@ -169,7 +170,7 @@ const TestPaths = struct {
     slots: [:0]u8,
     progress: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.log);
         alloc.free(self.slots);
         alloc.free(self.progress);
@@ -192,9 +193,9 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), progress_raw) catch {};
 
     return .{
-        .log = try alloc.dupeZ(u8, log_raw),
-        .slots = try alloc.dupeZ(u8, slots_raw),
-        .progress = try alloc.dupeZ(u8, progress_raw),
+        .log = try alloc.dupeSentinel(u8, log_raw, 0),
+        .slots = try alloc.dupeSentinel(u8, slots_raw, 0),
+        .progress = try alloc.dupeSentinel(u8, progress_raw, 0),
     };
 }
 
@@ -363,4 +364,52 @@ test "storage.hot_standby write gate rejects standby until promotion handoff is 
     try std.testing.expectEqual(Action.open_promoted_primary, completed_handoff.action);
     try std.testing.expectEqual(handoff.switch_lsn, completed_handoff.durable_lsn);
     try std.testing.expect(completed_handoff.promotion_handoff != null);
+}
+
+/// Borrowed storage admission adapters. Engine callers can check admission but
+/// cannot reach the primary log, mutable standby, or promotion/fence store.
+pub fn bindPrimary(primary: *const primary_mod.Primary) storage_contract.BorrowedWriteGate {
+    return .{ .ptr = primary, .check_fn = checkPrimary };
+}
+
+pub fn bindStandby(standby: *standby_mod.Standby) storage_contract.BorrowedWriteGate {
+    return .{ .ptr = standby, .check_fn = checkStandby, .allows_background_work = false };
+}
+
+pub fn bindFencedPrimary(gate: FencedPrimary) storage_contract.CapturedWriteGate {
+    return .{ .capture = storage_contract.BorrowedCapture.init(FencedPrimary, gate), .check_fn = checkFenced, .equal_fn = equalFenced };
+}
+
+pub fn runtimeFencedPrimary(gate: storage_contract.CapturedWriteGate) !FencedPrimary {
+    if (gate.check_fn != checkFenced) return error.UnsupportedReplicationWriteGate;
+    return gate.capture.read(FencedPrimary);
+}
+
+fn checkPrimary(ptr: *const anyopaque) !void {
+    const primary: *const primary_mod.Primary = @ptrCast(@alignCast(ptr));
+    try requireWrite(try evaluatePrimary(primary, .{}));
+}
+
+fn checkStandby(ptr: *const anyopaque) !void {
+    const standby: *standby_mod.Standby = @ptrCast(@alignCast(@constCast(ptr)));
+    try requireWrite(try evaluateStandby(standby, .{}));
+}
+
+fn equalFenced(left: storage_contract.CapturedWriteGate, right: storage_contract.CapturedWriteGate) bool {
+    const a = runtimeFencedPrimary(left) catch return false;
+    const b = runtimeFencedPrimary(right) catch return false;
+    return a.primary == b.primary and a.fence_store == b.fence_store and std.mem.eql(u8, a.node_id, b.node_id);
+}
+
+fn checkFenced(gate: storage_contract.CapturedWriteGate) !void {
+    try requireWrite(try evaluateFencedPrimary(try runtimeFencedPrimary(gate), .{}));
+}
+
+fn requireWrite(decision: Decision) !void {
+    switch (decision.action) {
+        .allow_write => {},
+        .reject_read_only_standby => return error.HAReadOnlyStandby,
+        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+        .reject_fenced_primary => return error.HAFencedPrimary,
+    }
 }

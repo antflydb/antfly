@@ -84,6 +84,7 @@ pub const ContentSecurityConfig = struct {
     max_download_size_bytes: ?u64 = null,
     download_timeout_seconds: ?u32 = null,
     max_image_dimension: ?u32 = null,
+    /// Local file downloads require an explicit, nonempty path allowlist.
     allowed_paths: ?[]const []u8 = null,
     user_agent: ?[]u8 = null,
 
@@ -694,6 +695,9 @@ fn downloadFileAllocWithContext(
     path: []const u8,
     security: ?*const ContentSecurityConfig,
 ) !DownloadedContent {
+    // Authorization precedes timeout handling so forbidden file requests are
+    // permanent denials even when the caller supplies a request deadline.
+    try requireFileAccess(security);
     // std.Io file operations are cancelable but do not accept a deadline.
     // Waiting for a canceled blocking filesystem task can itself remain
     // blocked on a network filesystem, so reject a claimed time ceiling
@@ -712,11 +716,7 @@ fn downloadFileAllocWithIo(
     path: []const u8,
     security: ?*const ContentSecurityConfig,
 ) !DownloadedContent {
-    if (security) |cfg| {
-        if (cfg.allowed_paths) |allowed_paths| {
-            if (allowed_paths.len == 0) return error.PathNotAllowed;
-        }
-    }
+    try requireFileAccess(security);
 
     const limit = maxDownloadSize(security);
     try validateFilePathSecurityBeforeOpen(alloc, io, path, security);
@@ -730,6 +730,12 @@ fn downloadFileAllocWithIo(
         .content_type = try alloc.dupe(u8, guessMimeType(path)),
         .data = data,
     };
+}
+
+fn requireFileAccess(security: ?*const ContentSecurityConfig) !void {
+    const cfg = security orelse return error.PathNotAllowed;
+    const allowed_paths = cfg.allowed_paths orelse return error.PathNotAllowed;
+    if (allowed_paths.len == 0) return error.PathNotAllowed;
 }
 
 fn allocRemainingBounded(reader: *std.Io.Reader, alloc: Allocator, max_size: usize) ![]u8 {
@@ -940,7 +946,7 @@ fn s3AuthorityMatchesEndpoint(
 fn validateUrlSecurity(parsed: std.Uri, security: ?*const ContentSecurityConfig) !void {
     const cfg = security orelse return;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = (parsed.getHost(&host_buffer) catch return error.InvalidHost).bytes;
+    const host = ((parsed.host orelse return error.InvalidHost).toRaw(&host_buffer) catch return error.InvalidHost);
 
     if (cfg.allowed_hosts) |allowed_hosts| {
         var allowed = false;
@@ -1406,21 +1412,40 @@ test "download content reads percent encoded file uri" {
     const uri = try std.mem.replaceOwned(u8, alloc, raw_uri, " ", "%20");
     defer alloc.free(uri);
 
-    var downloaded = try downloadContentAlloc(alloc, uri, null, null);
+    const paths = [_][]u8{abs_path};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
+    var downloaded = try downloadContentAlloc(alloc, uri, &security, null);
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("image/png", downloaded.content_type);
     try std.testing.expectEqualStrings("png-bytes", downloaded.data);
 }
 
+test "file downloads require explicit paths before opening a target" {
+    const alloc = std.testing.allocator;
+    const uri = "file:///path/that/does/not/exist";
+    const omitted = ContentSecurityConfig{ .block_private_ips = true };
+    const empty = ContentSecurityConfig{ .allowed_paths = &.{} };
+    try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, null, null));
+    try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, &omitted, null));
+    try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, &empty, null));
+    try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, .{ .io = std.testing.io }, uri, &omitted, null));
+    const deadline_context = DownloadContext{ .io = std.testing.io, .timeout_ms = 1 };
+    try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, deadline_context, uri, null, null));
+    try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, deadline_context, uri, &omitted, null));
+    try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, deadline_context, uri, &empty, null));
+}
+
 test "deadline-bound file downloads fail closed when file IO cannot enforce timeouts" {
     const context = DownloadContext{ .io = std.testing.io, .timeout_ms = 1 };
+    const paths = [_][]u8{@constCast("/not-opened-because-timeout-is-unsupported.txt")};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
     try std.testing.expectError(
         error.FileTimeoutUnsupported,
         downloadContentOutcomeAllocWithContext(
             std.testing.allocator,
             context,
             "file:///not-opened-because-timeout-is-unsupported.txt",
-            null,
+            &security,
             null,
         ),
     );
@@ -1434,11 +1459,13 @@ test "caller-owned IO preserves file downloads without a request deadline" {
     const path = try tmp.dir.realPathFileAlloc(std.testing.io, "context.txt", alloc);
     defer alloc.free(path);
 
+    const paths = [_][]u8{path};
+    const security = ContentSecurityConfig{ .allowed_paths = &paths };
     var downloaded = try downloadFileAllocWithContext(
         alloc,
         .{ .io = std.testing.io },
         path,
-        null,
+        &security,
     );
     defer downloaded.deinit(alloc);
     try std.testing.expectEqualStrings("bounded by size", downloaded.data);
@@ -1455,7 +1482,10 @@ test "file download accepts an exact cap and rejects cap plus one" {
     defer alloc.free(exact);
     const over = try tmp.dir.realPathFileAlloc(std.testing.io, "over.txt", alloc);
     defer alloc.free(over);
-    const security = ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const paths = [_][]u8{root};
+    const security = ContentSecurityConfig{ .max_download_size_bytes = 4, .allowed_paths = &paths };
 
     var downloaded = try downloadFileAlloc(alloc, exact, &security);
     defer downloaded.deinit(alloc);

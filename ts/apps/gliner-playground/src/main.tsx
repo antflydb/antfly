@@ -66,6 +66,7 @@ function App() {
   const [capability, setCapability] = useState("Checking browser capabilities…");
   const entry = catalog.find((item) => item.id === selected)!;
   const architecture = model?.architecture ?? rememberedArchitecture ?? entry.architecture;
+  const decisionModel = architecture === "laya" || architecture === "decide";
   useEffect(() => {
     client.current = new InferenceClient();
     void detectCapabilities().then((c) =>
@@ -79,7 +80,7 @@ function App() {
   function request(): Request {
     if (advanced) return JSON.parse(json) as Request;
     const names = split(labels);
-    if (architecture === "laya")
+    if (decisionModel)
       return {
         schema_version: 2,
         model: files ? `local:${localName}` : selected,
@@ -88,7 +89,7 @@ function App() {
           classifications: [
             {
               name: "decision",
-              mode: decisionMode,
+              mode: architecture === "decide" && decisionMode === "boolean" ? "single" : decisionMode,
               instruction,
               labels: decisionMode === "boolean" ? ["false", "true"] : split(decisionLabels),
             },
@@ -318,7 +319,7 @@ function App() {
                   onChange={(e) => setPrecision(e.target.value as Precision)}
                   disabled={busy || Boolean(model)}
                 >
-                  {["q8_0", "q4_k", "q4_0", "fp32", "fp16", "fp16_encoder"].map((p) => (
+                  {["q8_0", "q4_k", "q4_0", "fp32", "fp16", "bf16", "fp16_encoder"].map((p) => (
                     <option key={p}>{p}</option>
                   ))}
                 </select>
@@ -353,7 +354,7 @@ function App() {
         )}
         {model?.backend === "webgpu" && model.architecture === "laya" && (
           <p className="note">
-            GPU-resident FP16 weights · WebGPU encoder and decision heads. Tokenization, token
+            GPU-resident projection weights · WebGPU encoder and decision heads. Tokenization, token
             embedding lookup and final decision calibration use WASM CPU.
           </p>
         )}
@@ -380,9 +381,11 @@ function App() {
               <p className="note">
                 Canonical request; preserved verbatim. The builder is separate and does not modify
                 this JSON.
-                {architecture === "laya"
-                  ? " Laya accepts named single, ordinal and boolean classifications with instructions; entity extraction and long-document windows are unsupported."
-                  : " GLiNER2.5 supports mixed schemas, attributes, constraints and JointIE."}
+                {architecture === "decide"
+                  ? " Decide accepts named single, multi-label and ordinal classifications with instructions, label descriptions and examples; entity extraction and long-document windows are unsupported."
+                  : architecture === "laya"
+                    ? " Laya accepts named single, ordinal and boolean classifications with instructions; entity extraction and long-document windows are unsupported."
+                    : " GLiNER2.5 supports mixed schemas, attributes, constraints and JointIE."}
               </p>
               {architecture === "boundary" && (
                 <label>
@@ -420,7 +423,7 @@ function App() {
             </>
           ) : (
             <>
-              {architecture === "laya" ? (
+              {decisionModel ? (
                 <>
                   <label>
                     Decision type
@@ -468,9 +471,9 @@ function App() {
                     </label>
                   )}
                   <p className="note">
-                    Laya returns calibrated distributions and an action probability. It does not
-                    generate arguments or execute tools. Up to 16 questions per input in Advanced
-                    JSON; questions run serially.
+                    {architecture === "decide"
+                      ? "Decide scores classification labels with its [L] marker head. Use Advanced JSON for multiple tasks, label descriptions and examples. Load a local Q8 bundle with its matching encoder and head."
+                      : "Laya returns typed decision distributions. Packed checkpoints share a state trunk across questions and support candidate branches and two-stage choices. Up to 16 questions per input in Advanced JSON."}
                   </p>
                 </>
               ) : (
@@ -515,7 +518,7 @@ function App() {
                   disabled={busy}
                   onClick={() => {
                     setText(
-                      architecture === "laya"
+                      decisionModel
                         ? "Please search for the latest documentation about browser inference."
                         : examples[task]
                     );
@@ -543,7 +546,7 @@ function App() {
                 </label>
                 <span>{new TextEncoder().encode(text).length.toLocaleString()} bytes</span>
               </div>
-              {architecture !== "laya" &&
+              {!decisionModel &&
                 (task !== "structures" ? (
                   <label>
                     {task === "classification" ? "Classification labels" : "Entity labels"}
@@ -559,7 +562,7 @@ function App() {
                     customize fields and cardinalities.
                   </p>
                 ))}
-              {architecture !== "laya" && task === "relations" && (
+              {!decisionModel && task === "relations" && (
                 <label>
                   Relation types
                   <input
@@ -570,7 +573,7 @@ function App() {
                 </label>
               )}
               <div className="controls">
-                {architecture !== "laya" && (
+                {!decisionModel && (
                   <label>
                     Threshold: {threshold.toFixed(2)}
                     <input

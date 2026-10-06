@@ -26,7 +26,7 @@ const metal_compute_mod = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 const native_blas = @import("native.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = std.c;
 
 pub const TimingStats = struct {
     prepare_calls: u64 = 0,
@@ -1058,7 +1058,7 @@ const ReservedHiddenCarrier = struct {
         self.active_front = !self.active_front;
     }
 
-    fn deinit(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, keep_active: bool) void {
+    pub fn deinit(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, keep_active: bool) void {
         if (keep_active) {
             cb.free(self.inactive());
         } else {
@@ -1245,8 +1245,8 @@ fn computePleVectorsDirect(
     defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
 
     var started_at = monotonicNowNs();
-    const token_w = gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
+    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
         else => return err,
     };
     var finished_at = monotonicNowNs();
@@ -1340,8 +1340,8 @@ fn computePleVectorsDirectFromTokenTensor(
     defer metal_compute_mod.MetalCompute.endPlannedGraphScope(cb, planned_scope) catch {};
 
     var started_at = monotonicNowNs();
-    const token_w = gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
+    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
         else => return err,
     };
     var finished_at = monotonicNowNs();
@@ -1485,7 +1485,7 @@ const BackendOwnedGreedyTokenResult = struct {
     token_id: i64,
     final_hidden: ?ops.CT = null,
 
-    fn deinit(self: *BackendOwnedGreedyTokenResult, cb: *const ops.ComputeBackend) void {
+    pub fn deinit(self: *BackendOwnedGreedyTokenResult, cb: *const ops.ComputeBackend) void {
         if (self.final_hidden) |hidden| cb.free(hidden);
         self.* = undefined;
     }
@@ -1652,8 +1652,8 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
     const token_embedding_weight = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_embedding_weight);
     const ple_token_embedding_weight: ?ops.CT = if (gpt_config.hasPle())
-        gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-            error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
+        gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+            error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
             else => return err,
         }
     else
@@ -1909,8 +1909,8 @@ pub fn prewarmPleTokenEmbedding(
     if (gpt_config.family != .gemma or !gpt_config.hasPle()) return false;
     if (gpt_config.ple_hidden_size == 0 or gpt_config.num_hidden_layers == 0) return false;
     const ple_total_dim = try std.math.mul(usize, gpt_config.ple_hidden_size, gpt_config.num_hidden_layers);
-    const token_w = gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
+    const token_w = gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+        error.MissingWeight => try gpt_arch.getModelEmbeddingWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
         else => return err,
     };
     defer cb.free(token_w);

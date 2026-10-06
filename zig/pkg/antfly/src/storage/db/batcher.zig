@@ -98,7 +98,7 @@ const TextReplayAccumulator = struct {
     document_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *TextReplayAccumulator) void {
+    pub fn deinit(self: *TextReplayAccumulator) void {
         var delete_it = self.pre_deletes.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pre_deletes.deinit(self.alloc);
@@ -220,7 +220,7 @@ const DenseReplayAccumulator = struct {
     dense_embedding_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *DenseReplayAccumulator) void {
+    pub fn deinit(self: *DenseReplayAccumulator) void {
         var delete_it = self.pre_deletes.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pre_deletes.deinit(self.alloc);
@@ -454,7 +454,7 @@ const SparseReplayAccumulator = struct {
     sparse_embedding_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *SparseReplayAccumulator) void {
+    pub fn deinit(self: *SparseReplayAccumulator) void {
         var delete_it = self.pre_deletes.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.pre_deletes.deinit(self.alloc);
@@ -639,7 +639,7 @@ const GraphReplayAccumulator = struct {
     mutation_count: usize = 0,
     last_sequence: u64 = 0,
 
-    fn deinit(self: *GraphReplayAccumulator) void {
+    pub fn deinit(self: *GraphReplayAccumulator) void {
         var delete_it = self.deleted_keys.iterator();
         while (delete_it.next()) |entry| self.alloc.free(entry.key_ptr.*);
         self.deleted_keys.deinit(self.alloc);
@@ -729,7 +729,7 @@ const GraphReplayAccumulator = struct {
     }
 
     fn recordGraphWrite(self: *GraphReplayAccumulator, write: types.GraphEdgeWrite) !void {
-        const owned_key = try edgeKeyAlloc(self.alloc, write.source, write.target, write.edge_type);
+        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         errdefer self.alloc.free(owned_key);
 
         if (self.graph_deletes.fetchRemove(owned_key)) |removed| {
@@ -754,13 +754,7 @@ const GraphReplayAccumulator = struct {
     }
 
     fn recordGraphDelete(self: *GraphReplayAccumulator, delete: types.GraphEdgeDelete) !void {
-        if (self.deleted_keys.contains(delete.source) or self.deleted_keys.contains(delete.target) or
-            self.doc_clears.contains(delete.source) or self.doc_clears.contains(delete.target))
-        {
-            return;
-        }
-
-        const owned_key = try edgeKeyAlloc(self.alloc, delete.source, delete.target, delete.edge_type);
+        const owned_key = try internal_keys.graphRelationshipArtifactKeyAlloc(self.alloc, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         errdefer self.alloc.free(owned_key);
 
         if (self.graph_writes.fetchRemove(owned_key)) |removed| {
@@ -768,6 +762,16 @@ const GraphReplayAccumulator = struct {
             var removed_value = removed.value;
             deinitGraphWrite(self.alloc, &removed_value);
             self.mutation_count -= 1;
+        }
+
+        // Clear subsumption concerns old producer state. A later delete must
+        // still cancel any write queued after that clear before it is elided.
+        // Incident deletes for other producers remain exact replay mutations.
+        if (self.deleted_keys.contains(delete.producingDocument()) or
+            self.doc_clears.contains(delete.producingDocument()))
+        {
+            self.alloc.free(owned_key);
+            return;
         }
 
         var owned = try cloneGraphDelete(self.alloc, delete);
@@ -794,7 +798,7 @@ const GraphReplayAccumulator = struct {
         var writes_it = self.graph_writes.iterator();
         while (writes_it.next()) |entry| {
             const write = entry.value_ptr.*;
-            if (std.mem.eql(u8, write.source, key) or std.mem.eql(u8, write.target, key)) {
+            if (std.mem.eql(u8, write.producingDocument(), key)) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -812,7 +816,7 @@ const GraphReplayAccumulator = struct {
         var deletes_it = self.graph_deletes.iterator();
         while (deletes_it.next()) |entry| {
             const delete = entry.value_ptr.*;
-            if (std.mem.eql(u8, delete.source, key) or std.mem.eql(u8, delete.target, key)) {
+            if (std.mem.eql(u8, delete.producingDocument(), key)) {
                 try remove_keys.append(self.alloc, try self.alloc.dupe(u8, entry.key_ptr.*));
             }
         }
@@ -956,7 +960,13 @@ fn lessThanGraphWrite(_: void, lhs: types.GraphEdgeWrite, rhs: types.GraphEdgeWr
     if (source_cmp != .eq) return source_cmp == .lt;
     const target_cmp = std.mem.order(u8, lhs.target, rhs.target);
     if (target_cmp != .eq) return target_cmp == .lt;
-    return std.mem.order(u8, lhs.edge_type, rhs.edge_type) == .lt;
+    const type_cmp = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
+    if (type_cmp != .eq) return type_cmp == .lt;
+    const id_cmp = std.mem.order(u8, lhs.edge_id, rhs.edge_id);
+    if (id_cmp != .eq) return id_cmp == .lt;
+    const owner_cmp = std.mem.order(u8, lhs.owner_document, rhs.owner_document);
+    if (owner_cmp != .eq) return owner_cmp == .lt;
+    return std.mem.order(u8, lhs.owner, rhs.owner) == .lt;
 }
 
 fn lessThanGraphDelete(_: void, lhs: types.GraphEdgeDelete, rhs: types.GraphEdgeDelete) bool {
@@ -964,7 +974,13 @@ fn lessThanGraphDelete(_: void, lhs: types.GraphEdgeDelete, rhs: types.GraphEdge
     if (source_cmp != .eq) return source_cmp == .lt;
     const target_cmp = std.mem.order(u8, lhs.target, rhs.target);
     if (target_cmp != .eq) return target_cmp == .lt;
-    return std.mem.order(u8, lhs.edge_type, rhs.edge_type) == .lt;
+    const type_cmp = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
+    if (type_cmp != .eq) return type_cmp == .lt;
+    const id_cmp = std.mem.order(u8, lhs.edge_id, rhs.edge_id);
+    if (id_cmp != .eq) return id_cmp == .lt;
+    const owner_cmp = std.mem.order(u8, lhs.owner_document, rhs.owner_document);
+    if (owner_cmp != .eq) return owner_cmp == .lt;
+    return std.mem.order(u8, lhs.owner, rhs.owner) == .lt;
 }
 
 fn cloneDerivedDocument(alloc: Allocator, doc: derived_types.DerivedDocument) !derived_types.DerivedDocument {
@@ -1145,40 +1161,66 @@ test "sparse replay preserves multiple artifact members for one source key" {
 }
 
 fn cloneGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {
-    return .{
-        .index_name = try alloc.dupe(u8, write.index_name),
-        .source = try alloc.dupe(u8, write.source),
-        .target = try alloc.dupe(u8, write.target),
-        .edge_type = try alloc.dupe(u8, write.edge_type),
-        .weight = write.weight,
-        .created_at = write.created_at,
-        .updated_at = write.updated_at,
-        .metadata_json = if (write.metadata_json.len > 0) try alloc.dupe(u8, write.metadata_json) else "",
-    };
+    return write.cloneAlloc(alloc);
 }
 
 fn deinitGraphWrite(alloc: Allocator, write: *types.GraphEdgeWrite) void {
-    alloc.free(@constCast(write.index_name));
-    alloc.free(@constCast(write.source));
-    alloc.free(@constCast(write.target));
-    alloc.free(@constCast(write.edge_type));
-    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-    write.* = undefined;
+    write.deinit(alloc);
 }
 
 fn cloneGraphDelete(alloc: Allocator, delete: types.GraphEdgeDelete) !types.GraphEdgeDelete {
-    return .{
-        .index_name = try alloc.dupe(u8, delete.index_name),
-        .source = try alloc.dupe(u8, delete.source),
-        .target = try alloc.dupe(u8, delete.target),
-        .edge_type = try alloc.dupe(u8, delete.edge_type),
-    };
+    return delete.cloneAlloc(alloc);
 }
 
 fn deinitGraphDelete(alloc: Allocator, delete: *types.GraphEdgeDelete) void {
-    alloc.free(@constCast(delete.index_name));
-    alloc.free(@constCast(delete.source));
-    alloc.free(@constCast(delete.target));
-    alloc.free(@constCast(delete.edge_type));
-    delete.* = undefined;
+    delete.deinit(alloc);
+}
+
+test "graph replay node clears do not subsume independently owned fact deletions" {
+    const alloc = std.testing.allocator;
+    for ([_]types.GraphEdgeDelete{
+        .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one" },
+        .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .owner = "fact:one" },
+    }) |deletion| for ([_]bool{ false, true }) |clear_first| {
+        var accumulator = GraphReplayAccumulator{ .alloc = alloc, .index_name = "facts" };
+        defer accumulator.deinit();
+        if (clear_first) try accumulator.recordDocClear("a");
+        try accumulator.recordGraphDelete(deletion);
+        if (!clear_first) try accumulator.recordDocDelete("b");
+        try std.testing.expectEqual(@as(usize, 1), accumulator.graph_deletes.count());
+        try accumulator.recordDocDelete("fact:one");
+        try std.testing.expectEqual(@as(usize, 0), accumulator.graph_deletes.count());
+    };
+}
+
+test "graph replay target clears preserve foreign writes and exact incident deletes" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |clear_first| {
+        var replay = GraphReplayAccumulator{ .alloc = alloc, .index_name = "g" };
+        defer replay.deinit();
+        if (clear_first) try replay.recordDocClear("b");
+        try replay.recordGraphWrite(.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .metadata_json = "{\"target_table\":\"foreign\"}" });
+        try replay.recordGraphDelete(.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one" });
+        if (!clear_first) try replay.recordDocClear("b");
+        try std.testing.expectEqual(@as(usize, 1), replay.graph_writes.count());
+        try std.testing.expectEqual(@as(usize, 1), replay.graph_deletes.count());
+        try replay.recordDocClear("a");
+        try std.testing.expectEqual(@as(usize, 0), replay.graph_writes.count());
+        try std.testing.expectEqual(@as(usize, 0), replay.graph_deletes.count());
+    }
+}
+
+test "graph replay producer clear cancels writes followed by exact deletes" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |deleted| {
+        var replay = GraphReplayAccumulator{ .alloc = alloc, .index_name = "g" };
+        defer replay.deinit();
+        if (deleted) try replay.recordDocDelete("fact") else try replay.recordDocClear("fact");
+        try replay.recordGraphWrite(.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact" });
+        try replay.recordGraphDelete(.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact" });
+        try std.testing.expectEqual(@as(usize, 0), replay.graph_writes.count());
+        try std.testing.expectEqual(@as(usize, 0), replay.graph_deletes.count());
+        try replay.recordGraphWrite(.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact" });
+        try std.testing.expectEqual(@as(usize, 1), replay.graph_writes.count());
+    }
 }

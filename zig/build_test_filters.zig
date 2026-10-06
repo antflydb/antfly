@@ -115,6 +115,7 @@ pub fn addRuntimeControls(
     run: *std.Build.Step.Run,
     args: []const []const u8,
 ) void {
+    run.addPassthruArgs();
     if (hasForeignLongOption(args)) {
         run.addArgs(args);
         return;

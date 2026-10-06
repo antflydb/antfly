@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const bounded_decode = @import("../bounded_decode.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
@@ -739,11 +739,11 @@ pub fn encodePreparedAlloc(alloc: Allocator, segment: types.Segment, cancellatio
     var pos: usize = 0;
     putBytes(data, &pos, wire_magic);
     putInt(u16, data, &pos, wire_version);
-    data[pos] = @intFromEnum(segment.kind);
+    data[pos] = @backingInt(segment.kind);
     pos += 1;
-    data[pos] = @intFromEnum(segment.materialization_state);
+    data[pos] = @backingInt(segment.materialization_state);
     pos += 1;
-    data[pos] = @intFromEnum(segment.rejection_reason);
+    data[pos] = @backingInt(segment.rejection_reason);
     pos += 1;
     data[pos] = @intFromBool(segment.converged);
     pos += 1;

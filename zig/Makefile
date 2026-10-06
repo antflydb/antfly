@@ -62,7 +62,7 @@ generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-ge
 
 generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check ## Check all checked-in generated sources are current.
 
-tls-compat-check: ## Verify the checked-in Zig 0.16 TLS compatibility patch has not drifted.
+tls-compat-check: ## Verify the checked-in Zig TLS compatibility patch has not drifted.
 	@sh lib/httpx/src/tls/check_client_compat.sh
 
 openapi-generate: mcp-schema-fragments-generate
@@ -79,16 +79,16 @@ mcp-schema-fragments-check:
 	$(SCRIPTS_PY) ../scripts/generate_mcp_schema_fragments.py --check
 
 snowball-generate:
-	$(ZIG) build regen-snowball
+	$(ZIG) build regen-snowball $(ZIG_BUILD_FLAGS)
 
 snowball-check:
-	$(ZIG) build check-snowball
+	$(ZIG) build check-snowball $(ZIG_BUILD_FLAGS)
 
 sql-grammar-generate:
-	$(ZIG) build regen-sql-grammar
+	$(ZIG) build regen-sql-grammar $(ZIG_BUILD_FLAGS)
 
 sql-grammar-check:
-	$(ZIG) build sql-grammar-generated-check
+	$(ZIG) build sql-grammar-generated-check $(ZIG_BUILD_FLAGS)
 
 cabi-header-generate:
 	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py
@@ -142,8 +142,10 @@ endif
 	@set -e; \
 	segdir=$$(mktemp -d); \
 	trap 'rm -rf "$$segdir"' EXIT; \
+	producer=0; \
 	for f in $(TRACE_FILES); do \
-	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir"; \
+	  producer=$$((producer + 1)); \
+	  python3 ../scripts/tla-segment-raft-trace.py "$$f" "$$segdir/producer-$$producer"; \
 	done; \
 	segments=$$(find "$$segdir" -name '*.ndjson' -size +0c | sort); \
 	if [ -n "$$segments" ]; then \
@@ -160,6 +162,7 @@ tla-trace-txn: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson)
 endif
+	@python3 ../scripts/test_tla_filter_txn_trace.py
 	@set -e; \
 	validated=0; \
 	tmpfiles=""; tmpdirs=""; \

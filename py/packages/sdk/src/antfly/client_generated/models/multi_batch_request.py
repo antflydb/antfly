@@ -34,7 +34,7 @@ class MultiBatchRequest:
                 {'inserts': {'order:456': {'user_id': 'user:123', 'total': 99.99}}}}.
             sync_level (SyncLevel | Unset): Synchronization level for batch operations:
                 - "propose": Wait for Raft proposal acceptance (fastest, default)
-                - "write": Wait for Pebble KV write
+                - "write": Wait for the write to be durably applied to the local key-value store
                 - "full_text": Wait for full-text index WAL write
                 - "enrichments": Precompute enrichments before committing the document. A synchronous
                   producer failure rejects the write; post-commit worker failures retain the document

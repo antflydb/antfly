@@ -109,7 +109,7 @@ class QueryMatrixTest(unittest.TestCase):
                 [
                     "zig",
                     "build",
-                    "-Doptimize=ReleaseFast",
+                    "-Doptimize=fast",
                     "antfly-storage-bench",
                     "antfly-api-bench",
                 ],

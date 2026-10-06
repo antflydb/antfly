@@ -13,15 +13,23 @@
 // limitations.
 
 test {
+    _ = @import("storage/hot_standby/restore_staging_integration_test.zig");
+    _ = @import("storage/hot_standby/native_topology_receipt_integration_test.zig");
+    _ = @import("storage/hot_standby/online_source_integration_test.zig");
+    _ = @import("storage/hot_standby/db_integration_test.zig");
     _ = @import("vopr/index_maintenance.zig");
     _ = @import("antfly_source_root").antfly_sources.physical_db;
     _ = @import("graph/query.zig");
     _ = @import("storage/db/graph_runtime.zig");
+    _ = @import("storage/db/primary_effect.zig");
     _ = @import("storage/db_split_vopr.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");
+    _ = @import("storage/db/relational_index_catalog.zig");
+    _ = @import("storage/db/relational_index_gc.zig");
 }
 
 pub const antfly_sources = struct {
     pub const physical_db = @import("storage/db/db.zig");
+    pub const selected_db = @import("storage/db/mod.zig");
 };

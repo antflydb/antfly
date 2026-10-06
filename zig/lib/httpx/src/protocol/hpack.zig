@@ -533,7 +533,7 @@ pub const HuffmanCodec = struct {
     /// overwritten), which is correct because Huffman codes are prefix-free.
     const lut: [256]LutEntry = blk: {
         @setEvalBranchQuota(200_000);
-        var table = [_]LutEntry{.{ .sym = 0, .len = 0 }} ** 256;
+        var table = @as([256]LutEntry, @splat(.{ .sym = 0, .len = 0 }));
         var clen: u5 = 5;
         while (clen <= 8) : (clen += 1) {
             var sym: usize = 0;
@@ -1322,7 +1322,7 @@ test "RFC 7541 - Dynamic table eviction fills to 4096 bytes" {
     // Add entries until we exceed 4096 bytes
     // Each entry: "header-NN" (9) + "x" * 80 (80) + 32 = 121 bytes
     // 4096 / 121 ≈ 33 entries fit
-    const long_value = "x" ** 80;
+    const long_value = &@as([80]u8, @splat('x'));
     var i: usize = 0;
     while (i < 40) : (i += 1) {
         var name_buf: [16]u8 = undefined;

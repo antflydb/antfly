@@ -42,6 +42,7 @@ pub const elementwise_loss_math = @import("elementwise_loss_math.zig");
 pub const consistency_loss_math = @import("consistency_loss_math.zig");
 pub const listwise_loss_math = @import("listwise_loss_math.zig");
 pub const deberta_training_attention = @import("deberta_training_attention.zig");
+pub const segment_training_attention = @import("segment_training_attention.zig");
 
 pub const UnaryConsumeOp = enum {
     gelu,
@@ -63,6 +64,23 @@ pub const UnaryConsumeOp = enum {
 };
 
 pub const BackendKind = backend_contracts.BackendKind;
+
+/// Attention in which query `i` may see key `k` only when `k` lies in one of
+/// its three half-open ranges `ranges[i*6 .. i*6+6]` (`start, end` pairs;
+/// empty when equal) and, unless `window == maxInt(u32)`, the logical
+/// distance `|query_positions[i] - key_positions[k]|` is at most `window`.
+/// Tree-packed rows (pipelines/laya_tree.zig) use it instead of a dense
+/// `[L, L]` mask, so work is proportional to the keys each query can see.
+pub const SegmentAttention = struct {
+    ranges: []const u32,
+    query_positions: []const i32,
+    key_positions: []const i32,
+    window: u32 = std.math.maxInt(u32),
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+};
 pub const GraphDType = ml.graph.DType;
 pub const OperatorPlan = operator_plan.OperatorPlan;
 
@@ -143,6 +161,52 @@ pub const RmsNormTripleResult = struct {
     third: CT,
 };
 
+/// Exact NCHW transposed-convolution request. Weights use the ONNX layout
+/// [in_channels, out_channels / groups, kernel...]. Only the first
+/// `num_spatial` entries of each spatial array are used.
+pub const ConvTransposeRequest = struct {
+    input: CT,
+    weight: CT,
+    batch: usize,
+    in_channels: usize,
+    out_channels: usize,
+    input_spatial: [2]usize,
+    kernel: [2]usize,
+    strides: [2]usize,
+    padding: [2][2]i32,
+    dilations: [2]usize,
+    output_padding: [2]usize,
+    output_spatial: [2]usize,
+    groups: usize,
+    num_spatial: u8,
+};
+pub fn convTransposeOutputDim(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: [2]i32,
+    dilation: usize,
+    output_padding: usize,
+) ?usize {
+    if (input == 0 or kernel == 0 or stride == 0 or dilation == 0) return null;
+    if (output_padding >= stride and output_padding >= dilation) return null;
+
+    const expanded_input = std.math.mul(i128, @as(i128, @intCast(input)) - 1, @intCast(stride)) catch return null;
+    const expanded_kernel = std.math.mul(i128, @intCast(dilation), @as(i128, @intCast(kernel)) - 1) catch return null;
+    var value = std.math.add(i128, expanded_input, expanded_kernel) catch return null;
+    value = std.math.sub(i128, value, padding[0]) catch return null;
+    value = std.math.sub(i128, value, padding[1]) catch return null;
+    value = std.math.add(i128, value, @intCast(output_padding)) catch return null;
+    value = std.math.add(i128, value, 1) catch return null;
+    if (value <= 0 or value > @as(i128, @intCast(std.math.maxInt(usize)))) return null;
+    return @intCast(value);
+}
+
+test "transposed convolution dimensions reject arithmetic overflow" {
+    const maximum = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(?usize, null), convTransposeOutputDim(maximum, maximum, maximum, .{ 0, 0 }, maximum, 0));
+}
+
 /// Gemma 4's parallel FFN epilogue normalizes the shared and routed branches,
 /// adds them, normalizes the sum, then adds the attention residual. Backends
 /// may execute the full chain without materializing its four intermediates.
@@ -219,6 +283,26 @@ pub const MaskedBceWithLogitsBackwardRequest = struct {
     eps: f32,
     mean_reduction: bool,
     logits_shape: []const i64,
+};
+
+pub const SelectedTiedHeadLogitsRequest = struct {
+    hidden: CT,
+    weight: CT,
+    token_ids: CT,
+    in_dim: usize,
+    vocab_size: usize,
+    frozen_weight: bool,
+    output_shape: []const i64,
+};
+
+pub const SelectedTiedHeadBackwardRequest = struct {
+    weight: CT,
+    token_ids: CT,
+    upstream: CT,
+    in_dim: usize,
+    vocab_size: usize,
+    frozen_weight: bool,
+    hidden_shape: []const i64,
 };
 
 pub const LoraLinearBranchResult = struct {
@@ -703,7 +787,7 @@ pub const DecoderRuntimeComputeRegion = enum(u8) {
 
 pub const DecoderRuntimeComputeRegionScope = struct {
     backend: ?*const ComputeBackend = null,
-    previous: usize = @intFromEnum(DecoderRuntimeComputeRegion.other),
+    previous: usize = @backingInt(DecoderRuntimeComputeRegion.other),
     active: bool = false,
 
     pub fn deinit(self: *DecoderRuntimeComputeRegionScope) void {
@@ -777,17 +861,17 @@ pub const NativeQuantTimingStats = struct {
     a4b_moe_slot_upload_bytes: u64 = 0,
     a4b_moe_projected_enabled: u64 = 0,
     a4b_moe_projected_layer_attempts: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_route_hits: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_route_misses: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_all_hit_layers: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_token_attempts: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_moe_projected_all_hit_tokens: [a4b_projected_slot_capacities.len]u64 =
-        [_]u64{0} ** a4b_projected_slot_capacities.len,
+        @as([a4b_projected_slot_capacities.len]u64, @splat(0)),
     a4b_packed_q4_0_linear_attempts: u64 = 0,
     a4b_packed_q4_0_linear_successes: u64 = 0,
     a4b_packed_q4_0_linear_fallbacks: u64 = 0,
@@ -994,9 +1078,9 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_last_frame_compute_region_layer_count: u64 = 0,
     metal_runtime_last_frame_compute_region_other_count: u64 = 0,
     metal_runtime_last_frame_planned_command_op_count: u64 = 0,
-    metal_runtime_last_frame_planned_command_op_kind_counts: [32]u64 = [_]u64{0} ** 32,
-    metal_runtime_last_frame_planned_command_operator_counts: [16]u64 = [_]u64{0} ** 16,
-    metal_runtime_last_frame_planned_command_quant_dispatch_counts: [4]u64 = [_]u64{0} ** 4,
+    metal_runtime_last_frame_planned_command_op_kind_counts: [32]u64 = @as([32]u64, @splat(0)),
+    metal_runtime_last_frame_planned_command_operator_counts: [16]u64 = @as([16]u64, @splat(0)),
+    metal_runtime_last_frame_planned_command_quant_dispatch_counts: [4]u64 = @as([4]u64, @splat(0)),
     metal_runtime_last_frame_blit_buffer_upload_count: u64 = 0,
     metal_runtime_last_frame_blit_buffer_copy_count: u64 = 0,
     metal_runtime_last_frame_blit_buffer_slice_count: u64 = 0,
@@ -1016,7 +1100,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q8_0_linear_mm_f16_input: u64 = 0,
     metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output: u64 = 0,
     metal_runtime_q8_0_linear_mmv_f16_input: u64 = 0,
-    metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = [_][4]u64{[_]u64{0} ** 4} ** 12,
+    metal_runtime_q8_0_linear_family_dispatch_counts: [12][4]u64 = @as([12][4]u64, @splat(@as([4]u64, @splat(0)))),
     metal_runtime_q4_0_linear_reduce: u64 = 0,
     metal_runtime_q4_0_linear_reduce_rows_1: u64 = 0,
     metal_runtime_q4_0_linear_reduce_rows_2_8: u64 = 0,
@@ -1345,6 +1429,10 @@ pub const TrainingRuntimeStats = struct {
     h2d_bytes: u64 = 0,
     d2h_bytes: u64 = 0,
     largest_d2h_transfer_bytes: u64 = 0,
+    download_events: u64 = 0,
+    download_event_bytes: u64 = 0,
+    download_last_bytes: u64 = 0,
+    download_previous_bytes: u64 = 0,
     to_float32_calls: u64 = 0,
     download_alloc_calls: u64 = 0,
     stream_synchronizations: u64 = 0,
@@ -1392,6 +1480,17 @@ pub const WorkloadRegime = enum(u8) {
     decode = 3,
     speculative_draft = 4,
     speculative_verify = 5,
+};
+
+/// Borrowed tensors and host marker metadata. The returned feature tensor is owned.
+pub const LayaActionFeaturesRequest = struct {
+    hidden: CT,
+    logits: CT,
+    markers: []const i64,
+    batch: usize,
+    sequence: usize,
+    options: usize,
+    hidden_size: usize,
 };
 
 /// Abstract compute backend for tensor operations.
@@ -1524,6 +1623,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr);
     }
 
+    pub fn tryCumulativeSum(self: *const ComputeBackend, tensor: CT, axis: u8, exclusive: bool, reverse: bool) !?CT {
+        const op = self.vtable.cumulativeSum orelse return null;
+        return op(self.ptr, tensor, axis, exclusive, reverse);
+    }
+
     pub fn tryConvertDType(self: *const ComputeBackend, tensor: CT, target: GraphDType) !?CT {
         const op = self.vtable.convertDType orelse return null;
         return op(self.ptr, tensor, target);
@@ -1628,6 +1732,7 @@ pub const ComputeBackend = struct {
         decoderRuntimePushPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
         decoderRuntimePopPlannedComputeBarrierSuppression: ?*const fn (ctx: *anyopaque) anyerror!void = null,
 
+        cumulativeSum: ?*const fn (ctx: *anyopaque, tensor: CT, axis: u8, exclusive: bool, reverse: bool) anyerror!?CT = null,
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
         glinerBoundaryDevice: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.Request) anyerror!CT = null,
         glinerBoundaryScope: ?*const fn (ctx: *anyopaque, request: *const gliner_boundary_device.ScopeRequest) anyerror!gliner_boundary_device.ScopeStats = null,
@@ -1663,6 +1768,10 @@ pub const ComputeBackend = struct {
         /// acquisition. Free exactly once; the backend must outlive the handle.
         /// Storage may still be borrowed from the model or backend cache.
         acquireWeight: *const fn (ctx: *anyopaque, name: []const u8) anyerror!CT,
+        /// Look up an immutable weight for row gathers. Backends may skip
+        /// matrix-specific packing; use only with embedding lookup operations.
+        /// Handles may be shared: free once per lookup. Defaults to getWeight.
+        getEmbeddingWeight: ?*const fn (ctx: *anyopaque, name: []const u8) anyerror!CT = null,
         prefetchWeightHint: *const fn (ctx: *anyopaque, name: []const u8, hint: u32) void,
         drainPrefetchBudget: *const fn (ctx: *anyopaque, max_items: usize) void,
         debugProfileCheckpoint: ?*const fn (ctx: *anyopaque, label: []const u8, layer: usize) void = null,
@@ -2161,6 +2270,12 @@ pub const ComputeBackend = struct {
         /// Inclusive local half-window, without materializing a dense bias mask.
         slidingWindowAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, half_window: usize) anyerror!?CT = null,
 
+        /// Inclusive symmetric window; padding masks keys, never introduces causality.
+        /// Token-major Q/K/V and output: [batch*seq_len, num_heads*head_dim].
+        encoderLocalAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) anyerror!CT = null,
+        layaActionFeatures: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
+        packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
+
         /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
         /// but lets a backend select a model-scoped kernel without changing
@@ -2171,6 +2286,9 @@ pub const ComputeBackend = struct {
         /// to scaledDotProductAttention with an all-ones mask, but lets
         /// backends avoid a host mask allocation/upload.
         scaledDotProductAttentionFull: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!?CT = null,
+        /// Segment-masked attention for tree-packed sequences; see
+        /// `SegmentAttention`. Null declines to the host implementation.
+        segmentAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, request: *const SegmentAttention) anyerror!?CT = null,
 
         /// Causal self-attention for decoder layers.
         /// Q,K,V: [batch*seq_len, num_heads*head_dim].
@@ -2226,6 +2344,18 @@ pub const ComputeBackend = struct {
         /// must not fall back to the inference attention mask or host execution.
         debertaTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
         debertaTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, relative: CT, control_i32: CT, dO: CT, attrs: ml.graph.DebertaTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// CPU only today (no device kernel): the encoder's global and
+        /// local-window layers and packed rows' tree segments all lower to
+        /// this. `null` means the training graph must fall back to the
+        /// dense-bias attention path (see `finetune/laya/graph.zig`).
+        segmentTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        segmentTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+
+        /// ModernBERT training attention over packed [Q;K;V] with an i32
+        /// range/position control; linear storage, replayed backward
+        /// returning packed [dQ;dK;dV]. See ops/modernbert_training_attention.zig.
+        modernBertTrainingAttentionV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
+        modernBertTrainingAttentionBackwardV1: ?*const fn (ctx: *anyopaque, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs, control: ?InferenceExecutionControl) anyerror!CT = null,
 
         /// Optional destructive softmax over the last dimension. When this
         /// returns a tensor, the backend may have reused `input`'s storage, so
@@ -2308,6 +2438,11 @@ pub const ComputeBackend = struct {
         /// weight:[out_ch, in_ch/groups, kernel_h, kernel_w], bias:[out_ch].
         /// Returns [batch, out_ch, out_h, out_w].
         conv2d: *const fn (ctx: *anyopaque, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) anyerror!CT,
+        /// Exact NCHW transposed convolution. Backends that do not implement
+        /// this operation must leave it null rather than treating it as Conv.
+        convTranspose: ?*const fn (ctx: *anyopaque, request: *const ConvTransposeRequest) anyerror!CT = null,
+        /// Exact local pooling; an absent callback is an unsupported operation.
+        averagePool: ?*const fn (ctx: *anyopaque, input: CT, attrs: *const ml.graph.node.AveragePoolAttrs) anyerror!CT = null,
 
         /// Apply rotary position embeddings (RoPE) in-place.
         /// input: [total, dim] where total = batch*seq_len.
@@ -2354,6 +2489,10 @@ pub const ComputeBackend = struct {
         /// Backends may leave this null when they do not support integer tensors.
         fromInt32Shape: ?*const fn (ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT = null,
 
+        /// Optional exact graph-constant import. Copies bytes and shape; return
+        /// null to retain the backend's legacy numeric-constant path.
+        fromConstantBytes: ?*const fn (ctx: *anyopaque, data: []const u8, dtype: GraphDType, shape: []const i64) anyerror!?CT = null,
+
         /// Copy tensor data to a caller-owned f32 slice.
         toFloat32: *const fn (ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32,
 
@@ -2383,6 +2522,13 @@ pub const ComputeBackend = struct {
         residentTrainingNorm: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.NormInput, limits: resident_training.NormLimits, control: ?InferenceExecutionControl) anyerror!resident_training.NormSummary = null,
         residentTrainingValidate: ?*const fn (ctx: *anyopaque, inputs: []const resident_training.ValidationInput, limits: resident_training.ValidationLimits, control: ?InferenceExecutionControl) anyerror!resident_training.ValidationSummary = null,
         residentTrainingInstruction: ?*const fn (ctx: *anyopaque, instruction: *const resident_program.Instruction, inputs: []const CT, limits: resident_program.Limits, control: ?InferenceExecutionControl) anyerror!CT = null,
+        /// Open a command batch owned by one resident training transaction.
+        /// Resident operations then encode into it instead of each submitting
+        /// and waiting; reductions that read results back synchronize it.
+        /// Returns false when the backend has no batching.
+        residentTrainingBeginBatch: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+        /// Submit and wait for (commit) or discard (cancel) the open batch.
+        residentTrainingEndBatch: ?*const fn (ctx: *anyopaque, commit: bool) anyerror!void = null,
 
         /// Copy a tensor from another backend instance into this backend
         /// without host materialization when the two backends are compatible.
@@ -2881,6 +3027,14 @@ pub const ComputeBackend = struct {
         /// Log-softmax along last dimension: x - max - log(sum(exp(x-max))).
         /// `last_dim_size` is the size of the last dimension (not an axis index).
         logSoftmaxOp: ?*const fn (ctx: *anyopaque, input: CT, last_dim_size: u32) anyerror!CT = null,
+        /// Compute selected log-softmax values from a row-major logits matrix
+        /// without materializing the full log-probability matrix. Backends
+        /// return null when no fused resident implementation is available.
+        selectedTokenLogprobs: ?*const fn (ctx: *anyopaque, logits: CT, row_indices: []const u32, token_ids: []const u32, rows: usize, vocab_size: usize) anyerror!?CT = null,
+        /// Two selected logits from a frozen tied language-model head.
+        selectedTiedHeadLogits: ?*const fn (ctx: *anyopaque, request: *const SelectedTiedHeadLogitsRequest) anyerror!CT = null,
+        /// d_hidden for the selected tied-head projection.
+        selectedTiedHeadBackward: ?*const fn (ctx: *anyopaque, request: *const SelectedTiedHeadBackwardRequest) anyerror!CT = null,
         /// GLiNER-style masked BCE-with-logits scalar loss.
         maskedBceWithLogitsLoss: ?*const fn (ctx: *anyopaque, request: *const MaskedBceWithLogitsRequest) anyerror!CT = null,
         /// Gradient of masked BCE-with-logits with respect to logits.
@@ -2936,6 +3090,12 @@ pub const ComputeBackend = struct {
     pub fn acquireWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
         return self.vtable.acquireWeight(self.ptr, name);
+    }
+
+    pub fn getEmbeddingWeight(self: *const ComputeBackend, name: []const u8) !CT {
+        try self.checkExecutionControl();
+        const acquire = self.vtable.getEmbeddingWeight orelse self.vtable.getWeight;
+        return acquire(self.ptr, name);
     }
 
     pub fn prefetchWeight(self: *const ComputeBackend, name: []const u8) void {
@@ -3916,6 +4076,22 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn encoderLocalAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) !?CT {
+        if (self.vtable.encoderLocalAttention) |f| return try f(self.ptr, Q, K, V, mask, batch, seq_len, num_heads, head_dim, radius);
+        return null;
+    }
+
+    /// Optional exact GELU(gate) * value from [rows, 2*width], without slices.
+    pub fn packedGegluExact(self: *const ComputeBackend, input: CT, rows: usize, width: usize) !?CT {
+        const op = self.vtable.packedGegluExact orelse return null;
+        return op(self.ptr, input, rows, width);
+    }
+
+    pub fn layaActionFeatures(self: *const ComputeBackend, request: *const LayaActionFeaturesRequest) !?CT {
+        if (self.vtable.layaActionFeatures) |f| return try f(self.ptr, request);
+        return null;
+    }
+
     pub fn scaledDotProductAttention(self: *const ComputeBackend, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !CT {
         return self.vtable.scaledDotProductAttention(self.ptr, Q, K, V, mask, attn_bias, batch, seq_len, num_heads, head_dim);
     }
@@ -3927,6 +4103,22 @@ pub const ComputeBackend = struct {
             return f(self.ptr, Q, K, V, batch, seq_len, num_heads, head_dim);
         }
         return self.scaledDotProductAttention(Q, K, V, &.{}, null, batch, seq_len, num_heads, head_dim);
+    }
+
+    /// Token-major `Q [queries, heads*head_dim]` attending to `K`/`V`
+    /// `[keys, heads*head_dim]` through per-query key ranges (see
+    /// `SegmentAttention`). Returns token-major `[queries, heads*head_dim]`.
+    pub fn segmentAttention(self: *const ComputeBackend, allocator: std.mem.Allocator, Q: CT, K: CT, V: CT, request: *const SegmentAttention) !CT {
+        if (self.vtable.segmentAttention) |f| if (try f(self.ptr, Q, K, V, request)) |out| return out;
+        const q = try self.toFloat32(Q, allocator);
+        defer allocator.free(q);
+        const k = try self.toFloat32(K, allocator);
+        defer allocator.free(k);
+        const v = try self.toFloat32(V, allocator);
+        defer allocator.free(v);
+        const out = try @import("inference_linalg").segmentAttentionHost(allocator, q, k, v, request.ranges, request.query_positions, request.key_positions, request.window, request.queries, request.keys, request.num_heads, request.head_dim);
+        defer allocator.free(out);
+        return self.fromFloat32Shape(out, &.{ @intCast(request.queries), @intCast(request.num_heads * request.head_dim) });
     }
 
     pub fn scaledDotProductAttentionFull(self: *const ComputeBackend, Q: CT, K: CT, V: CT, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) !?CT {
@@ -3988,6 +4180,46 @@ pub const ComputeBackend = struct {
         try self.checkExecutionControl();
         const op = self.vtable.debertaTrainingAttentionBackwardV1 orelse return error.DebertaTrainingAttentionProfileUnavailable;
         const output = try op(self.ptr, qkv, relative, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn segmentTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.segmentTrainingAttentionV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn segmentTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.SegmentTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.segmentTrainingAttentionBackwardV1 orelse return error.SegmentTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn modernBertTrainingAttentionV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.modernBertTrainingAttentionV1 orelse return error.ModernBertTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, attrs, self.execution_control);
+        errdefer self.free(output);
+        try self.checkExecutionControl();
+        return output;
+    }
+
+    pub fn modernBertTrainingAttentionBackwardV1(self: *const ComputeBackend, qkv: CT, control_i32: CT, dO: CT, attrs: ml.graph.ModernBertTrainingAttentionAttrs) !CT {
+        _ = try attrs.layout();
+        try self.checkExecutionControl();
+        const op = self.vtable.modernBertTrainingAttentionBackwardV1 orelse return error.ModernBertTrainingAttentionProfileUnavailable;
+        const output = try op(self.ptr, qkv, control_i32, dO, attrs, self.execution_control);
         errdefer self.free(output);
         try self.checkExecutionControl();
         return output;
@@ -4111,6 +4343,15 @@ pub const ComputeBackend = struct {
 
     pub fn conv2d(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, batch: usize, in_channels: usize, out_channels: usize, height: usize, width: usize, kernel_h: usize, kernel_w: usize, stride_h: usize, stride_w: usize, padding_h: usize, padding_w: usize, groups: usize) !CT {
         return self.vtable.conv2d(self.ptr, input, weight, bias, batch, in_channels, out_channels, height, width, kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, groups);
+    }
+    pub fn convTranspose(self: *const ComputeBackend, request: *const ConvTransposeRequest) !?CT {
+        const op = self.vtable.convTranspose orelse return null;
+        return try op(self.ptr, request);
+    }
+
+    pub fn averagePool(self: *const ComputeBackend, input: CT, attrs: *const ml.graph.node.AveragePoolAttrs) !CT {
+        const op = self.vtable.averagePool orelse return error.UnsupportedPrimitiveOp;
+        return op(self.ptr, input, attrs);
     }
 
     pub fn multiply(self: *const ComputeBackend, a: CT, b: CT) !CT {
@@ -4271,6 +4512,11 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn fromConstantBytes(self: *const ComputeBackend, data: []const u8, dtype: GraphDType, shape: []const i64) !?CT {
+        if (self.vtable.fromConstantBytes) |op| return op(self.ptr, data, dtype, shape);
+        return null;
+    }
+
     pub fn toFloat32(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) ![]f32 {
         return self.vtable.toFloat32(self.ptr, tensor, allocator);
     }
@@ -4403,6 +4649,16 @@ pub const ComputeBackend = struct {
         errdefer self.free(result);
         try self.checkExecutionControl();
         return result;
+    }
+
+    pub fn residentTrainingBeginBatch(self: *const ComputeBackend) !bool {
+        const op = self.vtable.residentTrainingBeginBatch orelse return false;
+        return op(self.ptr);
+    }
+
+    pub fn residentTrainingEndBatch(self: *const ComputeBackend, commit: bool) !void {
+        const op = self.vtable.residentTrainingEndBatch orelse return;
+        return op(self.ptr, commit);
     }
 
     pub fn copyTensorFromBackend(self: *const ComputeBackend, src_backend: *const ComputeBackend, src_tensor: CT) !?CT {
@@ -5317,6 +5573,18 @@ pub const ComputeBackend = struct {
     }
     pub fn primLogSoftmax(self: *const ComputeBackend, input: CT, dim: u32) !CT {
         if (self.vtable.logSoftmaxOp) |f| return f(self.ptr, input, dim);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn selectedTokenLogprobs(self: *const ComputeBackend, logits: CT, row_indices: []const u32, token_ids: []const u32, rows: usize, vocab_size: usize) !?CT {
+        if (self.vtable.selectedTokenLogprobs) |f| return f(self.ptr, logits, row_indices, token_ids, rows, vocab_size);
+        return null;
+    }
+    pub fn selectedTiedHeadLogits(self: *const ComputeBackend, request: *const SelectedTiedHeadLogitsRequest) !CT {
+        if (self.vtable.selectedTiedHeadLogits) |f| return f(self.ptr, request);
+        return error.UnsupportedPrimitiveOp;
+    }
+    pub fn selectedTiedHeadBackward(self: *const ComputeBackend, request: *const SelectedTiedHeadBackwardRequest) !CT {
+        if (self.vtable.selectedTiedHeadBackward) |f| return f(self.ptr, request);
         return error.UnsupportedPrimitiveOp;
     }
     pub fn maskedBceWithLogitsLoss(self: *const ComputeBackend, request: *const MaskedBceWithLogitsRequest) !CT {

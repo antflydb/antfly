@@ -510,7 +510,7 @@ const FakeSession = struct {
         };
     }
 
-    fn deinit(self: *FakeSession, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *FakeSession, allocator: std.mem.Allocator) void {
         _ = self;
         _ = allocator;
     }

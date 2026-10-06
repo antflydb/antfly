@@ -78,6 +78,8 @@ pub const Entry = struct {
     }
 };
 
+pub const ScanAction = if (supports_native_derived_log) wal.WAL.ScanAction else enum { @"continue", stop };
+
 pub const EntryView = struct {
     sequence: u64,
     payload: []const u8,
@@ -159,6 +161,13 @@ pub const DerivedLog = if (!supports_native_derived_log) struct {
         }
 
         return try results.toOwnedSlice(alloc);
+    }
+
+    pub fn iterateOpaqueFromStreamingWithContext(self: *DerivedLog, from_sequence: u64, context: anytype, comptime callback: fn (@TypeOf(context), EntryView) anyerror!ScanAction) !void {
+        for (self.entries.items) |entry| {
+            if (entry.sequence < from_sequence) continue;
+            if (try callback(context, .{ .sequence = entry.sequence, .payload = entry.payload }) == .stop) return;
+        }
     }
 
     pub fn truncate(self: *DerivedLog, up_to_sequence: u64) !void {
@@ -259,10 +268,10 @@ pub const DerivedLog = if (!supports_native_derived_log) struct {
         self: *DerivedLog,
         from_sequence: u64,
         context: anytype,
-        comptime callback: fn (@TypeOf(context), EntryView) anyerror!wal.WAL.ScanAction,
+        comptime callback: fn (@TypeOf(context), EntryView) anyerror!ScanAction,
     ) !void {
         try self.wal_impl.iterateFromStreamingWithContext(from_sequence, context, struct {
-            fn adapted(ctx: @TypeOf(context), wal_entry: wal.WalEntry) anyerror!wal.WAL.ScanAction {
+            fn adapted(ctx: @TypeOf(context), wal_entry: wal.WalEntry) anyerror!ScanAction {
                 return try callback(ctx, .{
                     .sequence = wal_entry.lsn,
                     .payload = wal_entry.data,
@@ -378,27 +387,6 @@ test "derived log propagates wal group commit settings" {
     }
 
     return error.TestExpectedEqual;
-}
-
-test "derived log exposes wal and lmdb stats when available" {
-    var buf: [256]u8 = undefined;
-    const path = derivedLogTmpPath(&buf);
-    defer cleanupDerivedLogDir(path);
-
-    var log = try DerivedLog.open(path, .{ .backend = .lmdb });
-    defer log.close();
-
-    _ = try log.appendOpaque("payload");
-
-    const stats = log.fullStatsSnapshot();
-    try std.testing.expectEqual(@as(u64, 1), stats.wal.append_calls);
-    if (stats.commit) |commit| {
-        try std.testing.expect(commit.publish_calls >= 1);
-        try std.testing.expect(commit.full_publish_calls >= 1);
-        try std.testing.expect(commit.page_images_written > 0);
-        try std.testing.expect(commit.bytes_written > 0);
-        try std.testing.expect(commit.total_publish_ns > 0);
-    }
 }
 
 test "derived log defaults to lsm backend" {

@@ -36,6 +36,17 @@ class ClassifyValidationTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(classify([path])["sdk"])
 
+    def test_lite_binding_changes_run_the_sdk_suite(self) -> None:
+        for path in (
+            "go/pkg/lite/lite_cgo.go",
+            "py/packages/lite/src/antfly_lite/_database.py",
+            "rs/crates/lite/src/lib.rs",
+            "rs/crates/lite-sys/src/lib.rs",
+            "zig/pkg/antfly/capi-conformance/cases/open_modes.json",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(classify([path])["sdk"])
+
     def test_openapi_tool_environment_runs_the_sdk_suite(self) -> None:
         for path in ("scripts/pyproject.toml", "scripts/uv.lock"):
             with self.subTest(path=path):

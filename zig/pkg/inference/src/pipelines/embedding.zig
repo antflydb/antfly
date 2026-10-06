@@ -63,7 +63,7 @@ const PreprocessScratchAdmission = struct {
         try self.permits.append(self.allocator, permit);
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.permits.items) |*permit| permit.deinit();
         self.permits.deinit(self.allocator);
         self.permits = .empty;
@@ -79,7 +79,7 @@ const TextInputTensorSet = struct {
         return self.items[0..self.len];
     }
 
-    fn deinit(self: *TextInputTensorSet) void {
+    pub fn deinit(self: *TextInputTensorSet) void {
         if (self.token_type_tensor) |*tensor| tensor.deinit();
         self.* = undefined;
     }
@@ -1743,7 +1743,7 @@ pub const EmbeddingPipeline = struct {
         backend: *const ops_mod.ComputeBackend,
         owns_value: bool,
 
-        fn deinit(self: ResidentPooled) void {
+        pub fn deinit(self: ResidentPooled) void {
             if (self.owns_value) self.backend.free(self.value);
         }
     };
@@ -2554,10 +2554,7 @@ test "embedding text plans backend and fixed-shape batches" {
         .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, 77 } },
     };
     try std.testing.expect(textSessionBatchPlanForRuntime(&dynamic_info, .native, true, 3) == null);
-    try std.testing.expectEqual(
-        TextSessionBatchPlan{ .batch_size = 1, .pad_final_batch = false },
-        textSessionBatchPlanForRuntime(&dynamic_info, .metal, true, 3).?,
-    );
+    try std.testing.expect(textSessionBatchPlanForRuntime(&dynamic_info, .metal, true, 3) == null);
 }
 
 fn sessionHasInput(session: backends.Session, name: []const u8) bool {
@@ -2608,7 +2605,7 @@ fn textSessionBatchPlanForRuntime(
     if (backend == .onnx) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
-    if (imported and backend != .native) {
+    if (imported and backend != .native and backend != .metal) {
         return .{ .batch_size = 1, .pad_final_batch = false };
     }
     return null;
@@ -3488,7 +3485,7 @@ test "image embedding broker fuses concurrent callers and transfers owned vector
             self.result = results[0];
             shared.free(results);
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.result) |result| switch (result.result) {
                 .value => |vector| shared.free(vector),
                 .item_error => {},
@@ -3521,8 +3518,8 @@ test "borrowed image embeddings report native singleton and fallback execution" 
     const allocator = std.testing.allocator;
     var fake = FakeVisionBatchSession{};
     var pipeline = EmbeddingPipeline{ .allocator = allocator, .session = fake.session(), .tok = undefined, .config = .{ .normalize = false, .image_size = 2 }, .vision_session = fake.session() };
-    const pixels = [_]u8{ 255, 0, 0, 255 } ** 4;
-    const rasters = [_]antfly_image.BorrowedRasterAttachment{.{ .bytes = &pixels, .width = 2, .height = 2, .stride_bytes = 8 }} ** 2;
+    const pixels = z17RepeatArray([_]u8{ 255, 0, 0, 255 }, 4);
+    const rasters = @as([2]antfly_image.BorrowedRasterAttachment, @splat(.{ .bytes = &pixels, .width = 2, .height = 2, .stride_bytes = 8 }));
     const native = try pipeline.embedBorrowedRastersReported(&rasters);
     defer freeEmbeddingSlices(allocator, native.vectors);
     try std.testing.expectEqual(.native_batch, native.execution);
@@ -3552,7 +3549,7 @@ test "embedAudioPcm falls back under the execution gate without re-entry" {
         .audio_session = fake.session(),
     };
 
-    const samples = [_]f32{0.0} ** 1024;
+    const samples = @as([1024]f32, @splat(0.0));
     const clips = [_]audio.PcmAudio{
         .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
         .{ .samples = &samples, .sample_rate = audio.CLAP_CONFIG.sample_rate },
@@ -3579,7 +3576,7 @@ test "audio microbatch isolates corrupt clips and bounds decoded windows" {
         .tok = undefined,
         .config = .{ .normalize = false },
     };
-    const samples = [_]f32{0} ** 1024;
+    const samples = @as([1024]f32, @splat(0));
     const wav = try audio.wav.encodeMono(allocator, &samples, .{ .sample_rate = audio.CLAP_CONFIG.sample_rate, .audio_format = 1, .bits_per_sample = 16 });
     defer allocator.free(wav);
     const clips = [_]EncodedAudioClip{ .{ .bytes = wav }, .{ .bytes = "invalid audio" }, .{ .bytes = wav } };
@@ -3814,3 +3811,9 @@ const FakeProjectionSession = struct {
 
     fn close(_: *anyopaque) void {}
 };
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
+}

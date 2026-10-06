@@ -27,8 +27,15 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const extension_domain = @import("../extensions/mod.zig");
+const restore_staging = @import("../metadata/restore_staging.zig");
+const physical_metadata = @import("../metadata/storage/raft_apply_store.zig");
+const sql_settings = @import("../system_catalog/settings.zig");
+const sql_policies = @import("../system_catalog/policies.zig");
+const fk_generation_publication = @import("../metadata/fk_generation_publication.zig");
+const fk_initial_retirement_wire = @import("../metadata/fk_initial_retirement_wire.zig");
 
 pub const RaftApplyStoreConfig = struct {
+    borrowed_store: ?*@import("backend_erased.zig").Store = null,
     root_dir: []const u8,
     map_size: usize = 16 * 1024 * 1024,
     no_sync: bool = false,
@@ -76,6 +83,7 @@ pub const RaftApplyStore = struct {
     handle: ?*anyopaque,
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
     listeners_mutex: std.Io.Mutex = .init,
+    hot_standby_adapter: ?*@import("metadata_hot_standby_adapter.zig").Adapter = null,
 
     pub const RestoreJobRow = struct {
         key: []u8,
@@ -91,6 +99,7 @@ pub const RaftApplyStore = struct {
             .read_only = @intFromBool(cfg.read_only),
             .context = cfg.context,
             .root_dir = .fromSlice(cfg.root_dir),
+            .system_store = if (cfg.borrowed_store) |store| try @import("kernel_system_store_client.zig").nativeHandle(store) else null,
         }, &handle));
         return .{
             .alloc = alloc,
@@ -100,6 +109,10 @@ pub const RaftApplyStore = struct {
 
     pub fn deinit(self: *RaftApplyStore) void {
         abi.antfly_metadata_apply_store_close(self.handle);
+        if (self.hot_standby_adapter) |adapter| {
+            adapter.io_impl.deinit();
+            self.alloc.destroy(adapter);
+        }
         for (self.listeners.items) |listener| self.alloc.destroy(listener);
         self.listeners.deinit(self.alloc);
         self.* = undefined;
@@ -205,6 +218,119 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    fn parsedProjection(self: *RaftApplyStore, comptime T: type, alloc: std.mem.Allocator, request: abi.MetadataProjectionRequest) !?std.json.Parsed(T) {
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &request, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (std.mem.eql(u8, response.slice(), "null")) return null;
+        return try std.json.parseFromSlice(T, alloc, response.slice(), .{ .allocate = .alloc_always });
+    }
+
+    pub fn bindHotStandby(self: *RaftApplyStore, gate: ?@import("db/replication_contract.zig").WriteGate, mirror: ?@import("db/replication_contract.zig").AsyncEffectMirror) !void {
+        const Adapter = @import("metadata_hot_standby_adapter.zig").Adapter;
+        const next = try self.alloc.create(Adapter);
+        errdefer self.alloc.destroy(next);
+        next.* = .{ .alloc = self.alloc, .io_impl = std.Io.Threaded.init(self.alloc, .{}), .gate = gate, .mirror = mirror };
+        errdefer next.io_impl.deinit();
+        const port = next.asPort();
+        try statusToError(abi.antfly_metadata_apply_store_bind_ha(self.handle, &.{ .port = &port }));
+        if (self.hot_standby_adapter) |old| {
+            old.io_impl.deinit();
+            self.alloc.destroy(old);
+        }
+        self.hot_standby_adapter = next;
+    }
+    pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
+        _ = try self.projection(bool, .{ .kind = .flush_ha_outbox });
+    }
+    pub fn applyHotStandbyRecord(self: *RaftApplyStore, record: @import("db/replication_record.zig").RecordView) !void {
+        const bytes = try @import("db/replication_record.zig").encodeAlloc(self.alloc, record);
+        defer self.alloc.free(bytes);
+        _ = try self.projection(bool, .{ .kind = .apply_ha_record, .key = .fromSlice(bytes) });
+    }
+    pub fn exportHotStandbyCheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8) !@import("hot_standby/metadata_effects.zig").CheckpointArtifact {
+        _ = io; // IO is performed by the owning native metadata runtime.
+        return self.projection(@import("hot_standby/metadata_effects.zig").CheckpointArtifact, .{ .kind = .export_ha_checkpoint, .key = .fromSlice(path) });
+    }
+    pub fn importHotStandbyCheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8, size_bytes: u64) !void {
+        _ = io;
+        _ = try self.projection(bool, .{ .kind = .import_ha_checkpoint, .key = .fromSlice(path), .arg0 = size_bytes });
+    }
+    pub fn migrateStandaloneRestoreJobs(self: *RaftApplyStore, rows: []const RestoreJobRow) !void {
+        var encoded: std.Io.Writer.Allocating = .init(self.alloc);
+        defer encoded.deinit();
+        var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
+        try @import("db/relational_integrity_json.zig").write(rows, &stream);
+        _ = try self.projection(bool, .{ .kind = .migrate_standalone_restore_jobs, .key = .fromSlice(encoded.written()) });
+    }
+
+    pub fn getBackupCohort(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort, .group_id = group_id, .arg0 = job_id });
+    }
+    pub fn getBackupCohortProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, job_id: u64) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .backup_cohort_progress, .group_id = group_id, .arg0 = job_id });
+    }
+    pub fn listBackupCohorts(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after: ?[]const u8, limit: usize) ![]@import("docstore.zig").OwnedKVPair {
+        return self.projectionWithAllocator([]@import("docstore.zig").OwnedKVPair, alloc, .{ .kind = .backup_cohorts, .group_id = group_id, .arg0 = limit, .arg1 = @intFromBool(after != null), .key = .fromSlice(after orelse "") });
+    }
+    pub fn loadRestoreStaging(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id) !?std.json.Parsed(restore_staging.Job) {
+        return self.parsedProjection(restore_staging.Job, alloc, .{ .kind = .restore_staging_job, .group_id = group_id, .key = .fromSlice(&id) });
+    }
+    pub fn loadRestoreStagingForOwner(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, owner_group: u64) !?std.json.Parsed(restore_staging.Job) {
+        return self.parsedProjection(restore_staging.Job, alloc, .{ .kind = .restore_staging_owner_job, .group_id = group_id, .arg0 = owner_group });
+    }
+    pub fn loadRestoreStagingProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id) !?restore_staging.Progress {
+        return self.projectionWithAllocator(?restore_staging.Progress, alloc, .{ .kind = .restore_staging_progress, .group_id = group_id, .key = .fromSlice(&id) });
+    }
+    pub fn restoreStagingAuthorityAllowed(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, node_id: u64, owner_group: ?u64) !bool {
+        if (owner_group == 0) return false;
+        return self.projectionWithAllocator(bool, alloc, .{ .kind = .restore_staging_authority_allowed, .group_id = group_id, .key = .fromSlice(&id), .arg0 = node_id, .arg1 = owner_group orelse 0 });
+    }
+    pub fn loadRestoreStagingReceipt(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, state: restore_staging.State, owner_group: u64) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_staging_receipt, .group_id = group_id, .key = .fromSlice(&id), .arg0 = @backingInt(state), .arg1 = owner_group });
+    }
+    pub fn captureProvisioningCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !restore_staging.ProvisioningProjection {
+        return self.projectionWithAllocator(restore_staging.ProvisioningProjection, alloc, .{ .kind = .provisioning_catalog, .group_id = group_id });
+    }
+    pub fn initialGroupReservation(self: *RaftApplyStore, metadata_group_id: u64, range_group_id: u64) !?fk_generation_publication.InitialGroupReservation {
+        return self.projection(?fk_generation_publication.InitialGroupReservation, .{
+            .kind = .fk_initial_group_reservation,
+            .group_id = metadata_group_id,
+            .arg0 = range_group_id,
+        });
+    }
+    pub fn getRelationalTopologyProtocolActivationVersion(self: *RaftApplyStore, group_id: u64) !u16 {
+        return self.projection(u16, .{ .kind = .relational_topology_protocol_activation_version, .group_id = group_id });
+    }
+    pub fn resolveTableCreateIdentity(self: *RaftApplyStore, group_id: u64, initial: u64) !u64 {
+        return self.projection(u64, .{ .kind = .resolve_table_create_identity, .group_id = group_id, .arg0 = initial });
+    }
+    pub fn applyStandaloneCommand(self: *RaftApplyStore, group_id: u64, command: physical_metadata.TransitionCommand) !void {
+        const encoded = try physical_metadata.encodeTransitionCommand(self.alloc, command);
+        defer self.alloc.free(encoded);
+        _ = try self.projection(bool, .{ .kind = .standalone_command, .group_id = group_id, .key = .fromSlice(encoded) });
+    }
+    pub fn loadStandaloneCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .standalone_catalog });
+    }
+    pub fn loadStandaloneCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator) !?[]u8 {
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .standalone_catalog, .arg0 = 1 });
+    }
+    pub fn standaloneRevision(self: *RaftApplyStore) !u64 {
+        return self.projection(u64, .{ .kind = .standalone_revision });
+    }
+    pub fn replaceStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, tables: []const metadata.TableRecord, ranges: []const metadata.RangeRecord, auxiliary_json: []const u8) !void {
+        return self.updateStandaloneCatalog(group_id, expected_revision, .{ .replace = true, .tables = tables, .ranges = ranges, .auxiliary_json = auxiliary_json });
+    }
+
+    pub fn updateStandaloneCatalog(self: *RaftApplyStore, group_id: u64, expected_revision: u64, update: contract.StandaloneCatalogUpdate) !void {
+        var encoded: std.Io.Writer.Allocating = .init(self.alloc);
+        defer encoded.deinit();
+        var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
+        try @import("db/relational_integrity_json.zig").write(update, &stream);
+        _ = try self.projection(bool, .{ .kind = .replace_standalone_catalog, .group_id = group_id, .arg0 = expected_revision, .key = .fromSlice(encoded.written()) });
+    }
+
     fn projectionWithAllocator(self: *RaftApplyStore, comptime T: type, alloc: std.mem.Allocator, request: abi.MetadataProjectionRequest) !T {
         var response: abi.OwnedBytes = .{};
         try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &request, &response));
@@ -301,6 +427,81 @@ pub const RaftApplyStore = struct {
         const value = try self.catalogProjection(struct { meta: system_catalog.Meta, value: system_catalog.State }, arena.allocator(), group_id, .{ .catalog_snapshot = {} });
         return .{ .arena = arena, .meta = value.meta, .value = value.value };
     }
+    pub fn sqlSettingSnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: sql_settings.Scope) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_setting_snapshot = scope });
+    }
+    pub fn sqlPolicySnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_snapshot = .{ .table_id = table_id, .principal = principal, .database = database, .roles = roles } });
+    }
+    pub fn sqlPolicyInstallSnapshotJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: sql_policies.InstallRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_install_snapshot = request });
+    }
+    pub fn sqlPolicyPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_status = table_id });
+    }
+    pub fn sqlPolicyPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_publication_work = after_table_id });
+    }
+    pub fn sqlPolicyBeginCommandJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: sql_policies.BeginRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .sql_policy_begin_command = request });
+    }
+    pub fn requirePolicyIndexMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
+        const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_index_mutation_allowed = table_id });
+        if (!value) return error.RowPolicyUnsupported;
+    }
+    pub fn requirePolicyTopologyMutationAllowed(self: *RaftApplyStore, group_id: u64, table_id: u64) !void {
+        const value = try self.catalogProjection(bool, self.alloc, group_id, .{ .require_policy_topology_mutation_allowed = table_id });
+        if (!value) return error.RowPolicyUnsupported;
+    }
+    pub fn fkGenerationPublicationStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_status = child_table_id });
+    }
+    pub fn fkGenerationPublicationWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_work = after_child_table_id });
+    }
+    pub fn fkGenerationPublicationDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_decision = request });
+    }
+    pub fn fkGenerationPublicationSourceDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.SourceDecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_publication_source_decision = request });
+    }
+    pub fn fkInitialCreatePrepareJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialCreatePrepareRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_prepare = request });
+    }
+    pub fn preflightFkInitialCreateCommand(self: *RaftApplyStore, group_id: u64, bytes: []const u8) !void {
+        const result = try self.projection(contract.InitialFkPreflight, .{
+            .kind = .fk_initial_create_preflight,
+            .group_id = group_id,
+            .key = .fromSlice(bytes),
+        });
+        return switch (result) {
+            .ready => {},
+            .generation_changed => error.GenerationPublicationChanged,
+            .catalog_exists => error.CatalogAlreadyExists,
+            .table_transition_active => error.TableTransitionActive,
+        };
+    }
+    pub fn fkInitialChildDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.InitialChildDecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_child_decision = request });
+    }
+    pub fn fkInitialCreateStatusJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_status = child_table_id });
+    }
+    pub fn fkGenerationTableLockedJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_generation_table_locked = table_id });
+    }
+    pub fn fkInitialCreateWorkJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, after_child_table_id: u64) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_create_work = after_child_table_id });
+    }
+    pub fn fkInitialRetirementTicketPageJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.PageRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_retirement_page = request });
+    }
+    pub fn storeRootControlJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_initial_retirement_wire.Control) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .store_root_control = request });
+    }
+    pub fn fkInitialParentDecisionJson(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: fk_generation_publication.DecisionRequest) ![]u8 {
+        return self.catalogProjection([]u8, alloc, group_id, .{ .fk_initial_parent_decision = request });
+    }
     fn catalogProjection(self: *RaftApplyStore, comptime T: type, alloc: std.mem.Allocator, group_id: u64, request: contract.CatalogProjectionRequest) !T {
         const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
         defer alloc.free(bytes);
@@ -372,6 +573,10 @@ pub const RaftApplyStore = struct {
 
     pub fn listMergeTransitions(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.MergeTransitionRecord {
         return try self.projectionWithAllocator([]metadata.MergeTransitionRecord, alloc, .{ .kind = .merge_transitions, .group_id = group_id });
+    }
+
+    pub fn getMergeTransition(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, transition_id: u64) !?metadata.MergeTransitionRecord {
+        return self.projectionWithAllocator(?metadata.MergeTransitionRecord, alloc, .{ .kind = .merge_transition, .group_id = group_id, .arg0 = transition_id });
     }
 
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
@@ -636,6 +841,14 @@ pub const RaftApplyStore = struct {
 
     pub fn listRestoreJobRows(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]RestoreJobRow {
         return try self.projectionWithAllocator([]RestoreJobRow, alloc, .{ .kind = .restore_job_rows, .group_id = group_id });
+    }
+
+    pub fn getSecretCollection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, scope: []const u8) !?[]u8 {
+        var response: abi.OwnedBytes = .{};
+        try statusToError(abi.antfly_metadata_apply_store_projection(self.handle, &.{ .kind = .secret_collection, .group_id = group_id, .key = .fromSlice(scope) }, &response));
+        defer abi.antfly_storage_owner_buffer_destroy(&response);
+        if (response.len == 0) return null;
+        return try alloc.dupe(u8, response.slice());
     }
 
     pub fn getRestoreJobValue(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, key: []const u8) !?[]u8 {

@@ -646,6 +646,197 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Open a durable idle HTTP SQL connection
+         * @description Creates a principal- and API-node-owned connection with a one-hour idle-use deadline. Active or uncertain transactions retain their exact connection binding until completion or reconciliation; expiry is not an abort decision. Send connection_id with later SQL and prepared requests. This ID is not a transaction session_id. DISCARD ALL resets only this connection's setting overlay and prepared resources, and refuses active or uncertain transactions. Do not automatically replay ambiguous create responses.
+         */
+        post: operations["openSQLConnection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/connections/{connection_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Close an idle SQL connection and its prepared resources
+         * @description Refuses an active, beginning or uncertain transaction; route to owner_node_id.
+         */
+        delete: operations["closeSQLConnection"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create a durable prepared SQL resource
+         * @description Binds SELECT, INSERT, UPDATE or DELETE without executing it. The immutable resource belongs to the authenticated principal and API node, expires after one hour, and survives transaction COMMIT and owner restart with the same durable store and node identity. A session-bound resource is executable only while its attached session remains active. Owner failover is not automatic; execute and close must reach owner_node_id. Each durable store admits at most 128 resources and 4 MiB of serialized prepared state. Expired resources are reclaimed atomically during subsequent creation or close. Execution authenticates and authorizes again and rejects changed catalog identities or schemas. When session_id is supplied, preparation uses the attached session's authenticated database, namespace and setting overlay under its execution lease. The resource is bound to that session; execution re-reads current values but rejects a changed setting catalog. A native durable session store is required.
+         */
+        post: operations["prepareSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}/execute": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a durable prepared SQL resource
+         * @description Uses the stored statement, namespace and immutable binding identities. Resource admission linearizes when its durable record is loaded; a later close or expiry does not cancel that already admitted execution. Mutation outcomes must be reconciled rather than replayed after ambiguous errors.
+         */
+        post: operations["executePreparedSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql/prepared/{prepared_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Release a durable prepared SQL resource */
+        delete: operations["closePreparedSQL"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Publish or remove a durable SQL setting
+         * @description Cluster-administrator-only, revision-fenced publication of typed setting definitions and global, database, and credential-role defaults. SQL SET cannot change policy-sensitive settings. Observe an ambiguous mutation before retrying.
+         */
+        post: operations["administerSqlSettings"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Approve a physical store-root signing identity
+         * @description Cluster-administrator-only approval of a locally signed proof bound to the metadata cluster, node, store and physical root. Ordinary node registration does not grant retirement authority. The request is not automatically retried; observe the enrollment after an ambiguous 503.
+         */
+        post: operations["enrollStoreRoot"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/store-roots/enrollment-status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check one exact physical store-root enrollment
+         * @description Read-only, linearizable cluster-administrator check for the exact identity in a signed proof. Use after an ambiguous enroll response; this operation never submits another enrollment mutation.
+         */
+        post: operations["getStoreRootEnrollmentStatus"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a SQL statement
+         * @description Executes the bounded relational SELECT, INSERT, UPDATE, and DELETE
+         *     subset through the current catalog and native row execution contracts.
+         *     Parameters are bound separately from statement text. Document, graph,
+         *     and lake SQL sources, DDL, and SQL sessions are not yet supported.
+         *     Reads inherit native owner-local consistency, not a global SQL
+         *     transaction snapshot. Statements requiring a retained multi-page
+         *     statement snapshot fail when that capability is unavailable.
+         *     Unsupported statement shapes fail explicitly; the server never
+         *     silently substitutes a different query or truncates the result.
+         */
+        post: operations["executeSQL"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/query": {
         parameters: {
             query?: never;
@@ -821,6 +1012,131 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/agents/research": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Research Agent - Bounded multi-phase research with a cited report
+         * @description Runs a bounded research state machine:
+         *     plan → research (parallel retrieval researchers) → reflect → … → write → verify
+         *
+         *     Every researcher is an ordinary retrieval-agent run over the request's
+         *     authorized queries, so authorization, mandatory predicates and tool
+         *     policy are identical to `/agents/retrieval`. Researchers return
+         *     compressed findings; the writer only sees findings and a deduplicated
+         *     evidence registry, and the server validates every `[E#]` citation.
+         *
+         *     All work is bounded by `budget`. Send `research_state` back to resume
+         *     or extend a run. For runs longer than one request, use
+         *     `/agents/research/jobs`.
+         *
+         *     **SSE Event Types:** the retrieval-agent events are reused.
+         *     `step_progress` carries `phase` values `plan`, `sub_question_started`,
+         *     `finding`, `reflection`, `section` and `verification`. Report text
+         *     streams as `generation`. `done` carries the authoritative
+         *     ResearchAgentResult.
+         */
+        post: operations["researchAgent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a durable research job
+         * @description Persists a research request as a durable job that advances one bounded
+         *     phase at a time. Each phase checkpoints its research_state, so a job
+         *     survives server restarts and can be resumed by any caller holding the
+         *     same identity. Jobs are scoped to the authenticated principal.
+         */
+        post: operations["startResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get a durable research job */
+        get: operations["getResearchJob"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}/advance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Advance a durable research job
+         * @description Runs up to `max_phases` bounded research phases and persists the
+         *     checkpoint after each one. Concurrent advances of the same job are
+         *     rejected with 409.
+         */
+        post: operations["advanceResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/agents/research/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a durable research job */
+        post: operations["cancelResearchJob"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables": {
         parameters: {
             query?: never;
@@ -984,6 +1300,145 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
+        get: operations["getRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed or diagnosed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
+         */
+        post: operations["repairRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/batch": {
         parameters: {
             query?: never;
@@ -1116,8 +1571,25 @@ export interface paths {
     };
     "/db/v1/tables/{tableName}/schema": {
         parameters: {
-            query?: never;
-            header?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
+            header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
+            };
             path: {
                 /** @description Name of the table */
                 tableName: string;
@@ -1754,6 +2226,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/indexes/{indexName}": {
         parameters: {
             query?: never;
@@ -2257,6 +2775,207 @@ export interface paths {
         post: operations["createNamespaceTableIndex"];
         /** Drop an index from an explicit namespace table */
         delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /** Read distributed UNIQUE, foreign-key, and CHECK validation coverage */
+        get: operations["getNamespaceRelationalConstraintStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair version-conditional rows after failed or diagnosed constraint activation
+         * @description Requires table administrator permission. Each affected target range must
+         *     have failed UNIQUE/FK/CHECK activation or a validating MATCH PARTIAL
+         *     missing-parent diagnostic. Replacement values still satisfy all
+         *     constraints, and referential actions require write permission on every
+         *     affected table. Existing dependencies remain protected. Repairs do not
+         *     mark historical coverage valid. Invoke constraint retry after repairing
+         *     failed activation; validating diagnostics resume validation automatically.
+         */
+        post: operations["repairNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Restart failed UNIQUE/FK/CHECK validation after administrative repair
+         * @description Requires table administrator permission. Resets each failed owner using
+         *     an exact checkpoint precondition. Owners already validating or enforced
+         *     are unchanged. Retrying after partial progress is safe. Inspect the
+         *     constraint status endpoint for coverage and diagnostics.
+         *     When a retirement job is active, clears its paused diagnostic and
+         *     resumes that job instead of restarting activation. Retirement remains
+         *     fenced and retains all prior drain progress.
+         */
+        post: operations["retryNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/constraints/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retire unique and foreign-key definitions safely
+         * @description Requires table administrator permission. Starts a durable, bounded
+         *     all-owner drain. Poll constraints/status for progress. A target schema
+         *     is published automatically after the drain. With drop=true the table
+         *     remains fenced at ready_to_drop until an administrator explicitly
+         *     deletes it with the existing table deletion endpoint.
+         */
+        post: operations["retireNamespaceRelationalConstraints"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query projected typed relational rows */
+        post: operations["queryNamespaceRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/mutate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Atomically replace or delete version-conditional typed rows */
+        post: operations["mutateNamespaceRelationalRows"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a failed index build
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Retry accepts failed generations. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["retryNamespaceIndex"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Repair an index generation
+         * @description Generation-fenced relational index maintenance. Requires table ADMIN permission. Repair accepts ready or failed generations and rebuilds their derived records. Owners are admitted independently and durably; exact request replay resumes after partial acknowledgements. Unsupported index types return 405.
+         */
+        post: operations["repairNamespaceIndex"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2776,33 +3495,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/ai/v1/rerank_multimodal": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Rerank multimodal documents by relevance
-         * @description Re-scores multimodal documents based on relevance to a text query.
-         *
-         *     This endpoint accepts the same content-part image conventions as generation and embedding.
-         *     Text-only requests can be served immediately. Image-bearing requests reserve the stable
-         *     contract for native ColQwen-style late-interaction reranking as that encoder lands.
-         *     Image-bearing requests already run native Zig image preprocessing and grid preparation.
-         *     Remote URL byte potential is reserved before fetch, and image headers plus aggregate
-         *     decoded pixels are admitted before model loading.
-         */
-        post: operations["rerankMultimodalPrompts"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/ai/v1/rerank": {
         parameters: {
             query?: never;
@@ -2813,32 +3505,34 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Rerank prompts by relevance
-         * @description Re-scores pre-rendered text prompts based on relevance to a query using native or ONNX reranking models.
+         * Rerank documents by relevance
+         * @description Re-scores documents by relevance to a text query. Returns one score per
+         *     document, in request order.
          *
-         *     ## Client Responsibilities
+         *     Each entry in `documents` is either a string or an array of content parts, in
+         *     the same format that generation and embedding use: `text` parts, `image_url`
+         *     parts, and inline `media` parts with an `image/*` MIME type. The client renders
+         *     document fields or templates to text before calling this endpoint.
          *
-         *     The client must:
-         *     1. Extract relevant fields from documents
-         *     2. Render any templates
-         *     3. Send pre-rendered text strings as `prompts`
-         *
-         *     This design keeps inference stateless and allows clients to customize rendering logic.
+         *     Text-only documents work with any reranker. Documents with images require a
+         *     model that supports them: a ColQwen-style late-interaction reranker (manifest
+         *     capability `colqwen` or `multimodal_late_interaction`) or a Qwen3-VL reranker
+         *     bundled with its GGUF vision projector. Otherwise the request is rejected with
+         *     a `400`. Within a request that contains images, documents without images are
+         *     scored by the model's text scorer.
          *
          *     ## Models
          *
          *     - Models are auto-discovered from `models_dir/rerankers/`
-         *     - Cross-encoder rerankers are supported through the existing text scorer
+         *     - Cross-encoder rerankers are supported through the text scorer
          *     - Late-interaction text rerankers such as ColBERT can opt in with `model_manifest.json` capability `late_interaction` or `colbert`
-         *     - Supports quantized models (`model_quantized.onnx`)
          *     - Automatically prefers quantized variants if available
          *
-         *     This endpoint is still text-only. Real ColQwen-style multimodal reranking requires a future request shape that carries page images or image-derived embeddings.
-         *
-         *     For document-based reranking with field extraction, use the client-side
-         *     `lib/reranking` package which handles rendering before calling this endpoint.
+         *     Remote image URLs are fetched subject to the configured content security
+         *     policy. Image headers and aggregate decoded pixels are admitted before the
+         *     model loads.
          */
-        post: operations["rerankPrompts"];
+        post: operations["rerankDocuments"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3301,6 +3995,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/ai/v1/decide": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Answer named choice, ordinal score, and Boolean questions */
+        post: operations["decide"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ai/v1/extract": {
         parameters: {
             query?: never;
@@ -3662,6 +4373,221 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+         * @enum {string}
+         */
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumn: {
+            /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
+            name: string;
+            type: components["schemas"]["SQLColumnType"];
+        };
+        SQLPrepareRequest: {
+            statement: string;
+            database?: string;
+            namespace?: string;
+            /** @description Optional durable SQL session. Preparation binds its authenticated scope and current setting catalog under the session lease; execution must supply the same session. */
+            session_id?: string;
+            /** @description Optional idle HTTP SQL connection. Preparation binds to its current DISCARD generation; a transaction-bound preparation remains bound to session_id instead. */
+            connection_id?: string;
+        };
+        SQLPreparedExecutionRequest: {
+            parameters?: unknown[];
+            /** @default 128 */
+            limit?: number;
+            /** @description Optional durable transaction session. Required when the resource was prepared against a session; otherwise independent of the prepared resource lifetime. */
+            session_id?: string;
+            /** @description Required for a connection-bound resource; DISCARD ALL closes it without affecting other clients' resources. */
+            connection_id?: string;
+        };
+        SQLConnectionOpenRequest: {
+            /** @default default */
+            database?: string;
+            /** @default public */
+            namespace?: string;
+        };
+        SQLConnectionResponse: {
+            connection_id: string;
+            /** @description The owning API node. Zero denotes a standalone-local endpoint; send subsequent connection requests to that same endpoint. Otherwise route requests to the returned owning node. */
+            owner_node_id: string;
+            /**
+             * Format: int64
+             * @description Idle-use deadline in Unix milliseconds. An attached active or uncertain transaction remains accessible for completion and reconciliation after this deadline; expiry never implies abort.
+             */
+            expires_at_ms: number;
+            database: string;
+            namespace: string;
+        };
+        SQLPreparedResponse: {
+            prepared_id: string;
+            /** Format: int64 */
+            expires_at_ms: number;
+            /** @description Exact decimal API owner identifier, preserved by JavaScript clients. */
+            owner_node_id: string;
+            parameter_types: components["schemas"]["SQLColumnType"][];
+            columns: components["schemas"]["SQLColumn"][];
+        };
+        /** @description One typed setting value, matching the declared kind. */
+        SqlSettingValue: {
+            boolean: boolean;
+        } | {
+            /** Format: int64 */
+            integer: number;
+        } | {
+            string: string;
+        };
+        SqlSettingDatabaseDefault: {
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingRoleDefault: {
+            principal: string;
+            database: string;
+            value: components["schemas"]["SqlSettingValue"];
+        };
+        SqlSettingPut: {
+            name: string;
+            /** @enum {string} */
+            kind: "boolean" | "integer" | "string";
+            policy_sensitive?: boolean;
+            session_writable?: boolean;
+            default: components["schemas"]["SqlSettingValue"];
+            database_defaults?: components["schemas"]["SqlSettingDatabaseDefault"][];
+            role_defaults?: components["schemas"]["SqlSettingRoleDefault"][];
+        };
+        SqlSettingMutationPut: {
+            put: components["schemas"]["SqlSettingPut"];
+        };
+        SqlSettingMutationDrop: {
+            drop: string;
+        };
+        /** @description Put a complete definition/default set or drop one by name. */
+        SqlSettingMutationRequest: components["schemas"]["SqlSettingMutationPut"] | components["schemas"]["SqlSettingMutationDrop"];
+        StoreRootEnrollmentIdentity: {
+            metadata_incarnation: string;
+            /** Format: int64 */
+            node_id: number;
+            /** Format: int64 */
+            store_id: number;
+            /** @description Decimal u128 string; never pass through a floating-point JSON number. */
+            root_incarnation: string;
+            /** @description Ed25519 public key in lowercase hex. */
+            public_key: string;
+        };
+        StoreRootEnrollmentRequest: {
+            identity: components["schemas"]["StoreRootEnrollmentIdentity"];
+            /** @description Ed25519 proof-of-possession signature in lowercase hex. */
+            signature: string;
+        };
+        /**
+         * @description Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...),
+         *     never interpolated into SQL text. To preserve integer precision in
+         *     JavaScript clients, supply integers outside the exact JSON number range
+         *     as decimal strings; binding coerces parameters to the expected type.
+         *     The result limit is an admission bound, not an implicit SQL LIMIT:
+         *     statements whose results exceed it fail instead of silently truncating.
+         *     Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated
+         *     memory, and encoded results to a 16 MiB allocation budget.
+         */
+        SQLRequest: {
+            /** @description A single SQL statement. */
+            statement: string;
+            /** @description Positional JSON parameter values, including null. */
+            parameters?: unknown[];
+            /** @description Database used to resolve unqualified catalog names. */
+            database?: string;
+            /** @description Namespace used to resolve unqualified table names. */
+            namespace?: string;
+            /**
+             * @description Maximum admitted result rows; does not change statement semantics.
+             * @default 128
+             */
+            limit?: number;
+            /** @description Opaque SQL session identifier returned by a previous response. */
+            session_id?: string;
+            /** @description Durable idle HTTP connection. Its scope and settings are inherited; active transaction IDs cannot be bypassed by omitting session_id. DISCARD ALL requires this identity and is rejected while a transaction is active or uncertain. */
+            connection_id?: string;
+        };
+        /**
+         * @description Authoritative native SQL session state after the statement. Failed sessions require ROLLBACK or ROLLBACK TO SAVEPOINT; uncertain commit outcomes must be reconciled by transaction_id, never replayed.
+         * @enum {string}
+         */
+        SQLTransactionStatus: "idle" | "in_transaction" | "failed";
+        /**
+         * @description Durable mutation outcome. Every value confirms a commit and must not
+         *     cause the statement to be replayed. Pending or repair outcomes require
+         *     visibility convergence or operator action rather than another write.
+         * @enum {string}
+         */
+        SQLMutationOutcome: "committed" | "committed_pending" | "committed_repair_required" | "committed_graph_metric_materialization_rejected";
+        /**
+         * @description Ordinal result rows with corresponding logical column metadata. SQL NULL
+         *     is JSON null; sql_nulls distinguishes it from a JSON column containing
+         *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
+         *     values are strings. Objects and arrays in JSON columns remain JSON.
+         */
+        SQLResponse: {
+            columns: components["schemas"]["SQLColumn"][];
+            rows: unknown[][];
+            /**
+             * Format: int64
+             * @description Number of rows affected by a mutation, or zero for a read-only statement.
+             */
+            rows_affected: number;
+            /**
+             * @description Null flags aligned exactly with rows and their columns. True denotes
+             *     SQL NULL; false denotes a value, including the JSON literal null.
+             *     When omitted, null cells have the legacy SQL NULL interpretation.
+             */
+            sql_nulls?: boolean[][];
+            /** @description SQL command completion tag. */
+            command_tag: string;
+            mutation_outcome?: components["schemas"]["SQLMutationOutcome"];
+            ddl_receipt?: components["schemas"]["SQLDDLReceipt"];
+            /** @description Native transaction receipt for visibility or repair reconciliation; never replay a committed statement. */
+            transaction_id?: string;
+            /** @description Opaque SQL session identifier for subsequent requests. */
+            session_id?: string;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
+        /** @enum {string} */
+        SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
+        /**
+         * @description Durable DDL declaration receipt. admission_unknown means admission has
+         *     not been confirmed; reconcile restore_job_id and idempotency_key without replaying DDL.
+         *     Pending or invalid means the declaration
+         *     committed but validation has not established an active constraint. Do not
+         *     replay it. Inspect table constraint status using this immutable table
+         *     identity and schema generation; a later generation supersedes this receipt.
+         */
+        SQLDDLReceipt: {
+            database: string;
+            namespace: string;
+            table: string;
+            table_id: string;
+            /** Format: int64 */
+            schema_version: number;
+            state: components["schemas"]["SQLDDLReceiptState"];
+            diagnostic?: string;
+            /** @description Native staging job for an atomic schema rewrite or TRUNCATE generation barrier. table_id identifies the source generation. Poll the job; pending or admission_unknown is not completed DDL and must not be replayed. */
+            restore_job_id?: string;
+            /** @description Durable retry identity for an admitted or uncertain schema rewrite. Retain it with restore_job_id when reconciling admission; do not replay the DDL. */
+            idempotency_key?: string;
+        };
+        SQLDiagnostic: {
+            /** @description Five-character SQLSTATE error code. */
+            code: string;
+            /** @description Human-readable diagnostic with no sensitive parameter values. */
+            message: string;
+            /** @description Optional one-based character position in the submitted SQL statement. */
+            position?: number;
+            /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
+            transaction_id?: string;
+            /** @description False for SQLSTATE 40003; never replay a mutation whose outcome is unknown. */
+            retryable?: boolean;
+            transaction_status?: components["schemas"]["SQLTransactionStatus"];
+        };
         /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
         DatabaseCatalogRecord: {
             /**
@@ -3957,7 +4883,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable" | "decision_provider_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**
@@ -3966,10 +4892,10 @@ export interface components {
              */
             retryable: true;
         };
-        /** @description A stable failure envelope for query embedding and reranking dependencies. */
+        /** @description A stable failure envelope for query embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -4426,50 +5352,9 @@ export interface components {
          *
          *        See: https://antfly.io/docs/configuration#security--cors
          *
-         *     4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation)
-         *        ```handlebars
-         *        {{encodeToon this.fields}}
-         *        {{encodeToon this.fields lengthMarker=false indent=4}}
-         *        {{encodeToon this.fields delimiter="\t"}}
-         *        ```
-         *
-         *        **What is TOON?**
-         *        TOON is a compact, human-readable format designed for passing structured data to LLMs.
-         *        It provides **30-60% token reduction** compared to JSON while maintaining high LLM
-         *        comprehension accuracy.
-         *
-         *        **Key Features:**
-         *        - Compact syntax using `:` for key-value pairs
-         *        - Array length markers: `tags[#3]: ai,search,ml`
-         *        - Tabular format for uniform data structures
-         *        - Optimized for LLM parsing and understanding
-         *        - Maintains human readability
-         *
-         *        **Benefits:**
-         *        - **Lower API costs** - Reduced token usage means lower LLM API costs
-         *        - **Faster responses** - Less tokens to process
-         *        - **More context** - Fit more documents within token limits
-         *
-         *        **Options:**
-         *        - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true)
-         *        - `indent` (int): Indentation spacing for nested objects (default: 2)
-         *        - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs)
-         *
-         *        **Example output:**
-         *        ```
-         *        title: Introduction to Vector Search
-         *        author: Jane Doe
-         *        tags[#3]: ai,search,ml
-         *        metadata:
-         *          edition: 2
-         *          pages: 450
-         *        ```
-         *
-         *        **Default in RAG:** TOON is the default format for document rendering in RAG queries.
-         *
-         *        **References:**
-         *        - TOON Specification: https://github.com/toon-format/toon
-         *        - Go Implementation: https://github.com/alpkeskin/gotoon
+         *     4. **encodeToon** is not available in these templates. It is a helper of the
+         *        retrieval agent's `document_renderer`, which renders documents into the
+         *        generation prompt as TOON by default.
          *
          *     **Template Examples:**
          *
@@ -4551,26 +5436,26 @@ export interface components {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["EmbedderProvider"];
             /**
-             * @description Declare that this model supports non-text content (images, audio, video, PDFs),
-             *     even if the model isn't in Antfly's built-in model registry yet.
+             * @description Input types the model accepts. Normally omitted: Antfly learns them from the
+             *     model's capabilities, which Antfly inference publishes for every model it
+             *     serves. Set it only to use a model whose capabilities Antfly cannot discover
+             *     yet, such as a newly released model. When set, it replaces the discovered
+             *     input types.
              *
-             *     When `true`, Antfly treats the model as multimodal and sends binary content
-             *     (images, audio, etc.) through an embedding adapter that supports content parts.
-             *     Antfly currently provides that contract for local Antfly inference and Bedrock;
-             *     text-only provider adapters reject media rather than silently discarding it.
-             *
-             *     Not needed for models already in the local registry (e.g., `clip-*`, `clipclap`).
+             *     Only providers whose adapters can send media accept media inputs: `antfly`
+             *     (`image`, `audio`) and `bedrock` (`image`). Other providers reject `image` and
+             *     `audio` here rather than silently discarding media.
              *
              *     **Example:**
              *     ```json
              *     {
              *       "provider": "antfly",
              *       "model": "some-future-multimodal-model",
-             *       "multimodal": true
+             *       "inputs": ["text", "image"]
              *     }
              *     ```
              */
-            multimodal?: boolean;
+            inputs?: ("text" | "image" | "audio")[];
             /**
              * @deprecated
              * @description Deprecated compatibility form of
@@ -5676,6 +6561,11 @@ export interface components {
             source?: string;
             /** @description Whether this key has an Antfly-managed override that can be deleted. */
             managed?: boolean;
+            /**
+             * Format: uint64
+             * @description Committed native entry revision, when supported by the configured backend.
+             */
+            revision?: number;
             /** @description Corresponding environment variable name (e.g., OPENAI_API_KEY) */
             env_var?: string;
             /** Format: date-time */
@@ -5696,7 +6586,7 @@ export interface components {
         /**
          * @description Synchronization level for batch operations:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
-         *     - "write": Wait for Pebble KV write
+         *     - "write": Wait for the write to be durably applied to the local key-value store
          *     - "full_text": Wait for full-text index WAL write
          *     - "enrichments": Precompute enrichments before committing the document. A synchronous
          *       producer failure rejects the write; post-commit worker failures retain the document
@@ -5870,7 +6760,7 @@ export interface components {
             index_sort_order?: "asc" | "desc";
         };
         /** @enum {string} */
-        AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
+        AntflyType: "search_as_you_type" | "substring" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
         Table: {
             storage?: components["schemas"]["TableStorageSettings"];
             name: string;
@@ -6812,6 +7702,98 @@ export interface components {
              */
             limit?: number;
         };
+        RelationalRowCondition: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand. Omission means NULL. Integer columns also accept exact decimal strings. */
+            value?: unknown;
+            collation?: string;
+        };
+        /**
+         * @description Bounded relational scan in primary-key order, or composite index order
+         *     when index is supplied. Index queries require schema_version and every
+         *     owning shard must have the selected generation ready. Partial indexes
+         *     require their WHERE predicates to be implied by the query conditions.
+         *     The bounded proof combines per-column equality, tighter ranges,
+         *     exclusions, and NULL-aware predicates using exact typed values and
+         *     matching collations. Unsupported implications fail closed. Explicit
+         *     scan bounds alone are not an implication proof. Equal tuples are
+         *     ordered by primary key. Each shard read pins its own immutable schema
+         *     and row snapshot; this is not a table-wide consistent snapshot.
+         *     Resume with the last returned _id as from for primary scans, or its
+         *     cursor as after for index scans. A resumed request opens a fresh snapshot,
+         *     not a retained cursor; concurrent mutations may move rows across the
+         *     continuation boundary. Keep index, bounds and conditions unchanged when paging.
+         *     An empty projection returns row identities and versions only.
+         */
+        RelationalRowQueryRequest: {
+            /** @description Ready composite secondary index. Requires schema_version; cannot be combined with from/to. */
+            index?: string;
+            /** @description Opaque exclusive index-order cursor from the last returned row. Binds the immutable schema version, logical index name, and comparison semantics, independent of owner-local physical generations. Each owner must still prove its current local index is ready. */
+            after?: string;
+            lower?: components["schemas"]["RelationalRowIndexBound"];
+            upper?: components["schemas"]["RelationalRowIndexBound"];
+            fields: string[];
+            conditions?: components["schemas"]["RelationalRowCondition"][];
+            /** @description Exclusive lower primary-key bound, including pagination continuation. */
+            from?: string;
+            /** @description Exclusive upper primary-key bound. */
+            to?: string;
+            /**
+             * Format: uint32
+             * @default 128
+             */
+            limit?: number;
+            /**
+             * Format: uint32
+             * @description Reject the read if an owning shard has a different active schema epoch. Zero is a valid epoch and is distinct from omission.
+             */
+            schema_version?: number;
+        };
+        /** @description Typed left-prefix bound in declared index order, including descending components. Inclusive bounds include the entire matching prefix. Integer components accept exact decimal strings; null is an indexed null. */
+        RelationalRowIndexBound: {
+            values: unknown[];
+            /** @default true */
+            inclusive?: boolean;
+        };
+        RelationalRow: {
+            /** @description Opaque index-order continuation; present only for secondary-index queries. */
+            cursor?: string;
+            _id: string;
+            row: {
+                [key: string]: unknown;
+            };
+            /** @description Projected JSON columns containing the JSON literal null rather than SQL NULL. Other null-valued fields are SQL NULL. */
+            json_null_fields?: string[];
+            /** @description Exact row version for mutation preconditions, encoded as decimal text. */
+            version: string;
+            /**
+             * Format: uint32
+             * @description Active pinned schema epoch, not the historical physical row layout.
+             */
+            schema_version: number;
+        };
+        /** @description A complete row replacement, or deletion when row is omitted. No read-modify-write is implied. */
+        RelationalRowMutation: {
+            key: string;
+            /** @description Exact observed version. Zero requires that the row does not exist. */
+            expected_version: string;
+            row?: {
+                [key: string]: unknown;
+            };
+            /** @description Names of JSON-typed columns whose row value is the JSON literal null rather than SQL NULL. Each name must identify a present null-valued JSON column; duplicates, unknown names, non-null values, and use with deletion are rejected. */
+            json_null_fields?: string[];
+        };
+        /** @description Atomic version-conditional typed-row replacements and deletions using the durable distributed transaction coordinator. */
+        RelationalRowMutationRequest: {
+            /**
+             * Format: uint32
+             * @description Required active relational schema epoch, fenced during every participant prepare.
+             */
+            schema_version: number;
+            mutations: components["schemas"]["RelationalRowMutation"][];
+            sync_level?: components["schemas"]["SyncLevel"];
+        };
         /**
          * @description Batch insert, delete, and transform operations in a single request.
          *
@@ -7106,6 +8088,75 @@ export interface components {
              */
             phase?: "begin" | "prepare" | "resolve";
         };
+        /**
+         * @description Deterministic relational integrity failure; changing the mutation or data is required before retry.
+         * @enum {string}
+         */
+        RelationalConstraintConflictReason: "unique_constraint_violation" | "foreign_key_parent_missing" | "foreign_key_referenced";
+        /** @enum {string} */
+        RelationalConstraintActivationPhase: "unique" | "foreign_key" | "check";
+        RelationalConstraintRangeStatus: {
+            /** @description Exact owner group identifier as decimal text. */
+            group_id: string;
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            phase: components["schemas"]["RelationalConstraintActivationPhase"];
+            /** @description Exact cumulative validation row count as decimal text. */
+            rows_scanned: string;
+            /** @description Opaque namespace-and-range ownership digest. */
+            owner: string;
+            failure?: string;
+        };
+        RelationalConstraintRetryRequest: {
+            schema_version: number;
+        };
+        RelationalConstraintRetryResponse: {
+            /** @enum {string} */
+            status: "accepted";
+        };
+        /**
+         * @description Supply exactly one of target_schema or drop=true. A target schema may
+         *     only remove UNIQUE/FK definitions; all other schema properties must
+         *     remain unchanged. Its version is assigned by the server. Retirement
+         *     fences primary mutations while existing reference and claim records
+         *     are drained. External foreign keys referencing removed definitions
+         *     must be retired first.
+         */
+        RelationalConstraintRetirementRequest: {
+            schema_version: number;
+            target_schema?: components["schemas"]["TableSchema"];
+            /**
+             * @description Prepare for explicit table deletion; this operation does not delete the table.
+             * @default false
+             */
+            drop?: boolean;
+        };
+        RelationalConstraintRetirementStatus: {
+            /** @description Opaque retirement job identity. */
+            id: string;
+            /** @enum {string} */
+            phase: "fencing" | "foreign_keys" | "unique" | "publishing" | "published" | "ready_to_drop";
+            drop: boolean;
+            /** Format: uint32 */
+            target_schema_version: number;
+            /**
+             * @description Durable diagnostic that pauses the job. Retry resumes the exact
+             *     checkpoint after the cause is addressed; it does not undo a partial
+             *     drain or permit primary mutations while retirement is active.
+             */
+            failure?: string;
+        };
+        RelationalConstraintStatus: {
+            /** Format: uint32 */
+            schema_version: number;
+            /**
+             * @description Distributed UNIQUE, foreign-key, and scalar CHECK coverage across every current table owner. Native local validation is not a substitute for this coordinated proof.
+             * @enum {string}
+             */
+            coverage_kind: "unique_foreign_key_and_check";
+            state: components["schemas"]["RelationalConstraintValidationState"];
+            ranges: components["schemas"]["RelationalConstraintRangeStatus"][];
+            retirement?: components["schemas"]["RelationalConstraintRetirementStatus"];
+        };
         /** @description Structured details for an aborted transaction attempt. */
         TransactionConflict: {
             /** @description Table where the conflict was detected. */
@@ -7114,6 +8165,7 @@ export interface components {
             key: string;
             /** @description Human-readable conflict description. */
             message: string;
+            reason?: components["schemas"]["RelationalConstraintConflictReason"];
             /**
              * @description Stable machine-readable conflict classification.
              * @enum {string}
@@ -7222,6 +8274,11 @@ export interface components {
             lease_expires_at: number;
             lease_state: string;
             sync_level: string;
+            /**
+             * @description Durable read-only transaction outcome. outcome_unknown is not permission to replay a mutation with another ID.
+             * @enum {string}
+             */
+            disposition: "active" | "outcome_unknown" | "committed" | "committed_pending" | "committed_repair_required" | "aborted";
             staged_table_count: number;
             staged_read_count: number;
             staged_write_count: number;
@@ -7316,6 +8373,14 @@ export interface components {
              */
             connection: string;
         };
+        /**
+         * @description Native cluster backups pin a common transaction cut across a dependency-complete
+         *     table set. Restart-stable LSM seals are journaled before releasing write fences;
+         *     artifact upload uses those immutable seals without holding the write pause.
+         *     Native cohorts support at most 4096 tables and 4096 ranges and require the
+         *     filesystem-managed LSM backend. Portable backups do not support coordinated
+         *     UNIQUE/FK constraints or promise a common cross-table transaction cut.
+         */
         ClusterBackupRequest: {
             /**
              * @description Unique identifier for this backup. Used to reference the backup for restore operations.
@@ -7406,6 +8471,17 @@ export interface components {
             /** @description Opaque artifact generation retained by an ambiguous cluster attempt. */
             artifact_backup_id?: string;
         };
+        /**
+         * @description Native cohort restores use the existing asynchronous restore job to provision
+         *     hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+         *     and publish the dependency-complete target set atomically. Document, relational,
+         *     and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+         *     Skipping a live parent cannot substitute it for a parent generation required by
+         *     a restored child. Overwrite retains the old generation until validation and
+         *     cutover; cancellation after publication completes publication rather than rollback.
+         *     Reserved destination authorization is immutable: changing principal requires
+         *     canceling the old job and creating a new restore.
+         */
         ClusterRestoreRequest: {
             /**
              * @description Unique identifier of the backup to restore from.
@@ -7443,6 +8519,8 @@ export interface components {
         RestoreJob: {
             /** @description Opaque durable restore-job identifier. Clients must not parse it as a number. */
             job_id: string;
+            /** @description Durable admission identity. Retain it with job_id when reconciling an uncertain schema rewrite; do not replay the DDL. */
+            idempotency_key?: string;
             /** Format: int64 */
             attempt_id: number;
             /** @enum {string} */
@@ -7514,6 +8592,7 @@ export interface components {
                 /** @description True when additional failed tables or part of a long table name or error were omitted. */
                 failure_details_truncated?: boolean;
             };
+            /** @description Most recent retry or terminal failure reason. Retained while queued or running, including across progress checkpoints and recovery; omitted after successful completion. */
             error?: string;
             /** Format: int64 */
             created_at_ms: number;
@@ -7646,8 +8725,9 @@ export interface components {
              */
             mode?: string;
             /**
-             * @description Preferred output artifact. Suggested values are `query_request`, `bleve`, and
-             *     `filter_query`. The compatibility `query` field is still returned for existing clients.
+             * @description Preferred output artifact. Suggested values are `query_request`, `bleve` (Antfly's
+             *     native, Bleve-compatible full-text query JSON), and `filter_query`. The compatibility
+             *     `query` field is still returned for existing clients.
              * @example query_request
              */
             output?: string;
@@ -7685,7 +8765,8 @@ export interface components {
             /** @description Clarification questions exposed in the shared bounded-agent envelope. */
             questions?: components["schemas"]["AgentQuestion"][];
             /**
-             * @description Generated search query in native Bleve format.
+             * @description Generated search query in Antfly's native full-text query format (a Bleve-compatible
+             *     JSON query DSL: `match`, `term`, `conjuncts`, `disjuncts`, `must_not`, etc.).
              *     Can be used directly in QueryRequest.full_text_search or filter_query.
              * @example {
              *       "conjuncts": [
@@ -8135,9 +9216,23 @@ export interface components {
             /** @description Step configuration */
             steps?: components["schemas"]["RetrievalAgentSteps"];
             /**
-             * @description Handlebars template for rendering documents in the generation prompt.
-             *     Default uses TOON format for token efficiency.
-             *     Requires steps.generation to be set.
+             * @description Handlebars template that renders each retrieved document in the
+             *     generation prompt. Requires steps.generation to be set.
+             *
+             *     The template is rendered once per hit against `{id, score, fields}`,
+             *     where `fields` is the hit's source. When omitted, each document's
+             *     fields are encoded as TOON (Token-Oriented Object Notation), which
+             *     carries the same structure as JSON in fewer tokens.
+             *
+             *     Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
+             *     `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+             *     `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+             *     raw text.
+             *
+             *     Examples:
+             *     - `{{encodeToon this.fields}}`
+             *     - `{{encodeToon this.fields delimiter="tab"}}`
+             *     - `Title: {{{this.fields.title}}}`
              * @example {{encodeToon this.fields}}
              */
             document_renderer?: string;
@@ -8217,6 +9312,473 @@ export interface components {
             followup_questions?: string[];
             /** @description Evaluation results when steps.eval was configured */
             eval_result?: components["schemas"]["EvalResult"];
+        };
+        /**
+         * @description Research state-machine phase. `plan` decomposes the question,
+         *     `research` runs one bounded round of retrieval researchers, `reflect`
+         *     decides whether another round is needed, `write` produces the cited
+         *     report, `verify` checks citations, and `done` is terminal.
+         * @enum {string}
+         */
+        ResearchPhase: "plan" | "research" | "reflect" | "write" | "verify" | "done";
+        /**
+         * @description Declared upper bounds for one research run. The worst-case LLM and
+         *     tool-call cost is computable before execution; requests whose worst
+         *     case exceeds the server ceiling are rejected, not clamped.
+         */
+        ResearchBudget: {
+            /**
+             * @description Maximum research rounds (plan or reflect, then fan-out).
+             * @default 2
+             */
+            max_rounds?: number;
+            /**
+             * @description Maximum sub-questions researched per round.
+             * @default 4
+             */
+            max_sub_questions?: number;
+            /**
+             * @description Maximum researchers in flight at once.
+             * @default 2
+             */
+            max_parallel?: number;
+            /**
+             * @description Model-generation rounds available to each researcher.
+             * @default 6
+             */
+            researcher_iterations?: number;
+            /**
+             * @description Tool calls available to each researcher.
+             * @default 8
+             */
+            researcher_tool_calls?: number;
+            /**
+             * @description Hard cap on model calls across every role in the run.
+             * @default 80
+             */
+            max_llm_calls?: number;
+            /**
+             * @description Hard cap on tool calls across every researcher in the run.
+             * @default 120
+             */
+            max_tool_calls?: number;
+            /**
+             * @description Maximum distinct evidence items retained in the registry.
+             * @default 80
+             */
+            max_evidence?: number;
+            /**
+             * @description Output token budget for the report writer.
+             * @default 4000
+             */
+            max_report_tokens?: number;
+            /**
+             * @description Wall-clock budget for a synchronous run or a single job advance.
+             * @default 600000
+             */
+            deadline_ms?: number;
+        };
+        /** @description Configuration for one research role. Generator and chain default to the top-level request values. */
+        ResearchStepConfig: {
+            /** @description Whether the step runs. Defaults vary by step. */
+            enabled?: boolean;
+            /** @description Generator for this role. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for this role. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional role instructions. They cannot change authorized tables, filters, tools or budgets. */
+            instructions?: string;
+        };
+        /**
+         * @description Configuration for researchers. Every researcher is a bounded retrieval
+         *     agent run over the request's authorized queries. `tools` narrows the
+         *     top-level tools policy and cannot widen it.
+         */
+        ResearchRetrievalStepConfig: {
+            /** @description Generator for researchers. Defaults to the top-level generator. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for researchers. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional researcher instructions. */
+            instructions?: string;
+            /** @description Researcher tool policy. Narrows the top-level tools policy. */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            /** @description Optional tree or graph navigation available to each researcher. */
+            navigation?: components["schemas"]["RetrievalNavigationConfig"];
+        };
+        /** @description Configuration for the report writer. */
+        ResearchWriteStepConfig: {
+            /** @description Generator for the writer. Defaults to the top-level generator. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Chain of generators for the writer. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Additional writer instructions, for example audience or tone. */
+            instructions?: string;
+            /** @description Optional caller-supplied section headings. When omitted the writer chooses them. */
+            outline?: string[];
+        };
+        /** @description Per-role configuration for the research agent. */
+        ResearchAgentSteps: {
+            /** @description Planner that writes the research brief and sub-questions. Always runs unless research_state carries a plan. */
+            plan?: components["schemas"]["ResearchStepConfig"];
+            /** @description Researcher configuration. */
+            research?: components["schemas"]["ResearchRetrievalStepConfig"];
+            /** @description Gap analysis after each round. Enabled by default when budget.max_rounds > 1. */
+            reflect?: components["schemas"]["ResearchStepConfig"];
+            /** @description Report writer. */
+            write?: components["schemas"]["ResearchWriteStepConfig"];
+            /** @description Optional model check that cited evidence supports each section. Disabled by default. */
+            verify?: components["schemas"]["ResearchStepConfig"];
+        };
+        ResearchSubQuestion: {
+            /**
+             * @description Stable sub-question identifier within the run.
+             * @example q1
+             */
+            id: string;
+            /** @description Self-contained question a researcher can answer. */
+            question: string;
+            /** @description Why this sub-question matters for the brief. */
+            rationale?: string;
+            /** @description Evidence sources the planner expects to be useful. */
+            sources?: ("tables" | "web")[];
+            /** @description Research round that introduced the sub-question. */
+            round?: number;
+            /**
+             * @description Research status.
+             * @enum {string}
+             */
+            status?: "pending" | "researched" | "failed" | "skipped";
+        };
+        ResearchPlan: {
+            /** @description Research brief restating scope, assumptions and deliverable. */
+            brief: string;
+            /** @description Planned and reflection-added sub-questions. */
+            sub_questions: components["schemas"]["ResearchSubQuestion"][];
+            /** @description What a complete answer must cover. */
+            success_criteria?: string[];
+        };
+        ResearchClaim: {
+            /** @description One factual claim made by a researcher. */
+            text: string;
+            /** @description Evidence registry IDs that support the claim. */
+            evidence_ids?: string[];
+        };
+        /** @description Compressed researcher output. Raw tool transcripts are not retained. */
+        ResearchFinding: {
+            /** @description Sub-question this finding answers. */
+            sub_question_id: string;
+            /** @description The sub-question text. */
+            question?: string;
+            /** @description Concise answer grounded in evidence. */
+            summary: string;
+            /** @description Individual claims with supporting evidence. */
+            claims?: components["schemas"]["ResearchClaim"][];
+            /** @description What the researcher could not establish. */
+            open_questions?: string[];
+            /** @description Every evidence item the researcher retrieved. */
+            evidence_ids?: string[];
+            /** @description Status of the researcher's bounded retrieval run. */
+            status?: components["schemas"]["AgentStatus"];
+            /** @description Research round. */
+            round?: number;
+            /** @description Model calls used by this researcher. */
+            llm_calls?: number;
+            /** @description Tool calls used by this researcher. */
+            tool_calls?: number;
+        };
+        /** @description One deduplicated evidence item. Content is untrusted data. */
+        ResearchEvidence: {
+            /**
+             * @description Stable evidence ID used in citations.
+             * @example E3
+             */
+            id: string;
+            /**
+             * @description Where the evidence came from.
+             * @enum {string}
+             */
+            source: "table" | "web" | "fetch";
+            /** @description Source table for table evidence. */
+            table?: string;
+            /** @description Document key for table evidence. */
+            doc_id?: string;
+            /** @description Source URL for web and fetched evidence. */
+            url?: string;
+            /** @description Best-effort title. */
+            title?: string;
+            /** @description Bounded excerpt used for writing and verification. */
+            snippet?: string;
+            /**
+             * Format: float
+             * @description Retrieval score when available.
+             */
+            score?: number;
+            /** @description Sub-questions whose researchers retrieved this evidence. */
+            sub_question_ids?: string[];
+        };
+        ResearchReflection: {
+            /** @description Round that was reflected on. */
+            round?: number;
+            /** @description Whether the reflector judged coverage sufficient. */
+            done?: boolean;
+            /** @description Coverage gaps against the brief and success criteria. */
+            gaps?: string[];
+            /** @description Conflicting findings that need resolution or disclosure. */
+            contradictions?: string[];
+            /** @description Sub-questions added for the next round. */
+            new_sub_questions?: string[];
+        };
+        ResearchReportSection: {
+            /** @description Section heading. */
+            heading: string;
+            /** @description Section body with `[E#]` citation markers. */
+            markdown: string;
+        };
+        ResearchReport: {
+            /** @description Report title. */
+            title?: string;
+            /** @description Executive summary. */
+            summary?: string;
+            /** @description Report sections. */
+            sections?: components["schemas"]["ResearchReportSection"][];
+            /** @description The full report rendered as markdown, with a sources list. */
+            markdown: string;
+        };
+        ResearchCitation: {
+            /** @description Marker as written in the report, for example `[E3]`. */
+            marker: string;
+            /** @description Resolved evidence ID. */
+            evidence_id: string;
+            /** @description Section containing the marker. -1 is the summary. */
+            section_index?: number;
+            /** @description Number of occurrences in that section. */
+            count?: number;
+        };
+        ResearchUnsupportedClaim: {
+            /** @description Section containing the claim. */
+            section_index?: number;
+            /** @description Claim text. */
+            text?: string;
+            /** @description Evidence the claim cited. */
+            evidence_ids?: string[];
+            /** @description Why the claim is unsupported. */
+            reason?: string;
+        };
+        ResearchVerification: {
+            /** @description Number of sections checked. */
+            checked_sections?: number;
+            /** @description Citation markers that did not resolve to evidence and were removed. */
+            unresolved_markers?: string[];
+            /** @description Sections without any resolvable citation. */
+            uncited_sections?: number[];
+            /** @description Claims the verifier judged unsupported by their cited evidence. */
+            unsupported?: components["schemas"]["ResearchUnsupportedClaim"][];
+            /**
+             * Format: float
+             * @description Share of checked claims judged supported.
+             */
+            supported_ratio?: number;
+        };
+        ResearchUsage: {
+            /** @description Model calls across every role. */
+            llm_calls?: number;
+            /** @description Tool calls across every researcher. */
+            tool_calls?: number;
+            /** @description Researcher executions. */
+            researcher_runs?: number;
+            /** @description Research rounds completed. */
+            rounds?: number;
+            /** @description Evidence items in the registry. */
+            evidence_count?: number;
+            /**
+             * Format: int64
+             * @description Wall-clock time consumed so far.
+             */
+            elapsed_ms?: number;
+        };
+        /**
+         * @description Client-carried continuation state. Sending it back resumes the run at
+         *     `phase` without repeating completed work. It never contains raw tool
+         *     transcripts, credentials or connection settings. Evidence snippets are
+         *     bounded excerpts of documents the caller was authorized to read; every
+         *     resumed request is re-authorized.
+         *
+         *     The server signs the state it returns (`signature`) and rejects a
+         *     state whose signature does not verify, so a client cannot alter a
+         *     checkpoint, including its budget counters. Send the state back
+         *     unmodified. Signatures are valid across a cluster that shares an
+         *     internal service secret, otherwise only on the server that issued them
+         *     and until it restarts; use durable jobs to resume across restarts.
+         */
+        ResearchState: {
+            /** @description Server signature over this state. Do not modify the state. */
+            signature?: string;
+            phase: components["schemas"]["ResearchPhase"];
+            /** @description Completed research rounds. */
+            round?: number;
+            plan?: components["schemas"]["ResearchPlan"];
+            findings?: components["schemas"]["ResearchFinding"][];
+            evidence?: components["schemas"]["ResearchEvidence"][];
+            reflections?: components["schemas"]["ResearchReflection"][];
+            report?: components["schemas"]["ResearchReport"];
+            citations?: components["schemas"]["ResearchCitation"][];
+            verification?: components["schemas"]["ResearchVerification"];
+            usage?: components["schemas"]["ResearchUsage"];
+        };
+        ResearchIncompleteDetails: {
+            /**
+             * @description Why the run stopped:
+             *     - max_rounds: research rounds were exhausted before the reflector was satisfied (the report is still written)
+             *     - max_llm_calls / max_tool_calls: a hard budget was exhausted
+             *     - deadline: the wall-clock budget elapsed
+             *     - no_evidence: researchers found no evidence to write from
+             *     - clarification_required: the planner needs a user decision
+             *     - cancelled: a durable job was cancelled
+             *     - phase_limit: a job advance stopped after its requested number of phases
+             * @enum {string}
+             */
+            reason: "max_rounds" | "max_llm_calls" | "max_tool_calls" | "deadline" | "no_evidence" | "clarification_required" | "cancelled" | "phase_limit";
+            /** @description Human-readable detail. */
+            message?: string;
+        };
+        /**
+         * @description Request for the research agent. The agent plans sub-questions, runs a
+         *     bounded retrieval researcher per sub-question in parallel, reflects on
+         *     coverage, and writes a long-form report whose `[E#]` citations resolve
+         *     to a deduplicated evidence registry.
+         *
+         *     Researchers are ordinary retrieval-agent runs over `queries` with the
+         *     same authorization, mandatory predicates and tool policy. They cannot
+         *     widen tables, filters, tools or budgets.
+         */
+        ResearchAgentRequest: {
+            /**
+             * @description The research question.
+             * @example How do Antfly's hybrid search and reranking interact, and what are the tuning trade-offs?
+             */
+            query: string;
+            /**
+             * @description Authorized table scopes, as for the retrieval agent. `filter_query`
+             *     and `exclusion_query` are mandatory predicates for every researcher.
+             *     May be empty when web search is enabled.
+             */
+            queries: components["schemas"]["QueryRequest"][];
+            /** @description Optional conversational context. */
+            messages?: components["schemas"]["ChatMessage"][];
+            /** @description Domain context for every role. */
+            agent_knowledge?: string;
+            /** @description Mandatory filters applied to every researcher search. */
+            accumulated_filters?: components["schemas"]["FilterSpec"][];
+            /** @description Correlation identifier echoed back to the client. */
+            session_id?: string;
+            /** @description Structured user answers for client-carried continuation. */
+            decisions?: components["schemas"]["AgentDecision"][];
+            /**
+             * @description If true, the planner may return clarification questions instead of a plan.
+             * @default false
+             */
+            interactive?: boolean;
+            /** @description Default generator for every role. */
+            generator?: components["schemas"]["GeneratorConfig"];
+            /** @description Default chain of generators for every role. */
+            chain?: components["schemas"]["ChainLink"][];
+            /** @description Default tool policy for researchers, for example `web_search` and `fetch`. */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            steps?: components["schemas"]["ResearchAgentSteps"];
+            budget?: components["schemas"]["ResearchBudget"];
+            /** @description Continuation state returned by an earlier run. */
+            research_state?: components["schemas"]["ResearchState"];
+            /** @description Per-researcher tool-result context budget in tokens. */
+            max_context_tokens?: number;
+            /** @description Tokens reserved from max_context_tokens for prompts and answers. */
+            reserve_tokens?: number;
+            /**
+             * @description Enable SSE streaming vs JSON response.
+             * @default true
+             */
+            stream?: boolean;
+        };
+        /** @description Result from the research agent. */
+        ResearchAgentResult: {
+            /**
+             * @description Unique response ID.
+             * @example resr_cr3ig20h5tbs73e3ahrg
+             */
+            id?: string;
+            /** @description Writer model. */
+            model?: string;
+            /**
+             * Format: int64
+             * @description Unix timestamp (seconds) when the response was created.
+             */
+            created_at?: number;
+            status: components["schemas"]["AgentStatus"];
+            incomplete_details?: components["schemas"]["ResearchIncompleteDetails"];
+            phase?: components["schemas"]["ResearchPhase"];
+            usage?: components["schemas"]["ResearchUsage"];
+            plan?: components["schemas"]["ResearchPlan"];
+            findings?: components["schemas"]["ResearchFinding"][];
+            evidence?: components["schemas"]["ResearchEvidence"][];
+            reflections?: components["schemas"]["ResearchReflection"][];
+            report?: components["schemas"]["ResearchReport"];
+            citations?: components["schemas"]["ResearchCitation"][];
+            verification?: components["schemas"]["ResearchVerification"];
+            research_state: components["schemas"]["ResearchState"];
+            /** @description Execution trace. */
+            steps?: components["schemas"]["AgentStep"][];
+            /** @description Clarification questions when status is clarification_required. */
+            questions?: components["schemas"]["AgentQuestion"][];
+            /** @description Echoed correlation identifier. */
+            session_id?: string;
+        };
+        /**
+         * @description Durable research job lifecycle state.
+         * @enum {string}
+         */
+        ResearchJobState: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+        ResearchJobStartRequest: {
+            /**
+             * @description The research request. `stream` is ignored. Durable jobs persist the
+             *     request, so generators must reference credentials through the
+             *     secret store, environment or server connections rather than inline
+             *     API keys.
+             */
+            request: components["schemas"]["ResearchAgentRequest"];
+            /**
+             * @description Number of phases to run before the start call returns.
+             * @default 0
+             */
+            advance?: number;
+        };
+        ResearchJobAdvanceRequest: {
+            /**
+             * @description Maximum phases to run in this advance. Each phase checkpoints before the next starts.
+             * @default 1
+             */
+            max_phases?: number;
+        };
+        ResearchJob: {
+            /** @description Job identifier. */
+            job_id: string;
+            state: components["schemas"]["ResearchJobState"];
+            phase: components["schemas"]["ResearchPhase"];
+            /** @description The research question. */
+            query?: string;
+            /** @description Completed advance calls. */
+            advances?: number;
+            /** @description Whether cancellation was requested. */
+            cancel_requested?: boolean;
+            /** @description Last advance error, if any. */
+            last_error?: string;
+            /** Format: int64 */
+            created_at_ms?: number;
+            /** Format: int64 */
+            updated_at_ms?: number;
+            /** Format: int64 */
+            expires_at_ms?: number;
+            /** @description Latest checkpointed result, including research_state. */
+            result?: components["schemas"]["ResearchAgentResult"];
         };
         /**
          * @deprecated
@@ -8439,7 +10001,65 @@ export interface components {
             namespace?: string;
             table: string;
         };
+        /**
+         * @description Evaluate expressions after global retrieval merging, before final
+         *     offset/limit. Candidates require candidate_count; matches require
+         *     max_rows and fail if the full qualifying population exceeds that budget.
+         *     Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+         *     be combined with evaluation. NULL inputs skip inference; errors fail.
+         */
+        QueryEvaluation: {
+            /** @description Evaluate completed bindings of this named graph MATCH instead of retrieval hits. Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined with this stage. */
+            graph_query?: string;
+            /** @enum {string} */
+            scope: "candidates" | "matches";
+            candidate_count?: number;
+            max_rows?: number;
+            compute: {
+                [key: string]: components["schemas"]["QueryExpression"];
+            };
+            /** @description Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression), not (predicate), and, or (predicate arrays). Comparisons propagate NULL. */
+            where?: {
+                [key: string]: unknown;
+            };
+            order_by?: {
+                expression: components["schemas"]["QueryExpression"];
+                descending?: boolean;
+            }[];
+            aggregations?: {
+                [key: string]: {
+                    /** @enum {string} */
+                    type: "terms" | "avg" | "sum" | "count";
+                    expression: components["schemas"]["QueryExpression"];
+                };
+            };
+        };
+        /**
+         * @description Exactly one of literal, field, ref, or call. A call requires input and
+         *     decider. ai_decide requires questions; ai_probability requires statement;
+         *     ai_choice and ai_score require instructions and criteria. Named refs may
+         *     select nested JSON members with dotted paths. Binding cycles are invalid.
+         */
+        QueryExpression: {
+            literal?: unknown;
+            field?: string;
+            ref?: string;
+            /** @enum {string} */
+            call?: "ai_decide" | "ai_choice" | "ai_score" | "ai_probability";
+            input?: components["schemas"]["QueryExpression"];
+            decider?: string;
+            questions?: {
+                [key: string]: unknown;
+            };
+            statement?: string;
+            instructions?: string;
+            /** @description Choice ID map or ordered score level array. */
+            criteria?: {
+                [key: string]: string;
+            } | string[];
+        };
         QueryRequest: {
+            evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
              * @description Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -8690,6 +10310,7 @@ export interface components {
              */
             fields?: string[];
             hierarchy?: components["schemas"]["QueryHierarchy"];
+            highlight?: components["schemas"]["QueryHighlight"];
             /**
              * @description Maximum number of top-level results to return. For semantic_search, this is the topk parameter.
              *     This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -8842,9 +10463,9 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
-            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. */
+            /** @description Direct top-k read from a published graph metric generation. Results are returned in graph_metric_results under the requested name or the metric name when no explicit name is supplied. Supplying seed_nodes switches a pagerank metric to query-seeded personalized PageRank computed at query time; that form requires metric_freshness=fresh because published generations are global-only. */
             graph_metric?: components["schemas"]["GraphMetricQuery"];
-            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. */
+            /** @description Blend a published graph metric feature into ordinary search hit scores. Requests may require either any published generation or a generation that is fresh with respect to graph writes. Supplying seed_nodes switches a pagerank metric to a query-seeded personalized PageRank blend computed at query time; that form requires metric_freshness=fresh. Retrieval-agent queries may opt in to automatic seeding with auto_seed=true, which seeds the blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Caller-supplied seed_nodes always take precedence and are never overwritten. */
             graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
@@ -8860,41 +10481,9 @@ export interface components {
              */
             graph_queries?: components["schemas"]["GraphQueries"];
             /**
-             * @description Optional Handlebars template string for rendering document content in RAG queries.
-             *     Template has access to document fields via `{{this.fields.fieldName}}`.
-             *
-             *     **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-             *     ```handlebars
-             *     {{encodeToon this.fields}}
-             *     ```
-             *
-             *     **Available Helpers**:
-             *     - `encodeToon` - Renders fields in compact TOON format with configurable options:
-             *       - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-             *       - `indent` (int): Indentation spacing (default: 2)
-             *       - `delimiter` (string): Field separator for tabular arrays
-             *     - `scrubHtml` - Removes HTML tags and extracts text
-             *     - `media` - Wraps data URIs for GenKit multimodal support
-             *     - `eq` - Equality comparison for conditionals
-             *
-             *     **Examples**:
-             *     - Basic TOON: `{{encodeToon this.fields}}`
-             *     - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-             *     - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-             *     - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-             *     - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-             *
-             *     TOON format produces compact, LLM-optimized output like:
-             *     ```
-             *     title: Introduction to Vector Search
-             *     author: Jane Doe
-             *     tags[#3]: ai,search,ml
-             *     ```
-             *
-             *     **References**:
-             *     - TOON Specification: https://github.com/toon-format/toon
-             *     - Go Implementation: https://github.com/alpkeskin/gotoon
-             * @example {{encodeToon this.fields}}
+             * @description Not supported on queries, which do not generate text; requests that
+             *     set it are rejected. Set `document_renderer` on a retrieval agent
+             *     request to control how documents appear in the generation prompt.
              */
             document_renderer?: string;
             /**
@@ -9624,6 +11213,10 @@ export interface components {
         };
         /** @description A single query result hit */
         QueryHit: {
+            /** @description Named query-time computed values, separate from stored source. */
+            _computed?: {
+                [key: string]: unknown;
+            };
             /** @description ID of the record. */
             _id: string;
             /**
@@ -9665,6 +11258,63 @@ export interface components {
              *     requests whose effective order is `_id` ascending.
              */
             _sort?: unknown[];
+            /**
+             * @description Highlighted fragments keyed by source field, present when the request
+             *     set `highlight` and the stored document has the field. Highlights are
+             *     computed from the unprojected document, so a `fields` projection that
+             *     omits a highlighted field does not suppress its highlights. Each
+             *     fragment is a window of the stored field value with byte-offset spans
+             *     marking the text the full-text query matched.
+             */
+            _highlights?: {
+                [key: string]: components["schemas"]["HighlightFragment"][];
+            };
+        };
+        /**
+         * @description Ask for highlighted fragments of the stored fields matched by
+         *     `full_text_search` and by named full-text queries. Matches are located
+         *     by re-analyzing the stored value with the field's analyzer, so stemmed
+         *     and stop-word-filtered terms highlight the surface form. `prefix`,
+         *     `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match`,
+         *     `match_phrase`, or `prefix` on a `substring` companion
+         *     (`field._substring`) marks the exact contained bytes, including
+         *     matches that span two adjacent words.
+         */
+        QueryHighlight: {
+            /**
+             * @description Source fields to highlight. Defaults to every field the full-text
+             *     query references (companion suffixes such as `._substring` and
+             *     `.keyword` resolve to their root field).
+             * @example [
+             *       "title",
+             *       "body"
+             *     ]
+             */
+            fields?: string[];
+            /**
+             * @description Fragment window size in bytes.
+             * @default 150
+             */
+            fragment_size?: number;
+            /**
+             * @description Maximum fragments returned per field.
+             * @default 3
+             */
+            max_fragments?: number;
+        };
+        HighlightFragment: {
+            /** @description The fragment of the stored field value. */
+            text: string;
+            /** @description Byte offset of the fragment within the field value. */
+            offset: number;
+            /** @description Array index for one array; flattened value ordinal for paths through multiple arrays. */
+            item?: number;
+            spans: components["schemas"]["HighlightSpan"][];
+        };
+        /** @description Half-open byte range within the fragment text. */
+        HighlightSpan: {
+            start: number;
+            end: number;
         };
         /** @description A list of query hits. */
         QueryHits: {
@@ -9700,6 +11350,10 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Function evaluation scope, population, usage, and scoped aggregations. */
+            evaluation?: {
+                [key: string]: unknown;
+            };
             hits?: components["schemas"]["QueryHits"];
             /**
              * @description Aggregation results keyed by the user-defined aggregation names from the request.
@@ -9855,6 +11509,10 @@ export interface components {
         };
         /** @description A typed, weighted connection between documents */
         Edge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             /**
              * Format: byte
              * @description Base64-encoded source document key
@@ -10014,6 +11672,10 @@ export interface components {
             length?: number;
         };
         PathEdge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             source?: string;
             target?: string;
             type?: string;
@@ -10147,8 +11809,8 @@ export interface components {
              */
             on_delete?: components["schemas"]["ReplicationTransformOp"][];
             /**
-             * @description Bleve-style filter query that gets translated to SQL and applied as a
-             *     WHERE clause on the PostgreSQL publication. This filters rows at the
+             * @description Antfly's native filter query (see `RawQuery`) that gets translated to SQL and
+             *     applied as a WHERE clause on the PostgreSQL publication. This filters rows at the
              *     source before they are sent over the replication stream, reducing
              *     network and processing overhead.
              *
@@ -10242,7 +11904,7 @@ export interface components {
              */
             target_table: string;
             /**
-             * @description Bleve-style filter query evaluated against each CDC row. Only rows
+             * @description Antfly's native filter query (see `RawQuery`) evaluated against each CDC row. Only rows
              *     matching this filter are written to `target_table`. If omitted,
              *     all rows match (equivalent to `match_all`).
              */
@@ -10834,13 +12496,12 @@ export interface components {
          * @description Configuration for the Antfly inference embedding provider.
          *
          *     Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models.
-         *     It provides embedding generation with multi-tier caching (memory + persistent).
          *
          *     **Features:**
          *     - Local ONNX-based embedding generation
-         *     - L1 memory cache with configurable TTL
-         *     - L2 persistent Pebble database cache
-         *     - Singleflight deduplication for concurrent identical requests
+         *     - Query-time embeddings are served from an in-memory cache (64 MiB budget,
+         *       5-minute TTL by default) with concurrent identical requests coalesced onto
+         *       a single computation; there is no persistent on-disk cache tier
          *
          *     **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims)
          *
@@ -10917,6 +12578,142 @@ export interface components {
          * @enum {string}
          */
         EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Options specific to text chunking. */
+        TextChunkOptions: {
+            /** @description Target number of tokens per chunk. */
+            target_tokens?: number;
+            /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
+            overlap_tokens?: number;
+            /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
+            separator?: string;
+        };
+        /** @description Options specific to audio chunking. */
+        AudioChunkOptions: {
+            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
+            window_duration_ms?: number;
+            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
+            overlap_duration_ms?: number;
+        };
+        /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
+        ChunkOptions: {
+            /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
+            max_chunks?: number;
+            /**
+             * Format: float
+             * @description Confidence threshold for model-based chunking (0.0-1.0).
+             */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["AudioChunkOptions"];
+        };
+        /**
+         * @description Configuration for the Antfly inference chunking provider.
+         *
+         *     Antfly inference is Antfly's built-in ML service for local chunking.
+         *     The model name maps to ONNX model directory names (similar to how Ollama works).
+         *
+         *     **Chunking Models:**
+         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
+         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
+         *
+         *     **Deduplication:**
+         *     - Within a single document write, chunk results are deduplicated when multiple
+         *       indexes share the same source text and chunker configuration, so the source
+         *       is chunked at most once per write.
+         * @example {
+         *       "provider": "antfly",
+         *       "api_url": "http://localhost:8080",
+         *       "model": "fixed",
+         *       "text": {
+         *         "target_tokens": 500,
+         *         "overlap_tokens": 50,
+         *         "separator": "\n\n"
+         *       }
+         *     }
+         */
+        AntflyChunkerConfig: components["schemas"]["ChunkOptions"] & {
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /**
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+        };
+        /**
+         * @description The chunking provider to use.
+         * @enum {string}
+         */
+        ChunkerProvider: "mock" | "antfly";
+        /**
+         * @description A unified configuration for a chunking provider.
+         * @example {
+         *       "provider": "antfly",
+         *       "model": "fixed",
+         *       "text": {
+         *         "target_tokens": 500,
+         *         "overlap_tokens": 50
+         *       }
+         *     }
+         */
+        ChunkerConfig: components["schemas"]["AntflyChunkerConfig"] & {
+            provider: components["schemas"]["ChunkerProvider"];
+            /**
+             * @description Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
+             * @default false
+             */
+            store_chunks?: boolean;
+            /**
+             * @description Configuration for full-text indexing of chunks.
+             *     When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field.
+             *     When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
+             */
+            full_text_index?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Format: uri
+             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
+             * @example http://localhost:8080
+             */
+            api_url?: string;
+            /**
+             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
+             * @default fixed
+             * @example fixed
+             */
+            model?: string;
+            /** @description Maximum number of chunks to generate per document. Zero (or omitted, the default) means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk count for very large inputs. */
+            max_chunks?: number;
+            /** Format: float */
+            threshold?: number;
+            text?: components["schemas"]["TextChunkOptions"];
+            audio?: components["schemas"]["AudioChunkOptions"];
+        };
+        /** @description Bounded sample of the document's same-shard graph neighbors appended to an asset producer's rendered input as a compact JSON block ({"neighbors":[{"edge_type":...,"direction":...,"target":...,"weight":...}]}), ordered by edge type then target key. A conceptualizer enrichment on an entities table can thereby ground its abstractions in adjacent facts ("started_by -> John Andrew Rice"). The sampled block participates in the producer's skip state, so a changed adjacency re-runs the producer. */
+        EnrichmentNeighborContextConfig: {
+            /** @description Name of a graph index on the same table whose local state is sampled. Validated at admission; cross-shard neighbors are not sampled. */
+            graph_index: string;
+            /** @description Edge types to sample. Empty admits every edge type. */
+            edge_types?: string[];
+            /**
+             * @description Adjacency orientation to sample relative to the document.
+             * @default both
+             * @enum {string}
+             */
+            direction?: "out" | "in" | "both";
+            /**
+             * Format: uint32
+             * @description Maximum neighbors rendered into the producer input, applied after deterministic ordering.
+             * @default 8
+             */
+            limit?: number;
+        };
         /** @description Non-semantic execution policy for one producer or index maintenance operation. These fields tune how work is batched and do not change generated artifact identity. */
         ExecutionPolicy: {
             /** @description Maximum items to process in one batch for this operation. */
@@ -11000,7 +12797,7 @@ export interface components {
             field?: string;
             /** @description Optional template for generated text input. */
             template?: string;
-            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts. */
+            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts; asset enrichments may consume other asset artifacts (the upstream asset's produced bytes become this producer's source, so field and template must be omitted and the producer must consume text: copy, generator, or extractor). */
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
@@ -11010,7 +12807,12 @@ export interface components {
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
             chunk_overlap?: number;
-            /** @description Serialized chunker configuration for chunk enrichments. */
+            /** @description Chunker configuration for chunk enrichments. Cannot be combined with chunker_json. */
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /**
+             * @deprecated
+             * @description Legacy serialized chunker configuration for chunk enrichments. Cannot be combined with chunker.
+             */
             chunker_json?: string;
             /**
              * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
@@ -11019,8 +12821,17 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
+             */
             producer_json?: string;
+            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
             /** @description Typed shorthand for a transcription asset enrichment. Only valid with kind=asset and without producer_json; Antfly expands it into a document_extraction producer whose audio route transcribes each recording with this speech-to-text provider. The produced units carry the transcript text, provider confidence, and per-phrase time offsets, and chunk enrichments that consume them emit _start_time_ms/_end_time_ms on every chunk. With diarization: true the phrases also carry who spoke them, and a chunk that does not straddle a turn emits _speaker. content_type defaults to application/json. */
@@ -11033,6 +12844,74 @@ export interface components {
             /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
             field?: string;
         };
+        /** @description One named analysis component: its type and type-specific configuration. */
+        TextAnalysisComponent: {
+            type: string;
+            config?: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @description Custom text analysis for a full-text index. Component maps are keyed
+         *     by the name that analyzers and `field_analyzers` reference. Built-in
+         *     analyzers (`standard`, `simple`, `keyword`, `html`, `search_as_you_type`,
+         *     `substring`, and the language analyzers such as `german`) are always
+         *     available without declaring them.
+         *
+         *     Example: split camelCase identifiers and match them as substrings.
+         *
+         *     ```json
+         *     {
+         *       "analysis_config": {
+         *         "field_analyzers": {"symbol": "code"},
+         *         "token_filters": {
+         *           "tails": {"type": "suffix", "config": {"min": 3, "max": 24}}
+         *         },
+         *         "analyzers": {
+         *           "code": {
+         *             "type": "custom",
+         *             "config": {
+         *               "tokenizer": "whitespace",
+         *               "token_filters": ["camel_case", "unique", "tails"]
+         *             }
+         *           }
+         *         }
+         *       }
+         *     }
+         *     ```
+         */
+        TextAnalysisConfig: {
+            /** @description Map of indexed field name to analyzer name. Overrides the analyzer derived from the table schema for that field. */
+            field_analyzers?: {
+                [key: string]: string;
+            };
+            /** @description Named character filters. Types: `html_strip` (alias `html`), `ascii_fold`, `zero_width_non_joiner`. */
+            char_filters?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named tokenizers. Types: `unicode` (alias `unicode_words`), `whitespace`, `keyword`, `character`, `ngram` (`config.min`, `config.max`), `edge_ngram` (`config.min`, `config.max`, `config.side` of `front` or `back`). */
+            tokenizers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named token filters. Types: `lowercase` (alias `to_lower`), `stop_words` (alias `stop`; optional `config.language`), `stemmer` (optional `config.language`), `ngram` and `edge_ngram` (`config.min`, `config.max`), `shingle` (`config.min`, `config.max`, `config.separator` of `space` or `none`), `suffix` (`config.min`, `config.max`; emits every suffix of each token so prefix queries answer containment), `length` (`config.min`, `config.max`), `truncate` (`config.length`), `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`. Languages: english, german, french, spanish, italian, portuguese, dutch, swedish, norwegian, danish, finnish. */
+            token_filters?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Named analyzers of type `custom`. `config.tokenizer` names a built-in or declared tokenizer; `config.char_filters` and `config.token_filters` list built-in or declared component names in application order. Configuration-free filters (`lowercase`, `stop_words`, `stemmer`, `camel_case`, `unique`, `reverse`, `elision`, `apostrophe`, `suffix`) can be listed by name without declaring them. */
+            analyzers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+            /** @description Name of the date-time parser applied to datetime fields without a field-specific parser. */
+            default_datetime_parser?: string;
+            /** @description Map of field name to date-time parser name. */
+            field_date_time_parsers?: {
+                [key: string]: string;
+            };
+            /** @description Named date-time parsers. Type `sanitizedgo` accepts `config.layouts`, a list of Go reference-time layouts tried in order. */
+            date_time_parsers?: {
+                [key: string]: components["schemas"]["TextAnalysisComponent"];
+            };
+        };
         FullTextIndexConfig: {
             /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
@@ -11042,6 +12921,7 @@ export interface components {
             field?: string;
             /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             artifact_name?: string;
+            analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /**
          * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
@@ -11066,124 +12946,6 @@ export interface components {
          * @enum {string}
          */
         DistanceMetric: "l2_squared" | "inner_product" | "cosine";
-        /** @description Options specific to text chunking. */
-        TextChunkOptions: {
-            /** @description Target number of tokens per chunk. */
-            target_tokens?: number;
-            /** @description Number of tokens to overlap between consecutive chunks. Helps maintain context across chunk boundaries. Only used by fixed-size chunkers. */
-            overlap_tokens?: number;
-            /** @description Separator string for splitting (e.g., '\n\n' for paragraphs). Only used by fixed-size chunkers. */
-            separator?: string;
-        };
-        /** @description Options specific to audio chunking. */
-        AudioChunkOptions: {
-            /** @description Window duration in milliseconds for fixed-window audio chunking (default: 30000). */
-            window_duration_ms?: number;
-            /** @description Overlap duration in milliseconds between audio chunks (default: 0). */
-            overlap_duration_ms?: number;
-        };
-        /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
-        ChunkOptions: {
-            /** @description Maximum number of chunks to generate per document. */
-            max_chunks?: number;
-            /**
-             * Format: float
-             * @description Confidence threshold for model-based chunking (0.0-1.0).
-             */
-            threshold?: number;
-            text?: components["schemas"]["TextChunkOptions"];
-            audio?: components["schemas"]["AudioChunkOptions"];
-        };
-        /**
-         * @description Configuration for the Antfly inference chunking provider.
-         *
-         *     Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
-         *     The model name maps to ONNX model directory names (similar to how Ollama works).
-         *
-         *     **Chunking Models:**
-         *     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
-         *     - Any other name will attempt to load from models/chunkers/{name}/ directory
-         *
-         *     **Caching:**
-         *     - L1: Memory cache with 2-minute TTL
-         *     - L2: Persistent Pebble database
-         *     - Singleflight deduplication for concurrent identical requests
-         * @example {
-         *       "provider": "antfly",
-         *       "api_url": "http://localhost:8080",
-         *       "model": "fixed",
-         *       "max_chunks": 50,
-         *       "text": {
-         *         "target_tokens": 500,
-         *         "overlap_tokens": 50,
-         *         "separator": "\n\n"
-         *       }
-         *     }
-         */
-        AntflyChunkerConfig: components["schemas"]["ChunkOptions"] & {
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint (e.g., 'http://localhost:8080'). Can also be set via ANTFLY_INFERENCE_URL environment variable.
-             * @example http://localhost:8080
-             */
-            api_url?: string;
-            /**
-             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
-             * @default fixed
-             * @example fixed
-             */
-            model?: string;
-        };
-        /**
-         * @description The chunking provider to use.
-         * @enum {string}
-         */
-        ChunkerProvider: "mock" | "antfly";
-        /**
-         * @description A unified configuration for a chunking provider.
-         * @example {
-         *       "provider": "antfly",
-         *       "model": "fixed",
-         *       "text": {
-         *         "target_tokens": 500,
-         *         "overlap_tokens": 50
-         *       }
-         *     }
-         */
-        ChunkerConfig: components["schemas"]["AntflyChunkerConfig"] & {
-            provider: components["schemas"]["ChunkerProvider"];
-            /**
-             * @description Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
-             * @default false
-             */
-            store_chunks?: boolean;
-            /**
-             * @description Configuration for full-text indexing of chunks in Bleve.
-             *     When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-             *     When absent, chunks use :c: suffix and are only used for vector embeddings.
-             */
-            full_text_index?: {
-                [key: string]: unknown;
-            };
-            /**
-             * Format: uri
-             * @description The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL.
-             * @example http://localhost:8080
-             */
-            api_url?: string;
-            /**
-             * @description The chunking model to use. Defaults to 'fixed' for simple token-based chunking; other values select a model from models/chunkers/{name}/. Successful create responses include the effective model.
-             * @default fixed
-             * @example fixed
-             */
-            model?: string;
-            /** @description Maximum number of chunks to generate per document. Zero uses the chunker default. */
-            max_chunks?: number;
-            /** Format: float */
-            threshold?: number;
-            text?: components["schemas"]["TextChunkOptions"];
-            audio?: components["schemas"]["AudioChunkOptions"];
-        };
         /** @description Namespaced execution policy for managed index shorthand. Only namespaces with runtime effects are accepted. */
         IndexExecutionConfig: {
             /** @description Chunk producer batching for shorthand-created chunk enrichments. */
@@ -11250,6 +13012,10 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
+        GraphTtlConfig: {
+            /** @description Expiration duration using Antfly's integer-component duration format (ns, us, ms, s, m, h, d). */
+            duration: string;
+        };
         /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
         GraphEdgeType: string;
         /** @description Omitting this object selects all edge types. A types list selects only those types; mode and types cannot both be supplied. */
@@ -11296,10 +13062,14 @@ export interface components {
              * @enum {string}
              */
             model?: "document" | "external";
+            /** @description Logical source endpoint. When set, edge.edge_id is required; the artifact document remains the durable owner. */
+            source?: components["schemas"]["GraphTemplateValue"];
             target?: components["schemas"]["GraphTemplateValue"];
         };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        /** @description Maps each artifact item to a relationship identity, type, weight, and public metadata. */
         GraphArtifactEdgeMappingConfig: {
+            /** @description Stable application relationship ID. Required with nodes.source. Replays update the same identity; distinct IDs preserve parallel relationships. */
+            edge_id?: components["schemas"]["GraphTemplateValue"];
             type?: components["schemas"]["GraphTemplateValue"];
             weight?: components["schemas"]["GraphTemplateValue"];
             /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
@@ -11600,7 +13370,14 @@ export interface components {
             source: components["schemas"]["GraphArtifactProducerSourceConfig"];
             content_type?: string;
             execution?: components["schemas"]["ExecutionPolicy"];
-            /** @description Write-only producer configuration; it may contain credentials and is never returned. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json. */
+            producer?: {
+                [key: string]: unknown;
+            };
+            /**
+             * @deprecated
+             * @description Write-only producer configuration; it may contain credentials and is never returned.
+             */
             producer_json?: {
                 [key: string]: unknown;
             };
@@ -11614,6 +13391,33 @@ export interface components {
         GraphAlgebraicPlanningConfig: {
             bounded_traversal?: components["schemas"]["GraphBoundedTraversalConfig"];
         };
+        GraphResolverScorerLevel: {
+            /** @description Matcher condition, such as 'exact' or 'jaro_winkler >= 0.9'. */
+            when?: string;
+            /** @description Catch-all level when no previous condition matched. */
+            else?: boolean;
+            /** Format: double */
+            weight: number;
+        };
+        GraphResolverScorerComparison: {
+            name: string;
+            left: string;
+            right: string;
+            levels: components["schemas"]["GraphResolverScorerLevel"][];
+        };
+        GraphResolverScorerConfig: {
+            comparisons: components["schemas"]["GraphResolverScorerComparison"][];
+            combine?: {
+                /** Format: double */
+                bias?: number;
+            };
+            decision?: {
+                /** Format: double */
+                match?: number;
+                /** Format: double */
+                review?: number;
+            };
+        };
         /** @description Versioned entity resolver attached to an artifact-backed graph index. */
         GraphResolverConfig: {
             name: string;
@@ -11626,8 +13430,13 @@ export interface components {
             source_artifact_kind?: "asset" | "chunk" | "any";
             resolution_artifact: string;
             key_template: string;
+            /** @description Mention labels this resolver consumes; empty consumes every label (catch-all). Labeled resolvers sharing a source artifact must claim disjoint label sets, and every catch-all on that artifact skips the labels claimed by labeled siblings, so extraction labels stay open-vocabulary while each mention routes to exactly one labeled resolver (label-routed tables, e.g. event mentions to an events table). */
+            labels?: string[];
             /** @default true */
             type_must_match?: boolean;
+            /** @description Typed matcher scorer. Cannot be combined with scorer_json. */
+            scorer?: components["schemas"]["GraphResolverScorerConfig"];
+            /** @deprecated */
             scorer_json?: string;
             /** @enum {string} */
             candidate_search?: "" | "exact_key" | "prefix" | "ann";
@@ -11645,11 +13454,20 @@ export interface components {
             fusion_prior?: number;
             /** Format: double */
             fusion_prior_weight?: number;
+            /**
+             * Format: double
+             * @description Mention admission floor: mentions whose extractor-asserted confidence is below this are never resolved — no canonical entity key, no mention edge, and relation endpoints referencing them are withheld. The cheap post-extraction junk filter for score-carrying extractors; 0 (the default) admits everything.
+             */
+            min_confidence?: number;
             /** Format: uint64 */
             config_generation?: number;
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Creation-based edge expiration for this graph index. The duration is immutable within an index incarnation. */
+            ttl?: components["schemas"]["GraphTtlConfig"];
+            /** @description Compatibility alias for ttl.duration. Do not specify together with ttl. */
+            ttl_duration?: string;
             /** @description Named published graph metrics. Serverless supports background refresh only and limits configurations to 16 metrics per graph, 64 total per publication, 64 types per filter, and 128 UTF-8 bytes per metric name. */
             metrics?: {
                 [key: string]: components["schemas"]["GraphMetricConfig"];
@@ -11682,11 +13500,96 @@ export interface components {
             /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
             derive_from_schema?: boolean;
         };
+        /** @enum {string} */
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
+        /** @enum {string} */
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number";
+        /**
+         * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+         *     A literal requires type; omitted value means typed null. A column
+         *     requires column; other
+         *     operations require args. Unknown or irrelevant fields are rejected.
+         *     Arithmetic operands have the same integer or number type. Integer
+         *     division truncates toward zero. Overflow and division by zero reject
+         *     the write. Arithmetic and string operations propagate null. ASCII case
+         *     operations leave non-ASCII bytes unchanged. No volatile functions are
+         *     accepted. Allocated results are bounded to 1 MiB each. Allocations
+         *     and byte-comparison operand work share a 4 MiB evaluation budget per
+         *     row and expression set. An integer literal may use a decimal string
+         *     for exact int64 transport; blob uses base64 and datetime uses the
+         *     normal relational datetime representation.
+         *     Comparisons require operands of the same type and return boolean or
+         *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
+         *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
+         *     evaluate left to right with SQL three-valued short-circuit semantics;
+         *     NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+         */
+        RelationalScalarExpression: {
+            op: components["schemas"]["RelationalExpressionOp"];
+            type?: components["schemas"]["RelationalExpressionType"];
+            /** @description Typed literal value, including null. */
+            value?: unknown;
+            column?: string;
+            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            collation?: string;
+            args?: components["schemas"]["RelationalScalarExpression"][];
+        };
+        /**
+         * @description Direction of one ordered index key component. Omission selects asc.
+         * @enum {string}
+         */
+        RelationalIndexKeyDirection: "asc" | "desc";
+        /**
+         * @description Null placement for one ordered index key component. The default is
+         *     last for ascending keys and first for descending keys. Omission selects default.
+         * @enum {string}
+         */
+        RelationalIndexKeyNulls: "default" | "first" | "last";
+        /**
+         * @description Ordered component of a relational ordered-tuple index key. Supply
+         *     either a declared column or a deterministic typed scalar expression
+         *     with its result_type. Composite keys may mix both forms. Bounds use
+         *     the expression result type, not its input columns.
+         */
+        RelationalIndexKey: {
+            /** @description Declared relational column used by this key component. */
+            column?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+            result_type?: components["schemas"]["RelationalExpressionType"];
+            /**
+             * @description String-key collation. Omission selects binary ordering. Supported
+             *     binary aliases are C, POSIX, and binary. The aliases ci,
+             *     case_insensitive, and antfly.case_insensitive select ASCII-only
+             *     case folding, not locale-aware or Unicode case folding.
+             */
+            collation?: string;
+            direction?: components["schemas"]["RelationalIndexKeyDirection"];
+            nulls?: components["schemas"]["RelationalIndexKeyNulls"];
+        };
+        /** @enum {string} */
+        RelationalComparisonOp: "is_null" | "is_not_null" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_distinct" | "is_not_distinct";
+        /** @description A typed partial-index conjunct. Only TRUE is indexed; FALSE and SQL UNKNOWN are excluded. */
+        RelationalIndexPredicate: {
+            column: string;
+            op: components["schemas"]["RelationalComparisonOp"];
+            /** @description Typed scalar operand; integer columns also accept exact decimal strings. Omission means NULL. */
+            value?: unknown;
+            /** @description String comparison collation with the same semantics as ordered keys. */
+            collation?: string;
+        };
+        /** @description Schema-bound composite ordered index on a relational table. Keys use stable typed comparison semantics and independent direction, null placement, and string collation. Existing rows build asynchronously; indexed queries require complete owner coverage. The table schema is the single durable authority for these definitions. */
+        RelationalIndexConfig: {
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored for index-only projection; distinct from keys. */
+            include_columns?: string[];
+            /** @description Optional conjunction selecting index members. Queries must explicitly include all typed conjuncts. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description The type of the index.
          * @enum {string}
          */
-        IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
+        IndexType: "full_text" | "embeddings" | "graph" | "algebraic" | "relational";
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -11719,7 +13622,7 @@ export interface components {
              *     ]
              */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
-        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
+        } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"] | components["schemas"]["RelationalIndexConfig"]);
         /** @description Fields shared by every create-index variant. The index name is owned by the request path. */
         CreateIndexCommon: {
             /** @description Optional description of the index and its purpose */
@@ -11776,8 +13679,179 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Create a composite ordered index through the shared index resource. */
+        CreateRelationalIndexRequest: components["schemas"]["RelationalIndexConfig"] & {
+            /** @description Optional description of the index and its purpose. */
+            description?: string;
+            /**
+             * @description Index implementation version. Only zero is supported; the schema epoch is managed by the server.
+             * @default 0
+             */
+            version?: number;
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Type-safe configuration for a new index. The index name is owned by the request path. */
-        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"];
+        CreateIndexRequest: components["schemas"]["CreateFullTextIndexRequest"] | components["schemas"]["CreateEmbeddingsIndexRequest"] | components["schemas"]["CreateGraphIndexRequest"] | components["schemas"]["CreateAlgebraicIndexRequest"] | components["schemas"]["CreateRelationalIndexRequest"];
+        /**
+         * @description Storage representation for the table. Omission selects "document".
+         *     "relational" stores schema-bound typed rows and requires exactly one
+         *     closed document schema with declared properties. It implies
+         *     enforce_types; explicitly setting enforce_types to false is invalid.
+         *     Existing JSON document write and read APIs remain available. This
+         *     setting alone does not declare primary keys or unique constraints.
+         * @enum {string}
+         */
+        TableStorageMode: "document" | "relational";
+        ExternalLakeCredentialRef: {
+            /** @description Name of a configured external_io connection with lake_read capability. */
+            ref: string;
+            /** @description Allowed object prefix relative to the configured bucket or filesystem root. */
+            scope?: string;
+        };
+        ExternalLakeSnapshotSelector: {
+            /** @enum {string} */
+            mode: "current" | "snapshot_id" | "object_version_digest";
+            /** @description Required for snapshot_id; selects an Iceberg snapshot. */
+            id?: string;
+            /** @description Required for object_version_digest; pins a Parquet object inventory. */
+            digest?: string;
+        };
+        /** @description Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. */
+        ExternalLakeTableSource: {
+            /** @enum {string} */
+            kind: "external";
+            table_id: string;
+            /** @enum {string} */
+            format: "parquet" | "iceberg";
+            uri: string;
+            /** @default auto */
+            schema_fingerprint?: string;
+            /**
+             * @default read_only
+             * @enum {string}
+             */
+            write_policy?: "read_only";
+            credentials?: components["schemas"]["ExternalLakeCredentialRef"];
+            snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
+        };
+        RelationalColumnExpression: {
+            column: string;
+            expression: components["schemas"]["RelationalScalarExpression"];
+        };
+        /**
+         * @description A typed CHECK. Supply either expression or column and op (with optional
+         *     value and collation), never both forms. Expressions must return boolean
+         *     and use the shared bounded immutable scalar expression vocabulary.
+         *     New writes are checked from schema publication;
+         *     existing rows are validated separately. SQL UNKNOWN satisfies CHECK.
+         *     Comparison values must match the column type. Integer values may also
+         *     use exact decimal strings to avoid client-side floating-point rounding.
+         */
+        RelationalCheckConstraint: {
+            name: string;
+            column?: string;
+            op?: components["schemas"]["RelationalComparisonOp"];
+            /** @description Scalar comparison operand. Omission represents NULL. Null tests require a NULL operand. */
+            value?: unknown;
+            /** @description String comparison collation; uses the same rules as ordered indexes. */
+            collation?: string;
+            expression?: components["schemas"]["RelationalScalarExpression"];
+        };
+        /**
+         * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
+         *     requires deferrable=true and validates the final transaction state.
+         *     NO ACTION permits a valid final-state parent replacement; RESTRICT
+         *     still rejects referenced parent removal. Existing multi-request
+         *     transaction sessions retain deferred checks until commit; immediate
+         *     checks apply to each staged statement. SET CONSTRAINTS is not provided.
+         * @enum {string}
+         */
+        ForeignKeyTiming: "immediate" | "deferred";
+        /**
+         * @description A named, ordered composite unique key. Validation status is maintained
+         *     by the server. TTL expiry uses the distributed integrity coordinator.
+         *     Referenced unique keys are nondeferrable.
+         */
+        RelationalUniqueConstraint: {
+            name: string;
+            /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
+            primary?: boolean;
+            columns?: string[];
+            /** @description Typed native unique keys. Specify either columns or keys. */
+            keys?: components["schemas"]["RelationalIndexKey"][];
+            /** @description Conjunction restricting uniqueness to matching rows. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+            /** @description When true, NULL components compare equal for uniqueness. */
+            nulls_not_distinct?: boolean;
+            /** @description Permit uniqueness checks at transaction commit. Never eligible as an ON CONFLICT arbiter or a referenced foreign key target. */
+            deferrable?: boolean;
+            timing?: components["schemas"]["ForeignKeyTiming"];
+        };
+        /**
+         * @description Action on referencing rows when a referenced row is changed or removed.
+         * @enum {string}
+         */
+        ForeignKeyAction: "restrict" | "set_null" | "cascade" | "no_action";
+        /**
+         * @description Null matching semantics of a composite foreign key. Partial requires
+         *     at least one parent matching every non-null child component; all-null
+         *     children are exempt. Compatible parent witnesses are guarded through
+         *     commit, including concurrent deletion of alternative witnesses.
+         * @enum {string}
+         */
+        ForeignKeyMatch: "simple" | "full" | "partial";
+        /**
+         * @description Composite foreign key. Child and parent columns correspond by position
+         *     and must have the same physical comparison types. The parent columns
+         *     must identify a unique key. Existing-row validation is independent of
+         *     new-write enforcement and is never client-writable.
+         *     Enforcement and referential actions share the bounded distributed
+         *     transaction path, including TTL expiry. Partial matching uses ordered
+         *     support indexes on the parent; activation waits until these are ready.
+         *     SET NULL requires every child column to accept explicit NULL.
+         */
+        RelationalForeignKeyConstraint: {
+            name: string;
+            child_columns: string[];
+            /**
+             * @description Literal parent table name in the child table's database and namespace.
+             *     Resolved to an immutable table identity when the constraint is declared;
+             *     renaming a parent preserves the reference. Public schemas show its current name.
+             */
+            parent_table: string;
+            parent_columns: string[];
+            on_delete?: components["schemas"]["ForeignKeyAction"];
+            on_update?: components["schemas"]["ForeignKeyAction"];
+            timing?: components["schemas"]["ForeignKeyTiming"];
+            match?: components["schemas"]["ForeignKeyMatch"];
+            deferrable?: boolean;
+        };
+        /**
+         * @description Declarative table-owned ordered index. Keys are compared lexicographically
+         *     in the declared order, with independent direction, null placement, and
+         *     string collation. Creation builds existing rows asynchronously; queries
+         *     must wait for range-local coverage. Unique constraints and expression
+         *     keys are not implied by this object. Optional WHERE conjuncts select
+         *     only matching rows. INCLUDE columns
+         *     store typed values alongside keys for index-only projected reads.
+         */
+        RelationalIndexDefinition: {
+            /** @description Optional human-readable description, also exposed by the shared indexes API. */
+            description?: string;
+            name: string;
+            keys: components["schemas"]["RelationalIndexKey"][];
+            /** @description Non-key columns stored in the index; must be distinct from key columns. */
+            include_columns?: string[];
+            /** @description Conjunction of typed predicates. Indexed queries must explicitly contain every conjunct with equivalent typed comparison semantics. */
+            where?: components["schemas"]["RelationalIndexPredicate"][];
+        };
         /**
          * @description Field types accepted by detailed `x-antfly-field` and dynamic-template
          *     mappings. JSON-schema-oriented aliases are normalized to Antfly's
@@ -11786,7 +13860,7 @@ export interface components {
          *     geoshape.
          * @enum {string}
          */
-        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        FieldMappingType: "text" | "html" | "keyword" | "numeric" | "number" | "integer" | "boolean" | "bool" | "datetime" | "date" | "timestamp" | "geopoint" | "geo_point" | "geoshape" | "geo_shape" | "embedding" | "blob" | "link" | "search_as_you_type" | "substring";
         /** @description Mapping for one named multifield emitted from its parent document property. Multifields are intentionally one level deep and read the parent property's JSON value rather than a nested JSON property. */
         DocumentSubfieldMapping: {
             type?: components["schemas"]["FieldMappingType"];
@@ -11960,6 +14034,54 @@ export interface components {
              * @description Backend-managed schema generation used for migrations. Omit it from create and update requests.
              */
             readonly version?: number;
+            storage_mode?: components["schemas"]["TableStorageMode"];
+            /** @description External tables require relational storage mode and are read-only. Omit for native tables. */
+            base_source?: components["schemas"]["ExternalLakeTableSource"];
+            /**
+             * @description Immutable typed expressions applied only to absent columns on new
+             *     writes, never explicit null. Defaults cannot reference columns.
+             *     A column cannot have both a default and a generated expression.
+             *     Omission or [] declares none. Relational tables only.
+             */
+            column_defaults?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Stored immutable generated columns, evaluated in dependency order
+             *     on writes before validation and indexing. Cycles are rejected.
+             *     Generated columns are output-only; submitted values are replaced
+             *     by the computed value. Omission or [] declares none. Defaults
+             *     and generated declarations together are limited to 256 columns,
+             *     4096 expression nodes, and 4 MiB of literal data. Evaluation has
+             *     a shared 4 MiB allocation budget across all column expressions.
+             *     Restore verifies stored results instead of silently recomputing
+             *     them. Changing, adding, or removing generated semantics through
+             *     an existing table's schema update requires explicit rewrite=true
+             *     on the PUT or PATCH schema route. This returns a durable restore
+             *     job and replaces the complete authorized dependency cohort only
+             *     after distributed transformation and validation. Ordinary schema
+             *     updates reject these changes, even when a table appears empty.
+             *     Declaration reordering and default-only changes remain allowed.
+             *     Relational tables only.
+             */
+            generated_columns?: components["schemas"]["RelationalColumnExpression"][];
+            /**
+             * @description Named scalar CHECK constraints for a relational schema. This is
+             *     part of the complete schema: omission or [] declares no checks.
+             *     New writes enforce every check. Existing-row validation status is
+             *     maintained separately and is never accepted from the client.
+             */
+            checks?: components["schemas"]["RelationalCheckConstraint"][];
+            /** @description Complete set of composite unique declarations. Omission or [] declares none. */
+            unique_constraints?: components["schemas"]["RelationalUniqueConstraint"][];
+            /** @description Complete set of outgoing composite foreign keys. Omission or [] declares none. */
+            foreign_keys?: components["schemas"]["RelationalForeignKeyConstraint"][];
+            /**
+             * @description Desired ordered indexes for a relational table. Names must be unique.
+             *     An explicit array replaces the declarations; an empty array drops
+             *     them. Omission preserves existing declarations during schema updates.
+             *     Index definitions commit atomically with the schema; build progress
+             *     and readiness are local to each owning shard, not client-writable.
+             */
+            relational_indexes?: components["schemas"]["RelationalIndexDefinition"][];
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
@@ -12005,10 +14127,13 @@ export interface components {
             vector_space?: string;
             chunk_size?: number;
             chunk_overlap?: number;
+            chunker?: components["schemas"]["ChunkerConfig"];
+            /** @deprecated */
             chunker_json?: string;
             /** @default false */
             full_text_index?: boolean;
             content_type?: string;
+            neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             execution?: components["schemas"]["ExecutionPolicy"];
         };
         /** @description Fields returned for every newly created index. Provider credentials are write-only and are never returned. */
@@ -12030,6 +14155,7 @@ export interface components {
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             mem_only?: boolean;
             field?: string;
+            analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /** @description Normalized effective full-text index configuration returned after creation. */
         CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedFullTextIndexConfig"] & {
@@ -12180,8 +14306,19 @@ export interface components {
              */
             type: "algebraic";
         };
+        /** @description Effective schema-bound composite index configuration. */
+        CreatedRelationalIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["RelationalIndexConfig"] & {
+            /** @enum {string} */
+            type: "relational";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            type: "relational";
+        };
         /** @description Discriminated normalized configuration returned after an index is created. */
-        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"];
+        CreatedIndex: components["schemas"]["CreatedFullTextIndex"] | components["schemas"]["CreatedEmbeddingsIndex"] | components["schemas"]["CreatedGraphIndex"] | components["schemas"]["CreatedAlgebraicIndex"] | components["schemas"]["CreatedRelationalIndex"];
         /**
          * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
@@ -12578,7 +14715,10 @@ export interface components {
             error_count: number;
             /** Format: uint64 */
             retryable_error_count: number;
-            /** Format: uint64 */
+            /**
+             * Format: uint64
+             * @description Durable count of enrichment requests parked with a non-retryable (terminal) disposition, plus fatal worker failures. A terminally failed request never returns to pending; per-document terminal state is reported by the owning index's coverage counters (terminal_failed), and per-document diagnostics by the artifact repair issue listing.
+             */
             fatal_error_count: number;
             /**
              * Format: uint32
@@ -13289,8 +15429,49 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @enum {string} */
+        RelationalIndexBuildState: "building" | "ready" | "failed";
+        /** @enum {string} */
+        RelationalIndexBuildFailure: "incompatible_schema" | "invalid_row" | "key_too_large";
+        RelationalIndexRangeStatus: {
+            group_id: string;
+            /** @description Exact uint64 generation encoded as decimal, never a floating-point number. */
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            /** @description Namespace and owned-range fingerprint. */
+            owner: string;
+            /** @description Executable tuple comparison fingerprint. */
+            comparison: string;
+            /** @description Exact durable progress observation for generation-fenced maintenance. */
+            progress_digest: string;
+            /** @description Replicated desired maintenance ticket, separate from replica-local progress. */
+            maintenance_epoch: string;
+            /** @description Most recently accepted maintenance command proof for exact retry acknowledgement. */
+            last_maintenance_request?: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            rows_scanned: string;
+            failure?: components["schemas"]["RelationalIndexBuildFailure"];
+        };
+        RelationalIndexStatus: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            index_name: string;
+            state: components["schemas"]["RelationalIndexBuildState"];
+            ranges: components["schemas"]["RelationalIndexRangeStatus"][];
+        };
+        RelationalIndexStats: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            index_type: "relational";
+            milestones: components["schemas"]["IndexMilestones"];
+            relational_index: components["schemas"]["RelationalIndexStatus"];
+        };
         /** @description Statistics for an index */
-        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"] | components["schemas"]["RelationalIndexStats"];
         GraphMetricEdgeFilterStatus: {
             /** @enum {string} */
             mode: "all" | "types";
@@ -13440,6 +15621,11 @@ export interface components {
             recent_events?: components["schemas"]["GraphMetricEvent"][];
         };
         /**
+         * @description Validation state of an existing-row constraint.
+         * @enum {string}
+         */
+        RelationalConstraintValidationState: "enforced" | "unvalidated" | "validating" | "invalid";
+        /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
@@ -13467,44 +15653,6 @@ export interface components {
          */
         WebSearchProvider: "exa" | "serper" | "tavily" | "brave" | "you" | "linkup" | "vertex";
         /**
-         * @description Configuration for Exa neural/semantic web search.
-         *
-         *     Exa is optimized for semantic web search, highlights, and retrieved page
-         *     contents for RAG and agent workflows.
-         *
-         *     **Setup:**
-         *     1. Sign up at https://exa.ai
-         *     2. Get API key from dashboard
-         *
-         *     **Docs:** https://docs.exa.ai
-         */
-        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
-            /** @description Exa API key (or set EXA_API_KEY env var) */
-            api_key?: string;
-            /**
-             * @description Search mode to request from Exa
-             * @default auto
-             * @enum {string}
-             */
-            search_type?: "auto" | "neural" | "keyword";
-            /** @description Provider-specific result count override */
-            num_results?: number;
-            /** @description ISO date/time lower bound for published date filtering */
-            start_published_date?: string;
-            /** @description ISO date/time upper bound for published date filtering */
-            end_published_date?: string;
-            /** @description Only include results from these domains */
-            include_domains?: string[];
-            /** @description Exclude results from these domains */
-            exclude_domains?: string[];
-        } & {
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            provider: "exa";
-        };
-        /**
          * @description Configuration for Serper.dev Google Search API.
          *
          *     Serper provides a simpler alternative to Google Custom Search with
@@ -13517,11 +15665,12 @@ export interface components {
          *     **Docs:** https://serper.dev/docs
          */
         SerperSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "serper";
             /** @description Serper API key (or set SERPER_API_KEY env var) */
             api_key?: string;
             /**
              * @description Type of search to perform
-             * @default search
              * @enum {string}
              */
             search_type?: "search" | "news" | "images" | "places" | "shopping";
@@ -13530,6 +15679,12 @@ export interface components {
              * @enum {string}
              */
             time_period?: "d" | "w" | "m" | "y";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "serper";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13550,30 +15705,31 @@ export interface components {
          *     **Docs:** https://docs.tavily.com
          */
         TavilySearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "tavily";
             /** @description Tavily API key (or set TAVILY_API_KEY env var) */
             api_key?: string;
             /**
              * @description Search depth:
              *     - basic: Fast search with standard results
              *     - advanced: Deeper search with more comprehensive results
-             * @default basic
              * @enum {string}
              */
             search_depth?: "basic" | "advanced";
-            /**
-             * @description Include AI-generated answer summary
-             * @default true
-             */
+            /** @description Include AI-generated answer summary */
             include_answer?: boolean;
-            /**
-             * @description Include raw HTML content of pages
-             * @default false
-             */
+            /** @description Include raw HTML content of pages */
             include_raw_content?: boolean;
             /** @description Only include results from these domains */
             include_domains?: string[];
             /** @description Exclude results from these domains */
             exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "tavily";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13593,6 +15749,8 @@ export interface components {
          *     **Docs:** https://api.search.brave.com/app/documentation
          */
         BraveSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "brave";
             /** @description Brave Search API key (or set BRAVE_API_KEY env var) */
             api_key?: string;
             /**
@@ -13600,16 +15758,16 @@ export interface components {
              * @enum {string}
              */
             freshness?: "pd" | "pw" | "pm" | "py";
-            /**
-             * @description Include text decorations (bold, italic markers)
-             * @default false
-             */
+            /** @description Include text decorations (bold, italic markers) */
             text_decorations?: boolean;
-            /**
-             * @description Enable spellcheck suggestions
-             * @default true
-             */
+            /** @description Enable spellcheck suggestions */
             spellcheck?: boolean;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "brave";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13630,6 +15788,8 @@ export interface components {
          *     **Docs:** https://api.you.com
          */
         YouSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "you";
             /** @description You.com API key (or set YOU_API_KEY env var) */
             api_key?: string;
             /**
@@ -13637,6 +15797,12 @@ export interface components {
              * @description You.com API endpoint URL
              */
             endpoint?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "you";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13657,20 +15823,26 @@ export interface components {
          *     **Docs:** https://docs.linkup.so
          */
         LinkupSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "linkup";
             /** @description Linkup API key (or set LINKUP_API_KEY env var) */
             api_key?: string;
             /**
              * @description Search depth to request from Linkup
-             * @default standard
              * @enum {string}
              */
             depth?: "standard" | "deep";
             /**
              * @description Linkup response shape to request
-             * @default searchResults
              * @enum {string}
              */
             output_type?: "searchResults" | "sourcedAnswer";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "linkup";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13693,28 +15865,29 @@ export interface components {
          *     **Docs:** https://cloud.google.com/generative-ai-app-builder/docs
          */
         VertexSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "vertex";
             /**
              * @description Google Cloud search service flavor
-             * @default agent_search
              * @enum {string}
              */
             service?: "agent_search";
             /** @description Google Cloud project ID. Falls back to GOOGLE_CLOUD_PROJECT. */
             project_id?: string;
-            /**
-             * @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION.
-             * @default global
-             */
+            /** @description Google Cloud location. Falls back to GOOGLE_CLOUD_LOCATION. */
             location?: string;
             /** @description Agent Search data store ID. */
             data_store?: string;
-            /**
-             * @description Agent Search serving config ID.
-             * @default default_config
-             */
+            /** @description Agent Search serving config ID. */
             serving_config?: string;
             /** @description Service account JSON path. Falls back to GOOGLE_APPLICATION_CREDENTIALS. */
             credentials_path?: string;
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "vertex";
         } & {
             /**
              * @description discriminator enum property added by openapi-typescript
@@ -13727,6 +15900,12 @@ export interface components {
          *
          *     Each provider has specific configuration requirements. Use the appropriate
          *     provider-specific config or set common options at the top level.
+         *
+         *     Omitted options inherit the named connection when one is supplied.
+         *     Inline configurations preserve omission; clients must not materialize
+         *     defaults as overrides. Without a connection, the server applies provider
+         *     defaults (Exa: 5 results, 10000 ms timeout, safe search enabled, content
+         *     and highlights disabled, and auto search).
          *
          *     **Environment Variables (fallbacks):**
          *     - EXA_API_KEY
@@ -13753,20 +15932,11 @@ export interface components {
             serving_config?: string;
             /** @description Service account JSON path for provider vertex. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials. Falls back to GOOGLE_APPLICATION_CREDENTIALS or ADC. */
             credentials_path?: string;
-            /**
-             * @description Maximum number of search results to return
-             * @default 5
-             */
+            /** @description Maximum number of search results to return */
             max_results?: number;
-            /**
-             * @description Request timeout in milliseconds
-             * @default 10000
-             */
+            /** @description Request timeout in milliseconds */
             timeout_ms?: number;
-            /**
-             * @description Enable safe search filtering
-             * @default true
-             */
+            /** @description Enable safe search filtering */
             safe_search?: boolean;
             /**
              * @description Preferred language for results (e.g., 'en', 'es', 'fr')
@@ -13778,17 +15948,58 @@ export interface components {
              * @example us
              */
             region?: string;
-            /**
-             * @description Ask the provider to return extracted page content when supported
-             * @default false
-             */
+            /** @description Ask the provider to return extracted page content when supported */
             include_content?: boolean;
-            /**
-             * @description Ask the provider to return highlighted passages when supported
-             * @default false
-             */
+            /** @description Ask the provider to return highlighted passages when supported */
             include_highlights?: boolean;
         };
+        /**
+         * @description Configuration for Exa neural/semantic web search.
+         *
+         *     Exa is optimized for semantic web search, highlights, and retrieved page
+         *     contents for RAG and agent workflows.
+         *
+         *     **Setup:**
+         *     1. Sign up at https://exa.ai
+         *     2. Get API key from dashboard
+         *
+         *     **Docs:** https://docs.exa.ai
+         */
+        ExaSearchConfig: Omit<components["schemas"]["WebSearchConfig"], "provider"> & {
+            /** @enum {string} */
+            provider?: "exa";
+            /** @description Exa API key (or set EXA_API_KEY env var) */
+            api_key?: string;
+            /**
+             * @description Search mode to request from Exa
+             * @enum {string}
+             */
+            search_type?: "auto" | "neural" | "keyword";
+            /** @description Provider-specific result count override */
+            num_results?: number;
+            /** @description ISO date/time lower bound for published date filtering */
+            start_published_date?: string;
+            /** @description ISO date/time upper bound for published date filtering */
+            end_published_date?: string;
+            /** @description Only include results from these domains */
+            include_domains?: string[];
+            /** @description Exclude results from these domains */
+            exclude_domains?: string[];
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        } & {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            provider: "exa";
+        };
+        /** @description Provider-specific inline web search configuration. */
+        WebSearchProviderConfig: components["schemas"]["ExaSearchConfig"] | components["schemas"]["SerperSearchConfig"] | components["schemas"]["TavilySearchConfig"] | components["schemas"]["BraveSearchConfig"] | components["schemas"]["YouSearchConfig"] | components["schemas"]["LinkupSearchConfig"] | components["schemas"]["VertexSearchConfig"];
         Credentials: {
             /**
              * @description S3-compatible endpoint (e.g., 's3.amazonaws.com' or 'localhost:9000' for MinIO)
@@ -13891,7 +16102,7 @@ export interface components {
              *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
              *     options.
              */
-            web_search_config?: components["schemas"]["WebSearchConfig"];
+            web_search_config?: components["schemas"]["WebSearchProviderConfig"];
             /**
              * @description Name of a configured connections.<id> resource with kind web_search.
              *     Request-level tool options may reduce scope, but cannot expand the
@@ -14286,6 +16497,14 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Analyze the text with the field's analyzer and match any of the
+         *     resulting terms. On a `substring` companion field (`fieldName._substring`)
+         *     the text is lowercased and matched as a contained substring instead:
+         *     `{"match": "g3we", "field": "sku._substring"}` finds `RAG3-WEAVER`.
+         *     Substring lookups require at least two bytes and reject a token or
+         *     adjacent token pair longer than 32 bytes.
+         */
         MatchQuery: {
             match: string;
             field?: string;
@@ -14304,6 +16523,13 @@ export interface components {
         };
         /** @description The fuzziness of the query. Can be an integer or "auto". */
         Fuzziness: number | "auto";
+        /**
+         * @description Match a phrase using the field's analyzer. On a `substring` companion,
+         *     one or two words match contained text across token separators. Three
+         *     or more words are rejected because the suffix index cannot verify
+         *     their word boundaries; lookups over 32 bytes are also rejected.
+         *     Nonzero or automatic fuzziness is rejected on substring fields; use a standalone fuzzy query instead.
+         */
         MatchPhraseQuery: {
             match_phrase: string;
             field?: string;
@@ -14331,6 +16557,11 @@ export interface components {
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /**
+         * @description Match terms that start with the given bytes. On a `substring`
+         *     companion field the prefix is lowercased and matched as a contained
+         *     substring, exactly like `match` on that field.
+         */
         PrefixQuery: {
             prefix: string;
             field?: string;
@@ -14606,7 +16837,7 @@ export interface components {
             provider: components["schemas"]["RerankerProvider"];
             /** @description Field name to extract from documents for reranking. */
             field?: string;
-            /** @description Handlebars template to render document text for reranking. */
+            /** @description Handlebars template that renders each candidate for reranking. The `media` and `remoteMedia` helpers add images, which are sent to the reranker alongside the rendered text; only an Antfly reranker whose model accepts images can score them, and any other reranker rejects the query with `400`. */
             template?: string;
             /** @description Optional provider model name. When omitted, the selected provider's documented default is used. */
             model?: string;
@@ -14638,6 +16869,13 @@ export interface components {
              * @enum {string}
              */
             metric_freshness?: "published" | "fresh";
+            /** @description Node keys receiving all teleport mass for query-seeded personalized PageRank (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: personalized scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded reads against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, ranking degenerates to global PageRank. */
+            seed_nodes?: string[];
+            /**
+             * Format: double
+             * @description Damping override for query-seeded personalized PageRank (typical HippoRAG-style retrieval uses 0.9). Only valid together with seed_nodes; omitted reads keep the metric's configured damping.
+             */
+            damping?: number;
         };
         /** @description Blends a published graph metric into hit scores. Multi-shard tables require a globally coordinated metric snapshot and otherwise return graph_metric_global_materialization_required. */
         GraphMetricRerank: {
@@ -14674,6 +16912,18 @@ export interface components {
              * @enum {string}
              */
             metric_freshness?: "published" | "fresh";
+            /** @description Node keys receiving all teleport mass for a query-seeded personalized PageRank blend (HippoRAG-style retrieval). Only valid for pagerank metrics and requires metric_freshness=fresh: the blended feature scores are computed at query time from the current edge snapshot, while published generations are global-only, so seeded blends against published freshness are rejected. Seed keys absent from the graph are skipped; if none resolve, the blend degenerates to global PageRank. */
+            seed_nodes?: string[];
+            /**
+             * Format: double
+             * @description Damping override for the query-seeded personalized PageRank blend. Only valid together with seed_nodes; omitted blends keep the metric's configured damping.
+             */
+            damping?: number;
+            /**
+             * @description Seed the personalized PageRank blend from the query's literal graph-search start keys; only valid for pagerank metrics with metric_freshness=fresh. Honored by retrieval-agent queries: caller-supplied seed_nodes always take precedence and are never overwritten, and queries without literal graph-search start keys keep their unseeded (global) blend.
+             * @default false
+             */
+            auto_seed?: boolean;
         };
         /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
         GraphIdentifier: string;
@@ -14796,6 +17046,34 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
+        GraphRelationshipPropertyPredicate: {
+            /** @description JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type, /weight, /created_at, /updated_at. */
+            field: string;
+            /** @enum {string} */
+            op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "is_null" | "is_not_null";
+            /** @description Non-null scalar comparison value. Omit for is_null and is_not_null. */
+            value?: unknown;
+            /**
+             * @description Datetime compares RFC3339 instants rather than string ordering.
+             * @default scalar
+             * @enum {string}
+             */
+            value_type?: "scalar" | "datetime";
+        };
+        /** @description AND predicates applied to every relationship before neighbor admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a created_at value. Invalid timestamp properties never match. */
+        GraphRelationshipFilter: {
+            properties?: components["schemas"]["GraphRelationshipPropertyPredicate"][];
+            /**
+             * Format: date-time
+             * @description Require metadata.valid_at <= instant < metadata.invalid_at.
+             */
+            valid_at?: string;
+            /**
+             * Format: date-time
+             * @description Require metadata.created_at <= instant < metadata.expired_at.
+             */
+            known_at?: string;
+        };
         /** @description Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual stored edges and does not constrain the aggregate path objective. */
         GraphEdgeWeightRange: {
             /** Format: double */
@@ -14805,6 +17083,7 @@ export interface components {
         };
         /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphIdentifier"];
             to: components["schemas"]["GraphIdentifier"];
             /** @description Stored-edge direction relative to `from`; defaults to `out`. */
@@ -14946,6 +17225,7 @@ export interface components {
         };
         /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
         GraphTraversal: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             start: components["schemas"]["GraphNodeSelector"];
             /** @description Stored-edge direction relative to each expanded node; defaults to `out`. */
             direction?: components["schemas"]["EdgeDirection"];
@@ -14994,6 +17274,7 @@ export interface components {
         };
         /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
         GraphShortestPath: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
@@ -15019,8 +17300,9 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
-        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective. */
+        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction, type, edge ID and fact owner, and are ordered best-first by the selected objective. */
         GraphKShortestPaths: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
@@ -15151,6 +17433,7 @@ export interface components {
          * @description Deprecated graph_searches traversal and path parameters.
          */
         GraphQueryParams: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
@@ -15175,6 +17458,7 @@ export interface components {
          * @description Deprecated linear graph_searches pattern edge.
          */
         PatternEdgeStep: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
@@ -15263,6 +17547,10 @@ export interface components {
         };
         /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
         GraphBindingsResult: {
+            /** @description Evaluated values parallel to returned rows, when decision evaluation was requested. */
+            computed?: {
+                [key: string]: unknown;
+            }[];
             /**
              * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
              * @enum {string}
@@ -15308,6 +17596,10 @@ export interface components {
         GraphPathEdgeDirection: "out" | "in";
         /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
         GraphPathEdge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             direction: components["schemas"]["GraphPathEdgeDirection"];
@@ -15444,6 +17736,9 @@ export interface components {
          * @description Deprecated graph_searches pattern response row.
          */
         PatternMatch: {
+            _computed?: {
+                [key: string]: unknown;
+            };
             bindings?: {
                 [key: string]: components["schemas"]["LegacyGraphResultNode"];
             };
@@ -15520,6 +17815,26 @@ export interface components {
             context?: Record<string, never>[];
             /** @description IDs of retrieved documents (for retrieval metrics) */
             retrieved_ids?: string[];
+        };
+        IndexMaintenanceOwnerProof: {
+            group_id: string;
+            generation: string;
+            /** Format: uint32 */
+            slot: number;
+            owner: string;
+            comparison: string;
+            progress_digest: string;
+            maintenance_epoch: string;
+        };
+        /** @description Exact observations from index status. Each selected owner is admitted atomically through the replicated transaction journal; the selection is not one global transaction. Cancellation, conflicts, or a lost acknowledgement may leave some owners admitted. Resubmit the identical request to resume safely; do not replace its observations with newer progress unless starting a new maintenance attempt. */
+        IndexMaintenanceRequest: {
+            table_id: string;
+            /** Format: uint32 */
+            schema_version: number;
+            owners: components["schemas"]["IndexMaintenanceOwnerProof"][];
+        };
+        IndexMaintenanceResponse: {
+            acknowledged_groups: string[];
         };
         InferenceError: {
             /** @description Stable machine-readable error code */
@@ -15785,33 +18100,32 @@ export interface components {
              */
             query: string;
             /**
-             * @description Pre-rendered document texts to rerank. The client is responsible for extracting
-             *     and rendering document fields/templates before calling this endpoint.
+             * @description Documents to rerank. Each entry is a string or an array of text and image
+             *     content parts. Exactly one of `documents` and `prompts` is required.
              * @example [
              *       "Introduction to machine learning...",
-             *       "Deep learning fundamentals..."
+             *       [
+             *         {
+             *           "type": "text",
+             *           "text": "Quarterly invoice"
+             *         },
+             *         {
+             *           "type": "image_url",
+             *           "image_url": {
+             *             "url": "data:image/png;base64,iVBORw0KGgo..."
+             *           }
+             *         }
+             *       ]
              *     ]
              */
-            prompts: string[];
-        };
-        InferenceRerankMultimodalDocument: {
-            /** @description Optional caller-provided document identifier */
-            id?: string;
-            content: components["schemas"]["ChatMessageContent"];
-        };
-        InferenceRerankMultimodalRequest: {
+            documents?: components["schemas"]["ChatMessageContent"][];
             /**
-             * @description Name of multimodal reranking model from models_dir/rerankers/
-             * @example vidore/colqwen2-v1.0
+             * @deprecated
+             * @description Deprecated text-only form of `documents`. Accepted so older clients keep
+             *     working; send `documents` instead. Exactly one of `documents` and `prompts`
+             *     is required.
              */
-            model: string;
-            /**
-             * @description Text query for relevance scoring
-             * @example invoice total due date
-             */
-            query: string;
-            /** @description Documents expressed as text and image content parts */
-            documents: components["schemas"]["InferenceRerankMultimodalDocument"][];
+            prompts?: string[];
         };
         InferenceRerankResponse: {
             /**
@@ -15819,7 +18133,7 @@ export interface components {
              * @enum {string}
              */
             object: "list";
-            /** @description Rerank score objects, one per input prompt. */
+            /** @description Rerank score objects, one per input document. */
             data: components["schemas"]["InferenceRerankObject"][];
             /** @description Name of model used for reranking */
             model: string;
@@ -16280,6 +18594,47 @@ export interface components {
             /** @description List of input modalities this model accepts, such as `text`, `image`, or `audio` */
             inputs?: string[];
         };
+        InferenceDecideRequest: {
+            model: string;
+            state: string;
+            questions: {
+                [key: string]: components["schemas"]["InferenceDecideQuestion"];
+            };
+        };
+        InferenceDecideQuestion: {
+            /** @enum {string} */
+            type: "choice" | "score" | "noul";
+            instructions: string;
+            /** @description Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria. */
+            criteria?: {
+                [key: string]: string;
+            } | string[];
+        };
+        InferenceDecideResponse: {
+            model: string;
+            answers: {
+                [key: string]: components["schemas"]["InferenceDecideAnswer"];
+            };
+            usage: {
+                /** @description Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks. */
+                input_tokens: number;
+                /** @description Zero for classifier executors, which emit no generated tokens. */
+                output_tokens: number;
+            };
+        };
+        InferenceDecideAnswer: {
+            /** @enum {string} */
+            type: "choice" | "score" | "noul";
+            choice?: string;
+            score?: number;
+            noul?: number;
+            legend?: {
+                [key: string]: string;
+            };
+            probabilities?: {
+                [key: string]: number;
+            };
+        };
         InferenceModelsResponse: {
             /**
              * @description OpenAI-compatible response object type.
@@ -16310,6 +18665,10 @@ export interface components {
             };
             /** @description Available extractor models (models with 'extraction' capability) */
             extractors: {
+                [key: string]: components["schemas"]["InferenceModelInfo"];
+            };
+            /** @description Models declaring the decide task and typed_decisions capability */
+            deciders: {
                 [key: string]: components["schemas"]["InferenceModelInfo"];
             };
             /** @description Available generator/LLM models from models_dir/generators/ */
@@ -17423,9 +19782,11 @@ export interface components {
             top_k?: number;
             /**
              * @description Version 2 classification mode. Ordinal labels are ordered from lowest to highest.
+             *     Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+             *     Each model rejects modes it does not support.
              * @enum {string}
              */
-            mode?: "single" | "multi" | "ordinal";
+            mode?: "single" | "multi" | "ordinal" | "boolean";
             label_definitions?: {
                 [key: string]: components["schemas"]["ExtractionLabelDefinition"];
             };
@@ -17930,6 +20291,42 @@ export interface components {
             schema: components["schemas"]["ExtractionSchema"];
             options?: components["schemas"]["ExtractionOptions"];
         };
+        ExtractionLabelProbability: {
+            label: string;
+            /** Format: float */
+            probability: number;
+        };
+        /** @description Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based. */
+        ExtractionDecision: {
+            name: string;
+            /** @enum {string} */
+            type: "choice" | "score" | "boolean";
+            /** @description Highest-probability label. This is distinct from the expected ordinal value. */
+            label: string;
+            probabilities: components["schemas"]["ExtractionLabelProbability"][];
+            /** Format: float */
+            confidence: number;
+            /**
+             * @description Entropy confidence is not the probability that the selected label is correct.
+             * @enum {string}
+             */
+            confidence_method: "normalized_inverse_entropy" | "max_probability";
+            /**
+             * Format: float
+             * @description Score decisions only; sum of zero-based level index times probability.
+             */
+            expected_value?: number;
+            /**
+             * Format: float
+             * @description Boolean decisions only; probability of the true label.
+             */
+            true_probability?: number;
+            /**
+             * Format: float
+             * @description Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
+             */
+            act_probability?: number;
+        };
         ExtractionAttributeLabel: {
             label: string;
             confidence: components["schemas"]["ExtractionProbability"];
@@ -18018,6 +20415,8 @@ export interface components {
             solver_optimality_scope: "retained_candidate_graph";
         };
         ExtractionObject: {
+            /** @description Typed decision results from capable extractors, alongside compatible per-label classifications. */
+            decisions?: components["schemas"]["ExtractionDecision"][];
             id?: string;
             offset_unit?: components["schemas"]["ExtractionOffsetUnit"];
             entities?: components["schemas"]["ExtractionEntity"][];
@@ -18078,7 +20477,7 @@ export interface components {
              * @example fixed
              */
             model?: string;
-            /** @description Maximum number of chunks to generate per document. */
+            /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
             max_chunks?: number;
             /**
              * Format: float
@@ -19470,6 +21869,465 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    openSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["SQLConnectionOpenRequest"];
+            };
+        };
+        responses: {
+            /** @description Opened connection and routing owner */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLConnectionResponse"];
+                };
+            };
+            /** @description Connection admission failed */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closeSQLConnection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Closed connection */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Connection close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    prepareSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPrepareRequest"];
+            };
+        };
+        responses: {
+            /** @description Durable prepared resource */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLPreparedResponse"];
+                };
+            };
+            /** @description Preparation rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    executePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLPreparedExecutionRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Execution rejected or durable mutation outcome */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    closePreparedSQL: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Required to close a connection-bound prepared resource. */
+                "X-Antfly-SQL-Connection-Id"?: string;
+            };
+            path: {
+                prepared_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Resource released; already admitted executions may finish */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description Close rejected */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
+    administerSqlSettings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlSettingMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Setting catalog mutation committed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid setting definition or default */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog revision or setting generation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Mutation outcome unknown or metadata unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    enrollStoreRoot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentRequest"];
+            };
+        };
+        responses: {
+            /** @description Enrollment committed and observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity or proof of possession */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Root registration or enrollment changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata peer upgrade required */
+            426: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Outcome unknown or metadata unavailable; observe before retrying */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getStoreRootEnrollmentStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+            };
+        };
+        responses: {
+            /** @description Exact enrollment observed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreRootEnrollmentIdentity"];
+                };
+            };
+            /** @description Invalid identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Cluster administrator permission required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Exact identity is not enrolled, or store-root registration changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata unavailable; retry the read later */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    executeSQL: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL statement result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description DDL declaration durably admitted; constraint validation or native staging is pending. Do not replay. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Invalid statement, parameter, or result admission limit */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description Authentication required */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Insufficient permission for the statement's catalog resources */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Transaction or catalog conflict, committed DDL whose validation failed, or uncertain DDL admission with a recovery receipt. Do not replay uncertain DDL. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"] | components["schemas"]["SQLResponse"];
+                };
+            };
+            /** @description Foreground query, write, or request-body admission is exhausted */
+            429: {
+                headers: {
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Internal SQL execution failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL statement shape is not supported */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+            /** @description SQL backend execution capacity is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
     globalQuery: {
         parameters: {
             query?: never;
@@ -19663,6 +22521,190 @@ export interface operations {
             504: components["responses"]["QueryGatewayTimeout"];
         };
     };
+    researchAgent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchAgentRequest"];
+            };
+        };
+        responses: {
+            /** @description Research agent response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                    "application/json": components["schemas"]["ResearchAgentResult"];
+                };
+            };
+            /** @description Invalid research agent request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The caller lacks read permission on a requested table or tool connection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            413: components["responses"]["QueryPayloadTooLarge"];
+            422: components["responses"]["QueryUnprocessable"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
+            504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    startResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchJobStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Research job durably accepted */
+            202: {
+                headers: {
+                    /** @description Relative URL of the durable research job resource. */
+                    Location?: string;
+                    /** @description Suggested delay in seconds before the next advance or poll. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description The caller lacks read permission on a requested table or tool connection */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    getResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Research job status and latest checkpoint */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    advanceResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResearchJobAdvanceRequest"];
+            };
+        };
+        responses: {
+            /** @description Research job was already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            /** @description Research job advanced */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            429: components["responses"]["QueryRateLimited"];
+            500: components["responses"]["InternalServerError"];
+            502: components["responses"]["QueryBadGateway"];
+            503: components["responses"]["AgentTemporarilyUnavailable"];
+        };
+    };
+    cancelResearchJob: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Research job identifier. */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Research job cancelled or already terminal */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResearchJob"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
     listTables: {
         parameters: {
             query?: {
@@ -19841,6 +22883,293 @@ export interface operations {
             502: components["responses"]["QueryBadGateway"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
             504: components["responses"]["QueryGatewayTimeout"];
+        };
+    };
+    getRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     batchWrite: {
@@ -20073,8 +23402,24 @@ export interface operations {
     };
     updateSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -20101,7 +23446,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -20110,8 +23465,24 @@ export interface operations {
     };
     patchSchema: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Explicitly enqueue a durable fresh-generation schema rewrite instead
+                 *     of changing the live schema. Requires administrator permission on the
+                 *     entire dependency cohort. Sources remain writable during snapshot and
+                 *     catch-up; final validation and publication are atomic across the cohort.
+                 *     Returns a restore job (202), whose existing status/cancel routes apply.
+                 *     Independent graph/vector artifacts without a retained row-derived
+                 *     source proof are rejected before admission. The default false retains
+                 *     ordinary schema-update behavior. Existing absent values remain absent
+                 *     rather than retroactively receiving defaults. Stored column type
+                 *     changes and destructive column removal are rejected.
+                 */
+                rewrite?: boolean;
+            };
             header?: {
+                /** @description Retry identity for rewrite=true admission. Reusing a key for a different rewrite returns 409. */
+                "Idempotency-Key"?: string;
                 /** @description Strong schema ETag returned by a previous schema mutation, for example `"schema-0"`. A mismatch returns 409 instead of overwriting a concurrent update. */
                 "If-Match"?: string;
             };
@@ -20139,7 +23510,17 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            202: components["responses"]["CommittedMutationAccepted"];
+            /** @description Durable rewrite job accepted, or ordinary schema mutation committed with pending visibility */
+            202: {
+                headers: {
+                    /** @description Restore job status URL when rewrite=true. */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestoreJob"] | components["schemas"]["CommittedMutationOutcome"];
+                };
+            };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
@@ -21029,6 +24410,72 @@ export interface operations {
             };
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    retryIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     getIndex: {
@@ -22216,6 +25663,375 @@ export interface operations {
                 };
                 content?: never;
             };
+        };
+    };
+    getNamespaceRelationalConstraintStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Epoch- and owner-fenced validation status for every active range. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Schema or ownership changed during status collection. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description One or more current owners could not report authoritative coverage. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    repairNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Repair transaction committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Commit is durable; visibility or participant recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator or affected-table write permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Activation, schema, row version, or constraint changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description Failed owner checkpoints reset; background validation is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema or activation state changed; refresh and retry. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Some owners could not be reset; repeating the request is safe. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retireNamespaceRelationalConstraints: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalConstraintRetirementRequest"];
+            };
+        };
+        responses: {
+            /** @description Retirement accepted; no data or schema publication is implied yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationalConstraintRetryResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Administrator permission is missing. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Schema, retirement state, topology, or incoming foreign-key dependency changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Retirement coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryNamespaceRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowQueryRequest"];
+            };
+        };
+        responses: {
+            /** @description Bounded newline-delimited typed rows in primary-key order. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": string;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Requested schema epoch is stale. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Read ownership or storage is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mutateNamespaceRelationalRows: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationalRowMutationRequest"];
+            };
+        };
+        responses: {
+            /** @description Atomic mutations committed. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            /** @description Durable commit decision; participant visibility or recovery is pending. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description A version precondition or relational constraint conflicted. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Write coordination is temporarily unavailable. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryNamespaceIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
+        };
+    };
+    repairNamespaceIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexMaintenanceRequest"];
+            };
+        };
+        responses: {
+            /** @description All selected owner maintenance commands acknowledged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexMaintenanceResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            409: components["responses"]["IndexMutationConflict"];
+            429: components["responses"]["StorageResourceExhausted"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     renameDatabase: {
@@ -23796,7 +27612,7 @@ export interface operations {
             503: components["responses"]["TransientCapacity"];
         };
     };
-    rerankMultimodalPrompts: {
+    rerankDocuments: {
         parameters: {
             query?: never;
             header?: {
@@ -23812,7 +27628,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["InferenceRerankMultimodalRequest"];
+                "application/json": components["schemas"]["InferenceRerankRequest"];
             };
         };
         responses: {
@@ -23871,8 +27687,8 @@ export interface operations {
                     "application/json": components["schemas"]["InferenceError"];
                 };
             };
-            /** @description Multimodal reranking contract recognized but encoder path not implemented yet */
-            501: {
+            /** @description Internal server error */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -23882,76 +27698,6 @@ export interface operations {
             };
             /** @description Remote content fetch failed */
             502: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
-            503: components["responses"]["TransientCapacity"];
-        };
-    };
-    rerankPrompts: {
-        parameters: {
-            query?: never;
-            header?: {
-                /**
-                 * @description Set to `application/vnd.antfly.numeric.v1` to receive the values as a binary
-                 *     frame instead of JSON, which avoids serializing every float as text. Any
-                 *     other value, or none, returns the JSON body.
-                 */
-                Accept?: string;
-            };
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InferenceRerankRequest"];
-            };
-        };
-        responses: {
-            /** @description Prompts reranked successfully */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceRerankResponse"];
-                    "application/vnd.antfly.numeric.v1": string;
-                };
-            };
-            /** @description Invalid request */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Authentication is enabled and valid credentials were not supplied */
-            401: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Model not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["InferenceError"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -24886,6 +28632,68 @@ export interface operations {
             };
             /** @description Internal server error */
             500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Inference service unavailable. The unified Antfly server also returns this status when authentication is enabled but its backend is not ready. */
+            503: components["responses"]["TransientCapacity"];
+        };
+    };
+    decide: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InferenceDecideRequest"];
+            };
+        };
+        responses: {
+            /** @description Decision distributions and derived answers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceDecideResponse"];
+                };
+            };
+            /** @description Invalid question or unsupported decision model */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Authentication is enabled and valid credentials were not supplied */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description Model not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description State, schema, or output exceeds an executor limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -48,7 +48,7 @@ pub const Modules = struct {
     }
 };
 
-pub fn create(b: *std.Build, owner_path: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Modules {
+pub fn create(b: *std.Build, owner_path: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) Modules {
     const memory = b.createModule(.{ .root_source_file = owner_path.path(b, "runtime_memory_abi.zig"), .target = target, .optimize = optimize });
     const failure = b.createModule(.{ .root_source_file = owner_path.path(b, "runtime_failure_abi.zig"), .target = target, .optimize = optimize });
     const identity = b.createModule(.{ .root_source_file = owner_path.path(b, "runtime_failure_identity.zig"), .target = target, .optimize = optimize });

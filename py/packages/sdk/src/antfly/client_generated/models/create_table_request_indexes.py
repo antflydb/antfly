@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from ..models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
     from ..models.create_full_text_index_request import CreateFullTextIndexRequest
     from ..models.create_graph_index_request import CreateGraphIndexRequest
+    from ..models.create_relational_index_request import CreateRelationalIndexRequest
 
 
 T = TypeVar("T", bound="CreateTableRequestIndexes")
@@ -38,10 +39,12 @@ class CreateTableRequestIndexes:
         CreateAlgebraicIndexRequest
         | CreateEmbeddingsIndexRequest
         | CreateFullTextIndexRequest
-        | CreateGraphIndexRequest,
+        | CreateGraphIndexRequest
+        | CreateRelationalIndexRequest,
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        from ..models.create_algebraic_index_request import CreateAlgebraicIndexRequest
         from ..models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
         from ..models.create_full_text_index_request import CreateFullTextIndexRequest
         from ..models.create_graph_index_request import CreateGraphIndexRequest
@@ -54,6 +57,8 @@ class CreateTableRequestIndexes:
                 field_dict[prop_name] = prop.to_dict()
             elif isinstance(prop, CreateGraphIndexRequest):
                 field_dict[prop_name] = prop.to_dict()
+            elif isinstance(prop, CreateAlgebraicIndexRequest):
+                field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
 
@@ -65,6 +70,7 @@ class CreateTableRequestIndexes:
         from ..models.create_embeddings_index_request import CreateEmbeddingsIndexRequest
         from ..models.create_full_text_index_request import CreateFullTextIndexRequest
         from ..models.create_graph_index_request import CreateGraphIndexRequest
+        from ..models.create_relational_index_request import CreateRelationalIndexRequest
 
         d = dict(src_dict)
         create_table_request_indexes = cls()
@@ -79,6 +85,7 @@ class CreateTableRequestIndexes:
                 | CreateEmbeddingsIndexRequest
                 | CreateFullTextIndexRequest
                 | CreateGraphIndexRequest
+                | CreateRelationalIndexRequest
             ):
                 try:
                     if not isinstance(data, dict):
@@ -104,11 +111,19 @@ class CreateTableRequestIndexes:
                     return componentsschemas_create_index_request_type_2
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_create_index_request_type_3 = CreateAlgebraicIndexRequest.from_dict(data)
+
+                    return componentsschemas_create_index_request_type_3
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_create_index_request_type_3 = CreateAlgebraicIndexRequest.from_dict(data)
+                componentsschemas_create_index_request_type_4 = CreateRelationalIndexRequest.from_dict(data)
 
-                return componentsschemas_create_index_request_type_3
+                return componentsschemas_create_index_request_type_4
 
             additional_property = _parse_additional_property(prop_dict)
 
@@ -128,6 +143,7 @@ class CreateTableRequestIndexes:
         | CreateEmbeddingsIndexRequest
         | CreateFullTextIndexRequest
         | CreateGraphIndexRequest
+        | CreateRelationalIndexRequest
     ):
         return self.additional_properties[key]
 
@@ -137,7 +153,8 @@ class CreateTableRequestIndexes:
         value: CreateAlgebraicIndexRequest
         | CreateEmbeddingsIndexRequest
         | CreateFullTextIndexRequest
-        | CreateGraphIndexRequest,
+        | CreateGraphIndexRequest
+        | CreateRelationalIndexRequest,
     ) -> None:
         self.additional_properties[key] = value
 

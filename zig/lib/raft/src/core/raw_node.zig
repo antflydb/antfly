@@ -19,6 +19,45 @@ const message = @import("message.zig");
 const ready_mod = @import("ready.zig");
 const storage_mod = @import("storage.zig");
 
+test "durability-independent heartbeat extraction respects persisted term and queue budget" {
+    var store = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    store.setHardState(.{ .current_term = 1 });
+    var node = try RawNode.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 9,
+        .peers = &.{ 1, 2, 3 },
+        .election_tick = 5,
+        .heartbeat_tick = 1,
+        .async_storage_writes = true,
+    }, store.storage());
+    defer node.deinit();
+    try node.step(.{ .msg_type = .heartbeat, .from = 2, .to = 1, .term = 2, .context = @constCast("read-proof") });
+    const unpersisted = try node.takeDurabilityIndependentHeartbeats(std.testing.allocator, 1, 8, 1024);
+    defer message.freeMessages(std.testing.allocator, unpersisted);
+    try std.testing.expectEqual(@as(usize, 0), unpersisted.len);
+    const denied = try node.takeDurabilityIndependentHeartbeats(std.testing.allocator, 2, 1, 1);
+    defer message.freeMessages(std.testing.allocator, denied);
+    try std.testing.expectEqual(@as(usize, 0), denied.len);
+    store.setHardState(node.raft.hard_state);
+    const admitted = try node.takeDurabilityIndependentHeartbeats(std.testing.allocator, 2, 1, 1024);
+    defer message.freeMessages(std.testing.allocator, admitted);
+    try std.testing.expectEqual(@as(usize, 1), admitted.len);
+    try std.testing.expectEqual(message.MessageType.heartbeat_response, admitted[0].msg_type);
+    try std.testing.expectEqualStrings("read-proof", admitted[0].context);
+    try std.testing.expectEqual(@as(usize, 0), node.raft.messages.items.len);
+    try node.step(.{ .msg_type = .heartbeat, .from = 2, .to = 1, .term = 2, .context = @constCast("too-large-first") });
+    try node.step(.{ .msg_type = .heartbeat, .from = 3, .to = 1, .term = 2, .context = @constCast("r") });
+    try node.step(.{ .msg_type = .heartbeat, .from = 2, .to = 1, .term = 2, .context = @constCast("too-large-last") });
+    const middle = try node.takeDurabilityIndependentHeartbeats(std.testing.allocator, 2, 1, 70);
+    defer message.freeMessages(std.testing.allocator, middle);
+    try std.testing.expectEqual(@as(usize, 1), middle.len);
+    try std.testing.expectEqualStrings("r", middle[0].context);
+    try std.testing.expectEqual(@as(usize, 2), node.raft.messages.items.len);
+    try std.testing.expectEqualStrings("too-large-first", node.raft.messages.items[0].context);
+    try std.testing.expectEqualStrings("too-large-last", node.raft.messages.items[1].context);
+}
+
 pub const RawNode = struct {
     raft: raft_mod.Raft,
     async_storage_writes: bool,
@@ -155,6 +194,14 @@ pub const RawNode = struct {
     }
 
     pub fn ready(self: *RawNode) ready_mod.Ready {
+        const rd = self.prepareReady();
+        self.acceptPreparedReady(rd);
+        return rd;
+    }
+
+    /// Admission may inspect this Ready repeatedly without consuming it.
+    /// Its borrowed slices remain valid until the next prepare/step call.
+    pub fn prepareReady(self: *RawNode) ready_mod.Ready {
         if (!self.async_storage_writes) return self.raft.ready();
 
         self.clearReadyMessages();
@@ -183,9 +230,107 @@ pub const RawNode = struct {
             tryBuildStorageApplyMessage(self, rd.committed_entries) catch unreachable;
         }
 
-        self.acceptAsyncReady(rd);
         rd.messages = self.ready_messages.items;
         return rd;
+    }
+
+    pub fn acceptPreparedReady(self: *RawNode, rd: ready_mod.Ready) void {
+        if (self.async_storage_writes) self.acceptAsyncReady(rd);
+    }
+
+    /// While an append is outstanding, same-term heartbeats do not promise
+    /// new log durability. Votes, append responses, and every message from a
+    /// new term stay behind the persistence barrier.
+    pub fn takeDurabilityIndependentHeartbeats(self: *RawNode, alloc: std.mem.Allocator, durable_term: types.Term, max_messages: usize, max_bytes: usize) ![]message.Message {
+        return self.takeDurabilityIndependentControl(alloc, durable_term, 0, false, max_messages, max_bytes);
+    }
+
+    fn independentControl(msg: message.Message, durable_term: types.Term, durable_index: types.Index, allow_reads: bool) bool {
+        // ReadIndex messages carry no term in this protocol. They introduce
+        // no vote/log durability promise; responses name a durable prefix.
+        if (allow_reads and (msg.msg_type == .read_index or msg.msg_type == .read_index_response) and msg.term == 0)
+            return msg.msg_type == .read_index or msg.log_index <= durable_index;
+        if (msg.term != durable_term) return false;
+        return switch (msg.msg_type) {
+            .heartbeat, .heartbeat_response => true,
+            .read_index => allow_reads,
+            .read_index_response => allow_reads and msg.log_index <= durable_index,
+            else => false,
+        };
+    }
+
+    pub fn takeDurabilityIndependentControl(self: *RawNode, alloc: std.mem.Allocator, durable_term: types.Term, durable_index: types.Index, allow_reads: bool, max_messages: usize, max_bytes: usize) ![]message.Message {
+        var out = std.ArrayListUnmanaged(message.Message).empty;
+        errdefer {
+            for (out.items) |*msg| msg.deinit(alloc);
+            out.deinit(alloc);
+        }
+        if (self.raft.hard_state.current_term != durable_term) return try out.toOwnedSlice(alloc);
+        var bytes: usize = 0;
+        for (self.raft.messages.items) |msg| {
+            const size = 64 +| msg.context.len;
+            if (independentControl(msg, durable_term, durable_index, allow_reads) and
+                out.items.len < max_messages and size <= max_bytes -| bytes)
+            {
+                const owned = try msg.clone(alloc);
+                out.append(alloc, owned) catch |err| {
+                    var failed = owned;
+                    failed.deinit(alloc);
+                    return err;
+                };
+                bytes += size;
+            }
+        }
+        const result = try out.toOwnedSlice(alloc);
+        bytes = 0;
+        var removed_count: usize = 0;
+        var retained: usize = 0;
+        for (self.raft.messages.items) |msg| {
+            const size = 64 +| msg.context.len;
+            if (independentControl(msg, durable_term, durable_index, allow_reads) and
+                removed_count < result.len and size <= max_bytes -| bytes)
+            {
+                var removed = msg;
+                removed.deinit(self.raft.alloc);
+                bytes += size;
+                removed_count += 1;
+            } else {
+                self.raft.messages.items[retained] = msg;
+                retained += 1;
+            }
+        }
+        self.raft.messages.shrinkRetainingCapacity(retained);
+        return result;
+    }
+
+    pub fn takeDurableReadStates(self: *RawNode, alloc: std.mem.Allocator, durable_index: types.Index) ![]types.ReadState {
+        var out = std.ArrayListUnmanaged(types.ReadState).empty;
+        errdefer {
+            for (out.items) |*read| read.deinit(alloc);
+            out.deinit(alloc);
+        }
+        for (self.raft.read_states.items) |read| {
+            if (read.index > durable_index) continue;
+            const owned = try read.clone(alloc);
+            out.append(alloc, owned) catch |err| {
+                var failed = owned;
+                failed.deinit(alloc);
+                return err;
+            };
+        }
+        const result = try out.toOwnedSlice(alloc);
+        var retained: usize = 0;
+        for (self.raft.read_states.items) |read| {
+            if (read.index <= durable_index) {
+                var removed = read;
+                removed.deinit(self.raft.alloc);
+            } else {
+                self.raft.read_states.items[retained] = read;
+                retained += 1;
+            }
+        }
+        self.raft.read_states.shrinkRetainingCapacity(retained);
+        return result;
     }
 
     pub fn advance(self: *RawNode, rd: ready_mod.Ready) void {
@@ -282,14 +427,25 @@ pub const RawNode = struct {
     }
 
     fn acceptAsyncReady(self: *RawNode, rd: ready_mod.Ready) void {
-        if (rd.soft_state != null) self.prev_soft_state = self.raft.soft_state;
-        if (rd.hard_state != null) self.prev_hard_state = self.raft.hard_state;
+        if (rd.soft_state) |soft| self.prev_soft_state = soft;
+        if (rd.hard_state) |hard| self.prev_hard_state = hard;
         if (rd.read_states.len > 0) {
-            for (self.raft.read_states.items) |*read_state| read_state.deinit(self.raft.alloc);
-            self.raft.read_states.clearRetainingCapacity();
+            for (self.raft.read_states.items[0..rd.read_states.len]) |*read_state| read_state.deinit(self.raft.alloc);
+            std.mem.copyForwards(types.ReadState, self.raft.read_states.items, self.raft.read_states.items[rd.read_states.len..]);
+            self.raft.read_states.shrinkRetainingCapacity(self.raft.read_states.items.len - rd.read_states.len);
         }
-        for (self.raft.messages.items) |*msg| msg.deinit(self.raft.alloc);
-        self.raft.messages.clearRetainingCapacity();
+        // Configuration application may emit new messages between preparation
+        // and admission. Only the prefix captured in storage_append.responses
+        // belongs to this Ready; preserve the new frontier for the next one.
+        var captured: usize = 0;
+        for (rd.messages) |msg| if (msg.msg_type == .storage_append) {
+            for (msg.responses) |response| {
+                if (response.msg_type != .storage_append_response) captured += 1;
+            }
+        };
+        for (self.raft.messages.items[0..captured]) |*msg| msg.deinit(self.raft.alloc);
+        std.mem.copyForwards(message.Message, self.raft.messages.items, self.raft.messages.items[captured..]);
+        self.raft.messages.shrinkRetainingCapacity(self.raft.messages.items.len - captured);
         if (rd.entries.len > 0) {
             self.raft.log.acceptPersisting(rd.entries[rd.entries.len - 1].index);
         }

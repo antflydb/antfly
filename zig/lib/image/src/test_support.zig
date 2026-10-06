@@ -21,6 +21,7 @@ pub const max_manifest_bytes = 128 * 1024;
 pub const max_fixture_bytes = 16 * 1024 * 1024;
 
 pub const Manifest = struct {
+    arena: ?std.heap.ArenaAllocator = null,
     version: u32,
     results: struct {
         success: []const u8,
@@ -47,13 +48,20 @@ pub const Manifest = struct {
 pub fn loadManifest(alloc: Allocator, io: anytype) !Manifest {
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, manifest_rel_path, alloc, .limited(max_manifest_bytes));
     defer alloc.free(raw);
-    const source = try alloc.dupeZ(u8, raw);
+    const source = try alloc.dupeSentinel(u8, raw, 0);
     defer alloc.free(source);
-    return try std.zon.parse.fromSliceAlloc(Manifest, alloc, source, null, .{});
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    errdefer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const ParsedManifest = struct { version: u32, results: @FieldType(Manifest, "results"), fixtures: []Manifest.Fixture };
+    const parsed = try std.zon.parse.fromSlice(ParsedManifest, .{ .gpa = alloc, .arena = arena.allocator(), .source = source, .diagnostics = &diagnostics });
+    return .{ .version = parsed.version, .results = parsed.results, .fixtures = parsed.fixtures, .arena = arena };
 }
 
 pub fn freeManifest(alloc: Allocator, manifest: Manifest) void {
-    std.zon.parse.free(alloc, manifest);
+    _ = alloc;
+    var arena = manifest.arena orelse return;
+    arena.deinit();
 }
 
 pub fn fixtureRepoPathAlloc(alloc: Allocator, fixture_rel_path: []const u8) ![]u8 {

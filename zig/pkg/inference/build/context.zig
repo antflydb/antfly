@@ -18,7 +18,7 @@ const runtime = @import("runtime.zig");
 pub const Context = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: runtime.Paths,
     backend: runtime.BackendOptions,
     graph: runtime.Graph,

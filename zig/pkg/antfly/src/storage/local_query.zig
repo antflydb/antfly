@@ -16,9 +16,11 @@
 
 const std = @import("std");
 const graph_mod = @import("../graph/graph.zig");
+const graph_query_mod = @import("../graph/query.zig");
+const graph_exec_mod = @import("db/query/graph_exec.zig");
 const query_api = @import("../api/query.zig");
 const query_contract = @import("../api/query_contract.zig");
-const distributed_graph = @import("../api/distributed_graph.zig");
+const local_graph = @import("../api/local_graph.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
@@ -74,7 +76,7 @@ const tensorFragmentSlicesEqual = contract.tensorFragmentSlicesEqual;
 const validateAlgebraicPartialsAccessPaths = contract.validateAlgebraicPartialsAccessPaths;
 const validateAlgebraicProgramPartialsProof = contract.validateAlgebraicProgramPartialsProof;
 
-pub fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
+pub fn validateGraphHydrateResolvedDocFilterForDb(req: local_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
     if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
     const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
     if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
@@ -86,10 +88,10 @@ pub fn executeStorageKernelGraphExpand(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     table_name: []const u8,
-    req: distributed_graph.GraphExpandRequest,
-) !distributed_graph.GraphExpandResponse {
+    req: local_graph.GraphExpandRequest,
+) !local_graph.GraphExpandResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
-    const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
+    const expansions = try alloc.alloc(local_graph.GraphExpansion, req.frontier.len);
     var initialized: usize = 0;
     errdefer {
         for (expansions[0..initialized]) |*expansion| expansion.deinit(alloc);
@@ -98,14 +100,14 @@ pub fn executeStorageKernelGraphExpand(
     for (req.frontier, 0..) |item, i| {
         const frontier_key = try alloc.dupe(u8, item.key);
         errdefer alloc.free(frontier_key);
-        const search_req = try distributed_graph.frontierItemToSearchRequest(alloc, req, item);
-        defer distributed_graph.freeExpandSearchRequest(alloc, search_req);
+        const search_req = try local_graph.frontierItemToSearchRequest(alloc, req, item);
+        defer local_graph.freeExpandSearchRequest(alloc, search_req);
         var result = try db.search(alloc, search_req);
         defer result.deinit();
         var graph_result = if (result.graph_results.len > 0)
-            try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
+            try local_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
         else
-            try distributed_graph.emptyGraphSearchResult(alloc, req.name);
+            try local_graph.emptyGraphSearchResult(alloc, req.name);
         errdefer graph_result.deinit(alloc);
         for (graph_result.hits) |*hit| hit.deinit(alloc);
         if (graph_result.hits.len > 0) alloc.free(graph_result.hits);
@@ -124,8 +126,8 @@ pub fn executeStorageKernelGraphExpand(
 pub fn executeStorageKernelGraphHydrate(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
-    req: distributed_graph.GraphHydrateRequest,
-) !distributed_graph.GraphHydrateResponse {
+    req: local_graph.GraphHydrateRequest,
+) !local_graph.GraphHydrateResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
     try validateGraphHydrateResolvedDocFilterForDb(req, db);
     try validateGraphHydrateIncomingIndexIdentity(req, db);
@@ -140,45 +142,94 @@ pub fn executeStorageKernelGraphHydrate(
         if (hits.len > 0) alloc.free(hits);
     }
     try checkQueryDeadline(search_req);
-    const has_incoming = if (req.incoming_index_name.len > 0)
-        try db.graphHasIncomingEdgesForInternalRead(alloc, req.incoming_index_name, req.keys, .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash }, req.identity_read_generation)
+    const incoming = if (req.incoming_index_name.len > 0)
+        try db.graphHasIncomingEdgesForInternalReadBoundedAt(alloc, req.incoming_index_name, req.keys, .{ .generation = req.incoming_index_identity.incarnation, .config_fingerprint = req.incoming_index_identity.config_hash }, req.identity_read_generation, req.incoming_ttl_now_ns, @min(req.incoming_max_scanned_rows, @import("../graph/work_budget.zig").default_max_explored_edges))
     else
-        @constCast((&[_]bool{})[0..]);
-    errdefer if (has_incoming.len > 0) alloc.free(has_incoming);
+        null;
+    const has_incoming = if (incoming) |probe| probe.has_incoming else @constCast((&[_]bool{})[0..]);
+    errdefer if (incoming) |probe| probe.deinit(alloc);
+    if (req.metric_reads.len > 0 and req.metric_index_name.len == 0) return error.InvalidQueryRequest;
+    var metric_scores: []?f64 = @constCast((&[_]?f64{})[0..]);
+    errdefer if (metric_scores.len > 0) alloc.free(metric_scores);
+    var metric_status: []db_mod.types.GraphMetricStatus = @constCast((&[_]db_mod.types.GraphMetricStatus{})[0..]);
+    errdefer db_mod.types.freeGraphMetricStatuses(alloc, metric_status);
+    if (req.metric_reads.len > 0) {
+        try local_graph.validateGraphMetricReadsForDistributedTransport(req.metric_reads);
+        if (!req.metric_index_identity.valid()) return error.IndexGenerationMismatch;
+        const identity = db.core.index_manager.coverageIdentityForIndex(req.metric_index_name) orelse
+            return error.IndexGenerationMismatch;
+        if (identity.generation != req.metric_index_identity.incarnation or
+            identity.config_fingerprint == null or
+            identity.config_fingerprint.? != req.metric_index_identity.config_hash)
+            return error.IndexGenerationMismatch;
+        const entry = db.core.graphIndex(req.metric_index_name) orelse return error.IndexNotFound;
+        const names = try alloc.alloc([]const u8, req.metric_reads.len);
+        defer alloc.free(names);
+        const policies = try alloc.alloc(graph_mod.GraphIndex.GraphMetricColumnReadPolicy, req.metric_reads.len);
+        defer alloc.free(policies);
+        for (req.metric_reads, names, policies) |read, *name, *policy| {
+            name.* = read.name;
+            policy.* = .{ .require_fresh = read.freshness == .fresh };
+        }
+        var session = try entry.index.openGraphMetricReadSessionAlloc(alloc, names, policies);
+        defer session.deinit();
+        const score_count = std.math.mul(usize, req.keys.len, req.metric_reads.len) catch return error.GraphWorkBudgetExceeded;
+        metric_scores = if (score_count > 0)
+            try alloc.alloc(?f64, score_count)
+        else
+            @constCast((&[_]?f64{})[0..]);
+        const columns = try alloc.alloc([]?f64, req.metric_reads.len);
+        defer alloc.free(columns);
+        for (columns, 0..) |*column, i| column.* = metric_scores[i * req.keys.len ..][0..req.keys.len];
+        try session.readColumns(alloc, names, req.keys, columns);
+        const graph_statuses = try alloc.alloc(graph_query_mod.GraphMetricStatus, session.statuses.len);
+        var initialized: usize = 0;
+        defer {
+            for (graph_statuses[0..initialized]) |*status| status.deinit(alloc);
+            alloc.free(graph_statuses);
+        }
+        for (session.statuses, graph_statuses) |status, *out| {
+            out.* = try graph_query_mod.cloneGraphMetricStatus(alloc, status);
+            initialized += 1;
+        }
+        metric_status = try graph_exec_mod.cloneGraphMetricStatusesFromGraph(alloc, graph_statuses);
+    }
     try checkQueryDeadline(search_req);
     return .{
         .hits = hits,
         .has_incoming = has_incoming,
+        .metric_scores = metric_scores,
+        .metric_status = metric_status,
         .incoming_index_identity = req.incoming_index_identity,
+        .has_physical_incoming = if (incoming) |probe| probe.has_physical_incoming else @constCast((&[_]bool{})[0..]),
+        .incoming_ttl_now_ns = if (incoming != null) req.incoming_ttl_now_ns else null,
+        .incoming_scanned_rows = if (incoming) |probe| @intCast(probe.scanned_rows) else null,
     };
 }
 
 pub fn executeStorageKernelGraphEdges(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
-    req: distributed_graph.GraphEdgesRequest,
-) !distributed_graph.GraphEdgesResponse {
+    req: local_graph.GraphEdgesRequest,
+) !local_graph.GraphEdgesResponse {
     if (req.topology_epoch != 0) return error.InvalidArgument;
     const control_req = db_mod.types.SearchRequest{
         .identity_read_generation = req.identity_read_generation,
-        .execution_deadline_ns = req.execution_deadline_ns orelse distributed_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
+        .execution_deadline_ns = req.execution_deadline_ns orelse local_graph.executionDeadlineFromTimeoutMs(req.timeout_ms),
         .cancellation = req.cancellation,
     };
     try checkQueryDeadline(control_req);
-    try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-    _ = try currentIdentityReadGenerationForDb(req.identity_read_generation, db);
-    const graph_entry = db.core.graphIndex(req.index_name) orelse return error.IndexNotFound;
-    const edges = try graph_entry.index.getEdges(alloc, req.key, "", req.direction);
+    try local_graph.validateGraphEdgesTensorAccessPath(alloc, req);
+    const result = try db.graphEdgesForInternalReadBoundedAt(alloc, req.index_name, req.key, req.edge_types, req.direction, req.identity_read_generation, req.ttl_now_ns, req.max_edges, req.max_owned_bytes, req.max_scanned_rows);
     errdefer {
-        for (edges) |edge| graph_mod.GraphIndex.freeEdge(alloc, edge);
-        if (edges.len > 0) alloc.free(edges);
+        graph_mod.GraphIndex.freeEdges(alloc, result.edges);
     }
     try checkQueryDeadline(control_req);
-    return .{ .edges = edges };
+    return .{ .edges = result.edges, .scanned_rows = @intCast(result.scanned_rows) };
 }
 
 pub fn validateGraphHydrateIncomingIndexIdentity(
-    req: distributed_graph.GraphHydrateRequest,
+    req: local_graph.GraphHydrateRequest,
     db: *db_mod.DB,
 ) !void {
     if (req.incoming_index_name.len > 0) {

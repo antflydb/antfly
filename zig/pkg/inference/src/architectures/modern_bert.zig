@@ -68,7 +68,28 @@ const modern_bert_linear_specs = [_]struct {
 };
 
 fn modernBertLinearSlot(layer: usize, kind: ModernBertLinearSlotKind) usize {
-    return layer * modern_bert_linear_specs.len + @intFromEnum(kind);
+    return layer * modern_bert_linear_specs.len + @backingInt(kind);
+}
+
+const ModernBertNormSlotKind = enum(u1) { attention, mlp };
+
+/// Fixed LayerNorm slots: two per layer, then the embedding and final norms.
+/// Like the linear slots they stay attached to the model's Metal provider, so
+/// requests after the first upload no norm weights.
+fn modernBertNormSlot(layer: usize, kind: ModernBertNormSlotKind) usize {
+    return layer * 2 + @backingInt(kind);
+}
+fn modernBertEmbeddingNormSlot(config: Config) usize {
+    return @as(usize, @intCast(config.num_hidden_layers)) * 2;
+}
+fn modernBertFinalNormSlot(config: Config) usize {
+    return @as(usize, @intCast(config.num_hidden_layers)) * 2 + 1;
+}
+
+/// `layerNorm` through a prepared fixed slot, or null to take the generic path.
+fn slottedLayerNorm(cb: *const ComputeBackend, input: CT, slot: ?usize, config: Config) !?CT {
+    const prepared = slot orelse return null;
+    return cb.decoderRuntimeApplyLayerNorm(&.{ .slot = prepared, .input = input, .hidden_size = @intCast(config.hidden_size), .eps = config.layer_norm_eps });
 }
 
 fn metalModernBertEncoderSlotsPrepared(cb: *const ComputeBackend, config: Config) bool {
@@ -90,8 +111,11 @@ fn metalModernBertEncoderSlotsPrepared(cb: *const ComputeBackend, config: Config
                 output_dim,
             )) return false;
         }
+        if (layer > 0 and !cb.decoderRuntimeLayerNormSlotPrepared(modernBertNormSlot(layer, .attention), hidden)) return false;
+        if (!cb.decoderRuntimeLayerNormSlotPrepared(modernBertNormSlot(layer, .mlp), hidden)) return false;
     }
-    return true;
+    return cb.decoderRuntimeLayerNormSlotPrepared(modernBertEmbeddingNormSlot(config), hidden) and
+        cb.decoderRuntimeLayerNormSlotPrepared(modernBertFinalNormSlot(config), hidden);
 }
 
 fn preplanMetalModernBertEncoder(
@@ -144,8 +168,30 @@ fn preplanMetalModernBertEncoder(
                 // Native F16 safetensors reach Metal directly through the
                 // prepare path. No F32 mirror is required for this layout.
                 .retain_dense_fallback = false,
+                // MPS GEMM outruns the hand-written dense kernels here
+                // (Laya-large 3.1x, OpenDecider-nano 1.4x on M4 Max); BF16
+                // weights are expanded to F32 for it.
+                .prefer_f32_mps_fallback = !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS"),
             }))) return false;
         }
+    }
+    for (0..layer_count) |layer| {
+        for ([_]ModernBertNormSlotKind{ .attention, .mlp }) |kind| {
+            // HuggingFace ModernBERT makes the layer-0 attention norm an identity.
+            if (layer == 0 and kind == .attention) continue;
+            var name_buf: [256]u8 = undefined;
+            const weight = try getLayerWeight(cb, layer, if (kind == .attention) "attn_norm.weight" else "mlp_norm.weight", &name_buf);
+            defer cb.free(weight);
+            if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = modernBertNormSlot(layer, kind), .weight = weight, .bias = hidden_zero_bias, .hidden_size = hidden }))) return false;
+        }
+    }
+    for ([_]struct { name: []const u8, slot: usize }{
+        .{ .name = "model.embeddings.norm.weight", .slot = modernBertEmbeddingNormSlot(config) },
+        .{ .name = "model.final_norm.weight", .slot = modernBertFinalNormSlot(config) },
+    }) |norm| {
+        const weight = try cb.getWeight(norm.name);
+        defer cb.free(weight);
+        if (!(try cb.decoderRuntimePrepareLayerNorm(&.{ .slot = norm.slot, .weight = weight, .bias = hidden_zero_bias, .hidden_size = hidden }))) return false;
     }
     return true;
 }
@@ -224,6 +270,15 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (obj.get("global_rope_theta")) |value| config.global_rope_theta = jsonF32(value) orelse config.global_rope_theta;
     if (obj.get("local_rope_theta")) |value| config.local_rope_theta = jsonF32(value) orelse config.local_rope_theta;
     if (obj.get("layer_norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse config.layer_norm_eps;
+    if (obj.get("norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse config.layer_norm_eps;
+    // Transformers 5 nests the rope settings per layer type (Ettin, for
+    // example, uses 160000 for sliding layers too) and lists each layer's
+    // type instead of `global_attn_every_n_layers`.
+    if (obj.get("rope_parameters")) |value| if (value == .object) {
+        if (ropeTheta(value.object, "full_attention")) |theta| config.global_rope_theta = theta;
+        if (ropeTheta(value.object, "sliding_attention")) |theta| config.local_rope_theta = theta;
+    };
+    if (obj.get("layer_types")) |value| try checkLayerTypes(value, config);
 
     // `modernbert` is Transformers' public checkpoint layout. Keep the
     // historical layout available to the fused-chunker training code.
@@ -239,6 +294,23 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
         if (config.hidden_size < 64 or config.hidden_size % 64 != 0 or config.num_attention_heads == 0 or config.hidden_size % config.num_attention_heads != 0 or config.num_hidden_layers == 0 or laya.max_len > config.max_position_embeddings) return error.InvalidLayaConfig;
     }
     return config;
+}
+
+fn ropeTheta(params: std.json.ObjectMap, layer_type: []const u8) ?f32 {
+    const entry = params.get(layer_type) orelse return null;
+    if (entry != .object) return null;
+    return jsonF32(entry.object.get("rope_theta") orelse return null);
+}
+
+/// The encoder places full attention on every `global_attn_every_n_layers`-th
+/// layer; refuse any other pattern rather than run it wrongly.
+fn checkLayerTypes(value: std.json.Value, config: Config) !void {
+    if (value != .array or value.array.items.len != config.num_hidden_layers or config.global_attn_every_n_layers == 0) return error.UnsupportedModernBertLayerTypes;
+    for (value.array.items, 0..) |item, i| {
+        if (item != .string) return error.UnsupportedModernBertLayerTypes;
+        const want: []const u8 = if (i % config.global_attn_every_n_layers == 0) "full_attention" else "sliding_attention";
+        if (!std.mem.eql(u8, item.string, want)) return error.UnsupportedModernBertLayerTypes;
+    }
 }
 
 fn jsonU32(value: std.json.Value) ?u32 {
@@ -290,6 +362,149 @@ pub fn forwardCT(
     batch: usize,
     seq_len: usize,
 ) !CT {
+    return forwardImpl(cb, allocator, config, input_ids, attention_mask, batch, seq_len, null, null, null);
+}
+
+/// One tree-packed row (see pipelines/laya_tree.zig), attended through
+/// `ComputeBackend.segmentAttention` instead of a dense mask. `positions`
+/// and `ranges` (three key ranges per row, `[rows * 6]`) cover the rows this
+/// forward computes; `key_positions` covers every key of the row. Local
+/// layers add the sliding window in logical positions.
+pub const Packed = struct {
+    positions: []const i64,
+    ranges: []const u32,
+    key_positions: []const i32,
+    /// Per-question upper layers (Laya `packing.fuse_layers`): layers from
+    /// `upper_from` on attend with `upper_ranges` instead of `ranges`.
+    /// Layer indices count the encoder first, then any head layers.
+    upper_ranges: ?[]const u32 = null,
+    upper_from: usize = std.math.maxInt(usize),
+
+    /// The visibility layer `layer` attends with.
+    pub fn at(self: Packed, layer: usize) Packed {
+        var out = self;
+        if (self.upper_ranges) |upper| if (layer >= self.upper_from) {
+            out.ranges = upper;
+        };
+        return out;
+    }
+
+    /// The same row for a stack that starts `layers` deeper (the head after
+    /// the encoder).
+    pub fn after(self: Packed, layers: usize) Packed {
+        var out = self;
+        out.upper_from = self.upper_from -| layers;
+        return out;
+    }
+};
+
+/// Encode one tree-packed row. The result is `[seq_len, hidden]`.
+pub fn forwardPackedCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    packed_row: Packed,
+) !CT {
+    const seq_len = input_ids.len;
+    if (seq_len == 0 or packed_row.positions.len != seq_len) return error.InvalidInputShape;
+    for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
+    const mask = try allocator.alloc(i64, seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, seq_len, packed_row, null, null);
+}
+
+/// Cached trunk rows for a branch-only packed forward: per encoder layer,
+/// the trunk keys (after RoPE) and values, each `[prefix_rows, hidden]`.
+pub const Branches = struct {
+    prefix_rows: usize,
+    keys: []const CT,
+    values: []const CT,
+};
+
+/// Per encoder layer keys (after RoPE) and values. Either host copies,
+/// `[tokens * hidden]` each, or dense `[tokens, hidden]` backend tensors
+/// that the caller owns (`key_tensors`/`value_tensors`, one slot per layer).
+pub const Capture = struct {
+    keys: []const []f32 = &.{},
+    values: []const []f32 = &.{},
+    key_tensors: []?CT = &.{},
+    value_tensors: []?CT = &.{},
+
+    fn layers(self: Capture) usize {
+        return @max(self.keys.len, self.key_tensors.len);
+    }
+};
+
+/// Encode only the branch tokens of a packed row whose trunk occupies rows
+/// `0..prefix_rows` at contiguous positions (the ones the cached keys were
+/// captured at; `packed_row.key_positions` must agree). `packed_row.positions`
+/// covers the branch tokens; its masks cover the whole row. The result is
+/// `[branch tokens, hidden]` and equals those rows of `forwardPackedCT`.
+pub fn forwardBranchesCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    branch_ids: []const i64,
+    packed_row: Packed,
+    branches: Branches,
+) !CT {
+    const rows = branch_ids.len;
+    if (rows == 0 or packed_row.positions.len != rows or branches.keys.len != config.num_hidden_layers or branches.values.len != config.num_hidden_layers) return error.InvalidInputShape;
+    for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
+    const seq_len = branches.prefix_rows + rows;
+    const mask = try allocator.alloc(i64, seq_len);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    return forwardImpl(cb, allocator, config, branch_ids, mask, 1, seq_len, packed_row, branches, null);
+}
+
+/// The unpacked encoder forward at logical positions `first_position..`,
+/// also copying each layer's keys (after RoPE) and values to `capture`. Used
+/// to fill the packed-trunk cache.
+pub fn forwardCapturingCT(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    first_position: usize,
+    capture: Capture,
+) !CT {
+    if (capture.layers() != config.num_hidden_layers or @max(capture.values.len, capture.value_tensors.len) != config.num_hidden_layers) return error.InvalidInputShape;
+    const n = input_ids.len;
+    const mask = try allocator.alloc(i64, n);
+    defer allocator.free(mask);
+    @memset(mask, 1);
+    // Run as a one-segment packed row so captured keys use the same RoPE op
+    // and layout as the branch forward that later reads them.
+    const positions = try allocator.alloc(i64, n);
+    defer allocator.free(positions);
+    const key_positions = try allocator.alloc(i32, n);
+    defer allocator.free(key_positions);
+    const ranges = try allocator.alloc(u32, 6 * n);
+    defer allocator.free(ranges);
+    if (first_position + n > config.max_position_embeddings) return error.InvalidInputShape;
+    for (positions, key_positions, 0..) |*p, *k, i| {
+        p.* = @intCast(first_position + i);
+        k.* = @intCast(first_position + i);
+        ranges[6 * i ..][0..6].* = .{ 0, @intCast(n), 0, 0, 0, 0 };
+    }
+    return forwardImpl(cb, allocator, config, input_ids, mask, 1, n, .{ .positions = positions, .ranges = ranges, .key_positions = key_positions }, null, capture);
+}
+
+fn forwardImpl(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    attention_mask: []const i64,
+    batch: usize,
+    seq_len: usize,
+    packed_row: ?Packed,
+    branches: ?Branches,
+    capture: ?Capture,
+) !CT {
     const zero_bias: ?CT = if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias)
         try makeZeroBias(cb, allocator, config.hidden_size)
     else
@@ -309,7 +524,9 @@ pub fn forwardCT(
     // does not submit and wait after every projection.  The frame is owned
     // only here; callers that already compose a frame retain control.
     var encoder_frame_active = false;
-    if (cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
+    // Interleaved packed RoPE and trunk capture read back to the host, so
+    // those forwards run unframed.
+    if ((packed_row == null or !config.rope_interleaved) and capture == null and cb.kind() == .metal and metalEncoderFrameEnabled() and !cb.decoderRuntimeHasActiveFrame()) {
         encoder_frame_active = try cb.decoderRuntimeBeginFrame();
     }
     errdefer if (encoder_frame_active) cb.decoderRuntimeCancelFrame() catch {};
@@ -317,7 +534,20 @@ pub fn forwardCT(
     // 1. Token embeddings + embedding LayerNorm.
     //    ModernBERT has no absolute position embeddings; RoPE is applied in each
     //    attention layer instead.
-    var hidden = try embeddingsBlock(cb, config, zero_bias, input_ids, batch * seq_len);
+    // On Metal an unpacked batch runs without its padding: dense attention
+    // would mask padding and the local window with a host-built
+    // `[heads, seq, seq]` bias per layer, and every linear would multiply the
+    // padding rows too.
+    const row_segments = if (packed_row == null and branches == null and capture == null and cb.kind() == .metal and metalRowSegmentsEnabled())
+        try rowSegments(allocator, input_ids, attention_mask, batch, seq_len)
+    else
+        null;
+    defer if (row_segments) |rows| rows.deinit(allocator);
+
+    var hidden = if (row_segments) |rows|
+        try embeddingsBlock(cb, config, zero_bias, rows.ids, rows.tokens, resident_slots)
+    else
+        try embeddingsBlock(cb, config, zero_bias, input_ids, input_ids.len, resident_slots);
     errdefer cb.free(hidden);
 
     // 2. Encoder layers
@@ -334,6 +564,10 @@ pub fn forwardCT(
             layer_idx,
             zero_bias,
             resident_slots,
+            if (packed_row) |row| row.at(layer_idx) else null,
+            branches,
+            capture,
+            row_segments,
         );
         cb.free(hidden);
         hidden = new_hidden;
@@ -351,7 +585,9 @@ pub fn forwardCT(
     var name_buf: [128]u8 = undefined;
     const fn_w = try cb.getWeight(std.fmt.bufPrint(&name_buf, "model.final_norm.weight", .{}) catch return error.NameTooLong);
     defer cb.free(fn_w);
-    const normed_final = if (zero_bias) |bias|
+    const normed_final = if (try slottedLayerNorm(cb, hidden, if (resident_slots) modernBertFinalNormSlot(config) else null, config)) |normed|
+        normed
+    else if (zero_bias) |bias|
         try cb.layerNorm(hidden, fn_w, bias, @intCast(config.hidden_size), config.layer_norm_eps)
     else blk: {
         const fn_b = try cb.getWeight(std.fmt.bufPrint(&name_buf, "model.final_norm.bias", .{}) catch return error.NameTooLong);
@@ -360,6 +596,11 @@ pub fn forwardCT(
     };
     cb.free(hidden);
     hidden = normed_final;
+    if (row_segments) |rows| {
+        const padded = try cb.embeddingLookup(hidden, rows.restore, rows.restore.len, @intCast(config.hidden_size));
+        cb.free(hidden);
+        hidden = padded;
+    }
     if (encoder_frame_active) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         encoder_frame_active = false;
@@ -378,6 +619,7 @@ fn embeddingsBlock(
     zero_bias: ?CT,
     input_ids: []const i64,
     total: usize,
+    resident_slots: bool,
 ) !CT {
     const H = config.hidden_size;
 
@@ -388,6 +630,7 @@ fn embeddingsBlock(
     defer cb.free(tok_emb);
 
     // Embedding-level LayerNorm (replaces post-sum norm from classic BERT)
+    if (try slottedLayerNorm(cb, tok_emb, if (resident_slots) modernBertEmbeddingNormSlot(config) else null, config)) |normed| return normed;
     const ln_w = try cb.getWeight("model.embeddings.norm.weight");
     defer cb.free(ln_w);
     if (zero_bias) |bias| return cb.layerNorm(tok_emb, ln_w, bias, H, config.layer_norm_eps);
@@ -411,12 +654,19 @@ fn encoderLayer(
     layer_idx: usize,
     zero_bias: ?CT,
     resident_slots: bool,
+    packed_row: ?Packed,
+    branches: ?Branches,
+    capture: ?Capture,
+    row_segments: ?RowSegments,
 ) !CT {
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
     const head_dim = H / num_heads;
     const intermediate: usize = @intCast(config.intermediate_size);
-    const total = batch * seq_len;
+    // A branch-only forward projects just the branch rows; attention still
+    // spans the cached trunk rows that precede them.
+    const prefix_rows: usize = if (branches) |b| b.prefix_rows else 0;
+    const total = if (row_segments) |rows| rows.tokens else batch * seq_len - prefix_rows;
 
     // Layers 0, 3, 6, … use full (global) attention; all others are local.
     const is_global = (layer_idx % @as(usize, @intCast(config.global_attn_every_n_layers))) == 0;
@@ -431,6 +681,7 @@ fn encoderLayer(
     // HuggingFace ModernBERT makes the layer-0 attention norm an identity.
     const identity_attn_norm = config.checkpoint_layout == .huggingface_fused_qkv_no_bias and layer_idx == 0;
     const normed_attn = if (identity_attn_norm) hidden else blk: {
+        if (try slottedLayerNorm(cb, hidden, if (resident_slots) modernBertNormSlot(layer_idx, .attention) else null, config)) |normed| break :blk normed;
         const attn_ln_w = try getLayerWeight(cb, layer_idx, "attn_norm.weight", &name_buf);
         defer cb.free(attn_ln_w);
         if (zero_bias) |bias| break :blk try cb.layerNorm(hidden, attn_ln_w, bias, H, config.layer_norm_eps);
@@ -457,39 +708,70 @@ fn encoderLayer(
     // Apply RoPE to Q and K. HuggingFace ModernBERT's `rotate_half` uses
     // split-half rotation; the legacy checkpoint retains interleaved pairs.
     // rope_dim == head_dim: the full head dimension is rotated.
-    const Q = try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
+    const rope_positions: ?[]const i64 = if (packed_row) |row| row.positions else if (row_segments) |rows| rows.rope_positions else null;
+    const Q = if (rope_positions) |positions|
+        try ropeAtPositions(cb, allocator, qkv.q, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
+    else
+        try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(Q);
-    const K = try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
+    const K = if (rope_positions) |positions|
+        try ropeAtPositions(cb, allocator, qkv.k, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
+    else
+        try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
     defer cb.free(K);
 
-    // For local layers build a sliding-window additive attention bias.
-    // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
-    // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
-    // as a per-head shared bias added to raw dot-product scores before softmax.
-    const local_attn: ?CT = if (!is_global and cb.vtable.slidingWindowAttention != null)
-        try cb.vtable.slidingWindowAttention.?(cb.ptr, Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)
-    else
-        null;
-    const window_bias: ?CT = if (!is_global and local_attn == null) blk: {
-        const half: usize = @intCast(config.local_attention_window / 2);
-        break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
-    } else null;
-    defer if (window_bias) |wb| cb.free(wb);
+    if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
+    var joined: [2]?CT = .{ null, null };
+    defer for (joined) |tensor| if (tensor) |t| cb.free(t);
+    if (branches) |b| {
+        joined[0] = try joinRows(cb, allocator, b.keys[layer_idx], prefix_rows, K, total, H);
+        joined[1] = try joinRows(cb, allocator, b.values[layer_idx], prefix_rows, qkv.v, total, H);
+    }
+    const attn_out = if (packed_row) |row|
+        try packedAttention(cb, allocator, Q, joined[0] orelse K, joined[1] orelse qkv.v, row, if (is_global) std.math.maxInt(u32) else config.local_attention_window / 2, total, seq_len, num_heads, head_dim)
+    else if (!is_global and cb.kind() == .cuda)
+        (try cb.encoderLocalAttention(Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)) orelse return error.UnsupportedLayaBackend
+    else if (row_segments) |rows|
+        try cb.segmentAttention(allocator, Q, K, qkv.v, &.{
+            .ranges = rows.ranges,
+            .query_positions = rows.positions,
+            .key_positions = rows.positions,
+            .window = if (is_global) std.math.maxInt(u32) else config.local_attention_window / 2,
+            .queries = total,
+            .keys = total,
+            .num_heads = num_heads,
+            .head_dim = head_dim,
+        })
+    else fallback: {
+        // For local layers build a sliding-window additive attention bias.
+        // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
+        // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
+        // as a per-head shared bias added to raw dot-product scores before softmax.
+        const local_attn: ?CT = if (!is_global and cb.vtable.slidingWindowAttention != null)
+            try cb.vtable.slidingWindowAttention.?(cb.ptr, Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)
+        else
+            null;
+        const window_bias: ?CT = if (!is_global and local_attn == null) blk: {
+            const half: usize = @intCast(config.local_attention_window / 2);
+            break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
+        } else null;
+        defer if (window_bias) |wb| cb.free(wb);
 
-    // Bidirectional scaled dot-product attention (encoder, no causal mask).
-    // The padding mask (attention_mask) is consumed by the backend: positions
-    // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
-    const attn_out = local_attn orelse try cb.scaledDotProductAttention(
-        Q,
-        K,
-        qkv.v,
-        attention_mask,
-        window_bias,
-        batch,
-        seq_len,
-        num_heads,
-        head_dim,
-    );
+        // Bidirectional scaled dot-product attention (encoder, no causal mask).
+        // The padding mask (attention_mask) is consumed by the backend: positions
+        // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
+        break :fallback local_attn orelse try cb.scaledDotProductAttention(
+            Q,
+            K,
+            qkv.v,
+            attention_mask,
+            window_bias,
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+        );
+    };
     defer cb.free(attn_out);
 
     // Output projection
@@ -517,7 +799,9 @@ fn encoderLayer(
     // Pre-FFN LayerNorm
     const mlp_ln_w = try getLayerWeight(cb, layer_idx, "mlp_norm.weight", &name_buf);
     defer cb.free(mlp_ln_w);
-    const normed_ffn = if (zero_bias) |bias|
+    const normed_ffn = if (try slottedLayerNorm(cb, hidden_after_attn, if (resident_slots) modernBertNormSlot(layer_idx, .mlp) else null, config)) |normed|
+        normed
+    else if (zero_bias) |bias|
         try cb.layerNorm(hidden_after_attn, mlp_ln_w, bias, H, config.layer_norm_eps)
     else blk: {
         const mlp_ln_b = try getLayerWeight(cb, layer_idx, "mlp_norm.bias", &name_buf);
@@ -701,6 +985,13 @@ fn geGluFfn(
     );
     defer cb.free(gated_ct);
 
+    if (exact_gelu) {
+        if (try cb.packedGegluExact(gated_ct, total, intermediate_size)) |activated| {
+            defer cb.free(activated);
+            return linearNoBiasWithSlot(cb, activated, Wo_w, total, intermediate_size, hidden_size, wo_slot);
+        }
+    }
+
     const gate_ct = try cb.sliceLastDim(gated_ct, 0, intermediate_size);
     defer cb.free(gate_ct);
     const value_ct = try cb.sliceLastDim(gated_ct, intermediate_size, 2 * intermediate_size);
@@ -726,6 +1017,188 @@ fn geGluFfn(
         hidden_size,
         wo_slot,
     );
+}
+
+/// Segment-masked attention for `queries` packed rows over all `keys`.
+pub fn packedAttention(cb: *const ComputeBackend, allocator: std.mem.Allocator, q: CT, k: CT, v: CT, row: Packed, window: u32, queries: usize, keys: usize, num_heads: usize, head_dim: usize) !CT {
+    if (row.positions.len != queries or row.ranges.len != queries * 6 or row.key_positions.len != keys) return error.InvalidInputShape;
+    const query_positions = try allocator.alloc(i32, queries);
+    defer allocator.free(query_positions);
+    for (query_positions, row.positions) |*dst, p| dst.* = @intCast(p);
+    return cb.segmentAttention(allocator, q, k, v, &.{
+        .ranges = row.ranges,
+        .query_positions = query_positions,
+        .key_positions = row.key_positions,
+        .window = window,
+        .queries = queries,
+        .keys = keys,
+        .num_heads = num_heads,
+        .head_dim = head_dim,
+    });
+}
+
+/// Rows `prefix..seq` of a token-major `[seq, width]` activation.
+///
+/// On Metal, row joins and slices are last-dimension ops on a flattened
+/// `[1, rows * width]` view, which run in the ordered decode stream. Metal's
+/// axis-0 concat blits outside that stream and read stale inputs while
+/// earlier work was still queued. Other backends execute eagerly and use the
+/// row gather and axis-0 concat directly.
+pub fn branchRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, prefix: usize, seq: usize, width: usize) !CT {
+    if (cb.kind() != .metal) {
+        const ids = try allocator.alloc(i64, seq - prefix);
+        defer allocator.free(ids);
+        for (ids, prefix..) |*id, row| id.* = @intCast(row);
+        return cb.embeddingLookup(input, ids, ids.len, width);
+    }
+    const flat = try reshape(cb, allocator, input, &.{ 1, @intCast(seq * width) });
+    defer cb.free(flat);
+    const tail = try cb.sliceLastDim(flat, prefix * width, seq * width);
+    defer cb.free(tail);
+    return reshape(cb, allocator, tail, &.{ @intCast(seq - prefix), @intCast(width) });
+}
+
+/// `[a_rows + b_rows, width]` from `[a_rows, width]` and `[b_rows, width]`.
+pub fn joinRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, a: CT, a_rows: usize, b: CT, b_rows: usize, width: usize) !CT {
+    if (cb.kind() != .metal) {
+        return cb.primConcatPrim(a, b, 0, &.{ @intCast(a_rows), @intCast(width) }, &.{ @intCast(b_rows), @intCast(width) });
+    }
+    const left = try reshape(cb, allocator, a, &.{ 1, @intCast(a_rows * width) });
+    defer cb.free(left);
+    const right = try reshape(cb, allocator, b, &.{ 1, @intCast(b_rows * width) });
+    defer cb.free(right);
+    const joined = try cb.concat(left, right, 1, a_rows * width, b_rows * width);
+    defer cb.free(joined);
+    return reshape(cb, allocator, joined, &.{ @intCast(a_rows + b_rows), @intCast(width) });
+}
+
+/// Store one layer's keys and values as host copies or as dense tensors.
+pub fn captureLayer(cb: *const ComputeBackend, allocator: std.mem.Allocator, host_keys: []const []f32, host_values: []const []f32, key_tensors: []?CT, value_tensors: []?CT, layer: usize, keys: CT, values: CT, rows: usize, width: usize) !void {
+    if (key_tensors.len > 0) {
+        const shape = [_]i32{ @intCast(rows), @intCast(width) };
+        key_tensors[layer] = try reshape(cb, allocator, keys, &shape);
+        value_tensors[layer] = try reshape(cb, allocator, values, &shape);
+        return;
+    }
+    for ([_]CT{ keys, values }, [_][]f32{ host_keys[layer], host_values[layer] }) |tensor, dst| {
+        const host = try cb.toFloat32(tensor, allocator);
+        defer allocator.free(host);
+        if (host.len != dst.len) return error.InvalidInputShape;
+        @memcpy(dst, host);
+    }
+}
+
+/// A new handle with a different logical shape over the same elements.
+/// Tensors a backend cannot alias (host-backed or strided views) are
+/// materialized through the host, which is ordered but synchronizes.
+pub fn reshape(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, shape: []const i32) !CT {
+    if (try cb.cloneTensorShape(input, shape)) |view| return view;
+    const values = try cb.toFloat32(input, allocator);
+    defer allocator.free(values);
+    return cb.fromFloat32Shape(values, shape);
+}
+
+/// RoPE at explicit per-token positions for a token-major `[tokens, heads *
+/// head_dim]` projection. Packed rows restart positions at every branch, which
+/// the contiguous `rope` op cannot express. The rotation matches `rope` for
+/// positions 0..n-1 (see the packed-encoder degenerate-tree test).
+///
+/// Split-half rotation is M-RoPE with every frequency pair on the first axis,
+/// so device backends that implement `mrope` rotate in place; others use the
+/// host rotation.
+/// An unpacked, right-padded batch run without its padding: the real tokens
+/// of every row back to back, each row its own attention segment. Linears,
+/// norms and attention then skip padding entirely; `restore` maps every
+/// padded slot back to a compact row (padding to its row's first token).
+const RowSegments = struct {
+    /// Real tokens across the batch.
+    tokens: usize,
+    ids: []i64,
+    /// Per compact token: its row's key range (segment-attention layout).
+    ranges: []u32,
+    positions: []i32,
+    rope_positions: []i64,
+    restore: []i64,
+
+    fn deinit(self: RowSegments, allocator: std.mem.Allocator) void {
+        allocator.free(self.ids);
+        allocator.free(self.ranges);
+        allocator.free(self.positions);
+        allocator.free(self.rope_positions);
+        allocator.free(self.restore);
+    }
+};
+
+/// Null when a row is empty or not right-padded; the dense path handles it.
+fn rowSegments(allocator: std.mem.Allocator, input_ids: []const i64, attention_mask: []const i64, batch: usize, seq_len: usize) !?RowSegments {
+    if (attention_mask.len != batch * seq_len or input_ids.len != batch * seq_len) return null;
+    if (batch * seq_len > std.math.maxInt(u32)) return null;
+    var tokens: usize = 0;
+    for (0..batch) |row| {
+        const mask = attention_mask[row * seq_len ..][0..seq_len];
+        const len = std.mem.indexOfScalar(i64, mask, 0) orelse seq_len;
+        if (len == 0) return null;
+        for (mask[len..]) |m| if (m != 0) return null;
+        tokens += len;
+    }
+    const ids = try allocator.alloc(i64, tokens);
+    errdefer allocator.free(ids);
+    const ranges = try allocator.alloc(u32, tokens * 6);
+    errdefer allocator.free(ranges);
+    const positions = try allocator.alloc(i32, tokens);
+    errdefer allocator.free(positions);
+    const rope_positions = try allocator.alloc(i64, tokens);
+    errdefer allocator.free(rope_positions);
+    const restore = try allocator.alloc(i64, batch * seq_len);
+    @memset(ranges, 0);
+    var offset: usize = 0;
+    for (0..batch) |row| {
+        const mask = attention_mask[row * seq_len ..][0..seq_len];
+        const len = std.mem.indexOfScalar(i64, mask, 0) orelse seq_len;
+        for (0..seq_len) |i| {
+            restore[row * seq_len + i] = @intCast(offset + if (i < len) i else 0);
+            if (i >= len) continue;
+            const at = offset + i;
+            ids[at] = input_ids[row * seq_len + i];
+            ranges[at * 6 ..][0..2].* = .{ @intCast(offset), @intCast(offset + len) };
+            positions[at] = @intCast(i);
+            rope_positions[at] = @intCast(i);
+        }
+        offset += len;
+    }
+    return .{ .tokens = tokens, .ids = ids, .ranges = ranges, .positions = positions, .rope_positions = rope_positions, .restore = restore };
+}
+
+fn metalRowSegmentsEnabled() bool {
+    return @import("antfly_platform").env.getenvBoolDefault("ANTFLY_MODERNBERT_SEGMENT_ATTENTION", true);
+}
+
+fn ropeAtPositions(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    input: CT,
+    positions: []const i64,
+    num_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    interleaved: bool,
+) !CT {
+    if (!interleaved) {
+        const axes = try allocator.alloc(u32, 3 * positions.len);
+        defer allocator.free(axes);
+        for (0..3) |axis| for (positions, axes[axis * positions.len ..][0..positions.len]) |p, *dst| {
+            dst.* = @intCast(p);
+        };
+        if (try cb.mrope(input, positions.len, head_dim, theta, 1.0, axes, .{ @intCast(head_dim / 2), 0, 0 })) |rotated| return rotated;
+    }
+    const values = try cb.toFloat32(input, allocator);
+    defer allocator.free(values);
+    if (values.len != positions.len * num_heads * head_dim) return error.InvalidRoPEInput;
+    const chunks = try allocator.alloc(usize, positions.len * num_heads);
+    defer allocator.free(chunks);
+    for (chunks, 0..) |*chunk, i| chunk.* = @intCast(positions[i / num_heads]);
+    native_compute.ropeCore(values, chunks, head_dim, head_dim, theta, 1.0, interleaved);
+    return cb.fromFloat32Shape(values, &[_]i32{ @intCast(positions.len), @intCast(num_heads * head_dim) });
 }
 
 // ---------------------------------------------------------------------------
@@ -940,7 +1413,7 @@ fn forwardCapturingActivationsCT(
     }
 
     // The activation-capture path uses the separate-QKV layout's stored biases.
-    var hidden = try embeddingsBlock(cb, config, null, input_ids, total_tokens);
+    var hidden = try embeddingsBlock(cb, config, null, input_ids, total_tokens, false);
     // Free hidden on any error path; the happy path frees it explicitly below.
     errdefer cb.free(hidden);
 
@@ -1300,6 +1773,35 @@ test "HuggingFace ModernBERT config selects fused bias-free checkpoint layout" {
     try std.testing.expectEqual(@as(u32, 8192), cfg.max_position_embeddings);
 }
 
+test "ModernBERT row segments drop padding and refuse inner padding" {
+    const a = std.testing.allocator;
+    const rows = (try rowSegments(a, &.{ 7, 8, 9, 4, 5, 0 }, &.{ 1, 1, 1, 1, 1, 0 }, 2, 3)).?;
+    defer rows.deinit(a);
+    try std.testing.expectEqual(@as(usize, 5), rows.tokens);
+    try std.testing.expectEqualSlices(i64, &.{ 7, 8, 9, 4, 5 }, rows.ids);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 3, 0, 0, 0, 0 }, rows.ranges[0..6]);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 5, 0, 0, 0, 0 }, rows.ranges[4 * 6 ..][0..6]);
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 2, 0, 1 }, rows.positions);
+    try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2, 3, 4, 3 }, rows.restore);
+    try std.testing.expect((try rowSegments(a, &.{ 1, 2, 3 }, &.{ 1, 0, 1 }, 1, 3)) == null);
+    try std.testing.expect((try rowSegments(a, &.{ 1, 2, 3 }, &.{ 0, 0, 0 }, 1, 3)) == null);
+}
+
+test "Transformers 5 ModernBERT config reads per-layer-type rope and layer types" {
+    const cfg = try parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","num_hidden_layers":4,"norm_eps":1e-6,
+        \\"layer_types":["full_attention","sliding_attention","sliding_attention","full_attention"],
+        \\"rope_parameters":{"full_attention":{"rope_theta":160000.0},"sliding_attention":{"rope_theta":160000.0}}}
+    );
+    try std.testing.expectEqual(@as(f32, 160000), cfg.global_rope_theta);
+    try std.testing.expectEqual(@as(f32, 160000), cfg.local_rope_theta);
+    try std.testing.expectEqual(@as(f32, 1e-6), cfg.layer_norm_eps);
+    try std.testing.expectError(error.UnsupportedModernBertLayerTypes, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","num_hidden_layers":3,
+        \\"layer_types":["full_attention","full_attention","sliding_attention"]}
+    ));
+}
+
 test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm and all biases" {
     const allocator = std.testing.allocator;
     var store = native_compute.WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
@@ -1320,11 +1822,11 @@ test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm an
     });
     try putTestWeight(allocator, &store, "model.embeddings.norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
     try putTestWeight(allocator, &store, "model.final_norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
-    try putTestWeight(allocator, &store, "model.layers.0.attn.Wqkv.weight", &.{ 12, 4 }, &([_]f32{0} ** 48));
-    try putTestWeight(allocator, &store, "model.layers.0.attn.Wo.weight", &.{ 4, 4 }, &([_]f32{0} ** 16));
+    try putTestWeight(allocator, &store, "model.layers.0.attn.Wqkv.weight", &.{ 12, 4 }, &(@as([48]f32, @splat(0))));
+    try putTestWeight(allocator, &store, "model.layers.0.attn.Wo.weight", &.{ 4, 4 }, &(@as([16]f32, @splat(0))));
     try putTestWeight(allocator, &store, "model.layers.0.mlp_norm.weight", &.{4}, &.{ 1, 1, 1, 1 });
-    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wi.weight", &.{ 8, 4 }, &([_]f32{0} ** 32));
-    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wo.weight", &.{ 4, 4 }, &([_]f32{0} ** 16));
+    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wi.weight", &.{ 8, 4 }, &(@as([32]f32, @splat(0))));
+    try putTestWeight(allocator, &store, "model.layers.0.mlp.Wo.weight", &.{ 4, 4 }, &(@as([16]f32, @splat(0))));
 
     const output = try forward(&cb, allocator, .{
         .vocab_size = 4,

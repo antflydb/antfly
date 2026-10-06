@@ -1,5 +1,14 @@
 [
   {
+    "id": "gliner25-decide-q8",
+    "name": "GLiNER2.5 Decide",
+    "architecture": "decide",
+    "precision": "q8_0",
+    "files": [],
+    "qualification": "pending",
+    "license": "Check bundled model license"
+  },
+  {
     "id": "laya-english-fp16",
     "name": "Laya English (reference)",
     "architecture": "laya",

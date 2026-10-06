@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+repo_root=$(git rev-parse --show-toplevel)
+if ! command -v python3 >/dev/null 2>&1; then
+    echo 'pre-commit: python3 is required for staged-file formatting.' >&2
+    exit 1
+fi
+exec python3 "$repo_root/scripts/format_staged.py"

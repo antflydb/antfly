@@ -14,10 +14,13 @@
 
 """Exercise the Zig workflow's actual Git path filter against tracked inputs."""
 
+import json
+import os
 import re
 import shlex
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -25,54 +28,154 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ZigValidationScopeTests(unittest.TestCase):
-    def test_vopr_changes_select_qualification_and_the_base_gate(self):
+    def test_vopr_qualification_is_an_optional_admitted_suite(self):
+        config = json.loads((ROOT / ".github/scripts/pr-ci-config.json").read_text())
+        suite = next(suite for suite in config["suites"] if suite["id"] == "vopr")
+        self.assertEqual(suite["label"], "ci:vopr")
+        self.assertEqual(suite["workflow"], "zig-vopr-pr.yml")
+        wrapper = (ROOT / ".github/workflows/zig-vopr-pr.yml").read_text()
+        self.assertIn("uses: ./.github/workflows/pr-ci-admission.yml", wrapper)
+        self.assertIn("suite: ${{ inputs.full_soak && 'soak' || 'vopr' }}", wrapper)
+        self.assertIn("qualification_only: ${{ !inputs.full_soak }}", wrapper)
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
-        focused = workflow.split("      - name: Detect VOPR qualification changes", 1)[
-            1
-        ]
-        inputs = {
-            "zig/lib/vopr/src/runner.zig",
-            "zig/pkg/antfly/src/vopr/cli.zig",
-            "zig/pkg/antfly/src/storage/hot_standby/vopr.zig",
-            "zig/pkg/antfly/src/storage/hot_standby/standby.zig",
-            "zig/pkg/antfly/src/raft/transport/http_driver.zig",
-            "zig/pkg/antfly/src/raft/transport/http_snapshot.zig",
-            "zig/pkg/antfly/src/raft/host.zig",
-            "zig/pkg/antfly/src/raft/reconciler.zig",
-            "zig/pkg/antfly/src/raft/vopr_harness.zig",
-            "zig/pkg/antfly/src/data/runtime.zig",
-            "zig/build.zig",
-            "scripts/ci/zig_vopr_soak.py",
-            "scripts/ci/test_zig_vopr_soak.py",
-            "scripts/ci/zig_vopr_qualification.py",
-            ".github/workflows/zig-vopr-soak.yml",
-        }
-        unrelated = {"scripts/unrelated.py", "docs/guide.md"}
-        for source in (workflow, focused):
-            command = source.split('if ! "$helper"', 1)[1].split("\n          then", 1)[
-                0
-            ]
-            pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
-            with tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                subprocess.run(["git", "init", "-q", temporary], check=True)
-                for name in inputs | unrelated:
-                    path = root / name
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.touch()
-                subprocess.run(["git", "add", "."], cwd=root, check=True)
-                selected = subprocess.check_output(
-                    ["git", "ls-files", "-z", "--", *pathspecs], cwd=root
-                )
-            self.assertEqual(
-                {path.decode() for path in selected.split(b"\0") if path}, inputs
-            )
+        self.assertNotIn("vopr-qualification:", workflow)
+        self.assertIn("vopr-test", workflow)
+        self.assertIn("vopr-build", workflow)
 
-    def test_codegen_inputs_select_zig_validation(self):
+    def test_full_validation_job_admission_and_build_reuse(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        blocks = dict(
+            re.findall(r"\n  ([\w-]+):\n(.*?)(?=\n  [\w-]+:\n|\Z)", workflow, re.DOTALL)
+        )
+
+        def selected(
+            job, *, full=False, pr="7", event="workflow_dispatch", **overrides
+        ):
+            values = {
+                "inputs.full_validation": full,
+                "inputs.pr_number": pr,
+                "inputs.validation_scope": "all",
+                "github.run_attempt": 1,
+                "github.event_name": event,
+                "github.ref": "refs/heads/main",
+                "github.event.schedule": "",
+                "needs.admission.result": "success",
+                "needs.changes.result": "success",
+                "needs.changes.outputs.zig_tests": "true",
+                "needs.changes.outputs.model_check": "true",
+                "needs.changes.outputs.trace_validate": "true",
+                "needs.changes.outputs.e2e": "true",
+                "needs.e2e-base-build.result": "success" if pr else "skipped",
+                "needs.e2e-base-plan.result": "success"
+                if pr and not full
+                else "skipped",
+                "needs.e2e-full-build.result": "skipped" if pr else "success",
+            }
+            values.update(overrides)
+            condition = blocks[job].split("${{", 1)[1].split("}}", 1)[0]
+            condition = re.sub(
+                r"\b(?:inputs|github|needs)\.[\w.-]+",
+                lambda m: repr(values[m[0]]),
+                condition,
+            )
+            condition = (
+                condition.replace("!cancelled()", "True")
+                .replace("success()", "True")
+                .replace("always()", "True")
+            )
+            condition = (
+                re.sub(r"!(?!=)", "not ", condition)
+                .replace("&&", " and ")
+                .replace("||", " or ")
+            )
+            return bool(eval(" ".join(condition.split()), {"__builtins__": {}}))
+
+        full_jobs = [
+            "zig-full-tests",
+            "zig-build-cache-tests",
+            "zig-full",
+            "e2e-full-tests",
+            "e2e-full",
+            "arm64-codec",
+        ]
+        base_jobs = [
+            "zig-base-tests",
+            "zig-base",
+            "e2e-base-plan",
+            "e2e-base-tests",
+            "e2e-base",
+        ]
+        for job in full_jobs:
+            with self.subTest(job=job):
+                self.assertTrue(selected(job, full=True))
+                self.assertTrue(selected(job, pr="", event="push"))
+                self.assertFalse(
+                    selected(job, full=True, **{"needs.admission.result": "failure"})
+                )
+                self.assertFalse(selected(job, full=True, **{"github.run_attempt": 2}))
+                if job != "arm64-codec":
+                    self.assertFalse(selected(job))
+        for job in base_jobs:
+            self.assertTrue(selected(job))
+            self.assertFalse(selected(job, full=True))
+        self.assertTrue(selected("e2e-base-build", full=True))
+        self.assertTrue(selected("e2e-base-low-fd"))
+        self.assertTrue(selected("e2e-base-low-fd", full=True))
+        self.assertFalse(selected("e2e-base-low-fd", pr="", event="push"))
+        self.assertFalse(
+            selected("e2e-base-tests", **{"needs.e2e-base-plan.result": "failure"})
+        )
+        self.assertFalse(selected("e2e-full-build", full=True))
+        self.assertTrue(selected("e2e-full-build", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "e2e-full-tests",
+                full=True,
+                **{"needs.e2e-base-build.result": "failure"},
+            )
+        )
+
+        # Evaluate the actual aggregate shell, including independent low-FD
+        # coverage. Full validation must not hide a failed specialized lane.
+        aggregate = blocks["e2e-full"]
+        self.assertIn("e2e-base-low-fd]", aggregate)
+        self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
+        command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
+        for build, tests, low_fd, required, success in (
+            ("success", "success", "success", "true", True),
+            ("success", "success", "failure", "true", False),
+            ("success", "success", "skipped", "true", False),
+            ("success", "success", "skipped", "false", True),
+            ("failure", "success", "success", "true", False),
+            ("success", "failure", "success", "true", False),
+        ):
+            with self.subTest(
+                build=build, tests=tests, low_fd=low_fd, required=required
+            ):
+                result = subprocess.run(
+                    ["bash", "-c", command],
+                    env={
+                        **os.environ,
+                        "BUILD_RESULT": build,
+                        "TEST_RESULT": tests,
+                        "LOW_FD_RESULT": low_fd,
+                        "REQUIRE_LOW_FD": required,
+                    },
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stderr)
+
+    def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
         command = workflow.split('if ! "$helper"', 1)[1].split("\n          then", 1)[0]
         pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
         inputs = {
+            "scripts/laya/prepare_laya_finetune.py",
+            "scripts/laya/qualify_laya_finetune_quality.py",
+            "scripts/laya/test_run_laya_qualification.py",
+            "scripts/laya/test_prepare_laya_finetune.py",
+            "scripts/laya/test_qualify_laya_finetune_quality.py",
+            "scripts/laya/test_benchmark_laya_metal.py",
             "scripts/openapi_inputs.py",
             "scripts/openapi_joiner.py",
             "scripts/join_openapi.py",
@@ -121,7 +224,7 @@ def embedded_helper() -> str:
     """
     workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
     match = re.search(
-        r'cat > "\$helper" <<\'HELPER\'\n(.*?)\n {10}HELPER\n', workflow, re.S
+        r'cat > "\$helper" <<\'HELPER\'\n(.*?)\n {10}HELPER\n', workflow, re.DOTALL
     )
     assert match, "embedded zig-relevant-changes helper not found in zig-tests.yml"
     lines = [
@@ -137,6 +240,7 @@ def _relevant(root: Path, base: str, head: str, *pathspecs: str) -> int:
         cwd=root,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        check=False,
     ).returncode
 
 
@@ -237,6 +341,7 @@ class ZigRelevantChangesScriptTests(unittest.TestCase):
             cwd=self.root,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         ).returncode
         self.assertEqual(code, 2)
 

@@ -22,7 +22,7 @@ const decoder_tail_runtime = @import("decoder_tail_runtime.zig");
 const metal_compute_mod = @import("../ops/metal_compute.zig");
 const ops = @import("../ops/ops.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = std.c;
 
 fn prefillTraceEnabled() bool {
     const value = c_std.getenv("TERMITE_METAL_PREFILL_TRACE") orelse return false;
@@ -148,7 +148,7 @@ const ReservedHiddenCarrier = struct {
         self.active_front = !self.active_front;
     }
 
-    fn deinit(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, keep_active: bool) void {
+    pub fn deinit(self: *ReservedHiddenCarrier, cb: *const ops.ComputeBackend, keep_active: bool) void {
         if (keep_active) {
             cb.free(self.inactive());
         } else {

@@ -283,7 +283,7 @@ const ExtensionMcpTool = struct {
     required_capabilities: []extension_domain.Capability = &.{},
     runtime_binding: ?ExtensionRuntimeBinding = null,
 
-    fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
         alloc.free(self.description);
         alloc.free(self.input_schema_json);
         alloc.free(self.handler);
@@ -300,7 +300,7 @@ const ExtensionRuntimeBinding = struct {
     artifact: []u8,
     entrypoint: []u8,
 
-    fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.package_name);
         alloc.free(self.package_version);
         alloc.free(self.package_digest);
@@ -376,7 +376,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             };
         }
 
-        fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        pub fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
@@ -395,7 +395,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             return try ctx.executeOperation(alloc, .{ .create_table = .{ .table_name = table_name, .body = body_json } });
         }
 
-        fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        pub fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
@@ -418,7 +418,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             } });
         }
 
-        fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        pub fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
             const result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
@@ -1145,6 +1145,7 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
             .server = server,
             .authenticated_identity = authenticated_identity,
             .installed = installed,
+            .expected_storage_name = if (tool.member.table_name.len != 0) tool.member.table_name else null,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
             .package_store_root = server.cfg.extension_package_store_dir,
@@ -1155,6 +1156,12 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
                 .ai_embed = ExtensionHostContext(@TypeOf(server), @TypeOf(authenticated_identity)).aiEmbed,
             },
         })) |body| {
+            // A guest may swallow a host error and claim the write succeeded.
+            // A stale table binding must remain an error at the MCP boundary.
+            if (host_context.binding_failed) {
+                alloc.free(body);
+                return try mcpError(alloc, "extension table binding is no longer current");
+            }
             return try mcpResultFromExtensionJson(alloc, body);
         } else |err| switch (err) {
             error.WasmtimeUnavailable,
@@ -1183,23 +1190,60 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         server: Server,
         authenticated_identity: Identity,
         installed: *const extension_domain.InstalledExtension,
+        expected_storage_name: ?[]const u8,
+        binding_failed: bool = false,
+
+        fn noteBindingFailure(ctx: *@This(), err: anyerror) void {
+            switch (err) {
+                error.ExtensionTableBindingChanged, error.ExtensionTableBindingMissing => ctx.binding_failed = true,
+                else => {},
+            }
+        }
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
+            var zig017_return_error: ?anyerror = null;
             const ctx = hostContext(ptr);
-            try ctx.requireCapability("db:read");
-            const table_name = try ctx.resolveTableName(table);
-            const body = try extensionQueryBodyAlloc(alloc, query_json);
+            errdefer if (zig017_return_error) |err| ctx.noteBindingFailure(err);
+            (ctx.requireCapability("db:read") catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const table_name = (ctx.resolveTableName(table) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const body = (extensionQueryBodyAlloc(alloc, query_json) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity);
+            return (ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
+            var zig017_return_error: ?anyerror = null;
             const ctx = hostContext(ptr);
-            try ctx.requireCapability("db:write");
-            const table_name = try ctx.resolveTableName(table);
-            const body = try extensionBatchBodyAlloc(alloc, writes_json);
+            errdefer if (zig017_return_error) |err| ctx.noteBindingFailure(err);
+            (ctx.requireCapability("db:write") catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const table_name = (ctx.resolveTableName(table) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const body = (extensionBatchBodyAlloc(alloc, writes_json) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body);
+            return (ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
@@ -1235,6 +1279,8 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         }
 
         fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
+            if (ctx.installed.scope.kind == .table and ctx.expected_storage_name == null)
+                return error.ExtensionTableBindingMissing;
             return switch (ctx.installed.scope.kind) {
                 .table => ctx.installed.scope.table_name,
                 .cluster => requested,
@@ -1444,7 +1490,7 @@ fn buildA2aDispatcher(
     authenticated_identity: anytype,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
-    const HandlerKind = enum { query_builder, retrieval };
+    const HandlerKind = enum { query_builder, retrieval, research };
     const HandlerContext = struct {
         server: Server,
         authorization: ?[]const u8,
@@ -1466,6 +1512,7 @@ fn buildA2aDispatcher(
             return switch (ctx.kind) {
                 .query_builder => "query-builder",
                 .retrieval => "retrieval",
+                .research => "research",
             };
         }
 
@@ -1474,6 +1521,7 @@ fn buildA2aDispatcher(
             return switch (ctx.kind) {
                 .query_builder => .{ .id = "query-builder", .name = "Query Builder", .description = "Translate natural language into Antfly query requests", .tags = &.{ "antfly", "query" } },
                 .retrieval => .{ .id = "retrieval", .name = "Retrieval", .description = "Run Antfly retrieval and generation workflows", .tags = &.{ "antfly", "retrieval" } },
+                .research => .{ .id = "research", .name = "Research", .description = "Plan, research in parallel and write a cited report over Antfly tables and the web", .tags = &.{ "antfly", "research" } },
             };
         }
 
@@ -1482,6 +1530,7 @@ fn buildA2aDispatcher(
             return switch (ctx.kind) {
                 .query_builder => try ctx.executeQueryBuilder(alloc, request_ctx, queue),
                 .retrieval => try ctx.executeRetrieval(alloc, request_ctx, queue),
+                .research => try ctx.executeResearch(alloc, request_ctx, queue),
             };
         }
 
@@ -1505,6 +1554,43 @@ fn buildA2aDispatcher(
             const parsed: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch .{ .string = resp.body };
             try queue.artifact(alloc, request_ctx.task_id, request_ctx.context_id, "query", try a2a.dataPart(alloc, parsed));
             try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "completed", "query built");
+        }
+
+        /// Research data parts may carry `queries` (or a `table`), and the
+        /// research request's `generator`, `chain`, `steps`, `budget`, `tools`
+        /// and `agent_knowledge`. The run is non-interactive.
+        fn executeResearch(ctx: *@This(), alloc: std.mem.Allocator, request_ctx: a2a.RequestContext, queue: *a2a.EventQueue) !void {
+            const text = try a2a.messageText(alloc, request_ctx.message);
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "query", .{ .string = text });
+            try body.put(alloc, "stream", .{ .bool = true });
+            try body.put(alloc, "interactive", .{ .bool = false });
+            var queries = std.json.Array.init(alloc);
+            if (a2a.firstDataPart(request_ctx.message)) |data| {
+                if (data == .object) {
+                    if (data.object.get("queries")) |value| {
+                        if (value == .array) queries = value.array;
+                    } else if (jsonStringObjectField(data.object, "table")) |table| {
+                        var query_obj = std.json.ObjectMap.empty;
+                        try query_obj.put(alloc, "table", .{ .string = table });
+                        try queries.append(.{ .object = query_obj });
+                    }
+                    inline for (.{ "generator", "chain", "steps", "budget", "tools", "agent_knowledge", "research_state" }) |field| {
+                        if (data.object.get(field)) |value| try body.put(alloc, field, value);
+                    }
+                }
+            }
+            try body.put(alloc, "queries", .{ .array = queries });
+            const body_json = try stringifyJsonValue(alloc, .{ .object = body });
+            try ctx.server.executeA2aResearch(
+                alloc,
+                body_json,
+                request_ctx.task_id,
+                request_ctx.context_id,
+                queue,
+                ctx.query_embedding_security_scope,
+                ctx.authenticated_identity,
+            );
         }
 
         fn executeRetrieval(ctx: *@This(), alloc: std.mem.Allocator, request_ctx: a2a.RequestContext, queue: *a2a.EventQueue) !void {
@@ -1561,7 +1647,7 @@ fn buildA2aDispatcher(
         .task_store = server_ptr.a2a_tasks.iface(),
         .task_authority = task_authority,
     };
-    const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
+    const contexts = try dispatcher_alloc.alloc(HandlerContext, 3);
     contexts[0] = .{
         .server = server_ptr,
         .authorization = authorization,
@@ -1576,8 +1662,14 @@ fn buildA2aDispatcher(
         .authenticated_identity = authenticated_identity,
         .kind = .retrieval,
     };
-    try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());
-    try dispatcher.addHandler(dispatcher_alloc, contexts[1].iface());
+    contexts[2] = .{
+        .server = server_ptr,
+        .authorization = authorization,
+        .query_embedding_security_scope = query_embedding_security_scope,
+        .authenticated_identity = authenticated_identity,
+        .kind = .research,
+    };
+    for (contexts) |*context| try dispatcher.addHandler(dispatcher_alloc, context.iface());
     return dispatcher;
 }
 

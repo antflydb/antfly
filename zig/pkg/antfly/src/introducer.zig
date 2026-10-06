@@ -71,12 +71,12 @@ const TextBuildScratch = struct {
         resetScratchList(u32, alloc, &self.positions, retained_bytes);
     }
 
-    fn deinit(self: *TextBuildScratch, alloc: Allocator) void {
+    pub fn deinit(self: *TextBuildScratch, alloc: Allocator) void {
         self.hits.deinit(alloc);
         self.positions.deinit(alloc);
     }
 
-    fn estimatedMemoryBytes(self: *const TextBuildScratch) u64 {
+    pub fn estimatedMemoryBytes(self: *const TextBuildScratch) u64 {
         return (@as(u64, @intCast(self.hits.capacity)) * @sizeOf(inverted.InvertedIndexBuilder.TermHit)) +
             (@as(u64, @intCast(self.positions.capacity)) * @sizeOf(u32));
     }
@@ -104,7 +104,7 @@ const FieldPostingsBuilder = struct {
         };
     }
 
-    fn deinit(self: *FieldPostingsBuilder, alloc: Allocator) void {
+    pub fn deinit(self: *FieldPostingsBuilder, alloc: Allocator) void {
         _ = alloc;
         if (!self.active) return;
         self.builder.deinit();
@@ -131,7 +131,7 @@ const FieldPostingsBuilder = struct {
         return try self.builder.buildAlloc(output_alloc);
     }
 
-    fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
+    pub fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
         if (!self.active) return 0;
         return self.builder.estimatedMemoryBytes();
     }
@@ -267,12 +267,17 @@ pub const TextDocument = struct {
     doc_ordinal: ?u32 = null,
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    /// Subtrees the document schema declares with `x-antfly-index: false`.
+    /// Typed doc values are never inferred at or below these paths.
+    unindexed_paths: []const []const u8 = &.{},
     typed_fields: ?[]const TypedFieldValue = null,
     typed_source: ?std.json.Value = null,
 };
 
 pub const TextField = struct {
     field_name: []const u8,
+    /// Stored source path, including for generated companions and `_all`.
+    source_field: ?[]const u8 = null,
     text: []const u8,
     analyzer: ?*const analysis_mod.Analyzer = null,
 };
@@ -280,6 +285,7 @@ pub const TextField = struct {
 pub const BuildTextOptions = struct {
     recursive_typed_fields: bool = false,
     infer_type_dynamic_paths: []const []const u8 = &.{},
+    unindexed_paths: []const []const u8 = &.{},
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     profile: ?*BuildTextProfile = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -612,7 +618,7 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
     var field_indices = std.StringHashMapUnmanaged(u16).empty;
     defer field_indices.deinit(alloc);
 
-    var analyzer_cache = std.StringHashMapUnmanaged(*const analysis_mod.Analyzer).empty;
+    var analyzer_cache = std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer).empty;
     defer analyzer_cache.deinit(alloc);
 
     var doc_ordinals = std.ArrayListUnmanaged(u32).empty;
@@ -767,6 +773,9 @@ pub fn writeSegmentFromTextWithAnalysisOptions(
         doc_options.recursive_typed_fields = doc_options.recursive_typed_fields or text_doc.recursive_typed_fields;
         if (text_doc.infer_type_dynamic_paths.len > 0) {
             doc_options.infer_type_dynamic_paths = text_doc.infer_type_dynamic_paths;
+        }
+        if (text_doc.unindexed_paths.len > 0) {
+            doc_options.unindexed_paths = text_doc.unindexed_paths;
         }
         const typed_collect_start_ns = if (profile_timings) platform_time.monotonicNs() else 0;
         if (text_doc.typed_fields) |projected_typed_fields| {
@@ -963,7 +972,7 @@ const TextIndexSortEntry = struct {
     doc_index: usize,
     keys: []TextIndexSortValue,
 
-    fn deinit(self: *TextIndexSortEntry, alloc: Allocator) void {
+    pub fn deinit(self: *TextIndexSortEntry, alloc: Allocator) void {
         for (self.keys) |*key| key.deinit(alloc);
         alloc.free(self.keys);
         self.* = undefined;
@@ -979,7 +988,7 @@ const TextIndexSortValue = union(enum) {
     id: []const u8,
     numeric_val: typed_dv.NumericValue,
 
-    fn deinit(self: *TextIndexSortValue, alloc: Allocator) void {
+    pub fn deinit(self: *TextIndexSortValue, alloc: Allocator) void {
         switch (self.*) {
             .bytes_val => |bytes| alloc.free(bytes),
             else => {},
@@ -1198,20 +1207,26 @@ fn compareSortF64(a: f64, b: f64) std.math.Order {
     return std.math.order(a, b);
 }
 
+/// Resolve the analyzer used to index this exact field contribution. `_all`
+/// can receive values with different schema analyzers, so preserve the
+/// contribution's analyzer unless the index explicitly overrides this field.
+pub fn effectiveTextFieldAnalyzer(field: TextField, text_analysis: TextAnalysisConfig) *const analysis_mod.Analyzer {
+    return resolveFieldAnalyzer(field.field_name, text_analysis) orelse field.analyzer orelse &analysis_mod.default_analyzer;
+}
+
 fn cachedFieldAnalyzer(
     alloc: Allocator,
-    cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    cache: *std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer),
     field: TextField,
     default_analyzer: *const analysis_mod.Analyzer,
     text_analysis: TextAnalysisConfig,
 ) !*const analysis_mod.Analyzer {
-    if (field.analyzer) |analyzer| return analyzer;
     const gop = try cache.getOrPut(alloc, field.field_name);
     if (!gop.found_existing) {
         gop.key_ptr.* = field.field_name;
-        gop.value_ptr.* = resolveFieldAnalyzer(field.field_name, text_analysis) orelse default_analyzer;
+        gop.value_ptr.* = resolveFieldAnalyzer(field.field_name, text_analysis);
     }
-    return gop.value_ptr.*;
+    return gop.value_ptr.* orelse field.analyzer orelse default_analyzer;
 }
 
 fn addSingleTextFieldToBuilders(
@@ -1220,7 +1235,7 @@ fn addSingleTextFieldToBuilders(
     field_builders: *std.StringHashMapUnmanaged(FieldPostingsBuilder),
     field_indices: *std.StringHashMapUnmanaged(u16),
     seg_writer: *segment_mod.SegmentWriter,
-    analyzer_cache: *std.StringHashMapUnmanaged(*const analysis_mod.Analyzer),
+    analyzer_cache: *std.StringHashMapUnmanaged(?*const analysis_mod.Analyzer),
     doc_idx: u32,
     field: TextField,
     default_analyzer: *const analysis_mod.Analyzer,
@@ -1358,12 +1373,13 @@ pub fn collectTypedFieldProjection(
     if (options.recursive_typed_fields) {
         try collectTypedFieldProjectionRecursive(alloc, value, "", text_analysis, &fields);
     } else if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldProjectionRecursiveScoped(alloc, value, "", text_analysis, options.infer_type_dynamic_paths, &fields);
+        try collectTypedFieldProjectionRecursiveScoped(alloc, value, "", text_analysis, options.infer_type_dynamic_paths, options.unindexed_paths, &fields);
     } else {
         var it = value.object.iterator();
         while (it.next()) |entry| {
             const field_name = entry.key_ptr.*;
             if (field_name.len > 0 and field_name[0] == '_') continue;
+            if (pathFallsUnderAnyScopedPath(options.unindexed_paths, field_name)) continue;
 
             const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
             try appendTypedFieldProjectionValue(alloc, &fields, field_name, detected);
@@ -1402,7 +1418,7 @@ fn collectTypedFieldValuesFromValue(
         return;
     }
     if (options.infer_type_dynamic_paths.len > 0) {
-        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.profile);
+        try collectTypedFieldValuesRecursiveScoped(alloc, value, "", doc_id, typed_fields, text_analysis, options.infer_type_dynamic_paths, options.unindexed_paths, options.profile);
         return;
     }
 
@@ -1410,6 +1426,7 @@ fn collectTypedFieldValuesFromValue(
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
         if (field_name.len > 0 and field_name[0] == '_') continue;
+        if (pathFallsUnderAnyScopedPath(options.unindexed_paths, field_name)) continue;
 
         const detected = detectTypedValue(field_name, entry.value_ptr.*, text_analysis) orelse continue;
         try appendTypedFieldValue(alloc, typed_fields, field_name, doc_id, detected, options.profile);
@@ -1458,8 +1475,10 @@ fn collectTypedFieldProjectionRecursiveScoped(
     path: []const u8,
     text_analysis: TextAnalysisConfig,
     scoped_paths: []const []const u8,
+    unindexed_paths: []const []const u8,
     fields: *std.ArrayListUnmanaged(TypedFieldValue),
 ) !void {
+    if (path.len > 0 and pathFallsUnderAnyScopedPath(unindexed_paths, path)) return;
     if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
             try appendTypedFieldProjectionValue(alloc, fields, path, detected);
@@ -1477,12 +1496,12 @@ fn collectTypedFieldProjectionRecursiveScoped(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldProjectionRecursiveScoped(alloc, entry.value_ptr.*, child_path, text_analysis, scoped_paths, fields);
+                try collectTypedFieldProjectionRecursiveScoped(alloc, entry.value_ptr.*, child_path, text_analysis, scoped_paths, unindexed_paths, fields);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldProjectionRecursiveScoped(alloc, item, path, text_analysis, scoped_paths, fields);
+                try collectTypedFieldProjectionRecursiveScoped(alloc, item, path, text_analysis, scoped_paths, unindexed_paths, fields);
             }
         },
         else => {},
@@ -1574,8 +1593,10 @@ fn collectTypedFieldValuesRecursiveScoped(
     typed_fields: *std.StringHashMapUnmanaged(TypedFieldCollector),
     text_analysis: TextAnalysisConfig,
     scoped_paths: []const []const u8,
+    unindexed_paths: []const []const u8,
     profile: ?*BuildTextProfile,
 ) !void {
+    if (path.len > 0 and pathFallsUnderAnyScopedPath(unindexed_paths, path)) return;
     if (path.len > 0 and pathFallsUnderAnyScopedPath(scoped_paths, path)) {
         if (detectTypedValue(path, value, text_analysis)) |detected| {
             try appendTypedFieldValue(alloc, typed_fields, path, doc_id, detected, profile);
@@ -1593,12 +1614,12 @@ fn collectTypedFieldValuesRecursiveScoped(
                 else
                     try std.fmt.allocPrint(alloc, "{s}.{s}", .{ path, entry.key_ptr.* });
                 defer alloc.free(child_path);
-                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
+                try collectTypedFieldValuesRecursiveScoped(alloc, entry.value_ptr.*, child_path, doc_id, typed_fields, text_analysis, scoped_paths, unindexed_paths, profile);
             }
         },
         .array => |array| {
             for (array.items) |item| {
-                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, profile);
+                try collectTypedFieldValuesRecursiveScoped(alloc, item, path, doc_id, typed_fields, text_analysis, scoped_paths, unindexed_paths, profile);
             }
         },
         else => {},
@@ -2212,13 +2233,27 @@ fn resolveTokenizerComponent(component: std.json.Value, component_type: []const 
     return error.InvalidArgument;
 }
 
+/// Token filters that need no configuration can be referenced directly by
+/// name from an analyzer's `token_filters` list, without declaring a named
+/// component first. Named components declared in `token_filters` shadow these.
+fn builtinTokenFilterByName(name: []const u8) ?analysis_mod.TokenFilter {
+    if (std.mem.eql(u8, name, "to_lower") or std.mem.eql(u8, name, "lowercase")) return .lowercase;
+    if (std.mem.eql(u8, name, "stop_en") or std.mem.eql(u8, name, "stop_words")) return .stop_words;
+    if (std.mem.eql(u8, name, "stemmer_en") or std.mem.eql(u8, name, "stemmer")) return .stemmer;
+    if (std.mem.eql(u8, name, "camel_case")) return .camel_case;
+    if (std.mem.eql(u8, name, "unique")) return .unique;
+    if (std.mem.eql(u8, name, "reverse")) return .reverse;
+    if (std.mem.eql(u8, name, "elision")) return .elision;
+    if (std.mem.eql(u8, name, "apostrophe")) return .apostrophe;
+    if (std.mem.eql(u8, name, "suffix")) return .{ .suffix = .{} };
+    return null;
+}
+
 fn resolveTokenFilterName(name: []const u8, named: []const NamedTokenFilter) !analysis_mod.TokenFilter {
-    if (std.mem.eql(u8, name, "to_lower")) return .lowercase;
-    if (std.mem.eql(u8, name, "stop_en")) return .stop_words;
-    if (std.mem.eql(u8, name, "stemmer_en")) return .stemmer;
     for (named) |item| {
         if (std.mem.eql(u8, item.name, name)) return item.filter;
     }
+    if (builtinTokenFilterByName(name)) |filter| return filter;
     return error.InvalidArgument;
 }
 
@@ -2237,7 +2272,56 @@ fn resolveTokenFilterComponent(component: std.json.Value, component_type: []cons
             .max = try configU8(config_val, "max", 3),
         } };
     }
+    if (std.mem.eql(u8, component_type, "shingle")) {
+        const min = try configU8(config_val, "min", 2);
+        const max = try configU8(config_val, "max", 2);
+        if (min == 0 or max < min) return error.InvalidArgument;
+        return .{ .shingle = .{ .min = min, .max = max, .separator = try configShingleSeparator(config_val) } };
+    }
+    if (std.mem.eql(u8, component_type, "suffix")) {
+        return .{ .suffix = .{
+            .min = try configU8(config_val, "min", analysis_mod.substring_min_query_length),
+            .max = try configU8(config_val, "max", analysis_mod.substring_max_query_length),
+        } };
+    }
+    if (std.mem.eql(u8, component_type, "length")) {
+        return .{ .length = .{
+            .min = try configU8(config_val, "min", 0),
+            .max = try configU8(config_val, "max", 255),
+        } };
+    }
+    if (std.mem.eql(u8, component_type, "truncate")) {
+        return .{ .truncate = .{ .max_len = try configU8(config_val, "length", 255) } };
+    }
+    if (std.mem.eql(u8, component_type, "stop_words") or std.mem.eql(u8, component_type, "stop")) {
+        if (try configLanguage(config_val)) |lang| return .{ .stop_words_lang = lang };
+        return .stop_words;
+    }
+    if (std.mem.eql(u8, component_type, "stemmer")) {
+        if (try configLanguage(config_val)) |lang| return .{ .stemmer_lang = lang };
+        return .stemmer;
+    }
+    if (builtinTokenFilterByName(component_type)) |filter| return filter;
     return error.InvalidArgument;
+}
+
+fn configShingleSeparator(config_val: ?std.json.Value) !analysis_mod.TokenFilter.ShingleConfig.Separator {
+    const cfg = config_val orelse return .space;
+    if (cfg != .object) return .space;
+    const raw = cfg.object.get("separator") orelse return .space;
+    if (raw != .string) return error.InvalidArgument;
+    if (std.mem.eql(u8, raw.string, "none") or raw.string.len == 0) return .none;
+    if (std.mem.eql(u8, raw.string, "space") or std.mem.eql(u8, raw.string, " ")) return .space;
+    return error.InvalidArgument;
+}
+
+fn configLanguage(config_val: ?std.json.Value) !?analysis_mod.Language {
+    const cfg = config_val orelse return null;
+    if (cfg != .object) return null;
+    const raw = cfg.object.get("language") orelse cfg.object.get("lang") orelse return null;
+    if (raw != .string) return error.InvalidArgument;
+    if (std.mem.eql(u8, raw.string, "en")) return .english;
+    return std.meta.stringToEnum(analysis_mod.Language, raw.string) orelse error.InvalidArgument;
 }
 
 fn configU8(config_val: ?std.json.Value, field: []const u8, default_value: u8) !u8 {
@@ -2785,7 +2869,7 @@ test "buildSegmentFromTextWithAnalysisOptions releases full text working set aft
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
@@ -2975,6 +3059,75 @@ test "buildSegmentFromText uses configured custom datetime parsers for typed doc
     var ts_reader = try typed_dv.TypedDocValuesReader.init(alloc, ts_section);
     try std.testing.expectEqual(typed_dv.ValueType.u64_val, ts_reader.value_type);
     try std.testing.expect((try ts_reader.getU64(0)) != null);
+}
+
+test "analysis config resolves built-in filter names and configured filter types" {
+    const alloc = std.testing.allocator;
+    const cfg_json =
+        \\{"analysis_config":{
+        \\  "field_analyzers":{"code":"code_analyzer","compound":"compound_analyzer"},
+        \\  "token_filters":{
+        \\    "pairs":{"type":"shingle","config":{"min":1,"max":2,"separator":"none"}},
+        \\    "tails":{"type":"suffix","config":{"min":3,"max":8}},
+        \\    "short":{"type":"length","config":{"min":2,"max":10}},
+        \\    "stems_de":{"type":"stemmer","config":{"language":"german"}}
+        \\  },
+        \\  "analyzers":{
+        \\    "code_analyzer":{"type":"custom","config":{"tokenizer":"whitespace","token_filters":["camel_case","unique","short"]}},
+        \\    "compound_analyzer":{"type":"custom","config":{"tokenizer":"unicode","token_filters":["lowercase","pairs","tails","stems_de"]}}
+        \\  }
+        \\}}
+    ;
+
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const cfg = try parseTextAnalysisConfig(arena_state.allocator(), cfg_json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.analyzers.len);
+
+    const code = resolveFieldAnalyzer("code", cfg) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 3), code.filters.len);
+    try std.testing.expect(code.filters[0] == .camel_case);
+    try std.testing.expect(code.filters[1] == .unique);
+    try std.testing.expect(code.filters[2] == .length);
+    const code_tokens = try code.analyze(alloc, "parseHttpRequest parseHttpRequest");
+    defer analysis_mod.Analyzer.freeTokens(alloc, code_tokens);
+    try std.testing.expectEqual(@as(usize, 3), code_tokens.len);
+    try std.testing.expectEqualStrings("parse", code_tokens[0].term);
+    try std.testing.expectEqualStrings("http", code_tokens[1].term);
+    try std.testing.expectEqualStrings("request", code_tokens[2].term);
+
+    const compound = resolveFieldAnalyzer("compound", cfg) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, 4), compound.filters.len);
+    try std.testing.expect(compound.filters[0] == .lowercase);
+    switch (compound.filters[1]) {
+        .shingle => |shingle| {
+            try std.testing.expectEqual(@as(u8, 1), shingle.min);
+            try std.testing.expectEqual(@as(u8, 2), shingle.max);
+            try std.testing.expect(shingle.separator == .none);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (compound.filters[2]) {
+        .suffix => |suffix| {
+            try std.testing.expectEqual(@as(u8, 3), suffix.min);
+            try std.testing.expectEqual(@as(u8, 8), suffix.max);
+        },
+        else => return error.TestExpectedEqual,
+    }
+    switch (compound.filters[3]) {
+        .stemmer_lang => |lang| try std.testing.expect(lang == .german),
+        else => return error.TestExpectedEqual,
+    }
+
+    // Unknown filter names and languages are rejected rather than ignored.
+    try std.testing.expectError(error.InvalidArgument, parseTextAnalysisConfig(
+        arena_state.allocator(),
+        "{\"analysis_config\":{\"analyzers\":{\"a\":{\"type\":\"custom\",\"config\":{\"tokenizer\":\"unicode\",\"token_filters\":[\"no_such_filter\"]}}}}}",
+    ));
+    try std.testing.expectError(error.InvalidArgument, parseTextAnalysisConfig(
+        arena_state.allocator(),
+        "{\"analysis_config\":{\"token_filters\":{\"x\":{\"type\":\"stemmer\",\"config\":{\"language\":\"klingon\"}}}}}",
+    ));
 }
 
 test "buildSegmentFromText uses configured custom field analyzer" {

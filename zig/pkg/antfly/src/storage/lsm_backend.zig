@@ -42,8 +42,8 @@ const wal_mod = @import("lsm_backend/wal.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
-const fs_paths = @import("../common/fs_paths.zig");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const native_artifact_sink = @import("native_artifact_sink.zig");
 
 comptime {
@@ -123,7 +123,7 @@ else
         }
     };
 
-var file_pin_release_epoch: std.atomic.Value(u64) = .init(0);
+var file_pin_release_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0);
 
 const ObsoletePathRefRegistry = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -278,7 +278,7 @@ pub const ReaderPinKind = enum(u8) {
     other,
 };
 
-pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".fields.len;
+pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".field_names.len;
 
 pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
     return switch (kind) {
@@ -293,7 +293,7 @@ pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
 }
 
 fn readerPinKindIndex(kind: ReaderPinKind) usize {
-    return @intFromEnum(kind);
+    return @backingInt(kind);
 }
 
 pub const MutableSnapshotCloneReasonStats = background_runtime_mod.LsmMutableSnapshotCloneReasonStats;
@@ -323,11 +323,11 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
 }
 
 fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
-    return @intFromEnum(reason);
+    return @backingInt(reason);
 }
 
 fn activeReaderKindStats(active_readers_by_kind: [reader_pin_kind_count]usize) [reader_pin_kind_count]u64 {
-    var stats: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count;
+    var stats: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0));
     for (active_readers_by_kind, 0..) |active, i| stats[i] = @intCast(active);
     return stats;
 }
@@ -710,7 +710,7 @@ pub const Backend = struct {
     };
 
     pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
-        if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+        if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
         dst.started +|= src.started;
         dst.completed +|= src.completed;
         dst.failed +|= src.failed;
@@ -862,7 +862,7 @@ pub const Backend = struct {
         mutable_snapshot_clone_calls: u64 = 0,
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
-        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @as([mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats, @splat(.{})),
         bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
         bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
         bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
@@ -920,8 +920,8 @@ pub const Backend = struct {
         memtable_reclaim_units: u64 = 0,
         memtable_reclaim_max_slice_ns: u64 = 0,
         active_readers: u64 = 0,
-        active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
-        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
+        active_readers_by_kind: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0)),
+        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0)),
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
@@ -1079,7 +1079,7 @@ pub const Backend = struct {
             (!dst_wal_checkpoint_pending or
                 src.wal_checkpoint_retry_delay_ns < dst.wal_checkpoint_retry_delay_ns or
                 (src.wal_checkpoint_retry_delay_ns == dst.wal_checkpoint_retry_delay_ns and
-                    (@intFromEnum(src.wal_checkpoint_retry_reason) > @intFromEnum(dst.wal_checkpoint_retry_reason) or
+                    (@backingInt(src.wal_checkpoint_retry_reason) > @backingInt(dst.wal_checkpoint_retry_reason) or
                         (src.wal_checkpoint_retry_reason == dst.wal_checkpoint_retry_reason and
                             src.wal_checkpoint_retry_attempts > dst.wal_checkpoint_retry_attempts))));
         if (src_retry_precedes) {
@@ -1122,16 +1122,16 @@ pub const Backend = struct {
     }
 
     pub fn accumulateWriteStats(dst: *WriteStats, src: WriteStats) void {
-        inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
-                @field(dst, field.name) |= @field(src, field.name);
-            } else if (comptime std.mem.eql(u8, field.name, "compaction_max_input_bytes") or
-                std.mem.eql(u8, field.name, "compaction_max_output_bytes") or
-                std.mem.eql(u8, field.name, "compaction_max_ns"))
+        inline for (comptime std.meta.fieldNames(WriteStats)) |reflected_name| {
+            if (comptime std.mem.eql(u8, reflected_name, "table_file_compression_codec_mask")) {
+                @field(dst, reflected_name) |= @field(src, reflected_name);
+            } else if (comptime std.mem.eql(u8, reflected_name, "compaction_max_input_bytes") or
+                std.mem.eql(u8, reflected_name, "compaction_max_output_bytes") or
+                std.mem.eql(u8, reflected_name, "compaction_max_ns"))
             {
-                @field(dst, field.name) = @max(@field(dst, field.name), @field(src, field.name));
+                @field(dst, reflected_name) = @max(@field(dst, reflected_name), @field(src, reflected_name));
             } else {
-                @field(dst, field.name) +|= @field(src, field.name);
+                @field(dst, reflected_name) +|= @field(src, reflected_name);
             }
         }
     }
@@ -1603,7 +1603,7 @@ pub const Backend = struct {
     current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
-    active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
+    active_readers_by_kind: [reader_pin_kind_count]usize = @as([reader_pin_kind_count]usize, @splat(0)),
     manifest_dirty: bool = false,
     obsolete_paths: repository_mod.ObsoleteLedger = .empty,
     active_ledger_reclamations: ?*@import("lsm_backend/ledger_reclamation.zig").Job = null,
@@ -1699,7 +1699,7 @@ pub const Backend = struct {
     mutable_snapshot_clone_calls: u64 = 0,
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
-    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @as([mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats, @splat(.{})),
     bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
     bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
     bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
@@ -1973,20 +1973,22 @@ pub const Backend = struct {
     }
 
     pub fn prepareWalOperationLockFile(self: *Backend) !void {
-        if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
-        if (self.wal_operation_lock_file != null) return;
+        if (comptime builtin.os.tag != .freestanding) {
+            if (!self.options.wal_enabled or self.root_dir == null or !self.storage.?.supportsNativePathLocks()) return;
+            if (self.wal_operation_lock_file != null) return;
 
-        const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
-        defer self.allocator.free(lock_path);
-        self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
-            self.allocator,
-            lock_path,
-            .{ .create_if_missing = true },
-            self.options.native_storage_pool,
-        ) catch |err| switch (err) {
-            error.FileNotFound => if (self.options.backend.read_only) return else return err,
-            else => return err,
-        };
+            const lock_path = try walOperationLockPathAlloc(self.allocator, self.root_dir.?);
+            defer self.allocator.free(lock_path);
+            self.wal_operation_lock_file = storage_io.openNativePathLockFileWithPool(
+                self.allocator,
+                lock_path,
+                .{ .create_if_missing = true },
+                self.options.native_storage_pool,
+            ) catch |err| switch (err) {
+                error.FileNotFound => if (self.options.backend.read_only) return else return err,
+                else => return err,
+            };
+        }
     }
 
     pub fn closeWalOperationLockFile(self: *Backend) void {
@@ -2168,6 +2170,33 @@ pub const Backend = struct {
         run_ids: []u64,
         run_paths: [][]u8,
 
+        /// Persist the retained generation using immutable file links. Unlike
+        /// process-local run refs, this tree survives owner restart and GC.
+        pub fn seal(self: *const NativeCheckpoint, io: std.Io, destination_root: []const u8, cancellation: CancellationToken) !u64 {
+            if (!self.storage.supportsHostPathGenerationPublication()) return error.NativeBackupStorageBackendUnsupported;
+            try fs_paths.createDirPathPortable(io, destination_root);
+            const manifest = try std.fmt.allocPrint(self.allocator, "{s}/manifest.bin", .{destination_root});
+            defer self.allocator.free(manifest);
+            var total = try writeCheckpointBytes(io, manifest, self.manifest_bytes, null);
+            const runs = try std.fmt.allocPrint(self.allocator, "{s}/runs", .{destination_root});
+            defer self.allocator.free(runs);
+            try fs_paths.createDirPathPortable(io, runs);
+            for (self.run_paths, self.run_ids) |source, id| {
+                try cancellation.check();
+                const target = try std.fmt.allocPrint(self.allocator, "{s}/{d}.tbl", .{ runs, id });
+                defer self.allocator.free(target);
+                try std.Io.Dir.hardLink(.cwd(), source, .cwd(), target, io, .{});
+                var file = try std.Io.Dir.cwd().openFile(io, target, .{});
+                defer file.close(io);
+                const stat = try file.stat(io);
+                if (stat.kind != .file) return error.UnsupportedFileType;
+                total = std.math.add(u64, total, stat.size) catch return error.FileTooBig;
+            }
+            try fs_paths.syncDirPortable(io, runs);
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
+
         pub fn deinit(self: *NativeCheckpoint) void {
             for (self.run_paths) |path| {
                 run_snapshot_refs.release(path);
@@ -2238,7 +2267,7 @@ pub const Backend = struct {
         const locked = runtime_mod.lockBackend(Backend, self);
         defer runtime_mod.unlockBackend(Backend, self, locked);
 
-        try self.flushMutable();
+        try self.flushCheckpointCutLocked();
         if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
             try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
         }
@@ -4729,6 +4758,27 @@ pub const Backend = struct {
         try self.flushAllImmutableMemtables();
     }
 
+    /// Unlike a maintenance step, a self-contained checkpoint cannot yield
+    /// with committed data still in a memtable. An unlocked background build
+    /// temporarily owns the oldest epoch; wait for its publication, then drain
+    /// the remaining epochs and any mutable tail added while the lock was
+    /// released. Never certify a manifest-only image of a partial cut.
+    fn flushCheckpointCutLocked(self: *Backend) !void {
+        while (true) {
+            if (self.closing.load(.acquire)) return error.BackendClosing;
+            if (self.mutable.entryCount() > 0) try self.rotateMutableToImmutable();
+            if (self.activeImmutableMemtableCount() == 0) return;
+            if (self.immutable_flush_build_in_flight) {
+                if (!self.waitForImmutableFlushBuildLocked()) return error.WouldBlock;
+                continue;
+            }
+            // Explicit checkpoint work is outside background admission. Pass
+            // that distinction down rather than overriding the shared budget
+            // across an unlocked build, where maintenance can run concurrently.
+            _ = try self.flushImmutableMemtableWindowWithAdmission(true, false);
+        }
+    }
+
     fn directIngestMutableAtBulkFinishIfPossible(self: *Backend) !bool {
         if (!self.options.direct_bulk_ingest) return false;
         if (self.mutable.entryCount() == 0) return false;
@@ -4948,6 +4998,10 @@ pub const Backend = struct {
     }
 
     fn flushImmutableMemtableWindow(self: *Backend, force: bool) !bool {
+        return self.flushImmutableMemtableWindowWithAdmission(force, true);
+    }
+
+    fn flushImmutableMemtableWindowWithAdmission(self: *Backend, force: bool, charge_maintenance: bool) !bool {
         const window_count = self.immutableFlushWindowCount(force);
         if (window_count == 0) return false;
         const state = self.immutable_memtables.items[self.immutable_head];
@@ -4955,7 +5009,7 @@ pub const Backend = struct {
         for (self.activeImmutableMemtables()[0..window_count]) |window_state| {
             estimated_io_bytes +|= estimatedFlushIoBytes(window_state);
         }
-        if (!self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
+        if (charge_maintenance and !self.tryReserveMaintenanceIoBudget(estimated_io_bytes)) return false;
         if (self.root_dir != null and self.storage != null) {
             return try self.flushOldestImmutableMemtableUnlockedBuild(window_count);
         }
@@ -5702,7 +5756,7 @@ pub const Backend = struct {
         return live.tree.root == durable.tree.root;
     }
 
-    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !usize {
+    fn writeRunSetManifestSnapshotLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool) !u64 {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         var turn = try self.beginManifestTurn();
         defer turn.deinit();
@@ -5711,7 +5765,7 @@ pub const Backend = struct {
 
     /// Caller owns the publication lane and backend lock. Administrative callers
     /// acquire that lane before constructing their prospective ownership graph.
-    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !usize {
+    fn writeRunSetManifestSnapshotInTurnLocked(self: *Backend, root_dir: []const u8, runs: []const Run, start_ns: u64, live: bool, waited: bool) !u64 {
         std.debug.assert(self.manifest_publish_in_flight);
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         self.manifest_publish_allow_concurrency = live;
@@ -6423,7 +6477,7 @@ pub const Backend = struct {
                 if (self.read_version != version) return error.CompactionPlanningStale;
                 if (self.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_in_memory_state, compaction_mod.DomainIndex.buildMemoryBound(version.runs.len));
                 self.retainReaderKind(.compaction);
-                var snapshot = .{ .allocator = self.allocator, .options = self.options, .planning_directory = version.directory, .runs = std.ArrayListUnmanaged(Run){ .items = version.runs, .capacity = 0 } };
+                var snapshot = .{ .allocator = self.allocator, .options = self.options, .planning_directory = version.directory, .runs = std.ArrayListUnmanaged(Run){ .items = version.runs, .capacity = 0, .pointer_stability = .{} } };
                 runtime_mod.unlockBackend(Backend, self, true);
                 const built = compaction_mod.DomainIndex.create(&snapshot);
                 _ = runtime_mod.lockBackend(Backend, self);
@@ -7331,7 +7385,7 @@ pub const Backend = struct {
                     self.wal_checkpoint_retry_deadline_ns,
                     candidate_deadline_ns,
                 );
-                if (@intFromEnum(reason) > @intFromEnum(self.wal_checkpoint_retry_reason)) {
+                if (@backingInt(reason) > @backingInt(self.wal_checkpoint_retry_reason)) {
                     self.wal_checkpoint_retry_reason = reason;
                 }
             }
@@ -7739,7 +7793,15 @@ pub const Backend = struct {
         defer self.maintenance_io_budget_remaining = saved_budget;
 
         var flushes: u64 = 0;
-        if (self.activeImmutableMemtableCount() > 0 and try self.flushOldestImmutableMemtable()) {
+        // A direct-bulk-ingest batch queues its already-sorted state as an
+        // immutable memtable so it can be published without a mutable-insert
+        // detour; it is not an ordinary flush candidate. Forcing it through
+        // the normal flush path here would record a spurious flush and
+        // defeat the bulk flush-threshold multiplier the caller configured.
+        // Bulk sessions defer their memtable flush to session finish (see
+        // finishBulkIngestSessionWithOptionsLocked); only the manifest
+        // checkpoint below must not wait for that.
+        if (!self.bulkIngestActive() and self.activeImmutableMemtableCount() > 0 and try self.flushOldestImmutableMemtable()) {
             flushes = 1;
         }
         var manifest_publishes: u64 = 0;
@@ -8109,22 +8171,18 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats = RecoveredRunFileCleanupStats{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            _ = parseRunIdFromRecoveredTableTempFileName(entry.name) orelse continue;
+        for (names) |name| {
+            _ = parseRunIdFromRecoveredTableTempFileName(name) orelse continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             const size = self.storage.?.fileSize(path) catch 0;
             repository_mod.deleteFileAbsoluteWithStorage(self.storage.?, path) catch |err| switch (err) {
@@ -8145,23 +8203,19 @@ pub const Backend = struct {
         const runs_dir = try std.fs.path.join(self.allocator, &.{ root_dir, "runs" });
         defer self.allocator.free(runs_dir);
 
-        var io_impl = std.Io.Threaded.init(self.allocator, .{});
-        defer io_impl.deinit();
-
-        var dir = std.Io.Dir.cwd().openDir(io_impl.io(), runs_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return .{},
+        const storage = self.storage.?;
+        const names = storage.listFileNamesAlloc(self.allocator, runs_dir) catch |err| switch (err) {
+            error.FileNotFound, error.DirectoryListingUnsupported => return .{},
             else => return err,
         };
-        defer dir.close(io_impl.io());
+        defer storage_io.Storage.freeFileNames(self.allocator, names);
 
         var stats: RecoveredRunFileCleanupStats = .{};
-        var it = dir.iterate();
-        while (try it.next(io_impl.io())) |entry| {
-            if (entry.kind != .file) continue;
-            const run_id = parseRunIdFromTableFileName(entry.name) orelse continue;
+        for (names) |name| {
+            const run_id = parseRunIdFromTableFileName(name) orelse continue;
             if (self.runIdTrackedByManifestLocked(run_id)) continue;
 
-            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, entry.name });
+            const path = try std.fs.path.join(self.allocator, &.{ runs_dir, name });
             defer self.allocator.free(path);
             if (self.pathTrackedByManifestLocked(path) or self.obsoletePathPinnedByOpenVersion(path)) continue;
 
@@ -8173,9 +8227,14 @@ pub const Backend = struct {
             stats.files_deleted +|= 1;
             stats.bytes_deleted +|= size;
         }
-        const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
-        stats.files_deleted +|= manifest_stats.files_deleted;
-        stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        // Manifest-set inventory requires the native exclusive writer lease.
+        if (builtin.os.tag != .freestanding) {
+            var io_impl = std.Io.Threaded.init(self.allocator, .{});
+            defer io_impl.deinit();
+            const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
+            stats.files_deleted +|= manifest_stats.files_deleted;
+            stats.bytes_deleted +|= manifest_stats.bytes_deleted;
+        }
         return stats;
     }
 
@@ -10058,7 +10117,7 @@ fn implementationTests() type {
             try std.testing.expect(one_memtable_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = one_memtable_bytes + one_memtable_bytes / 2,
                 .hard_limit_bytes = one_memtable_bytes * 3,
             };
@@ -10109,7 +10168,7 @@ fn implementationTests() type {
             try std.testing.expect(one_memtable_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = one_memtable_bytes * 10,
             };
@@ -10154,7 +10213,7 @@ fn implementationTests() type {
             try std.testing.expect(one_memtable_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = one_memtable_bytes * 10,
             };
@@ -10194,7 +10253,7 @@ fn implementationTests() type {
 
         test "lsm backend direct bulk admission rejects before wal append" {
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = 1,
             };
@@ -10232,7 +10291,7 @@ fn implementationTests() type {
             try std.testing.expect(incoming_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = incoming_bytes + incoming_bytes / 2,
                 .hard_limit_bytes = incoming_bytes * 4,
             };
@@ -10268,7 +10327,7 @@ fn implementationTests() type {
             try std.testing.expect(incoming_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = incoming_bytes,
                 .hard_limit_bytes = incoming_bytes + incoming_bytes / 2,
             };
@@ -10296,7 +10355,7 @@ fn implementationTests() type {
         }
 
         test "lsm backend resource manager reclaims local durable state before rejecting" {
-            const payload = [_]u8{'a'} ** (16 * 1024);
+            const payload = @as([(16 * 1024)]u8, @splat('a'));
             var sample: ActiveMemTable = .{ .ordered_enabled = false };
             defer sample.deinit(std.testing.allocator);
             try sample.upsert(std.testing.allocator, .{}, "key:a", &payload, false);
@@ -10304,12 +10363,12 @@ fn implementationTests() type {
             const admission_bytes = one_memtable_bytes * 16;
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = admission_bytes,
                 .hard_limit_bytes = admission_bytes + one_memtable_bytes / 2,
             };
             var policies = resource_manager_mod.Options.defaultPolicies();
-            policies[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
+            policies[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
             var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .policies = policies });
             var storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer storage.deinit();
@@ -10330,7 +10389,7 @@ fn implementationTests() type {
             }
             // The current payload fills the slice. Reclaiming this durable immutable
             // leaves enough space for run metadata and the next small transaction.
-            manager.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+            manager.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{}, "key:b", "b");
@@ -11633,6 +11692,9 @@ fn implementationTests() type {
                 .storage = storage.storage(),
                 .wal_checkpoint_dirty_bytes_multiplier = 2,
                 .wal_checkpoint_dirty_bytes_floor = 256,
+                // Bulk sessions defer soft-pressure memtable flushes. A hard
+                // admission bound still checkpoints during sustained writes.
+                .wal_hard_limit_bytes = 2048,
                 .foreground_soft_wal_checkpoint = true,
                 .compact_threshold_runs = 100,
             });
@@ -11655,12 +11717,14 @@ fn implementationTests() type {
             try std.testing.expect(backend.bulkIngestActive());
             try std.testing.expect(writes < 16);
             try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_flushes);
+            try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_admission_checkpoints);
             try std.testing.expect(backend.write_stats.manifest_writes > 0);
-            try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
+            try std.testing.expect(backend.snapshotMaintenanceStats().wal_retained_bytes <= backend.options.wal_hard_limit_bytes);
             try std.testing.expectEqualSlices(u8, &value, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 
-            try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+            try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = true });
             try std.testing.expect(!backend.bulkIngestActive());
+            try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
         }
 
         test "lsm backend deferred direct bulk commits publish bounded wal checkpoints" {
@@ -12093,6 +12157,88 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 2500), try countRunEntriesForTest(&backend));
             try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000000"));
             try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000499"));
+        }
+
+        test "bulk append index prefix probes merge pending keys namespaces and disk tombstones" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1 });
+            defer backend.close();
+            {
+                var initial = try backend.beginBatchWithOptions(.{});
+                defer initial.abort();
+                try initial.put(.{ .name = "docs" }, "p:a", "disk");
+                try initial.put(.{ .name = "docs" }, "p:b", "disk");
+                try initial.put(.{ .name = "other" }, "p:a", "other");
+                try initial.commit();
+            }
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try std.testing.expect(!try txn.hasPrefix(.{}, "p:"));
+            try txn.appendPut(.{}, "bulk:a", "first");
+            try txn.appendPut(.{}, "bulk:a", "last");
+            try std.testing.expect(try txn.hasPrefix(.{}, "bulk:"));
+            try std.testing.expectEqual(@as(usize, 2), txn.bulk_appends.entryCount());
+            try txn.delete(.{ .name = "docs" }, "p:a");
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try txn.delete(.{ .name = "docs" }, "p:b");
+            try std.testing.expect(!try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "other" }, "p:"));
+            try txn.put(.{ .name = "docs" }, "p:c", "new");
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try txn.delete(.{}, "bulk:a");
+            try std.testing.expect(!try txn.hasPrefix(.{}, "bulk:"));
+            try txn.commit();
+        }
+
+        test "bulk append index native namespace overlay preserves latest values across drain" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+            defer backend.close();
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try txn.appendPut(.{}, "a", "old");
+            try txn.appendPut(.{ .name = "docs" }, "a", "namespaced");
+            try txn.appendPut(.{}, "z", "last");
+            try txn.appendPut(.{}, "a", "new");
+            try std.testing.expectEqualStrings("new", try txn.get(.{}, "a"));
+            try std.testing.expectEqualStrings("namespaced", try txn.get(.{ .name = "docs" }, "a"));
+            try std.testing.expectError(error.NotFound, txn.get(.{}, "missing"));
+            var values: [3]?[]const u8 = undefined;
+            try txn.getManySorted(.{}, &.{ "a", "missing", "z" }, &values);
+            try std.testing.expectEqualStrings("new", values[0].?);
+            try std.testing.expect(values[1] == null);
+            try std.testing.expectEqualStrings("last", values[2].?);
+            try txn.delete(.{}, "a");
+            try std.testing.expectError(error.NotFound, txn.get(.{}, "a"));
+            try std.testing.expectEqual(@as(u32, 0), txn.bulk_index.entries.count());
+            try txn.appendPut(.{}, "a", "recreated");
+            try std.testing.expectEqualStrings("recreated", try txn.get(.{}, "a"));
+            try txn.commit();
+            try std.testing.expectEqualStrings("recreated", try backend.getMergedWithMutable(&backend.mutable, .{}, "a"));
+        }
+
+        test "bulk append index native bound overlay preserves latest values across drain" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+            defer backend.close();
+            var txn = try runtime_mod.BoundWriteTxn(Backend).openWithOptions(&backend, .{ .name = "docs" }, .{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try txn.appendPut("a", "old");
+            try txn.appendPut("z", "last");
+            try txn.appendPut("a", "new");
+            try std.testing.expectEqualStrings("new", try txn.get("a"));
+            try std.testing.expectError(error.NotFound, txn.get("missing"));
+            var values: [3]?[]const u8 = undefined;
+            try txn.getManySorted(&.{ "a", "missing", "z" }, &values);
+            try std.testing.expectEqualStrings("new", values[0].?);
+            try std.testing.expect(values[1] == null);
+            try std.testing.expectEqualStrings("last", values[2].?);
+            try txn.put("a", "updated");
+            try std.testing.expectEqual(@as(u32, 0), txn.bulk_index.entries.count());
+            try std.testing.expectEqualStrings("updated", try txn.get("a"));
+            try txn.commit();
+            try std.testing.expectEqualStrings("updated", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "a"));
         }
 
         test "lsm backend runtime erases bound store handles with cursor access across runs" {
@@ -12589,7 +12735,7 @@ fn implementationTests() type {
                     var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
                     var pad_key_buf: [32]u8 = undefined;
                     const pad_key = try std.fmt.bufPrint(&pad_key_buf, "pad:{d}", .{generation});
-                    const padding = [_]u8{'p'} ** 256;
+                    const padding = @as([256]u8, @splat('p'));
                     try txn.put(.{ .name = "docs" }, pad_key, &padding);
                     switch (generation) {
                         1 => {
@@ -12715,7 +12861,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             var txn = try backend.beginWrite();
             try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
             try txn.commit();
@@ -12730,7 +12876,7 @@ fn implementationTests() type {
             var mutable: ActiveMemTable = .{};
             defer mutable.deinit(std.testing.allocator);
 
-            const value = [_]u8{'x'} ** (256 * 1024);
+            const value = @as([(256 * 1024)]u8, @splat('x'));
             for (0..8) |i| {
                 // Unpinned replacements reclaim the superseded allocation immediately.
                 const value_len: usize = if (i % 2 == 0) 64 * 1024 else value.len;
@@ -12759,7 +12905,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -12801,7 +12947,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value_a = [_]u8{'a'} ** 300;
+            const value_a = @as([300]u8, @splat('a'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:a", value_a[0..]);
@@ -12821,7 +12967,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(retired_bytes, retired_stats.retired_immutable_bytes);
             try std.testing.expectEqual(@as(u64, 1), retired_stats.immutable_pinned_generations);
 
-            const value_b = [_]u8{'b'} ** 300;
+            const value_b = @as([300]u8, @splat('b'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:b", value_b[0..]);
@@ -12943,8 +13089,8 @@ fn implementationTests() type {
 
             var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
             defer runtime.deinit();
-            const value_a = [_]u8{'a'} ** 4096;
-            const value_b = [_]u8{'b'} ** 4096;
+            const value_a = @as([4096]u8, @splat('a'));
+            const value_b = @as([4096]u8, @splat('b'));
             {
                 var write = try runtime.beginWrite();
                 try write.put("doc:a", &value_a);
@@ -13279,7 +13425,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -13313,7 +13459,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             {
                 var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
                 try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -13346,7 +13492,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
             try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
             try txn.commit();
@@ -13365,7 +13511,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 100;
+            const value = @as([100]u8, @splat('x'));
             var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
             try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
             try txn.commit();
@@ -13504,7 +13650,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             for (0..10) |i| {
                 var key_buf: [16]u8 = undefined;
                 const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
@@ -13541,7 +13687,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             for (0..10) |i| {
                 var key_buf: [16]u8 = undefined;
                 const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
@@ -14096,7 +14242,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14176,7 +14322,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14217,7 +14363,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14253,7 +14399,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14274,7 +14420,7 @@ fn implementationTests() type {
 
         test "lsm backend compaction scheduler reserves resource-manager work budget" {
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = 1,
             };
@@ -16651,7 +16797,7 @@ fn implementationTests() type {
 
             var key_storage: [count][64]u8 = undefined;
             var keys: [count][]const u8 = undefined;
-            var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+            var values: [count]?[]const u8 = @as([count]?[]const u8, @splat(null));
             for (&keys, 0..) |*key, i| {
                 key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
             }
@@ -17338,7 +17484,7 @@ fn implementationTests() type {
             defer runtime.deinit();
 
             const lane: u8 = 7;
-            const payload = "x" ** 1024;
+            const payload = z17RepeatString("x", 1024);
             {
                 var write = try runtime.beginWrite();
                 for (1..97) |sequence| {
@@ -17956,7 +18102,7 @@ fn implementationTests() type {
 
             var selected_keys: [selected_count][]const u8 = undefined;
             for (&selected_keys, 0..) |*key, i| key.* = keys[i * stride];
-            var values: [selected_count]?[]const u8 = [_]?[]const u8{null} ** selected_count;
+            var values: [selected_count]?[]const u8 = @as([selected_count]?[]const u8, @splat(null));
 
             var read = try backend.beginRead();
             defer read.abort();
@@ -18012,7 +18158,7 @@ fn implementationTests() type {
             var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
             defer runtime.deinit();
 
-            var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+            var values: [count]?[]const u8 = @as([count]?[]const u8, @splat(null));
             var probe = try runtime.beginProbe();
             defer probe.abort();
             try probe.getManySortedWithBlockCacheAdmission(&key_views, &values, .transient);
@@ -21403,7 +21549,7 @@ fn implementationTests() type {
                 defer runtime.deinit();
                 var txn = try runtime.beginRead();
                 defer txn.abort();
-                try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:079"));
+                try std.testing.expectEqualStrings(&(@as([48]u8, @splat('v'))), try txn.get("doc:079"));
                 try std.testing.expectError(error.NotFound, txn.get("doc:000"));
             }
 
@@ -21416,7 +21562,7 @@ fn implementationTests() type {
             defer runtime.deinit();
             var txn = try runtime.beginRead();
             defer txn.abort();
-            try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:000"));
+            try std.testing.expectEqualStrings(&(@as([48]u8, @splat('v'))), try txn.get("doc:000"));
             try std.testing.expectError(error.NotFound, txn.get("doc:079"));
         }
 
@@ -21769,7 +21915,7 @@ fn implementationTests() type {
         }
 
         test "lsm overlap scoring aggregate scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const time = @import("antfly_platform").time;
             for ([_]usize{ 1000, 10000, 100000 }) |count| {
                 var backend = Backend.init(std.heap.smp_allocator, .{ .l0_hard_limit_runs = 16 });
@@ -21905,7 +22051,7 @@ fn implementationTests() type {
         }
 
         test "lsm dependency continuation slice scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
             const time = @import("antfly_platform").time;
             const allocator = std.heap.smp_allocator;
@@ -22311,7 +22457,7 @@ fn implementationTests() type {
                 .defer_flush_on_commit = true,
             });
             defer backend.close();
-            const payload = [_]u8{'x'} ** 1024;
+            const payload = @as([1024]u8, @splat('x'));
             {
                 var write = try backend.beginWrite();
                 errdefer write.abort();
@@ -22357,7 +22503,7 @@ fn implementationTests() type {
                     .cache = if (cached) &cache else null,
                 });
                 defer backend.close();
-                const payload = [_]u8{'x'} ** (1024 * 1024);
+                const payload = @as([(1024 * 1024)]u8, @splat('x'));
                 {
                     var write = try backend.beginWrite();
                     errdefer write.abort();
@@ -22406,7 +22552,7 @@ fn implementationTests() type {
             const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
             var backend = try Backend.open(alloc, path, .{ .flush_threshold = 1 });
             defer backend.close();
-            const payload = [_]u8{'v'} ** 8192;
+            const payload = @as([8192]u8, @splat('v'));
             {
                 var write = try backend.beginWrite();
                 errdefer write.abort();
@@ -22524,7 +22670,7 @@ fn implementationTests() type {
             defer backend.close();
             var runtime = try backend.runtimeStore(alloc, .{ .name = "graph" });
             defer runtime.deinit();
-            const payload = [_]u8{'x'} ** (64 * 1024);
+            const payload = @as([(64 * 1024)]u8, @splat('x'));
             {
                 var write = try runtime.beginWrite();
                 errdefer write.abort();
@@ -22583,6 +22729,68 @@ fn implementationTests() type {
                 try std.testing.expectEqualStrings("a", (try cur.prev()).?.key);
                 try std.testing.expect((try cur.prev()) == null);
                 try std.testing.expectEqualStrings("c", (try cur.seekAtOrAfter("b")).?.key);
+            }
+        }
+
+        test "lsm monotone prefix seeks retain unaffected sources after churn" {
+            const alloc = std.testing.allocator;
+            for ([_]usize{ 0, 8, 32 }) |companions| {
+                var backing = storage_io.MemoryStorage.init(alloc);
+                defer backing.deinit();
+                var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+                defer cache.deinit();
+                var backend = try Backend.open(alloc, "/lsm-monotone-prefix", .{ .storage = backing.storage(), .cache = &cache, .compact_threshold_runs = 10000 });
+                defer backend.close();
+                // One cold level plus 32 overlapping update runs. Each prefix
+                // skip should reposition only the level and affected L0 run.
+                for (0..33) |run_number| {
+                    var state: State = .{};
+                    errdefer state.deinit(alloc);
+                    for (0..512) |row| {
+                        if (run_number != 0 and row % 32 != run_number - 1) continue;
+                        var key_buf: [64]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
+                        try state.upsert(alloc, .{ .name = "docs" }, key, if (run_number == 0) "old" else "new", false);
+                        if (run_number != 0) for (0..companions) |companion| {
+                            const child = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:1:{d:0>3}", .{ row, companion });
+                            try state.upsert(alloc, .{ .name = "docs" }, child, "index", false);
+                        };
+                    }
+                    var run = try compaction_mod.makeRunAtLevel(Backend, &backend, state, if (run_number == 0) 1 else 0);
+                    state = .{};
+                    errdefer run.deinit(alloc);
+                    try backend.runs.append(alloc, run);
+                }
+                try backend.runs.reindexForTest(alloc);
+                try backend.persistManifest();
+                var read = try backend.beginRead();
+                defer read.abort();
+                var counts: [2]usize = undefined;
+                var elapsed: [2]u64 = undefined;
+                for ([_]bool{ true, false }, 0..) |restart, mode| {
+                    var cursor = try read.openCursor(.{ .name = "docs" });
+                    defer cursor.close();
+                    cursor.test_full_forward_seek = restart;
+                    const started = @import("antfly_platform").time.monotonicNs();
+                    for (0..512) |row| {
+                        var key_buf: [64]u8 = undefined;
+                        const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
+                        const entry = (try cursor.seekAtOrAfter(key)) orelse return error.TestUnexpectedResult;
+                        try std.testing.expectEqualStrings(key, entry.key);
+                        try std.testing.expectEqualStrings("new", entry.value);
+                    }
+                    elapsed[mode] = @intCast(@import("antfly_platform").time.monotonicNs() - started);
+                    counts[mode] = cursor.test_seek_sources;
+                    // Equal borrowed-key seeks, reverse movement, exhaustion,
+                    // and reseeking after exhaustion retain public semantics.
+                    const borrowed = cursor.current_key.?;
+                    try std.testing.expectEqualStrings(borrowed, (try cursor.seekAtOrAfter(borrowed)).?.key);
+                    try std.testing.expectEqualStrings("doc:00000:0", (try cursor.seekAtOrAfter("doc:00000:0")).?.key);
+                    try std.testing.expect((try cursor.seekAtOrAfter("z")) == null);
+                    try std.testing.expectEqualStrings("doc:00000:0", (try cursor.seekAtOrAfter("doc:00000:0")).?.key);
+                }
+                try std.testing.expect(counts[1] * 8 < counts[0]);
+                std.debug.print("lsm-prefix-seek companions={d} rows=512 full_sources={d} incremental_sources={d} full_ns={d} incremental_ns={d}\n", .{ companions, counts[0], counts[1], elapsed[0], elapsed[1] });
             }
         }
 
@@ -22897,6 +23105,87 @@ fn implementationTests() type {
             }
         }
 
+        test "lsm native checkpoint waits for in-flight immutable publication and includes the mutable tail" {
+            if (!supports_waitable_immutable_flush or builtin.single_threaded) return;
+            const alloc = std.testing.allocator;
+            var storage = storage_io.MemoryStorage.init(alloc);
+            defer storage.deinit();
+            var backend = try Backend.open(alloc, "/checkpoint-inflight-cut", .{
+                .storage = storage.storage(),
+                .flush_threshold = 1024 * 1024,
+                .compact_threshold_runs = 10000,
+            });
+            defer backend.close();
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "older", "immutable");
+                try write.commit();
+            }
+            {
+                const locked = runtime_mod.lockBackend(Backend, &backend);
+                defer runtime_mod.unlockBackend(Backend, &backend, locked);
+                try backend.rotateMutableToImmutable();
+            }
+            {
+                var write = try backend.beginWrite();
+                errdefer write.abort();
+                try write.put(.{}, "retention", "committed-tail");
+                try write.commit();
+            }
+            // Model the exclusive oldest-epoch build owner. Completion waits
+            // for the checkpoint to rotate the committed tail, so this tests
+            // the contested cut deterministically, not a scheduling race.
+            backend.immutable_flush_build_in_flight = true;
+            backend.maintenance_io_budget_remaining = 11;
+            const Builder = struct {
+                fn complete(target: *Backend) !void {
+                    const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
+                    while (true) {
+                        const locked = runtime_mod.lockBackend(Backend, target);
+                        const ready = target.activeImmutableMemtableCount() >= 2;
+                        const expired = platform_time.monotonicNs() >= deadline;
+                        if (ready or expired) {
+                            target.maintenance_io_budget_remaining = 23;
+                            target.finishImmutableFlushBuildLocked();
+                        }
+                        runtime_mod.unlockBackend(Backend, target, locked);
+                        if (ready) return;
+                        if (expired) return error.TestCheckpointDidNotRotateTail;
+                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    }
+                }
+            };
+            var completion = std.testing.io.concurrent(Builder.complete, .{&backend}) catch |err| {
+                backend.finishImmutableFlushBuildLocked();
+                return err;
+            };
+            var completion_awaited = false;
+            defer if (!completion_awaited) {
+                completion.await(std.testing.io) catch {};
+            };
+            var checkpoint = try backend.pinNativeCheckpoint();
+            defer checkpoint.deinit();
+            const completed = completion.await(std.testing.io);
+            completion_awaited = true;
+            try completed;
+            try std.testing.expectEqual(@as(?u64, 23), backend.maintenance_io_budget_remaining);
+            try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
+            try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
+            try std.testing.expect(checkpoint.run_ids.len > 0);
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkpoint", .{tmp.sub_path});
+            defer alloc.free(restored_path);
+            _ = try checkpoint.materialize(std.testing.io, restored_path, .none);
+            var restored = try Backend.open(alloc, restored_path, .{ .backend = .{ .read_only = true } });
+            defer restored.close();
+            var read = try Backend.BoundReadTxn.open(&restored, .{});
+            defer read.abort();
+            try std.testing.expectEqualStrings("immutable", try read.get("older"));
+            try std.testing.expectEqualStrings("committed-tail", try read.get("retention"));
+        }
+
         test "lsm journal checkpoints bound replay and backups export standalone manifests" {
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
@@ -23133,7 +23422,7 @@ fn implementationTests() type {
             defer runtime_mod.unlockBackend(Backend, &backend, locked);
             _ = try backend.planningDirectory();
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
             var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
             backend.options.resource_manager = &manager;
             defer backend.options.resource_manager = null;
@@ -23238,7 +23527,7 @@ fn implementationTests() type {
         test "lsm planning metadata is admitted before allocation" {
             for ([_]usize{ 16, 128 }) |run_count| {
                 var budgets = resource_manager_mod.Options.defaultBudgets();
-                budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{ .hard_limit_bytes = 1 };
+                budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{ .hard_limit_bytes = 1 };
                 var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
                 var backend = Backend.init(std.testing.allocator, .{});
                 defer backend.close();
@@ -23379,7 +23668,7 @@ fn implementationTests() type {
                 var storage = storage_io.MemoryStorage.init(alloc);
                 defer storage.deinit();
                 var budgets = resource_manager_mod.Options.defaultBudgets();
-                budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 1024 };
+                budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 1024 };
                 var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
                 defer manager.deinit(alloc);
                 var backend = try Backend.open(alloc, "/bulk-admission-scheduler", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .compaction_scheduler = .{ .max_in_flight_input_bytes = if (memory_denial) 1024 * 1024 else 1, .allow_oversized_single_job = false, .resource_reservation_bytes = if (memory_denial) 2048 else 0 } });
@@ -23418,7 +23707,7 @@ fn implementationTests() type {
         }
 
         test "lsm bulk admission prepared work scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
             for ([_]usize{ 1000, 10000, 50000 }) |count| {
                 const keys = try alloc.alloc(u8, count * 8);
@@ -23582,7 +23871,7 @@ fn implementationTests() type {
         }
 
         test "lsm maintenance score aggregate scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
             for ([_]usize{ 1000, 10000, 50000 }) |count| {
                 const keys = try alloc.alloc(u8, count * 8);
@@ -24096,7 +24385,7 @@ fn implementationTests() type {
         }
 
         test "lsm persistent directory and lazy cursor scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const Fixture = struct {
                 allocator: Allocator = std.heap.smp_allocator,
                 retained: usize = 0,
@@ -24133,7 +24422,7 @@ fn implementationTests() type {
                         return self.planning_directory.?;
                     }
                 };
-                var planner = Planner{ .allocator = alloc, .runs = .{ .items = runs, .capacity = 0 } };
+                var planner = Planner{ .allocator = alloc, .runs = .{ .items = runs, .capacity = 0, .pointer_stability = .{} } };
                 var planning_ns: [2][3]u64 = undefined;
                 for (0..3) |sample| for (0..2) |turn| {
                     const mode = (sample + turn) % 2;
@@ -24266,7 +24555,7 @@ fn implementationTests() type {
         }
 
         test "lsm native durability lane contention benchmark" {
-            if (builtin.mode != .ReleaseFast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+            if (builtin.mode != .fast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
             var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
             defer io_impl.deinit();
@@ -24375,7 +24664,7 @@ fn implementationTests() type {
         }
 
         test "lsm incremental manifest publication benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
             defer storage.deinit();
@@ -24406,7 +24695,7 @@ fn implementationTests() type {
         }
 
         test "lsm shared scan epoch setup benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
             defer storage.deinit();
@@ -24847,7 +25136,7 @@ test "lsm backend source vector payloads write batches pipeline reads with overl
 
     var key_storage: [count][64]u8 = undefined;
     var keys: [count][]const u8 = undefined;
-    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    var values: [count]?[]const u8 = @as([count]?[]const u8, @splat(null));
     for (&keys, 0..) |*key, i| {
         key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
     }
@@ -24886,4 +25175,15 @@ test "lsm backend source vector payloads write batches pipeline reads with overl
     try std.testing.expectEqualSlices(u8, large_value, values[0].?);
     try std.testing.expectEqualStrings("committed", values[12].?);
     try std.testing.expectEqualStrings("overlay", values[13].?);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

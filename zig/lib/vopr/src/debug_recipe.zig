@@ -177,7 +177,7 @@ pub fn run(
             return replayed;
         }
 
-        fn collect(
+        pub fn collect(
             _: ?*anyopaque,
             child_allocator: std.mem.Allocator,
             artifact: *const trace.Trace,

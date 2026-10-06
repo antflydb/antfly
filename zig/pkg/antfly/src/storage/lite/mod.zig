@@ -20,7 +20,7 @@ pub const index_storage = @import("index_storage.zig");
 pub const native = @import("native.zig");
 pub const secret_store = @import("secret_store.zig");
 pub const paths = @import("paths.zig");
-pub const restore_staging = @import("restore_staging.zig");
+pub const restore_staging = if (@import("builtin").os.tag == .freestanding) @import("portable_restore.zig") else @import("restore_staging.zig");
 
 test {
     _ = backend;

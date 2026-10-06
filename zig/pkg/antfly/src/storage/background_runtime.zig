@@ -13,13 +13,14 @@
 // limitations.
 
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const std = @import("std");
 const pdf = @import("antfly_pdf");
 const platform = @import("antfly_platform");
 const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
-const threaded_io_limits = @import("../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
 pub const MaintenanceScheduler = @import("../common/maintenance_scheduler.zig").Scheduler;
 
@@ -37,7 +38,7 @@ pub const LsmMutableSnapshotReason = enum(u8) {
     bulk_current_scan,
 };
 
-pub const lsm_mutable_snapshot_reason_count = @typeInfo(LsmMutableSnapshotReason).@"enum".fields.len;
+pub const lsm_mutable_snapshot_reason_count = @typeInfo(LsmMutableSnapshotReason).@"enum".field_names.len;
 
 pub const LsmMutableSnapshotCloneReasonStats = struct {
     calls: u64 = 0,
@@ -60,7 +61,7 @@ pub const LsmOwnerCloneStats = struct {
     /// attribution record. This is a counter, not owner residency.
     labels_collapsed_total: u64 = 0,
     by_reason: [lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats =
-        [_]LsmMutableSnapshotCloneReasonStats{.{}} ** lsm_mutable_snapshot_reason_count,
+        @as([lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats, @splat(.{})),
 
     pub fn accumulate(self: *@This(), other: @This()) void {
         self.calls +|= other.calls;
@@ -102,7 +103,7 @@ const LsmOwnerCloneRegistry = struct {
         owner_overflow: bool,
         stats: LsmOwnerCloneStats,
 
-        fn deinit(self: *Entry, alloc: Allocator) void {
+        pub fn deinit(self: *Entry, alloc: Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.owner_name);
             self.* = undefined;
@@ -162,7 +163,7 @@ const LsmOwnerCloneRegistry = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *LsmOwnerCloneRegistry) void {
+    pub fn deinit(self: *LsmOwnerCloneRegistry) void {
         for (self.entries.items) |*entry| entry.deinit(self.alloc);
         self.entries.deinit(self.alloc);
         self.entry_by_key.deinit(self.alloc);
@@ -384,7 +385,7 @@ const LsmOwnerCloneRegistry = struct {
         self.collapsed_labels +|= stats.labels_collapsed_total;
     }
 
-    fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
+    pub fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
         // Registry labels are immutable and entries are never removed. Capture
         // a prefix boundary under the mutex, then allocate outside it. Labels
         // admitted after that boundary belong to the next scrape; retrying for
@@ -453,6 +454,9 @@ const LsmOwnerCloneRegistry = struct {
 };
 
 pub const Backend = runtime_backend.Backend;
+// Keep the concrete type available so host-oriented code remains type-correct
+// when compiled for WASI; `initIoLane` prevents constructing it on hostless
+// targets.
 pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
@@ -553,7 +557,7 @@ const LaneLeaseGate = struct {
             return;
         }
 
-        if (comptime builtin.os.tag == .freestanding or builtin.single_threaded) {
+        if (comptime is_hostless or builtin.single_threaded) {
             if (self.active() != 0) @panic("cannot drain a lane lease without an I/O coordinator");
             return;
         }
@@ -671,7 +675,7 @@ pub const OwnerMaintenanceProbe = struct {
 };
 
 fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime is_hostless) {
         return error.UnsupportedPlatform;
     } else {
         const io_impl = try alloc.create(IoImpl);
@@ -694,12 +698,12 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
 /// per additional detected CPU; the caller always runs one task inline.
 fn boundedIoAsyncLimit(concurrent_limit: u32) Io.Limit {
     if (comptime builtin.single_threaded) return .nothing;
-    const cpu_count = std.Thread.getCpuCount() catch return .limited(concurrent_limit);
+    const cpu_count = platform.process_memory.cpuCapacity().parallelism();
     return .limited(@min(@as(usize, concurrent_limit), cpu_count -| 1));
 }
 
 fn deinitIoLane(alloc: Allocator, io_impl: *IoImpl) void {
-    if (comptime builtin.os.tag != .freestanding) {
+    if (comptime !is_hostless) {
         io_impl.deinit();
     }
     alloc.destroy(io_impl);
@@ -735,7 +739,7 @@ const OwnerRegistry = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *OwnerRegistry) void {
+    pub fn deinit(self: *OwnerRegistry) void {
         var iterator = self.states.valueIterator();
         while (iterator.next()) |state| std.debug.assert(state.in_flight == 0);
         self.states.deinit(self.alloc);
@@ -985,23 +989,23 @@ pub const BackendRuntime = struct {
     borrowed_io: ?BorrowedIo = null,
     api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    api_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    api_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    api_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    api_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     inference_lane_gate: LaneLeaseGate = .{},
     inference_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    inference_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    inference_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    inference_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pdf_render_lane_gate: LaneLeaseGate = .{},
     pdf_render_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    pdf_render_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    pdf_render_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    pdf_render_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    pdf_render_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     worker_lane_gate: LaneLeaseGate = .{},
     reserved_workers: std.atomic.Value(usize) = .init(0),
     peak_reserved_workers: std.atomic.Value(usize) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
     control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    control_lane_acquisitions_total: std.atomic.Value(u64) = .init(0),
-    control_lane_rejections_total: std.atomic.Value(u64) = .init(0),
+    control_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    control_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
@@ -1042,7 +1046,7 @@ pub const BackendRuntime = struct {
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
 
         if (config.backend != .manual) {
-            if (comptime builtin.os.tag == .freestanding) {
+            if (comptime is_hostless) {
                 return error.UnsupportedPlatform;
             } else {
                 const io_impl = try initIoLane(alloc, config.lane_limits.durable_background);
@@ -1073,7 +1077,8 @@ pub const BackendRuntime = struct {
         const scheduler_io = self.io() orelse return error.MissingBackendRuntimeIo;
         // One coordinator and the durable-job reaper also use this lane.
         if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
-        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, @max(1, self.lane_limits.durable_background / 2));
+        const cpu_limit = platform.process_memory.cpuCapacity().parallelism();
+        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)));
         self.maintenance_scheduler.store(scheduler, .release);
         return scheduler;
     }
@@ -1122,7 +1127,11 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.pdf_render_executor.swap(null, .acq_rel)) |executor| {
-            executor.destroy();
+            if (comptime builtin.os.tag == .freestanding) {
+                unreachable;
+            } else {
+                executor.destroy();
+            }
         }
         if (self.control_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -1217,6 +1226,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn storage(self: *BackendRuntime) ?storage_io.Storage {
+        if (comptime builtin.os.tag == .freestanding) return null;
         if (self.borrowed_storage) |*borrowed| return borrowed.storage();
         return null;
     }
@@ -1357,7 +1367,7 @@ pub const BackendRuntime = struct {
             // No waiting, task submission, or transport occurs under this lock.
             const sync_io = Io.Threaded.global_single_threaded.io();
             impl.mutex.lockUncancelable(sync_io);
-            const remaining = @intFromEnum(impl.concurrent_limit) -| impl.busy_count;
+            const remaining = @backingInt(impl.concurrent_limit) -| impl.busy_count;
             const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
             impl.mutex.unlock(sync_io);
             if (reserved > remaining) return error.RequestForwardCapacityUnavailable;
@@ -1846,15 +1856,18 @@ pub const BackendRuntimeHandle = struct {
     }
 
     pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
-        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
-        errdefer deinitIoLane(alloc, filesystem_io);
-        var handle = try init(alloc, .{
-            .backend = .manual,
-            .filesystem_io = filesystem_io.io(),
-        });
-        handle.owned_filesystem_io = filesystem_io;
-        return handle;
+        if (comptime builtin.os.tag == .freestanding) {
+            return error.UnsupportedPlatform;
+        } else {
+            const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
+            errdefer deinitIoLane(alloc, filesystem_io);
+            var handle = try init(alloc, .{
+                .backend = .manual,
+                .filesystem_io = filesystem_io.io(),
+            });
+            handle.owned_filesystem_io = filesystem_io;
+            return handle;
+        }
     }
 
     pub fn deinit(self: *BackendRuntimeHandle) void {
@@ -1931,7 +1944,7 @@ const inline_vtable = DurableJobLane.VTable{
     .executes_inline = true,
 };
 
-const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
+const ThreadedDurableJobLane = if (is_hostless) struct {
     fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
@@ -1945,7 +1958,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
-    fn deinit(_: *ThreadedDurableJobLane) void {}
+    pub fn deinit(_: *ThreadedDurableJobLane) void {}
 
     fn submit(_: *anyopaque, _: Job) !void {
         return error.UnsupportedPlatform;
@@ -2022,7 +2035,7 @@ const ThreadedDurableJobLane = if (builtin.os.tag == .freestanding) struct {
         };
     }
 
-    fn deinit(self: *ThreadedDurableJobLane) void {
+    pub fn deinit(self: *ThreadedDurableJobLane) void {
         self.accepting.store(false, .release);
         self.shutdown_reaper.set(self.io_impl.io());
         if (self.reaper_future) |*future| {
@@ -2244,7 +2257,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 test "lane lease gate closes admission and drains a committed borrower" {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     var gate = LaneLeaseGate{};
     try std.testing.expectEqual(@as(?usize, 1), gate.tryAcquire());
@@ -2298,7 +2311,7 @@ test "backend runtime durable lane runs inline jobs" {
             ctx.ran = true;
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             ctx.deinit_called = true;
         }
@@ -2401,7 +2414,7 @@ test "backend runtime maintenance probes are bounded and fair across owners" {
     defer handle.deinit();
     const runtime = handle.ptr();
     var owner_ids: [owner_count]u64 = undefined;
-    var contexts = [_]Ctx{.{}} ** owner_count;
+    var contexts = @as([owner_count]Ctx, @splat(.{}));
     for (&owner_ids, &contexts) |*owner_id, *ctx| {
         owner_id.* = try runtime.allocOwnerId();
         try runtime.armOwnerMaintenanceProbe(owner_id.*, .{ .ptr = ctx, .run = Fns.run });
@@ -2430,7 +2443,7 @@ test "backend runtime durable lane leaves inline failed jobs owned by caller" {
             return error.ExpectedFailure;
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             ctx.deinit_called = true;
         }
@@ -2468,7 +2481,7 @@ test "backend runtime threaded durable lane sees initialized jobs" {
             ctx.ran.store(true, .release);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             ctx.deinit_called.store(true, .release);
         }
@@ -2478,7 +2491,11 @@ test "backend runtime threaded durable lane sees initialized jobs" {
     defer handle.deinit();
 
     const owner_id = try handle.ptr().allocOwnerId();
-    var ctxs: [64]Ctx = [_]Ctx{.{}} ** 64;
+    // The runtime reserves one of its bounded durable-lane slots for the
+    // reaper. This test checks initialized job handoff within the admission
+    // contract; saturation/rejection is covered by the lane-limit tests.
+    const job_count = default_io_concurrent_limit - 1;
+    var ctxs: [job_count]Ctx = @as([job_count]Ctx, @splat(.{}));
     for (&ctxs) |*ctx| {
         try handle.ptr().durable_jobs.submit(.{
             .owner_id = owner_id,
@@ -2646,7 +2663,7 @@ test "backend runtime retains LSM owner clone counters across generations" {
         .peak_bytes = 768,
         .bulk_current_scan_peak_active_bytes = 512,
     };
-    first.by_reason[@intFromEnum(LsmMutableSnapshotReason.bulk_current_scan)] = .{
+    first.by_reason[@backingInt(LsmMutableSnapshotReason.bulk_current_scan)] = .{
         .calls = 2,
         .bytes_total = 1024,
         .peak_bytes = 768,
@@ -3218,7 +3235,7 @@ test "backend runtime inference lane has an isolated bounded executor" {
         handle.ptr().inference_io_impl.load(.acquire).?.concurrent_limit,
     );
     try std.testing.expect(
-        @intFromEnum(handle.ptr().inference_io_impl.load(.acquire).?.async_limit) <= handle.ptr().lane_limits.inference,
+        @backingInt(handle.ptr().inference_io_impl.load(.acquire).?.async_limit) <= handle.ptr().lane_limits.inference,
     );
     try std.testing.expect(inference_io.vtable == handle.ptr().threaded_network_io_vtable.?);
     try std.testing.expect(
@@ -3272,8 +3289,8 @@ test "backend runtime publishes one PDF render lane under concurrent first lease
     defer handle.deinit();
     const runtime = handle.ptr();
     const caller_count = 8;
-    var published = [_]?*bounded_worker_lane.Executor{null} ** caller_count;
-    var failures = [_]?anyerror{null} ** caller_count;
+    var published = @as([caller_count]?*bounded_worker_lane.Executor, @splat(null));
+    var failures = @as([caller_count]?anyerror, @splat(null));
     var threads: [caller_count]std.Thread = undefined;
     for (&threads, &published, &failures) |*thread, *observed, *failure| thread.* = try std.Thread.spawn(.{}, struct {
         fn run(target: *BackendRuntime, result: *?*bounded_worker_lane.Executor, failed: *?anyerror) void {
@@ -3309,7 +3326,7 @@ test "backend runtime shutdown drains PDF render leases before worker destructio
         }
     }.run, .{ &handle, &deinitialized });
 
-    while (!runtime.pdf_render_lane_gate.isClosed()) std.Thread.yield() catch {};
+    while (!runtime.pdf_render_lane_gate.isClosed()) @import("antfly_platform").time.yieldNow();
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquirePdfRenderLane());
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
@@ -3326,7 +3343,7 @@ test "backend runtime publishes one lazy inference lane under concurrent first u
     try std.testing.expect(runtime.inference_io_impl.load(.acquire) == null);
 
     const caller_count = 16;
-    var published = [_]?*IoImpl{null} ** caller_count;
+    var published = @as([caller_count]?*IoImpl, @splat(null));
     var threads: [caller_count]std.Thread = undefined;
     for (&threads, &published) |*thread, *observed| {
         thread.* = try std.Thread.spawn(.{}, struct {
@@ -3348,10 +3365,7 @@ test "backend runtime async lane limit is CPU aware" {
         try std.testing.expectEqual(std.Io.Limit.nothing, boundedIoAsyncLimit(8));
         return;
     }
-    const expected = if (std.Thread.getCpuCount()) |cpu_count|
-        std.Io.Limit.limited(@min(@as(usize, 8), cpu_count -| 1))
-    else |_|
-        std.Io.Limit.limited(8);
+    const expected = std.Io.Limit.limited(@min(@as(usize, 8), platform.process_memory.cpuCapacity().parallelism() -| 1));
     try std.testing.expectEqual(expected, boundedIoAsyncLimit(8));
 }
 
@@ -3612,7 +3626,7 @@ test "backend runtime durable lane drains threaded jobs by owner" {
             _ = ctx.value.fetchAdd(1, .monotonic);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             _ = ctx.deinits.fetchAdd(1, .monotonic);
         }
@@ -3662,7 +3676,7 @@ test "backend runtime threaded durable lane rejects jobs after owner close" {
             _ = ctx.ran.fetchAdd(1, .release);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             _ = ctx.deinits.fetchAdd(1, .release);
         }
@@ -3730,7 +3744,7 @@ test "backend runtime owner close rejects recursive submit from draining job" {
             };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             _ = ctx.deinits.fetchAdd(1, .release);
         }
@@ -3901,7 +3915,7 @@ test "backend runtime concurrent owner drains both wait for payload teardown" {
         finished_drains: std.atomic.Value(usize) = .init(0),
         deinits: std.atomic.Value(usize) = .init(0),
         fn run(_: *anyopaque) !void {}
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.release.waitUncancelable(std.testing.io);
             _ = self.deinits.fetchAdd(1, .release);
@@ -4007,7 +4021,7 @@ test "backend runtime durable lane deinits threaded job payload after completion
             _ = ctx.ran.fetchAdd(1, .release);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             _ = ctx.deinits.fetchAdd(1, .release);
         }
@@ -4050,7 +4064,7 @@ test "backend runtime threaded worker releases payload before reaper joins" {
             ctx.ran.store(true, .release);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             ctx.deinit_called.store(true, .release);
         }

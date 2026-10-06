@@ -25,12 +25,14 @@
 //! leader turns replay into public entity writes. With no sink the stage waits by
 //! default; callers can explicitly disable promotion when that is intended.
 //!
-//! Replay stability: re-promoting the same resolution re-issues an idempotent
-//! upsert (the sink merges canonical fields and unions aliases), so replay is a
-//! no-op. The stage advances `applied_sequence` only after the upserts return.
+//! Replay stability: a durable companion row records each promoted decision.
+//! Replaying an unchanged decision skips the sink, which merges canonical
+//! fields and unions aliases. The stage advances `applied_sequence` only after
+//! the upserts return.
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -42,6 +44,7 @@ const resolution_runtime = @import("resolution_runtime.zig");
 const types = @import("types.zig");
 const runtime_callbacks = @import("runtime_callbacks.zig");
 const IndexManager = @import("catalog/index_manager.zig").IndexManager;
+const ResolverConfig = @import("catalog/index_manager.zig").ResolverConfig;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -89,6 +92,130 @@ fn buildEntityDocAlloc(alloc: std.mem.Allocator, e: resolver_lib.ResolvedEntity)
     return try std.json.Stringify.valueAlloc(alloc, doc, .{});
 }
 
+/// Companion state row: the entity keys and canonical fields this
+/// resolution artifact's canonical mentions last promoted, keyed by mention
+/// local id. Compositional event identity makes re-keying a designed
+/// convergence path (a participant merge re-keys the events it touches).
+/// Without this diff every re-key would strand the previously promoted
+/// document as a dead node. The diff writes a merged_into tombstone for a
+/// logical re-key and deletes the old copy for a pinned physical move. The
+/// recorded fields also make a replay of the same decision a no-op instead
+/// of a repeat live promotion.
+fn promotedKeysStateKeyAlloc(alloc: Allocator, resolution_key: []const u8) ![]u8 {
+    var key = std.ArrayListUnmanaged(u8).empty;
+    defer key.deinit(alloc);
+    try key.appendSlice(alloc, &.{ internal_keys.replay_namespace, 0xff, internal_keys.promoted_keys_state_kind });
+    try internal_keys.appendEncodedComponent(&key, alloc, resolution_key);
+    return try key.toOwnedSlice(alloc);
+}
+
+/// Each durable state value is
+/// [table, key, storage_table, label, canonical_name, alias].
+/// Keep this order in sync with stringifyPromotedKeysState.
+const PromotedRef = struct {
+    table: []const u8,
+    key: []const u8,
+    storage_table: ?[]const u8,
+    label: []const u8,
+    canonical_name: []const u8,
+    alias: []const u8,
+};
+
+/// An admitted promotion retains its exact immutable batch until the remote
+/// outcome and local receipt are both known. Keeping it in the same row as
+/// the receipt makes admission/completion single local atomic writes, and
+/// bounds recovery state to one batch per resolution artifact.
+const PromotionIntent = struct {
+    version: u32 = 1,
+    pending: struct {
+        config_generation: u64,
+        entries: []const EntityUpsert,
+        receipt: []const u8,
+    },
+};
+
+fn promotedAlias(e: resolver_lib.ResolvedEntity) []const u8 {
+    return if (e.surface_form.len > 0) e.surface_form else e.canonical_name;
+}
+
+fn promotedRefMatches(previous: PromotedRef, e: resolver_lib.ResolvedEntity) bool {
+    return std.mem.eql(u8, previous.table, e.doc_ref.table) and
+        std.mem.eql(u8, previous.key, e.doc_ref.key) and
+        (if (previous.storage_table) |physical|
+            if (e.doc_ref.storage_table) |current| std.mem.eql(u8, physical, current) else false
+        else
+            e.doc_ref.storage_table == null) and
+        std.mem.eql(u8, previous.label, e.label) and
+        std.mem.eql(u8, previous.canonical_name, e.canonical_name) and
+        std.mem.eql(u8, previous.alias, promotedAlias(e));
+}
+
+fn parsePromotedKeysState(a: Allocator, raw: []const u8) !std.StringArrayHashMapUnmanaged(PromotedRef) {
+    var map = std.StringArrayHashMapUnmanaged(PromotedRef).empty;
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    if (parsed != .object) return error.InvalidPromotionReceipt;
+    var it = parsed.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .array) return error.InvalidPromotionReceipt;
+        const fields = entry.value_ptr.array.items;
+        if (fields.len != 6) return error.InvalidPromotionReceipt;
+        var all_strings = true;
+        for (fields[0..2]) |field| {
+            if (field != .string) all_strings = false;
+        }
+        for (fields[3..]) |field| {
+            if (field != .string) all_strings = false;
+        }
+        if (!all_strings or (fields[2] != .string and fields[2] != .null)) return error.InvalidPromotionReceipt;
+        try map.put(a, entry.key_ptr.*, .{
+            .table = fields[0].string,
+            .key = fields[1].string,
+            .storage_table = if (fields[2] == .string) fields[2].string else null,
+            .label = fields[3].string,
+            .canonical_name = fields[4].string,
+            .alias = fields[5].string,
+        });
+    }
+    return map;
+}
+
+fn stringifyPromotedKeysState(a: Allocator, entities: []const resolver_lib.ResolvedEntity, prior: *const std.StringArrayHashMapUnmanaged(PromotedRef)) ![]u8 {
+    var state: std.json.ObjectMap = .empty;
+    for (entities) |e| {
+        // Review is a temporary decision, not proof that an earlier remote
+        // promotion vanished. Retain that receipt while this local mention
+        // exists, so a later accepted re-key still retires its old document.
+        // Truly removed mentions drop out, keeping state bounded by the
+        // current artifact rather than an ever-growing identity history.
+        const ref: PromotedRef = if (isPromotableDecision(e.decision) and e.canonical_name.len > 0) .{
+            .table = e.doc_ref.table,
+            .key = e.doc_ref.key,
+            .storage_table = e.doc_ref.storage_table,
+            .label = e.label,
+            .canonical_name = e.canonical_name,
+            .alias = promotedAlias(e),
+        } else prior.get(e.local_id) orelse continue;
+        var fields = std.json.Array.init(a);
+        try fields.append(.{ .string = ref.table });
+        try fields.append(.{ .string = ref.key });
+        try fields.append(if (ref.storage_table) |physical| .{ .string = physical } else .null);
+        try fields.append(.{ .string = ref.label });
+        try fields.append(.{ .string = ref.canonical_name });
+        try fields.append(.{ .string = ref.alias });
+        try state.put(a, e.local_id, .{ .array = fields });
+    }
+    return std.json.Stringify.valueAlloc(a, std.json.Value{ .object = state }, .{});
+}
+
+fn buildMergedTombstoneDocAlloc(alloc: Allocator, previous_table: []const u8, e: resolver_lib.ResolvedEntity) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .entity_type = e.label,
+        .canonical_name = e.canonical_name,
+        .merged_into = e.doc_ref.key,
+        .merged_into_table = if (std.mem.eql(u8, previous_table, e.doc_ref.table)) @as(?[]const u8, null) else e.doc_ref.table,
+    }, .{});
+}
+
 fn isPromotableDecision(decision: resolver_lib.Decision) bool {
     return switch (decision) {
         .new, .match => true,
@@ -116,26 +243,43 @@ fn processResolutionArtifactWithCatalog(
     store: resolver_lib.ArtifactStore,
     resolution_key: []const u8,
     sink: EntitySink,
-    catalog: ?*IndexManager,
+    resolver_configs: ?[]const ResolverConfig,
 ) !usize {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state_key = try promotedKeysStateKeyAlloc(a, resolution_key);
+    // Recover an already admitted operation before reading the mutable
+    // resolution artifact. A lost reply must retry the same batch even when
+    // the resolver has since moved to a different canonical key or the
+    // artifact has been deleted. Catalog fencing below still governs every
+    // newly admitted decision; recovery finishes an earlier admitted one.
+    var prior_raw = try store.get(a, state_key);
+    if (prior_raw) |state_raw| {
+        const value = try std.json.parseFromSliceLeaky(std.json.Value, a, state_raw, .{});
+        if (value == .object and value.object.get("pending") != null and value.object.get("pending").? == .object) {
+            const intent = try std.json.parseFromSliceLeaky(PromotionIntent, a, state_raw, .{});
+            if (intent.version != 1) return error.UnsupportedPromotionIntent;
+            var receipt = try parsePromotedKeysState(a, intent.pending.receipt);
+            defer receipt.deinit(a);
+            try sink.upsertBatch(gpa, intent.pending.entries);
+            try store.put(state_key, intent.pending.receipt);
+            prior_raw = try a.dupe(u8, intent.pending.receipt);
+        }
+    }
     const raw = (try store.get(gpa, resolution_key)) orelse return 0;
     defer gpa.free(raw);
 
     var parsed = try resolver_lib.parseResolution(gpa, raw);
     defer parsed.deinit();
 
-    if (catalog) |manager| {
+    if (resolver_configs) |resolvers| {
         // DB catalog mutation holds this runtime's catch-up fence. Keep the
         // generation check and the sink call in that same critical section so
         // queued decisions from an old configuration cannot publish later.
         const key = (try internal_keys.parseResolutionArtifactKeyAlloc(gpa, resolution_key)) orelse return 0;
         defer gpa.free(key.doc_key);
         defer gpa.free(key.artifact_name);
-        const resolvers = try manager.listResolvers(gpa);
-        defer {
-            for (resolvers) |*cfg| cfg.deinit(gpa);
-            gpa.free(resolvers);
-        }
         var current = false;
         for (resolvers) |cfg| {
             if (std.mem.eql(u8, cfg.resolution_artifact, key.artifact_name) and
@@ -151,15 +295,56 @@ fn processResolutionArtifactWithCatalog(
     // Collect every resolvable entity, then commit them in one batch so a
     // document's entities promote atomically (the sink uses a multi-participant
     // transaction when it supports one).
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
+    var prior = if (prior_raw) |state_raw| try parsePromotedKeysState(a, state_raw) else std.StringArrayHashMapUnmanaged(PromotedRef).empty;
+    defer prior.deinit(a);
 
     var entries = std.ArrayListUnmanaged(EntityUpsert).empty;
+    var promotable_count: usize = 0;
     for (parsed.entities) |e| {
         if (!isPromotableDecision(e.decision)) continue;
         // Need at least a canonical name to mint/merge a meaningful entity.
         if (e.canonical_name.len == 0) continue;
+        promotable_count += 1;
+        if (prior.get(e.local_id)) |previous| {
+            const same_logical_key = std.mem.eql(u8, previous.table, e.doc_ref.table) and std.mem.eql(u8, previous.key, e.doc_ref.key);
+            const same_storage_table = if (previous.storage_table) |old|
+                if (e.doc_ref.storage_table) |current| std.mem.eql(u8, old, current) else false
+            else
+                e.doc_ref.storage_table == null;
+            if (same_logical_key and same_storage_table) {
+                // The same key with the same canonical document is a
+                // byte-stable replay (a retried resolution window
+                // re-emits its artifact when the handoff marker did not
+                // land). The state row proves the earlier batch
+                // committed, so re-upserting adds nothing. Avoid a remote
+                // write even though the sink's live transform is safe to
+                // replay across a curator redirect.
+                if (promotedRefMatches(previous, e)) continue;
+            } else if (same_logical_key and previous.storage_table != null and e.doc_ref.storage_table != null) {
+                // A physical table move with the same logical key cannot use
+                // a redirect: that would point back to the old document.
+                // Delete the old pinned copy in the same commit as the new one.
+                try entries.append(a, .{
+                    .table = previous.table,
+                    .storage_table = previous.storage_table,
+                    .key = previous.key,
+                    .delete = true,
+                });
+            } else if (!same_logical_key) {
+                // A mention that previously promoted a DIFFERENT key in
+                // the same table has re-keyed (compositional identity
+                // following a merge): tombstone the old document with a
+                // merged_into redirect so it never lingers as a dead
+                // node, in the same atomic batch as the survivor's
+                // upsert.
+                try entries.append(a, .{
+                    .table = previous.table,
+                    .storage_table = previous.storage_table,
+                    .key = previous.key,
+                    .doc_json = try buildMergedTombstoneDocAlloc(a, previous.table, e),
+                });
+            }
+        }
         try entries.append(a, .{
             .table = e.doc_ref.table,
             .storage_table = e.doc_ref.storage_table,
@@ -167,8 +352,26 @@ fn processResolutionArtifactWithCatalog(
             .doc_json = try buildEntityDocAlloc(a, e),
         });
     }
-    if (entries.items.len == 0) return 0;
+    if (entries.items.len == 0 and promotable_count == prior.count()) return 0;
+    const state_value = try stringifyPromotedKeysState(a, parsed.entities, &prior);
+    if (entries.items.len == 0) {
+        // Every remaining mention was a byte-stable replay, but the artifact
+        // itself may have shrunk. Remove vanished mentions while retaining
+        // the last accepted receipt for mentions temporarily under review.
+        const unchanged = if (prior_raw) |prior_state| std.mem.eql(u8, prior_state, state_value) else promotable_count == 0;
+        if (!unchanged) try store.put(state_key, state_value);
+        return 0;
+    }
+    const intent = try std.json.Stringify.valueAlloc(a, PromotionIntent{ .pending = .{
+        .config_generation = parsed.config_generation,
+        .entries = entries.items,
+        .receipt = state_value,
+    } }, .{});
+    try store.put(state_key, intent);
     try sink.upsertBatch(gpa, entries.items);
+    // Replace the admitted intent only after the batch commits. A crash or
+    // lost reply now re-emits its exact bytes before diffing a newer artifact.
+    try store.put(state_key, state_value);
     return entries.items.len;
 }
 
@@ -187,12 +390,12 @@ fn processRecordKeysMaybeSink(
     store: resolver_lib.ArtifactStore,
     changed_artifact_keys: []const []const u8,
     sink: ?EntitySink,
-    catalog: ?*IndexManager,
+    resolver_configs: ?[]const ResolverConfig,
 ) !void {
     for (changed_artifact_keys) |key| {
         if (!internal_keys.isResolutionArtifactKey(key)) continue;
         const concrete_sink = sink orelse return error.PromotionSinkUnavailable;
-        _ = try processResolutionArtifactWithCatalog(gpa, store, key, concrete_sink, catalog);
+        _ = try processResolutionArtifactWithCatalog(gpa, store, key, concrete_sink, resolver_configs);
     }
 }
 
@@ -242,13 +445,25 @@ fn catchUpWindowMaybeSink(
         store: resolver_lib.ArtifactStore,
         sink: ?EntitySink,
         catalog: ?*IndexManager,
+        resolver_configs: ?[]ResolverConfig = null,
         max_seen: u64,
 
         fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             var decoded = try change_journal_mod.decodeRecord(self.gpa, payload);
             defer decoded.deinit();
-            try processRecordKeysMaybeSink(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink, self.catalog);
+            // The catalog is needed only if this record can reach the sink.
+            // Keep one snapshot for all matching artifacts in this window.
+            if (self.sink != null and self.resolver_configs == null) {
+                if (self.catalog) |manager| {
+                    for (decoded.record.changed_artifact_keys) |key| {
+                        if (!internal_keys.isResolutionArtifactKey(key)) continue;
+                        self.resolver_configs = try manager.listResolvers(self.gpa);
+                        break;
+                    }
+                }
+            }
+            try processRecordKeysMaybeSink(self.gpa, self.store, decoded.record.changed_artifact_keys, self.sink, self.resolver_configs);
             if (sequence > self.max_seen) self.max_seen = sequence;
         }
     };
@@ -259,6 +474,10 @@ fn catchUpWindowMaybeSink(
         .sink = sink,
         .catalog = catalog,
         .max_seen = from_sequence,
+    };
+    defer if (ctx.resolver_configs) |configs| {
+        for (configs) |*cfg| cfg.deinit(gpa);
+        gpa.free(configs);
     };
     _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
         error.PromotionSinkUnavailable => return .{
@@ -288,9 +507,9 @@ pub const PromotionRuntime = struct {
     sink_available: std.atomic.Value(bool),
     missing_sink_blocked: std.atomic.Value(bool),
     missing_sink_policy: MissingSinkPolicy,
-    applied_sequence: std.atomic.Value(u64),
-    target_sequence: std.atomic.Value(u64),
-    error_count: std.atomic.Value(u64),
+    applied_sequence: @import("antfly_platform").atomic.Value(u64),
+    target_sequence: @import("antfly_platform").atomic.Value(u64),
+    error_count: @import("antfly_platform").atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     worker_started: std.atomic.Value(bool) = .init(false),
@@ -359,6 +578,16 @@ pub const PromotionRuntime = struct {
             };
         }
         if (advanced) self.wakeWorker();
+    }
+
+    pub const RetirementReadiness = enum { ready, pending, publication_not_owned };
+
+    /// Caller holds catch_up_mutex, fencing the publisher and owner changes.
+    /// Diagnostic strings are deliberately not part of the catalog contract.
+    pub fn retirementReadinessLocked(self: *PromotionRuntime) RetirementReadiness {
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return .ready;
+        if (self.owner) |owner| if (!owner.isLocalOwner()) return .publication_not_owned;
+        return .pending;
     }
 
     pub fn stats(self: *PromotionRuntime) types.ReplayStageStats {
@@ -582,8 +811,9 @@ const testing = std.testing;
 const MapStore = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]u8) = .empty,
+    put_count: usize = 0,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -598,9 +828,10 @@ const MapStore = struct {
         const gop = try self.map.getOrPut(self.alloc, key);
         if (gop.found_existing) self.alloc.free(gop.value_ptr.*) else gop.key_ptr.* = try self.alloc.dupe(u8, key);
         gop.value_ptr.* = owned_value;
+        self.put_count += 1;
     }
 
-    fn backendStore(self: *MapStore) BackendStore {
+    pub fn backendStore(self: *MapStore) BackendStore {
         return .{ .store_ptr = self };
     }
 
@@ -716,16 +947,22 @@ const CaptureSink = struct {
     alloc: std.mem.Allocator,
     keys: std.ArrayListUnmanaged([]u8) = .empty,
     tables: std.ArrayListUnmanaged([]u8) = .empty,
+    storage_tables: std.ArrayListUnmanaged(?[]u8) = .empty,
     docs: std.ArrayListUnmanaged([]u8) = .empty,
+    deletes: std.ArrayListUnmanaged(bool) = .empty,
     batch_calls: usize = 0,
+    lost_replies: usize = 0,
 
-    fn deinit(self: *CaptureSink) void {
+    pub fn deinit(self: *CaptureSink) void {
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.tables.items) |t| self.alloc.free(t);
+        for (self.storage_tables.items) |maybe_table| if (maybe_table) |table| self.alloc.free(table);
         for (self.docs.items) |d| self.alloc.free(d);
         self.keys.deinit(self.alloc);
         self.tables.deinit(self.alloc);
+        self.storage_tables.deinit(self.alloc);
         self.docs.deinit(self.alloc);
+        self.deletes.deinit(self.alloc);
     }
 
     fn sink(self: *CaptureSink) EntitySink {
@@ -734,23 +971,29 @@ const CaptureSink = struct {
 
     const vtable = EntitySink.VTable{ .upsert = upsert, .upsert_batch = upsertBatch };
 
-    fn record(self: *CaptureSink, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
+    fn record(self: *CaptureSink, table: []const u8, storage_table: ?[]const u8, key: []const u8, doc_json: []const u8, delete: bool) anyerror!void {
         try self.tables.append(self.alloc, try self.alloc.dupe(u8, table));
+        try self.storage_tables.append(self.alloc, if (storage_table) |physical| try self.alloc.dupe(u8, physical) else null);
         try self.keys.append(self.alloc, try self.alloc.dupe(u8, key));
         try self.docs.append(self.alloc, try self.alloc.dupe(u8, doc_json));
+        try self.deletes.append(self.alloc, delete);
     }
 
     fn upsert(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
-        try self.record(table, key, doc_json);
+        try self.record(table, null, key, doc_json, false);
     }
 
     fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const EntityUpsert) anyerror!void {
         _ = allocator;
         const self: *CaptureSink = @ptrCast(@alignCast(ptr));
         self.batch_calls += 1;
-        for (entries) |e| try self.record(e.table, e.key, e.doc_json);
+        for (entries) |e| try self.record(e.table, e.storage_table, e.key, e.doc_json, e.delete);
+        if (self.lost_replies > 0) {
+            self.lost_replies -= 1;
+            return error.HttpConnectionClosing;
+        }
     }
 };
 
@@ -820,6 +1063,238 @@ test "processResolutionArtifact upserts a canonical entity per resolved mention"
 
     // A missing artifact promotes nothing.
     try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), "no-such-key", capture.sink()));
+}
+
+test "processResolutionArtifact atomically moves a pinned physical destination" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","storage_table":"table:old","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("table:old", capture.storage_tables.items[0].?);
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","storage_table":"table:new","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("table:old", capture.storage_tables.items[1].?);
+    try testing.expect(capture.deletes.items[1]);
+    try testing.expectEqualStrings("person/ada", capture.keys.items[1]);
+    try testing.expectEqualStrings("table:new", capture.storage_tables.items[2].?);
+    try testing.expect(!capture.deletes.items[2]);
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+
+    // Without a pinned new physical table, the old destination may still be
+    // the live one. Re-upsert the logical key without issuing a blind delete.
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada","surface_form":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expect(!capture.deletes.items[3]);
+}
+
+test "processResolutionArtifact recovers a lost reply before diffing a newer canonical key" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "events_resolution_v1");
+    defer alloc.free(resolution_key);
+    const state_key = try promotedKeysStateKeyAlloc(alloc, resolution_key);
+    defer alloc.free(state_key);
+    var capture = CaptureSink{ .alloc = alloc, .lost_replies = 2 };
+    defer capture.deinit();
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","key":"event/provisional"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke."}]}
+    );
+    try testing.expectError(error.HttpConnectionClosing, processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    const intent = try alloc.dupe(u8, map.map.get(state_key).?);
+    defer alloc.free(intent);
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","key":"event/canonical"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke."}]}
+    );
+    // A second uncertain outcome cannot replace the admitted batch with a
+    // newer one or accumulate an unbounded history of provisional keys.
+    try testing.expectError(error.HttpConnectionClosing, processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings(intent, map.map.get(state_key).?);
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[0]);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[1]);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[2]);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[3]);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[3], "\"merged_into\":\"event/canonical\"") != null);
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[4]);
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+}
+
+test "processResolutionArtifact tombstones the prior key when a mention re-keys" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "events_resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[
+        \\  {"local_id":"v0","doc_ref":{"table":"events","key":"event/provisional"},"confidence":1.0,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}
+        \\]}
+    );
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","key":"event/canonical"},"confidence":0.7,"decision":"review","label":"event","canonical_name":"Ada spoke."}]}
+    );
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 1), capture.keys.items.len);
+
+    // The sibling re-drive re-keys the mention onto its canonical
+    // compositional identity. Promotion is upsert-only, so without the
+    // promoted-keys diff the provisional document would linger as a dead
+    // node; instead it becomes a merged_into redirect in the same batch as
+    // the survivor's upsert.
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[
+        \\  {"local_id":"v0","doc_ref":{"table":"events","key":"event/canonical"},"confidence":1.0,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}
+        \\]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[1]);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[1], "\"merged_into\":\"event/canonical\"") != null);
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[2]);
+
+    // A byte-stable replay re-emits neither the tombstone nor the survivor:
+    // the state row proves both already committed.
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+}
+
+test "processResolutionArtifact tombstones the prior physical destination after re-key" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "events_resolution_v1");
+    defer alloc.free(resolution_key);
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","storage_table":"table:old","key":"event/provisional"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"v0","doc_ref":{"table":"events","storage_table":"table:new","key":"event/canonical"},"confidence":1,"decision":"new","label":"event","canonical_name":"Ada spoke.","surface_form":"Ada spoke."}]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 2), capture.batch_calls);
+    try testing.expectEqualStrings("event/provisional", capture.keys.items[1]);
+    try testing.expectEqualStrings("table:old", capture.storage_tables.items[1].?);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"merged_into\":\"event/canonical\"}",
+        capture.docs.items[1],
+    );
+    try testing.expectEqualStrings("event/canonical", capture.keys.items[2]);
+    try testing.expectEqualStrings("table:new", capture.storage_tables.items[2].?);
+    try @import("antfly-json").testing.expectSubsetJsonText(
+        alloc,
+        "{\"canonical_name\":\"Ada spoke.\"}",
+        capture.docs.items[2],
+    );
+}
+
+test "processResolutionArtifact redirects a curated move to another logical table" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"people","storage_table":"table:people","key":"person/ada"},"confidence":1,"decision":"new","label":"person","canonical_name":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try map.put(resolution_key,
+        \\{"config_generation":1,"entities":[{"local_id":"e0","doc_ref":{"table":"curated","storage_table":"table:curated","key":"person/ada"},"confidence":1,"decision":"match","label":"person","canonical_name":"Ada"}]}
+    );
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqualStrings("people", capture.tables.items[1]);
+    try testing.expectEqualStrings("table:people", capture.storage_tables.items[1].?);
+    try @import("antfly-json").testing.expectSubsetJsonText(alloc, "{\"merged_into\":\"person/ada\",\"merged_into_table\":\"curated\"}", capture.docs.items[1]);
+    try testing.expectEqualStrings("curated", capture.tables.items[2]);
+    try testing.expectEqualStrings("table:curated", capture.storage_tables.items[2].?);
+}
+
+test "processResolutionArtifact skips a byte-stable replay of an already-promoted decision" {
+    const alloc = testing.allocator;
+    var map = MapStore{ .alloc = alloc };
+    defer map.deinit();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    try map.put(resolution_key, sample_resolution);
+
+    var capture = CaptureSink{ .alloc = alloc };
+    defer capture.deinit();
+
+    try testing.expectEqual(@as(usize, 2), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 1), capture.batch_calls);
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+
+    // A retried resolution window re-emits the identical artifact (its
+    // handoff marker did not land). The entities are already durable, so the
+    // promoter must not issue redundant remote writes. Destination transforms
+    // remain replay-safe even when this source-side state has not landed.
+    const puts_before_replay = map.put_count;
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(puts_before_replay, map.put_count);
+    try testing.expectEqual(@as(usize, 1), capture.batch_calls);
+    try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+
+    // A changed canonical document for the same key (a new surface form
+    // joins the alias union) still promotes, and only that mention.
+    try map.put(resolution_key,
+        \\{"config_generation":3,"entities":[
+        \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada_lovelace"},"confidence":0.98,"decision":"new","label":"person","canonical_name":"Ada Lovelace","surface_form":"Countess of Lovelace"},
+        \\  {"local_id":"e1","doc_ref":{"table":"entities","key":"org/antfly"},"confidence":1.0,"decision":"match","label":"org","canonical_name":"Antfly","surface_form":"Antfly DB"}
+        \\]}
+    );
+    try testing.expectEqual(@as(usize, 1), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 2), capture.batch_calls);
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+    try testing.expectEqualStrings("person/ada_lovelace", capture.keys.items[2]);
+    try testing.expect(std.mem.indexOf(u8, capture.docs.items[2], "\"aliases\":[\"Countess of Lovelace\"]") != null);
+
+    // The durable state holds fields directly, without an escaped copy of
+    // the sink document. A replay of this new state skips the sink.
+    const state_key = try promotedKeysStateKeyAlloc(alloc, resolution_key);
+    defer alloc.free(state_key);
+    const state = map.map.get(state_key).?;
+    try testing.expect(std.mem.indexOf(u8, state, "\"e0\":[\"entities\",\"person/ada_lovelace\",null,\"person\",\"Ada Lovelace\",\"Countess of Lovelace\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, state, "\"doc\"") == null);
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+
+    // Dropping a mention changes the companion row without another sink call.
+    try map.put(resolution_key,
+        \\{"config_generation":3,"entities":[
+        \\  {"local_id":"e0","doc_ref":{"table":"entities","key":"person/ada_lovelace"},"confidence":0.98,"decision":"new","label":"person","canonical_name":"Ada Lovelace","surface_form":"Countess of Lovelace"}
+        \\]}
+    );
+    try testing.expectEqual(@as(usize, 0), try processResolutionArtifact(alloc, map.store(), resolution_key, capture.sink()));
+    try testing.expectEqual(@as(usize, 3), capture.keys.items.len);
+    try testing.expect(std.mem.indexOf(u8, map.map.get(state_key).?, "\"e1\"") == null);
 }
 
 test "processResolutionArtifact leaves review-band mentions unpromoted" {
@@ -903,7 +1378,7 @@ const FakeSource = struct {
         return .{ .matched_entries = matched, .last_sequence = last };
     }
 
-    fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
+    pub fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
     fn latest(ptr: *anyopaque, _: Allocator, from_sequence: u64, hint: replay_source_mod.TargetHint) anyerror!u64 {
@@ -1014,12 +1489,28 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
     try runtime.catchUp();
     try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.publication_not_owned, runtime.retirementReadinessLocked());
+    }
     const follower_stats = runtime.stats();
     try testing.expect(follower_stats.blocked);
     try testing.expectEqualStrings("not_source_group_leader", follower_stats.blocked_reason);
 
     owner.local_owner = true;
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.pending, runtime.retirementReadinessLocked());
+    }
+
     try runtime.catchUp();
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.ready, runtime.retirementReadinessLocked());
+    }
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
     const leader_stats = runtime.stats();
@@ -1167,6 +1658,11 @@ test "PromotionRuntime blocked retry observes sink wake generation" {
 
     try testing.expect(!runtime.shouldDelayBlockedRetry(observed_wake_generation));
     try runtime.catchUp();
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.ready, runtime.retirementReadinessLocked());
+    }
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
 

@@ -1,3 +1,7 @@
+import {
+  isRelationalExpressionType,
+  validateRelationalExpression,
+} from "./relational-expression.js";
 import type {
   ArtifactIndexSource,
   CreateIndexRequest,
@@ -6,6 +10,7 @@ import type {
   GraphIndexSource,
   IndexConfig,
   IndexEmbedderConfig,
+  RelationalIndexConfig,
 } from "./types.js";
 
 const MAX_ARTIFACT_SOURCES = 64;
@@ -28,6 +33,10 @@ export function validateCreateIndexRequestRelationships(
 ): void {
   if (!isRecord(config)) throw new TypeError("index config must be an object");
   const object = config as Record<string, unknown>;
+  if (object.type === "relational") {
+    validateRelationalIndexConfig(object);
+    return;
+  }
   const hasSources = relationshipFieldActive(object.sources);
   if (object.type === "full_text" && hasSources && relationshipFieldActive(object.artifact_name)) {
     throw new TypeError("Index sources cannot be combined with artifact_name.");
@@ -73,6 +82,106 @@ export function validateCreateIndexRequestRelationships(
         "Embedding source_artifact_name must match the authoritative embedding enrichment."
       );
     }
+  }
+}
+
+// Exhaustive generated-type keys make new public operators a deliberate SDK
+// validation change, without maintaining another application-local enum.
+const relationalOperators: Record<NonNullable<RelationalIndexConfig["where"]>[number]["op"], true> =
+  {
+    eq: true,
+    ne: true,
+    gt: true,
+    gte: true,
+    lt: true,
+    lte: true,
+    is_null: true,
+    is_not_null: true,
+    is_distinct: true,
+    is_not_distinct: true,
+  };
+const relationalOperatorNames = new Set(Object.keys(relationalOperators));
+
+function validateRelationalIndexConfig(config: Record<string, unknown>): void {
+  validateOnlyKeys(
+    config,
+    ["name", "type", "keys", "include_columns", "where", "description", "version"],
+    "relational index"
+  );
+  if (config.version !== undefined && config.version !== null && config.version !== 0) {
+    throw new TypeError("Relational index version is assigned by the table schema.");
+  }
+  if (!Array.isArray(config.keys) || config.keys.length === 0 || config.keys.length > 32) {
+    throw new TypeError("Relational index keys must contain between 1 and 32 columns.");
+  }
+  const columns = new Set<string>();
+  const expressionBudget = { nodes: 0, literalBytes: 0 };
+  config.keys.forEach((key, index) => {
+    const path = `keys[${index}]`;
+    if (!isRecord(key)) throw new TypeError(`${path} must be an object`);
+    validateOnlyKeys(
+      key,
+      ["column", "expression", "result_type", "direction", "nulls", "collation"],
+      path
+    );
+    if ((key.column !== undefined) === (key.expression !== undefined))
+      throw new TypeError(`${path} requires exactly one of column or expression`);
+    if (key.column !== undefined) {
+      validateRequiredString(key.column, `${path}.column`);
+      if (key.result_type !== undefined)
+        throw new TypeError(`${path}.result_type is only valid for an expression`);
+      if (columns.has(key.column))
+        throw new TypeError(`Duplicate index column ${JSON.stringify(key.column)}.`);
+      columns.add(key.column);
+    } else {
+      if (!isRelationalExpressionType(key.result_type))
+        throw new TypeError(`${path}.result_type is required for an expression`);
+      validateRelationalExpression(key.expression, `${path}.expression`, expressionBudget);
+    }
+    if (key.direction != null && key.direction !== "asc" && key.direction !== "desc")
+      throw new TypeError(`${path}.direction must be asc or desc`);
+    if (
+      key.nulls != null &&
+      key.nulls !== "default" &&
+      key.nulls !== "first" &&
+      key.nulls !== "last"
+    )
+      throw new TypeError(`${path}.nulls must be default, first, or last`);
+    if (key.collation != null) validateRequiredString(key.collation, `${path}.collation`);
+  });
+  if (config.include_columns != null) {
+    if (!Array.isArray(config.include_columns) || config.include_columns.length > 256)
+      throw new TypeError("include_columns must contain at most 256 columns");
+    config.include_columns.forEach((column, index) => {
+      validateRequiredString(column, `include_columns[${index}]`);
+      if (columns.has(column))
+        throw new TypeError(`Duplicate index column ${JSON.stringify(column)}.`);
+      columns.add(column);
+    });
+  }
+  if (config.where != null) {
+    if (!Array.isArray(config.where) || config.where.length > 256)
+      throw new TypeError("where must contain at most 256 conjuncts");
+    config.where.forEach((condition, index) => {
+      const path = `where[${index}]`;
+      if (!isRecord(condition)) throw new TypeError(`${path} must be an object`);
+      validateOnlyKeys(condition, ["column", "op", "value", "collation"], path);
+      validateRequiredString(condition.column, `${path}.column`);
+      if (typeof condition.op !== "string" || !relationalOperatorNames.has(condition.op))
+        throw new TypeError(`${path}.op must be a supported relational comparison`);
+      if (condition.collation != null)
+        validateRequiredString(condition.collation, `${path}.collation`);
+      const value = condition.value;
+      if (
+        value != null &&
+        typeof value !== "string" &&
+        typeof value !== "boolean" &&
+        (typeof value !== "number" || !Number.isFinite(value))
+      )
+        throw new TypeError(`${path}.value must be a finite JSON scalar or null`);
+      if ((condition.op === "is_null" || condition.op === "is_not_null") && value != null)
+        throw new TypeError(`${path}.${condition.op} does not take a non-null value`);
+    });
   }
 }
 
@@ -263,7 +372,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     validateOptionalString(source.mention_edge_type, `sources[${index}].mention_edge_type`);
     if (source.nodes !== undefined) {
       if (!isRecord(source.nodes)) throw new TypeError(`sources[${index}].nodes must be an object`);
-      validateOnlyKeys(source.nodes, ["model", "target"], `sources[${index}].nodes`);
+      validateOnlyKeys(source.nodes, ["model", "source", "target"], `sources[${index}].nodes`);
     }
     if (
       source.nodes?.model !== undefined &&
@@ -274,9 +383,16 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     }
     if (source.edge !== undefined) {
       if (!isRecord(source.edge)) throw new TypeError(`sources[${index}].edge must be an object`);
-      validateOnlyKeys(source.edge, ["type", "weight", "metadata"], `sources[${index}].edge`);
+      validateOnlyKeys(
+        source.edge,
+        ["type", "weight", "metadata", "edge_id"],
+        `sources[${index}].edge`
+      );
     }
-    for (const [fieldName, value] of [["target", source.nodes?.target]] as const) {
+    for (const [fieldName, value] of [
+      ["source", source.nodes?.source],
+      ["target", source.nodes?.target],
+    ] as const) {
       if (
         value !== undefined &&
         typeof value !== "string" &&
@@ -288,6 +404,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
       }
     }
     for (const [fieldName, value] of [
+      ["edge_id", source.edge?.edge_id],
       ["type", source.edge?.type],
       ["weight", source.edge?.weight],
     ] as const) {
@@ -300,6 +417,9 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
           `sources[${index}].edge.${fieldName} must be a string or finite number`
         );
       }
+    }
+    if (source.nodes?.source !== undefined && source.edge?.edge_id === undefined) {
+      throw new TypeError(`sources[${index}].nodes.source requires edge.edge_id`);
     }
     if (source.edge?.metadata !== undefined && !isRecord(source.edge.metadata)) {
       throw new TypeError(`sources[${index}].edge.metadata must be an object`);

@@ -27,7 +27,7 @@ test "WasmCompute shaped browser weights own bytes and packed embeddings decode 
     var compute = wasm_compute.WasmCompute.init(a);
     var cb = compute.computeBackend();
     defer cb.deinit();
-    var packed_bytes = [_]u8{1} ** 34;
+    var packed_bytes = @as([34]u8, @splat(1));
     packed_bytes[0] = 0;
     packed_bytes[1] = 0x3c; // f16 scale 1, then 32 signed int8 values of 1
     try compute.registerShapedWeight("embedding", &.{ 1, 32 }, &packed_bytes, .Q8_0);
@@ -63,6 +63,31 @@ test "WasmCompute layer norm accepts a packed f16 input weight" {
     defer a.free(values);
     try std.testing.expectApproxEqAbs(@as(f32, -1), values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 1), values[1], 0.0001);
+}
+
+test "WasmCompute concat decodes packed FP16 weights and validates geometry" {
+    const a = std.testing.allocator;
+    var compute = wasm_compute.WasmCompute.init(a);
+    var cb = compute.computeBackend();
+    defer cb.deinit();
+    const left = [_]f16{ 1, 2, 3, 4 };
+    const right = [_]f32{ 5, 6 };
+    try compute.registerShapedWeight("left", &.{ 2, 2 }, std.mem.sliceAsBytes(&left), .F16);
+    try compute.registerShapedWeight("right", &.{ 2, 1 }, std.mem.sliceAsBytes(&right), .F32);
+    const l = try cb.getWeight("left");
+    const r = try cb.getWeight("right");
+    const output = try cb.primConcatPrim(l, r, 1, &.{ 2, 2 }, &.{ 2, 1 });
+    defer cb.free(output);
+    const values = try cb.toFloat32(output, a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 3, 4, 6 }, values);
+    try std.testing.expectError(error.InvalidTensorShape, cb.primConcatPrim(l, r, 1, &.{ 1, 2 }, &.{ 2, 1 }));
+    try std.testing.expectError(error.InvalidTensorShape, cb.primConcatPrim(l, r, 2, &.{ 2, 2 }, &.{ 2, 1 }));
+    const bfloat = [_]u16{ 0x4780, 0xbf80 }; // 65536, -1; first exceeds F16 range.
+    try compute.registerShapedWeight("bfloat", &.{ 1, 2 }, std.mem.sliceAsBytes(&bfloat), .BF16);
+    const decoded = try cb.toFloat32(try cb.getWeight("bfloat"), a);
+    defer a.free(decoded);
+    try std.testing.expectEqualSlices(f32, &.{ 65536, -1 }, decoded);
 }
 
 // Tiny BERT config: 1 layer, 4 heads, 32-dim, 64 intermediate.

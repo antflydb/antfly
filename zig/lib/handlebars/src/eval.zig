@@ -144,9 +144,9 @@ pub const Value = union(enum) {
         // Structs → map
         if (info == .@"struct") {
             var m: ValueMap = .{};
-            inline for (info.@"struct".fields) |field| {
-                const fv = @field(val, field.name);
-                try m.put(arena, field.name, try from(arena, fv));
+            inline for (info.@"struct".field_names) |reflected_name| {
+                const fv = @field(val, reflected_name);
+                try m.put(arena, reflected_name, try from(arena, fv));
             }
             return .{ .map = m };
         }
@@ -769,9 +769,13 @@ pub const Eval = struct {
             .path => |p| self.resolvePath(&p),
             .string_literal => |s| Value.str(s.value),
             .boolean_literal => |b| Value.bln(b.value),
-            .number_literal => |n| if (n.is_int)
-                Value.int(@intFromFloat(n.value))
-            else
+            // Parse integers from the source text: the f64 value loses
+            // precision near the i64 limits and may not convert at all.
+            .number_literal => |n| if (!n.is_int)
+                Value.flt(n.value)
+            else if (std.fmt.parseInt(i64, n.original, 10)) |int|
+                Value.int(int)
+            else |_|
                 Value.flt(n.value),
             .sub_expression => |s| self.evalExpressionValue(&s.expression.expression),
             else => .undefined,
@@ -1109,9 +1113,9 @@ fn testRender(arena: Allocator, template: []const u8, context: Value) ![]const u
 
 fn makeCtx(arena: Allocator, entries: anytype) !Value {
     var m: ValueMap = .{};
-    inline for (@typeInfo(@TypeOf(entries)).@"struct".fields) |field| {
-        const val = @field(entries, field.name);
-        try m.put(arena, field.name, val);
+    inline for (comptime std.meta.fieldNames(@TypeOf(entries))) |reflected_name| {
+        const val = @field(entries, reflected_name);
+        try m.put(arena, reflected_name, val);
     }
     return .{ .map = m };
 }

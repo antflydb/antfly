@@ -281,3 +281,45 @@ it("extraction v2 binds response IDs to the submitted request, retaining legacy 
   respondWith(legacy);
   expect(await client.extractRaw(identifiedRequest)).toEqual(legacy);
 });
+
+it("Laya decisions preserve boolean zero probabilities", async () => {
+  const decision = {
+    name: "needed",
+    type: "boolean",
+    label: "false",
+    probabilities: [
+      { label: "false", probability: 1 },
+      { label: "true", probability: 0 },
+    ],
+    confidence: 1,
+    confidence_method: "max_probability",
+    act_probability: 0,
+    true_probability: 0,
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            object: "extraction",
+            model: "laya",
+            schema_version: 2,
+            data: [{ decisions: [decision] }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+    )
+  );
+  const response = await new InferenceClient({ baseUrl: "http://test" }).extractV2({
+    model: "laya",
+    inputs: [{ content: "hello" }],
+    schema: {
+      classifications: [
+        { name: "needed", mode: "boolean", instruction: "Need search?", labels: ["false", "true"] },
+      ],
+    },
+  });
+  expect(response.data[0]?.decisions?.[0]?.true_probability).toBe(0);
+  expect(response.data[0]?.decisions?.[0]).toEqual(decision);
+});

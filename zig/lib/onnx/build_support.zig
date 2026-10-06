@@ -25,7 +25,7 @@ pub fn create(
     options: struct {
         root: std.Build.LazyPath,
         target: std.Build.ResolvedTarget,
-        optimize: std.builtin.OptimizeMode,
+        optimize: std.lang.Optimize,
         protobuf: *std.Build.Module,
         // Standalone library consumers can inject ML into the exported graph module.
         ml: ?*std.Build.Module = null,

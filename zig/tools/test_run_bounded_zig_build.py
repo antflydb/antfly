@@ -65,20 +65,29 @@ class BoundedZigBuildTest(unittest.TestCase):
         # only composes owners; testing it would couple this contract to file
         # layout instead of the scheduler claim used by the storage artifact.
         runtime_build = SCRIPT.parents[1] / "pkg/antfly/build/runtime_memory.zig"
-        build = runtime_build.read_text(encoding="utf-8")
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
         )
-        claim = re.search(
-            r"\.storage_kernel => (?P<gib>\d+) \* 1024 \* 1024 \* 1024",
-            build,
+        claim = subprocess.run(
+            [
+                os.environ.get("ZIG", "zig"),
+                "run",
+                "--dep",
+                "runtime_memory",
+                "-Mroot=tools/runtime_storage_compile_claim.zig",
+                f"-Mruntime_memory={runtime_build}",
+            ],
+            cwd=SCRIPT.parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
         )
-        self.assertIsNotNone(
-            claim, "update this contract when storage claims change shape"
-        )
+        # These CI caps apply to Linux; the separate macOS reservation is
+        # checked by the runtime profile tests above.
         # Physical storage is its own archive. The distributed reservation no
         # longer includes DB codegen and cannot establish this admission check.
-        required = int(claim.group("gib")) * 1024**3
+        required = int(claim.stderr.strip())
+        self.assertGreater(required, 0)
         caps = re.findall(r"--max-rss-cap (\d+)", workflow)
         self.assertTrue(caps)
         for cap in caps:
@@ -95,15 +104,16 @@ class BoundedZigBuildTest(unittest.TestCase):
                 re.MULTILINE | re.DOTALL,
             )
         )
-        for job in (
-            "zig-base-tests",
-            "zig-full-tests",
-            "zig-build-cache-tests",
-            "e2e-base-build",
-            "e2e-full-build",
-        ):
+        expected_runners = {
+            "zig-base-tests": "arc-antfly-heavy",
+            "zig-full-tests": "arc-antfly-heavy",
+            "zig-build-cache-tests": "arc-antfly-heavy",
+            "e2e-base-build": "arc-antfly-heavy-runtime",
+            "e2e-full-build": "arc-antfly-heavy-runtime",
+        }
+        for job, runner in expected_runners.items():
             with self.subTest(job=job):
-                self.assertIn("    runs-on: arc-antfly-heavy\n", jobs[job])
+                self.assertIn(f"    runs-on: {runner}\n", jobs[job])
                 budget = re.search(
                     r'^      ANTFLY_ZIG_MAX_RSS: "(\d+)"$',
                     jobs[job],
@@ -175,7 +185,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
-            ["build", "antfly-unit-test", "-Doptimize=Debug"],
+            ["build", "antfly-unit-test", "-Doptimize=debug"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -185,7 +195,7 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "zig",
                 "build",
                 "antfly-unit-test",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
                 "--maxrss",

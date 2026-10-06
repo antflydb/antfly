@@ -23,7 +23,7 @@
 const std = @import("std");
 const fencing = @import("fencing.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const standby_mod = @import("standby.zig");
 
 var test_path_counter: u64 = 0;
@@ -307,7 +307,7 @@ fn testPath(alloc: std.mem.Allocator, comptime name: []const u8) ![:0]u8 {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
-    return try alloc.dupeZ(u8, raw);
+    return try alloc.dupeSentinel(u8, raw, 0);
 }
 
 fn baseRecord(lsn: u64, payload: []const u8) replication_record.Record {

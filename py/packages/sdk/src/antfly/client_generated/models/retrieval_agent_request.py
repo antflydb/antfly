@@ -104,9 +104,23 @@ class RetrievalAgentRequest:
                 behavior.
                 Each step can have its own generator (or chain of generators) and step-specific options.
                 If a step is not configured, it is skipped (retrieval always runs).
-            document_renderer (str | Unset): Handlebars template for rendering documents in the generation prompt.
-                Default uses TOON format for token efficiency.
-                Requires steps.generation to be set.
+            document_renderer (str | Unset): Handlebars template that renders each retrieved document in the
+                generation prompt. Requires steps.generation to be set.
+
+                The template is rendered once per hit against `{id, score, fields}`,
+                where `fields` is the hit's source. When omitted, each document's
+                fields are encoded as TOON (Token-Oriented Object Notation), which
+                carries the same structure as JSON in fewer tokens.
+
+                Helpers: `encodeToon` (options `indent`, 1 to 16, default 2; and
+                `delimiter`: `comma`, `tab`, or `pipe`), `scrubHtml`, `eq`, and
+                `media`. Values in `{{...}}` are HTML-escaped; use `{{{...}}}` for
+                raw text.
+
+                Examples:
+                - `{{encodeToon this.fields}}`
+                - `{{encodeToon this.fields delimiter="tab"}}`
+                - `Title: {{{this.fields.title}}}`
                  Example: {{encodeToon this.fields}}.
     """
 

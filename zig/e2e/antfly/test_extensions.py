@@ -14,8 +14,8 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import signal
 import subprocess
 import tempfile
@@ -25,7 +25,6 @@ from typing import Any
 
 import pytest
 import requests
-
 from conftest import (
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
@@ -209,7 +208,16 @@ class _ExtensionProcess:
             f"[data]\n{_read_log_tail(self.data_log_path)}"
         )
 
-    def stop(self) -> None:
+    def stop(self, *, test_failed: bool = False) -> None:
+        if test_failed:
+            for name, proc in (
+                ("standalone", self.standalone_proc),
+                ("metadata", self.metadata_proc),
+                ("data", self.data_proc),
+            ):
+                if proc is not None:
+                    print(f"extension {name} process exit={proc.poll()}")
+            print(self.debug_logs())
         self.port_reservations.close()
         for proc in (self.data_proc, self.metadata_proc, self.standalone_proc):
             if proc is not None and proc.poll() is None:
@@ -229,7 +237,7 @@ class _ExtensionProcess:
         ):
             if not handle.closed:
                 handle.close()
-        if not maybe_preserve_tempdir(self.tempdir):
+        if not maybe_preserve_tempdir(self.tempdir, failed=test_failed):
             self.tempdir.cleanup()
 
 
@@ -249,7 +257,8 @@ def extension_server(request) -> _ExtensionProcess:
     try:
         yield server
     finally:
-        server.stop()
+        report = getattr(request.node, "rep_call", None)
+        server.stop(test_failed=report is not None and report.failed)
 
 
 def _check_response(response: requests.Response) -> Any:
@@ -291,6 +300,105 @@ def test_extension_memoryaf_wasm_runtime_required() -> None:
         _assert_extension_package_routes(server)
     finally:
         server.stop()
+
+
+def test_extension_table_binding_rejects_rename_and_name_reuse(
+    extension_server: _ExtensionProcess,
+) -> None:
+    if not os.environ.get("ANTFLY_WASMTIME_LIB"):
+        pytest.skip("set ANTFLY_WASMTIME_LIB to exercise extension host calls")
+    server = extension_server
+    session = requests.Session()
+
+    def request(method: str, path: str, body=None):
+        return _check_response(
+            session.request(method, server.url + path, json=body, timeout=30)
+        )
+
+    wait_until(
+        lambda: any(
+            package["name"] == "memoryaf"
+            for package in request("GET", "/extensions/v1/packages")
+        ),
+        timeout_s=10.0,
+        interval_s=0.25,
+    )
+    api = server.api_url.removeprefix(server.url)
+    table = "extension_binding_original"
+    renamed = "extension_binding_archived"
+    request("POST", f"{api}/tables/{table}", {"num_shards": 1})
+    request(
+        "POST",
+        "/extensions/v1/installed/memoryaf",
+        {
+            "version": MEMORYAF_VERSION,
+            "scope": {"kind": "table", "table_name": table},
+            "grants": MEMORYAF_GRANTS,
+        },
+    )
+    members = request("GET", "/extensions/v1/installed/memoryaf/objects")
+    endpoint = "/mcp/v1/extensions/memoryaf"
+    initialized = session.post(
+        server.url + endpoint,
+        json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        timeout=10,
+    )
+    _check_response(initialized)
+    session.headers["Mcp-Session-Id"] = initialized.headers["Mcp-Session-Id"]
+
+    def invoke(name: str, arguments: dict):
+        return request(
+            "POST",
+            endpoint,
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )["result"]
+
+    def assert_binding_error(name: str, arguments: dict) -> None:
+        result = invoke(name, arguments)
+        assert result["isError"], result
+        assert result["content"][0]["text"] == (
+            "extension table binding is no longer current"
+        )
+
+    assert not invoke("store_memory", {"content": "original memory"})["isError"]
+    request(
+        "POST",
+        f"{api}/databases/default/namespaces/public/tables/{table}/rename",
+        {"name": renamed},
+    )
+    # Renaming must fail closed under the old public authorization scope, even
+    # when the guest itself claims that a failed host write succeeded.
+    assert_binding_error("store_memory", {"content": "after rename"})
+    assert_binding_error("list_memories", {"limit": 5})
+    request("POST", f"{api}/tables/{table}", {"num_shards": 1})
+    request(
+        "POST",
+        f"{api}/tables/{table}/batch",
+        {
+            "inserts": {"replacement": {"content": "replacement data"}},
+            "sync_level": "full_index",
+        },
+    )
+    request(
+        "POST",
+        "/extensions/v1/installed/memoryaf/update",
+        {"target_version": MEMORYAF_VERSION},
+    )
+    assert_binding_error("store_memory", {"content": "wrong table"})
+    assert_binding_error("list_memories", {"limit": 5})
+    assert members == request("GET", "/extensions/v1/installed/memoryaf/objects")
+    replacement = request("POST", f"{api}/tables/{table}/query", {"limit": 10})
+    original = request("POST", f"{api}/tables/{renamed}/query", {"limit": 10})
+    replacement_hits = replacement["responses"][0]["hits"]["hits"]
+    original_hits = original["responses"][0]["hits"]["hits"]
+    assert [hit["_id"] for hit in replacement_hits] == ["replacement"]
+    assert len(original_hits) == 1
+    assert original_hits[0]["_source"]["content"] == "original memory"
 
 
 def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> None:
@@ -429,7 +537,7 @@ def _assert_extension_package_routes(extension_server: _ExtensionProcess) -> Non
             timeout=10,
         )
     )
-    assert store["result"]["isError"] is False
+    assert store["result"]["isError"] is False, store
     assert store["result"]["structuredContent"]["ok"] is True
     assert store["result"]["structuredContent"]["tool"] == "store_memory"
     assert store["result"]["structuredContent"]["status"] == "stored"

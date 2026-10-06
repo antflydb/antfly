@@ -15,9 +15,9 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const cuda_identity = if (build_options.enable_cuda) @import("cuda_jit_identity") else struct {
-    pub const baseline = "0" ** 64;
-    pub const qualification = "0" ** 64;
-    pub const dispatch = "0" ** 64;
+    pub const baseline = z17RepeatString("0", 64);
+    pub const qualification = z17RepeatString("0", 64);
+    pub const dispatch = z17RepeatString("0", 64);
 };
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
@@ -246,7 +246,7 @@ fn noteGeneratedGqaScorePreworkConsumerConfigured(
     mode: GeneratedGqaScorePreworkConsumerMode,
     source: []const u8,
 ) void {
-    const bit = @as(u8, 1) << @intCast(@intFromEnum(mode));
+    const bit = @as(u8, 1) << @intCast(@backingInt(mode));
     if (generated_gqa_score_prework_consumer_config_log_mask.fetchOr(bit, .monotonic) & bit != 0) return;
     std.log.info(
         "cuda_gqa_score_prework_consumer: event=configured configured={s} consumer=none route=none head_dim=0 fallback_reason=none source={s}",
@@ -263,7 +263,7 @@ pub const GeneratedGqaScorePreworkRoute = enum(u8) {
     gemma4_f16_local = 2,
     gemma4_f16_global = 3,
 
-    fn name(self: GeneratedGqaScorePreworkRoute) []const u8 {
+    pub fn name(self: GeneratedGqaScorePreworkRoute) []const u8 {
         return switch (self) {
             .none => "none",
             .f32_control => "f32_control",
@@ -339,7 +339,7 @@ fn generatedGqaScorePreworkConsumerLogBit(
         512 => 1,
         else => return null,
     };
-    const bit_index = @as(usize, @intFromEnum(event)) * 6 + consumer_slot * 2 + head_dim_slot;
+    const bit_index = @as(usize, @backingInt(event)) * 6 + consumer_slot * 2 + head_dim_slot;
     return @as(u64, 1) << @intCast(bit_index);
 }
 
@@ -609,7 +609,7 @@ pub fn generatedGqaScorePreworkScheduleTag(
     compute_minor: i32,
 ) u8 {
     const selection = generatedGqaScorePreworkSelection(request, compute_major, compute_minor) orelse return 0;
-    return @intFromEnum(selection.route);
+    return @backingInt(selection.route);
 }
 
 fn generatedGqaDecodeSplitKvMinTokens() u32 {
@@ -676,7 +676,7 @@ fn generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len: usize) GeneratedGqaDecodeSc
 }
 
 pub fn generatedGqaDecodeScheduleTag(kv_seq_len: usize) u8 {
-    return @intFromEnum(generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len));
+    return @backingInt(generatedGqaDecodeScheduleForKvSeqLen(kv_seq_len));
 }
 
 fn generatedGqaDecodeWorkspaceBytes() usize {
@@ -693,7 +693,7 @@ fn allocGqaSplitkOnlineDecodeWorkspace(
     const layout = cuda_kernel_renderer.generatedSplitkOnlineDecodeWorkspaceLayout();
     var workspace = try buffer_mod.DeviceBuffer.alloc(ctx, layout.total_bytes);
     errdefer workspace.free(ctx);
-    const zero_counters = [_]u32{0} ** cuda_kernel_renderer.generated_splitk_online_decode_query_heads;
+    const zero_counters = @as([cuda_kernel_renderer.generated_splitk_online_decode_query_heads]u32, @splat(0));
     const counters = buffer_mod.DeviceBuffer{
         .ptr = workspace.ptr + layout.completion_counters_offset,
         .len = zero_counters.len * @sizeOf(u32),
@@ -718,7 +718,7 @@ const GqaDecodeProfile = enum {
     splitk_online_sm89,
     required_splitk_online_sm89,
 
-    fn name(self: GqaDecodeProfile) []const u8 {
+    pub fn name(self: GqaDecodeProfile) []const u8 {
         return switch (self) {
             .off => "off",
             .splitk_online_sm89 => "splitk-online-sm89",
@@ -781,7 +781,7 @@ const GqaPrefillProfile = enum {
     flash_f16_sm89,
     required_flash_f16_sm89,
 
-    fn name(self: GqaPrefillProfile) []const u8 {
+    pub fn name(self: GqaPrefillProfile) []const u8 {
         return switch (self) {
             .off => "off",
             .automatic => "automatic",
@@ -831,7 +831,7 @@ const GqaPrefillProfileSource = enum {
     canonical,
     legacy,
 
-    fn name(self: GqaPrefillProfileSource) []const u8 {
+    pub fn name(self: GqaPrefillProfileSource) []const u8 {
         return switch (self) {
             .default => "default",
             .canonical => "canonical",
@@ -1184,7 +1184,7 @@ fn claimGqaSplitkOnlineDecodeTelemetry(
     head_dim: usize,
 ) bool {
     const head_slot: usize = if (head_dim == 256) 0 else if (head_dim == 512) 1 else 2;
-    const bit_index = @as(usize, @intFromEnum(event)) * 3 + head_slot;
+    const bit_index = @as(usize, @backingInt(event)) * 3 + head_slot;
     const bit = @as(u64, 1) << @intCast(bit_index);
     return word.fetchOr(bit, .monotonic) & bit == 0;
 }
@@ -1495,7 +1495,7 @@ fn gqaFlashPrefillTelemetryBit(
 ) u64 {
     const head_bucket: usize = if (head_dim == 256) 0 else if (head_dim == 512) 1 else 2;
     const query_bucket: usize = if (q_seq_len == 512) 0 else if (q_seq_len == 3) 1 else 2;
-    const bit_index = @as(usize, @intFromEnum(event)) * 9 + head_bucket * 3 + query_bucket;
+    const bit_index = @as(usize, @backingInt(event)) * 9 + head_bucket * 3 + query_bucket;
     return @as(u64, 1) << @intCast(bit_index);
 }
 
@@ -1617,6 +1617,7 @@ pub const JitProductionRoutes = struct {
 pub const JitModelProfile = enum {
     clipclap,
     bert_encoder,
+    laya,
     deberta_reranker,
     gliner2,
     florence2,
@@ -1632,11 +1633,11 @@ pub const JitRouteScope = struct {
     // Deterministically sorted distinct [out_dim, in_dim] Q4_0 shapes that can
     // reach generated dispatch for this model. They define the live
     // conformance domain and are part of the exact qualification cache key.
-    observed_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    observed_shapes: [max_observed_shapes][2]usize = @as([max_observed_shapes][2]usize, @splat(.{ 0, 0 })),
     observed_shape_count: usize = 0,
-    prefill_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    prefill_shapes: [max_observed_shapes][2]usize = @as([max_observed_shapes][2]usize, @splat(.{ 0, 0 })),
     prefill_shape_count: usize = 0,
-    pair_shapes: [max_observed_shapes][2]usize = [_][2]usize{.{ 0, 0 }} ** max_observed_shapes,
+    pair_shapes: [max_observed_shapes][2]usize = @as([max_observed_shapes][2]usize, @splat(.{ 0, 0 })),
     pair_shape_count: usize = 0,
     conformance_complete: bool = true,
 
@@ -1646,6 +1647,7 @@ pub const JitRouteScope = struct {
             // E2B/E4B Q4_0. Encoder models keep the bundled runtime.
             .clipclap,
             .bert_encoder,
+            .laya,
             .deberta_reranker,
             .gliner2,
             .florence2,
@@ -1936,9 +1938,9 @@ const max_runtime_jit_functions_per_artifact = 3;
 
 const RuntimeJitFunctionMapping = struct {
     slots: [max_runtime_jit_functions_per_artifact]?*driver_mod.CUfunction =
-        [_]?*driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+        @as([max_runtime_jit_functions_per_artifact]?*driver_mod.CUfunction, @splat(null)),
     names: [max_runtime_jit_functions_per_artifact][]const u8 =
-        [_][]const u8{""} ** max_runtime_jit_functions_per_artifact,
+        @as([max_runtime_jit_functions_per_artifact][]const u8, @splat("")),
     count: usize = 0,
 
     fn one(slot: *driver_mod.CUfunction, name: []const u8) RuntimeJitFunctionMapping {
@@ -2000,7 +2002,7 @@ pub const RuntimeJitCancellation = struct {
 };
 
 fn runtimeJitMonotonicNowNs() u64 {
-    const value = std.Io.Clock.awake.now(io_compat.io()).nanoseconds;
+    const value = std.Io.Clock.awake.now(io_compat.testingIo()).nanoseconds;
     if (value <= 0) return 0;
     return @intCast(@min(value, std.math.maxInt(u64)));
 }
@@ -2073,12 +2075,12 @@ const runtime_jit_rejection_capacity: usize = 256;
 
 const RuntimeJitRejectionMemo = struct {
     const Entry = struct {
-        key: kernel_jit.ArtifactKey = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey),
+        key: kernel_jit.ArtifactKey = @as([@sizeOf(kernel_jit.ArtifactKey)]u8, @splat(0)),
         rejected_at_ns: u64 = 0,
         valid: bool = false,
     };
 
-    entries: [runtime_jit_rejection_capacity]Entry = [_]Entry{.{}} ** runtime_jit_rejection_capacity,
+    entries: [runtime_jit_rejection_capacity]Entry = @as([runtime_jit_rejection_capacity]Entry, @splat(.{})),
     next_evict: usize = 0,
 
     fn activeAt(self: *RuntimeJitRejectionMemo, key: kernel_jit.ArtifactKey, now_ns: u64) bool {
@@ -2172,7 +2174,7 @@ pub const RuntimeJitStats = struct {
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     runtime_jit_modules: [quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule =
-        [_]driver_mod.CUmodule{null} ** quant_kernel_compiler.first_generated_artifacts.len,
+        @as([quant_kernel_compiler.first_generated_artifacts.len]driver_mod.CUmodule, @splat(null)),
     runtime_jit_module_count: usize = 0,
     runtime_jit_routes: JitProductionRoutes = .{},
     runtime_jit_pending_routes: JitProductionRoutes = .{},
@@ -2259,6 +2261,7 @@ pub const KernelModule = struct {
     embedding_lookup_bf16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_f16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f32: driver_mod.CUfunction = null,
+    embedding_lookup_i32_bf16_weight_f32: driver_mod.CUfunction = null,
     embedding_lookup_i32_f16_weight_f32: driver_mod.CUfunction = null,
     take_rows_f32: driver_mod.CUfunction = null,
     gemma4_a4b_topk_rows_f32: driver_mod.CUfunction = null,
@@ -2274,6 +2277,10 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    laya_action_features_f32: driver_mod.CUfunction = null,
+    laya_local_attention_f32: driver_mod.CUfunction = null,
+    laya_packed_geglu_f32: driver_mod.CUfunction = null,
+    laya_attention_warp_f32: driver_mod.CUfunction = null,
     // BF16 tensor-core full attention for Qwen3-VL's token-major D=64 vision
     // tower.  Kept separate from the general attention dispatcher so only the
     // architecture with the qualified layout/semantics can select it.
@@ -2401,7 +2408,9 @@ pub const KernelModule = struct {
     primitive_broadcast_f32: driver_mod.CUfunction = null,
     layer_norm_backward_f32: driver_mod.CUfunction = null,
     primitive_softmax_f32: driver_mod.CUfunction = null,
+    selected_token_logprobs_f32: driver_mod.CUfunction = null,
     primitive_gather_f32: driver_mod.CUfunction = null,
+    primitive_gather_bf16_f32: driver_mod.CUfunction = null,
     primitive_scatter_add_axis0_f32: driver_mod.CUfunction = null,
     primitive_transpose_f32: driver_mod.CUfunction = null,
     primitive_transpose_2d_f32: driver_mod.CUfunction = null,
@@ -2919,7 +2928,7 @@ pub const KernelModule = struct {
         if (cache_path) |path| {
             cache = kernel_jit.ArtifactCache.initPath(
                 allocator,
-                io_compat.io(),
+                io_compat.testingIo(),
                 path,
                 try config.maxCacheBytes(),
             ) catch |err| blk: {
@@ -3000,7 +3009,7 @@ pub const KernelModule = struct {
                 }
             }
 
-            const kernel_name = allocator.dupeZ(u8, artifact.kernel_id) catch |err| {
+            const kernel_name = allocator.dupeSentinel(u8, artifact.kernel_id, 0) catch |err| {
                 try handleRuntimeJitFailure(mode, required_route, artifact, "kernel name allocation", @errorName(err), "");
                 continue;
             };
@@ -3045,10 +3054,10 @@ pub const KernelModule = struct {
                 try handleRuntimeJitFailure(mode, required_route, artifact, "PTX module load", @errorName(err), "");
                 continue;
             };
-            var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+            var functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
             var all_symbols_resolved = true;
             for (0..mapping.count) |index| {
-                const symbol_name = allocator.dupeZ(u8, mapping.names[index]) catch |err| {
+                const symbol_name = allocator.dupeSentinel(u8, mapping.names[index], 0) catch |err| {
                     _ = ctx.driver.fns.cuModuleUnload(module);
                     try handleRuntimeJitFailure(mode, required_route, artifact, "symbol name allocation", @errorName(err), "");
                     all_symbols_resolved = false;
@@ -3365,6 +3374,7 @@ pub const KernelModule = struct {
         const embedding_lookup_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_f16_weight_f32");
         var embedding_lookup_i32_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&embedding_lookup_i32_f32, module, "termite_embedding_lookup_i32_f32"));
+        const embedding_lookup_i32_bf16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_bf16_weight_f32");
         const embedding_lookup_i32_f16_weight_f32 = loadOptionalFunction(ctx, module, "termite_embedding_lookup_i32_f16_weight_f32");
         var take_rows_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&take_rows_f32, module, "termite_take_rows_f32"));
@@ -3388,6 +3398,10 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const laya_local_attention_f32 = loadOptionalFunction(ctx, module, "termite_laya_local_attention_f32");
+        const laya_packed_geglu_f32 = loadOptionalFunction(ctx, module, "termite_laya_packed_geglu_f32");
+        const laya_attention_warp_f32 = loadOptionalFunction(ctx, module, "termite_laya_attention_warp_f32");
+        const laya_action_features_f32 = loadOptionalFunction(ctx, module, "termite_laya_action_features_f32");
         const qwen3vl_vision_attention_tc_bf16_m32n16 = loadOptionalFunction(ctx, module, "termite_qwen3vl_vision_attention_tc_bf16_m32n16");
         const attention_f32_bert_prefill_s256_hd64 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64");
         const attention_f32_bert_prefill_s256_hd64_q8 = loadOptionalFunction(ctx, module, "termite_attention_f32_bert_prefill_s256_hd64_q8");
@@ -3570,7 +3584,9 @@ pub const KernelModule = struct {
         const primitive_broadcast_f32 = loadOptionalFunction(ctx, module, "termite_primitive_broadcast_f32");
         const layer_norm_backward_f32 = loadOptionalFunction(ctx, module, "termite_layer_norm_backward_f32");
         const primitive_softmax_f32 = loadOptionalFunction(ctx, module, "termite_primitive_softmax_f32");
+        const selected_token_logprobs_f32 = loadOptionalFunction(ctx, module, "termite_selected_token_logprobs_f32");
         const primitive_gather_f32 = loadOptionalFunction(ctx, module, "termite_primitive_gather_f32");
+        const primitive_gather_bf16_f32 = loadOptionalFunction(ctx, module, "termite_primitive_gather_bf16_f32");
         const primitive_scatter_add_axis0_f32 = loadOptionalFunction(ctx, module, "termite_primitive_scatter_add_axis0_f32");
         const primitive_transpose_f32 = loadOptionalFunction(ctx, module, "termite_primitive_transpose_f32");
         const primitive_transpose_2d_f32 = loadOptionalFunction(ctx, module, "termite_primitive_transpose_2d_f32");
@@ -3881,6 +3897,7 @@ pub const KernelModule = struct {
             .embedding_lookup_bf16_weight_f32 = embedding_lookup_bf16_weight_f32,
             .embedding_lookup_f16_weight_f32 = embedding_lookup_f16_weight_f32,
             .embedding_lookup_i32_f32 = embedding_lookup_i32_f32,
+            .embedding_lookup_i32_bf16_weight_f32 = embedding_lookup_i32_bf16_weight_f32,
             .embedding_lookup_i32_f16_weight_f32 = embedding_lookup_i32_f16_weight_f32,
             .take_rows_f32 = take_rows_f32,
             .gemma4_a4b_topk_rows_f32 = gemma4_a4b_topk_rows_f32,
@@ -3896,6 +3913,10 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .laya_action_features_f32 = laya_action_features_f32,
+            .laya_local_attention_f32 = laya_local_attention_f32,
+            .laya_packed_geglu_f32 = laya_packed_geglu_f32,
+            .laya_attention_warp_f32 = laya_attention_warp_f32,
             .qwen3vl_vision_attention_tc_bf16_m32n16 = qwen3vl_vision_attention_tc_bf16_m32n16,
             .attention_f32_bert_prefill_s256_hd64 = attention_f32_bert_prefill_s256_hd64,
             .attention_f32_bert_prefill_s256_hd64_q8 = attention_f32_bert_prefill_s256_hd64_q8,
@@ -3994,7 +4015,9 @@ pub const KernelModule = struct {
             .primitive_broadcast_f32 = primitive_broadcast_f32,
             .layer_norm_backward_f32 = layer_norm_backward_f32,
             .primitive_softmax_f32 = primitive_softmax_f32,
+            .selected_token_logprobs_f32 = selected_token_logprobs_f32,
             .primitive_gather_f32 = primitive_gather_f32,
+            .primitive_gather_bf16_f32 = primitive_gather_bf16_f32,
             .primitive_scatter_add_axis0_f32 = primitive_scatter_add_axis0_f32,
             .primitive_transpose_f32 = primitive_transpose_f32,
             .primitive_transpose_2d_f32 = primitive_transpose_2d_f32,
@@ -4253,6 +4276,7 @@ pub const KernelModule = struct {
             self.embedding_lookup_bf16_weight_f32 = null;
             self.embedding_lookup_f16_weight_f32 = null;
             self.embedding_lookup_i32_f32 = null;
+            self.embedding_lookup_i32_bf16_weight_f32 = null;
             self.embedding_lookup_i32_f16_weight_f32 = null;
             self.take_rows_f32 = null;
             self.gemma4_a4b_topk_rows_f32 = null;
@@ -4369,7 +4393,9 @@ pub const KernelModule = struct {
             self.primitive_broadcast_f32 = null;
             self.layer_norm_backward_f32 = null;
             self.primitive_softmax_f32 = null;
+            self.selected_token_logprobs_f32 = null;
             self.primitive_gather_f32 = null;
+            self.primitive_gather_bf16_f32 = null;
             self.primitive_scatter_add_axis0_f32 = null;
             self.primitive_transpose_f32 = null;
             self.primitive_transpose_2d_f32 = null;
@@ -4564,7 +4590,14 @@ pub const KernelModule = struct {
     pub fn hasBf16WeightPrimitives(self: *const KernelModule) bool {
         return self.linear_bf16_weight_f32_tiled != null and
             self.embedding_lookup_bf16_weight_f32 != null and
+            self.embedding_lookup_i32_bf16_weight_f32 != null and
             self.linear_bf16_weight_f32_qkv_nobias_tiled != null;
+    }
+
+    pub fn hasLayaPrimitives(self: *const KernelModule) bool {
+        return self.hasClipClapPrimitives() and self.rope_f32 != null and
+            self.slice_last_dim_f32 != null and self.elementwise_f32 != null and
+            self.laya_local_attention_f32 != null and self.laya_action_features_f32 != null;
     }
 
     pub fn hasClipClapPrimitives(self: *const KernelModule) bool {
@@ -4622,7 +4655,7 @@ pub const KernelModule = struct {
     }
 
     pub fn launchGliner25Attention(self: *const KernelModule, ctx: *context_mod.CudaContext, buffers: [10]buffer_mod.DeviceBuffer, descriptor: @import("../deberta_training_attention_schedule.zig").Params) !void {
-        const function = self.gliner25_attention[@intFromEnum(descriptor.phase)] orelse return error.CudaKernelUnavailable;
+        const function = self.gliner25_attention[@backingInt(descriptor.phase)] orelse return error.CudaKernelUnavailable;
         var pointers: [10]driver_mod.CUdeviceptr = undefined;
         var params: [11]?*anyopaque = undefined;
         for (buffers, 0..) |input, i| pointers[i] = input.ptr;
@@ -4735,25 +4768,18 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, work, &params);
     }
 
-    /// Fail closed before a GLiNER2 training run starts if an embedded CUDA
-    /// artifact predates any of the kernels needed by forward, autodiff, loss,
-    /// gradient accumulation, clipping, or the resident AdamW optimizer.
-    pub fn hasGliner2TrainingPrimitives(self: *const KernelModule) bool {
-        return self.hasGliner2Primitives() and
-            self.binary_scalar_f32 != null and
+    /// Backend-neutral primitives required by the compiled autodiff executor,
+    /// device gradient accumulation, clipping, and resident AdamW.
+    pub fn hasDeviceTrainingPrimitives(self: *const KernelModule) bool {
+        return self.binary_scalar_f32 != null and
             self.elementwise_broadcast_f32 != null and
             self.f32_to_i32 != null and
             self.round_f32 != null and
             self.primitive_where_f32 != null and
             self.primitive_batched_dot_f32 != null and
-            self.deberta_attention_backward_scores_f32 != null and
-            self.deberta_attention_backward_f32 != null and
             self.training_accumulate_f32 != null and
             self.training_adamw_f32 != null and
             self.training_sum_squares_f32 != null and
-            self.masked_bce_accumulate_f32 != null and
-            self.masked_bce_finalize_f32 != null and
-            self.masked_bce_backward_f32 != null and
             self.primitive_reduce_f32 != null and
             self.primitive_broadcast_f32 != null and
             self.layer_norm_backward_f32 != null and
@@ -4763,6 +4789,29 @@ pub const KernelModule = struct {
             self.primitive_transpose_f32 != null and
             self.primitive_concat_f32 != null and
             self.primitive_slice_f32 != null;
+    }
+
+    /// Fail closed before a Gemma 4 CUDA policy-training run.  Gemma uses the
+    /// decoder/BF16 forward surface and the generic autodiff/device-optimizer
+    /// surface; both must come from the same loaded artifact.
+    pub fn hasGemma4TrainingPrimitives(self: *const KernelModule) bool {
+        return self.hasGemma4DecoderPrimitives() and
+            self.hasBf16WeightPrimitives() and
+            self.primitive_gather_bf16_f32 != null and
+            self.hasDeviceTrainingPrimitives();
+    }
+
+    /// Fail closed before a GLiNER2 training run starts if an embedded CUDA
+    /// artifact predates any of the kernels needed by forward, autodiff, loss,
+    /// gradient accumulation, clipping, or the resident AdamW optimizer.
+    pub fn hasGliner2TrainingPrimitives(self: *const KernelModule) bool {
+        return self.hasGliner2Primitives() and
+            self.hasDeviceTrainingPrimitives() and
+            self.deberta_attention_backward_scores_f32 != null and
+            self.deberta_attention_backward_f32 != null and
+            self.masked_bce_accumulate_f32 != null and
+            self.masked_bce_finalize_f32 != null and
+            self.masked_bce_backward_f32 != null;
     }
 
     pub fn hasFlorence2Primitives(self: *const KernelModule) bool {
@@ -5298,7 +5347,7 @@ pub const KernelModule = struct {
         var input_ptr = input.ptr;
         var scalar_ptr = scalar.ptr;
         var count_u32 = try toU32(count);
-        var op_u32: u32 = @intFromEnum(op);
+        var op_u32: u32 = @backingInt(op);
         var scalar_on_left_u32: u32 = @intFromBool(scalar_on_left);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
@@ -7431,7 +7480,7 @@ pub const KernelModule = struct {
         var a_ptr = a.ptr;
         var b_ptr = b.ptr;
         var count_u32 = try toU32(count);
-        var op_u32: u32 = @intFromEnum(op);
+        var op_u32: u32 = @backingInt(op);
         var params = [_]?*anyopaque{
             @ptrCast(&dst_ptr),
             @ptrCast(&a_ptr),
@@ -7474,7 +7523,7 @@ pub const KernelModule = struct {
         var a_rank_u32 = try toU32(a_rank);
         var b_rank_u32 = try toU32(b_rank);
         var output_rank_u32 = try toU32(output_rank);
-        var op_u32: u32 = @intFromEnum(op);
+        var op_u32: u32 = @backingInt(op);
         var a_dims_mut = a_dims;
         var b_dims_mut = b_dims;
         var output_dims_mut = output_dims;
@@ -7527,6 +7576,7 @@ pub const KernelModule = struct {
         m: usize,
         n: usize,
         k: usize,
+        lhs_contract_last: bool,
         rhs_contract_last: bool,
     ) driver_mod.Error!void {
         const function = self.primitive_batched_dot_f32 orelse return error.CudaKernelUnavailable;
@@ -7545,6 +7595,7 @@ pub const KernelModule = struct {
         var m_u32 = try toU32(m);
         var n_u32 = try toU32(n);
         var k_u32 = try toU32(k);
+        var lhs_contract_last_u32: u32 = @intFromBool(lhs_contract_last);
         var rhs_contract_last_u32: u32 = @intFromBool(rhs_contract_last);
         var params = [_]?*anyopaque{
             @ptrCast(&output_ptr),
@@ -7554,6 +7605,7 @@ pub const KernelModule = struct {
             @ptrCast(&m_u32),
             @ptrCast(&n_u32),
             @ptrCast(&k_u32),
+            @ptrCast(&lhs_contract_last_u32),
             @ptrCast(&rhs_contract_last_u32),
         };
         try launch1d(function, ctx, output_count, &params);
@@ -7782,6 +7834,40 @@ pub const KernelModule = struct {
         scale: f32,
     ) driver_mod.Error!void {
         const function = self.embedding_lookup_i32_f16_weight_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total, dim);
+        try checkBytes(dst, count);
+        try checkRawBytes(weight, dim * @sizeOf(u16));
+        try checkRawBytes(ids, total * @sizeOf(i32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var weight_ptr = weight.ptr;
+        var ids_ptr = ids.ptr;
+        var total_u32 = try toU32(total);
+        var dim_u32 = try toU32(dim);
+        var scale_value = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&weight_ptr),
+            @ptrCast(&ids_ptr),
+            @ptrCast(&total_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&scale_value),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchEmbeddingLookupI32Bf16WeightF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        weight: buffer_mod.DeviceBuffer,
+        ids: buffer_mod.DeviceBuffer,
+        total: usize,
+        dim: usize,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.embedding_lookup_i32_bf16_weight_f32 orelse return error.CudaKernelUnavailable;
         const count = try checkedTensorElements(total, dim);
         try checkBytes(dst, count);
         try checkRawBytes(weight, dim * @sizeOf(u16));
@@ -8718,6 +8804,79 @@ pub const KernelModule = struct {
         const blocks = try checkedTensorElements(try checkedTensorElements(batch, num_heads), query_tiles);
         try launchBlocks(function, ctx, blocks, 256, &params);
         return true;
+    }
+
+    pub fn launchLayaLocalAttentionF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) driver_mod.Error!void {
+        if (batch == 0 or seq == 0 or seq > 512 or dim == 0 or dim > 128 or heads == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq), try checkedTensorElements(heads, dim));
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq) * @sizeOf(i64));
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var heads_u32 = try toU32(heads);
+        var dim_u32 = try toU32(dim);
+        var radius_u32 = try toU32(radius);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&q_ptr), @ptrCast(&k_ptr), @ptrCast(&v_ptr), @ptrCast(&mask_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&heads_u32), @ptrCast(&dim_u32), @ptrCast(&radius_u32) };
+        try launchBlocks(self.laya_local_attention_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq), heads), 128, &params);
+    }
+    pub fn launchLayaAttentionWarpF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, q: buffer_mod.DeviceBuffer, k: buffer_mod.DeviceBuffer, v: buffer_mod.DeviceBuffer, mask: buffer_mod.DeviceBuffer, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) driver_mod.Error!void {
+        if (batch == 0 or seq == 0 or seq > 512 or (dim != 64 and dim != 128) or heads == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq), try checkedTensorElements(heads, dim));
+        try checkBytes(dst, count);
+        try checkBytes(q, count);
+        try checkBytes(k, count);
+        try checkBytes(v, count);
+        try checkRawBytes(mask, try checkedTensorElements(batch, seq) * @sizeOf(i64));
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var heads_u32 = try toU32(heads);
+        var dim_u32 = try toU32(dim);
+        var radius_u32 = try toU32(radius);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&q_ptr), @ptrCast(&k_ptr), @ptrCast(&v_ptr), @ptrCast(&mask_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&heads_u32), @ptrCast(&dim_u32), @ptrCast(&radius_u32) };
+        try launchBlocks(self.laya_attention_warp_f32 orelse return error.CudaKernelUnavailable, ctx, try checkedTensorElements(try checkedTensorElements(batch, seq), heads), 128, &params);
+    }
+    pub fn launchLayaPackedGegluF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, src: buffer_mod.DeviceBuffer, rows: usize, width: usize) driver_mod.Error!void {
+        if (rows == 0 or width == 0) return error.InvalidCudaState;
+        const count = try checkedTensorElements(rows, width);
+        try checkBytes(dst, count);
+        try checkBytes(src, try checkedTensorElements(count, 2));
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var rows_u32 = try toU32(rows);
+        var width_u32 = try toU32(width);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&src_ptr), @ptrCast(&rows_u32), @ptrCast(&width_u32) };
+        try launch1d(self.laya_packed_geglu_f32 orelse return error.CudaKernelUnavailable, ctx, count, &params);
+    }
+
+    pub fn launchLayaActionFeaturesF32(self: *KernelModule, ctx: *context_mod.CudaContext, dst: buffer_mod.DeviceBuffer, hidden: buffer_mod.DeviceBuffer, logits: buffer_mod.DeviceBuffer, markers: buffer_mod.DeviceBuffer, batch: usize, seq: usize, count: usize, dim: usize) driver_mod.Error!void {
+        if (batch == 0 or seq == 0 or dim == 0 or count < 2 or count > 20) return error.InvalidCudaState;
+        try checkBytes(dst, try checkedTensorElements(batch, dim + 4));
+        try checkBytes(hidden, try checkedTensorElements(try checkedTensorElements(batch, seq), dim));
+        try checkBytes(logits, try checkedTensorElements(batch, count));
+        try checkRawBytes(markers, try checkedTensorElements(batch, count) * @sizeOf(i64));
+        var dst_ptr = dst.ptr;
+        var hidden_ptr = hidden.ptr;
+        var logits_ptr = logits.ptr;
+        var markers_ptr = markers.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_u32 = try toU32(seq);
+        var count_u32 = try toU32(count);
+        var dim_u32 = try toU32(dim);
+        var params = [_]?*anyopaque{ @ptrCast(&dst_ptr), @ptrCast(&hidden_ptr), @ptrCast(&logits_ptr), @ptrCast(&markers_ptr), @ptrCast(&batch_u32), @ptrCast(&seq_u32), @ptrCast(&count_u32), @ptrCast(&dim_u32) };
+        try launchBlocks(self.laya_action_features_f32 orelse return error.CudaKernelUnavailable, ctx, batch, 128, &params);
     }
 
     pub fn launchTokenMajorAttentionF32(
@@ -12349,7 +12508,9 @@ pub const KernelModule = struct {
             @ptrCast(&input_ptr),
             @ptrCast(&count_u32),
         };
-        try launch1d(function, ctx, count, &params);
+        // The kernel intentionally uses one block so its clipping-norm
+        // reduction order is deterministic across launches and processes.
+        try launchBlocks(function, ctx, 1, 256, &params);
     }
 
     pub fn launchMaskedBceAccumulateF32(
@@ -12601,6 +12762,43 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, rows, &params);
     }
 
+    pub fn launchSelectedTokenLogprobsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        output: buffer_mod.DeviceBuffer,
+        logits: buffer_mod.DeviceBuffer,
+        row_indices: buffer_mod.DeviceBuffer,
+        token_ids: buffer_mod.DeviceBuffer,
+        selected_count: usize,
+        rows: usize,
+        vocab_size: usize,
+    ) driver_mod.Error!void {
+        const function = self.selected_token_logprobs_f32 orelse return error.CudaKernelUnavailable;
+        const logits_count = try checkedTensorElements(rows, vocab_size);
+        try checkBytes(output, selected_count);
+        try checkBytes(logits, logits_count);
+        try checkRawBytes(row_indices, selected_count * @sizeOf(u32));
+        try checkRawBytes(token_ids, selected_count * @sizeOf(u32));
+        if (selected_count == 0) return;
+        var output_ptr = output.ptr;
+        var logits_ptr = logits.ptr;
+        var row_indices_ptr = row_indices.ptr;
+        var token_ids_ptr = token_ids.ptr;
+        var selected_count_u32 = try toU32(selected_count);
+        var rows_u32 = try toU32(rows);
+        var vocab_size_u32 = try toU32(vocab_size);
+        var params = [_]?*anyopaque{
+            @ptrCast(&output_ptr),
+            @ptrCast(&logits_ptr),
+            @ptrCast(&row_indices_ptr),
+            @ptrCast(&token_ids_ptr),
+            @ptrCast(&selected_count_u32),
+            @ptrCast(&rows_u32),
+            @ptrCast(&vocab_size_u32),
+        };
+        try launchBlocks(function, ctx, selected_count, 256, &params);
+    }
+
     pub fn launchPrimitiveGatherF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -12616,6 +12814,39 @@ pub const KernelModule = struct {
         const function = self.primitive_gather_f32 orelse return error.CudaKernelUnavailable;
         try checkBytes(output, output_count);
         try checkBytes(input, input_count);
+        try checkBytes(indices, index_count);
+        if (output_count == 0) return;
+        if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
+        var output_ptr = output.ptr;
+        var input_ptr = input.ptr;
+        var indices_ptr = indices.ptr;
+        var output_count_u32 = try toU32(output_count);
+        var index_count_u32 = try toU32(index_count);
+        var axis_extent_u32 = try toU32(axis_extent);
+        var suffix_size_u32 = try toU32(suffix_size);
+        var params = [_]?*anyopaque{
+            @ptrCast(&output_ptr),       @ptrCast(&input_ptr),       @ptrCast(&indices_ptr),
+            @ptrCast(&output_count_u32), @ptrCast(&index_count_u32), @ptrCast(&axis_extent_u32),
+            @ptrCast(&suffix_size_u32),
+        };
+        try launch1d(function, ctx, output_count, &params);
+    }
+
+    pub fn launchPrimitiveGatherBf16F32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        output: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        indices: buffer_mod.DeviceBuffer,
+        output_count: usize,
+        input_count: usize,
+        index_count: usize,
+        axis_extent: usize,
+        suffix_size: usize,
+    ) driver_mod.Error!void {
+        const function = self.primitive_gather_bf16_f32 orelse return error.CudaKernelUnavailable;
+        try checkBytes(output, output_count);
+        try checkRawBytes(input, try checkedTensorElements(input_count, @sizeOf(u16)));
         try checkBytes(indices, index_count);
         if (output_count == 0) return;
         if (index_count == 0 or axis_extent == 0 or suffix_size == 0) return error.InvalidCudaState;
@@ -17990,7 +18221,7 @@ const generated_q4_0_q8_e2b_pair_threads: usize = 384;
 const generated_q4_0_q8_e2b_down_small_threads: usize = 128;
 const generated_q4_0_q8_e2b_down_large_threads: usize = 256;
 const generated_q4_0_ggml_q8_1_down_threads: usize = 128;
-const generated_q4_0_q8_e2b_max_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu_squared);
+const generated_q4_0_q8_e2b_max_activation: u8 = @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu_squared);
 const generated_q4_0_exact_ffn_pair_threads: usize = 128;
 const generated_q4_0_exact_ffn_down_threads: usize = 256;
 
@@ -18381,7 +18612,7 @@ const LiveRuntimeJitConformance = struct {
     fn identity(self: LiveRuntimeJitConformance, route: LiveRuntimeJitRoute) kernel_jit.ArtifactKey {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update(live_runtime_jit_conformance_policy_identity);
-        hasher.update(&.{@intFromEnum(route)});
+        hasher.update(&.{@backingInt(route)});
         var budget_encoded: [@sizeOf(u64)]u8 = undefined;
         std.mem.writeInt(u64, &budget_encoded, live_runtime_jit_max_fixture_bytes, .little);
         hasher.update(&budget_encoded);
@@ -18522,7 +18753,7 @@ fn liveRuntimeJitScopeWithinFixtureBudget(scope: JitRouteScope) bool {
 
 const RuntimeJitQualificationScopes = struct {
     scopes: [JitRouteScope.max_observed_shapes]JitRouteScope =
-        [_]JitRouteScope{.{}} ** JitRouteScope.max_observed_shapes,
+        @as([JitRouteScope.max_observed_shapes]JitRouteScope, @splat(.{})),
     count: usize = 0,
     complete: bool = true,
 
@@ -19919,7 +20150,7 @@ test "CUDA runtime JIT qualification scopes retain bounded body and omit oversiz
 
 test "CUDA runtime JIT negative qualification memo is exact bounded and expiring" {
     var memo = RuntimeJitRejectionMemo{};
-    var key = [_]u8{0} ** @sizeOf(kernel_jit.ArtifactKey);
+    var key = @as([@sizeOf(kernel_jit.ArtifactKey)]u8, @splat(0));
     key[0] = 1;
     var other = key;
     other[0] = 2;
@@ -19969,7 +20200,7 @@ test "CUDA runtime JIT live qualifier is prepublication-sync and injectable" {
         .ctx = @ptrFromInt(4096),
         .module = &module,
         .artifact = artifact,
-        .candidate_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact,
+        .candidate_functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null)),
     };
 
     const cached = try resolveRuntimeJitQualification(.on, true, qualified, qualifier, request);
@@ -20118,7 +20349,7 @@ test "CUDA runtime JIT activation requires exact qualification and publishes bun
     };
     var module = KernelModule{};
     const mapping = module.generatedFunctionMapping(production).?;
-    var functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    var functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
     for (0..mapping.count) |index| functions[index] = @ptrFromInt(index + 1);
 
     try std.testing.expect(module.installRuntimeJitFunctions(production, mapping, functions, .shadow, true));
@@ -20143,8 +20374,8 @@ test "CUDA runtime JIT activation requires exact qualification and publishes bun
     promoted_attention.production_enabled = true;
     var attention_module = KernelModule{};
     const attention_mapping = attention_module.generatedFunctionMapping(promoted_attention).?;
-    var old_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
-    var new_functions = [_]driver_mod.CUfunction{null} ** max_runtime_jit_functions_per_artifact;
+    var old_functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
+    var new_functions = @as([max_runtime_jit_functions_per_artifact]driver_mod.CUfunction, @splat(null));
     for (0..attention_mapping.count) |index| {
         old_functions[index] = @ptrFromInt(index + 11);
         new_functions[index] = @ptrFromInt(index + 21);
@@ -20326,8 +20557,8 @@ fn loadPtxModuleWithJitLog(
     ptx: []const u8,
     label: []const u8,
 ) driver_mod.Error!void {
-    var info_log: [4096]u8 = .{0} ** 4096;
-    var error_log: [4096]u8 = .{0} ** 4096;
+    var info_log: [4096]u8 = @splat(0);
+    var error_log: [4096]u8 = @splat(0);
     var options = [_]driver_mod.CUjit_option{
         driver_mod.CU_JIT_INFO_LOG_BUFFER,
         driver_mod.CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
@@ -20433,6 +20664,7 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     defer module.unload(&ctx);
 
     try module.requireGemma4DecoderPrimitives();
+    try smokePrimitiveBatchedDotF32(allocator, &ctx, &module);
     try smokeBf16WeightPrimitives(allocator, &ctx, &module);
     try smokeAddMulScalarF32(allocator, &ctx, &module);
     try smokeRmsNormAddMulScalarF32(allocator, &ctx, &module);
@@ -20448,6 +20680,99 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     try smokeGemma4A4BExactDown(allocator, &ctx, &module);
     try smokeGemma4A4BExactLmHead(allocator, &ctx, &module);
     try smokeGemma4A4BNormFusion(allocator, &ctx, &module);
+}
+
+fn smokePrimitiveBatchedDotF32(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    const batch_count: usize = 2;
+    const m: usize = 2;
+    const n: usize = 3;
+    const k: usize = 4;
+    const lhs_count = batch_count * m * k;
+    const rhs_count = batch_count * n * k;
+    const output_count = batch_count * m * n;
+
+    const lhs_host = try allocator.alloc(f32, lhs_count);
+    defer allocator.free(lhs_host);
+    const rhs_host = try allocator.alloc(f32, rhs_count);
+    defer allocator.free(rhs_host);
+    const expected = try allocator.alloc(f32, output_count);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, output_count);
+    defer allocator.free(actual);
+
+    var lhs = try buffer_mod.DeviceBuffer.alloc(ctx, lhs_count * @sizeOf(f32));
+    defer lhs.free(ctx);
+    var rhs = try buffer_mod.DeviceBuffer.alloc(ctx, rhs_count * @sizeOf(f32));
+    defer rhs.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, output_count * @sizeOf(f32));
+    defer output.free(ctx);
+
+    inline for (.{ false, true }) |lhs_contract_last| {
+        inline for (.{ false, true }) |rhs_contract_last| {
+            for (0..batch_count) |batch| {
+                for (0..m) |row| {
+                    for (0..k) |inner| {
+                        const logical_value = @as(f32, @floatFromInt(1 + batch * 17 + row * 5 + inner)) * 0.125;
+                        const index = if (lhs_contract_last)
+                            (batch * m + row) * k + inner
+                        else
+                            (batch * k + inner) * m + row;
+                        lhs_host[index] = logical_value;
+                    }
+                }
+                for (0..k) |inner| {
+                    for (0..n) |col| {
+                        const logical_value = @as(f32, @floatFromInt(1 + batch * 13 + inner * 3 + col)) * -0.0625;
+                        const index = if (rhs_contract_last)
+                            (batch * n + col) * k + inner
+                        else
+                            (batch * k + inner) * n + col;
+                        rhs_host[index] = logical_value;
+                    }
+                }
+                for (0..m) |row| {
+                    for (0..n) |col| {
+                        var sum: f32 = 0.0;
+                        for (0..k) |inner| {
+                            const lhs_index = if (lhs_contract_last)
+                                (batch * m + row) * k + inner
+                            else
+                                (batch * k + inner) * m + row;
+                            const rhs_index = if (rhs_contract_last)
+                                (batch * n + col) * k + inner
+                            else
+                                (batch * k + inner) * n + col;
+                            sum += lhs_host[lhs_index] * rhs_host[rhs_index];
+                        }
+                        expected[(batch * m + row) * n + col] = sum;
+                    }
+                }
+            }
+
+            try lhs.copyFromHost(ctx, std.mem.sliceAsBytes(lhs_host));
+            try rhs.copyFromHost(ctx, std.mem.sliceAsBytes(rhs_host));
+            try module.launchPrimitiveBatchedDotF32(
+                ctx,
+                output,
+                lhs,
+                rhs,
+                batch_count,
+                m,
+                n,
+                k,
+                lhs_contract_last,
+                rhs_contract_last,
+            );
+            try ctx.synchronize();
+            try output.copyToHost(ctx, std.mem.sliceAsBytes(actual));
+            try ctx.synchronize();
+            try expectApproxSlice(actual, expected, 0.00001);
+        }
+    }
 }
 
 pub fn smokeQwen3VlPrimitives(allocator: std.mem.Allocator) !void {
@@ -20616,9 +20941,9 @@ fn smokeGemma4A4BResidentQ4_0(
     const max_routes = rows * experts;
     const expert_stride = intermediate * q4_0_block_bytes;
 
-    const input_host = [_]f32{1.0 / 32.0} ** (rows * hidden);
+    const input_host = @as([rows * hidden]f32, @splat(1.0 / 32.0));
     const logits_host = [_]f32{ 0.0, 2.0, 3.0, -1.0 };
-    var weight_host = [_]u8{0} ** (experts * expert_stride);
+    var weight_host = @as([experts * expert_stride]u8, @splat(0));
     for (0..experts) |expert| {
         const value: i4 = if (expert == 0) 2 else 1;
         for (0..intermediate) |out| {
@@ -20832,7 +21157,7 @@ fn smokeGemma4A4BExactDown(
         const offset = block * q4_0_block_bytes;
         writeQ4_0SmokeRow(weight_host[offset .. offset + q4_0_block_bytes], 0.125, value);
     }
-    const route_ids_host = [_]u32{0} ** routes;
+    const route_ids_host = @as([routes]u32, @splat(0));
 
     var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_host.len * @sizeOf(f32));
     defer input.free(ctx);
@@ -20898,7 +21223,7 @@ fn smokeGemma4A4BExactLmHead(
     const q8_row_blocks = in_dim / q8_1_values_per_block;
     const col_tiles = out_dim / q6_k_col_tile8;
 
-    const input_host = [_]f32{0.25} ** in_dim;
+    const input_host = @as([in_dim]f32, @splat(0.25));
     const weight_host = try allocator.alloc(u8, out_dim * q6_row_blocks * q6_k_block_bytes);
     defer allocator.free(weight_host);
     for (0..out_dim) |col| {
@@ -21281,6 +21606,50 @@ fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.Cud
     try embed_output.copyToHost(ctx, std.mem.sliceAsBytes(embed_out));
     try ctx.synchronize();
     try expectApproxSlice(embed_out, &expected_embed, 0.0001);
+
+    const ids_i32_data = [_]i32{ 2, 0 };
+    var ids_i32 = try buffer_mod.DeviceBuffer.alloc(ctx, ids_i32_data.len * @sizeOf(i32));
+    defer ids_i32.free(ctx);
+    try ids_i32.copyFromHost(ctx, std.mem.sliceAsBytes(&ids_i32_data));
+    try module.launchEmbeddingLookupI32Bf16WeightF32(ctx, embed_output, embed_weight, ids_i32, ids_i32_data.len, embed_dim, 1.0);
+    try ctx.synchronize();
+    try embed_output.copyToHost(ctx, std.mem.sliceAsBytes(embed_out));
+    try ctx.synchronize();
+    try expectApproxSlice(embed_out, &expected_embed, 0.0001);
+
+    const logits_data = [_]f32{ 0.0, 1.0, 2.0, 3.0, 1.0, 0.0, -1.0, -2.0 };
+    const selected_rows = [_]u32{ 0, 1 };
+    const selected_tokens = [_]u32{ 3, 0 };
+    var logits = try buffer_mod.DeviceBuffer.alloc(ctx, logits_data.len * @sizeOf(f32));
+    defer logits.free(ctx);
+    var selected_rows_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_rows.len * @sizeOf(u32));
+    defer selected_rows_device.free(ctx);
+    var selected_tokens_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_tokens.len * @sizeOf(u32));
+    defer selected_tokens_device.free(ctx);
+    var selected_logps_device = try buffer_mod.DeviceBuffer.alloc(ctx, selected_tokens.len * @sizeOf(f32));
+    defer selected_logps_device.free(ctx);
+    try logits.copyFromHost(ctx, std.mem.sliceAsBytes(&logits_data));
+    try selected_rows_device.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_rows));
+    try selected_tokens_device.copyFromHost(ctx, std.mem.sliceAsBytes(&selected_tokens));
+    try module.launchSelectedTokenLogprobsF32(
+        ctx,
+        selected_logps_device,
+        logits,
+        selected_rows_device,
+        selected_tokens_device,
+        selected_tokens.len,
+        2,
+        4,
+    );
+    try ctx.synchronize();
+    var selected_logps: [2]f32 = undefined;
+    try selected_logps_device.copyToHost(ctx, std.mem.sliceAsBytes(&selected_logps));
+    try ctx.synchronize();
+    const expected_selected = [_]f32{
+        3.0 - @log(@exp(0.0) + @exp(1.0) + @exp(2.0) + @exp(3.0)),
+        1.0 - @log(@exp(1.0) + @exp(0.0) + @exp(-1.0) + @exp(-2.0)),
+    };
+    try expectApproxSlice(&selected_logps, &expected_selected, 0.0001);
 
     const q_out_dim: usize = 2;
     const kv_out_dim: usize = 1;
@@ -22482,7 +22851,7 @@ pub fn smokeQ8_0(allocator: std.mem.Allocator) !void {
         -17, -18, -19, -20, -21, -22, -23, -24,
         -25, -26, -27, -28, -29, -30, -31, -32,
     };
-    var weight_raw = [_]u8{0} ** (out_dim * q8_0_block_bytes);
+    var weight_raw = @as([(out_dim * q8_0_block_bytes)]u8, @splat(0));
     writeQ8_0SmokeRow(weight_raw[0..34], 1.0, 1);
     writeQ8_0SmokeRow(weight_raw[34..68], 0.5, 2);
     writeQ8_0SmokeRow(weight_raw[68..102], 2.0, -1);
@@ -22560,11 +22929,11 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
         -17, -18, -19, -20, -21, -22, -23, -24,
         -25, -26, -27, -28, -29, -30, -31, -32,
     };
-    var weight_raw = [_]u8{0} ** (out_dim * q4_0_block_bytes);
+    var weight_raw = @as([(out_dim * q4_0_block_bytes)]u8, @splat(0));
     writeQ4_0SmokeRow(weight_raw[0..18], 1.0, 1);
     writeQ4_0SmokeRow(weight_raw[18..36], 0.5, 2);
     writeQ4_0SmokeRow(weight_raw[36..54], 2.0, -1);
-    var patterned_row = [_]i4{0} ** q4_0_values_per_block;
+    var patterned_row = @as([q4_0_values_per_block]i4, @splat(0));
     patterned_row[0] = 1;
     patterned_row[16] = -1;
     writeQ4_0SmokeRowValues(weight_raw[54..72], 1.0, &patterned_row);
@@ -22630,10 +22999,10 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
         const ripple: f32 = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 9)) - 4)) / 43.0;
         value.* = centered + ripple;
     }
-    var large_weight_raw = [_]u8{0} ** (large_out_dim * large_row_blocks * q4_0_block_bytes);
+    var large_weight_raw = @as([(large_out_dim * large_row_blocks * q4_0_block_bytes)]u8, @splat(0));
     for (0..large_out_dim) |col| {
         for (0..large_row_blocks) |block| {
-            var values = [_]i4{0} ** q4_0_values_per_block;
+            var values = @as([q4_0_values_per_block]i4, @splat(0));
             for (&values, 0..) |*value, lane_index| {
                 const raw: i32 = @intCast((col * 31 + block * 13 + lane_index * 5) % 15);
                 value.* = @intCast(raw - 7);
@@ -22766,7 +23135,7 @@ pub fn smokeQ4_0(allocator: std.mem.Allocator) !void {
     try ctx.synchronize();
     try expectApproxSlice(out, expected[0..], 4.0);
 
-    const gate_data = [_]f32{1.0} ** (rows * in_dim);
+    const gate_data = @as([(rows * in_dim)]f32, @splat(1.0));
     var gate = try buffer_mod.DeviceBuffer.alloc(&ctx, gate_data.len * @sizeOf(f32));
     defer gate.free(&ctx);
     try gate.copyFromHost(&ctx, std.mem.sliceAsBytes(&gate_data));
@@ -22861,8 +23230,8 @@ pub fn smokeQ4_0E4BPairActivationQ8_1Rows(allocator: std.mem.Allocator) !void {
     defer allocator.free(up_weight_raw);
     for (0..out_dim) |col| {
         for (0..input_row_blocks) |block| {
-            var gate_values = [_]i4{0} ** q4_0_values_per_block;
-            var up_values = [_]i4{0} ** q4_0_values_per_block;
+            var gate_values = @as([q4_0_values_per_block]i4, @splat(0));
+            var up_values = @as([q4_0_values_per_block]i4, @splat(0));
             for (0..q4_0_values_per_block) |lane| {
                 const gate_raw: i32 = @intCast((col * 31 + block * 13 + lane * 5) % 15);
                 const up_raw: i32 = @intCast((col * 19 + block * 23 + lane * 7 + 3) % 15);
@@ -22901,7 +23270,7 @@ pub fn smokeQ4_0E4BPairActivationQ8_1Rows(allocator: std.mem.Allocator) !void {
         rows,
         in_dim,
         out_dim,
-        @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.gelu),
+        @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.gelu),
     );
     try ctx.synchronize();
 
@@ -22931,7 +23300,7 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
         input_data[i] = @floatFromInt(i + 1);
         input_data[in_dim + i] = -@as(f32, @floatFromInt(i + 1));
     }
-    var weight_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_raw[0..144], 1.0, 1);
     writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
     const bias_data = [_]f32{ 0.25, -1.0 };
@@ -23040,7 +23409,7 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
 
     const rows: usize = 2;
     const dim: usize = q6_k_values_per_block;
-    var weight_raw = [_]u8{0} ** (rows * q6_k_block_bytes);
+    var weight_raw = @as([(rows * q6_k_block_bytes)]u8, @splat(0));
     writeQ6_KSmokeRow(weight_raw[0..q6_k_block_bytes], 1.0, -3);
     writeQ6_KSmokeRow(weight_raw[q6_k_block_bytes .. 2 * q6_k_block_bytes], 0.5, 4);
 
@@ -23081,8 +23450,8 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
     try ctx.synchronize();
     try expectApproxSlice(actual, expected, 0.0001);
 
-    const gate_data = [_]f32{1.0} ** q6_k_values_per_block;
-    const up_data = [_]f32{1.0} ** q6_k_values_per_block;
+    const gate_data = @as([q6_k_values_per_block]f32, @splat(1.0));
+    const up_data = @as([q6_k_values_per_block]f32, @splat(1.0));
     var gate = try buffer_mod.DeviceBuffer.alloc(&ctx, gate_data.len * @sizeOf(f32));
     defer gate.free(&ctx);
     var up = try buffer_mod.DeviceBuffer.alloc(&ctx, up_data.len * @sizeOf(f32));
@@ -23095,13 +23464,13 @@ pub fn smokeQ6_K(allocator: std.mem.Allocator) !void {
 
     try module.launchLinearQ6KTile4F32(&ctx, down_out, gate, weight, 1, q6_k_values_per_block, rows);
     try ctx.synchronize();
-    var down_actual = [_]f32{0} ** rows;
+    var down_actual = @as([rows]f32, @splat(0));
     try down_out.copyToHost(&ctx, std.mem.sliceAsBytes(&down_actual));
     try ctx.synchronize();
     try expectApproxSlice(&down_actual, &down_expected, 0.01);
 
     @memset(&down_actual, 0);
-    try module.launchLinearQ6KGatedDownTile4F32(&ctx, down_out, gate, up, weight, 1, q6_k_values_per_block, rows, @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu));
+    try module.launchLinearQ6KGatedDownTile4F32(&ctx, down_out, gate, up, weight, 1, q6_k_values_per_block, rows, @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.relu));
     try ctx.synchronize();
     try down_out.copyToHost(&ctx, std.mem.sliceAsBytes(&down_actual));
     try ctx.synchronize();
@@ -23121,15 +23490,15 @@ fn smokeFlorence2TripleQ4KTcHmmaF32(
         input_data[i] = @floatFromInt(i + 1);
         input_data[in_dim + i] = -@as(f32, @floatFromInt(i + 1));
     }
-    var weight_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_raw[0..144], 1.0, 1);
     writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
-    var weight_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
+    var weight_tc_raw = @as([(out_dim * q4_k_tc_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeTensorCore(&weight_tc_raw, &weight_raw, in_dim, out_dim);
-    var weight_b_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    var weight_b_raw = @as([(out_dim * q4_k_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeRow(weight_b_raw[0..144], 0.25, 3);
     writeQ4_KSmokeRow(weight_b_raw[144..288], 2.0, 1);
-    var weight_b_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
+    var weight_b_tc_raw = @as([(out_dim * q4_k_tc_block_bytes)]u8, @splat(0));
     writeQ4_KSmokeTensorCore(&weight_b_tc_raw, &weight_b_raw, in_dim, out_dim);
     const bias_data = [_]f32{ 0.25, -1.0 };
     const bias_b_data = [_]f32{ 1.5, -2.25 };
@@ -24445,7 +24814,7 @@ test "generated CUDA Q6_K Q8_1 argmax launch contracts are exact" {
 }
 
 test "generated CUDA Q4_0 Q8_1 E2B launch contracts are exact" {
-    const silu_activation: u8 = @intFromEnum(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.silu);
+    const silu_activation: u8 = @backingInt(@import("../../graph/backend_contracts.zig").DecoderRuntimeActivationKind.silu);
     try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 6144, silu_activation));
     try std.testing.expect(generatedQ4_0PairQ8E2BShapeEligible(1, 1536, 12288, silu_activation));
     try std.testing.expect(generatedQ4_0DownQ8E2BShapeEligible(1, 6144, 1536));
@@ -24616,7 +24985,7 @@ test "cuda kernel launch helper bounds" {
 }
 
 test "cuda q8_0 smoke row writer uses gguf block layout" {
-    var raw = [_]u8{0} ** q8_0_block_bytes;
+    var raw = @as([q8_0_block_bytes]u8, @splat(0));
     writeQ8_0SmokeRow(&raw, 1.0, -3);
     try std.testing.expectEqual(@as(u8, 0x00), raw[0]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[1]);
@@ -24624,9 +24993,20 @@ test "cuda q8_0 smoke row writer uses gguf block layout" {
 }
 
 test "cuda q4_0 smoke row writer uses gguf block layout" {
-    var raw = [_]u8{0} ** q4_0_block_bytes;
+    var raw = @as([q4_0_block_bytes]u8, @splat(0));
     writeQ4_0SmokeRow(&raw, 1.0, -3);
     try std.testing.expectEqual(@as(u8, 0x00), raw[0]);
     try std.testing.expectEqual(@as(u8, 0x3c), raw[1]);
     for (raw[2..]) |byte| try std.testing.expectEqual(@as(u8, 0x55), byte);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

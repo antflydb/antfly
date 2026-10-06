@@ -27,16 +27,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 import requests
 from conftest import (
     ANTFLY_PUBLIC_API_ROOT,
+    AUTH_BOOTSTRAP_PASSWORD,
     DEFAULT_ANTFLY_BIN,
     REPO_ROOT,
     _read_log_tail,
     annotate_metadata_table_names,
     antfly_public_api_url,
+    internal_service_headers,
     maybe_preserve_tempdir,
     publication_retry_delay,
     resolve_binary_path,
@@ -309,18 +312,136 @@ def _create_cluster_table_when_admitted(
     deadline = time.monotonic() + timeout_s
     attempts = 0
     last_response: requests.Response | None = None
+    last_observation: requests.Response | None = None
+    table_url = f"{cluster.data_api_urls[0]}/tables/{table_name}"
+
+    def remember_table(table: dict) -> dict:
+        if hasattr(cluster, "table_ids"):
+            cluster.table_ids[table_name] = int(table["table_id"])
+        return table
+
+    def canonical_schema(value):
+        # Only backend-managed generation and documented omitted defaults are
+        # normalized. Do not use a subset match: an unexpected FK, default,
+        # generated expression, or document property changes the contract.
+        # tables.zig installs this dynamic document schema when create omits
+        # schema. Omission is not equivalent to an arbitrary empty schema.
+        result = (
+            dict(value)
+            if value is not None
+            else {
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": True,
+                            "x-antfly-dynamic-indexing": {"mode": "infer_types"},
+                        }
+                    },
+                },
+            }
+        )
+        result.pop("version", None)
+        mode = result.setdefault("storage_mode", "document")
+        result.setdefault("enforce_types", mode == "relational")
+        for field in (
+            "column_defaults",
+            "generated_columns",
+            "checks",
+            "unique_constraints",
+            "foreign_keys",
+            "relational_indexes",
+            "dynamic_templates",
+            "index_sort",
+        ):
+            if result.get(field) is None:
+                result[field] = []
+        result.setdefault("default_type", "")
+        result.setdefault("document_schemas", {})
+        result.setdefault("ttl", None)
+        result.setdefault("ttl_field", "_timestamp")
+        result.setdefault("ttl_duration_ns", 0)
+        return result
+
+    def verify_observed_definition(table):
+        # This fixture currently creates schema/description/shard definitions.
+        # Fail closed if it grows a request option whose response projection we
+        # have not modeled, instead of treating a partial match as admission.
+        assert set(definition) <= {"num_shards", "description", "schema"}, (
+            "cannot reconcile unknown table create with unsupported definition fields"
+        )
+        assert table.get("name") == table_name, "observed table name mismatch"
+        if "num_shards" in definition:
+            assert (
+                isinstance(table.get("shards"), dict)
+                and len(table["shards"]) == definition["num_shards"]
+            ), "observed table shard count mismatch"
+        assert (table.get("description") or "") == definition.get("description", ""), (
+            "observed table description mismatch"
+        )
+        assert canonical_schema(table.get("schema")) == canonical_schema(
+            definition.get("schema")
+        ), "observed table schema mismatch"
+
+    def observe_table():
+        nonlocal last_observation
+        cluster.assert_processes_alive()
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "table create observation deadline exceeded"
+        last_observation = session.get(table_url, timeout=remaining)
+        cluster.assert_processes_alive()
+        return last_observation
+
     try:
+        # Test-owned names must be absent before this mutation. An existing
+        # matching table is not evidence that our uncertain create succeeded.
+        # This helper requires exclusive fixture ownership of its unique name.
+        while True:
+            existing = observe_table()
+            if existing.status_code == 404:
+                break
+            assert existing.status_code != 200, "table already exists before create"
+            if existing.status_code != 503:
+                _check_response(existing)
+                raise AssertionError("unexpected table absence observation")
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         while True:
             cluster.assert_processes_alive()
             remaining = deadline - time.monotonic()
             assert remaining > 0, "table create admission deadline exceeded"
             attempts += 1
             last_response = session.post(
-                f"{cluster.data_api_urls[0]}/tables/{table_name}",
+                table_url,
                 json=definition,
                 timeout=remaining,
             )
             cluster.assert_processes_alive()
+            if (
+                last_response.status_code == 409
+                and last_response.headers.get("X-Antfly-Raft-Mutation-Outcome")
+                == "unknown-v1"
+                and last_response.headers.get(
+                    "X-Antfly-Metadata-Mutation-Not-Admitted", ""
+                ).lower()
+                != "true"
+            ):
+                # A durable proposal may have committed. Never send another
+                # POST, even when visibility is delayed or reads are shed.
+                while True:
+                    try:
+                        observed = observe_table()
+                    except (requests.Timeout, requests.ConnectionError):
+                        observed = None
+                    if observed is not None:
+                        if observed.status_code == 200:
+                            table = _check_response(observed)
+                            verify_observed_definition(table)
+                            return remember_table(table)
+                        if observed.status_code not in (404, 503):
+                            _check_response(observed)
+                            raise AssertionError("unexpected table create observation")
+                    time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
             retryable = False
             if (
                 last_response.status_code == 503
@@ -347,7 +468,7 @@ def _create_cluster_table_when_admitted(
                 result = _check_response(last_response)
                 if attempts > 1:
                     print(f"backup table create admitted after {attempts} attempts")
-                return result
+                return remember_table(result)
             # This response advertises Retry-After: 1. Keep backoff and every
             # subsequent request within the original create request budget.
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
@@ -357,6 +478,8 @@ def _create_cluster_table_when_admitted(
             f"last_status={last_response.status_code if last_response is not None else None}; "
             f"last_headers={dict(last_response.headers) if last_response is not None else None}; "
             f"last_response={last_response.text if last_response is not None else None}\n"
+            f"last_observation_status={last_observation.status_code if last_observation is not None else None}; "
+            f"last_observation={last_observation.text if last_observation is not None else None}\n"
             f"{cluster.debug_logs()}"
         ) from exc
 
@@ -364,26 +487,239 @@ def _create_cluster_table_when_admitted(
 def _seed_cluster_docs_when_writable(
     cluster, session: requests.Session, table_name: str, docs: dict, *, timeout_s=30.0
 ) -> dict | None:
+    return _batch_cluster_docs_when_writable(
+        cluster, session, table_name, inserts=docs, timeout_s=timeout_s
+    )
+
+
+def _constraint_probe_outcome(response, expected_error):
+    reasons = {
+        "UniqueConstraintViolation": "unique_constraint_violation",
+        "ForeignKeyParentMissing": "foreign_key_parent_missing",
+        "ForeignKeyReferenced": "foreign_key_referenced",
+    }
+    reason = reasons[expected_error]
+    text = response.text.strip()
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.status_code == 409:
+        if text == expected_error:
+            return True
+        if isinstance(payload, dict):
+            # Unknown/committed outcomes never become successful constraint
+            # evidence, even if an incidental message names the constraint.
+            if payload.get("code") not in (None, reason) or payload.get(
+                "status"
+            ) not in (None, "aborted", "conflict"):
+                raise AssertionError(f"uncertain constraint probe: {text}")
+            if payload.get("error") == expected_error:
+                return True
+            conflict = payload.get("conflict")
+            if isinstance(conflict, dict) and payload.get("status") in (
+                "aborted",
+                "conflict",
+            ):
+                if (
+                    conflict.get("reason") == reason
+                    and conflict.get("retryable") is False
+                ):
+                    return True
+                if (
+                    payload.get("status") == "aborted"
+                    and conflict.get("reason") is None
+                    and conflict.get("retryable") is True
+                    and conflict.get("kind")
+                    in (
+                        "transaction_conflict",
+                        "optimistic_conflict",
+                        "participant_unavailable",
+                    )
+                ):
+                    return False
+        if text == "batch transaction conflicted":
+            return False
+    if response.status_code == 503 and text == "write unavailable":
+        return False
+    raise AssertionError(
+        f"expected {expected_error}, got {response.status_code}: {text}"
+    )
+
+
+def _assert_constraint_rejected(
+    cluster, session, table, inserts, expected_error, *, timeout_s=90.0
+):
+    deadline = time.monotonic() + timeout_s
+    observations = []
+
+    def rejected():
+        cluster.assert_processes_alive()
+        # No transport-exception retry: an invalid write might have committed
+        # if enforcement regressed and only its response was lost.
+        try:
+            response = session.post(
+                f"{cluster.data_api_urls[0]}/tables/{table}/batch",
+                json={"inserts": inserts},
+                timeout=max(0.001, min(20.0, deadline - time.monotonic())),
+            )
+        except requests.RequestException as exc:
+            # wait_until also serves read-only polling and understands some
+            # retryable HTTPError responses. Do not inherit that for writes.
+            raise AssertionError(f"constraint probe transport failed: {exc}") from exc
+        observations.append(f"{response.status_code}: {response.text[:1024]}")
+        del observations[:-8]
+        return _constraint_probe_outcome(response, expected_error)
+
+    try:
+        assert wait_until(rejected, timeout_s=timeout_s, interval_s=0.5), (
+            f"constraint did not return {expected_error}"
+        )
+    except (AssertionError, requests.RequestException) as exc:
+        raise AssertionError(
+            f"constraint probe failed: {exc}; observations={observations}\n"
+            f"{cluster.debug_logs()}"
+        ) from exc
+
+
+def _assert_unique_claims_rejected(cluster, table, rows):
+    """Check every claim independently, with bounded transport ownership."""
+
+    def probe(ordinal, row):
+        # A shared candidate row would add unrelated intent contention. A
+        # separate session also avoids sharing requests' mutable pool state.
+        with requests.Session() as session:
+            session.headers["Connection"] = "close"
+            _assert_constraint_rejected(
+                cluster,
+                session,
+                table,
+                {f"8:duplicate:{ordinal}": {"id": row["id"]}},
+                "UniqueConstraintViolation",
+            )
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(probe, ordinal, row) for ordinal, row in enumerate(rows)
+        ]
+        # Join every worker before the caller starts the next mutation. A
+        # failed probe propagates; combining claims in one rejected batch
+        # would allow a different surviving claim to hide a missing one.
+        for future in futures:
+            future.result()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_unique_claim_probes_are_independent_bounded_and_joined(monkeypatch, fail):
+    cluster = object()
+    lock = threading.Lock()
+    barrier = threading.Barrier(3)
+    sessions = []
+    observed = []
+    active = 0
+    peak = 0
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.closed = False
+            self.used = False
+            with lock:
+                sessions.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+    def rejected(owner, session, table, inserts, expected):
+        nonlocal active, peak
+        assert owner is cluster and table == "parents"
+        assert expected == "UniqueConstraintViolation"
+        assert session.headers == {"Connection": "close"}
+        assert not session.closed and not session.used
+        session.used = True
+        key, row = next(iter(inserts.items()))
+        with lock:
+            observed.append((key, row["id"]))
+            active += 1
+            peak = max(peak, active)
+        try:
+            if row["id"] < 3:
+                # A serial implementation cannot satisfy this barrier. Keep
+                # the watchdog finite so regressions fail without hanging.
+                barrier.wait(timeout=3)
+            if fail and row["id"] == 1:
+                raise AssertionError("claim probe failed")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(requests, "Session", Session)
+    monkeypatch.setattr(sys.modules[__name__], "_assert_constraint_rejected", rejected)
+    rows = [{"id": value} for value in range(36)]
+    if fail:
+        with pytest.raises(AssertionError, match="claim probe failed"):
+            _assert_unique_claims_rejected(cluster, "parents", rows)
+    else:
+        _assert_unique_claims_rejected(cluster, "parents", rows)
+    assert peak == 3 and active == 0
+    assert len(observed) == 36
+    assert len({key for key, _ in observed}) == 36
+    assert {value for _, value in observed} == set(range(36))
+    assert all(session.closed and session.used for session in sessions)
+
+
+def _batch_cluster_docs_when_writable(
+    cluster,
+    session: requests.Session,
+    table_name: str,
+    *,
+    inserts: dict | None = None,
+    deletes: tuple[str, ...] = (),
+    timeout_s=30.0,
+) -> dict | None:
     # Replication status is an observation, not a lease on the data leader or
-    # its routing catalog. Seed through the write API's admission contract.
+    # its routing catalog. Mutate through the write API's admission contract.
     # Only explicit pre-commit rejection permits a fresh batch attempt. An
-    # uncertain transaction is never replayed: require every expected document
-    # to become visible before treating setup as complete.
+    # uncertain transaction is never replayed: observe every expected effect
+    # before returning. Callers still verify cross-table cascades separately.
+    docs = inserts or {}
+    assert docs or deletes, "expected a nonempty batch"
+    assert not docs.keys() & set(deletes), "ambiguous insert/delete expectation"
+    mutation = {"sync_level": "write"}
+    if docs:
+        mutation["inserts"] = docs
+    if deletes:
+        mutation["deletes"] = list(deletes)
     deadline = time.monotonic() + timeout_s
     last_response: requests.Response | None = None
 
     def attempt() -> dict | None:
         nonlocal last_response
         cluster.assert_processes_alive()
-        last_response = session.post(
-            f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
-            json={"inserts": docs, "sync_level": "write"},
-            timeout=max(0.001, deadline - time.monotonic()),
-        )
+        try:
+            last_response = session.post(
+                f"{cluster.data_api_urls[0]}/tables/{table_name}/batch",
+                json=mutation,
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except requests.RequestException as exc:
+            # A transport exception has no proven non-admission outcome.
+            # In particular, adapters/hooks may raise HTTPError themselves;
+            # do not let wait_until apply its broader read-only retry policy.
+            raise AssertionError(f"batch transport failed: {exc}") from exc
         if (
             last_response.status_code == 503
             and last_response.text.strip() == "write unavailable"
+        ) or (
+            last_response.status_code == 409
+            and last_response.text.strip() == "batch transaction conflicted"
         ):
+            # Activation and leader/route convergence may abort a transaction
+            # after admission. A reported abort is safe to retry; constraint
+            # violations and unknown outcomes do not match either response.
             return None
         if last_response.status_code == 409:
             try:
@@ -399,7 +735,12 @@ def _seed_cluster_docs_when_writable(
         return _check_response(last_response)
 
     try:
-        batch = wait_until(attempt, timeout_s=timeout_s, interval_s=0.1)
+        batch = wait_until(
+            attempt,
+            timeout_s=timeout_s,
+            interval_s=0.1,
+            ready_when=lambda result: result is not None,
+        )
         assert batch is not None, f"table {table_name} did not become writable"
         if batch.get("code") == "transaction_outcome_unknown":
 
@@ -418,23 +759,35 @@ def _seed_cluster_docs_when_writable(
                     )
                     if actual != expected:
                         return False
+                for key in deletes:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    try:
+                        response = session.get(
+                            f"{cluster.data_api_urls[0]}/tables/{table_name}/documents/{key}",
+                            timeout=min(10.0, remaining),
+                        )
+                    except requests.RequestException:
+                        return False
+                    # An unavailable read is not evidence of deletion.
+                    if response.status_code != 404:
+                        return False
                 return True
 
-            assert docs and wait_until(
+            assert wait_until(
                 committed,
                 timeout_s=max(0.0, deadline - time.monotonic()),
                 interval_s=0.1,
-            ), "uncertain seed transaction did not commit every expected document"
-            print(
-                "backup seed commit confirmed by document reads; batch was not replayed"
-            )
+            ), "uncertain transaction did not expose every expected document mutation"
+            print("batch effects confirmed by document reads; batch was not replayed")
             return None
         return batch
     except (AssertionError, requests.RequestException) as exc:
         # Preserve routing and proposal diagnostics for unresolved outcomes
         # before teardown removes this six-process cluster.
         raise AssertionError(
-            f"backup table {table_name} seed failed: {exc}; "
+            f"table {table_name} batch failed: {exc}; "
             f"last_status={last_response.status_code if last_response is not None else None}; "
             f"last_headers={dict(last_response.headers) if last_response is not None else None}; "
             f"last_response={last_response.text if last_response is not None else None}\n"
@@ -632,9 +985,11 @@ def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
 class ThreeByThreeBackupCluster:
     # Use the executable's production Raft/control cadence. A 5 ms Raft tick
     # makes real disk sync latency exceed the election budget on CI storage.
-    def __init__(self, binary: str):
+    def __init__(self, binary: str, *, online_merge_enabled: bool | None = None):
         self.binary = binary
+        self.online_merge_enabled = online_merge_enabled
         self.host = "127.0.0.1"
+        self.table_ids: dict[str, int] = {}
         with ExitStack() as setup:
             self.tempdir = tempfile.TemporaryDirectory(
                 prefix="antfly-zig-metadata-backup-e2e-"
@@ -650,8 +1005,11 @@ class ThreeByThreeBackupCluster:
                 f"http://{self.host}:{port}" for port in self.metadata_admin_ports
             ]
             self.metadata_public_urls = [
-                antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT)
-                for url in self.metadata_admin_urls
+                antfly_public_api_url(
+                    f"http://admin:{AUTH_BOOTSTRAP_PASSWORD}@{self.host}:{port}",
+                    root=ANTFLY_PUBLIC_API_ROOT,
+                )
+                for port in self.metadata_admin_ports
             ]
             self.data_ports = list(self.port_reservations.reserve_many(3))
             self.data_raft_ports = list(self.port_reservations.reserve_many(3))
@@ -732,7 +1090,7 @@ class ThreeByThreeBackupCluster:
         )
 
     def _metadata_command(self, node_id: int) -> list[str]:
-        return [
+        command = [
             self.binary,
             "metadata",
             "--config",
@@ -749,6 +1107,8 @@ class ThreeByThreeBackupCluster:
             str(self.metadata_admin_ports[node_id - 1]),
             "--health",
             "false",
+            "--auth",
+            "true",
             "--data-dir",
             str(self.root / f"metadata-{node_id}"),
             "--replica-root-dir",
@@ -758,6 +1118,11 @@ class ThreeByThreeBackupCluster:
             "--snapshot-root-dir",
             str(self.root / f"metadata-{node_id}-snapshots"),
         ]
+        if self.online_merge_enabled is not None:
+            command.extend(
+                ["--online-merge-enabled", str(self.online_merge_enabled).lower()]
+            )
+        return command
 
     def _data_command(self, index: int) -> list[str]:
         node_id = index + 4
@@ -803,6 +1168,10 @@ class ThreeByThreeBackupCluster:
                 lambda command=command, log_file=self.metadata_log_files[i]: (
                     subprocess.Popen(
                         debuggable_command(command),
+                        env={
+                            **os.environ,
+                            "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                        },
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
                         cwd=REPO_ROOT,
@@ -811,8 +1180,24 @@ class ThreeByThreeBackupCluster:
             )
             self.metadata_procs.append(proc)
 
-        for url in self.metadata_admin_urls:
-            if not wait_for_server(url, path="/metadata/v1/status", timeout=30.0):
+        metadata_processes = [
+            (f"metadata-{i + 1}", proc) for i, proc in enumerate(self.metadata_procs)
+        ]
+
+        def metadata_ready(url):
+            return wait_for_server(
+                url,
+                path="/metadata/v1/status",
+                timeout=30.0,
+                processes=metadata_processes,
+            )
+
+        for url, live in zip(
+            self.metadata_admin_urls,
+            self._metadata_probe_executor.map(metadata_ready, self.metadata_admin_urls),
+            strict=True,
+        ):
+            if not live:
                 raise RuntimeError(
                     f"metadata server failed to start at {url}\n{self.debug_logs()}"
                 )
@@ -839,9 +1224,24 @@ class ThreeByThreeBackupCluster:
                 ),
             )
             self.data_procs.append(proc)
-            if not wait_for_server(data_api_url, timeout=30.0):
+        # Every process starts before readiness joins. Preserve fresh roots and
+        # per-node leases while overlapping independent open/listener work.
+        processes = [(f"data-{i + 4}", proc) for i, proc in enumerate(self.data_procs)]
+        processes.extend(
+            (f"metadata-{i + 1}", proc) for i, proc in enumerate(self.metadata_procs)
+        )
+
+        def ready(url):
+            return wait_for_server(url, timeout=30.0, processes=processes)
+
+        for url, live in zip(
+            self.data_api_urls,
+            self._metadata_probe_executor.map(ready, self.data_api_urls),
+            strict=True,
+        ):
+            if not live:
                 raise RuntimeError(
-                    f"data server failed to start at {data_api_url}\n{self.debug_logs()}"
+                    f"data server failed to start at {url}\n{self.debug_logs()}"
                 )
 
         if not wait_until(
@@ -853,6 +1253,38 @@ class ThreeByThreeBackupCluster:
                 "data nodes did not register on every metadata node\n"
                 f"{self.debug_logs()}"
             )
+        self._enroll_store_roots()
+
+    def _enroll_store_roots(self) -> None:
+        incarnation = self.metadata_snapshot(0)["status"]["metadata_incarnation"]
+        for node_id in range(4, 7):
+            proof = subprocess.run(
+                [
+                    self.binary,
+                    "internal",
+                    "store-root",
+                    "proof",
+                    "--replica-root-dir",
+                    str(self.root / f"data-{node_id}-replicas"),
+                    "--metadata-incarnation",
+                    incarnation,
+                    "--node-id",
+                    str(node_id),
+                    "--store-id",
+                    str(node_id),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+            )
+            response = requests.post(
+                f"{self.metadata_public_urls[0]}/store-roots/enroll",
+                json=json.loads(proof.stdout),
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=30,
+            )
+            _check_response(response)
 
     def metadata_snapshot(self, index: int, *, request_timeout_s: float = 1.0) -> dict:
         response = requests.get(
@@ -914,6 +1346,21 @@ class ThreeByThreeBackupCluster:
                 return False
         return True
 
+    def refresh_table_identity(self, table_name: str) -> bool:
+        # Restore publishes a fresh physical owner behind the logical name.
+        # Capture its authoritative public binding before topology convergence.
+        for base in self.data_api_urls:
+            try:
+                response = requests.get(f"{base}/tables/{table_name}", timeout=1.0)
+            except requests.RequestException:
+                continue
+            if response.status_code in (404, 503):
+                continue
+            response.raise_for_status()
+            self.table_ids[table_name] = int(response.json()["table_id"])
+            return True
+        return False
+
     def fully_replicated_topology(self, table_name: str) -> tuple[int, set[int]] | None:
         self.assert_processes_alive()
         expected_node_ids = set(range(4, 7))
@@ -924,7 +1371,7 @@ class ThreeByThreeBackupCluster:
         topology = None
         for snapshot in snapshots:
             assert snapshot is not None
-            table_id = next(
+            table_id = self.table_ids.get(table_name) or next(
                 (
                     int(table.get("table_id", 0))
                     for table in snapshot.get("tables", [])
@@ -1051,6 +1498,34 @@ class ThreeByThreeBackupCluster:
                 f"cluster process exited: {', '.join(exited)}\n{self.debug_logs()}"
             )
 
+    def restart_crashed_node(self, *, metadata: bool, index: int) -> None:
+        """Reopen one killed process from its existing Raft/owner directories."""
+        procs = self.metadata_procs if metadata else self.data_procs
+        assert 0 <= index < len(procs)
+        assert procs[index].poll() is not None, "restart requires a stopped node"
+        if metadata:
+            command = self._metadata_command(index + 1)
+            ports = (self.metadata_raft_ports[index], self.metadata_admin_ports[index])
+            log = self.metadata_log_files[index]
+            url, path = self.metadata_admin_urls[index], "/metadata/v1/status"
+        else:
+            command = self._data_command(index)
+            ports = (self.data_ports[index], self.data_raft_ports[index])
+            log = self.data_log_files[index]
+            url, path = self.data_api_urls[index], "/status"
+        for port in ports:
+            self.port_reservations.reserve_requested(port)
+        procs[index] = self.port_reservations.handoff_to(
+            ports,
+            lambda: subprocess.Popen(
+                debuggable_command(command),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            ),
+        )
+        assert wait_for_server(url, path=path, timeout=30.0), self.debug_logs()
+
     def debug_logs(self) -> str:
         try:
             statuses = _metadata_status_observations(
@@ -1129,6 +1604,43 @@ class ThreeByThreeBackupCluster:
             ready_when=lambda value: value is not None,
         )
 
+    def wait_for_group_leader(self, group_id: int, *, timeout_s: float = 30.0) -> dict:
+        """Wait for the data group's asynchronous report within one deadline."""
+        deadline = time.monotonic() + timeout_s
+        last = None
+        while time.monotonic() < deadline:
+            self.assert_processes_alive()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            leader = self.metadata_leader_id_once(request_timeout_s=min(1.0, remaining))
+            remaining = deadline - time.monotonic()
+            if leader is not None and remaining > 0:
+                try:
+                    snapshot = self.metadata_snapshot(
+                        leader - 1, request_timeout_s=min(3.0, remaining)
+                    )
+                except (requests.RequestException, AssertionError) as exc:
+                    last = repr(exc)
+                else:
+                    last = next(
+                        (
+                            row
+                            for row in snapshot["merged_group_statuses"]
+                            if int(row["group_id"]) == group_id
+                        ),
+                        None,
+                    )
+                    if last is not None and last["leader_known"]:
+                        assert int(last["leader_store_id"]) > 0, last
+                        return last
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+        raise AssertionError(
+            f"group {group_id} has no reported leader within {timeout_s}s; last={last!r}"
+        )
+
     def metadata_stable_leader_id(
         self,
         *,
@@ -1194,26 +1706,24 @@ class ThreeByThreeBackupCluster:
         if not self._metadata_probe_executor_shutdown:
             self._metadata_probe_executor.shutdown(wait=True, cancel_futures=True)
             self._metadata_probe_executor_shutdown = True
-        self.port_reservations.close()
-        for proc in reversed(self.data_procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        self.data_procs = []
+        from process_lifecycle import stop_processes
 
-        for proc in reversed(self.metadata_procs):
-            if proc.poll() is None:
-                proc.send_signal(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-        self.metadata_procs = []
+        # Data nodes finish before metadata stops. Within each role all nodes
+        # are signalled first; listener leases remain held until every exit.
+        failures = []
+        for attribute in ("data_procs", "metadata_procs"):
+            try:
+                stop_processes(list(reversed(getattr(self, attribute))))
+            except Exception as error:
+                failures.append(error)
+            else:
+                setattr(self, attribute, [])
+        if failures:
+            # Keep ownership, logs, roots and listener leases for unreaped
+            # processes. Still attempt both role stages before reporting.
+            maybe_preserve_tempdir(self.tempdir, failed=True)
+            raise ExceptionGroup("cluster shutdown failed", failures)
+        self.port_reservations.close()
 
         for handle in [*self.data_log_files, *self.metadata_log_files]:
             if not handle.closed:
@@ -1234,7 +1744,9 @@ def three_by_three_backup_cluster(
     if not resolved.exists():
         pytest.skip(f"antfly binary not built: {resolved}")
 
-    cluster = ThreeByThreeBackupCluster(str(resolved))
+    cluster = ThreeByThreeBackupCluster(
+        str(resolved), online_merge_enabled=getattr(request, "param", None)
+    )
     try:
         yield cluster
     finally:
@@ -1607,6 +2119,324 @@ def test_cluster_backup_restore_round_trip(backup_api):
             assert restored_doc["title"] == expected_title
 
 
+@pytest.mark.parametrize("three_by_three_backup_cluster", [None, True], indirect=True)
+def test_three_by_three_automatically_admits_online_document_merge(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+) -> None:
+    _exercise_online_document_merge(three_by_three_backup_cluster)
+
+
+@pytest.mark.parametrize("three_by_three_backup_cluster", [False], indirect=True)
+def test_three_by_three_online_merge_explicitly_disabled(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+) -> None:
+    _exercise_online_document_merge(three_by_three_backup_cluster, expect_online=False)
+
+
+def _seed_online_merge_setup_docs(cluster, session, table_name, documents):
+    # Initial corpus construction is not the transaction under test. Bound
+    # its per-request UNIQUE/FK planning and routed ReadIndex fanout instead of
+    # repeatedly restarting one large prepare when placement is converging.
+    # Faulted retained-tail writes below intentionally remain atomic batches.
+    batch = {}
+    for key, value in documents.items():
+        batch[key] = value
+        if len(batch) == 8:
+            _seed_cluster_docs_when_writable(cluster, session, table_name, batch)
+            batch = {}
+    if batch:
+        _seed_cluster_docs_when_writable(cluster, session, table_name, batch)
+
+
+@pytest.mark.parametrize("count", [0, 1, 8, 9, 35, 36])
+def test_online_merge_setup_batches_preserve_complete_corpus(monkeypatch, count):
+    documents = {f"key:{i}": {"id": i} for i in range(count)}
+    calls = []
+
+    def seed(cluster, session, table, batch):
+        assert (cluster, session, table) == ("cluster", "session", "rows")
+        calls.append(batch)
+
+    monkeypatch.setitem(globals(), "_seed_cluster_docs_when_writable", seed)
+    _seed_online_merge_setup_docs("cluster", "session", "rows", documents)
+    assert all(1 <= len(batch) <= 8 for batch in calls)
+    assert [item for batch in calls for item in batch.items()] == list(
+        documents.items()
+    )
+    assert len(calls) == (count + 7) // 8
+
+
+def test_online_merge_setup_batches_stop_on_ambiguous_failure(monkeypatch):
+    calls = []
+
+    def seed(_cluster, _session, _table, batch):
+        calls.append(batch)
+        raise AssertionError("transaction outcome unknown")
+
+    monkeypatch.setitem(globals(), "_seed_cluster_docs_when_writable", seed)
+    with pytest.raises(AssertionError, match="transaction outcome unknown"):
+        _seed_online_merge_setup_docs(
+            None, None, "rows", {f"key:{i}": {"id": i} for i in range(36)}
+        )
+    assert len(calls) == 1
+    assert len(calls[0]) == 8
+
+
+def _exercise_online_document_merge(
+    cluster,
+    *,
+    after_accept=None,
+    before_merge=None,
+    expect_online=True,
+    table_name=None,
+    schema=None,
+    documents=None,
+    timings=None,
+) -> str:
+    table_name = table_name or f"online_merge_{time.time_ns()}"
+    session = requests.Session()
+    session.headers.update({"Content-Type": "application/json", "Connection": "close"})
+    table_config = {
+        "num_shards": 3,
+        "description": "online merge admission and receiver receipts",
+    }
+    if schema is not None:
+        table_config["schema"] = schema
+    _create_cluster_table_when_admitted(
+        cluster,
+        session,
+        table_name,
+        table_config,
+    )
+    if timings:
+        timings.mark("parent.create")
+    assert wait_until(
+        lambda: cluster.fully_replicated_topology(table_name) or None,
+        timeout_s=90.0,
+        interval_s=0.5,
+    ), cluster.debug_logs()
+    if timings:
+        timings.mark("parent.replicated_topology")
+    if schema and (schema.get("unique_constraints") or schema.get("foreign_keys")):
+
+        def enforced():
+            response = session.get(
+                f"{cluster.data_api_urls[0]}/tables/{table_name}/constraints/status",
+                timeout=5,
+            )
+            if response.status_code == 200:
+                return response.json().get("state") == "enforced"
+            assert response.status_code in (404, 409, 503), response.text
+            return False
+
+        assert wait_until(enforced, timeout_s=90), cluster.debug_logs()
+    if timings:
+        timings.mark("parent.constraints_enforced")
+    documents = (
+        documents
+        if documents is not None
+        else {
+            "0:large": {
+                "title": "immutable source",
+                "payload": "x" * (2 * 1024 * 1024),
+            },
+            "0:small": {"title": "source companion"},
+            "8:base": {"title": "receiver base"},
+            "z:untouched": {"title": "unrelated range"},
+        }
+    )
+    # Keep the large single-owner write outside the cross-shard transaction's
+    # lower aggregate prepare limit while exercising snapshot row chunks.
+    _seed_cluster_docs_when_writable(
+        cluster, session, table_name, {"0:large": documents["0:large"]}
+    )
+    _seed_online_merge_setup_docs(
+        cluster,
+        session,
+        table_name,
+        {key: value for key, value in documents.items() if key != "0:large"},
+    )
+    if timings:
+        timings.mark("parent.seed")
+    if before_merge is not None:
+        before_merge(cluster, session, table_name, documents)
+    leader = cluster.metadata_stable_leader_id(timeout_s=20.0)
+    assert leader is not None, cluster.debug_logs()
+    snapshot = cluster.metadata_snapshot(leader - 1)
+    # Creation records the authoritative identity; logical-name annotations on
+    # diagnostic snapshots are best effort and can be absent during recovery.
+    table_id = cluster.table_ids[table_name]
+    catalog_table = next(
+        value for value in snapshot["tables"] if int(value["table_id"]) == table_id
+    )
+    physical_name = quote(catalog_table["name"], safe="")
+    ranges = sorted(
+        (value for value in snapshot["ranges"] if int(value["table_id"]) == table_id),
+        key=lambda value: value["start_key"],
+    )
+    donor, receiver = (int(value["group_id"]) for value in ranges[:2])
+    for key, expected_range in (
+        ("0:large", ranges[0]),
+        ("0:small", ranges[0]),
+        ("8:base", ranges[1]),
+        ("z:untouched", ranges[2]),
+    ):
+        assert expected_range["start_key"] <= key
+        assert expected_range["end_key"] is None or key < expected_range["end_key"]
+    if timings:
+        timings.mark("merge.discover_donor_receiver")
+    accepted = session.post(
+        f"{cluster.metadata_admin_urls[leader - 1]}/internal/v1/tables/{physical_name}/merge",
+        headers=internal_service_headers(),
+        json={
+            "donor_group_id": donor,
+            "receiver_group_id": receiver,
+            "allow_doc_identity_reassignment": True,
+        },
+        timeout=20,
+    )
+    assert accepted.status_code == 202, (
+        f"{accepted.status_code}: {accepted.text}\n{cluster.debug_logs()}"
+    )
+    if timings:
+        timings.mark("merge.admission")
+    observed_online: dict | None = None
+    if after_accept is not None:
+        observed_online = after_accept(
+            cluster, table_id, donor, receiver, table_name, documents
+        )
+    if timings:
+        timings.mark("merge.fault_callback_complete")
+    initial_scope = observed_online["scope"] if observed_online is not None else None
+    last_transition: dict | None = None
+    saw_completed = False
+    last_observed_phase = None
+    deadline = time.monotonic() + 180.0
+    while time.monotonic() < deadline:
+        leader = cluster.metadata_leader_id_once(request_timeout_s=1.0)
+        if leader is None:
+            time.sleep(0.1)
+            continue
+        try:
+            snapshot = cluster.metadata_snapshot(leader - 1, request_timeout_s=2.0)
+        except requests.RequestException:
+            # A leader change can race discovery. Keep the overall deadline,
+            # but do not fail a multi-node transition on one stale route.
+            time.sleep(0.1)
+            continue
+        transitions = [
+            value
+            for value in snapshot.get("merge_transitions", [])
+            if int(value["donor_group_id"]) == donor
+            and int(value["receiver_group_id"]) == receiver
+        ]
+        if transitions:
+            last_transition = transitions[0]
+            if initial_scope is not None:
+                assert last_transition.get("online") is not None, (
+                    f"online merge downgraded to ordinary: {last_transition!r}"
+                )
+            if not expect_online:
+                assert last_transition.get("online") is None, last_transition
+            if last_transition.get("online") is not None:
+                observed_online = last_transition["online"]
+                phase = observed_online.get("phase")
+                if timings and phase != last_observed_phase:
+                    timings.observe("merge.transition", merge_phase=phase)
+                    last_observed_phase = phase
+                if initial_scope is None:
+                    initial_scope = observed_online["scope"]
+                assert observed_online["scope"] == initial_scope, (
+                    f"online merge replaced its admitted scope: {last_transition!r}"
+                )
+                if observed_online.get("phase") == "complete":
+                    saw_completed = True
+                    break
+                assert observed_online.get("phase") != "cancelled", (
+                    f"online merge canceled: {last_transition!r}\n{cluster.debug_logs()}"
+                )
+        elif observed_online is not None or (not expect_online and last_transition):
+            # Completed transitions are retired after source release. A poll
+            # can miss the brief terminal record, especially across elections;
+            # require its removal AND the committed cutover, not a particular
+            # observation cadence. Cancellation cannot satisfy this topology.
+            live_groups = {
+                int(value["group_id"])
+                for value in snapshot["ranges"]
+                if int(value["table_id"]) == table_id
+            }
+            if (
+                donor not in live_groups
+                and receiver in live_groups
+                and len(live_groups) == 2
+            ):
+                saw_completed = True
+                break
+        time.sleep(0.1)
+    if expect_online:
+        assert observed_online is not None, (
+            f"never admitted online: {last_transition!r}\n{cluster.debug_logs()}"
+        )
+    assert saw_completed, (
+        f"{'online' if expect_online else 'guarded'} merge did not release source: "
+        f"{last_transition!r}\n{cluster.debug_logs()}"
+    )
+    if timings:
+        timings.mark("merge.complete_and_source_released")
+    remaining = {
+        int(value["group_id"])
+        for value in snapshot["ranges"]
+        if int(value["table_id"]) == table_id
+    }
+    assert donor not in remaining and receiver in remaining and len(remaining) == 2
+    for key, expected in documents.items():
+        actual = wait_until(
+            lambda key=key: _lookup_doc_from_url(
+                session, cluster.data_api_urls[0], table_name, key
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        matches = actual is not None and all(
+            actual.get(field) == value for field, value in expected.items()
+        )
+        if not matches:
+            observations = []
+            for api_url in cluster.data_api_urls:
+                try:
+                    response = session.get(
+                        f"{api_url}/tables/{table_name}/documents/{key}", timeout=5
+                    )
+                    value = response.json() if response.status_code == 200 else None
+                    observations.append(
+                        {
+                            "url": api_url,
+                            "status": response.status_code,
+                            "keys": sorted(value) if isinstance(value, dict) else None,
+                            "title": value.get("title")
+                            if isinstance(value, dict)
+                            else None,
+                            "payload_length": len(value.get("payload", ""))
+                            if isinstance(value, dict)
+                            else None,
+                            "expected_payload_length": len(expected.get("payload", "")),
+                            "id": value.get("_id") if isinstance(value, dict) else None,
+                            "error": response.text[:256]
+                            if response.status_code != 200
+                            else None,
+                        }
+                    )
+                except (requests.RequestException, ValueError) as exc:
+                    observations.append({"url": api_url, "error": repr(exc)[:256]})
+            assert matches, (
+                f"restored online row mismatch {key!r}: {observations}\n{cluster.debug_logs()}"
+            )
+    if timings:
+        timings.mark("verify.parent_rows")
+    session.close()
+    return table_name
+
+
 def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     three_by_three_backup_cluster: ThreeByThreeBackupCluster,
 ) -> None:
@@ -1694,6 +2524,10 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         if _is_metadata_not_leader_response(response):
             last_response = response
             continue
+        assert response.status_code == 200, (
+            f"backup_status={response.status_code} body={response.text}\n"
+            f"{cluster.debug_logs()}"
+        )
         backup = _check_response(response)
         break
     assert backup is not None, (
@@ -1842,6 +2676,7 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
     assert restore["committed_table_count"] == 1
     assert restore["failed_table_count"] == 0
 
+    assert wait_until(lambda: cluster.refresh_table_identity(table_name), timeout_s=30)
     restored_topology = wait_until(
         lambda: cluster.fully_replicated_topology(table_name),
         timeout_s=90.0,
@@ -1881,6 +2716,342 @@ def test_three_by_three_cluster_backup_restore_through_metadata_public_api(
         timeout_s=30.0,
         interval_s=0.25,
     ), f"completed restore progress was not retired\n{cluster.debug_logs()}"
+
+
+@pytest.mark.parametrize("backup_format", ["portable", "native"])
+def test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_crash(
+    three_by_three_backup_cluster: ThreeByThreeBackupCluster,
+    backup_format: str,
+) -> None:
+    """Real six-process Raft/HTTP failover; no direct storage mutation adapters."""
+    cluster = three_by_three_backup_cluster
+    suffix = time.time_ns()
+    document_table, relational_table = f"mixed_docs_{suffix}", f"mixed_rows_{suffix}"
+    tables = (document_table, relational_table)
+    schema = {
+        "storage_mode": "relational",
+        "default_type": "row",
+        "document_schemas": {
+            "row": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "tenant": {"type": "integer"},
+                        "id": {"type": "integer"},
+                        "price": {"type": "integer"},
+                        "active": {"type": "boolean"},
+                    },
+                    "required": ["tenant", "id", "price", "active"],
+                    "additionalProperties": False,
+                }
+            }
+        },
+        "relational_indexes": [
+            {
+                "name": "active_price",
+                "keys": [
+                    {"column": "tenant"},
+                    {
+                        "expression": {
+                            "op": "multiply",
+                            "args": [
+                                {"op": "column", "column": "price"},
+                                {"op": "literal", "type": "integer", "value": "2"},
+                            ],
+                        },
+                        "result_type": "integer",
+                    },
+                    {"column": "id"},
+                ],
+                "include_columns": ["price"],
+                "where": [{"column": "active", "op": "eq", "value": True}],
+            }
+        ],
+    }
+    query = {
+        "index": "active_price",
+        "fields": ["id", "price"],
+        "limit": 4096,
+        "conditions": [{"column": "active", "op": "eq", "value": True}],
+        "lower": {"values": [1]},
+        "upper": {"values": [1]},
+    }
+    with requests.Session() as session:
+        session.headers.update(
+            {"Content-Type": "application/json", "Connection": "close"}
+        )
+        source_topologies = {}
+        for table in tables:
+            definition = {"num_shards": 3}
+            if table == relational_table:
+                definition["schema"] = schema
+            _create_cluster_table_when_admitted(cluster, session, table, definition)
+            source_topologies[table] = wait_until(
+                lambda table=table: cluster.fully_replicated_topology(table),
+                timeout_s=90,
+                interval_s=0.5,
+            )
+            assert source_topologies[table] is not None, cluster.debug_logs()
+        table_contract = _check_response(
+            session.get(
+                f"{cluster.data_api_urls[0]}/tables/{relational_table}", timeout=10
+            )
+        )
+        query["schema_version"] = table_contract["schema"]["version"]
+        relational_rows = {
+            f"{prefix}:{i:03}": {
+                "tenant": 1,
+                "id": group * 12 + i,
+                "price": 100 + group * 12 + i,
+                "active": i % 3 != 0,
+            }
+            for group, prefix in enumerate(("0", "8", "z"))
+            for i in range(12)
+        }
+        documents = {
+            f"{prefix}:doc": {
+                "title": prefix,
+                "body": "ordinary document survives mixed restore",
+            }
+            for prefix in ("0", "8", "z")
+        }
+        _seed_cluster_docs_when_writable(cluster, session, document_table, documents)
+        # The server assigns epoch zero to the initial schema. Exercise both
+        # public typed boundaries against that actual epoch, not a fixture-made
+        # schema update that would conceal zero/absence admission mistakes.
+        first_key = next(iter(relational_rows))
+        typed_mutation = {
+            "schema_version": query["schema_version"],
+            "mutations": [
+                {
+                    "key": first_key,
+                    "expected_version": "0",
+                    "row": relational_rows[first_key],
+                }
+            ],
+            "sync_level": "write",
+        }
+        mismatched_mutation = session.post(
+            f"{cluster.data_api_urls[0]}/tables/{relational_table}/rows/mutate",
+            json={**typed_mutation, "schema_version": query["schema_version"] + 1},
+            timeout=30,
+        )
+        assert mismatched_mutation.status_code == 409, mismatched_mutation.text
+        mutation = session.post(
+            f"{cluster.data_api_urls[0]}/tables/{relational_table}/rows/mutate",
+            json=typed_mutation,
+            timeout=30,
+        )
+        assert mutation.status_code == 201, mutation.text
+        _seed_cluster_docs_when_writable(
+            cluster,
+            session,
+            relational_table,
+            {key: row for key, row in relational_rows.items() if key != first_key},
+        )
+
+        mismatched_query = session.post(
+            f"{cluster.data_api_urls[0]}/tables/{relational_table}/rows/query",
+            json={**query, "schema_version": query["schema_version"] + 1},
+            timeout=10,
+        )
+        assert mismatched_query.status_code == 409, mismatched_query.text
+
+        last_index_response = None
+
+        def indexed_rows(api_url: str) -> list[dict] | None:
+            nonlocal last_index_response
+            try:
+                response = session.post(
+                    f"{api_url}/tables/{relational_table}/rows/query",
+                    json=query,
+                    timeout=3,
+                )
+            except requests.RequestException as exc:
+                last_index_response = repr(exc)
+                return None
+            last_index_response = (response.status_code, response.text[:2000])
+            if response.status_code in (404, 409, 503):
+                return None
+            assert response.status_code == 200, response.text
+            return [json.loads(line) for line in response.text.splitlines() if line]
+
+        expected_keys = {key for key, row in relational_rows.items() if row["active"]}
+
+        def complete_indexed_rows(api_url: str) -> list[dict] | None:
+            rows = indexed_rows(api_url)
+            return (
+                rows
+                if rows is not None and {row["_id"] for row in rows} == expected_keys
+                else None
+            )
+
+        source_rows = wait_until(
+            lambda: complete_indexed_rows(cluster.data_api_urls[0]),
+            timeout_s=90,
+            interval_s=0.5,
+        )
+        assert source_rows is not None, (
+            f"last_index_response={last_index_response}\n{cluster.debug_logs()}"
+        )
+        source_versions = {row["_id"]: row["version"] for row in source_rows}
+        backup_dir = Path(
+            tempfile.mkdtemp(prefix="mixed-repository-", dir=cluster.root)
+        )
+        backup_id = f"mixed-{suffix}"
+        repository = {
+            "backup_id": backup_id,
+            "location": _file_location(backup_dir),
+            "connection": BACKUP_CONNECTION,
+        }
+        try:
+            backup_response = session.post(
+                f"{cluster.metadata_leader_public_url()}/backup",
+                json={
+                    **repository,
+                    "table_names": list(tables),
+                    "format": backup_format,
+                },
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise AssertionError(
+                f"backup transport failed: {exc}\n{cluster.debug_logs()}"
+            ) from exc
+        assert backup_response.status_code == 200, (
+            f"backup_status={backup_response.status_code} body={backup_response.text}\n"
+            f"{cluster.debug_logs()}"
+        )
+        backup = _check_response(backup_response)
+        assert backup["status"] == "completed", backup
+        assert {table["name"] for table in backup["tables"]} == set(tables)
+        for table in tables:
+            response = session.delete(
+                f"{cluster.data_api_urls[0]}/tables/{table}", timeout=30
+            )
+            assert response.status_code == 204, response.text
+            topology = source_topologies[table]
+            assert wait_until(
+                lambda table=table, topology=topology: (
+                    cluster.table_absent_on_all_metadata_nodes(table, *topology)
+                ),
+                timeout_s=30,
+                interval_s=0.25,
+            ), cluster.debug_logs()
+
+        # Stop every owner before admission to deterministically prevent the
+        # restore from completing between its 202 receipt and coordinator kill.
+        # Metadata keeps quorum and the API request still crosses its real route.
+        leader_id = cluster.metadata_stable_leader_id(timeout_s=30)
+        assert leader_id is not None
+        coordinator = leader_id - 1
+        for proc in cluster.data_procs:
+            proc.send_signal(signal.SIGSTOP)
+        try:
+            response = session.post(
+                f"{cluster.metadata_public_urls[coordinator]}/restore",
+                json={**repository, "restore_mode": "fail_if_exists"},
+                timeout=30,
+            )
+            assert response.status_code == 202, response.text
+            job_id = response.json()["job_id"]
+            cluster.metadata_procs[coordinator].kill()
+            cluster.metadata_procs[coordinator].wait(timeout=10)
+            # A self-confirmed same-term quorum is sufficient after the crash;
+            # three consecutive transport samples add no Raft safety proof.
+            successor_id = cluster.metadata_leader_id(timeout_s=30)
+            assert successor_id is not None and successor_id != leader_id, (
+                cluster.debug_logs()
+            )
+            successor_url = cluster.metadata_public_urls[successor_id - 1]
+            recovered = _check_response(
+                session.get(f"{successor_url}/restore/jobs/{job_id}", timeout=10)
+            )
+            assert recovered["phase"] not in ("succeeded", "failed", "cancelled"), (
+                recovered
+            )
+            cluster.restart_crashed_node(metadata=True, index=coordinator)
+        finally:
+            for proc in cluster.data_procs:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGCONT)
+
+        last_restore_observations: dict[str, object] = {}
+
+        def terminal() -> dict | None:
+            cluster.assert_processes_alive()
+            for base in cluster.metadata_public_urls:
+                try:
+                    response = session.get(f"{base}/restore/jobs/{job_id}", timeout=2)
+                except requests.RequestException as exc:
+                    last_restore_observations[base] = {"transport_error": str(exc)}
+                    continue
+                last_restore_observations[base] = {
+                    "status": response.status_code,
+                    "body": response.text[:16384],
+                }
+                if response.status_code in (404, 503):
+                    continue
+                result = _check_response(response)
+                if result["phase"] in ("succeeded", "failed", "cancelled"):
+                    return result
+            return None
+
+        completed = wait_until(terminal, timeout_s=180, interval_s=0.25)
+        assert completed is not None and completed["phase"] == "succeeded", (
+            f"job={completed} last_restore_observations={last_restore_observations}\n"
+            f"{cluster.debug_logs()}"
+        )
+        assert completed["result"]["committed_table_count"] == 2, completed
+        assert completed["result"]["failed_table_count"] == 0, completed
+        for table in tables:
+            assert wait_until(
+                lambda table=table: cluster.refresh_table_identity(table), timeout_s=30
+            )
+            current = wait_until(
+                lambda table=table: cluster.fully_replicated_topology(table),
+                timeout_s=90,
+                interval_s=0.5,
+            )
+            assert current is not None and current[1].isdisjoint(
+                source_topologies[table][1]
+            )
+
+        # Crash a real storage process, retain the other two voters, and prove
+        # index reads remain available before reopening its physical replicas.
+        cluster.data_procs[0].kill()
+        cluster.data_procs[0].wait(timeout=10)
+        assert wait_until(
+            lambda: complete_indexed_rows(cluster.data_api_urls[1]),
+            timeout_s=45,
+            interval_s=0.25,
+        ), cluster.debug_logs()
+        cluster.restart_crashed_node(metadata=False, index=0)
+        for base in cluster.data_api_urls:
+            restored_rows = wait_until(
+                lambda base=base: complete_indexed_rows(base),
+                timeout_s=60,
+                interval_s=0.25,
+            )
+            assert restored_rows is not None
+            assert {row["_id"] for row in restored_rows} == expected_keys
+            assert {
+                row["_id"]: row["version"] for row in restored_rows
+            } == source_versions
+            for item in restored_rows:
+                original = relational_rows[item["_id"]]
+                assert item["row"] == {"id": original["id"], "price": original["price"]}
+            for key, expected in documents.items():
+                assert (
+                    wait_until(
+                        lambda base=base, key=key: _lookup_doc_from_url(
+                            session, base, document_table, key
+                        ),
+                        timeout_s=30,
+                        interval_s=0.25,
+                    )
+                    == expected
+                )
 
 
 @pytest.mark.objectstore_integration
@@ -1985,7 +3156,7 @@ def _concurrent_restore_observers(backup_api, expected_titles):
                     response = session.get(
                         f"{backup_api.url}/tables/{table}{suffix}", timeout=10
                     )
-                    if response.status_code == 503:
+                    if response.status_code in (409, 503):
                         assert publication_retry_delay(response, 0.01) is not None, (
                             response.url,
                             response.status_code,
@@ -2168,7 +3339,10 @@ def _cluster_restore_modes(backup_api, *, concurrent_observers=False):
         assert restored_docs[table_b]["title"] == "Original Beta"
 
 
-def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
+@pytest.mark.parametrize("backup_format", ["native", "portable"])
+def test_partial_cluster_backup_is_not_published_and_can_retry(
+    backup_api, backup_format
+):
     table_name = f"cluster_partial_{time.time_ns()}"
     missing_table = f"cluster_partial_missing_{time.time_ns()}"
     backup_id = f"cluster-partial-{time.time_ns()}"
@@ -2193,10 +3367,23 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
     with tempfile.TemporaryDirectory(prefix="antfly-cluster-partial-") as backup_dir:
         location = _file_location(backup_dir)
 
+        # No existing owner returns per-table failures, not an invalid empty
+        # cohort. Its reservation must be released before reusing the ID.
+        missing = backup_api.cluster_backup(
+            backup_id=backup_id,
+            location=location,
+            table_names=[missing_table],
+            backup_format=backup_format,
+        )
+        assert missing["status"] == "failed"
+        assert missing["tables"][0]["status"] == "failed"
+        assert "not found" in missing["tables"][0]["error"]
+
         backup = backup_api.cluster_backup(
             backup_id=backup_id,
             location=location,
             table_names=[table_name, missing_table],
+            backup_format=backup_format,
         )
         assert backup["status"] == "partial"
         by_name = {table["name"]: table for table in backup["tables"]}
@@ -2234,6 +3421,7 @@ def test_partial_cluster_backup_is_not_published_and_can_retry(backup_api):
             backup_id=backup_id,
             location=location,
             table_names=[table_name, missing_table],
+            backup_format=backup_format,
         )
         assert retried["status"] == "completed"
         assert {table["name"] for table in retried["tables"]} == {
@@ -2419,6 +3607,6 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
                 "restore_mode": "fail_if_exists",
             },
         )
-        cluster_job = _wait_for_terminal_restore_job(backup_api, cluster_restore)
-        assert cluster_job["phase"] == "failed"
-        assert cluster_job["error"] == "InvalidRequest"
+        # Cluster restore also validates repository admission before creating a job.
+        assert cluster_restore.status_code == 400, cluster_restore.text
+        assert "error" in cluster_restore.json(), cluster_restore.text

@@ -17,7 +17,6 @@ pub fn main(init: std.process.Init) !void {
     var iterator = std.process.Args.Iterator.init(init.minimal.args);
     _ = iterator.next();
     const command = iterator.next() orelse return error.MissingCommand;
-    if (!std.mem.eql(u8, command, "run")) return error.InvalidCommand;
     var arguments: [64][]const u8 = undefined;
     var count: usize = 0;
     while (iterator.next()) |argument| {
@@ -25,5 +24,11 @@ pub fn main(init: std.process.Init) !void {
         arguments[count] = argument;
         count += 1;
     }
-    try cli.runServer(allocator, init.io, arguments[0..count]);
+    if (std.mem.eql(u8, command, "run")) {
+        try cli.runServer(allocator, init.io, arguments[0..count]);
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        // Qualification needs the identity and capabilities of this exact
+        // server binary, including when built on a memory-constrained host.
+        try @import("inference").cuda_info.main(allocator, init.io, arguments[0..count]);
+    } else return error.InvalidCommand;
 }

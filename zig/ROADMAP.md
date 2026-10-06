@@ -27,7 +27,7 @@ Detailed execution belongs in subsystem docs:
 - [pkg/antfly/src/metadata/METADATA.md](pkg/antfly/src/metadata/METADATA.md)
 - [pkg/antfly/src/api/PLAN.md](pkg/antfly/src/api/PLAN.md)
 - [pkg/antfly/src/raft/RAFT.md](pkg/antfly/src/raft/RAFT.md)
-- [pkg/antfly/src/lmdb/LMDB.md](pkg/antfly/src/lmdb/LMDB.md)
+- [lib/lmdb/src/LMDB.md](lib/lmdb/src/LMDB.md)
 - [pkg/inference/ROADMAP.md](pkg/inference/ROADMAP.md)
 - [lib/raft/ROADMAP.md](lib/raft/ROADMAP.md)
 
@@ -77,7 +77,7 @@ formats):
   [STATUS.md](STATUS.md), [STATUS_API.md](STATUS_API.md)
 - DB-backed shard transitions, durable replica state, LMDB/WAL paths, and LSM
   backend work —
-  [DB.md](DB.md), [pkg/antfly/src/lmdb/LMDB.md](pkg/antfly/src/lmdb/LMDB.md)
+  [DB.md](DB.md), [lib/lmdb/src/LMDB.md](lib/lmdb/src/LMDB.md)
 - table/index lifecycle, routed reads/writes, graph/query/retrieval surfaces,
   and OpenAPI-shaped API contracts —
   [SCHEMA.md](SCHEMA.md), [GRAPH.md](GRAPH.md), [OPENAPI.md](OPENAPI.md)
@@ -163,7 +163,7 @@ Principle:
 ### 5. Storage Engine And Durability
 
 Primary reference:
-- [pkg/antfly/src/lmdb/LMDB.md](pkg/antfly/src/lmdb/LMDB.md)
+- [lib/lmdb/src/LMDB.md](lib/lmdb/src/LMDB.md)
 
 Near-term goals:
 - keep LMDB/WAL durability and crash confidence improving

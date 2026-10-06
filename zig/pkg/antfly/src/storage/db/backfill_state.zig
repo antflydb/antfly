@@ -16,7 +16,7 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const lsm_backend = @import("../lsm_backend/storage_io.zig");
 
 const rebuild_state_name = "rebuild.state";
@@ -41,7 +41,9 @@ const PublishFaultPoint = enum {
     after_rename,
 };
 
-var test_publish_fault: ?PublishFaultPoint = null;
+/// Test-only crash seam shared by callers verifying destructive rebuild order.
+/// Production publication never consults this value.
+pub var test_publish_fault: ?PublishFaultPoint = null;
 
 pub const LoadResult = union(enum) {
     absent,
@@ -70,7 +72,7 @@ const DecodedLoadResult = union(enum) {
     corrupt,
     valid: DecodedCursor,
 
-    fn deinit(self: *DecodedLoadResult, alloc: Allocator) void {
+    pub fn deinit(self: *DecodedLoadResult, alloc: Allocator) void {
         switch (self.*) {
             .valid => |cursor| alloc.free(cursor.key),
             else => {},
@@ -115,6 +117,9 @@ pub const RebuildState = struct {
     }
 
     pub fn checkWithIo(self: RebuildState, alloc: Allocator, io: std.Io) !?[]u8 {
+        // Freestanding stores have no crash recovery boundary: every open
+        // rebuilds in memory, so no durable cursor is required.
+        if (builtin.os.tag == .freestanding) return null;
         var loaded = try self.loadDecodedWithIo(alloc, io);
         defer loaded.deinit(alloc);
         return switch (loaded) {
@@ -205,7 +210,7 @@ pub const RebuildState = struct {
     }
 
     pub fn updateWithIo(self: RebuildState, io: std.Io, key: []const u8) !void {
-        if (builtin.os.tag == .freestanding and self.storage == null) return;
+        if (builtin.os.tag == .freestanding) return;
         const alloc = std.heap.page_allocator;
         const encoded = try encodeState(alloc, self.owner_generation, false, key);
         defer alloc.free(encoded);
@@ -235,7 +240,7 @@ pub const RebuildState = struct {
     }
 
     pub fn clearWithIo(self: RebuildState, io: std.Io) !void {
-        if (builtin.os.tag == .freestanding and self.storage == null) return;
+        if (builtin.os.tag == .freestanding) return;
         const path = try self.pathAlloc(std.heap.page_allocator);
         defer std.heap.page_allocator.free(path);
         if (self.storage) |storage| {
@@ -359,6 +364,9 @@ fn injectPublishFault(point: PublishFaultPoint) !void {
 }
 
 fn loadDecodedPathWithIo(alloc: Allocator, io: std.Io, path: []const u8) !DecodedLoadResult {
+    // The freestanding path reads through RebuildState.storage above. There is
+    // no process cwd to consult when that storage is absent.
+    if (comptime builtin.os.tag == .freestanding) return .absent;
     const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(rebuild_state_max_read_bytes)) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return .absent,
         error.StreamTooLong => return .corrupt,

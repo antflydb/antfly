@@ -102,6 +102,33 @@ pub fn runFromIterator(
         if (legacy_secret_path) |path| &.{path} else &.{},
     );
     defer if (secret_store) |*store| store.deinit();
+    var native_keys: @import("common/secret_keyring.zig").Keyring = undefined;
+    var native_objects: ?@import("serverless/object_store_support.zig").OpenedObjectStore = null;
+    defer if (native_objects) |*objects| objects.deinit();
+    var native_secrets: ?@import("serverless/secret_store.zig").Store = null;
+    defer if (native_secrets) |*store| store.deinit();
+    if (secret_store) |*facade| {
+        if (facade.native_config) |native| {
+            const cfg = native.value;
+            if (cfg.backend != .serverless) return error.InvalidConfig;
+            // Bootstrap credentials come from workload identity/environment,
+            // independently of the encrypted store being opened.
+            if (!(std.mem.startsWith(u8, cfg.path, "s3://") or std.mem.startsWith(u8, cfg.path, "gs://") or std.mem.startsWith(u8, cfg.path, "file://"))) return error.InvalidConfig;
+            native_objects = try @import("serverless/object_store_support.zig").OpenedObjectStore.initRemoteUriWithS3AndOpenOptions(alloc, cfg.path, "native-secrets", null, .{ .ensure_bucket = false });
+            native_keys = .{ .alloc = alloc, .io = runtime_io, .path = cfg.keyring_path.? };
+            try native_keys.validate();
+            native_secrets = try @import("serverless/secret_store.zig").Store.init(alloc, runtime_io, cfg.scope, native_keys.provider(), .{
+                .client = native_objects.?.client,
+                .gcs_client = native_objects.?.gcs_client,
+                .bucket = native_objects.?.bucket,
+                .prefix = native_objects.?.prefix,
+                .consistency = .linearizable_cas,
+            });
+            const handle = native_secrets.?.nativeStore();
+            facade.attachNative(handle.source, handle.writer);
+            _ = try handle.source.refresh(cfg.scope);
+        }
+    }
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
         try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, runtime_io, path, if (secret_store) |*store| store else null, .serverless)
     else
@@ -129,6 +156,8 @@ pub fn runFromIterator(
     }
 
     const bootstrap = serverless.BootstrapConfig{
+        .secret_store = if (secret_store) |*store| store else null,
+        .node_config = if (loaded_config) |*cfg| cfg else null,
         .artifacts_uri = try resolveRequired(init.environ_map, cli.artifacts_uri, configured_uris.artifacts, "ANTFLY_SERVERLESS_ARTIFACTS_URI"),
         .manifests_uri = try resolveRequired(init.environ_map, cli.manifests_uri, configured_uris.manifests, "ANTFLY_SERVERLESS_MANIFESTS_URI"),
         .wal_uri = try resolveRequired(init.environ_map, cli.wal_uri, configured_uris.wal, "ANTFLY_SERVERLESS_WAL_URI"),
@@ -172,6 +201,7 @@ pub fn runFromIterator(
 
     var srv = serverless.ServerlessServer.init(alloc, runtime_io, .{
         .bootstrap = bootstrap,
+        .http = .{ .secret_store = if (secret_store) |*store| store else null, .secret_admin_token = init.environ_map.get("ANTFLY_SECRET_ADMIN_TOKEN") },
         .listener = listener,
     }) catch |err| {
         reportStartupError(err);
@@ -244,7 +274,7 @@ const ServerlessHealthSource = struct {
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
-        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(self.supervisor.currentState()));
+        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(self.supervisor.currentState()));
         try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
         const run_stats = self.srv.stack.runtime.metricsSnapshot();
         const query_metrics = self.srv.stack.query.metricsSnapshot();
@@ -481,7 +511,7 @@ const ConfiguredStorageUris = struct {
         return out;
     }
 
-    fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
         if (self.artifacts) |value| alloc.free(value);
         if (self.manifests) |value| alloc.free(value);
         if (self.wal) |value| alloc.free(value);

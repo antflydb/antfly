@@ -27,7 +27,9 @@ class ChunkerConfig:
 
     Attributes:
         provider (ChunkerProvider): The chunking provider to use.
-        max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero uses the chunker default.
+        max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (or omitted, the default)
+            means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk
+            count for very large inputs.
         threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
         text (TextChunkOptions | Unset): Options specific to text chunking.
         audio (AudioChunkOptions | Unset): Options specific to audio chunking.
@@ -39,9 +41,11 @@ class ChunkerConfig:
         store_chunks (bool | Unset): Controls whether chunk data is persisted to storage. When false (default), chunks
             are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
             Default: False.
-        full_text_index (ChunkerConfigFullTextIndex | Unset): Configuration for full-text indexing of chunks in Bleve.
-            When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field.
-            When absent, chunks use :c: suffix and are only used for vector embeddings.
+        full_text_index (ChunkerConfigFullTextIndex | Unset): Configuration for full-text indexing of chunks.
+            When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index,
+            queryable and projectable via the document's `_chunks` field.
+            When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search
+            (unless `store_chunks` is also set).
     """
 
     provider: ChunkerProvider

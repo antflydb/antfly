@@ -8,7 +8,7 @@ const background_runtime = @import("background_runtime.zig");
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 
-var coordinator_boot_sequence: std.atomic.Value(u64) = .init(1);
+var coordinator_boot_sequence: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 pub const Operation = enum { check, compact, vacuum };
 pub const State = enum { queued, running, succeeded, failed, canceled };
@@ -121,7 +121,7 @@ pub const Coordinator = struct {
         error_name: ?[]const u8 = null,
         cancel: CancelToken = .{},
 
-        fn deinit(self: *Job, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Job, allocator: std.mem.Allocator) void {
             if (self.idempotency_key) |key| allocator.free(key);
             allocator.destroy(self);
         }
@@ -147,7 +147,7 @@ pub const Coordinator = struct {
             execution.coordinator.runJob(execution.job);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const execution: *JobExecution = @ptrCast(@alignCast(ptr));
             execution.coordinator.allocator.destroy(execution);
         }
@@ -365,7 +365,7 @@ test "storage maintenance requires an asynchronous backend runtime" {
 
 test "storage maintenance coordinator is idempotent and single flight" {
     const Fake = struct {
-        runs: std.atomic.Value(u64) = .init(0),
+        runs: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn source(self: *@This()) Source {
             return .{ .ptr = self, .vtable = &.{ .status = status, .run = run } };

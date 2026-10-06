@@ -558,6 +558,9 @@ pub const Session = struct {
     vtable: *const VTable,
     close_protection: ?CloseProtection = null,
     run_admission: ?RunAdmission = null,
+    /// Borrowed from the session owner, backed by its retained model lease.
+    /// Copies share one ledger so concurrent requests cannot reuse the credit.
+    generation_workspace: ?*memory.ReservedGenerationWorkspace = null,
     output_geometry: ?SequenceOutputGeometry = null,
     cached_decoder_geometry: ?CachedDecoderGeometry = null,
     /// Explicit stage contract: these small control tensors are equal across
@@ -566,7 +569,15 @@ pub const Session = struct {
     /// Borrowed from the model/runtime owner; stable for every session copy.
     execution_gate: ?*std.atomic.Mutex = null,
 
+    /// Stable planning capacity, shared by all copies of this session. Live
+    /// contention is resolved by workspace acquisition after chunk selection.
+    pub fn generationWorkspaceCapacity(self: Session) ?memory.AdmissionAmounts {
+        return if (self.generation_workspace) |workspace| workspace.capacity else null;
+    }
+
     pub const VTable = struct {
+        hasLayaDecisions: ?*const fn (ptr: *anyopaque) bool = null,
+        runLayaDecisions: ?*const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor = null,
         run: *const fn (ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) anyerror![]Tensor,
         inputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
         outputInfo: *const fn (ptr: *anyopaque) []const TensorInfo,
@@ -629,6 +640,29 @@ pub const Session = struct {
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return attachOutputAdmission(outputs, allocator, &resource_lease);
+    }
+
+    /// Optional typed-decision route. Only an unsupported/disabled capability
+    /// returns null; execution and admission failures propagate without fallback.
+    pub fn runLayaDecisionsWithControl(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !?[]Tensor {
+        const run_decisions = self.vtable.runLayaDecisions orelse return null;
+        if (self.vtable.hasLayaDecisions) |supported| if (!supported(self.ptr)) return null;
+        const active = control orelse InferenceExecutionControl{};
+        try active.check();
+        var protection = if (control) |c| try c.enterUninterruptible(self.interruption()) else null;
+        defer if (protection) |*p| p.deinit();
+        var lease = if (self.run_admission) |admission|
+            try admission.acquireRequest(try self.planRun(inputs, null), self.outputInfo())
+        else
+            null;
+        errdefer if (lease) |*l| l.release();
+        const outputs = (try run_decisions(self.ptr, inputs, allocator, control)) orelse {
+            if (lease) |*l| l.release();
+            return null;
+        };
+        errdefer deinitTensorSlice(outputs, allocator);
+        try active.check();
+        return try attachOutputAdmission(outputs, allocator, &lease);
     }
 
     /// Borrows outputs and the lease until success. On error the caller still
@@ -1037,6 +1071,33 @@ pub const RunPermit = struct {
         return outputs;
     }
 
+    /// Use the chunk's existing admission for resident typed decisions.
+    pub fn runLayaDecisionsWithControl(
+        self: *RunPermit,
+        inputs: []const Tensor,
+        allocator: std.mem.Allocator,
+        control: ?InferenceExecutionControl,
+    ) !?[]Tensor {
+        const run_decisions = self.session.vtable.runLayaDecisions orelse return null;
+        if (self.session.vtable.hasLayaDecisions) |supported| if (!supported(self.session.ptr)) return null;
+        try self.resolveGeometry(inputs);
+        if (self.execution_yielded) {
+            var execution = try self.acquireExecution();
+            defer execution.deinit();
+            const outputs = (try execution.runLayaDecisionsWithControl(inputs, allocator, control)) orelse return null;
+            errdefer deinitTensorSlice(outputs, allocator);
+            return try Session.attachOutputAdmission(outputs, allocator, &execution.lease);
+        }
+        const active = control orelse InferenceExecutionControl{};
+        try active.check();
+        var protection = if (control) |c| try c.enterUninterruptible(self.session.interruption()) else null;
+        defer if (protection) |*p| p.deinit();
+        const outputs = (try run_decisions(self.session.ptr, inputs, allocator, control)) orelse return null;
+        errdefer deinitTensorSlice(outputs, allocator);
+        try active.check();
+        return outputs;
+    }
+
     pub fn runResident(
         self: *RunPermit,
         inputs: []const Tensor,
@@ -1170,11 +1231,16 @@ fn deinitTensorSlice(tensors: []Tensor, allocator: std.mem.Allocator) void {
     allocator.free(tensors);
 }
 
-test "session vtable layout" {
-    // Ensure the vtable has all required function pointers.
-    const info = @typeInfo(Session.VTable);
-    try std.testing.expectEqual(@as(usize, 15), info.@"struct".fields.len);
+test "session vtable exposes required entry points" {
+    // Optional capabilities can be added without changing this contract.
+    try std.testing.expect(@hasField(Session.VTable, "run"));
+    try std.testing.expect(@hasField(Session.VTable, "inputInfo"));
+    try std.testing.expect(@hasField(Session.VTable, "outputInfo"));
+    try std.testing.expect(@hasField(Session.VTable, "backend"));
+    try std.testing.expect(@hasField(Session.VTable, "close"));
     try std.testing.expect(@hasField(Session.VTable, "independentBatchRows"));
+    try std.testing.expect(@hasField(Session.VTable, "hasLayaDecisions"));
+    try std.testing.expect(@hasField(Session.VTable, "runLayaDecisions"));
 }
 
 const AdmissionProbeSession = struct {
@@ -1282,6 +1348,51 @@ const DeadlineProbeSession = struct {
     };
 };
 
+test "laya decision permit reuses admission and releases yielded output leases" {
+    const Probe = struct {
+        controller: *memory.AdmissionController,
+        expected: memory.AdmissionAmounts = .{},
+        fail: bool = false,
+
+        fn runDecisions(ptr: *anyopaque, _: []const Tensor, allocator: std.mem.Allocator, _: ?InferenceExecutionControl) !?[]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.expected, self.controller.snapshot());
+            if (self.fail) return error.InvalidLayaOutput;
+            const outputs = try allocator.alloc(Tensor, 1);
+            errdefer allocator.free(outputs);
+            outputs[0] = try Tensor.initFloat32(allocator, "decisions", &.{1}, &.{1});
+            return outputs;
+        }
+    };
+    var controller = memory.AdmissionController{};
+    var probe = Probe{ .controller = &controller };
+    var vtable = AdmissionProbeSession.vtable;
+    vtable.runLayaDecisions = Probe.runDecisions;
+    const session = Session{
+        .ptr = &probe,
+        .vtable = &vtable,
+        .run_admission = .{
+            .controller = &controller,
+            .backend_class = .cpu,
+            .limits = .{},
+            .static_workspace_bytes = 4096,
+        },
+    };
+    for ([_]bool{ false, true }) |yielded| {
+        var permit = try session.admit(.{ .batch = 1, .sequence = 1, .output_bytes = 12 });
+        defer permit.deinit();
+        probe.expected = controller.snapshot();
+        if (yielded) try std.testing.expect(try permit.yieldExecution());
+        const outputs = (try permit.runLayaDecisionsWithControl(&.{}, std.testing.allocator, .{})).?;
+        deinitTensorSlice(outputs, std.testing.allocator);
+        probe.fail = true;
+        try std.testing.expectError(error.InvalidLayaOutput, permit.runLayaDecisionsWithControl(&.{}, std.testing.allocator, null));
+        probe.fail = false;
+        permit.deinit();
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
 test "controlled blocked backend expires and admission unwinds" {
     var controller = memory.AdmissionController{};
     var probe: u8 = 0;
@@ -1308,7 +1419,7 @@ test "controlled blocked backend expires and admission unwinds" {
 
 test "run admission scales dynamic outputs and honors reserved backend workspace" {
     var controller = memory.AdmissionController{};
-    var input_bytes = [_]u8{0} ** 64;
+    var input_bytes = @as([64]u8, @splat(0));
     const input = Tensor{
         .data = &input_bytes,
         .dtype = .i64,

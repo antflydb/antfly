@@ -1,8 +1,11 @@
 """Check production-soak evidence without starting a server or building Zig."""
 
 import os
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -19,6 +22,9 @@ class RegressionEvidenceTests(unittest.TestCase):
         stale=False,
         autograph=False,
         cluster_restore=False,
+        profile="",
+        report=True,
+        selector="example.py::test_restore",
     ):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -29,7 +35,11 @@ class RegressionEvidenceTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import os, sys, resource\n"
                 "from pathlib import Path\n"
-                "path = next(arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml='))\n"
+                "if '--collect-only' in sys.argv: print('stub collection'); sys.exit(4 if os.environ['STUB_JUNIT_MODE'] == 'collection-error' else 0)\n"
+                "path = next((arg.split('=', 1)[1] for arg in sys.argv if arg.startswith('--junitxml=')), None)\n"
+                "if path is None: print('stub invoked without junit'); sys.exit(0)\n"
+                "print('stub invoked with junit')\n"
+                "print('project=' + sys.argv[sys.argv.index('--project') + 1])\n"
                 "mode = os.environ['STUB_JUNIT_MODE']\n"
                 "if mode != 'missing':\n"
                 "    child = '<skipped/>' if mode == 'skip' or (mode == 'normal-skip' and '/normal/' in path) else ''\n"
@@ -40,11 +50,15 @@ class RegressionEvidenceTests(unittest.TestCase):
             if stale:
                 (reports / "worker-1-case-1.xml").write_text("previous run")
             result = subprocess.run(
-                [str(SCRIPT.with_name("zig-e2e-cluster-restore-soak.sh"))]
-                if cluster_restore
-                else [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
-                if autograph
-                else [str(SCRIPT), "example.py::test_restore"],
+                (
+                    [str(SCRIPT.with_name("zig-e2e-cluster-restore-soak.sh"))]
+                    if cluster_restore
+                    else (
+                        [str(SCRIPT.with_name("zig-e2e-autograph-soak.sh"))]
+                        if autograph
+                        else [str(SCRIPT), selector]
+                    )
+                ),
                 env={
                     **os.environ,
                     "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
@@ -52,8 +66,9 @@ class RegressionEvidenceTests(unittest.TestCase):
                     "ANTFLY_E2E_ENV_LOADED": "1",
                     "ANTFLY_E2E_REGRESSION_REPEATS": str(repeats),
                     "ANTFLY_E2E_REGRESSION_WORKERS": str(workers),
-                    "ANTFLY_E2E_REGRESSION_REPORT_DIR": str(reports),
+                    "ANTFLY_E2E_REGRESSION_REPORT_DIR": str(reports) if report else "",
                     "STUB_JUNIT_MODE": mode,
+                    "ANTFLY_E2E_REGRESSION_PROFILE": profile,
                 },
                 check=False,
                 capture_output=True,
@@ -64,6 +79,117 @@ class RegressionEvidenceTests(unittest.TestCase):
                 str(p.relative_to(reports)): p.read_text()
                 for p in reports.rglob("*.xml")
             }
+
+    def test_collection_failure_stops_before_workers_and_repetitions(self):
+        result, reports = self.run_loop(mode="collection-error", workers=2, repeats=3)
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual(reports, {})
+        self.assertEqual(result.stdout.count("stub collection"), 1)
+        self.assertNotIn("E2E regression worker=", result.stdout)
+
+    def test_inference_selector_uses_its_project_and_requires_passes(self):
+        result, _ = self.run_loop(
+            selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("project=e2e/inference", result.stdout)
+        result, _ = self.run_loop(
+            selector="e2e/inference/test_dictate.py::test_dictate_cleanup_rewrites_transcript",
+            mode="skip",
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_without_report_directory_still_validates_junit_evidence(self):
+        result, reports = self.run_loop(report=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("stub invoked with junit", result.stdout)
+        self.assertEqual(reports, {})
+        skipped, _ = self.run_loop(mode="skip", report=False)
+        self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
+
+    def test_cancellation_stops_parallel_workers_and_their_servers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / "server.py"
+            child.write_text(
+                "import os, signal, time\nfrom pathlib import Path\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "p = Path(os.environ['HEARTBEAT_ROOT']) / str(os.getpid())\n"
+                "while True:\n p.write_text(str(time.monotonic())); time.sleep(.01)\n"
+            )
+            uv = root / "uv"
+            uv.write_text(
+                f"#!{sys.executable}\nimport subprocess, sys, time\n"
+                "if '--collect-only' in sys.argv: sys.exit(0)\n"
+                f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+                "time.sleep(60)\n"
+            )
+            uv.chmod(0o755)
+            heartbeats = root / "heartbeats"
+            heartbeats.mkdir()
+            process = subprocess.Popen(
+                [str(SCRIPT), "example.py::test_restore"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env={
+                    **os.environ,
+                    "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+                    "HEARTBEAT_ROOT": str(heartbeats),
+                    "SKIP_BUILD": "1",
+                    "ANTFLY_E2E_ENV_LOADED": "1",
+                    "ANTFLY_E2E_REGRESSION_REPEATS": "1",
+                    "ANTFLY_E2E_REGRESSION_WORKERS": "2",
+                    "TMPDIR": str(root),
+                    "ANTFLY_E2E_REGRESSION_REPORT_DIR": str(root / "reports"),
+                },
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while (
+                    len(list(heartbeats.iterdir())) < 2 and time.monotonic() < deadline
+                ):
+                    time.sleep(0.02)
+                self.assertEqual(len(list(heartbeats.iterdir())), 2)
+                process.send_signal(signal.SIGTERM)
+                output, _ = process.communicate(timeout=15)
+                self.assertEqual(process.returncode, 130, output)
+                logs = list(
+                    (root / "reports").glob("antfly-e2e-regression.*/worker-*.log")
+                )
+                self.assertEqual(len(logs), 2)
+                self.assertTrue(
+                    all("E2E regression worker=" in log.read_text() for log in logs)
+                )
+                time.sleep(0.1)
+                stopped = {p: p.read_text() for p in heartbeats.iterdir()}
+                time.sleep(0.1)
+                self.assertEqual(
+                    {p: p.read_text() for p in heartbeats.iterdir()}, stopped
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+                for path in heartbeats.iterdir():
+                    try:
+                        os.kill(int(path.name), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_cluster_profile_selection_preserves_each_case_once(self):
+        for profile in ("normal", "constrained"):
+            result, reports = self.run_loop(
+                cluster_restore=True, profile=profile, workers=2, repeats=2
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(len(reports), 8)
+            self.assertTrue(all(name.startswith(profile + "/") for name in reports))
+
+    def test_cluster_rejects_unknown_profile_before_running_tests(self):
+        result, reports = self.run_loop(cluster_restore=True, profile="typo")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(reports, {})
 
     def test_every_worker_and_repetition_retains_distinct_evidence(self):
         result, reports = self.run_loop(workers=2, repeats=2)

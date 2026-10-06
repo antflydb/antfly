@@ -35,11 +35,11 @@ const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("../../inference/managed_embedder.zig");
-const bedrock = @import("../../inference/bedrock.zig");
+const bedrock = @import("antfly_inference_bedrock");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const common_config = @import("../../common/config.zig");
 
 pub const BootstrapConfig = struct {
@@ -122,50 +122,7 @@ const ConfiguredExternalSourceObjectStoreResolver = struct {
 };
 
 const S3ClientPool = struct {
-    const AwsCredentialContext = struct {
-        alloc: Allocator,
-        http: @import("httpx").Client,
-        cache: bedrock.CredentialCache = .{},
-        region: []u8,
-        source: bedrock.CredentialSource,
-
-        fn init(alloc: Allocator, region: []const u8, source: bedrock.CredentialSource, io: std.Io) !AwsCredentialContext {
-            const owned_region = try alloc.dupe(u8, region);
-            return .{
-                .alloc = alloc,
-                .http = @import("httpx").Client.init(alloc, io),
-                .region = owned_region,
-                .source = source,
-            };
-        }
-
-        fn deinit(self: *AwsCredentialContext) void {
-            self.cache.deinit(self.alloc);
-            self.http.deinit();
-            self.alloc.free(self.region);
-            self.* = undefined;
-        }
-
-        fn provider(self: *AwsCredentialContext) objectstore.S3.CredentialProvider {
-            return .{ .ptr = self, .get_fn = get };
-        }
-
-        fn get(ptr: *anyopaque, alloc: Allocator) anyerror!objectstore.S3.DynamicCredentials {
-            const self: *AwsCredentialContext = @ptrCast(@alignCast(ptr));
-            _ = alloc;
-            const lease = try self.cache.getLeaseForSource(self.alloc, &self.http, self.region, self.source);
-            const credentials = lease.credentials();
-            return .{
-                .access_key_id = @constCast(credentials.access_key_id),
-                .secret_access_key = @constCast(credentials.secret_access_key),
-                .session_token = if (credentials.session_token) |value| @constCast(value) else null,
-                .ownership = .{ .borrowed = .{
-                    .ctx = lease.releaseContext(),
-                    .release = bedrock.CredentialCache.Lease.releaseOpaque,
-                } },
-            };
-        }
-    };
+    const AwsCredentialContext = @import("../aws_credential_context.zig").AwsCredentialContext;
 
     const Entry = struct {
         options: object_store_support.S3Options,
@@ -188,7 +145,7 @@ const S3ClientPool = struct {
         return .{ .alloc = alloc, .io_impl = io_impl };
     }
 
-    fn deinit(self: *S3ClientPool) void {
+    pub fn deinit(self: *S3ClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
             if (entry.credential_context) |context| {
@@ -261,7 +218,7 @@ const GcsClientPool = struct {
         return .{ .alloc = alloc, .io = io };
     }
 
-    fn deinit(self: *GcsClientPool) void {
+    pub fn deinit(self: *GcsClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
             self.alloc.destroy(entry.impl);
@@ -366,7 +323,7 @@ const OwnedS3Target = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;
@@ -377,7 +334,7 @@ const OwnedGcsTarget = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;

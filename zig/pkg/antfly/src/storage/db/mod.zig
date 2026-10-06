@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const coordinated_ttl = @import("../coordinated_ttl.zig");
 const query_search = @import("query/search_exec.zig");
 const distributed_stats = @import("../../search/distributed_stats.zig");
 const planning_adapter = @import("planning_adapter.zig");
@@ -25,6 +26,7 @@ const query_graph = @import("query/graph_exec.zig");
 const query_result_shape = @import("query/result_shape.zig");
 
 pub const types = @import("types.zig");
+pub const ArtifactPublicationDispatcher = @import("artifact_publication.zig").Dispatcher;
 pub const merge_state = @import("merge_state.zig");
 pub const docstore = @import("../docstore.zig");
 pub const lease = @import("lease.zig");
@@ -32,7 +34,6 @@ pub const ownership = @import("ownership.zig");
 pub const generation_lifecycle = @import("generation_lifecycle.zig");
 pub const native_backup = @import("native_backup.zig");
 pub const logical_snapshot_manifest_file_name = @import("core.zig").logical_snapshot_manifest_file_name;
-pub const transaction_resolution = @import("transaction_resolution.zig");
 pub const apply_state = @import("derived/apply_state.zig");
 pub const embedder = @import("enrichment/embedder.zig");
 pub const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
@@ -42,7 +43,10 @@ pub const enrichment_lease = @import("enrichment/enrichment_lease.zig");
 pub const enrichment_state = @import("enrichment/enrichment_state.zig");
 pub const enrichment_runtime = @import("enrichment/enrichment_runtime.zig");
 pub const enrichment_worker = @import("enrichment/enrichment_worker.zig");
-pub const chunker = @import("enrichment/chunker.zig");
+pub const chunker = if (builtin.os.tag == .freestanding)
+    @import("enrichment/chunker_stub.zig")
+else
+    @import("enrichment/chunker.zig");
 pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const derived_types = @import("derived/derived_types.zig");
 pub const derived_worker = @import("derived/derived_worker.zig");
@@ -88,7 +92,7 @@ pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 pub const SearchWithDenseProfileResult = @import("antfly_source_root").antfly_sources.physical_db.SearchWithDenseProfileResult;
-pub const RaftAppliedEntryIdentity = @import("antfly_source_root").antfly_sources.physical_db.RaftAppliedEntryIdentity;
+pub const OrderedApplyReceipt = @import("antfly_source_root").antfly_sources.physical_db.OrderedApplyReceipt;
 pub const LsmOwnerKind = DB.LsmOwnerKind;
 pub const LsmOwnerStats = DB.LsmOwnerStats;
 pub const documentExtractionStoredUnitFingerprintAlloc = @import("antfly_source_root").antfly_sources.physical_db.documentExtractionStoredUnitFingerprintAlloc;
@@ -100,15 +104,14 @@ pub const OpenOptions = @import("antfly_source_root").antfly_sources.physical_db
 pub const DenseNativeMigrationPolicySource = @import("antfly_source_root").antfly_sources.physical_db.DenseNativeMigrationPolicySource;
 pub const NativeRestoreOpenPlan = @import("antfly_source_root").antfly_sources.physical_db.NativeRestoreOpenPlan;
 pub const OpenMode = @import("antfly_source_root").antfly_sources.physical_db.OpenMode;
-pub const HAAsyncEffectMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncEffectMirror;
-pub const HAAsyncBatchMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncBatchMirror;
-pub const HAAsyncMetadataMirror = @import("antfly_source_root").antfly_sources.physical_db.HAAsyncMetadataMirror;
-pub const HAMutationBarrier = @import("antfly_source_root").antfly_sources.physical_db.HAMutationBarrier;
-pub const HAProgressPollFn = @import("antfly_source_root").antfly_sources.physical_db.HAProgressPollFn;
-pub const HAPrimaryProgressSyncWait = @import("antfly_source_root").antfly_sources.physical_db.HAPrimaryProgressSyncWait;
-pub const HAWriteGate = @import("antfly_source_root").antfly_sources.physical_db.HAWriteGate;
+pub const ReplicationAsyncEffectMirror = @import("antfly_source_root").antfly_sources.physical_db.ReplicationAsyncEffectMirror;
+pub const ReplicationAsyncBatchMirror = @import("antfly_source_root").antfly_sources.physical_db.ReplicationAsyncBatchMirror;
+pub const ReplicationAsyncMetadataMirror = @import("antfly_source_root").antfly_sources.physical_db.ReplicationAsyncMetadataMirror;
+pub const MutationBarrier = @import("antfly_source_root").antfly_sources.physical_db.MutationBarrier;
+
+pub const ReplicationWriteGate = @import("antfly_source_root").antfly_sources.physical_db.ReplicationWriteGate;
 pub const SchemaBeforeIndexLoad = @import("antfly_source_root").antfly_sources.physical_db.SchemaBeforeIndexLoad;
-pub const HAReplicationRecordView = @import("../hot_standby/replication_record.zig").RecordView;
+pub const ReplicationRecordView = @import("replication_record.zig").RecordView;
 pub const ReplayProgress = @import("antfly_source_root").antfly_sources.physical_db.ReplayProgress;
 pub const QueryVisibilityHook = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityHook;
 pub const QueryVisibilityChange = @import("antfly_source_root").antfly_sources.physical_db.QueryVisibilityChange;
@@ -195,12 +198,14 @@ pub const testing = if (builtin.is_test) struct {
 } else struct {};
 
 test {
+    _ = @import("artifact_publication_transport.zig");
+    _ = @import("artifact_publication_transport_codec.zig");
+    _ = @import("root_signing_identity.zig");
     _ = types;
     _ = merge_state;
     _ = docstore;
     _ = lease;
     _ = ownership;
-    _ = transaction_resolution;
     _ = apply_state;
     _ = embedder;
     _ = enrichment_artifact_codec;

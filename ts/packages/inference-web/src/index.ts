@@ -1,10 +1,10 @@
 // Copyright 2026 Antfly, Inc. SPDX-License-Identifier: Apache-2.0
-export type Precision = "q8_0" | "q4_k" | "q4_0" | "fp32" | "fp16_encoder" | "fp16";
+export type Precision = "q8_0" | "q4_k" | "q4_0" | "fp32" | "fp16_encoder" | "fp16" | "bf16";
 export type Backend = "auto" | "wasm" | "webgpu";
 export type Progress = { stage: string; file?: string; loaded: number; total: number };
 export type BundleFiles = Map<string, Blob> | File[];
 export type ModelInfo = {
-  architecture: "span" | "boundary" | "laya";
+  architecture: "span" | "boundary" | "decide" | "laya";
   precision: Precision;
   bytes: number;
   backend: "wasm" | "webgpu";
@@ -23,7 +23,7 @@ export type CatalogFile = { path: string; url: string; sha256: string; size_byte
 export type CatalogModel = {
   id: string;
   name: string;
-  architecture: "span" | "boundary" | "laya";
+  architecture: "span" | "boundary" | "decide" | "laya";
   precision: Precision;
   files: CatalogFile[];
   qualification: "pending" | "passed";
@@ -110,7 +110,8 @@ export class InferenceClient {
       precision: result.precision,
       bytes: result.bytes,
       qualified: false,
-    } as Omit<ModelInfo, "backend">;
+      cpuReason: result.cpuReason as string | undefined,
+    } as Omit<ModelInfo, "backend"> & { cpuReason?: string };
   }
   private assertIdle() {
     if (this.disposed) throw new Error("Inference client is disposed");
@@ -149,8 +150,7 @@ export class InferenceClient {
       check();
       this.requestedBackend = options.backend ?? "auto";
       let fallbackReason: string | undefined;
-      const cpuOnlyLaya = inspected.architecture === "laya" && inspected.precision !== "fp16";
-      if (this.requestedBackend !== "wasm" && capabilities.webgpu && !cpuOnlyLaya) {
+      if (this.requestedBackend !== "wasm" && capabilities.webgpu && !inspected.cpuReason) {
         const { WebGPUOps } = await moduleAt(this.assets, "webgpu-ops.js");
         check();
         const gpu: Gpu = new WebGPUOps();
@@ -180,9 +180,7 @@ export class InferenceClient {
           });
         }
       } else if (this.requestedBackend !== "wasm")
-        fallbackReason = cpuOnlyLaya
-          ? "Laya GPU residency requires an FP16 bundle; this bundle uses WASM CPU."
-          : capabilities.reason;
+        fallbackReason = inspected.cpuReason ?? capabilities.reason;
       const { InferenceWeb } = await moduleAt(this.assets, "inference-web.js");
       check();
       const runtime: Runtime = new InferenceWeb();

@@ -30,9 +30,9 @@ pub const geo = @import("search/geo.zig");
 pub const graph = @import("graph/graph.zig");
 pub const graph_pattern = @import("graph/pattern.zig");
 pub const graph_query = @import("graph/query.zig");
-pub const ha_seed_activation = @import("storage/hot_standby/seed_activation.zig");
-pub const ha_seed_snapshot = @import("storage/hot_standby/seed_snapshot.zig");
-pub const ha_validation = @import("storage/hot_standby/validation.zig");
+pub const hot_standby_seed_activation = @import("storage/hot_standby/seed_activation.zig");
+pub const hot_standby_seed_snapshot = @import("storage/hot_standby/seed_snapshot.zig");
+pub const hot_standby_validation = @import("storage/hot_standby/validation.zig");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const managed_embedder = @import("inference/managed_embedder.zig");
 pub const lite = @import("storage/lite/mod.zig");
@@ -51,7 +51,7 @@ pub const restore_admission = @import("storage/restore_admission.zig");
 pub const scraping = @import("antfly_scraping");
 pub const public_api = @import("api/mod.zig");
 pub const raft = @import("raft/mod.zig");
-pub const raft_catalog = @import("raft/catalog.zig");
+pub const raft_catalog = @import("raft/storage/catalog.zig");
 pub const shard = @import("storage/shard.zig");
 pub const storage_backend = @import("storage/backend_types.zig");
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
@@ -75,3 +75,5 @@ pub const test_error_logs = @import("test_error_logs.zig");
 
 pub const kernel_runtime_services = @import("storage/kernel_runtime_services.zig");
 pub const memory_budget = @import("storage/memory_budget.zig");
+
+pub const capi_dependencies = @import("capi_dependencies.zig");

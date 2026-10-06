@@ -7,6 +7,7 @@ import { resolve } from 'node:path';
 import { inspectBundle } from './runtime/extraction-bundle.js';
 import { ExtractionSession } from './runtime/extraction-session.js';
 import { createWasmAbi } from './runtime/wasm-abi.js';
+import { layaFixture, layaRequest } from './laya-test-fixture.mjs';
 
 function bundle() {
   return new Map(Object.entries({
@@ -26,12 +27,67 @@ test('Laya upstream and native folders share a normalized config without mutatin
   assert(!files.has('tokenizer.json'));
   const native = new Map([['config.json', new Blob([JSON.stringify(upstream.config)])], ['model.safetensors', files.get('model.safetensors')], ['tokenizer.json', files.get('tokenizer/tokenizer.json')], ['tokenizer_config.json', files.get('tokenizer/tokenizer_config.json')]]);
   assert.equal((await inspectBundle(native, 'fp16')).architecture, 'laya');
+  native.set('config.json', new Blob([JSON.stringify({ ...upstream.config, model_type: 'modern_bert' })]));
+  assert.equal((await inspectBundle(native, 'fp16')).architecture, 'laya');
   await assert.rejects(inspectBundle(files, 'q8_0'), /dense FP16/);
   files.delete('model.safetensors');
   await assert.rejects(inspectBundle(files, 'fp16'), /model.safetensors/);
 });
 
 const root = process.env.LAYA_MODEL, wasmPath = process.env.EXTRACTION_WASM;
+test('tiny Laya WASM: packed layouts, pointer, two-stage, Q8 and OpenDecider', { skip: !wasmPath, timeout: 120000 }, async () => {
+  const { instance } = await WebAssembly.instantiate(await readFile(wasmPath), { env: {} });
+  const session = new ExtractionSession(instance.exports, createWasmAbi(instance.exports));
+  const variants = [ {},
+    { packing: { mode: 'question', max_packed_len: 2048 } },
+    { packing: { mode: 'question', max_packed_len: 2048, trunk_sees: 'questions' } },
+    { packing: { mode: 'question', max_packed_len: 2048, fuse_layers: 2, question_first: true } },
+    { packing: { mode: 'candidate', max_packed_len: 2048, two_stage: { top_k: 2, mass_cutoff: .9 } } },
+    { decision_head: 'pointer', pointer_dim: 32 },
+    { decision_head: 'pointer', pointer_dim: 32, packing: { mode: 'candidate', max_packed_len: 2048 } },
+    { weight_quantization: 'q8_0' },
+    { format: 'opendecider' },
+  ];
+  try {
+    for (const precision of ['fp32', 'fp16', 'bf16']) for (const extra of variants) {
+      await session.load(layaFixture(extra, precision), precision);
+      const before = instance.exports.extraction_live_bytes(session.handle);
+      const geometry = session.run(layaRequest, true).value;
+      assert(geometry.encoded_tokens > 0);
+      const output = session.run(layaRequest).value;
+      assert.deepEqual(output.data[0].decisions.map(d => d.type), ['choice', 'score', 'boolean']);
+      assert.deepEqual(session.run(layaRequest).value, output, JSON.stringify(extra));
+      for (const d of output.data[0].decisions) {
+        assert(Math.abs(d.probabilities.reduce((sum, p) => sum + p.probability, 0) - 1) < 1e-5);
+        if (extra.format === 'opendecider') assert.equal(d.act_probability, undefined);
+      }
+      if (extra.packing?.mode === 'candidate') {
+        const many = structuredClone(layaRequest); many.schema.classifications = [ { ...many.schema.classifications[0], labels: Array.from({ length: 24 }, (_, i) => 'option' + i) } ];
+        assert.equal(session.run(many).value.data[0].decisions[0].probabilities.length, 24);
+      }
+      assert(instance.exports.extraction_live_bytes(session.handle) < before + 65536, 'request scratch must be released');
+      if (extra.packing?.mode === 'question' && !extra.packing.trunk_sees && !extra.packing.fuse_layers) {
+        const cached = structuredClone(layaRequest); cached.inputs[0].content = 'state '.repeat(100);
+        const cold = session.run(cached).value, warm = session.run(cached).value;
+        for (let i = 0; i < cold.data[0].decisions.length; i++) for (let j = 0; j < cold.data[0].decisions[i].probabilities.length; j++)
+          assert(Math.abs(cold.data[0].decisions[i].probabilities[j].probability - warm.data[0].decisions[i].probabilities[j].probability) < 1e-6);
+        const retained = instance.exports.extraction_live_bytes(session.handle);
+        assert(retained > before + 65536, 'long state should populate the trunk cache');
+        assert.deepEqual(session.run(cached).value, warm);
+        assert.equal(instance.exports.extraction_live_bytes(session.handle), retained, 'hot cache memory must plateau');
+      }
+      session.unload();
+    }
+    const invalid = layaFixture({ decision_head: 'pointer', pointer_dim: 32 });
+    // Corrupt a required head tensor's geometry without changing its byte count.
+    const blob = invalid.get('model.safetensors');
+    const n = Number(new DataView(await blob.slice(0, 8).arrayBuffer()).getBigUint64(0, true));
+    const header = JSON.parse(await blob.slice(8, 8 + n).text()); header['pointer.q.weight'].shape = [16, 128];
+    const encoded = new TextEncoder().encode(JSON.stringify(header)), prefix = new ArrayBuffer(8); new DataView(prefix).setBigUint64(0, BigInt(encoded.length), true);
+    invalid.set('model.safetensors', new Blob([prefix, encoded, blob.slice(8 + n)]));
+    await assert.rejects(session.load(invalid, 'fp32'), /InvalidLayaWeights/);
+  } finally { session.unload(); }
+});
 export const request = {
   schema_version: 2, model: 'laya', inputs: [{ id: 'local', content: 'Please search for the latest documentation about browser inference.' }],
   schema: { classifications: [

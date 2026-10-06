@@ -19,57 +19,60 @@
 //! payloads instead of becoming the HA record header itself.
 
 const std = @import("std");
+const codecs = @import("../db/replication_effects.zig");
 const Allocator = std.mem.Allocator;
 const change_journal = @import("../db/derived/change_journal.zig");
+pub const primary_effect = codecs.primary_effect;
 const db_types = @import("../db/types.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("replication_record.zig");
+const replication_record = @import("../db/replication_record.zig");
 const schema_mod = @import("../schema.zig");
 
 var test_path_counter: u64 = 0;
 
-pub const AppendDerivedEffectOptions = struct {
-    shard_id: ?u64 = null,
-    table_id: ?u64 = null,
-    commit_timestamp_ns: i64 = 0,
-};
+pub const AppendDerivedEffectOptions = codecs.AppendDerivedEffectOptions;
 
-pub const AppendBatchMutationOptions = struct {
-    shard_id: ?u64 = null,
-    table_id: ?u64 = null,
-    commit_timestamp_ns: i64 = 0,
-};
+pub const AppendBatchMutationOptions = codecs.AppendBatchMutationOptions;
 
-pub const AppendMetadataMutationOptions = struct {
-    shard_id: ?u64 = null,
-    table_id: ?u64 = null,
-    commit_timestamp_ns: i64 = 0,
-};
+pub const AppendMetadataMutationOptions = codecs.AppendMetadataMutationOptions;
 
-pub const BatchMutationPayload = struct {
-    schema_version: u32 = 1,
-    request: db_types.BatchRequest,
-};
+pub const BatchMutationPayload = codecs.BatchMutationPayload;
 
-pub const MetadataMutationKind = enum {
-    schema,
-};
+/// Page semantics cannot be silently ignored by older standbys. Their V1
+/// decoder rejects V2 before applying rows, independently of Raft negotiation.
+pub const encodeInitialChildMutationRequestAlloc = codecs.encodeInitialChildMutationRequestAlloc;
 
-pub const MetadataMutationPayload = struct {
-    schema_version: u32 = 2,
-    kind: MetadataMutationKind,
-    schema_bytes: []const u8,
-    public_schema_json: ?[]const u8 = null,
-};
+pub const MetadataMutationKind = codecs.MetadataMutationKind;
 
-pub fn encodeBatchMutationRequestAlloc(
-    alloc: Allocator,
-    request: db_types.BatchRequest,
-) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, BatchMutationPayload{
-        .request = request,
-    }, .{});
-}
+pub const MetadataMutationPayload = codecs.MetadataMutationPayload;
+
+/// Policy installation is an owner Raft decision, not a schema update. The
+/// exact signed snapshot and Raft identity travel in one ordered HA record.
+pub const encodeRowPolicyMetadataMutationAlloc = codecs.encodeRowPolicyMetadataMutationAlloc;
+
+/// An HA standby must replay the same source-fence cut as the primary, not a
+/// generic schema update that would bypass (or fail) FK generation admission.
+pub const PublishedChildSchema = codecs.PublishedChildSchema;
+
+pub const encodeBatchMutationRequestAlloc = codecs.encodeBatchMutationRequestAlloc;
+
+pub const encodeGraphRetirementSealMutationRequestAlloc = codecs.encodeGraphRetirementSealMutationRequestAlloc;
+
+pub const encodeRestoreGenerationAdmissionMutationRequestAlloc = codecs.encodeRestoreGenerationAdmissionMutationRequestAlloc;
+
+pub const encodeOnlineSourceMutationRequestAlloc = codecs.encodeOnlineSourceMutationRequestAlloc;
+
+pub const encodeArtifactCatalogMutationRequestAlloc = codecs.encodeArtifactCatalogMutationRequestAlloc;
+
+pub const encodeArtifactPublicationMutationRequestAlloc = codecs.encodeArtifactPublicationMutationRequestAlloc;
+
+pub const encodeArtifactPublicationTransportMutationRequestAlloc = codecs.encodeArtifactPublicationTransportMutationRequestAlloc;
+
+pub const encodeMergeProofAdoptionMutationRequestAlloc = codecs.encodeMergeProofAdoptionMutationRequestAlloc;
+
+pub const encodeRaftBatchMutationRequestAlloc = codecs.encodeRaftBatchMutationRequestAlloc;
+
+pub const encodeBatchMutationWithRestoreBootstrapAlloc = codecs.encodeBatchMutationWithRestoreBootstrapAlloc;
 
 pub fn appendBatchMutationRequest(
     alloc: Allocator,
@@ -98,34 +101,19 @@ pub fn appendEncodedBatchMutationRequest(
     });
 }
 
-pub fn decodeBatchMutationRequest(
-    alloc: Allocator,
-    record: replication_record.RecordView,
-) !std.json.Parsed(BatchMutationPayload) {
-    if (record.kind != .batch_mutation) return error.NotBatchMutationRecord;
-    if (record.payload_codec != .json) return error.UnsupportedBatchMutationCodec;
-    var parsed = try std.json.parseFromSlice(BatchMutationPayload, alloc, record.payload, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    errdefer parsed.deinit();
-    if (parsed.value.schema_version != 1) return error.UnsupportedBatchMutationPayloadVersion;
-    return parsed;
-}
+pub const decodeBatchMutationRequest = codecs.decodeBatchMutationRequest;
 
-pub fn encodeSchemaMetadataMutationAlloc(
-    alloc: Allocator,
-    schema: schema_mod.TableSchema,
-    public_schema_json: ?[]const u8,
-) ![]u8 {
-    const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
-    defer alloc.free(schema_bytes);
-    return try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
-        .kind = .schema,
-        .schema_bytes = schema_bytes,
-        .public_schema_json = public_schema_json,
-    }, .{});
-}
+pub const encodeNativeTopologyMutationRequestAlloc = codecs.encodeNativeTopologyMutationRequestAlloc;
+
+/// Inspect only the fixed-size restore completion proof on duplicate replay.
+/// Unknown JSON values (notably ordinary row payloads) are scanned without
+/// materializing them, so published restore tombstones do not make later
+/// large-batch replays allocate a second copy of every row.
+pub const decodeRestoreFinishForReplay = codecs.decodeRestoreFinishForReplay;
+
+pub const encodeSchemaMetadataMutationAlloc = codecs.encodeSchemaMetadataMutationAlloc;
+
+pub const encodePublishedChildSchemaMetadataMutationAlloc = codecs.encodePublishedChildSchemaMetadataMutationAlloc;
 
 pub fn appendSchemaMetadataMutation(
     alloc: Allocator,
@@ -155,52 +143,11 @@ pub fn appendEncodedSchemaMetadataMutation(
     });
 }
 
-pub fn decodeMetadataMutation(
-    alloc: Allocator,
-    record: replication_record.RecordView,
-) !std.json.Parsed(MetadataMutationPayload) {
-    if (record.kind != .metadata_mutation) return error.NotMetadataMutationRecord;
-    if (record.payload_codec != .json) return error.UnsupportedMetadataMutationCodec;
-    var parsed = try std.json.parseFromSlice(MetadataMutationPayload, alloc, record.payload, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    errdefer parsed.deinit();
-    if (parsed.value.schema_version != 1 and parsed.value.schema_version != 2) return error.UnsupportedMetadataMutationPayloadVersion;
-    return parsed;
-}
+pub const decodeMetadataMutation = codecs.decodeMetadataMutation;
 
-pub const DecodedSchemaMetadataMutation = struct {
-    alloc: Allocator,
-    schema: schema_mod.TableSchema,
-    public_schema_json: ?[]u8,
+pub const DecodedSchemaMetadataMutation = codecs.DecodedSchemaMetadataMutation;
 
-    pub fn deinit(self: *DecodedSchemaMetadataMutation) void {
-        schema_mod.freeSchema(self.alloc, self.schema);
-        if (self.public_schema_json) |value| self.alloc.free(value);
-        self.* = undefined;
-    }
-};
-
-pub fn decodeSchemaMetadataMutation(
-    alloc: Allocator,
-    record: replication_record.RecordView,
-) !DecodedSchemaMetadataMutation {
-    var parsed = try decodeMetadataMutation(alloc, record);
-    defer parsed.deinit();
-    if (parsed.value.kind != .schema) return error.UnsupportedMetadataMutationKind;
-    const schema = try schema_mod.deserializeSchema(alloc, parsed.value.schema_bytes);
-    errdefer schema_mod.freeSchema(alloc, schema);
-    const public_schema_json = if (parsed.value.schema_version >= 2)
-        if (parsed.value.public_schema_json) |value| try alloc.dupe(u8, value) else null
-    else
-        null;
-    return .{
-        .alloc = alloc,
-        .schema = schema,
-        .public_schema_json = public_schema_json,
-    };
-}
+pub const decodeSchemaMetadataMutation = codecs.decodeSchemaMetadataMutation;
 
 pub fn appendDerivedChangeRecord(
     alloc: Allocator,
@@ -219,7 +166,7 @@ pub fn appendEncodedDerivedChangeRecord(
     encoded_change_record: []const u8,
     options: AppendDerivedEffectOptions,
 ) !u64 {
-    if (!change_journal.looksLikeBinaryRecord(encoded_change_record)) {
+    if (!change_journal.looksLikeBinaryRecord(encoded_change_record) and !primary_effect.isPrimaryEffect(encoded_change_record)) {
         return error.UnsupportedDerivedEffectPayload;
     }
 
@@ -233,14 +180,7 @@ pub fn appendEncodedDerivedChangeRecord(
     });
 }
 
-pub fn decodeDerivedChangeRecord(
-    alloc: Allocator,
-    record: replication_record.RecordView,
-) !change_journal.DecodedRecord {
-    if (record.kind != .derived_effect) return error.NotDerivedEffectRecord;
-    if (record.payload_codec != .binary) return error.UnsupportedDerivedEffectCodec;
-    return try change_journal.decodeRecord(alloc, record.payload);
-}
+pub const decodeDerivedChangeRecord = codecs.decodeDerivedChangeRecord;
 
 fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
     const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
@@ -253,7 +193,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
-    return try alloc.dupeZ(u8, raw);
+    return try alloc.dupeSentinel(u8, raw, 0);
 }
 
 test "storage.hot_standby effects appends derived change journal payload as HA derived effect" {
@@ -384,6 +324,54 @@ test "storage.hot_standby effects appends schema metadata payload as HA metadata
     try std.testing.expectEqual(@as(u64, 123), decoded.schema.ttl_duration_ns);
     try std.testing.expectEqualStrings("expires_at", decoded.schema.ttl_field);
     try std.testing.expectEqualStrings("{\"version\":7}", decoded.public_schema_json.?);
+    try std.testing.expect(decoded.published_child == null);
+
+    const published_fence: @import("../db/relational_integrity_topology_contract.zig").Fence = .{
+        .role = .child_generation_source,
+        .transition_id = 11,
+        .attempt = 1,
+        .peer_group_id = 31,
+        .owner_group_id = 21,
+        .namespace = .{ .table_id = 41, .shard_id = 21, .range_id = 21 },
+        .catalog_digest = @splat(1),
+    };
+    const published = PublishedChildSchema{
+        .fence = published_fence,
+        .before_schema_json_digest = @splat(2),
+        .schema_json_digest = @splat(3),
+        .before_catalog_digest = @splat(4),
+        .after_catalog_digest = @splat(5),
+        .applied_term = 7,
+        .applied_index = 11,
+    };
+    const payload = try encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", published);
+    defer alloc.free(payload);
+    const published_lsn = try appendEncodedSchemaMetadataMutation(&primary, payload, .{});
+    var published_entry = (try primary.log.entryAt(alloc, published_lsn)) orelse return error.TestExpectedEqual;
+    defer published_entry.deinit(alloc);
+    var decoded_published = try decodeSchemaMetadataMutation(alloc, published_entry.record);
+    defer decoded_published.deinit();
+    try std.testing.expectEqual(@as(u32, 8), decoded_published.schema.version);
+    try std.testing.expect(decoded_published.published_child.?.fence.eql(published_fence));
+    try std.testing.expectEqual(@as(u64, 11), decoded_published.published_child.?.applied_index);
+
+    var dual = published;
+    dual.fence.role = .child_generation_dual;
+    dual.fence.peer_group_id = dual.fence.owner_group_id;
+    const dual_payload = try encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", dual);
+    defer alloc.free(dual_payload);
+    const dual_lsn = try appendEncodedSchemaMetadataMutation(&primary, dual_payload, .{});
+    var dual_entry = (try primary.log.entryAt(alloc, dual_lsn)) orelse return error.TestExpectedEqual;
+    defer dual_entry.deinit(alloc);
+    var decoded_dual = try decodeSchemaMetadataMutation(alloc, dual_entry.record);
+    defer decoded_dual.deinit();
+    try std.testing.expect(decoded_dual.published_child.?.fence.eql(dual.fence));
+    var invalid_dual = dual;
+    invalid_dual.fence.role = .child_generation_parent;
+    try std.testing.expectError(error.InvalidGenerationPublication, encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", invalid_dual));
+    invalid_dual = dual;
+    invalid_dual.applied_index = 0;
+    try std.testing.expectError(error.InvalidGenerationPublication, encodePublishedChildSchemaMetadataMutationAlloc(alloc, .{ .version = 8, .default_type = "row" }, "{\"version\":8}", invalid_dual));
 
     const legacy_schema_bytes = try schema_mod.serializeSchema(alloc, .{
         .version = 6,
@@ -412,117 +400,6 @@ test "storage.hot_standby effects appends schema metadata payload as HA metadata
     try std.testing.expectEqual(@as(?[]u8, null), legacy_decoded.public_schema_json);
 }
 
-test "storage.hot_standby effects rejects non-derived HA records when decoding derived payloads" {
-    const record = replication_record.Record{
-        .kind = .batch_mutation,
-        .payload_codec = .binary,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "",
-    };
-    try std.testing.expectError(
-        error.NotDerivedEffectRecord,
-        decodeDerivedChangeRecord(std.testing.allocator, record),
-    );
-}
-
-test "storage.hot_standby effects rejects unsupported batch mutation payloads" {
-    const derived = replication_record.Record{
-        .kind = .derived_effect,
-        .payload_codec = .json,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "{}",
-    };
-    try std.testing.expectError(
-        error.NotBatchMutationRecord,
-        decodeBatchMutationRequest(std.testing.allocator, derived),
-    );
-
-    const binary = replication_record.Record{
-        .kind = .batch_mutation,
-        .payload_codec = .binary,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "",
-    };
-    try std.testing.expectError(
-        error.UnsupportedBatchMutationCodec,
-        decodeBatchMutationRequest(std.testing.allocator, binary),
-    );
-
-    const bad_version = replication_record.Record{
-        .kind = .batch_mutation,
-        .payload_codec = .json,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "{\"schema_version\":2,\"request\":{}}",
-    };
-    try std.testing.expectError(
-        error.UnsupportedBatchMutationPayloadVersion,
-        decodeBatchMutationRequest(std.testing.allocator, bad_version),
-    );
-}
-
-test "storage.hot_standby effects rejects unsupported metadata mutation payloads" {
-    const batch = replication_record.Record{
-        .kind = .batch_mutation,
-        .payload_codec = .json,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "{}",
-    };
-    try std.testing.expectError(
-        error.NotMetadataMutationRecord,
-        decodeMetadataMutation(std.testing.allocator, batch),
-    );
-
-    const binary = replication_record.Record{
-        .kind = .metadata_mutation,
-        .payload_codec = .binary,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "",
-    };
-    try std.testing.expectError(
-        error.UnsupportedMetadataMutationCodec,
-        decodeMetadataMutation(std.testing.allocator, binary),
-    );
-
-    const bad_version = replication_record.Record{
-        .kind = .metadata_mutation,
-        .payload_codec = .json,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "{\"schema_version\":3,\"kind\":\"schema\",\"schema_bytes\":\"\"}",
-    };
-    try std.testing.expectError(
-        error.UnsupportedMetadataMutationPayloadVersion,
-        decodeMetadataMutation(std.testing.allocator, bad_version),
-    );
-}
-
 test "storage.hot_standby effects rejects non-binary encoded change records before append" {
     var primary: primary_mod.Primary = undefined;
     try std.testing.expectError(
@@ -531,19 +408,6 @@ test "storage.hot_standby effects rejects non-binary encoded change records befo
     );
 }
 
-test "storage.hot_standby effects rejects unsupported derived effect payload codecs" {
-    const record = replication_record.Record{
-        .kind = .derived_effect,
-        .payload_codec = .json,
-        .cluster_id = 1,
-        .timeline_id = 1,
-        .epoch = 1,
-        .lsn = 1,
-        .previous_lsn = 0,
-        .payload = "{}",
-    };
-    try std.testing.expectError(
-        error.UnsupportedDerivedEffectCodec,
-        decodeDerivedChangeRecord(std.testing.allocator, record),
-    );
+test {
+    _ = codecs;
 }

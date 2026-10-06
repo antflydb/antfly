@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const catalog = @import("storage/catalog.zig");
 const host = @import("host.zig");
 const managed_host = @import("managed_host.zig");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -282,7 +282,7 @@ pub const VirtualHttpNetwork = struct {
         base_uri: []u8,
         request: transport.HttpRequest,
 
-        fn deinit(self: *QueuedRequest, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *QueuedRequest, alloc: std.mem.Allocator) void {
             alloc.free(self.base_uri);
             alloc.free(@constCast(self.request.uri));
             for (self.request.headers) |header| {
@@ -387,6 +387,17 @@ pub const VirtualHttpNetwork = struct {
             gop.key_ptr.* = uri;
         }
         gop.value_ptr.* = executor_;
+    }
+
+    pub fn unregisterNode(self: *VirtualHttpNetwork, node_id: u64) void {
+        var keys = self.routes.keyIterator();
+        while (keys.next()) |key| {
+            const route = splitVirtualUri(key.*) orelse continue;
+            if (route.node_id != node_id) continue;
+            const removed = self.routes.fetchRemove(key.*).?;
+            self.alloc.free(@constCast(removed.key));
+            return;
+        }
     }
 
     pub fn useQueuedDelivery(self: *VirtualHttpNetwork) void {
@@ -528,6 +539,11 @@ pub const VirtualHttpNetwork = struct {
 
     pub fn isLinkPartitioned(self: *const VirtualHttpNetwork, link: Link) bool {
         return self.partitioned_links.contains(link);
+    }
+
+    pub fn hasConnectivityFaults(self: *const VirtualHttpNetwork) bool {
+        return self.partitioned_nodes.count() != 0 or self.partitioned_links.count() != 0 or
+            self.unavailable_nodes.count() != 0;
     }
 
     pub fn dropNext(self: *VirtualHttpNetwork) void {
@@ -1767,6 +1783,7 @@ pub const ManagedHttpClusterSimulation = struct {
     configs: []ManagedHttpHostSimulationConfig,
     deps: []ManagedHttpHostSimulationDeps,
     nodes: []ManagedHttpHostSimulation,
+    node_live: []bool,
     started: bool = false,
 
     pub const Fault = union(enum) {
@@ -1815,6 +1832,9 @@ pub const ManagedHttpClusterSimulation = struct {
 
         const nodes = try alloc.alloc(ManagedHttpHostSimulation, configs.len);
         errdefer alloc.free(nodes);
+        const node_live = try alloc.alloc(bool, configs.len);
+        errdefer alloc.free(node_live);
+        @memset(node_live, false);
 
         var initialized: usize = 0;
         errdefer {
@@ -1828,6 +1848,7 @@ pub const ManagedHttpClusterSimulation = struct {
         for (owned_configs, owned_deps, 0..) |cfg, dep, i| {
             nodes[i] = try ManagedHttpHostSimulation.init(alloc, cfg, dep);
             initialized += 1;
+            node_live[i] = true;
             const node_id = cfg.host.http.host.local_node_id;
             try nodes[i].useVirtualBaseUri(node_id);
             try network.registerNode(node_id, nodes[i].serverRequestExecutor());
@@ -1839,12 +1860,14 @@ pub const ManagedHttpClusterSimulation = struct {
             .configs = owned_configs,
             .deps = owned_deps,
             .nodes = nodes,
+            .node_live = node_live,
         };
     }
 
     pub fn deinit(self: *ManagedHttpClusterSimulation) void {
-        for (self.nodes) |*sim| sim.deinit();
+        for (self.nodes, self.node_live) |*sim, live| if (live) sim.deinit();
         self.alloc.free(self.nodes);
+        self.alloc.free(self.node_live);
         self.alloc.free(self.configs);
         self.alloc.free(self.deps);
         self.network.deinit();
@@ -1862,7 +1885,8 @@ pub const ManagedHttpClusterSimulation = struct {
             }
         }
 
-        for (self.nodes) |*sim| {
+        for (self.nodes, self.node_live) |*sim, live| {
+            if (!live) return error.SimulationNodeUnavailable;
             try sim.start();
             started += 1;
         }
@@ -1870,17 +1894,20 @@ pub const ManagedHttpClusterSimulation = struct {
     }
 
     pub fn stopAll(self: *ManagedHttpClusterSimulation) void {
-        for (self.nodes) |*sim| sim.stop();
+        for (self.nodes, self.node_live) |*sim, live| if (live) sim.stop();
         self.started = false;
     }
 
     pub fn node(self: *ManagedHttpClusterSimulation, index: usize) *ManagedHttpHostSimulation {
+        std.debug.assert(self.node_live[index]);
         return &self.nodes[index];
     }
 
     pub fn stepAll(self: *ManagedHttpClusterSimulation) !void {
+        for (self.node_live) |live| if (!live) return error.SimulationNodeUnavailable;
         _ = try self.network.drainDue(null);
-        for (self.nodes) |*sim| {
+        for (self.nodes, self.node_live) |*sim, live| {
+            std.debug.assert(live);
             _ = try sim.stepOnce();
             _ = try self.network.drainDue(null);
         }
@@ -1957,12 +1984,23 @@ pub const ManagedHttpClusterSimulation = struct {
     }
 
     pub fn restartNode(self: *ManagedHttpClusterSimulation, index: usize) !void {
-        if (self.started) self.nodes[index].stop();
-        self.nodes[index].deinit();
+        if (index >= self.nodes.len) return error.InvalidNodeIndex;
+        const node_id = self.configs[index].host.http.host.local_node_id;
+        self.network.unregisterNode(node_id);
+        if (self.node_live[index]) {
+            if (self.started) self.nodes[index].stop();
+            self.nodes[index].deinit();
+            self.node_live[index] = false;
+        }
         var cfg = self.configs[index];
         cfg.async_transport = false;
         self.nodes[index] = try ManagedHttpHostSimulation.init(self.alloc, cfg, self.deps[index]);
-        const node_id = self.configs[index].host.http.host.local_node_id;
+        self.node_live[index] = true;
+        errdefer {
+            self.network.unregisterNode(node_id);
+            self.node_live[index] = false;
+            self.nodes[index].deinit();
+        }
         try self.nodes[index].useVirtualBaseUri(node_id);
         try self.network.registerNode(node_id, self.nodes[index].serverRequestExecutor());
         if (self.started) try self.nodes[index].start();
@@ -1975,7 +2013,8 @@ pub const ManagedHttpClusterSimulation = struct {
 
             fn done(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                for (cluster.nodes) |*sim| {
+                for (cluster.nodes, cluster.node_live) |*sim, live| {
+                    if (!live) continue;
                     if (sim.raftStatus(ctx.group_id)) |status| {
                         if (status.soft.role == .leader) {
                             ctx.leader_id = status.id;
@@ -2004,7 +2043,8 @@ pub const ManagedHttpClusterSimulation = struct {
 
             fn done(cluster: *ManagedHttpClusterSimulation, ptr: *anyopaque) !bool {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                for (cluster.nodes) |*sim| {
+                for (cluster.nodes, cluster.node_live) |*sim, live| {
+                    if (!live) continue;
                     if (sim.raftStatus(ctx.group_id)) |status| {
                         if (status.soft.role == .leader and status.id == ctx.expected_leader_id) return true;
                     }
@@ -2130,7 +2170,7 @@ const StorageRecorder = struct {
     alloc: std.mem.Allocator,
     stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
 
-    fn deinit(self: *StorageRecorder) void {
+    pub fn deinit(self: *StorageRecorder) void {
         self.stores.deinit(self.alloc);
         self.* = undefined;
     }
@@ -4737,7 +4777,7 @@ test "cluster simulation drives split transition actions deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -4896,7 +4936,7 @@ test "http host simulation drives queued split transitions through the service l
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5050,7 +5090,7 @@ test "http host simulation rolls back and retries queued split transitions throu
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5231,7 +5271,7 @@ test "http host simulation removes queued split transition mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5354,7 +5394,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5587,7 +5627,7 @@ test "cluster simulation drives merge transition actions deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5731,7 +5771,7 @@ test "cluster simulation drives queued split transitions through service-owned m
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -6854,7 +6894,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7126,7 +7166,7 @@ test "http host simulation rolls back and retries queued merge transitions throu
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7290,7 +7330,7 @@ test "http host simulation removes queued merge transition mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7394,7 +7434,7 @@ test "http host simulation updates merge transition to rollback mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }

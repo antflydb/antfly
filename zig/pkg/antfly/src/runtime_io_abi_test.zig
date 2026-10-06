@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const bridge = @import("runtime_io_abi.zig");
+const bridge = @import("antfly_runtime_abi").io_abi;
 extern fn runtime_io_abi_test_borrow(*bridge.Borrow) callconv(.c) void;
 extern fn runtime_io_abi_test_inject(bool) callconv(.c) void;
 extern fn runtime_io_abi_test_destroy(*const bridge.Borrow) callconv(.c) void;
@@ -65,7 +65,7 @@ test "executor archive boundary translates embedded operation batch and reader e
     defer runtime_io_abi_test_inject(false);
     const result = try io.operate(.{ .file_read_streaming = .{ .file = .stdin(), .data = &.{} } });
     try std.testing.expectError(error.InputOutput, result.file_read_streaming);
-    const sent = io.vtable.netSend(io.userdata, undefined, &.{}, .{});
+    const sent = (try io.operate(.{ .net_send = .{ .socket_handle = undefined, .messages = &.{}, .flags = .{} } })).net_send;
     try std.testing.expectEqual(error.NetworkDown, sent[0].?);
     try std.testing.expectEqual(@as(usize, 0), sent[1]);
 

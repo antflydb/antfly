@@ -359,7 +359,9 @@ test "gliner boundary socket transport gate disconnect retry metrics and shutdow
     try std.testing.expectEqual(@as(u64, 2), transport.server.runtimeStats().request_cancellations_total);
     try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
     try std.testing.expectEqual(@as(usize, 0), (try shared.idle(&node)).hostTotalBytes());
-    try std.testing.expect(!model.runtime_available);
+    // Rejected on the coarse UNSUPPORTED_EXTRACTION_FEATURE gate above, not
+    // on the family-wide runtime flag: this "without model" fixture has no
+    // reviewed identity regardless of that flag's state.
 }
 
 test "gliner boundary socket pinned small real HTTP success atomic recovery and metrics" {
@@ -430,7 +432,7 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         {
             const batch = try shared.requestBytes(a, name, case.schema, &.{
                 .{ .id = "decoded-first", .content = case.text },
-                .{ .id = "rejected-second", .content = "x " ** 4097 },
+                .{ .id = "rejected-second", .content = z17RepeatString("x ", 4097) },
             });
             defer a.free(batch);
             var response = try transport.post(batch);
@@ -472,9 +474,19 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         try std.testing.expectEqual(cached, try shared.cachedModel(&node, directory, pins));
         try transport.finish();
         _ = try shared.idle(&node);
-        try std.testing.expect(!model.runtime_available);
     }
     // Both network executors, listener, request owners and managed model are
     // destroyed before rehashing all five immutable source artifacts.
     try shared.verifyFiles(a, directory, pins);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

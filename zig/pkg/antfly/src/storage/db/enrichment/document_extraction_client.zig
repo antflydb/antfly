@@ -116,7 +116,7 @@ const ResultCollector = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.content_type) |value| self.alloc.free(value);
         if (self.route_type) |value| self.alloc.free(value);
         if (self.unsupported_reason) |value| self.alloc.free(value);
@@ -409,7 +409,7 @@ pub fn acceptProviderFailure(
             err,
             .storage_owner,
             abi.abi_version,
-            @intFromEnum(validation_operation),
+            @backingInt(validation_operation),
         );
         return err;
     };
@@ -419,7 +419,7 @@ pub fn acceptProviderFailure(
             error.InvalidBoundaryFailureIdentity,
             .storage_owner,
             abi.abi_version,
-            @intFromEnum(validation_operation),
+            @backingInt(validation_operation),
         );
         return error.InvalidBoundaryFailureIdentity;
     }

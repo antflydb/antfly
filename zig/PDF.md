@@ -604,7 +604,7 @@ operation, and effective authentication identity. Antfly clients query
 `/ai/v1/models?model=<model>&task=<task>&operation=<operation>`, where task is
 one of `read`, `generate`, `embed`, `rerank`, `chunk`, `extract`, `rewrite`, or
 `transcribe`, and operation names the endpoint that will actually
-execute (for example `generate.batch`, `generate`, `rerank_multimodal`, or
+execute (for example `generate.batch`, `generate`, `rerank`, or
 `embeddings`). The same authorization is used for discovery and execution. The
 proxy validates that the operation belongs to the task, resolves only that
 operation's route capability cohort, and surveys only healthy endpoint
@@ -4548,7 +4548,7 @@ report model qualification after running only the fake providers.
   generated production inference archive, resolves only
   `antfly_standalone_inference_get_function_table`, and verifies function-table
   prefix validation, wrapper-owned version rejection, stable `Status` mapping,
-  and borrowed binary MIME rejection without importing `inference_host.zig`.
+  and borrowed binary MIME rejection without importing `pkg/inference/src/host/host.zig`.
   The focused standalone runtime test depends on this executable.
 
 ## Performance architecture after review

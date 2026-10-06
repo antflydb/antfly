@@ -27,7 +27,7 @@ pub const Queue = struct {
     tail: ?*Ticket = null,
     pending: std.atomic.Value(usize) = .init(0),
     live: std.atomic.Value(usize) = .init(0),
-    bytes: std.atomic.Value(u64) = .init(0),
+    bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     manager: ?*resources.ResourceManager = null,
     wake_context: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
@@ -293,7 +293,7 @@ test "output cleanup owns partial outputs after cancellation and wakes bulk main
 }
 
 test "output cleanup off-lock handoff scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     const Run = @import("repository.zig").Run;
     const compaction = @import("compaction.zig");

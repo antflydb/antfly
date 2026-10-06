@@ -179,6 +179,7 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         };
         defer compute.deinit();
         print("capability_clipclap: {}\n", .{compute.supportsProfile(.clipclap)});
+        print("capability_laya: {}\n", .{compute.supportsProfile(.laya)});
         print("capability_deberta_reranker: {}\n", .{compute.supportsProfile(.deberta_reranker)});
         print("capability_florence2: {}\n", .{compute.supportsProfile(.florence2)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
@@ -323,7 +324,7 @@ fn smokeCublasLtBf16(allocator: std.mem.Allocator) !bool {
     const out_dim: usize = 16;
     var input_data: [rows * in_dim]f32 = undefined;
     for (&input_data, 0..) |*value, i| value.* = @floatFromInt((i % 7) + 1);
-    var weight_data: [out_dim * in_dim]u16 = .{0} ** (out_dim * in_dim);
+    var weight_data: [out_dim * in_dim]u16 = @splat(0);
     for (0..out_dim) |row| weight_data[row * in_dim + row] = bf16Bits(1.0);
 
     var input = try cuda_buffer.DeviceBuffer.alloc(&ctx, input_data.len * @sizeOf(f32));
@@ -686,7 +687,7 @@ const Gemma4RmseCategory = enum {
     other,
 };
 
-const gemma4_rmse_category_count = @typeInfo(Gemma4RmseCategory).@"enum".fields.len;
+const gemma4_rmse_category_count = @typeInfo(Gemma4RmseCategory).@"enum".field_names.len;
 
 const RmseAccumulator = struct {
     tensor_count: usize = 0,
@@ -725,7 +726,7 @@ fn runGemma4CrossRmseOnStores(
     hf_store: tensor_store_mod.TensorStore,
 ) !void {
     const gguf_file = gguf_store.ggufFile() orelse return error.InvalidTensorStore;
-    var groups = [_]RmseAccumulator{.{}} ** gemma4_rmse_category_count;
+    var groups = @as([gemma4_rmse_category_count]RmseAccumulator, @splat(.{}));
     var skipped: usize = 0;
     const verbose = envFlag("ANTFLY_INFERENCE_CUDA_RMSE_VERBOSE");
     const max_full_elements = envUsize("ANTFLY_INFERENCE_CUDA_RMSE_MAX_ELEMENTS") orelse 40_000_000;
@@ -734,7 +735,7 @@ fn runGemma4CrossRmseOnStores(
     for (gguf_file.tensors) |tensor| {
         const category = gemma4RmseCategoryForName(tensor.name);
         if (std.mem.eql(u8, tensor.name, "token_embd.weight")) {
-            try runGemma4EmbeddingRowRmse(allocator, gguf_store, hf_store, &groups[@intFromEnum(category)], verbose);
+            try runGemma4EmbeddingRowRmse(allocator, gguf_store, hf_store, &groups[@backingInt(category)], verbose);
             continue;
         }
 
@@ -758,7 +759,7 @@ fn runGemma4CrossRmseOnStores(
                 @tagName(category),
                 tensor.tensor_type.name(),
                 elem_count,
-                &groups[@intFromEnum(category)],
+                &groups[@backingInt(category)],
                 verbose,
             )) {
                 print(
@@ -817,7 +818,7 @@ fn runGemma4CrossRmseOnStores(
         defer allocator.free(hf_values);
         if (gguf_values.len != hf_values.len) return error.InvalidTensorShape;
         const stats = diffStats(gguf_values, hf_values);
-        groups[@intFromEnum(category)].add(tensor.name, stats, elem_count, false);
+        groups[@backingInt(category)].add(tensor.name, stats, elem_count, false);
         if (verbose) {
             print(
                 "gemma4_cross_rmse_tensor: name={s} source={s} category={s} type={s} elems={d} max_abs={d:.6} mean_abs={d:.6} rmse={d:.6} rel_rmse={d:.6} actual_rms={d:.6} expected_rms={d:.6} max_index={d}\n",
@@ -841,7 +842,7 @@ fn runGemma4CrossRmseOnStores(
 
     for (&groups, 0..) |*group, idx| {
         if (group.elem_count == 0) continue;
-        const category: Gemma4RmseCategory = @enumFromInt(idx);
+        const category: Gemma4RmseCategory = @fromBackingInt(@intCast(idx));
         const count: f64 = @floatFromInt(group.elem_count);
         const mean_abs = group.sum_abs / count;
         const rmse = @sqrt(group.sum_sq / count);
@@ -1137,7 +1138,7 @@ const Gemma4Layer0CpuOutputs = struct {
     ffn_post: []f32,
     out: []f32,
 
-    fn deinit(self: *Gemma4Layer0CpuOutputs, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Gemma4Layer0CpuOutputs, allocator: std.mem.Allocator) void {
         allocator.free(self.attn_norm);
         allocator.free(self.q);
         allocator.free(self.k);
@@ -1787,7 +1788,7 @@ const Gemma4Layer0Weights = struct {
     post_ffw_norm: []f32,
     layer_output_scale: []f32,
 
-    fn deinit(self: *Gemma4Layer0Weights, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Gemma4Layer0Weights, allocator: std.mem.Allocator) void {
         allocator.free(self.attn_norm);
         allocator.free(self.q);
         allocator.free(self.k);

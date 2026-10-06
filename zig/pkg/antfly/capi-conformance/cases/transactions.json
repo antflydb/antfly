@@ -1,0 +1,24 @@
+{
+  "name": "transactions",
+  "description": "Local transaction lifecycle: begin, write intents, commit, status, commit version, and abort.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "begin_transaction", "txn_id": "636f6e666f726d616e63652d74786e01", "timestamp": 3},
+    {"op": "write_transaction", "txn_id": "636f6e666f726d616e63652d74786e01", "writes": [
+      {"key": "doc:txn", "value": {"title": "committed in a transaction"}}
+    ]},
+    {"op": "transaction_status", "txn_id": "636f6e666f726d616e63652d74786e01", "expect": {"equals": "pending"}},
+    {"op": "resolve_transaction", "txn_id": "636f6e666f726d616e63652d74786e01", "status": "committed", "commit_version": 4},
+    {"op": "transaction_status", "txn_id": "636f6e666f726d616e63652d74786e01", "expect": {"equals": "committed"}},
+    {"op": "commit_version", "txn_id": "636f6e666f726d616e63652d74786e01", "expect": {"equals": 4}},
+    {"op": "lookup", "key": "doc:txn", "expect": {"json_subset": {"title": "committed in a transaction"}}},
+    {"op": "begin_transaction", "txn_id": "636f6e666f726d616e63652d74786e02", "timestamp": 5},
+    {"op": "write_transaction", "txn_id": "636f6e666f726d616e63652d74786e02", "writes": [
+      {"key": "doc:aborted", "value": {"title": "never visible"}}
+    ]},
+    {"op": "resolve_transaction", "txn_id": "636f6e666f726d616e63652d74786e02", "status": "aborted", "commit_version": 0},
+    {"op": "transaction_status", "txn_id": "636f6e666f726d616e63652d74786e02", "expect": {"equals": "aborted"}},
+    {"op": "lookup", "key": "doc:aborted", "expect": {"error": "ANTFLY_NOT_FOUND"}},
+    {"op": "transaction_status", "txn_id": "000000000000000000000000000000ff", "expect": {"error": "ANTFLY_TXN_NOT_FOUND"}}
+  ]
+}

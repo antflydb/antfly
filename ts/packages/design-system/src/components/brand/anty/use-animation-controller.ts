@@ -20,12 +20,6 @@ import { createGlowSystem, type GlowSystemControls } from "./animation/glow-syst
 import { initializeCharacter } from "./animation/initialize";
 import { createShadowTracker, type ShadowTrackerControls } from "./animation/shadow";
 import {
-  createPixelateSystem,
-  type PixelateCycleOptions,
-  type PixelateOptions,
-  type PixelateSystemControls,
-} from "./pixelate/pixelate-system";
-import {
   type AnimationCallbacks,
   type AnimationOptions,
   AnimationState,
@@ -34,6 +28,12 @@ import {
   type EyeStyle,
   isEmotionType,
 } from "./animation/types";
+import {
+  createPixelateSystem,
+  type PixelateCycleOptions,
+  type PixelateOptions,
+  type PixelateSystemControls,
+} from "./pixelate/pixelate-system";
 
 export interface AnimationElements {
   container?: HTMLElement | null;
@@ -470,6 +470,7 @@ export function useAnimationController(
 
   useEffect(() => {
     if (!autoStartIdle || !isReady.current || !controllerRef.current) return;
+    if (!elements.character || !elements.shadow) return;
     if (isOff) return;
     if (isWakingUpRef.current) return;
     if (controllerRef.current.isIdlePrevented()) return;
@@ -485,8 +486,8 @@ export function useAnimationController(
 
     const idleResult = createIdleAnimation(
       {
-        character: elements.character!,
-        shadow: elements.shadow!,
+        character: elements.character,
+        shadow: elements.shadow,
         eyeLeft: elements.eyeLeft || undefined,
         eyeRight: elements.eyeRight || undefined,
         eyeLeftPath: elements.eyeLeftPath || undefined,
@@ -534,6 +535,7 @@ export function useAnimationController(
     (emotion: EmotionType, animationOptions: AnimationOptions = {}): boolean => {
       if (!controllerRef.current) return false;
       if (!isReady.current) return false;
+      if (!elements.character) return false;
 
       if (!isEmotionType(emotion)) {
         if (ENABLE_ANIMATION_DEBUG_LOGS) {
@@ -557,7 +559,7 @@ export function useAnimationController(
         gsap.killTweensOf(eyeElements);
       }
 
-      gsap.set(elements.character!, {
+      gsap.set(elements.character, {
         rotation: 0,
         rotationY: 0,
         rotationX: 0,
@@ -570,7 +572,7 @@ export function useAnimationController(
       const tl = interpretEmotionConfig(
         emotionConfig,
         {
-          character: elements.character!,
+          character: elements.character,
           eyeLeft: elements.eyeLeft,
           eyeRight: elements.eyeRight,
           eyeLeftPath: elements.eyeLeftPath,
@@ -625,11 +627,12 @@ export function useAnimationController(
 
   const startIdle = useCallback(() => {
     if (!controllerRef.current || !isReady.current) return;
+    if (!elements.character || !elements.shadow) return;
 
     const idleResult = createIdleAnimation(
       {
-        character: elements.character!,
-        shadow: elements.shadow!,
+        character: elements.character,
+        shadow: elements.shadow,
         eyeLeft: elements.eyeLeft || undefined,
         eyeRight: elements.eyeRight || undefined,
         eyeLeftPath: elements.eyeLeftPath || undefined,

@@ -27,16 +27,18 @@ const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_work_budget = @import("../graph/work_budget.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const public_limits = @import("public_limits.zig");
+const public_limits = @import("antfly_public_limits");
 const query_contract = @import("query_contract.zig");
 
 pub const QueryResponse = query_contract.QueryResponse;
 pub const QueryResponseMeta = query_contract.QueryResponseMeta;
 pub const OwnedQueryRequest = query_contract.OwnedQueryRequest;
 pub const PublicFilterQueryErrorKind = query_contract.PublicFilterQueryErrorKind;
+pub const SemanticResolver = query_contract.SemanticResolver;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parseGraphMetricRequestsAlloc = query_contract.parseGraphMetricRequestsAlloc;
+pub const validateStoragePublicQueryRequest = query_contract.validateStoragePublicQueryRequest;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
@@ -1017,7 +1019,7 @@ const GraphAggregateResultBuilder = struct {
         self.value = self.distinct_values.items.len;
     }
 
-    fn deinit(self: *GraphAggregateResultBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphAggregateResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         self.distinct_seen.deinit(alloc);
         for (self.distinct_values.items) |value| {
@@ -1062,7 +1064,7 @@ const GraphSearchResultBuilder = struct {
     total_hits: u32 = 0,
     truncated: bool = false,
 
-    fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         self.node_identities.deinit(alloc);
         for (self.nodes.items) |*node| node.deinit(alloc);
@@ -1628,7 +1630,7 @@ const GraphMetricResultBuilder = struct {
     score_limit: usize,
     status: ?db_mod.types.GraphMetricStatus = null,
 
-    fn deinit(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         if (self.index_name.len > 0) alloc.free(self.index_name);
         if (self.metric_name.len > 0) alloc.free(self.metric_name);
@@ -1766,9 +1768,14 @@ fn validateRequestedGraphMetricFanIn(
                 if (!std.mem.eql(u8, metric_result.index_name, query.query.index_name)) return error.UnsupportedQueryRequest;
                 if (!std.mem.eql(u8, metric_result.metric_name, query.query.metric_name)) return error.UnsupportedQueryRequest;
                 if (!std.mem.eql(u8, metric_result.status.name, query.query.metric_name)) return error.UnsupportedQueryRequest;
-                if (metric_result.status.published_generation == 0) return error.UnsupportedQueryRequest;
-                try validateGraphMetricPublishedStatus(metric_result.status);
-                try validateGraphMetricFreshness(query.query.freshness, metric_result.status);
+                // Seeded rankings are computed fresh from the shard's edge
+                // snapshot rather than read from a published generation, so
+                // their publication state carries no fan-in requirement.
+                if (query.query.seed_nodes.len == 0) {
+                    if (metric_result.status.published_generation == 0) return error.UnsupportedQueryRequest;
+                    try validateGraphMetricPublishedStatus(metric_result.status);
+                    try validateGraphMetricFreshness(query.query.freshness, metric_result.status);
+                }
             }
             if (!found) return error.UnsupportedQueryRequest;
         }
@@ -1948,9 +1955,13 @@ fn mergeGraphMetricRerankStatus(
     for (results) |result| {
         const status = result.graph_metric_rerank_status orelse return error.UnsupportedQueryRequest;
         if (!std.mem.eql(u8, status.name, rerank.metric_name)) return error.UnsupportedQueryRequest;
-        if (status.published_generation == 0) return error.UnsupportedQueryRequest;
-        try validateGraphMetricPublishedStatus(status);
-        try validateGraphMetricFreshness(rerank.freshness, status);
+        // Seeded rerank scores are computed fresh at query time; their
+        // publication state carries no fan-in requirement.
+        if (rerank.seed_nodes.len == 0) {
+            if (status.published_generation == 0) return error.UnsupportedQueryRequest;
+            try validateGraphMetricPublishedStatus(status);
+            try validateGraphMetricFreshness(rerank.freshness, status);
+        }
         if (merged) |*existing| {
             if (existing.published_generation != status.published_generation) return error.UnsupportedQueryRequest;
             try validateGraphMetricStatusCompatible(existing.*, status);
@@ -4498,7 +4509,7 @@ fn consumerTests() type {
         }
 
         test "query merge allocation scales with the selected page" {
-            const large_stored = "x" ** 1024;
+            const large_stored = z17RepeatString("x", 1024);
             var input_hits: [2048]db_mod.types.SearchHit = undefined;
             for (&input_hits) |*hit| {
                 hit.* = .{
@@ -9766,4 +9777,15 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

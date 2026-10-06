@@ -16,7 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
 const tracing = @import("../tracing/mod.zig");
-pub const catalog = @import("catalog.zig");
+pub const catalog = @import("storage/catalog.zig");
 const backup_restore = @import("storage/backup_restore.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const peer_resolver = @import("peer_resolver.zig");
@@ -120,6 +120,9 @@ pub fn stableRandomSeed(group_id: u64, local_node_id: u64) u64 {
 }
 
 pub const HostDeps = struct {
+    /// Installed on each data group, including groups restored from catalog.
+    /// Runs under the same owner serialization as all Raft append paths.
+    data_proposal_admission: ?raft_engine.core.ProposalAdmission = null,
     /// Borrowed synchronization and monotonic clock authority; must outlive the host. The default
     /// supports blocking mutex waits without allocating a worker pool.
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
@@ -243,6 +246,9 @@ pub const HostMetrics = struct {
     runtime_pending_snapshot_submissions: usize = 0,
     runtime_pending_apply_tasks: usize = 0,
     runtime_pending_apply_bytes: usize = 0,
+    runtime_pending_persistence_tasks: usize = 0,
+    runtime_pending_persistence_bytes: usize = 0,
+    runtime_pending_persistence_age_ms: u64 = 0,
     runtime_transport_queue_denials: usize = 0,
     runtime_apply_queue_denials: usize = 0,
     runtime_oversized_outbound_ready_rejections: usize = 0,
@@ -376,7 +382,7 @@ pub const Host = struct {
         group_id: u64,
         message: raft_engine.core.Message,
 
-        fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
             self.message.deinit(alloc);
             self.* = undefined;
         }
@@ -391,7 +397,7 @@ pub const Host = struct {
         backup_id: ?[]u8 = null,
         snapshot_path: ?[]u8 = null,
 
-        fn deinit(self: *OwnedBootstrapStatus, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *OwnedBootstrapStatus, alloc: std.mem.Allocator) void {
             if (self.last_error) |msg| alloc.free(msg);
             if (self.backup_id) |value| alloc.free(value);
             if (self.snapshot_path) |value| alloc.free(value);
@@ -408,6 +414,80 @@ pub const Host = struct {
     admission_conflicts: std.AutoHashMapUnmanaged(u64, raft_engine.runtime.group.ReplicaAdmissionConflict) = .empty,
     inbound_mutex: std.Io.Mutex = .init,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
+    /// Borrowed notification only; the callback must not reenter the host.
+    /// The inbound mutex protects registration, invocation, and removal so
+    /// a producer cannot notify a retired progress driver.
+    progress_wake: ?ProgressWake = null,
+    progress_wake_registered: std.atomic.Value(bool) = .init(false),
+
+    pub const ProgressWake = struct {
+        ptr: *anyopaque,
+        notify_fn: *const fn (*anyopaque) void,
+    };
+
+    pub fn registerProgressWake(self: *Host, wake: ProgressWake) !void {
+        self.lockInbound();
+        defer self.inbound_mutex.unlock(self.deps.io);
+        if (self.progress_wake != null) return error.RaftProgressAlreadyOwned;
+        self.progress_wake = wake;
+        self.progress_wake_registered.store(true, .release);
+        // A durable WAL completion is progress debt just like new inbound
+        // traffic. Notify the existing driver immediately rather than adding
+        // a tick interval to every append. The proxy fences driver lifetime
+        // with the same inbound mutex used by registration/removal.
+        self.runtime_host.persistence_wake = .{ .ptr = self, .notify = persistenceCompleted };
+        // Messages accepted before registration are already progress debt.
+        if (self.pending_inbound.items.len != 0) wake.notify_fn(wake.ptr);
+    }
+
+    pub fn releaseProgressWake(self: *Host) void {
+        self.lockInbound();
+        defer self.inbound_mutex.unlock(self.deps.io);
+        self.progress_wake = null;
+        self.progress_wake_registered.store(false, .release);
+    }
+
+    fn notifyProgressLocked(self: *Host) void {
+        if (self.progress_wake) |wake| wake.notify_fn(wake.ptr);
+    }
+
+    fn notifyProgress(self: *Host) void {
+        // Manual/deterministic hosts retain their existing proposal path.
+        // The mutex is needed only to fence a registered callback's lifetime.
+        if (!self.progress_wake_registered.load(.acquire)) return;
+        self.lockInbound();
+        defer self.inbound_mutex.unlock(self.deps.io);
+        self.notifyProgressLocked();
+    }
+
+    fn persistenceCompleted(ptr: *anyopaque) void {
+        const self: *Host = @ptrCast(@alignCast(ptr));
+        self.notifyProgress();
+    }
+
+    test "persistence completion wake follows the registered progress driver lifetime" {
+        const Probe = struct {
+            calls: usize = 0,
+            fn notify(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+            }
+        };
+        var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{ .io = std.testing.io });
+        defer host.deinit();
+        var probe = Probe{};
+        try host.registerProgressWake(.{ .ptr = &probe, .notify_fn = Probe.notify });
+        const wake = host.runtime_host.persistence_wake.?;
+        wake.notify(wake.ptr);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        host.releaseProgressWake();
+        wake.notify(wake.ptr);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try host.registerProgressWake(.{ .ptr = &probe, .notify_fn = Probe.notify });
+        defer host.releaseProgressWake();
+        wake.notify(wake.ptr);
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    }
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
         var runtime_cfg = cfg.runtime;
@@ -497,6 +577,10 @@ pub const Host = struct {
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
         var descriptor = try factory.buildDescriptor(record);
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        if (self.cfg.metadata_group_id == null or record.group_id != self.cfg.metadata_group_id.?) {
+            if (self.deps.data_proposal_admission) |admission|
+                descriptor.group.raft_config.proposal_admission = admission;
+        }
         // A descriptor factory may attach a scenario-local trace sink (for
         // example, VOPR's in-memory TLA export). Host configuration overrides
         // that sink explicitly; the build-wide stderr logger is only the
@@ -563,6 +647,10 @@ pub const Host = struct {
         const factory = self.deps.descriptor_factory orelse return error.MissingReplicaDescriptorFactory;
         var descriptor = try factory.buildDescriptor(record);
         errdefer factory.freeDescriptor(self.alloc, &descriptor);
+        if (self.cfg.metadata_group_id == null or record.group_id != self.cfg.metadata_group_id.?) {
+            if (self.deps.data_proposal_admission) |admission|
+                descriptor.group.raft_config.proposal_admission = admission;
+        }
         if (self.cfg.trace_logger) |trace_logger| {
             descriptor.group.raft_config.trace_logger = trace_logger;
         } else if (descriptor.group.raft_config.trace_logger == null and comptime build_options.with_tla) {
@@ -682,6 +770,18 @@ pub const Host = struct {
         return try replica_catalog.snapshotReplicas(alloc);
     }
 
+    /// Reads one durable ownership record and its revision without cloning the
+    /// entire catalog. A null outer optional means this host has no catalog;
+    /// a null point record means the catalog has no entry for the group.
+    pub fn readReplicaCatalogRecord(
+        self: *Host,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?catalog.ReplicaCatalogPoint {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return try replica_catalog.readReplica(alloc, group_id);
+    }
+
     /// Returns the durable admission decision, independently of whether the
     /// live runtime has finished installing or removing the replica.
     pub fn replicaCatalogContains(self: *Host, group_id: u64) ?bool {
@@ -721,6 +821,12 @@ pub const Host = struct {
         if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
+        self.clearBootstrapStatus(group_id);
+        _ = self.admission_conflicts.remove(group_id);
+    }
+
+    pub fn retireReplicaPreservingCatalog(self: *Host, group_id: u64) !void {
+        try self.runtime_host.retireReplicaPreservingCatalog(group_id);
         self.clearBootstrapStatus(group_id);
         _ = self.admission_conflicts.remove(group_id);
     }
@@ -862,6 +968,10 @@ pub const Host = struct {
         return self.runtimeReplicaStatus(group_id);
     }
 
+    pub fn persistenceIsStalled(self: *const Host, timeout_ns: u64) bool {
+        return self.runtime_host.persistenceIsStalled(timeout_ns);
+    }
+
     fn runtimeReplicaStatus(self: *Host, group_id: u64) HostedReplicaStatus {
         if (self.runtime_host.group(group_id) == null) return .absent;
         if (self.runtime_host.groupQuarantine(group_id) != null) return .quarantined;
@@ -956,6 +1066,9 @@ pub const Host = struct {
         snapshot.runtime_pending_snapshot_submissions = runtime_metrics.pending_snapshot_submissions;
         snapshot.runtime_pending_apply_tasks = runtime_metrics.pending_apply_tasks;
         snapshot.runtime_pending_apply_bytes = runtime_metrics.pending_apply_bytes;
+        snapshot.runtime_pending_persistence_tasks = runtime_metrics.pending_persistence_tasks;
+        snapshot.runtime_pending_persistence_bytes = runtime_metrics.pending_persistence_bytes;
+        snapshot.runtime_pending_persistence_age_ms = runtime_metrics.pending_persistence_age_ms;
         snapshot.pending_inbound_snapshot_bytes = runtime_metrics.pending_snapshot_bytes;
         snapshot.inbound_snapshot_admission_denials = runtime_metrics.snapshot_admission_denials;
         snapshot.runtime_transport_queue_denials = runtime_metrics.transport_queue_denials;
@@ -1044,6 +1157,7 @@ pub const Host = struct {
             self.metrics.inbound_message_enqueues += pending.items.len;
             self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
             pending.clearRetainingCapacity();
+            self.notifyProgressLocked();
         }
     }
 
@@ -1076,6 +1190,9 @@ pub const Host = struct {
             }
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
+        // Bounded drains retain their scheduling limit, but must not leave
+        // the remaining queue asleep until the next election tick.
+        if (self.pending_inbound.items.len != 0) self.notifyProgressLocked();
         self.inbound_mutex.unlock(self.deps.io);
 
         var drained: usize = 0;
@@ -1105,14 +1222,17 @@ pub const Host = struct {
 
     pub fn campaignGroup(self: *Host, group_id: u64) !void {
         self.runtime_host.campaignGroup(group_id) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn propose(self: *Host, group_id: u64, data: []const u8) !void {
         self.runtime_host.propose(group_id, data) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeWithReceipt(self: *Host, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
         self.runtime_host.proposeWithReceipt(group_id, data, accepted_index) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeBatchWithReceipt(
@@ -1128,6 +1248,7 @@ pub const Host = struct {
             accepted_first_index,
             accepted_last_index,
         ) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
@@ -1192,6 +1313,7 @@ pub const Host = struct {
         });
         self.metrics.inbound_message_enqueues += 1;
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
+        self.notifyProgressLocked();
     }
 
     pub fn admitSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) !void {
@@ -1210,14 +1332,17 @@ pub const Host = struct {
 
     pub fn readIndex(self: *Host, group_id: u64, request_ctx: []const u8) !void {
         self.runtime_host.readIndex(group_id, request_ctx) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeConfChange(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChange) !void {
         self.runtime_host.proposeConfChange(group_id, conf_change) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn proposeConfChangeV2(self: *Host, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
         self.runtime_host.proposeConfChangeV2(group_id, conf_change) catch |err| return mapGroupActivityError(err);
+        self.notifyProgress();
     }
 
     pub fn raftStatus(self: *Host, group_id: u64) ?raft_engine.core.Status {
@@ -1849,6 +1974,7 @@ test "host can ensure and remove a replica" {
                     .contains_replica = containsReplica,
                     .list_replicas = listReplicas,
                     .snapshot_replicas = snapshotReplicas,
+                    .read_replica = readReplica,
                     .revision = revision,
                     .apply_batch = applyBatch,
                     .prepare_batch = prepareBatch,
@@ -1878,6 +2004,13 @@ test "host can ensure and remove a replica" {
                 .token = revision(ptr),
                 .records = try listReplicas(ptr, alloc),
             };
+        }
+
+        fn readReplica(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64) !catalog.ReplicaCatalogPoint {
+            _ = ptr;
+            _ = alloc;
+            _ = group_id;
+            return .{ .token = .{ .revision = 1 }, .record = null };
         }
 
         fn revision(_: *anyopaque) catalog.ReplicaCatalogToken {
@@ -2027,6 +2160,14 @@ test "host rejects live snapshot uploads addressed to another node" {
 }
 
 test "host queues live snapshot uploads for runtime round" {
+    const WakeProbe = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var wake_probe: WakeProbe = .{};
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -2088,6 +2229,9 @@ test "host queues live snapshot uploads for runtime round" {
 
     const voters = try std.testing.allocator.dupe(u64, &[_]u64{1});
     const data = try std.testing.allocator.dupe(u8, "queued-snapshot");
+    try host.registerProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer host.releaseProgressWake();
+    try std.testing.expectEqual(@as(usize, 0), wake_probe.calls);
     try host.handleSnapshotUpload(.{
         .group_id = 41,
         .from = 2,
@@ -2106,6 +2250,7 @@ test "host queues live snapshot uploads for runtime round" {
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
     try std.testing.expectEqual(@as(usize, "queued-snapshot".len), host.metricsSnapshot().pending_inbound_snapshot_bytes);
+    try std.testing.expectEqual(@as(usize, 1), wake_probe.calls);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.inbound_message_drains);
     try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.admitSnapshotUpload(.{
         .group_id = 41,
@@ -2121,6 +2266,14 @@ test "host queues live snapshot uploads for runtime round" {
 }
 
 test "host drops stale inbound peer batch groups without leaking pending storage" {
+    const WakeProbe = struct {
+        calls: usize = 0,
+        fn notify(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var wake_probe: WakeProbe = .{};
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
@@ -2215,13 +2368,20 @@ test "host drops stale inbound peer batch groups without leaking pending storage
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.pending_inbound_messages);
 
+    try host.registerProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify });
+    defer host.releaseProgressWake();
+    try std.testing.expectEqual(@as(usize, 1), wake_probe.calls);
+    try std.testing.expectError(error.RaftProgressAlreadyOwned, host.registerProgressWake(.{ .ptr = &wake_probe, .notify_fn = WakeProbe.notify }));
+
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 2), wake_probe.calls);
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 2), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 2), wake_probe.calls);
 
     // A single poisoned group must not terminate the shared progress driver.
     try host.campaignGroup(41);

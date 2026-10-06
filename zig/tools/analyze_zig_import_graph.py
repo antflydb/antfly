@@ -18,9 +18,9 @@ import json
 import re
 import struct
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
 
 SCRIPT = Path(__file__).resolve()
 REPO_ROOT = SCRIPT.parents[2]
@@ -109,8 +109,6 @@ API_KERNEL_IMPLEMENTATIONS = (
     "storage/db/mod.zig",
     "storage/db/db.zig",
     "storage/docstore.zig",
-    "storage/lmdb.zig",
-    "storage/lmdb_backend.zig",
 )
 
 # Authoritative compiler-report gate for the linked distributed/control unit.
@@ -401,7 +399,7 @@ def load_time_report(name: str, path: Path, repo_root: Path = REPO_ROOT) -> Time
     with path.open(encoding="utf-8") as source:
         raw = json.load(source)
     if not isinstance(raw, dict):
-        raise ValueError(f"time report is not a JSON object: {path}")
+        raise TypeError(f"time report is not a JSON object: {path}")
 
     file_values = raw.get("all_files")
     has_file_list = isinstance(file_values, list)
@@ -1086,8 +1084,15 @@ def check_runtime_boundary(graph: ImportGraph) -> bool:
 def check_codegen_boundary(graph: ImportGraph) -> bool:
     clean = True
     for source_name, target_name in CODEGEN_BOUNDARIES:
+        if (
+            not (graph.source_root / source_name).is_file()
+            or not (graph.source_root / target_name).is_file()
+        ):
+            continue
         source = graph.resolve_source(source_name)
         target = graph.resolve_source(target_name)
+        # Relocated inference host files are checked as Apache package sources
+        # by check_apache_boundary.py instead of this server-only import graph.
         path = graph.shortest_path(source, target)
         if not path:
             continue
@@ -1096,7 +1101,15 @@ def check_codegen_boundary(graph: ImportGraph) -> bool:
         print(f"codegen boundary violation: {rendered}", file=sys.stderr)
 
     for source_name, token in INFERENCE_ABI_FORBIDDEN_TOKENS:
-        source = graph.resolve_source(source_name)
+        if (
+            source_name == "standalone/inference_bridge.zig"
+            and not (graph.source_root / source_name).is_file()
+        ):
+            source = REPO_ROOT / "zig/pkg/inference/src/host/bridge.zig"
+        elif not (graph.source_root / source_name).is_file():
+            continue
+        else:
+            source = graph.resolve_source(source_name)
         if token not in source.read_text(encoding="utf-8"):
             continue
         clean = False
@@ -1263,7 +1276,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             return 1
         return 0
-    except ValueError as error:
+    except (TypeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

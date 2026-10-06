@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const runtime_callback_abi = @import("../../runtime_callback_abi.zig");
-const CancellationToken = @import("../cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
@@ -22,6 +22,17 @@ pub const metadata_not_leader_value = "true";
 /// to another replica only when this response proves no proposal was admitted.
 pub const metadata_mutation_not_admitted_header = "X-Antfly-Metadata-Mutation-Not-Admitted";
 pub const metadata_mutation_not_admitted_value = "true";
+
+/// Socket I/O uses platform-dependent names for a disconnected peer. Preserve
+/// one transport failure contract across native and foreign executors; this
+/// does not prove whether a request was delivered or permit a write replay.
+pub fn canonicalTransportError(err: anyerror) anyerror {
+    return switch (err) {
+        error.SocketUnconnected => error.ConnectionResetByPeer,
+        error.UnexpectedEof => error.InvalidResponse,
+        else => err,
+    };
+}
 
 pub const Method = enum {
     GET,
@@ -105,6 +116,10 @@ pub const HttpRequest = struct {
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     timeout_ms: ?u32 = null,
+    /// Optional decoded response-body ceiling. Buffered executors may lower,
+    /// never raise, their configured ceiling. For streaming, null preserves
+    /// sink-owned budgeting; a supplied ceiling also bounds transport output.
+    max_response_bytes: ?usize = null,
     body: []const u8 = &.{},
     cancellation: ?*const RequestCancellation = null,
     delivery_tracker: ?*RequestDeliveryTracker = null,
@@ -114,6 +129,10 @@ pub const HttpRequest = struct {
             if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry.value;
         }
         return null;
+    }
+
+    pub fn responseLimit(self: HttpRequest, configured_limit: usize) usize {
+        return @min(self.max_response_bytes orelse configured_limit, configured_limit);
     }
 };
 
@@ -128,24 +147,24 @@ pub const RequestDeliveryTracker = struct {
         may_have_been_sent,
     };
 
-    state: std.atomic.Value(u8) = .init(@intFromEnum(State.unknown)),
+    state: std.atomic.Value(u8) = .init(@backingInt(State.unknown)),
 
     /// Enter an executor whose send boundary is not yet known. The executor
     /// may subsequently prove `not_sent` or advance to `may_have_been_sent`.
     pub fn markUnknown(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.unknown), .release);
+        self.state.store(@backingInt(State.unknown), .release);
     }
 
     pub fn markNotSent(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.not_sent), .release);
+        self.state.store(@backingInt(State.not_sent), .release);
     }
 
     pub fn markMayHaveBeenSent(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.may_have_been_sent), .release);
+        self.state.store(@backingInt(State.may_have_been_sent), .release);
     }
 
     pub fn load(self: *const RequestDeliveryTracker) State {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 };
 
@@ -233,7 +252,8 @@ pub const StreamingRequestExecutor = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn execute(self: StreamingRequestExecutor, alloc: std.mem.Allocator, req: HttpRequest, writer: StreamWriter) !bool {
-        return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req, writer });
+        if (req.delivery_tracker) |tracker| tracker.markUnknown();
+        return BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req, writer }) catch |err| return canonicalTransportError(err);
     }
 };
 
@@ -245,7 +265,7 @@ pub const RequestExecutor = struct {
     /// Authentication and retry envelopes use this instead of escaping to the
     /// host clock when an executor is backed by a simulated or embedded Io.
     realtime_ns_fn: ?*const fn (ptr: *anyopaque) i128 = null,
-    clock_io: ?@import("../../runtime_io_abi.zig").Borrow = null,
+    clock_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,
@@ -267,7 +287,7 @@ pub const RequestExecutor = struct {
         // setup and must advance the state before transmission. An executor
         // that does not implement tracking therefore remains safely unknown.
         if (req.delivery_tracker) |tracker| tracker.markUnknown();
-        return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req });
+        return BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req }) catch |err| return canonicalTransportError(err);
     }
 
     pub fn monotonicNs(self: RequestExecutor) u64 {
@@ -294,7 +314,7 @@ pub const RequestExecutor = struct {
     ) !?bool {
         const execute_stream = self.vtable.execute_stream orelse return null;
         if (req.delivery_tracker) |tracker| tracker.markUnknown();
-        return try BoundaryAbi.call("execute_stream", self.boundary_dispatch, execute_stream, .{ self.ptr, alloc, req, writer });
+        return BoundaryAbi.call("execute_stream", self.boundary_dispatch, execute_stream, .{ self.ptr, alloc, req, writer }) catch |err| return canonicalTransportError(err);
     }
 };
 
@@ -324,6 +344,57 @@ test "request executor invalidates caller-side delivery proof at its boundary" {
     }));
     try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, observing.observed.?);
     try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+}
+
+test "disconnected executor errors preserve uncertain mutation delivery without replay" {
+    const Disconnected = struct {
+        calls: usize = 0,
+        failure: anyerror = error.SocketUnconnected,
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: HttpRequest) anyerror!HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.failure;
+        }
+        fn stream(ptr: *anyopaque, _: std.mem.Allocator, _: HttpRequest, _: StreamWriter) anyerror!bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self.failure;
+        }
+    };
+    var disconnected = Disconnected{};
+    const executor: RequestExecutor = .{ .ptr = &disconnected, .vtable = &.{ .execute = Disconnected.execute, .execute_stream = Disconnected.stream } };
+    var tracker: RequestDeliveryTracker = .{};
+    const request: HttpRequest = .{ .method = .POST, .uri = "http://127.0.0.1/internal", .delivery_tracker = &tracker };
+    const Sink = struct {
+        fn start(_: *anyopaque, _: std.mem.Allocator, _: StreamingResponse) anyerror!void {}
+        fn write(_: *anyopaque, _: []const u8) anyerror!void {}
+        fn flush(_: *anyopaque) anyerror!void {}
+    };
+    const writer: StreamWriter = .{ .ptr = &disconnected, .vtable = &.{ .start = Sink.start, .write_all = Sink.write, .flush = Sink.flush } };
+    tracker.markNotSent();
+    try std.testing.expectError(error.ConnectionResetByPeer, executor.execute(std.testing.allocator, request));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 1), disconnected.calls);
+    tracker.markNotSent();
+    try std.testing.expectError(error.ConnectionResetByPeer, executor.executeStream(std.testing.allocator, request, writer));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 2), disconnected.calls);
+    const streaming: StreamingRequestExecutor = .{ .ptr = &disconnected, .vtable = &.{ .execute = Disconnected.stream } };
+    tracker.markNotSent();
+    try std.testing.expectError(error.ConnectionResetByPeer, streaming.execute(std.testing.allocator, request, writer));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 3), disconnected.calls);
+    disconnected.failure = error.UnexpectedEof;
+    tracker.markNotSent();
+    try std.testing.expectError(error.InvalidResponse, executor.execute(std.testing.allocator, request));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 4), disconnected.calls);
+    tracker.markNotSent();
+    try std.testing.expectError(error.InvalidResponse, executor.executeStream(std.testing.allocator, request, writer));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 5), disconnected.calls);
+    try std.testing.expectEqual(error.OutOfMemory, canonicalTransportError(error.OutOfMemory));
+    try std.testing.expectEqual(error.InvalidResponse, canonicalTransportError(error.UnexpectedEof));
 }
 
 test "http common types compile" {

@@ -34,7 +34,8 @@ Supported compatibility paths:
 | --- | --- | --- |
 | GLiNER2 base-v1 | WASM CPU or WebGPU + WASM | Complete split encoder/head GGUF pair, or full SafeTensors |
 | GLiNER2.5 Small / Base | WASM CPU or WebGPU encoder + WASM task heads | Mixed-precision boundary GGUF or FP32 SafeTensors |
-| Laya English | WASM CPU; explicit CPU fallback when WebGPU is requested | Dense FP16/FP32 SafeTensors, upstream or native-importer folder |
+| GLiNER2.5-Decide | WASM CPU or WebGPU + WASM classification | Complete local Q8 encoder/head GGUF pair |
+| Laya / OpenDecider | WebGPU for unpacked FP16; WASM CPU for FP32/BF16 and packed rows | Dense FP16/FP32/BF16 SafeTensors, upstream or native-importer folder |
 
 GLiNER bundles require `config.json`, `encoder_config/config.json`,
 `tokenizer.json`, and `tokenizer_config.json`. Preserve nested paths when
@@ -42,6 +43,23 @@ selecting the model folder. Boundary GGUFs use the existing native converter
 and its integrity receipt; exact tensor inventories, shapes, precision, byte
 lengths, duplicate names, and receipt hashes are checked before execution.
 GLiNER2 supports the pinned base-v1 inventory, not arbitrary DeBERTa checkpoints.
+
+### GLiNER2.5-Decide
+
+Select **GLiNER2.5 Decide**, then choose a local converted Q8 folder. Both
+`gliner2-encoder.Q8_0.gguf` and its matching `gliner2-head.Q8_0.gguf` or
+`gliner_head.gguf` are accepted. Keep the encoder sidecar and tokenizer files.
+The adapter checks version 3 / architecture version 1 / `markerV0`, loads the
+DeBERTa-v3-large geometry, and validates all 419 tensor names and shapes.
+Its full FP32 checkpoint exceeds the browser's 1 GiB file limit; use Q8.
+
+Decide uses extraction-v2 classification requests, including instructions,
+label descriptions, examples, single/multi-label selection and ordinal
+constraints. Boolean builder requests use two-label single classification.
+Advanced JSON supports multiple tasks with main's bounded prompt splitting
+and schema-order restoration. Entity/relation/structure extraction and
+long-document windows are rejected on this route. It returns classification
+scores; Laya's calibrated typed-decision and action fields remain Laya-specific.
 
 ### Laya typed decisions
 
@@ -56,22 +74,38 @@ plus tokenizer files at the root; both layouts use the same inference path.
 No Python or remote model code runs in the browser.
 
 The Laya builder supports single choice, ordinal, and boolean questions.
-Advanced JSON accepts PR #815's extraction-v2 `classifications` schema,
+Advanced JSON accepts the extraction-v2 `classifications` schema,
 including instructions and label descriptions. The result view shows the
 complete distribution, confidence method, zero-based expected ordinal level,
 true probability, and action probability. It never executes tools.
-One input and at most 16 questions are accepted per browser request;
-questions run serially. The checkpoint's 512-token budget includes the
+One input and at most 16 questions are accepted per browser request.
+Unpacked questions run serially. The checkpoint's token budget includes the
 formatted question and options. Overlength state text is rejected; question
 and option token caps follow upstream preprocessing. Entities, relations,
-windowing, multi-label decisions, GGUF/Q8/Q4, BF16, and multilingual Laya
-are not supported by this browser adapter. WebGPU runs the encoder and decision
+windowing, multi-label decisions, and GGUF/Q4
+are not supported by this browser adapter. WebGPU runs the unpacked encoder and decision
 heads, including RoPE, sliding-window attention, erf-based GELU, and row gathering.
 Tokenization, token/type embedding-row lookup, confidence/action feature assembly,
 and final calibration remain on CPU. Only small final features/logits are read
 back; encoder activations stay on-device. On macOS Chromium,
 this runs through the browser's Metal-backed WebGPU adapter; it does not execute
 the native Metal backend or compile Metal shaders to WASM.
+
+Native-imported checkpoints can use main's question or candidate packing,
+question-aware trunks, per-question upper layers, question-first positions,
+pointer heads, and two-stage candidate shortlisting. Candidate mode accepts
+up to 255 options. These layouts require checkpoints trained for them; the
+browser honors checkpoint configuration rather than changing released weights.
+Packed requests use WASM CPU segment attention, share trunks across questions,
+and reuse main's state cache (64 MiB, charged to the model budget). Question-aware
+and fused trunks follow main's cache bypass rules. Packed scratch is limited to
+512 MiB per row, within the overall 1.5 GiB host budget.
+`laya.weight_quantization: "q8_0"` quantizes the same encoder/head linears at
+load as main; checkpoint files remain dense and other weights keep their precision.
+OpenDecider uses its native-importer `format: "opendecider"` configuration and
+marker MLP, with no action probability in the result.
+BF16 source tensors expand exactly to FP32 on CPU, within the host budget;
+BF16 linear weights configured for Q8 serving quantize directly from those values.
 
 Laya retains packed FP16 projection weights on the GPU across requests. The
 shader unpacks FP16 storage and accumulates in FP32, without requiring the
@@ -180,6 +214,8 @@ From `zig/` (no model downloads occur in these tests):
 
 ```sh
 node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-extraction-support.mjs pkg/inference/web/test-model-discovery.mjs pkg/inference/web/test-webgpu-worker-transfers.mjs
+EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs
+EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm DECIDE_MODEL=/absolute/decide-q8 node --test pkg/inference/web/test-decide-runtime.mjs
 EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm EXTRACTION_MODEL=/absolute/small-q8 EXTRACTION_PRECISION=q8_0 EXTRACTION_CYCLES=20 EXTRACTION_ORACLE=pkg/inference/testdata/gliner25/pipeline_cases.json node --test pkg/inference/web/test-extraction-runtime.mjs
 ```
 
@@ -192,6 +228,12 @@ EXTRACTION_MODEL=/absolute/gliner2-base-bundle EXTRACTION_PRECISION=q4_k EXTRACT
 EXTRACTION_MODEL=/absolute/small-q8 EXTRACTION_PRECISION=q8_0 EXTRACTION_GPU=1 EXTRACTION_ORACLE=/absolute/antfly/zig/pkg/inference/testdata/gliner25/pipeline_cases.json pnpm --filter @antfly/gliner-playground test:browser
 pnpm --filter @antfly/gliner-playground build
 ```
+
+From the app directory, `EXTRACTION_GPU=1 DECIDE_MODEL=/absolute/decide-q8 node --test
+test/decision-models.test.mjs` checks Decide's browser UI/reference labels,
+Laya pointer/Q8/OpenDecider GPU parity, and explicit packed CPU fallback.
+The small deterministic Laya fixtures require no download and exercise the
+packed layouts, two-stage choices, state cache and inventory rejection in WASM.
 
 Laya-specific checks (from `zig/`, model files remain outside the repository):
 

@@ -25,7 +25,7 @@ const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("builder.zig");
 const publication_plan = @import("publication_plan.zig");
 const api_codec = @import("../api/codec.zig");
-const Cancellation = @import("../../common/cancellation.zig").CancellationToken;
+const Cancellation = @import("antfly_cancellation").CancellationToken;
 const document_facts = @import("document_facts.zig");
 const page_tree = @import("../graph_segment/page_tree.zig");
 
@@ -308,7 +308,7 @@ const CountingStore = struct {
     fn selfFrom(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
     fn put(ptr: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8) !store_mod.ArtifactMetadata {
         return putUntil(ptr, alloc, bytes, .none);
     }

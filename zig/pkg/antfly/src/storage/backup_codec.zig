@@ -24,6 +24,9 @@ pub const magic = [8]u8{ 'A', 'N', 'T', 'F', 'L', 'Y', 'B', '\n' };
 /// AFB1 remains readable. AFB2 is the common transport envelope for portable
 /// logical streams and native physical generations, including self-describing
 /// relational-row document entries.
+/// Descriptor used by logical snapshots and replication seed transports.
+pub const logical_snapshot_manifest_file_name = "SNAPSHOT.json";
+
 pub const legacy_format_version: u32 = 1;
 pub const format_version: u32 = 2;
 
@@ -58,6 +61,17 @@ pub const BlockType = enum(u8) {
     metadata_batch = 0x18,
     artifact_batch = 0x19,
     resolution_batch = 0x1A,
+    /// Authenticated online source-copy only; ordinary restores rebuild their
+    /// own claims and must reject this owner-bound shadow integrity stream.
+    integrity_batch = 0x1B,
+    /// Certified online source-copy only. Preserves physical artifact
+    /// ownership and incarnation state; never accepted by ordinary restore.
+    source_artifact_batch = 0x1C,
+    /// Certified source-copy only. Inert producer proofs and a bitmap of
+    /// source-cut output owners; receivers must issue their own adoption.
+    source_proof_batch = 0x1D,
+    /// Exact versioned relationship artifact keys and portable edge values.
+    graph_relationship_batch = 0x1E,
     blob_header = 0x20,
     blob_chunk = 0x21,
     footer_index = 0x22,
@@ -166,7 +180,7 @@ pub fn writeHeader(buf: *ArrayList(u8), alloc: Allocator, h: FileHeader) !void {
 pub fn writeBlock(buf: *ArrayList(u8), alloc: Allocator, block_type: BlockType, payload: []const u8) !void {
     if (payload.len > max_block_payload_bytes) return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
-    env_header[0] = @intFromEnum(block_type);
+    env_header[0] = @backingInt(block_type);
     env_header[1] = 0; // no compression
     std.mem.writeInt(u32, env_header[2..6], @intCast(payload.len), .little);
 
@@ -210,7 +224,7 @@ pub fn writeBlockPartsTo(writer: *std.Io.Writer, block_type: BlockType, parts: [
     if (payload_len > max_block_payload_bytes or payload_len > std.math.maxInt(u32))
         return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
-    env_header[0] = @intFromEnum(block_type);
+    env_header[0] = @backingInt(block_type);
     env_header[1] = 0;
     std.mem.writeInt(u32, env_header[2..6], @intCast(payload_len), .little);
     var crc = Crc32.init();
@@ -275,7 +289,7 @@ pub const SliceReader = struct {
 
     pub fn readBlock(self: *SliceReader, alloc: Allocator) !Block {
         const env = try self.readExact(6);
-        const block_type: BlockType = @enumFromInt(env[0]);
+        const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
@@ -397,7 +411,7 @@ pub const FileReader = struct {
     pub fn readBlock(self: *FileReader, alloc: Allocator) !Block {
         var env: [6]u8 = undefined;
         try self.readExact(&env);
-        const block_type: BlockType = @enumFromInt(env[0]);
+        const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
@@ -428,8 +442,11 @@ pub const FileReader = struct {
 pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
     const Reader = std.Io.Reader;
     var input = Reader.fixed(compressed);
-    var window_buf: [std.compress.zstd.default_window_len + std.compress.zstd.block_size_max]u8 = undefined;
-    var decomp = std.compress.zstd.Decompress.init(&input, &window_buf, .{});
+    // The window is about 8 MiB, so keep it off the stack: embedded callers
+    // run libantfly on threads whose stacks are only a few MiB.
+    const window_buf = try alloc.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max);
+    defer alloc.free(window_buf);
+    var decomp = std.compress.zstd.Decompress.init(&input, window_buf, .{});
     return decomp.reader.allocRemaining(alloc, .limited(max_block_payload_bytes));
 }
 
@@ -515,6 +532,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
     if (data.len < 4) return error.BatchTooShort;
 
     const count = std.mem.readInt(u32, data[0..4], .little);
+    if (count > (data.len - 4) / 8) return error.Truncated;
     var off: usize = 4;
 
     var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, count);
@@ -534,6 +552,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
 
         if (off + key_len > data.len) return error.Truncated;
         const key = try alloc.dupe(u8, data[off..][0..key_len]);
+        errdefer alloc.free(key);
         off += key_len;
 
         if (off + 4 > data.len) return error.Truncated;
@@ -542,6 +561,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
 
         if (off + value_len > data.len) return error.Truncated;
         const value = try alloc.dupe(u8, data[off..][0..value_len]);
+        errdefer alloc.free(value);
         off += value_len;
 
         try entries.append(alloc, .{
@@ -550,6 +570,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
         });
     }
 
+    if (off != data.len) return error.TrailingBytes;
     return entries.toOwnedSlice(alloc);
 }
 
@@ -1007,7 +1028,7 @@ test "header CRC validation" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -1028,7 +1049,7 @@ test "block round-trip uncompressed" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -1055,7 +1076,7 @@ test "block CRC validation" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -1122,7 +1143,7 @@ test "document batch round-trip" {
     try std.testing.expectError(error.TrailingData, documentBatchEntryCount(with_trailing));
     try std.testing.expectError(error.TrailingData, decodeDocumentBatchBorrowed(alloc, with_trailing));
 
-    var impossible_count = [_]u8{0} ** 4;
+    var impossible_count = @as([4]u8, @splat(0));
     std.mem.writeInt(u32, &impossible_count, std.math.maxInt(u32), .little);
     try std.testing.expectError(error.Truncated, decodeDocumentBatchBorrowed(alloc, &impossible_count));
 
@@ -1529,4 +1550,22 @@ fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
         .index_name = index_name,
         .entries = try entries.toOwnedSlice(alloc),
     };
+}
+
+test "relationship key value decoding releases truncated and failed allocations" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeKeyValueBatch(alloc, &.{.{ .key = "owner-scoped-key", .value = "relationship-value" }});
+    defer alloc.free(payload);
+    for (4..payload.len) |end| try std.testing.expectError(error.Truncated, decodeKeyValueBatch(alloc, payload[0..end]));
+    const Case = struct {
+        fn decode(a: Allocator, bytes: []const u8) !void {
+            const entries = try decodeKeyValueBatch(a, bytes);
+            defer a.free(entries);
+            defer for (entries) |entry| {
+                a.free(entry.key);
+                a.free(entry.value);
+            };
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.decode, .{payload});
 }

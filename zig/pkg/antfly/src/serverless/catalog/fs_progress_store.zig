@@ -15,10 +15,10 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const work_lease = @import("../build/work_lease.zig");
 const head_coordination = @import("../head_coordination.zig");
 
@@ -827,7 +827,7 @@ pub const FsProgressStore = struct {
 
     fn erasedGetEnrichmentStageHeadVersion(ptr: *anyopaque, namespace: []const u8, stage_id: u8) !?u64 {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.getEnrichmentStageHeadVersion(namespace, @enumFromInt(stage_id));
+        return try self.getEnrichmentStageHeadVersion(namespace, @fromBackingInt(stage_id));
     }
 
     fn erasedCompareAndSwapEnrichmentStageHeadVersion(
@@ -838,12 +838,12 @@ pub const FsProgressStore = struct {
         head_version: u64,
     ) !bool {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.compareAndSwapEnrichmentStageHeadVersion(namespace, @enumFromInt(stage_id), expected, head_version);
+        return try self.compareAndSwapEnrichmentStageHeadVersion(namespace, @fromBackingInt(stage_id), expected, head_version);
     }
 
     fn erasedGetEnrichmentStageDocOffset(ptr: *anyopaque, namespace: []const u8, stage_id: u8) !?u64 {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.getEnrichmentStageDocOffset(namespace, @enumFromInt(stage_id));
+        return try self.getEnrichmentStageDocOffset(namespace, @fromBackingInt(stage_id));
     }
 
     fn erasedCompareAndSwapEnrichmentStageDocOffset(
@@ -854,7 +854,7 @@ pub const FsProgressStore = struct {
         doc_offset: u64,
     ) !bool {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.compareAndSwapEnrichmentStageDocOffset(namespace, @enumFromInt(stage_id), expected, doc_offset);
+        return try self.compareAndSwapEnrichmentStageDocOffset(namespace, @fromBackingInt(stage_id), expected, doc_offset);
     }
 
     fn erasedGetEnrichmentStageHeadDocOffset(
@@ -864,7 +864,7 @@ pub const FsProgressStore = struct {
         head_version: u64,
     ) !?u64 {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.getEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
+        return try self.getEnrichmentStageHeadDocOffset(namespace, @fromBackingInt(stage_id), head_version);
     }
 
     fn erasedCompareAndSwapEnrichmentStageHeadDocOffset(
@@ -878,7 +878,7 @@ pub const FsProgressStore = struct {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapEnrichmentStageHeadDocOffset(
             namespace,
-            @enumFromInt(stage_id),
+            @fromBackingInt(stage_id),
             head_version,
             expected,
             doc_offset,
@@ -892,7 +892,7 @@ pub const FsProgressStore = struct {
         head_version: u64,
     ) !void {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.deleteEnrichmentStageHeadDocOffset(namespace, @enumFromInt(stage_id), head_version);
+        return try self.deleteEnrichmentStageHeadDocOffset(namespace, @fromBackingInt(stage_id), head_version);
     }
 
     fn erasedGetEnrichmentStageProgress(
@@ -901,7 +901,7 @@ pub const FsProgressStore = struct {
         stage_id: u8,
     ) !?progress_store.EnrichmentStageProgress {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
-        return try self.getEnrichmentStageProgress(namespace, @enumFromInt(stage_id));
+        return try self.getEnrichmentStageProgress(namespace, @fromBackingInt(stage_id));
     }
 
     fn erasedCompareAndSwapEnrichmentStageProgress(
@@ -914,7 +914,7 @@ pub const FsProgressStore = struct {
         const self: *FsProgressStore = @ptrCast(@alignCast(ptr));
         return try self.compareAndSwapEnrichmentStageProgress(
             namespace,
-            @enumFromInt(stage_id),
+            @fromBackingInt(stage_id),
             expected,
             desired,
         );

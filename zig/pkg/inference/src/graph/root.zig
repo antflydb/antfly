@@ -150,6 +150,7 @@ test {
     _ = multi_executor;
     _ = native_partition_executor;
     _ = metal_partition_executor;
+    _ = @import("metal_capabilities.zig");
     _ = webgpu_partition_executor;
     _ = compiled_backend;
     _ = compiled_registry;

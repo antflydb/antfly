@@ -6,6 +6,38 @@ info:
 
 components:
   schemas:
+    DeciderConfig:
+      type: object
+      additionalProperties: false
+      required: [provider]
+      properties:
+        provider:
+          type: string
+          enum: [antfly, jev]
+        model:
+          type: string
+          description: Required for Antfly; Jev defaults to jev-latest.
+        url:
+          type: string
+          description: Provider base URL; endpoint path is selected by provider.
+        api_key:
+          type: string
+          description: API key or secret reference. Defaults to the provider environment variable.
+        max_rows:
+          type: integer
+          minimum: 1
+          default: 10000
+        max_input_tokens:
+          type: integer
+          minimum: 1
+          default: 1000000
+        rate_limit:
+          $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
+        batch_size:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 32
     SecretsConfig:
       type: object
       additionalProperties: false
@@ -29,20 +61,63 @@ components:
     NativeSecretStoreConfig:
       type: object
       additionalProperties: false
-      required: [path]
       description: |
-        Antfly-managed override store. Currently file-backed and node-local;
-        this setting does not replicate secrets between nodes. Without native,
-        secret API writes are disabled.
+        Antfly-managed override store. File preserves the legacy JSON store.
+        Distributed stores encrypted records in metadata Raft; serverless uses
+        conditional object-store publication. Data nodes use a distributed reader.
+        Bootstrap wrapping and delivery credentials cannot reference this store.
       properties:
         name:
           type: string
           default: native
           description: Unique source name; environment is reserved.
+        backend:
+          type: string
+          enum: [file, distributed, serverless]
+          default: file
         path:
           type: string
-          minLength: 1
-          description: Literal file path, relative to the process working directory if not absolute.
+          description: Required file path for file, or dedicated s3/gs/file URI for serverless. Unused by distributed.
+        scope:
+          type: string
+          default: default
+          description: Trusted deployment or tenant scope; not supplied by API callers.
+        keyring_path:
+          type: string
+          description: Mounted bootstrap wrapping-key JSON file. Required for encrypted writers; omitted on data nodes.
+        grants:
+          type: array
+          description: Metadata-only read grants. Every consumer must have a distinct mounted credential.
+          items:
+            type: object
+            additionalProperties: false
+            required: [name, credential_path, keys]
+            properties:
+              name:
+                type: string
+              credential_path:
+                type: string
+                description: Mounted file containing a random 32-byte credential in hexadecimal.
+              keys:
+                type: array
+                items:
+                  type: string
+                description: Exact secret names this consumer may resolve. No implicit wildcard.
+        reader:
+          type: object
+          additionalProperties: false
+          required: [name, credential_path, urls]
+          description: Distributed data-node reader; mutually exclusive with keyring_path and grants.
+          properties:
+            name:
+              type: string
+            credential_path:
+              type: string
+            urls:
+              type: array
+              items:
+                type: string
+              description: Metadata admin endpoints. Requests also require internal service authentication.
     SecretSourceConfig:
       type: object
       additionalProperties: false
@@ -59,6 +134,30 @@ components:
           type: string
           minLength: 1
           description: Literal path to an externally managed secret file. Never written by the API.
+    PgwireConfig:
+      type: object
+      description: Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+      properties:
+        enabled:
+          type: boolean
+          default: false
+        bind_host:
+          type: string
+          default: "127.0.0.1"
+        bind_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 5432
+        max_connections:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 32
+        externally_protected_transport:
+          type: boolean
+          default: false
+          description: Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     Config:
       type: object
       properties:
@@ -83,6 +182,8 @@ components:
           $ref: "#/components/schemas/GraphExecutionConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
+        pgwire:
+          $ref: "#/components/schemas/PgwireConfig"
         backup:
           $ref: "#/components/schemas/BackupConfig"
         secrets:
@@ -357,6 +458,11 @@ components:
               - generator_config:
                   provider: openai
                   model: gpt-4.1
+        deciders:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/DeciderConfig"
+          description: Named decision providers for ai_decide and convenience functions.
         rerankers:
           type: object
           additionalProperties:

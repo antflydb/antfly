@@ -58,7 +58,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                     .id = addId(spec),
                     .name = "storage.db_split.add_doc",
                     .kind = .workload,
-                    .parameter = @intFromEnum(spec),
+                    .parameter = @backingInt(spec),
                 });
             }
             try list.append(allocator, .{ .id = reopen_source_id, .name = "storage.db_split.reopen_source", .kind = .maintenance });
@@ -94,7 +94,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                 try events.emitNamed(allocator, .state_change, "storage.db_split.full_split_complete", world.decisions);
                 return vopr.outcome.TransitionOutcome.applied();
             }
-            const spec: fixture.DocSpec = @enumFromInt(@as(u2, @intCast(selected.parameter)));
+            const spec: fixture.DocSpec = @fromBackingInt(@as(u2, @intCast(selected.parameter)));
             if (selected.id != addId(spec)) return error.UnknownDbSplitVoprTransition;
             try world.harness.apply(.{ .add_doc = spec });
             try events.emitNamed(allocator, .client_response, "storage.db_split.document_acknowledged", @intCast(selected.parameter));
@@ -149,7 +149,7 @@ pub fn replay(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !
 }
 
 fn addId(spec: fixture.DocSpec) u64 {
-    return vopr.id.derive("storage.db_split.doc", add_base, @intFromEnum(spec));
+    return vopr.id.derive("storage.db_split.doc", add_base, @backingInt(spec));
 }
 
 fn runRecordReplay(seed: u64) !void {

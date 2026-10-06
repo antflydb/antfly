@@ -17,7 +17,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const common = @import("http_common.zig");
 const PeerObserver = @import("peer_disconnect_observer.zig").Observer;
-const threaded_io_limits = @import("../threaded_io_limits.zig");
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 pub const default_max_request_bytes: usize = 32 * 1024 * 1024;
 pub const default_request_stack_size: usize = 8 * 1024 * 1024;
@@ -82,6 +82,15 @@ fn isRequestCancellation(err: anyerror) bool {
     return err == error.Cancelled or err == error.Canceled;
 }
 
+fn isRequestPeerDisconnect(err: anyerror, stream_err: ?anyerror) bool {
+    // std.http writes through an Io.Writer, which erases socket failures as
+    // WriteFailed. Only treat that error as a disconnect when the underlying
+    // stream writer proves the peer closed; allocation and other write errors
+    // must still reach the handler-error log.
+    const cause = if (err == error.WriteFailed) stream_err orelse return false else err;
+    return cause == error.ConnectionResetByPeer or cause == error.SocketUnconnected;
+}
+
 pub const StdHttpListenerConfig = struct {
     /// Dedicated capabilities borrowed until stop; neither may share request capacity.
     accept_io: ?std.Io = null,
@@ -135,7 +144,7 @@ pub const StdHttpListener = struct {
         listener: *StdHttpListener,
         stream: std.Io.net.Stream,
 
-        fn deinit(self: *ConnectionTask) void {
+        pub fn deinit(self: *ConnectionTask) void {
             const listener = self.listener;
             listener.unregisterActiveStream(&self.stream);
             self.stream.close(listener.io_impl.io());
@@ -162,12 +171,12 @@ pub const StdHttpListener = struct {
     peak_connection_threads: std.atomic.Value(u32) = .init(0),
     active_requests: std.atomic.Value(u32) = .init(0),
     peak_active_requests: std.atomic.Value(u32) = .init(0),
-    rejected_requests_total: std.atomic.Value(u64) = .init(0),
-    accept_errors_total: std.atomic.Value(u64) = .init(0),
-    cancellation_watcher_start_failures_total: std.atomic.Value(u64) = .init(0),
-    deadline_observer_failures_total: std.atomic.Value(u64) = .init(0),
-    deadline_expirations_total: std.atomic.Value(u64) = .init(0),
-    peer_disconnects_total: std.atomic.Value(u64) = .init(0),
+    rejected_requests_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    accept_errors_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    cancellation_watcher_start_failures_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    deadline_observer_failures_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    deadline_expirations_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    peer_disconnects_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     peer_observer: ?PeerObserver = null,
     active_streams_lock: std.atomic.Mutex = .unlocked,
     active_streams: std.ArrayListUnmanaged(*const std.Io.net.Stream) = .empty,
@@ -595,7 +604,7 @@ pub const StdHttpListener = struct {
             // the peer has gone away or the owning I/O task is being torn
             // down. Do not turn disconnect storms into error-log storms or
             // spend work attempting a 500 on a connection that cannot use it.
-            if (isRequestCancellation(err)) return;
+            if (isRequestCancellation(err) or isRequestPeerDisconnect(err, stream_writer.err)) return;
             if (self.stopping.load(.acquire)) {
                 std.log.warn("http request canceled during listener stop method={s} target={s} err={s}", .{
                     request_method,
@@ -787,7 +796,7 @@ pub const StdHttpListener = struct {
             // retryable response instead of leaving expensive work running
             // until their own timeout while the listener runs out of FDs.
             try request.respond("service overloaded; retry later", .{
-                .status = @enumFromInt(429),
+                .status = @fromBackingInt(@intCast(429)),
                 .keep_alive = false,
                 .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
             });
@@ -814,7 +823,7 @@ pub const StdHttpListener = struct {
                     _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
                     if (consumes_expensive_slot) {
                         try request.respond("query cancellation capacity unavailable", .{
-                            .status = @enumFromInt(503),
+                            .status = @fromBackingInt(@intCast(503)),
                             .keep_alive = false,
                             .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
                         });
@@ -827,7 +836,7 @@ pub const StdHttpListener = struct {
                 _ = self.cancellation_watcher_start_failures_total.fetchAdd(1, .monotonic);
                 if (consumes_expensive_slot) {
                     try request.respond("query cancellation capacity unavailable", .{
-                        .status = @enumFromInt(503),
+                        .status = @fromBackingInt(@intCast(503)),
                         .keep_alive = false,
                         .extra_headers = &.{.{ .name = "retry-after", .value = "1" }},
                     });
@@ -893,7 +902,7 @@ pub const StdHttpListener = struct {
         }
 
         try request.respond(response.body, .{
-            .status = @enumFromInt(response.status),
+            .status = @fromBackingInt(@intCast(response.status)),
             .keep_alive = false,
             .extra_headers = extra_headers,
         });
@@ -915,7 +924,7 @@ pub const StdHttpListener = struct {
             };
         }
 
-        fn startResponse(ptr: *anyopaque, alloc: std.mem.Allocator, response: common.StreamingResponse) !void {
+        pub fn startResponse(ptr: *anyopaque, alloc: std.mem.Allocator, response: common.StreamingResponse) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.body_writer != null) return error.ResponseAlreadyStarted;
 
@@ -938,7 +947,7 @@ pub const StdHttpListener = struct {
 
             self.body_writer = try self.request.respondStreaming(self.buffer, .{
                 .respond_options = .{
-                    .status = @enumFromInt(response.status),
+                    .status = @fromBackingInt(@intCast(response.status)),
                     .keep_alive = false,
                     .extra_headers = extra_headers,
                 },
@@ -1164,6 +1173,12 @@ test "std http listener classifies request cancellation as expected termination"
     try std.testing.expect(isRequestCancellation(error.Canceled));
     try std.testing.expect(!isRequestCancellation(error.Timeout));
     try std.testing.expect(!isRequestCancellation(error.Unexpected));
+    try std.testing.expect(isRequestPeerDisconnect(error.WriteFailed, error.ConnectionResetByPeer));
+    try std.testing.expect(isRequestPeerDisconnect(error.WriteFailed, error.SocketUnconnected));
+    try std.testing.expect(isRequestPeerDisconnect(error.ConnectionResetByPeer, null));
+    try std.testing.expect(!isRequestPeerDisconnect(error.WriteFailed, null));
+    try std.testing.expect(!isRequestPeerDisconnect(error.WriteFailed, error.SystemResources));
+    try std.testing.expect(!isRequestPeerDisconnect(error.Unexpected, error.ConnectionResetByPeer));
 }
 
 test "std http listener and executor round-trip raft batch route" {
@@ -1972,7 +1987,7 @@ test "std http listener recovers after 128 real clients abandon saturated querie
 
     const bound_addr = listener.boundAddress() orelse return error.TestUnexpectedResult;
     const client_io = std.Io.Threaded.global_single_threaded.io();
-    var clients = [_]?std.Io.net.Stream{null} ** 128;
+    var clients = @as([128]?std.Io.net.Stream, @splat(null));
     defer for (&clients) |*slot| {
         if (slot.*) |*client| client.close(client_io);
         slot.* = null;
@@ -2637,7 +2652,7 @@ test "std http listener retains a bounded worker plateau and recovers descriptor
     var warmed_thread_ceiling: ?usize = null;
 
     for (0..rounds) |_| {
-        var clients = [_]?std.Io.net.Stream{null} ** batch_size;
+        var clients = @as([batch_size]?std.Io.net.Stream, @splat(null));
         defer for (&clients) |*maybe_stream| {
             if (maybe_stream.*) |*stream| stream.close(client_io);
         };

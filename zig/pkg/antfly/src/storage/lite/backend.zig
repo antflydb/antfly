@@ -40,6 +40,7 @@ pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
 pub const StableSnapshotReport = native.StableSnapshotReport;
 pub const VacuumReport = native.VacuumReport;
+pub const ReclamationOptions = docstore.reclamation.Options;
 
 pub const Profile = capabilities.Profile;
 pub const supported_inference_modes = capabilities.supported_inference_modes;
@@ -68,6 +69,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
     read_only: bool = false,
     no_sync: bool = false,
@@ -78,6 +80,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    reclamation: docstore.reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
@@ -90,6 +93,7 @@ pub fn isAflitePath(path: []const u8) bool {
 }
 
 pub const StorageStatus = struct {
+    reclamation: ?docstore.reclamation.Status = null,
     format: []const u8 = "aflite",
     engine: []const u8,
     primary_layout: []const u8,
@@ -140,7 +144,7 @@ pub const Handle = struct {
         index_base_path: []u8,
         runtime_store: *backend_erased.Store,
 
-        fn deinit(self: *NamespaceRuntime, allocator: Allocator) void {
+        pub fn deinit(self: *NamespaceRuntime, allocator: Allocator) void {
             self.runtime_store.deinit();
             allocator.destroy(self.runtime_store);
             allocator.free(self.index_base_path);
@@ -198,6 +202,7 @@ pub const Handle = struct {
     pub fn openOrCreate(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
         return open(allocator, path, opts) catch |err| switch (err) {
             error.FileNotFound => createWithOptions(allocator, path, .{
+                .reclamation = opts.reclamation,
                 .exclusive = true,
                 .no_sync = opts.no_sync,
                 .resource_manager = opts.resource_manager,
@@ -213,10 +218,14 @@ pub const Handle = struct {
     pub fn deinit(self: *Handle) void {
         switch (self.engine) {
             .bridge_lsm_container => {
-                if (self.bridge_storage) |storage| {
-                    storage.deinit();
-                    self.allocator.destroy(storage);
-                    self.bridge_storage = null;
+                if (comptime builtin.os.tag == .freestanding) {
+                    unreachable;
+                } else {
+                    if (self.bridge_storage) |storage| {
+                        storage.deinit();
+                        self.allocator.destroy(storage);
+                        self.bridge_storage = null;
+                    }
                 }
             },
             .native_single_file => {
@@ -376,7 +385,7 @@ pub const Handle = struct {
         );
         defer self.allocator.free(key);
 
-        if (try store.file.getCatalogRecordAlloc(self.allocator, key)) |raw| {
+        if (try store.getCatalogRecordAlloc(self.allocator, key)) |raw| {
             defer self.allocator.free(raw);
             if (raw.len != @sizeOf(u128)) return error.InvalidLiteRootIncarnation;
             const incarnation = std.mem.readInt(u128, raw[0..@sizeOf(u128)], .little);
@@ -394,7 +403,7 @@ pub const Handle = struct {
         if (incarnation == 0) incarnation = 1;
         var encoded: [@sizeOf(u128)]u8 = undefined;
         std.mem.writeInt(u128, &encoded, incarnation, .little);
-        try store.file.putCatalogRecord(key, &encoded);
+        try store.putCatalogRecord(key, &encoded);
         return incarnation;
     }
 
@@ -418,7 +427,7 @@ pub const Handle = struct {
         if (self.namespace_runtimes.get(canonical)) |runtime| {
             if (runtime.key_prefix.len != 0) return error.LiteNamespaceAlreadyOpened;
         }
-        try self.native_docstore.?.file.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
+        try self.native_docstore.?.putCatalogRecord(root_namespace_alias_catalog_key, canonical);
         self.root_namespace_alias = canonical;
     }
 
@@ -430,7 +439,7 @@ pub const Handle = struct {
     pub fn markEmbeddedArtifact(self: *Handle) !void {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isEmbeddedArtifact()) return;
-        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
+        try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, embedded_artifact_profile);
     }
 
     pub fn isEmbeddedArtifact(self: *const Handle) !bool {
@@ -440,7 +449,7 @@ pub const Handle = struct {
     pub fn markStandaloneArtifact(self: *Handle) !void {
         if (self.engine != .native_single_file) return error.InvalidArgument;
         if (try self.isStandaloneArtifact()) return;
-        try self.native_docstore.?.file.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
+        try self.native_docstore.?.putCatalogRecord(artifact_profile_catalog_key, standalone_artifact_profile);
     }
 
     pub fn isStandaloneArtifact(self: *const Handle) !bool {
@@ -449,7 +458,7 @@ pub const Handle = struct {
 
     fn artifactHasProfile(self: *const Handle, expected: []const u8) !bool {
         if (self.engine != .native_single_file) return false;
-        const value = (try self.native_docstore.?.file.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
+        const value = (try self.native_docstore.?.getCatalogRecordAlloc(self.allocator, artifact_profile_catalog_key)) orelse return false;
         defer self.allocator.free(value);
         return std.mem.eql(u8, value, expected);
     }
@@ -484,17 +493,20 @@ pub const Handle = struct {
     }
 
     pub fn storageStatus(self: *Handle) StorageStatus {
+        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
+        defer if (self.native_docstore) |store| store.mutex.unlock();
         return switch (self.engine) {
             .native_single_file => blk: {
                 const file = &self.native_docstore.?.file;
                 const checkpoint = file.activeCheckpoint();
                 break :blk .{
+                    .reclamation = self.native_docstore.?.reclamationStatusAssumeLocked() catch null,
                     .engine = @tagName(self.engine),
                     .primary_layout = "native_document_pages",
                     .replay_layout = "native_replay_lanes_in_document_catalog",
                     .index_layout = native_index_layout,
                     .index_namespace = native_index_base_path,
-                    .format_version = native.format_version,
+                    .format_version = if (file.header.indexed_reclamation) 4 else native.format_version,
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
                     .checkpoint_sequence = checkpoint.commit_sequence,
@@ -556,8 +568,6 @@ pub const Handle = struct {
 
     fn maintenanceStatus(ptr: *anyopaque) maintenance.Status {
         const self: *Handle = @ptrCast(@alignCast(ptr));
-        if (self.native_docstore) |store| platform_sync.lockYielding(&store.mutex);
-        defer if (self.native_docstore) |store| store.mutex.unlock();
         const status = self.storageStatus();
         return .{
             .engine = "lite",
@@ -667,6 +677,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+        .reclamation = opts.reclamation,
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
@@ -689,6 +700,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
     };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+        .reclamation = opts.reclamation,
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,
         .resource_manager = resource_manager,
@@ -738,6 +750,9 @@ fn initNativeSingleFile(
     if (root_namespace_alias) |alias| {
         if (!isStableGroupNamespace(alias)) return error.InvalidLiteRootNamespaceAlias;
     }
+    // Construction returns/moves a value. Only this heap owner has a stable
+    // address that a maintenance task may retain, including on idle reopen.
+    store.startMaintenance();
     return .{
         .allocator = allocator,
         .engine = .native_single_file,
@@ -831,6 +846,33 @@ fn hasMode(modes: []const []const u8, expected: []const u8) bool {
     return false;
 }
 
+test "lite reclamation backend reopen activates idle retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reopen-retirement.aflite");
+    defer a.free(path);
+    {
+        var handle = try Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer handle.deinit();
+        const owner = handle.native_docstore.?;
+        owner.maintenance_cancel.request();
+        try owner.putCatalogRecord("meta", "old");
+        try owner.putCatalogRecord("meta", "new");
+    }
+    var handle = try Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    const owner = handle.native_docstore.?;
+    try std.testing.expect(owner.maintenance_future != null);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    // No mutations, transactions, or explicit maintainOnce calls after open.
+    while ((try owner.reclamationStatus()).pending_data_retirement_objects != 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect((try owner.checkWithCancel(null)).valid);
+}
+
 test "lite backend capabilities distinguish native and hosted profiles" {
     const native_caps = capabilitiesForProfile(.native);
     const local_runtime_available = native_caps.local_inference_runtime;
@@ -885,6 +927,7 @@ test "lite backend capabilities distinguish native and hosted profiles" {
 test "lite backend capabilities contract is stable" {
     const expected_fields = [_][]const u8{
         "freestanding_build",
+        "threading",
         "hosted_profile",
         "manual_maintenance",
         "background_enrichment_runtime",
@@ -920,10 +963,10 @@ test "lite backend capabilities contract is stable" {
         "object_storage_primary",
     };
 
-    const fields = @typeInfo(Capabilities).@"struct".fields;
-    try std.testing.expectEqual(expected_fields.len, fields.len);
-    inline for (fields, 0..) |field, i| {
-        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    const field_names = @typeInfo(Capabilities).@"struct".field_names;
+    try std.testing.expectEqual(expected_fields.len, field_names.len);
+    inline for (field_names, 0..) |reflected_name, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], reflected_name);
     }
 
     const allocator = std.testing.allocator;
@@ -939,7 +982,7 @@ test "lite backend capabilities contract is stable" {
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]";
     const supported_modes_json = "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]";
     const native_local_runtime_available = capabilitiesForProfile(.native).local_inference_runtime;
-    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         !freestanding,
@@ -964,7 +1007,7 @@ test "lite backend capabilities contract is stable" {
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"manual_maintenance\",\"disabled_deferred\"]";
     const hosted_local_runtime_available = capabilitiesForProfile(.hosted).local_inference_runtime;
-    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"threading\":\"serialized\",\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         freestanding,
@@ -987,12 +1030,20 @@ test "lite backend inference status reports disabled as clean state" {
         "local_runtime_available",
         "caller_supplied_artifacts",
         "no_inference_configured_ok",
+        "host_budget_mb",
+        "backend_budget_mb",
+        "combined_budget_mb",
+        "kv_budget_mb",
+        "scratch_budget_mb",
+        "process_memory_budget_mb",
+        "process_memory_limit_bytes",
+        "process_memory_limit_source",
     };
 
-    const fields = @typeInfo(InferenceStatus).@"struct".fields;
-    try std.testing.expectEqual(expected_fields.len, fields.len);
-    inline for (fields, 0..) |field, i| {
-        try std.testing.expectEqualStrings(expected_fields[i], field.name);
+    const field_names = @typeInfo(InferenceStatus).@"struct".field_names;
+    try std.testing.expectEqual(expected_fields.len, field_names.len);
+    inline for (field_names, 0..) |reflected_name, i| {
+        try std.testing.expectEqualStrings(expected_fields[i], reflected_name);
     }
 
     const status = inferenceStatusForProfile(.native);
@@ -1053,6 +1104,8 @@ test "lite backend native engine creates and checks aflite file" {
     var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
+    // Keep this format/maintenance test deterministic while using NativeFile directly.
+    handle.native_docstore.?.maintenance_cancel.request();
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
     try std.testing.expect(handle.maintenanceSource().status().maintenance.online);
     var cancel = maintenance.CancelToken{};
@@ -1089,8 +1142,10 @@ test "lite backend native engine creates and checks aflite file" {
     const configured_report = try handle.check();
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(configured_report.file_size, vacuumed.before_size);
-    try std.testing.expectEqual(configured_report.compact_size, vacuumed.after_size);
-    try std.testing.expectEqual(vacuumed.before_size - vacuumed.after_size, vacuumed.reclaimed_bytes);
+    // Publishing the replacement adds allocator metadata beyond the image estimate.
+    try std.testing.expectEqual((try handle.native_docstore.?.file.file.stat(std.testing.io)).size, vacuumed.after_size);
+    try std.testing.expect(vacuumed.after_size >= configured_report.compact_size);
+    try std.testing.expectEqual(vacuumed.before_size -| vacuumed.after_size, vacuumed.reclaimed_bytes);
 }
 
 test "lite backend propagates no_sync to native engine" {
@@ -1155,7 +1210,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
-    try std.testing.expectEqual(native.format_version, status.format_version.?);
+    try std.testing.expectEqual(@as(u32, 4), status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
     try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);
@@ -1315,7 +1370,7 @@ test "lite backend auto rejects invalid native headers without fallback" {
     defer allocator.free(unsupported_version_path);
 
     {
-        var encoded: [native.header_size]u8 = .{0} ** native.header_size;
+        var encoded: [native.header_size]u8 = @splat(0);
         @memcpy(encoded[0.."AFLITE0X".len], "AFLITE0X");
         var file = try std.Io.Dir.cwd().createFile(std.testing.io, invalid_magic_path, .{});
         defer file.close(std.testing.io);
@@ -1630,7 +1685,13 @@ test "lite backend recovers vector crash orphans only on writer reopen" {
             try storage.writeFileAbsolute(orphan, "orphan");
             try storage.writeFileAbsolute(root ++ "/unmanaged", "keep");
             try storage.writeFileAbsolute(unrelated, "keep");
-            sequence = handle.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        }
+        // Closing joins maintenance; measure the checkpoint after its final
+        // retirement publication so the read-only reopen is the only activity.
+        {
+            var snapshot = try @import("native.zig").NativeFile.open(alloc, fixture.path(), true);
+            defer snapshot.close();
+            sequence = snapshot.activeCheckpoint().commit_sequence;
         }
         for ([_]db_mod.OpenOptions.OpenMode{ .query_readonly, .writer }) |mode| {
             var db = try Connection.open(alloc, fixture.path(), mode);

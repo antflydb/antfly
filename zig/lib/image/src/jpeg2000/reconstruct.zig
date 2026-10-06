@@ -254,7 +254,7 @@ test "irreversible sample rounding validates SIMD and scalar boundaries" {
     try std.testing.expectEqual(@as(i32, -2), converted[2]);
     try std.testing.expectEqual(@as(i32, 2), converted[3]);
 
-    var invalid_simd = [_]f32{0.0} ** simd_lanes_f32_i32;
+    var invalid_simd = @as([simd_lanes_f32_i32]f32, @splat(0.0));
     invalid_simd[simd_lanes_f32_i32 - 1] = 2147483648.0;
     var simd_output: [simd_lanes_f32_i32]i32 = undefined;
     try std.testing.expectError(

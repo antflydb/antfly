@@ -168,13 +168,13 @@ pub const PrefillChunkPlan = struct {
         hashU64(&hash, self.prompt_tokens);
         hashU64(&hash, self.max_chunk_rows);
         hashU64(&hash, self.max_scratch_bytes);
-        hashU64(&hash, @intFromEnum(self.fairness));
-        hashU64(&hash, @intFromEnum(self.selection));
+        hashU64(&hash, @backingInt(self.fairness));
+        hashU64(&hash, @backingInt(self.selection));
         hashU64(&hash, self.forced_drain_budget_bytes);
         hashU64(&hash, self.chunks.len);
         for (self.chunks) |chunk| {
             hashU64(&hash, chunk.rows);
-            hashU64(&hash, @intFromEnum(chunk.weight_route_hint));
+            hashU64(&hash, @backingInt(chunk.weight_route_hint));
         }
         return hash;
     }
@@ -2427,7 +2427,7 @@ test "scheduler drains a multi-lease workload without leaking pending work" {
     var step = std.ArrayListUnmanaged(StepItem).empty;
     defer step.deinit(allocator);
 
-    var seen = [_]bool{false} ** total_items;
+    var seen = @as([total_items]bool, @splat(false));
     var steps_taken: usize = 0;
     const safety_iter_cap: usize = total_items * 8;
     var safety_iter: usize = 0;

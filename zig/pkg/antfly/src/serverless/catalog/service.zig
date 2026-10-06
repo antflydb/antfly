@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
@@ -248,6 +248,7 @@ pub const CatalogService = struct {
         read_schema_json: []const u8,
         indexes_json: []const u8,
     ) !bool {
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, schema_json, read_schema_json, indexes_json);
         const namespace = try self.defaultServingNamespaceAlloc(table_name);
         defer self.alloc.free(namespace);
         return try self.store.ensureTable(
@@ -295,12 +296,14 @@ pub const CatalogService = struct {
     pub fn ensureTableWritesAllowed(self: *CatalogService, table_name: []const u8) !void {
         var table = (try self.getTableAlloc(self.alloc, table_name)) orelse return error.NamespaceNotFound;
         defer table.deinit(self.alloc);
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, table.schema_json, table.read_schema_json, table.indexes_json);
         try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
     }
 
     pub fn ensureNamespaceWritesAllowed(self: *CatalogService, namespace: []const u8) !void {
         var table = (try self.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return;
         defer table.deinit(self.alloc);
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, table.schema_json, table.read_schema_json, table.indexes_json);
         try ensureSchemaWritesAllowedAlloc(self.alloc, table.schema_json);
     }
 
@@ -311,6 +314,7 @@ pub const CatalogService = struct {
         read_schema_json: []const u8,
         indexes_json: []const u8,
     ) !bool {
+        try @import("storage_capabilities.zig").requireDefinition(self.alloc, schema_json, read_schema_json, indexes_json);
         return try self.store.setTableDefinition(table_name, schema_json, read_schema_json, indexes_json);
     }
 
@@ -331,7 +335,7 @@ pub const CatalogService = struct {
         manifest_version: u64 = 0,
         manifest: ?manifest_mod.Manifest = null,
 
-        fn deinit(self: *PublishedHead, alloc: Allocator) void {
+        pub fn deinit(self: *PublishedHead, alloc: Allocator) void {
             if (self.manifest) |*manifest| manifest.deinit(alloc);
             self.* = undefined;
         }
@@ -667,11 +671,11 @@ pub const CatalogService = struct {
             .head_graph_index_actions = head_graph_index_actions,
             .head_derived_output_actions = head_actions.derived_output_actions,
             .artifact_actions = .{
-                .document_segment = @enumFromInt(@intFromEnum(plan.artifact_actions.document_segment)),
-                .full_text = @enumFromInt(@intFromEnum(plan.artifact_actions.full_text)),
-                .dense_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.dense_vector)),
-                .sparse_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.sparse_vector)),
-                .graph = @enumFromInt(@intFromEnum(plan.artifact_actions.graph)),
+                .document_segment = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.document_segment))),
+                .full_text = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.full_text))),
+                .dense_vector = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.dense_vector))),
+                .sparse_vector = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.sparse_vector))),
+                .graph = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.graph))),
             },
             .index_config_actions = owned_index_config_actions,
             .full_text_index_actions = full_text_index_actions,
@@ -679,9 +683,9 @@ pub const CatalogService = struct {
             .sparse_index_actions = sparse_index_actions,
             .graph_index_actions = graph_index_actions,
             .derived_output_actions = .{
-                .chunk_preview = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_preview)),
-                .chunk_embeddings = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_embeddings)),
-                .rerank_terms = @enumFromInt(@intFromEnum(plan.derived_output_actions.rerank_terms)),
+                .chunk_preview = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.chunk_preview))),
+                .chunk_embeddings = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.chunk_embeddings))),
+                .rerank_terms = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.rerank_terms))),
             },
             .derived_output_resolutions = derived_output_resolutions,
             .max_pending_records = effective_policy.max_pending_records,
@@ -1402,7 +1406,7 @@ fn cloneFullTextIndexActionsAlloc(
     for (items, 0..) |item, idx| {
         out[idx] = .{
             .name = try alloc.dupe(u8, item.name),
-            .action = @enumFromInt(@intFromEnum(item.action)),
+            .action = @fromBackingInt(@intCast(@backingInt(item.action))),
             .source_mode = item.source_mode,
             .chunked_source_count = item.chunked_source_count,
         };
@@ -1448,7 +1452,7 @@ fn cloneNamedArtifactActionsAlloc(
     for (items, 0..) |item, idx| {
         out[idx] = .{
             .name = try alloc.dupe(u8, item.name),
-            .action = @enumFromInt(@intFromEnum(item.action)),
+            .action = @fromBackingInt(@intCast(@backingInt(item.action))),
         };
         initialized += 1;
     }
@@ -1837,7 +1841,7 @@ const HeadPublicationActions = struct {
     graph_index_actions: []catalog_types.NamedArtifactPublicationAction = &.{},
     derived_output_actions: catalog_types.DerivedOutputPublicationActions = .{},
 
-    fn deinit(self: *HeadPublicationActions, alloc: Allocator) void {
+    pub fn deinit(self: *HeadPublicationActions, alloc: Allocator) void {
         for (self.full_text_index_actions) |*entry| entry.deinit(alloc);
         if (self.full_text_index_actions.len > 0) alloc.free(self.full_text_index_actions);
         for (self.vector_index_actions) |*entry| entry.deinit(alloc);
@@ -2232,7 +2236,7 @@ fn parseFullTextIndexVersion(index_name: []const u8) ?u32 {
 }
 
 fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (@intFromEnum(lhs) != @intFromEnum(rhs)) return false;
+    if (@backingInt(lhs) != @backingInt(rhs)) return false;
     return switch (lhs) {
         .null => true,
         .bool => |value| value == rhs.bool,
@@ -2292,7 +2296,7 @@ test "serverless named graph planning reuses topology for metric-only changes" {
 }
 
 test "serverless named graph planning unwinds every failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(a: Allocator) !void {
             const actions = try planNamedIndexActionsAlloc(a, "{\"old\":{\"type\":\"graph\"}}", "{\"a\":{\"type\":\"graph\"},\"b\":{\"type\":\"graph\"},\"c\":{\"type\":\"graph\"},\"d\":{\"type\":\"graph\"},\"e\":{\"type\":\"graph\"},\"f\":{\"type\":\"graph\"},\"g\":{\"type\":\"graph\"},\"h\":{\"type\":\"graph\"}}", .graph, 1);
             defer freeNamedArtifactActions(a, actions);
@@ -2592,7 +2596,7 @@ const VectorCompactionSignal = struct {
     cluster_imbalance: f32 = 0,
     distance_span_max: f32 = 0,
 
-    fn deinit(self: *VectorCompactionSignal, alloc: Allocator) void {
+    pub fn deinit(self: *VectorCompactionSignal, alloc: Allocator) void {
         if (self.driver_index_name) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -5523,8 +5527,8 @@ test "serverless external readiness shares exact publication bindings and actual
             defer plan.deinit(alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
-    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
 }
 
 test "serverless materialization readiness distinguishes absent drops from real work" {
@@ -5553,11 +5557,11 @@ test "serverless catalog status stays local and write admission rejects read-onl
             self.calls += 1;
             return error.UnexpectedArtifactAccess;
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.store.ArtifactMetadata {
             return denied(ptr);
         }
-        fn putScoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.store.ArtifactMetadata {
+        fn putScoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !artifacts_mod.store.ArtifactMetadata {
             return denied(ptr);
         }
         fn get(ptr: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
@@ -5634,6 +5638,20 @@ test "serverless catalog status stays local and write admission rejects read-onl
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureTableWritesAllowed("events"));
     try std.testing.expectError(error.ExternalTableReadOnly, catalog.ensureNamespaceWritesAllowed("events"));
     try std.testing.expectError(error.ExternalSourcePlanResolverUnavailable, catalog.buildTable("events"));
+
+    // Reject both newly declared and already-persisted unsupported semantics.
+    try std.testing.expectError(error.RelationalStorageUnavailable, catalog.ensureTableWithDefinition("unsupported", 1, .{}, "{\"storage_mode\":\"relational\"}", "", "{}"));
+    try std.testing.expect((try catalog.getTableAlloc(alloc, "unsupported")) == null);
+    const unsupported = [_]struct { read_schema: []const u8, indexes: []const u8 }{
+        .{ .read_schema = "{\"storage_mode\":\"relational\"}", .indexes = "{}" },
+        .{ .read_schema = "", .indexes = "{\"ordered\":{\"type\":\"relational\"}}" },
+    };
+    for (unsupported) |definition| {
+        try std.testing.expect(try test_catalog_store.setTableDefinition("events", "{}", definition.read_schema, definition.indexes));
+        try std.testing.expectError(error.RelationalStorageUnavailable, catalog.ensureTableWritesAllowed("events"));
+        try std.testing.expectError(error.RelationalStorageUnavailable, catalog.ensureNamespaceWritesAllowed("events"));
+    }
+    try std.testing.expect(try catalog.setTableDefinition("events", current_schema, "", "{}"));
 
     // A selector is not a resolved inventory. Neither current nor explicit
     // pins may create a partial external HEAD without the resolver capability.

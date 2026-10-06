@@ -134,22 +134,32 @@ This makes the reranker compatible with both BERT-style ColBERT checkpoints and 
 
 ### Endpoint
 
-`POST /rerank_multimodal`
+`POST /rerank`, the same endpoint as text reranking.
 
 Request fields:
 - `model`: reranker name
 - `query`: text query
-- `documents`: array of multimodal documents
+- `documents`: array of documents
 
-Each document carries `content` in the same format used for generation and embedding:
+Each document uses the same content format as generation and embedding:
 - plain string text
 - array of `ContentPart` values: text parts, `image_url` parts using data URIs, or inline `media` parts with `image/*` mime types
 
+The deprecated `prompts` field (an array of strings) is still accepted in place of `documents`; a request may not send both.
+
+The model catalog advertises `rerank_documents_v1: true` on reranker capabilities. Antfly sends `documents` only to servers that advertise it and falls back to `prompts` (text only) otherwise, so a cluster and an inference pool can be upgraded in either order.
+
+Query-time rerankers reach this path through their `template`: the `media` and `remoteMedia` helpers render each candidate into text and image parts. The embedded runtime receives them through the linked `rerank_documents` provider operation, which runs the same handler core (`Node.rerankDocumentValues`) as the HTTP route.
+
 ### Current Behavior
 
-- Text-only multimodal documents are reranked through the existing native text reranker path.
+- Requests without images are reranked through the native text reranker path, whatever the model.
 - Image-bearing requests are parsed, validated, resized, normalized, and grid-prepared natively in Zig.
-- Models that do not advertise `colqwen` or `multimodal_late_interaction` are rejected for image-bearing requests.
+- Image support is resolved from the model manifest into an executor kind (`resolvedExecutorKind("rerank", ...)`), the same way image embedding is:
+  - a manifest whose `inputs` are declared without `image` stays text-only;
+  - a Qwen3-VL reranker GGUF bundle with its projector resolves to `native_projector_reranking` (pointwise);
+  - a manifest declaring the `colqwen` or `multimodal_late_interaction` capability resolves to `native_late_interaction_reranking` (MaxSim).
+- That executor kind is the single answer for the model catalog's `input_modalities`, the executor contract, and the handler. Image-bearing requests to a model without an image executor are rejected with `400 MODEL_NOT_SUPPORTED` before media is fetched or the model loads.
 - Image-bearing requests execute end to end when the model has a native GPT/Qwen text session plus either a `visual_model` export or native Qwen2-VL vision config.
   - If a `visual_model` export is present, Antfly inference uses it.
   - Otherwise it falls back to the native Qwen2-VL-style vision tower path.
@@ -185,7 +195,7 @@ The published `vidore/colqwen2-v1.0-hf` config contains the full `vlm_config.vis
 
 ### Remaining Work
 
-- Request-level `/rerank_multimodal` smoke/regression surface
+- Request-level multimodal `/rerank` smoke/regression surface
 - Unified text and multimodal late-interaction reporting semantics
 - Broader multimodal server-path regression coverage
 ```

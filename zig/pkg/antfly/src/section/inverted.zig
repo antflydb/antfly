@@ -15,19 +15,17 @@
 //! Inverted text index section for full-text search.
 //!
 //! Builds and queries an inverted index using:
-//!   - Blocked term dictionary indexed by a Vellum FST (block ceiling → block offset)
+//!   - Blocked term dictionary indexed by an FST (block ceiling → block offset)
 //!   - Roaring bitmaps for posting lists (document ID sets)
 //!   - Chunked int encoder for term frequencies and field norms
 //!   - BM25 scoring
-//!
-//! Wire-compatible with zapx SectionInvertedTextIndex.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const roaring = @import("../encoding/roaring.zig");
 const chunked = @import("../encoding/chunked_coder.zig");
 const simd_bitpack = @import("../encoding/simd_bitpack.zig");
-const vellum = @import("antfly_vellum");
+const fst = @import("antfly_fst");
 const bloom = @import("bloom");
 const platform_time = @import("antfly_platform").time;
 
@@ -354,19 +352,19 @@ fn writeCurrentHeader(
     doc_count: u32,
     total_field_len: u64,
     chunk_size: u32,
-    vellum_len: u32,
+    fst_len: u32,
     bloom_len: u32,
     norms_len: u32,
 ) void {
     std.debug.assert(dst.len >= v7_header_size);
     @memcpy(dst[0..4], "INVT");
     dst[4] = version;
-    dst[5..9].* = @bitCast(std.mem.nativeToLittle(u32, doc_count));
-    dst[9..17].* = @bitCast(std.mem.nativeToLittle(u64, total_field_len));
-    dst[17..21].* = @bitCast(std.mem.nativeToLittle(u32, chunk_size));
-    dst[21..25].* = @bitCast(std.mem.nativeToLittle(u32, vellum_len));
-    dst[25..29].* = @bitCast(std.mem.nativeToLittle(u32, bloom_len));
-    dst[29..33].* = @bitCast(std.mem.nativeToLittle(u32, norms_len));
+    dst[5..9].* = @bitCast(@as(u32, doc_count));
+    dst[9..17].* = @bitCast(@as(u64, total_field_len));
+    dst[17..21].* = @bitCast(@as(u32, chunk_size));
+    dst[21..25].* = @bitCast(@as(u32, fst_len));
+    dst[25..29].* = @bitCast(@as(u32, bloom_len));
+    dst[29..33].* = @bitCast(@as(u32, norms_len));
 }
 
 // ============================================================================
@@ -454,7 +452,7 @@ pub const InvertedIndexBuildProfile = struct {
 };
 
 fn appendLeU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, value))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, value))));
 }
 
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
@@ -557,7 +555,7 @@ fn encodeBlockedTermDictionary(alloc: Allocator, entries: []const TermDictEntry)
     try index_terms.ensureTotalCapacity(alloc, estimated_block_count * (term_bytes.max +| 5));
 
     const fst_registry_size: usize = std.math.clamp(entries.len, 64, 65_536);
-    var block_fst_builder = try vellum.Builder.init(alloc, .{
+    var block_fst_builder = try fst.Builder.init(alloc, .{
         .registry_table_size = fst_registry_size,
     });
     defer block_fst_builder.deinit();
@@ -640,7 +638,7 @@ const StreamingTermDictionaryBuilder = struct {
     pending_count: usize = 0,
     term_count: usize = 0,
     block_count: u32 = 0,
-    block_fst_builder: vellum.Builder,
+    block_fst_builder: fst.Builder,
     finalized_blocks: bool = false,
 
     fn init(alloc: Allocator) !StreamingTermDictionaryBuilder {
@@ -649,13 +647,13 @@ const StreamingTermDictionaryBuilder = struct {
             // Large merges benefit from the maximum bounded registry. This is
             // independent of vocabulary size and avoids resizing the FST
             // builder while keeping its working set predictable.
-            .block_fst_builder = try vellum.Builder.init(alloc, .{
+            .block_fst_builder = try fst.Builder.init(alloc, .{
                 .registry_table_size = 65_536,
             }),
         };
     }
 
-    fn deinit(self: *StreamingTermDictionaryBuilder) void {
+    pub fn deinit(self: *StreamingTermDictionaryBuilder) void {
         self.block_data.deinit(self.alloc);
         self.index_records.deinit(self.alloc);
         self.index_terms.deinit(self.alloc);
@@ -960,7 +958,7 @@ pub const InvertedIndexBuilder = struct {
     /// chunk-framed positions):
     ///   [header: 33 bytes]
     ///   [postings_data]
-    ///   [vellum FST data]
+    ///   [FST data]
     ///
     /// Header:
     ///   magic: "INVT" (4 bytes)
@@ -1213,7 +1211,7 @@ const PostingSerializeScratch = struct {
         self.impact_encoded.clearRetainingCapacity();
     }
 
-    fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
+    pub fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
         self.chunks.deinit(alloc);
         self.doc_deltas.deinit(alloc);
         self.freq_values.deinit(alloc);
@@ -1244,11 +1242,11 @@ fn appendPostingSkipData(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), chu
     var chunk_index: usize = postings_skip_stride_chunks;
     while (chunk_index < chunks.len) : (chunk_index += postings_skip_stride_chunks) {
         const boundary = chunks[chunk_index - 1];
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, boundary.max_doc))));
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(chunk_index))))));
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, boundary.chunk_id))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, boundary.max_doc))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(chunk_index))))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, boundary.chunk_id))));
         const payload_end = boundary.doc_ctrl_off + boundary.doc_ctrl_len;
-        try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, payload_end))));
+        try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, payload_end))));
     }
 }
 
@@ -1855,13 +1853,13 @@ const PostingAccumulator = struct {
         return .{};
     }
 
-    fn deinit(self: *PostingAccumulator, alloc: Allocator) void {
+    pub fn deinit(self: *PostingAccumulator, alloc: Allocator) void {
         self.doc_ids.deinit(alloc);
         self.metas.deinit(alloc);
         self.all_positions.deinit(alloc);
     }
 
-    fn estimatedMemoryBytes(self: *const PostingAccumulator) u64 {
+    pub fn estimatedMemoryBytes(self: *const PostingAccumulator) u64 {
         return (@as(u64, @intCast(self.doc_ids.capacity)) * @sizeOf(u32)) +
             (@as(u64, @intCast(self.metas.capacity)) * @sizeOf(PostingMeta)) +
             (@as(u64, @intCast(self.all_positions.capacity)) * @sizeOf(u32));
@@ -2158,7 +2156,7 @@ pub const InvertedIndexReader = struct {
     dict_block_count: u32,
     dict_blocks: []const u8,
     dict_index: []const u8,
-    dict_fst: vellum.FST,
+    dict_fst: fst.FST,
     /// Optional per-segment term bloom filter. When present, callers can
     /// reject absent terms before walking the FST. Borrows into `data`.
     term_bloom: ?bloom.BorrowedFilter,
@@ -2195,7 +2193,7 @@ pub const InvertedIndexReader = struct {
         const block_data = dict_data[term_dict_header_size..][0..block_data_len];
         const block_index_data = dict_data[term_dict_header_size + @as(usize, block_data_len) ..][0..block_index_len];
         const block_fst_data = dict_data[term_dict_header_size + @as(usize, block_data_len) + @as(usize, block_index_len) ..];
-        const dict_fst = try vellum.FST.load(block_fst_data);
+        const dict_fst = try fst.FST.load(block_fst_data);
 
         var term_bloom: ?bloom.BorrowedFilter = null;
         if (bloom_len > 0) {
@@ -2423,9 +2421,12 @@ pub const InvertedIndexReader = struct {
         };
     }
 
-    /// Iterate terms matching an automaton. Blocks are enumerated by prefix FST,
-    /// then the automaton is checked against full terms inside each block.
-    pub fn fstSearchIterator(self: *const InvertedIndexReader, aut: vellum.Automaton) !TermIterator {
+    /// Iterate terms matching an automaton. Blocks are enumerated by the
+    /// block-ceiling FST; blocks whose shared prefix already leaves the
+    /// automaton dead are skipped by seeking past the dead prefix, and the
+    /// remaining terms are checked incrementally from their front-coded
+    /// shared prefix.
+    pub fn fstSearchIterator(self: *const InvertedIndexReader, aut: fst.Automaton) !TermIterator {
         return .{
             .alloc = self.alloc,
             .reader = self,
@@ -2681,14 +2682,24 @@ pub const InvertedIndexReader = struct {
 pub const TermIterator = struct {
     alloc: Allocator,
     reader: *const InvertedIndexReader,
-    block_iter: vellum.FSTIterator,
+    block_iter: fst.FSTIterator,
     current_block_prefix: []const u8 = &.{},
     current_block_cursor: usize = 0,
     current_block_remaining: u32 = 0,
     current_block_last_postings_offset: u64 = 0,
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
-    automaton: ?vellum.Automaton = null,
+    automaton: ?fst.Automaton = null,
+    /// Automaton states aligned with `current_key`: entry `i` is the state
+    /// after consuming `current_key[0..i]`. Front-coded terms reuse the
+    /// states of their shared prefix, so each decoded term only feeds its
+    /// leaf bytes through the automaton.
+    automaton_states: std.ArrayListUnmanaged(usize) = .empty,
+    /// Scratch key used to seek the block iterator past a dead prefix.
+    seek_scratch: std.ArrayListUnmanaged(u8) = .empty,
+    /// Diagnostic: dictionary blocks skipped without decoding because their
+    /// shared prefix cannot lead to an automaton match.
+    blocks_pruned: u64 = 0,
     // We must copy the key before advancing, because block parsing reuses section slices.
     current_key: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -2712,7 +2723,7 @@ pub const TermIterator = struct {
 
             const shared_len = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
             const leaf_len = readVarintU32(self.reader.dict_blocks, &self.current_block_cursor) catch return error.InvalidData;
-            if (shared_len > self.current_key.items.len) return error.InvalidData;
+            if (self.current_block_prefix.len + shared_len > self.current_key.items.len) return error.InvalidData;
             if (self.current_block_cursor + leaf_len > self.reader.dict_blocks.len) return error.InvalidData;
             const leaf = self.reader.dict_blocks[self.current_block_cursor..][0..leaf_len];
             self.current_block_cursor += leaf_len;
@@ -2723,14 +2734,16 @@ pub const TermIterator = struct {
             self.current_key.shrinkRetainingCapacity(self.current_block_prefix.len + shared_len);
             try self.current_key.appendSlice(self.alloc, leaf);
 
+            // The automaton state stack must track every decoded key, so it
+            // advances before any range check can skip the term.
+            if (self.automaton) |aut| {
+                if (!try self.advanceAutomatonStates(aut, self.current_block_prefix.len + shared_len)) continue;
+            }
             if (self.start) |start| {
                 if (std.mem.order(u8, self.current_key.items, start) == .lt) continue;
             }
             if (self.end) |end| {
                 if (std.mem.order(u8, self.current_key.items, end) != .lt) return null;
-            }
-            if (self.automaton) |aut| {
-                if (!termMatchesAutomaton(aut, self.current_key.items)) continue;
             }
 
             const result: LookupResult = if (fstValIs1Hit(value))
@@ -2746,37 +2759,99 @@ pub const TermIterator = struct {
     }
 
     fn loadNextBlock(self: *TermIterator) !bool {
-        const current = self.block_iter.current() orelse return false;
-        _ = try self.block_iter.nextEntry();
-        const block_offset: usize = @intCast(current.val);
-        if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
-        var cursor = block_offset;
-        const prefix_len = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
-        self.current_block_remaining = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
-        if (cursor + prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
-        self.current_block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
-        cursor += prefix_len;
-        self.current_block_cursor = cursor;
-        self.current_block_last_postings_offset = 0;
-        self.current_key.clearRetainingCapacity();
-        try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
+        while (true) {
+            const current = self.block_iter.current() orelse return false;
+            const block_offset: usize = @intCast(current.val);
+            if (block_offset >= self.reader.dict_blocks.len) return error.InvalidData;
+            var cursor = block_offset;
+            const prefix_len = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
+            const block_remaining = readVarintU32(self.reader.dict_blocks, &cursor) catch return error.InvalidData;
+            if (cursor + prefix_len > self.reader.dict_blocks.len) return error.InvalidData;
+            const block_prefix = self.reader.dict_blocks[cursor..][0..prefix_len];
+            cursor += prefix_len;
+
+            if (self.automaton) |aut| {
+                if (try self.primeAutomatonStates(aut, block_prefix)) |dead_len| {
+                    // Every term in this block starts with `block_prefix`, and
+                    // the automaton is already dead after `dead_len` of its
+                    // bytes, so no term in this block (or in any later block
+                    // sharing that dead prefix) can match. Seek the block
+                    // index straight past the dead range instead of decoding
+                    // each block's terms one by one.
+                    self.blocks_pruned += 1;
+                    if (!try self.seekPastDeadPrefix(block_prefix[0..dead_len])) return false;
+                    continue;
+                }
+            }
+
+            _ = try self.block_iter.nextEntry();
+            self.current_block_remaining = block_remaining;
+            self.current_block_prefix = block_prefix;
+            self.current_block_cursor = cursor;
+            self.current_block_last_postings_offset = 0;
+            self.current_key.clearRetainingCapacity();
+            try self.current_key.appendSlice(self.alloc, self.current_block_prefix);
+            return true;
+        }
+    }
+
+    /// Feed a block's shared prefix through the automaton from its start
+    /// state, recording the state after every byte. Returns the number of
+    /// prefix bytes after which the automaton became dead, or null when the
+    /// whole prefix can still lead to a match.
+    fn primeAutomatonStates(self: *TermIterator, aut: fst.Automaton, block_prefix: []const u8) !?usize {
+        self.automaton_states.clearRetainingCapacity();
+        try self.automaton_states.ensureTotalCapacity(self.alloc, block_prefix.len + 1);
+        var state = aut.start();
+        self.automaton_states.appendAssumeCapacity(state);
+        if (!aut.canMatch(state)) return 0;
+        for (block_prefix, 0..) |byte, index| {
+            state = aut.accept(state, byte);
+            self.automaton_states.appendAssumeCapacity(state);
+            if (!aut.canMatch(state)) return index + 1;
+        }
+        return null;
+    }
+
+    /// Extend the automaton state stack from the retained key prefix to the
+    /// end of `current_key`. Returns whether the full term is accepted.
+    fn advanceAutomatonStates(self: *TermIterator, aut: fst.Automaton, retained_len: usize) !bool {
+        if (self.automaton_states.items.len <= retained_len) return error.InvalidData;
+        self.automaton_states.shrinkRetainingCapacity(retained_len + 1);
+        const leaf = self.current_key.items[retained_len..];
+        try self.automaton_states.ensureUnusedCapacity(self.alloc, leaf.len);
+        var state = self.automaton_states.items[retained_len];
+        for (leaf) |byte| {
+            // Dead states stay dead; keep pushing so the stack stays aligned
+            // with `current_key` for the next front-coded term.
+            if (aut.canMatch(state)) state = aut.accept(state, byte);
+            self.automaton_states.appendAssumeCapacity(state);
+        }
+        return aut.canMatch(state) and aut.isMatch(state);
+    }
+
+    /// Reposition the block iterator at the first block whose ceiling sorts
+    /// after every key starting with `dead_prefix`. Returns false when no such
+    /// key exists (the prefix is all 0xFF bytes), which ends iteration.
+    fn seekPastDeadPrefix(self: *TermIterator, dead_prefix: []const u8) !bool {
+        self.seek_scratch.clearRetainingCapacity();
+        try self.seek_scratch.appendSlice(self.alloc, dead_prefix);
+        while (self.seek_scratch.items.len > 0 and self.seek_scratch.items[self.seek_scratch.items.len - 1] == 0xFF) {
+            self.seek_scratch.items.len -= 1;
+        }
+        if (self.seek_scratch.items.len == 0) return false;
+        self.seek_scratch.items[self.seek_scratch.items.len - 1] += 1;
+        try self.block_iter.seek(self.seek_scratch.items);
         return true;
     }
 
     pub fn deinit(self: *TermIterator) void {
         self.current_key.deinit(self.alloc);
+        self.automaton_states.deinit(self.alloc);
+        self.seek_scratch.deinit(self.alloc);
         self.block_iter.deinit();
     }
 };
-
-fn termMatchesAutomaton(aut: vellum.Automaton, term: []const u8) bool {
-    var state = aut.start();
-    for (term) |b| {
-        if (!aut.canMatch(state)) return false;
-        state = aut.accept(state, b);
-    }
-    return aut.isMatch(state);
-}
 
 /// Result of looking up a term. Either a full postings list or a 1-hit value.
 pub const LookupResult = union(enum) {
@@ -4506,16 +4581,16 @@ fn remapSingleContributorPostings(
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, postings.doc_freq))));
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(bitmap_bytes.len))))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, postings.doc_freq))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(bitmap_bytes.len))))));
     try out.appendSlice(alloc, bitmap_bytes);
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(freq_norm_bytes.len))))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(freq_norm_bytes.len))))));
     try out.appendSlice(alloc, freq_norm_bytes);
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, num_chunks))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, num_chunks))));
     try out.appendSlice(alloc, block_max_meta);
 
     const positions_len: u32 = if (postings.positions_data) |pd| @intCast(pd.len) else 0;
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, positions_len))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, positions_len))));
     if (postings.positions_data) |pd| {
         try out.appendSlice(alloc, pd);
     }
@@ -4570,9 +4645,9 @@ fn shiftBlockMaxWholeChunks(
     const out = try alloc.alloc(u8, @as(usize, num_chunks) * 6);
     for (0..num_chunks) |chunk_idx| {
         const base = chunk_idx * 6;
-        out[base..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, 0));
-        out[base + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, std.math.maxInt(u16)));
-        out[base + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, 0));
+        out[base..][0..2].* = @bitCast(@as(u16, 0));
+        out[base + 2 ..][0..2].* = @bitCast(@as(u16, std.math.maxInt(u16)));
+        out[base + 4 ..][0..2].* = @bitCast(@as(u16, 0));
     }
     if (postings.block_max) |bm| {
         const dst_off = @as(usize, chunk_delta) * 6;
@@ -4627,16 +4702,16 @@ fn rebuildShiftedBlockMax(
 
     for (0..num_chunks) |chunk_idx| {
         const base = chunk_idx * 6;
-        out[base..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, chunk_max_freq[chunk_idx]));
-        out[base + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, chunk_min_norm[chunk_idx]));
-        out[base + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, chunk_max_norm[chunk_idx]));
+        out[base..][0..2].* = @bitCast(@as(u16, chunk_max_freq[chunk_idx]));
+        out[base + 2 ..][0..2].* = @bitCast(@as(u16, chunk_min_norm[chunk_idx]));
+        out[base + 4 ..][0..2].* = @bitCast(@as(u16, chunk_max_norm[chunk_idx]));
     }
 
     return out;
 }
 
 // ============================================================================
-// 1-Hit Encoding (zapx-compatible)
+// 1-Hit Encoding
 // ============================================================================
 
 /// Mask for the encoding type in FST values (bits 63-62).
@@ -4669,7 +4744,7 @@ pub fn fstValIs1Hit(v: u64) bool {
 }
 
 // ============================================================================
-// freqHasLocs Encoding (zapx-compatible)
+// freqHasLocs Encoding
 // ============================================================================
 
 /// Encode frequency and hasLocs flag into a single value.
@@ -4786,7 +4861,7 @@ const MergeMemorySink = struct {
     alloc: Allocator,
     output: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn deinit(self: *MergeMemorySink) void {
+    pub fn deinit(self: *MergeMemorySink) void {
         self.output.deinit(self.alloc);
     }
 
@@ -5159,7 +5234,7 @@ fn singleContributorIndex(current_entries: []const ?TermIterator.Entry, term: []
 
 fn appendSingleContributorTerm(
     alloc: Allocator,
-    fst_builder: *vellum.Builder,
+    fst_builder: *fst.Builder,
     postings_data: *std.ArrayListUnmanaged(u8),
     entry: TermIterator.Entry,
     deleted_docs: ?[]const ?roaring.RoaringBitmap,
@@ -7017,7 +7092,7 @@ test "v6 below bloom threshold skips bloom payload" {
 test "legacy section versions are rejected by current reader" {
     const alloc = std.testing.allocator;
 
-    var fst_builder = try vellum.Builder.init(alloc, .{});
+    var fst_builder = try fst.Builder.init(alloc, .{});
     defer fst_builder.deinit();
     try fst_builder.insert("hello", 0);
     const fst_bytes = try fst_builder.finish();
@@ -7029,10 +7104,10 @@ test "legacy section versions are rejected by current reader" {
     defer alloc.free(section);
     @memcpy(section[0..4], "INVT");
     section[4] = 5;
-    section[5..9].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, 2)));
-    section[9..17].* = @bitCast(std.mem.nativeToLittle(u64, @as(u64, 3)));
-    section[17..21].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, 1024)));
-    section[21..25].* = @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(fst_bytes.len))));
+    section[5..9].* = @bitCast(@as(u32, @as(u32, 2)));
+    section[9..17].* = @bitCast(@as(u64, @as(u64, 3)));
+    section[17..21].* = @bitCast(@as(u32, @as(u32, 1024)));
+    section[21..25].* = @bitCast(@as(u32, @as(u32, @intCast(fst_bytes.len))));
     @memcpy(section[25..][0..fst_bytes.len], fst_bytes);
 
     try std.testing.expectError(error.UnsupportedVersion, InvertedIndexReader.init(alloc, section));
@@ -7069,8 +7144,8 @@ test "current reader reopens origin-main v23 postings and block-max layout" {
         const dst = current_block_max_start + chunk_idx * 6;
         @memcpy(expanded[dst..][0..2], current[src..][0..2]);
         const norm: u16 = @intCast(fieldNormFromId(current[src + 2]));
-        expanded[dst + 2 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm));
-        expanded[dst + 4 ..][0..2].* = @bitCast(std.mem.nativeToLittle(u16, norm));
+        expanded[dst + 2 ..][0..2].* = @bitCast(@as(u16, norm));
+        expanded[dst + 4 ..][0..2].* = @bitCast(@as(u16, norm));
     }
     const current_block_max_end = current_block_max_start + @as(usize, stored_chunks) * 3;
     const legacy_block_max_end = current_block_max_start + @as(usize, stored_chunks) * 6;

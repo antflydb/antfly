@@ -22,12 +22,22 @@ fn storageKernelLinkAnchor() callconv(.c) u32 {
     return antfly_abi_version();
 }
 
-// The reusable archive also owns executable runtime entry points. Those
-// hidden paths call the separately compiled API and inference units, but no
-// public C ABI operation can enter them. Resolve their private references with
+// The reusable archive also owns an executable-only API-kernel runtime entry
+// point. That hidden path calls the separately compiled API-kernel unit, but
+// no public C ABI operation can enter it. Resolve its private reference with
 // a trap in the shared-library consumer so the linker does not retain the
-// unrelated API/inference archives. The executable consumer resolves the real
-// symbols and never links this anchor module.
+// unrelated API-kernel archive. The executable consumer resolves the real
+// symbol and never links this anchor module.
+//
+// The inference entry point (`antfly_standalone_inference_get_function_
+// table`) is NOT trapped here: libantfly embeds the standalone inference
+// runtime in-process, the same as the `antfly` executable (2026-09-17
+// product decision -- see COMPILATION.md's "C API composition" section), so
+// this shared-library link genuinely includes the inference archive (see
+// `pkg/antfly/build/runtime.zig`'s storage_kernel unit and the `.inference`
+// unit linked into `libantfly_link_mod`), and the real definition exported
+// by `runtime_inference_root.zig` satisfies the storage-kernel archive's
+// reference.
 fn unavailableExecutableRuntimeDependency() callconv(.c) noreturn {
     @trap();
 }
@@ -37,13 +47,8 @@ comptime {
         .name = "antfly_storage_kernel_link_anchor",
         .visibility = .hidden,
     });
-    for ([_][]const u8{
-        "antfly_api_kernel_get_function_table",
-        "antfly_standalone_inference_get_function_table",
-    }) |name| {
-        @export(&unavailableExecutableRuntimeDependency, .{
-            .name = name,
-            .visibility = .hidden,
-        });
-    }
+    @export(&unavailableExecutableRuntimeDependency, .{
+        .name = "antfly_api_kernel_get_function_table",
+        .visibility = .hidden,
+    });
 }

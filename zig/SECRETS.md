@@ -47,8 +47,9 @@ retains its precedence when a refresh fails.
 
 - `native` is optional and is the only store the secret API can write. Its name
   defaults to `native`. The name describes Antfly ownership, not storage topology.
-  This first implementation requires `path` and is file-backed and node-local;
-  it does **not** replicate API mutations across a distributed cluster.
+  `backend` defaults to `file`, preserving the existing node-local JSON store.
+  Explicit `distributed` and `serverless` backends use encrypted persistence;
+  their configuration and runtime delivery are described below.
 - `sources` defaults to `[]`. Entries require a unique `name`, a `type`, and
   provider-specific settings. Only `type: "file"` is implemented now. These are
   externally managed and read-only to Antfly, regardless of filesystem permissions.
@@ -135,7 +136,7 @@ resolution semantics.
 | --- | --- | --- |
 | Distributed Antfly | Dedicated encrypted metadata records replicated through metadata Raft | Durable quorum commit and application of the conditional mutation |
 | Antfly Lite | Reserved encrypted records inside the native `.aflite` file | Atomic durable commit through the existing single-writer machinery |
-| Antfly Serverless | Immutable encrypted objects and a versioned head per scope | Successful conditional publication of the head |
+| Antfly Serverless | One bounded ciphertext collection per scope | Successful conditional replacement using ETag/generation CAS |
 
 The common contracts (`common/secret_contract.zig`), AFSE codec
 (`common/secret_record.zig`), and Lite persistence adapter
@@ -258,17 +259,21 @@ Authenticated internal RPCs authorize each worker's scope and required secret.
 Publish invalidations after commit and periodically reconcile revisions so missed
 notifications cannot leave permanent stale caches.
 
-#### Distributed secret delivery to data nodes (planned)
+#### Distributed secret delivery to data nodes
 
 Metadata nodes implement the authoritative `NativeStore`; every data node hosts
-a read-only remote `Source` backed by internal RPCs and a memory cache. Metadata
+a read-only remote `Source` backed by internal RPCs. The initial source always
+reads through; the bounded memory cache described below is a future optimization. Metadata
 Raft replicates durable encrypted AFSE records. Data nodes obtain values needed
 by their assigned work and authorized scopes. Cluster-wide secrets may be
 available to all nodes, while tenant secrets require tenant-specific access.
 Having a node identity alone does not grant access to every scope or key.
 
-The initial delivery model decrypts on the metadata service and sends resolved
-values over mutually authenticated TLS. Only metadata nodes need KMS/key-provider
+The implemented delivery model decrypts on metadata and uses the existing
+internal service authentication plus a separate per-consumer credential and exact
+key allowlist. Requests and replies are encrypted with XChaCha20-Poly1305, including
+through TLS-terminating proxies. See the current implementation below. A future
+mTLS identity adapter can replace mounted delivery credentials. Only metadata nodes need KMS/key-provider
 access. Data nodes keep resolved values in memory, with no plaintext disk cache;
 responses and errors must not put secret values in logs or tracing. Direct AFSE
 delivery is a possible later alternative, but would require each recipient to
@@ -276,7 +281,7 @@ have authorized unwrap access and separately provisioned key-provider credential
 Node identity, transport trust, and metadata key-provider credentials come from
 bootstrap configuration, not from the native store they unlock.
 
-The mutation and delivery sequence is:
+The intended sequence once watch/cache optimization is added is:
 
 1. Encrypt the mutation and durably commit/apply it through metadata Raft,
    advancing the scope revision and recording the changed entry revision.
@@ -289,7 +294,7 @@ The mutation and delivery sequence is:
    consumer generation. Provider clients, connection pools, and workers apply
    the subsystem-specific rotation rules described later in this document.
 
-The intended internal protocol is:
+The longer-term internal protocol is (watch is not yet implemented):
 
 | Operation | Semantics |
 | --- | --- |
@@ -433,26 +438,186 @@ secret revision update.
 
 #### Serverless persistence
 
-**Serverless:** Store immutable encrypted records or, initially, a small encrypted
-record collection under a dedicated per-scope prefix. Upload objects before
-conditionally publishing a head that identifies the committed revision. Use
-ETag/generation compare-and-swap; concurrent writers fail/retry rather than lose
-updates. Readers follow the head, never infer the latest revision from listings.
-The head/index needs the same trusted access boundary as other control metadata;
-AEAD on records alone does not authenticate a forged absence in an index. Reuse
-object-store conditional-write primitives, but do not couple secret lifetime to
-a table manifest or table deletion. Garbage-collect unreferenced objects only
-after accounting for readers and retained backups. Reject storage providers that
-cannot supply the required conditional publication semantics.
+**Serverless:** The initial implementation atomically replaces one bounded
+ciphertext collection using conditional publication. It is both the head and
+payload; no listing, second object, or garbage collector is needed. If larger
+collections later require immutable records and a separate versioned head,
+upload records before publishing the head and retain objects needed by readers
+and backups. The trusted head/index boundary is essential: AEAD alone cannot
+authenticate an absence forged by an untrusted storage administrator.
+
+### Implemented distributed and serverless runtime
+
+The existing resolver facade now delegates native operations to the common
+`Source`/`NativeStore` contract. Native values precede ordered read-only file
+sources and the default-enabled environment fallback. A native read error fails
+resolution; only an authoritative absence allows fallback. Legacy file sources
+retain their existing last-known-good policy. Data-node facades have no writer.
+
+A metadata node uses:
+
+```json
+{
+  "secrets": {
+    "native": {
+      "backend": "distributed",
+      "scope": "production",
+      "keyring_path": "/run/antfly/native-keyring.json",
+      "grants": [
+        {
+          "name": "data-1",
+          "credential_path": "/run/antfly/delivery/data-1.key",
+          "keys": ["openai.api_key", "backup.s3.secret_access_key"]
+        }
+      ]
+    },
+    "sources": [],
+    "environment": true
+  }
+}
+```
+
+A data node uses the same scope, its own delivery credential, and metadata admin
+endpoints. It also needs the existing internal-service bootstrap credentials.
+It does not receive a wrapping key or access to ciphertext persistence:
+
+```json
+{
+  "secrets": {
+    "native": {
+      "backend": "distributed",
+      "scope": "production",
+      "reader": {
+        "name": "data-1",
+        "credential_path": "/run/antfly/delivery/data-1.key",
+        "urls": ["https://metadata-1.example", "https://metadata-2.example"]
+      }
+    }
+  }
+}
+```
+
+Delivery credentials are independently generated random 32-byte keys, represented
+as 64 hexadecimal characters in mounted files (a trailing newline is allowed).
+Include every secret name the data node resolves, including names intended to
+fall back to local files/environment after an authorized native absence.
+Provision a distinct key per grant. Merely possessing the shared internal-service
+credential does not satisfy a grant. Keep grants and wrapping keys consistent
+across metadata replicas. Grant definitions load at startup; credential files
+reload for every exchange, allowing atomic replacement and revocation. During a
+rollout, a metadata replica with the old credential remains an authorized source
+until its mount is updated. External credential revocation remains separate.
+
+`POST /internal/v1/secrets:read` supports resolve, filtered metadata list, and scope
+revision refresh. The grant name selects a credential; an authenticated encrypted
+request binds the operation, trusted scope, key and minimum revision. A reply is
+authenticated against the complete randomized request, preventing replay of an old
+value or absence into a new read. Responses contain ciphertext and `Cache-Control:
+no-store`; no plaintext disk cache or secret values in diagnostics are introduced.
+Each successful resolve crosses a metadata Raft read barrier. An outage fails
+closed immediately; there is no source-level positive or negative cache, TTL,
+watch history, or missed-invalidation recovery to manage in this first version.
+Existing consumer caches must still revalidate their secret source before use;
+in-flight operations may retain an already acquired credential.
+
+A serverless deployment uses an independent secret namespace:
+
+```json
+{
+  "secrets": {
+    "native": {
+      "backend": "serverless",
+      "scope": "production",
+      "path": "s3://antfly-control/production/native",
+      "keyring_path": "/run/antfly/native-keyring.json"
+    }
+  }
+}
+```
+
+`gs://` and `file://` are also supported. S3 uses the same refreshable bootstrap
+credential provider as serverless storage, including profiles, web identity and
+task/instance roles. Storage access uses independently provisioned workload
+identity/environment credentials. The bucket must already exist; `file://` uses
+the `native-secrets` bucket directory below its root. Providers must guarantee
+linearizable reads and conditional writes; an S3-compatible endpoint with
+eventual consistency is not supported. The embedded adapter requires an explicit
+`linearizable_cas` capability assertion. No secret lives beneath a table prefix,
+so table deletion and table backup cleanup cannot delete secrets. Serverless
+workers receive the same resolver as request handlers. Serverless `/secrets`
+(also `/db/v1/secrets`) administration requires a separate bearer token of at
+least 32 bytes, configured through `ANTFLY_SECRET_ADMIN_TOKEN`, even when other
+serverless routes are exposed through a trusted ingress. Terminate public TLS at
+that ingress. Without the token, administration is disabled.
+
+The mounted keyring is a JSON object with `active` and `keys`, where each key has
+an immutable `id` and a 64-character hexadecimal `key`. For example:
+
+```json
+{
+  "active": "wrapping-2026-09",
+  "keys": [
+    {"id": "wrapping-2026-09", "key": "<64 random hexadecimal characters>"}
+  ]
+}
+```
+
+Generate each wrapping key independently (for example `openssl rand -hex 32`),
+protect the file with OS permissions, and mount it only on decrypting runtimes.
+Antfly never creates or persists a root wrapping key next to encrypted records.
+The provider reloads the file for every wrap/unwrap, authenticates scope, key name,
+entry revision and key ID, and erases owned key material after use. Rotation adds
+a new key and changes `active`; retain old key IDs until their records and backups
+have been resealed or retired. Replacing bytes under an existing ID is invalid.
+A missing keyring or missing retained key is an availability error.
+
+Both adapters write **AFSC v2** (and can read AFSC v1), a bounded collection of
+AFSE envelopes: 4-byte `AFSC` magic, u16 version, u16 scope length, u64 scope
+revision, u32 entry count (all little endian), a random 16-byte publication ID,
+scope bytes, then u32 length + AFSE bytes for each entry. AFSC v1 omits the
+publication ID. Every mutation, including delete, gets a new ID so concurrent
+identical operations have distinct commit evidence. Entries are sorted by name;
+duplicate names, invalid framing, unexpected scope, and entry revisions above
+the collection revision are rejected. The initial limits are 1,024 entries and 8
+MiB per scope, retaining the common 1 MiB value limit. An empty collection
+retains its revision to prevent delete/recreate ABA.
+
+Distributed publication uses metadata transition tag 60 and a private
+`native_secrets_v1` namespace. Encryption happens before proposal. Apply checks
+the expected scope revision and atomically publishes ciphertext; a losing CAS is
+a deterministic no-op. Followers forward the encrypted proposal through Raft and
+wait for the exact collection to become visible behind a read barrier. A
+different publication at the proposed revision proves a CAS conflict; a later
+revision or timeout yields `OutcomeUnknown`, since it may have superseded our
+commit. Raft snapshot/export/import of internal metadata retains this namespace.
+Public table enumeration does not expose it. **Upgrade every metadata replica
+before enabling the distributed backend**; old binaries cannot apply the new
+transition or restore its snapshot projection. Disabling the configuration does
+not make persisted state downgrade-compatible.
+
+Serverless stores the collection at
+`<prefix>/secrets/v1/<hex SHA-256(scope)>/collection`. One conditional PUT publishes
+both head and payload atomically, avoiding a two-object commit and orphan GC.
+GET captures the payload and its ETag from the same response. GCS captures the
+`x-goog-generation` from that response and publishes with `ifGenerationMatch`
+(including generation zero for creation), because JSON API upload CAS does not
+use the ETag read-condition header. See [GCS preconditions](https://docs.cloud.google.com/storage/docs/request-preconditions). Missing buckets,
+missing ETags, permissions failures and unsupported conditional operations are
+errors. Only known precondition failures permit automatic preparation retry;
+ambiguous publication returns `OutcomeUnknown` without replaying the mutation.
+API PUT responses expose the committed entry revision and never the value.
 
 ### Bootstrap, caching, and rollout
 
-Startup becomes two phases: obtain storage access, node identity, and key-provider
-access from workload identity, mounted sources, or the host application; then open
-native storage and resolve application secrets. Bootstrap credentials cannot
-reference the store they unlock. Adjust today's eager configuration resolution
-when backend integration lands. The existing `environment` switch controls
-resolver fallback, not cloud workload identity or the encryption provider.
+Startup becomes two phases: obtain storage access, node identity, and
+key-provider access from workload identity, mounted sources, or the host
+application; then open native storage and resolve application secrets. Bootstrap
+credentials cannot reference the store they unlock. Operational provider
+registry, inference API/S3 credentials, inference and web-search connection
+credentials, external-I/O credentials, and remote-content references are
+retained until use; bootstrap settings still resolve before the native store
+opens. The existing `environment` switch controls resolver fallback, not cloud
+workload identity or the encryption provider.
 
 API mutation success means durable publication, not that all workers have already
 refreshed. Return a committed revision, expose observed revisions, and allow
@@ -461,8 +626,8 @@ whether still-valid last-known-good values are usable during outages. Expired
 caches fail; backend outages must not silently change the winning source. Remove
 native override and revoke external credential remain different operations.
 
-Lite persistence is implemented; next add distributed Raft persistence and
-serverless publication against the same contract suite. Backend tests must cover crash
+Lite persistence, distributed Raft persistence, and serverless conditional
+publication are implemented against the common contract. Backend tests cover
 recovery, competing conditional writers, delete/recreate without revision reuse,
 missed invalidations, stale/partitioned reads, key-provider failure and rotation,
 unauthorized scope access, and backup/restore. Migration from existing JSON is an
@@ -837,8 +1002,10 @@ as AFSE v1 above. It encrypts individual secret values with authenticated identi
 metadata; it does not encrypt the existing `PersistedSecretsFile` JSON wholesale.
 The codec has an independently generated libsodium/PyNaCl wire vector and tests
 for tampering, truncation, wrong keys, entropy failure, and allocation cleanup.
-Lite persistence is available to embedding hosts; runtime resolver integration
-and distributed/serverless persistence remain pending. Projected files continue to
+Lite persistence is available to embedding hosts. Distributed and serverless
+adapters are connected to their respective runtimes; standalone rejects these
+backend selections (Lite remains an embedding-host adapter). Data nodes use the scoped
+read-only delivery protocol described above. Projected files continue to
 use the existing JSON format and last-known-good reload behavior. Any future
 encrypted-file adapter must enforce an explicit cache freshness policy on failed
 authentication rather than treating an unreadable native store as absence.
@@ -1073,8 +1240,9 @@ Additional runtime tests:
 5. Kubernetes-projected files are the primary enterprise integration surface.
    Direct external secret manager integrations are deferred.
 6. Plaintext JSON remains the initial store format, protected by filesystem
-   permissions. The AFSE codec and Lite adapter are implemented; runtime
-   integration, other persistence adapters, and explicit migration remain pending.
+   permissions. AFSE records, Lite/distributed/serverless adapters, and runtime
+   integration are implemented; explicit migration of existing JSON stores remains
+   pending.
 7. Start true live rotation with managed embedder API keys.
 8. Support live rotation for all credential-bearing integrations that Antfly
    owns: generator/reranker providers, remote-content credentials, S3/backup
@@ -1091,3 +1259,68 @@ Additional runtime tests:
    first, and what bounded cache freshness policy should native backends use?
 3. Should S3/backup and remote-content clients share a generation-keyed
    credential cache, or should each subsystem own its own cache?
+
+## Secret-store qualification
+
+`zig build secrets-test` is a required CI gate. It combines the common resolver
+and encrypted record tests, distributed/serverless adapter tests, the Lite host
+lifecycle, and the `native-secret-lifecycle` VOPR scenario. Lite coverage uses the
+real `.aflite` host API and live resolver, including rotation, unavailable keys,
+read-only reopen, stable snapshots, concurrent writers, ambiguous sync fencing,
+tamper rejection, and the existing backup/import isolation rules.
+
+The VOPR scenario maintains an independent value/revision model while driving
+production Lite, standalone file, filesystem object-store CAS, and encrypted
+delivery implementations through deterministic `VoprIo`. Every fault is forced
+at least once in the bounded test; seeded histories explore different orderings.
+It covers competing/stale writers, lost acknowledgements before and after
+publication, key rotation, corruption, replayed delivery responses, denied grants,
+partitions, Lite sync failures, and crash/reopen. After an uncertain write the
+model permits only the complete old or complete new state; it checks that the
+adapter never retries the mutation. Every history is exactly replayed. This is
+not a virtual metadata Raft cluster: quorum routing and elections are exercised
+by the real-process suite below.
+
+`e2e/antfly/test_secrets.py` starts production standalone, three-node metadata
+plus data, and two-worker serverless deployments. A local OpenAI-compatible
+provider records the Authorization header used by real background enrichment.
+The suite checks native precedence, rotation, restart, deletion revealing file
+and environment fallback, key failure, metadata-only API responses, serverless
+admin authentication, concurrent writers, follower writes, metadata leader death
+and catch-up, read-only data nodes, delivery credential revocation, and metadata
+outage. The storage-owner ABI borrows the process resolver before any table opens;
+this is necessary for background enrichment to see the same native store as the
+public API. A cached bearer header must match the newly resolved value even if
+source generations collide.
+
+Run from `zig/`:
+
+```sh
+zig build antfly secrets-test vopr-build
+uv run --project e2e/antfly pytest -q e2e/antfly/test_secrets.py -m 'not objectstore_integration'
+python3 ../scripts/ci/zig_vopr_soak.py --binary zig-out/bin/vopr run \
+  --scenario secrets --histories 100 --seed 6195175 \
+  --corpus /tmp/secret-corpus --output /tmp/secret-campaign
+```
+
+The base E2E suite discovers these local tests. Nightly VOPR runs 1,000 secret
+histories per exploration-policy shard and retains replay traces and corpora.
+The separate `Zig secret store cloud qualification` workflow runs weekly or on
+manual dispatch once repository variable `SECRET_STORE_CLOUD_QUALIFICATION=true`
+is set. It runs trusted `main` code using the `secret-store-qualification`
+environment. Configure its variables `SECRET_STORE_S3_BUCKET`,
+`SECRET_STORE_GCS_BUCKET`, `SECRET_STORE_AWS_REGION`, and secrets
+`SECRET_STORE_AWS_ACCESS_KEY_ID`, `SECRET_STORE_AWS_SECRET_ACCESS_KEY`, optional
+`SECRET_STORE_AWS_SESSION_TOKEN`, and `SECRET_STORE_GCS_SERVICE_ACCOUNT_JSON`.
+Use dedicated test buckets and narrowly scoped credentials. The enabled workflow
+fails if settings are absent rather than silently skipping either provider.
+
+For local cloud qualification set `OBJECTSTORE_S3_INTEGRATION=1` and/or
+`OBJECTSTORE_GCS_INTEGRATION=1`, the corresponding `OBJECTSTORE_*_TEST_BUCKET`,
+and the normal object-store credentials; run the same pytest file with
+`-m objectstore_integration`. Each test uses a unique `antfly-secret-e2e/` prefix,
+checks concurrent conditional publication from separate workers and restart
+visibility, and removes its native overrides. Encrypted empty-head objects may
+remain: apply a lifecycle expiration policy to that test prefix. Cloud tests
+are skipped in ordinary developer/PR runs; filesystem and HTTP mock coverage
+must not be reported as real S3/GCS qualification.

@@ -25,66 +25,12 @@ const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const tables_api = @import("tables.zig");
-const runtime_io_abi = @import("../runtime_io_abi.zig");
+const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 
 /// One absolute monotonic budget shared by snapshot capture and all CPU-side
 /// routing work that follows it. The periodic checkpoint keeps large catalog
 /// scans interruptible without putting a clock read on every range.
-pub const RoutingBudget = struct {
-    deadline_ns: ?u64 = null,
-    io: ?runtime_io_abi.Borrow = null,
-
-    const checkpoint_stride: usize = 64;
-
-    pub fn init(deadline_ns: ?u64) RoutingBudget {
-        return .{ .deadline_ns = deadline_ns };
-    }
-
-    pub fn initIo(deadline_ns: ?u64, io: ?std.Io) RoutingBudget {
-        return .{ .deadline_ns = deadline_ns, .io = if (io) |value| runtime_io_abi.Borrow.init(&value) else null };
-    }
-
-    pub fn nowNs(self: RoutingBudget) u64 {
-        const borrow = self.io orelse return platform_time.monotonicNs();
-        var receiver = borrow.receive() catch @panic("incompatible routing clock ABI");
-        return @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds));
-    }
-
-    /// Translate a deadline into this budget's clock without extending it.
-    /// Threaded .awake and native MONOTONIC have different epochs on Darwin.
-    pub fn deadlineFrom(self: RoutingBudget, source: RoutingBudget) ?u64 {
-        const deadline = source.deadline_ns orelse return null;
-        if (self.io) |target| {
-            if (source.io) |origin| {
-                if (target.userdata == origin.userdata and target.vtable == origin.vtable and target.dispatch == origin.dispatch)
-                    return deadline;
-            }
-        } else if (source.io == null) return deadline;
-        // Sample the destination first so time spent translating cannot
-        // extend the caller's budget. Expired budgets remain expired.
-        const target_now = self.nowNs();
-        return target_now +| (deadline -| source.nowNs());
-    }
-
-    pub fn sleepNs(self: RoutingBudget, duration_ns: u64) !void {
-        if (self.io) |borrow| {
-            var receiver = try borrow.receive();
-            try receiver.io().sleep(.fromNanoseconds(duration_ns), .awake);
-        } else {
-            platform_clock.Clock.real().sleepMs(@max(@as(u64, 1), duration_ns / std.time.ns_per_ms));
-        }
-    }
-
-    pub fn checkpoint(self: RoutingBudget) !void {
-        if (self.deadline_ns) |deadline| {
-            if (self.nowNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        }
-    }
-
-    pub fn checkpointIndex(self: RoutingBudget, index: usize) !void {
-        if (index % checkpoint_stride == 0) try self.checkpoint();
-    }
-};
+pub const RoutingBudget = @import("routing_budget.zig").RoutingBudget;
 
 /// Narrow a fence in its own clock domain. A timestamp and its clock are one
 /// budget; callers must never compare raw timestamps from different clocks.
@@ -142,6 +88,8 @@ pub const CatalogSource = struct {
     }
 
     pub const VTable = struct {
+        restore_scope_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[32]u8 = null,
+        restore_plan_for_group: ?*const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64) anyerror!?[16]u8 = null,
         /// Snapshot slices and all transitively referenced bytes must remain
         /// valid until the matching `free_admin_snapshot` call returns.
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
@@ -193,6 +141,14 @@ pub const CatalogSource = struct {
 
     pub fn adminSnapshot(self: CatalogSource) !metadata_api.AdminSnapshot {
         return try self.vtable.admin_snapshot(self.ptr);
+    }
+
+    pub fn restoreScopeForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return if (self.vtable.restore_scope_for_group) |callback| try callback(self.ptr, table_name, group_id) else null;
+    }
+
+    pub fn restorePlanForGroup(self: CatalogSource, table_name: []const u8, group_id: u64) !?[16]u8 {
+        return if (self.vtable.restore_plan_for_group) |callback| try callback(self.ptr, table_name, group_id) else null;
     }
 
     pub fn freeAdminSnapshot(self: CatalogSource, snapshot: *metadata_api.AdminSnapshot) void {
@@ -652,6 +608,8 @@ pub const RoutingSession = struct {
     }
 
     const vtable: CatalogSource.VTable = .{
+        .restore_scope_for_group = restoreScopeForGroup,
+        .restore_plan_for_group = restorePlanForGroup,
         .admin_snapshot = adminSnapshot,
         .free_admin_snapshot = freeAdminSnapshot,
         .routing_snapshot = routingSnapshot,
@@ -669,6 +627,14 @@ pub const RoutingSession = struct {
 
     fn cast(ptr: *anyopaque) *RoutingSession {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    fn restoreScopeForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[32]u8 {
+        return cast(ptr).base.restoreScopeForGroup(table_name, group_id);
+    }
+
+    fn restorePlanForGroup(ptr: *anyopaque, table_name: []const u8, group_id: u64) !?[16]u8 {
+        return cast(ptr).base.restorePlanForGroup(table_name, group_id);
     }
 
     fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -1735,10 +1701,10 @@ pub fn validatePinnedGroupTopologyUntil(
     if (actual_epoch != expected_epoch) return error.TopologyChanged;
 }
 
-/// Transactions may not straddle a split or merge. The transition record is
-/// published before range cutover, so checking it in addition to the range
-/// epoch closes the prepare-to-cutover window where durable intents could
-/// otherwise be left on the previous owner.
+/// Ordinary transitions exclude transactions throughout their lifetime. Online
+/// merges retain committed effects while copying and close admission only at
+/// freeze. Their native fence drains prepared participants before the final
+/// tail/cutover, including callers with a stale pre-freeze catalog snapshot.
 pub fn validateTransactionTopologyStable(
     catalog: CatalogSource,
     table_name: []const u8,
@@ -1769,6 +1735,7 @@ fn validateTransactionTopologyStableSnapshot(
     }
     for (snapshot.merge_transitions) |transition| {
         if (!transitionPhaseActive(transition.phase)) continue;
+        if (onlineMergeAllowsTransactions(transition)) continue;
         if (transition.table_contract.table_id == table.table_id or
             std.mem.eql(u8, transition.table_contract.table_name, table.name))
         {
@@ -1781,6 +1748,18 @@ fn validateTransactionTopologyStableSnapshot(
             return error.TopologyChanged;
         }
     }
+}
+
+fn onlineMergeAllowsTransactions(transition: metadata_transition_state.MergeTransitionRecord) bool {
+    const online = transition.online orelse return false;
+    switch (online.phase) {
+        .admit, .publish, .snapshot, .tail => {},
+        else => return false,
+    }
+    // The exception belongs to an authenticated admitted merge attempt, not
+    // merely an online-looking phase on an ordinary or mismatched record.
+    online.validateRecord(transition) catch return false;
+    return online.scope.authority == .raft and online.scope.fence.role == .merge_source;
 }
 
 fn transitionPhaseActive(phase: metadata_transition_state.TransitionPhase) bool {
@@ -1965,11 +1944,13 @@ pub const TableGroupDescriptorProjection = struct {
     schema_json: []u8,
     indexes_json: []u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
+    initial_range: ?@import("../storage/byte_range.zig").ByteRange = null,
     restore: ?@import("../storage/restore_identity.zig").Identity = null,
 
     pub fn deinit(self: *TableGroupDescriptorProjection, alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
         alloc.free(self.indexes_json);
+        @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, self.initial_range);
         if (self.restore) |*identity| identity.deinit(alloc);
         self.* = undefined;
     }
@@ -1986,6 +1967,20 @@ pub fn tableGroupDescriptorProjection(
     group_id: u64,
     deadline_ns: ?u64,
 ) !?TableGroupDescriptorProjection {
+    return tableGroupDescriptorProjectionControlled(alloc, catalog, table_name, group_id, catalog.budget(deadline_ns));
+}
+
+/// One catalog-clock budget covers eventual capture, authoritative miss
+/// confirmation, and projection. Cancellation prevents admission after a
+/// completed capture; the original deadline bounds capture I/O itself.
+pub fn tableGroupDescriptorProjectionControlled(
+    alloc: std.mem.Allocator,
+    catalog: CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    budget: RoutingBudget,
+) !?TableGroupDescriptorProjection {
+    try budget.checkpoint();
     // Catalog-wide routing intentionally strips schema and index payloads.
     // A first-party point projection is bounded to one table and therefore
     // carries the complete physical definition needed by the storage owner.
@@ -1995,8 +1990,10 @@ pub fn tableGroupDescriptorProjection(
     if (catalog.vtable.table_routing_snapshot) |capture| {
         if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
             return error.CatalogRoutingUnavailable;
-        var snapshot = try capture(catalog.ptr, table_name, deadline_ns);
+        try budget.checkpoint();
+        var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);
         defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+        try budget.checkpoint();
         if (try descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id)) |projection|
             return projection;
     }
@@ -2007,8 +2004,10 @@ pub fn tableGroupDescriptorProjection(
     if (catalog.vtable.linearizable_table_routing_snapshot) |capture| {
         if (catalog.vtable.free_routing_snapshot == unsupportedFreeRoutingSnapshot)
             return error.CatalogRoutingUnavailable;
-        var snapshot = try capture(catalog.ptr, table_name, deadline_ns);
+        try budget.checkpoint();
+        var snapshot = try capture(catalog.ptr, table_name, budget.deadline_ns);
         defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
+        try budget.checkpoint();
         if (try descriptorProjectionFromRoutingSnapshot(alloc, snapshot, table_name, group_id)) |projection|
             return projection;
     }
@@ -2017,15 +2016,17 @@ pub fn tableGroupDescriptorProjection(
     // diagnostic read. Its scheduler keeps the debt until the point projection
     // is ready. Explicit split/restore structural admission retains the full
     // lifecycle fallback below.
-    if (deadline_ns != null) return error.CatalogRoutingUnavailable;
+    if (budget.deadline_ns != null) return error.CatalogRoutingUnavailable;
 
     // A split destination does not become an active routing range until
     // cutover, but its immutable descriptor is already captured in the
     // replicated transition contract. Consult the full lifecycle projection
     // only on this compact-routing miss; ordinary owner opens stay independent
     // of the much larger administrative/runtime status snapshot.
+    try budget.checkpoint();
     var admin = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&admin);
+    try budget.checkpoint();
     if (findTableByName(admin.tables, table_name)) |table| {
         for (admin.ranges) |range| {
             if (range.table_id != table.table_id or range.group_id != group_id) continue;
@@ -2037,6 +2038,7 @@ pub fn tableGroupDescriptorProjection(
                 table.schema_json,
                 table.indexes_json,
                 table.storage,
+                .{ .start = range.start_key, .end = range.end_key orelse "" },
                 restoreIdentityFromRange(range),
             );
         }
@@ -2057,6 +2059,7 @@ pub fn tableGroupDescriptorProjection(
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
             null,
+            null, // The replicated split bootstrap owns its initial range.
             null,
         );
     }
@@ -2076,6 +2079,7 @@ pub fn tableGroupDescriptorProjection(
             transition.table_contract.schema_json,
             transition.table_contract.indexes_json,
             null,
+            null, // The replicated merge bootstrap owns its initial range.
             null,
         );
     }
@@ -2099,6 +2103,7 @@ fn descriptorProjectionFromRoutingSnapshot(
             table.schema_json,
             table.indexes_json,
             table.storage,
+            .{ .start = range.start_key, .end = range.end_key orelse "" },
             restoreIdentityFromRange(range),
         );
     }
@@ -2113,15 +2118,19 @@ fn descriptorProjectionFromValues(
     schema_json: []const u8,
     indexes_json: []const u8,
     table_storage: ?@import("../common/table_storage.zig").Settings,
+    initial_range: ?@import("../storage/byte_range.zig").ByteRange,
     restore: ?@import("../storage/restore_identity.zig").Identity,
 ) !TableGroupDescriptorProjection {
     const owned_schema_json = try alloc.dupe(u8, schema_json);
     errdefer alloc.free(owned_schema_json);
+    const owned_initial_range = try @import("../storage/kernel_owner_descriptor.zig").cloneInitialRange(alloc, initial_range);
+    errdefer @import("../storage/kernel_owner_descriptor.zig").freeInitialRange(alloc, owned_initial_range);
     const owned_indexes_json = try alloc.dupe(u8, indexes_json);
     errdefer alloc.free(owned_indexes_json);
     return .{
         .table_id = table_id,
         .table_storage = table_storage,
+        .initial_range = owned_initial_range,
         .doc_identity_shard_id = doc_identity_shard_id,
         .doc_identity_range_id = doc_identity_range_id,
         .schema_json = owned_schema_json,
@@ -3514,6 +3523,93 @@ fn consumerTests() type {
                 .free_admin_snapshot = Source.free,
             } };
             try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "docs"));
+        }
+
+        test "distributed txn topology admits online copy but fences freeze cancellation and stale epochs" {
+            const Source = struct {
+                fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+                    return @as(*metadata_api.AdminSnapshot, @ptrCast(@alignCast(ptr))).*;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            var tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 1, .name = "rows" }};
+            var ranges = [_]metadata_table_manager.RangeRecord{
+                .{ .table_id = 1, .group_id = 2, .range_id = 4, .start_key = "", .end_key = "m" },
+                .{ .table_id = 1, .group_id = 3, .range_id = 5, .start_key = "m", .end_key = null },
+            };
+            const initial: metadata_transition_state.MergeTransitionRecord = .{
+                .transition_id = 9,
+                .donor_group_id = 2,
+                .receiver_group_id = 3,
+                .table_contract = .{ .table_id = 1, .table_name = "rows", .source_identity = .{ .shard_id = 2, .range_id = 4 }, .target_identity = .{ .shard_id = 3, .range_id = 5 } },
+                .online = .{ .scope = .{
+                    .fence = .{ .transition_id = 9, .attempt = 1, .peer_group_id = 3, .owner_group_id = 2, .role = .merge_source, .namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 4 }, .catalog_digest = @splat(7) },
+                    .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 5 },
+                    .consumer_epoch = 6,
+                    .copy_attempt = .{ .donor_term = 8, .sequence = 1 },
+                } },
+            };
+            var merges = [_]metadata_transition_state.MergeTransitionRecord{initial};
+            var snapshot: metadata_api.AdminSnapshot = .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &tables,
+                .ranges = &ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &merges,
+            };
+            const source: CatalogSource = .{ .ptr = &snapshot, .vtable = &.{ .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.free } };
+            const epoch = try transactionTopologyEpoch(std.testing.allocator, source, "rows");
+            inline for (std.meta.tags(@import("../metadata/online_merge.zig").Phase)) |phase| {
+                merges[0] = initial;
+                merges[0].online.?.phase = phase;
+                if (phase != .admit and phase != .publish) {
+                    merges[0].online.?.certificate = .{ .cut = .{ .namespace = initial.online.?.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
+                    merges[0].online.?.acknowledged = 11;
+                }
+                if (phase == .final_tail or phase == .cutover or phase == .release or phase == .complete) {
+                    merges[0].online.?.final_sequence = 11;
+                    merges[0].online.?.final_applied_index = 25;
+                    merges[0].online.?.final_cut_digest = @splat(9);
+                }
+                if (phase == .complete) merges[0].phase = .finalized;
+                if (phase == .cancelled) merges[0].phase = .rolled_back;
+                try merges[0].online.?.validateRecord(merges[0]);
+                switch (phase) {
+                    .admit, .publish, .snapshot, .tail, .complete, .cancelled => {
+                        try validateTransactionTopologyStable(source, "rows");
+                        try validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch);
+                        var routing = (try transactionRoutingSnapshot(std.testing.allocator, source, "rows")).?;
+                        defer routing.deinit(std.testing.allocator);
+                        try std.testing.expectEqual(epoch, routing.topology_epoch);
+                        try std.testing.expectEqual(@as(?u64, 2), routing.resolveGroupForKey("a"));
+                        try std.testing.expectEqual(@as(?u64, 3), routing.resolveGroupForKey("z"));
+                    },
+                    else => {
+                        try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+                        try std.testing.expectError(error.TopologyChanged, transactionTopologyEpoch(std.testing.allocator, source, "rows"));
+                        try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch));
+                        try std.testing.expectError(error.TopologyChanged, transactionRoutingSnapshot(std.testing.allocator, source, "rows"));
+                    },
+                }
+            }
+            merges[0] = initial;
+            merges[0].online = null;
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+            merges[0] = initial;
+            merges[0].online.?.scope.fence.transition_id += 1;
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+            merges[0] = initial;
+            merges[0].online.?.phase = .snapshot; // No immutable certificate.
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
+            merges[0] = initial;
+            ranges[0].end_key = "n";
+            ranges[1].start_key = "n";
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyEpoch(std.testing.allocator, source, "rows", epoch));
+            var splits = [_]metadata_transition_state.SplitTransitionRecord{.{ .transition_id = 10, .attempt_epoch = 1, .source_group_id = 2, .destination_group_id = 4, .table_contract = .{ .table_id = 1, .table_name = "rows" } }};
+            snapshot.split_transitions = &splits;
+            try std.testing.expectError(error.TopologyChanged, validateTransactionTopologyStable(source, "rows"));
         }
 
         test "catalog source resolves a single-range table group" {

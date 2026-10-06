@@ -16,6 +16,7 @@ pub const allocator = @import("allocator.zig");
 pub const atomic = @import("atomic.zig");
 pub const clock = @import("clock.zig");
 pub const env = @import("env.zig");
+pub const entropy = @import("entropy.zig");
 pub const filesystem = @import("filesystem.zig");
 pub const inference_process_supervisor = @import("inference_process_supervisor.zig");
 pub const one_shot_process = @import("one_shot_process.zig");
@@ -23,3 +24,9 @@ pub const process = @import("process.zig");
 pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");
+
+/// Linux fiber backend adapted to the pinned Zig release Io interface.
+pub const Evented = if (@import("builtin").os.tag == .linux and @import("std").Io.fiber.supported)
+    @import("io_uring_compat.zig")
+else
+    @import("std").Io.Evented;

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 
 pub const GroupDbPathResolver = struct {
@@ -127,7 +127,7 @@ const DbRuntimeHandle = struct {
         }
     }
 
-    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+    pub fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.db) |db| {
             db.close();

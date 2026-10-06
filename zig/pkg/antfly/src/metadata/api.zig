@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metadata_state = @import("state.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const extension_domain = @import("../extensions/mod.zig");
@@ -26,25 +26,15 @@ const transition_state = @import("transition_state.zig");
 const metadata_incarnation = @import("incarnation.zig");
 const reallocation_request = @import("reallocation_request.zig");
 
-pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
+pub const MetadataClusterIncarnation = @import("catalog_mutation_stamp.zig").MetadataClusterIncarnation;
+
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
 /// Authoritative ordering stamp for one consensus-committed catalog mutation.
 /// The Raft log index is comparable only inside the same metadata namespace;
 /// carrying that namespace with the receipt prevents delayed callbacks from a
 /// replaced metadata group from superseding current control-plane work.
-pub const CatalogMutationStamp = struct {
-    metadata_group_id: u64,
-    metadata_incarnation: MetadataClusterIncarnation,
-    term: u64,
-    index: u64,
-
-    pub fn eql(lhs: CatalogMutationStamp, rhs: CatalogMutationStamp) bool {
-        return lhs.metadata_group_id == rhs.metadata_group_id and
-            std.mem.eql(u8, &lhs.metadata_incarnation, &rhs.metadata_incarnation) and
-            lhs.term == rhs.term and lhs.index == rhs.index;
-    }
-};
+pub const CatalogMutationStamp = @import("catalog_mutation_stamp.zig").CatalogMutationStamp;
 
 /// Allocation-free subset of `/status` used by rolling-upgrade admission
 /// probes. Keeping this separate from MetadataStatus avoids parsing and
@@ -185,10 +175,20 @@ pub const MetadataStatus = struct {
 
 /// Detach the only borrowed field from JSON parser and HTTP response storage.
 /// Unknown roles fail closed and remain compatible with older clients.
-pub fn stabilizeMetadataStatus(
-    status: MetadataStatus,
-) MetadataStatus {
+pub fn stabilizeMetadataStatus(status: MetadataStatus) MetadataStatus {
     var stable = status;
+    stable.metadata_raft_role = stableMetadataRaftRole(status.metadata_raft_role);
+    return stable;
+}
+
+/// Preserve the topology wire type while detaching its borrowed role string.
+pub fn stabilizeMetadataRuntimeTopology(topology: MetadataRuntimeTopology) MetadataRuntimeTopology {
+    var stable = topology;
+    stable.metadata_raft_role = stableMetadataRaftRole(topology.metadata_raft_role);
+    return stable;
+}
+
+fn stableMetadataRaftRole(value: []const u8) []const u8 {
     const stable_roles = [_][]const u8{
         "absent",
         "unknown",
@@ -199,13 +199,9 @@ pub fn stabilizeMetadataStatus(
         "leader",
     };
     for (stable_roles) |role| {
-        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
-            stable.metadata_raft_role = role;
-            return stable;
-        }
+        if (std.mem.eql(u8, role, value)) return role;
     }
-    stable.metadata_raft_role = "unknown";
-    return stable;
+    return "unknown";
 }
 
 pub const MetadataHead = struct {
@@ -260,7 +256,17 @@ pub const ReplicationSourceActionHint = struct {
     reseed_exact_cutover_path: []u8,
 };
 
+/// Internal admission result. A successful response means the current
+/// metadata membership has durably activated the store-root UUID decoder.
+pub const StoreRootReadiness = struct {
+    activated_version: u16,
+};
+
 pub const AdminSnapshot = struct {
+    /// Compact observational peer view. Never substitutes for a catalog view.
+    peer_view: bool = false,
+    planning_view: bool = false,
+    peer_view_revision: [32]u8 = @splat(0),
     status: MetadataStatus,
     reallocation_request: ?reallocation_request.ReallocationRequestRecord = null,
     tables: []table_manager.TableRecord,
@@ -376,90 +382,18 @@ pub const CatalogRouteQuery = struct {
     group_id: u64 = 0,
 };
 
-pub const CatalogIdentityNamespace = struct {
-    table_id: u64,
-    shard_id: u64,
-    range_id: u64,
-};
-
-pub const CatalogGroupRoute = struct {
-    group_id: u64,
-    range_id: u64,
-    identity_namespace: CatalogIdentityNamespace,
-};
-
-pub const catalog_route_fence_protocol_current: u16 = 1;
-pub const catalog_route_fence_header = "X-Antfly-Catalog-Route-Fence";
-pub const catalog_route_fence_ack_header = "X-Antfly-Catalog-Route-Fence-Ack";
-pub const catalog_route_fence_ack_value = "1";
-pub const catalog_route_deadline_ms_header = "X-Antfly-Catalog-Route-Deadline-Ms";
-pub const catalog_route_default_deadline_ms: u32 = 5_000;
-pub const catalog_route_max_deadline_ms: u32 = 30_000;
-
-/// Immutable authority and identity carried with every first-party
-/// group-local read. The receiver validates this against its compact routing
-/// projection before opening storage, so an independently cached admin
-/// snapshot can never select a different table generation.
-pub const CatalogRouteFence = struct {
-    protocol: u16 = catalog_route_fence_protocol_current,
-    metadata_group_id: u64,
-    metadata_incarnation: ?MetadataClusterIncarnation = null,
-    catalog_revision: u64,
-    table_id: u64,
-    topology_epoch: u64,
-    route: CatalogGroupRoute,
-    /// Receiver-local admission context. These fields are intentionally
-    /// excluded from the wire representation: monotonic clocks and borrowed
-    /// cancellation callbacks are process-local capabilities.
-    admission_deadline_ns: ?u64 = null,
-    admission_deadline_io: ?@import("../runtime_io_abi.zig").Borrow = null,
-    admission_cancellation: CancellationToken = .none,
-
-    const Wire = struct {
-        protocol: u16 = catalog_route_fence_protocol_current,
-        metadata_group_id: u64,
-        metadata_incarnation: ?MetadataClusterIncarnation = null,
-        catalog_revision: u64,
-        table_id: u64,
-        topology_epoch: u64,
-        route: CatalogGroupRoute,
-    };
-
-    fn wire(self: @This()) Wire {
-        return .{
-            .protocol = self.protocol,
-            .metadata_group_id = self.metadata_group_id,
-            .metadata_incarnation = self.metadata_incarnation,
-            .catalog_revision = self.catalog_revision,
-            .table_id = self.table_id,
-            .topology_epoch = self.topology_epoch,
-            .route = self.route,
-        };
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.write(self.wire());
-    }
-
-    pub fn jsonParse(alloc: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(Wire, alloc, source, options);
-        return .{
-            .protocol = value.protocol,
-            .metadata_group_id = value.metadata_group_id,
-            .metadata_incarnation = value.metadata_incarnation,
-            .catalog_revision = value.catalog_revision,
-            .table_id = value.table_id,
-            .topology_epoch = value.topology_epoch,
-            .route = value.route,
-        };
-    }
-
-    pub fn validate(self: @This()) !void {
-        if (self.protocol != catalog_route_fence_protocol_current) return error.UnsupportedCatalogRouteFence;
-        if (self.metadata_group_id == 0 or self.table_id == 0 or self.route.group_id == 0) return error.InvalidCatalogRouteFence;
-        if (self.route.identity_namespace.table_id != self.table_id) return error.InvalidCatalogRouteFence;
-    }
-};
+pub const CatalogIdentityNamespace = @import("catalog_route_contract.zig").CatalogIdentityNamespace;
+pub const CatalogGroupRoute = @import("catalog_route_contract.zig").CatalogGroupRoute;
+pub const catalog_route_fence_protocol_current = @import("catalog_route_contract.zig").catalog_route_fence_protocol_current;
+pub const catalog_route_fence_header = @import("catalog_route_contract.zig").catalog_route_fence_header;
+pub const catalog_route_fence_ack_header = @import("catalog_route_contract.zig").catalog_route_fence_ack_header;
+pub const catalog_route_fence_ack_value = @import("catalog_route_contract.zig").catalog_route_fence_ack_value;
+pub const read_index_absence_header = @import("catalog_route_contract.zig").read_index_absence_header;
+pub const read_index_absence_value = @import("catalog_route_contract.zig").read_index_absence_value;
+pub const catalog_route_deadline_ms_header = @import("catalog_route_contract.zig").catalog_route_deadline_ms_header;
+pub const catalog_route_default_deadline_ms = @import("catalog_route_contract.zig").catalog_route_default_deadline_ms;
+pub const catalog_route_max_deadline_ms = @import("catalog_route_contract.zig").catalog_route_max_deadline_ms;
+pub const CatalogRouteFence = @import("catalog_route_contract.zig").CatalogRouteFence;
 
 pub const CatalogRoutePlan = struct {
     metadata_group_id: u64,
@@ -598,7 +532,7 @@ pub const CatalogProjectionIndex = struct {
             self.table_name_indexes.putAssumeCapacity(table.name, index);
             self.table_topologies.putAssumeCapacity(table.table_id, .{
                 .range_count = 0,
-                .digest = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .digest = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
             });
         }
         for (ranges, 0..) |range, index| {
@@ -788,7 +722,7 @@ pub fn catalogTableTopologyResolution(
     table_id: u64,
     ranges: []const table_manager.RangeRecord,
 ) CatalogTableTopologyResolution {
-    var accumulator = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+    var accumulator = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
     var range_count: u64 = 0;
     var single_group_id: ?u64 = null;
     for (ranges) |range| {
@@ -1184,6 +1118,9 @@ pub fn captureMergeObservations(
     var out = std.ArrayListUnmanaged(transition_state.MergeObservationRecord).empty;
     errdefer out.deinit(alloc);
     for (merge_transitions) |record| {
+        // The online controller's durable state is already in the transition
+        // record. Ordinary runtime observations are not its authority.
+        if (record.online != null) continue;
         const observation = (source.observeMergeTransition(record.transition_id) catch |err| {
             std.log.warn("merge transition snapshot observation failed transition_id={d} err={s}", .{ record.transition_id, @errorName(err) });
             continue;
@@ -1308,7 +1245,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(records);
         }
 
-        fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
+        pub fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
             const records = try alloc.alloc(table_manager.StoreRecord, 1);
             const group_statuses = try alloc.alloc(table_manager.GroupStatusReport, 1);
             group_statuses[0] = .{
@@ -1336,7 +1273,7 @@ test "metadata admin snapshot captures projected metadata state" {
             return records;
         }
 
-        fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
+        pub fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
             for (records) |record| table_manager.freeStore(alloc, record);
             alloc.free(records);
         }
@@ -1355,7 +1292,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(intents);
         }
 
-        fn listLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator) ![]raft_host.BootstrapStatus {
+        pub fn listLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator) ![]raft_host.BootstrapStatus {
             const statuses = try alloc.alloc(raft_host.BootstrapStatus, 1);
             statuses[0] = .{
                 .group_id = 10,
@@ -1370,7 +1307,7 @@ test "metadata admin snapshot captures projected metadata state" {
             return statuses;
         }
 
-        fn freeLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator, statuses: []raft_host.BootstrapStatus) void {
+        pub fn freeLocalBootstrapStatuses(_: @This(), alloc: std.mem.Allocator, statuses: []raft_host.BootstrapStatus) void {
             for (statuses) |bootstrap_status| {
                 if (bootstrap_status.last_error) |msg| alloc.free(msg);
                 if (bootstrap_status.backup_id) |value| alloc.free(value);
@@ -1379,7 +1316,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(statuses);
         }
 
-        fn listProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator) ![]table_manager.RestoreProgressRecord {
+        pub fn listProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator) ![]table_manager.RestoreProgressRecord {
             const records = try alloc.alloc(table_manager.RestoreProgressRecord, 1);
             records[0] = .{
                 .table_id = 1,
@@ -1390,12 +1327,12 @@ test "metadata admin snapshot captures projected metadata state" {
             return records;
         }
 
-        fn freeProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator, records: []table_manager.RestoreProgressRecord) void {
+        pub fn freeProjectedRestoreProgress(_: @This(), alloc: std.mem.Allocator, records: []table_manager.RestoreProgressRecord) void {
             for (records) |record| table_manager.freeRestoreProgress(alloc, record);
             alloc.free(records);
         }
 
-        fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
+        pub fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
             const records = try alloc.alloc(table_manager.ReplicationSourceStatusRecord, 1);
             records[0] = .{
                 .table_id = 1,
@@ -1423,7 +1360,7 @@ test "metadata admin snapshot captures projected metadata state" {
             return records;
         }
 
-        fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
+        pub fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
             for (records) |record| table_manager.freeReplicationSourceStatus(alloc, record);
             alloc.free(records);
         }
@@ -1459,7 +1396,7 @@ test "metadata admin snapshot captures projected metadata state" {
             alloc.free(records);
         }
 
-        fn observeSplitTransition(_: @This(), transition_id: u64) !?transition_state.SplitObservation {
+        pub fn observeSplitTransition(_: @This(), transition_id: u64) !?transition_state.SplitObservation {
             if (transition_id != 9001) return null;
             return .{
                 .status = .{
@@ -1476,7 +1413,7 @@ test "metadata admin snapshot captures projected metadata state" {
             };
         }
 
-        fn observeMergeTransition(_: @This(), transition_id: u64) !?transition_state.MergeObservation {
+        pub fn observeMergeTransition(_: @This(), transition_id: u64) !?transition_state.MergeObservation {
             if (transition_id != 9002) return null;
             return .{
                 .donor = .{
@@ -1631,12 +1568,12 @@ test "metadata admin snapshot derives replication source action hints for reseed
             alloc.free(records);
         }
 
-        fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
+        pub fn listProjectedStores(_: @This(), alloc: std.mem.Allocator) ![]table_manager.StoreRecord {
             const records = try alloc.alloc(table_manager.StoreRecord, 0);
             return records;
         }
 
-        fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
+        pub fn freeProjectedStores(_: @This(), alloc: std.mem.Allocator, records: []table_manager.StoreRecord) void {
             alloc.free(records);
         }
 
@@ -1649,7 +1586,7 @@ test "metadata admin snapshot derives replication source action hints for reseed
             alloc.free(records);
         }
 
-        fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
+        pub fn listProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator) ![]table_manager.ReplicationSourceStatusRecord {
             const records = try alloc.alloc(table_manager.ReplicationSourceStatusRecord, 1);
             records[0] = .{
                 .table_id = 9,
@@ -1664,7 +1601,7 @@ test "metadata admin snapshot derives replication source action hints for reseed
             return records;
         }
 
-        fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
+        pub fn freeProjectedReplicationSourceStatuses(_: @This(), alloc: std.mem.Allocator, records: []table_manager.ReplicationSourceStatusRecord) void {
             for (records) |record| table_manager.freeReplicationSourceStatus(alloc, record);
             alloc.free(records);
         }

@@ -29,6 +29,7 @@ const eval_gliner2_autodiff_adapter_dataset = @import("../tools/eval_gliner2_aut
 const eval_gliner2_boundary_head = @import("../eval/eval_gliner2_top_layer_boundary_head.zig");
 const eval_gliner2_boundary_task_head = @import("../eval/eval_gliner2_top_layer_boundary_task_head.zig");
 const eval_reranker_checkpoint = @import("../eval/eval_reranker_checkpoint.zig");
+const eval_laya = @import("../eval/eval_laya.zig");
 const generate_gemma4_multimodal_pilot_dataset = @import("../tools/generate_gemma4_multimodal_pilot_dataset.zig");
 const generate_gemma4_pilot_dataset = @import("../tools/generate_gemma4_pilot_dataset.zig");
 const inspect_colqwen2_checkpoint = @import("../tools/inspect_colqwen2_checkpoint.zig").Command(@import("inference_internal"));
@@ -81,6 +82,7 @@ const train_eval_reranker_lora_surrogate_cached = @import("../train/train_eval_r
 const train_eval_reranker_lora_top_layer_cached_surrogate = @import("../train/train_eval_reranker_lora_top_layer_cached_surrogate.zig");
 const train_gliner2_autodiff = @import("../train/train_gliner2_autodiff.zig");
 const train_gliner25 = @import("../train/train_gliner25.zig");
+const train_laya = @import("../train/train_laya.zig");
 
 test {
     _ = train_gliner25;
@@ -100,6 +102,7 @@ const Command = struct {
 };
 
 const commands = [_]Command{
+    .{ .domain = "train", .action = "run", .subject = "laya", .adapter_argv0 = "train-laya", .main_fn = train_laya.main },
     .{ .domain = "train", .action = "run", .subject = "gliner25", .adapter_argv0 = "train-gliner25", .main_fn = train_gliner25.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-pilot", .adapter_argv0 = "generate-gemma4-pilot-dataset", .main_fn = generate_gemma4_pilot_dataset.main },
     .{ .domain = "dataset", .action = "generate", .subject = "gemma4-multimodal-pilot", .adapter_argv0 = "generate-gemma4-multimodal-pilot-dataset", .main_fn = generate_gemma4_multimodal_pilot_dataset.main },
@@ -157,6 +160,7 @@ const commands = [_]Command{
     .{ .domain = "train", .action = "run", .subject = "layoutlmv3-lora-token", .adapter_argv0 = "train-eval-layoutlmv3-lora-token", .main_fn = train_eval_layoutlmv3_lora_token.main },
 
     .{ .domain = "eval", .action = "run", .subject = "reranker-checkpoint", .adapter_argv0 = "eval-reranker-checkpoint", .main_fn = eval_reranker_checkpoint.main },
+    .{ .domain = "eval", .action = "run", .subject = "laya", .adapter_argv0 = "eval-laya", .main_fn = eval_laya.main },
     .{ .domain = "eval", .action = "run", .subject = "fused-chunker", .adapter_argv0 = "eval-fused-chunker", .main_fn = eval_fused_chunker.main },
     .{ .domain = "eval", .action = "run", .subject = "gliner2-adapter", .adapter_argv0 = "eval-gliner2-autodiff-adapter", .main_fn = eval_gliner2_autodiff_adapter.main },
     .{ .domain = "eval", .action = "run", .subject = "gliner2-adapter-dataset", .adapter_argv0 = "eval-gliner2-autodiff-adapter-dataset", .main_fn = eval_gliner2_autodiff_adapter_dataset.main },
@@ -327,18 +331,18 @@ const CommandArguments = struct {
         errdefer for (owned[0..initialized]) |argument| allocator.free(argument);
         const vector = try allocator.alloc([*:0]const u8, count);
         errdefer allocator.free(vector);
-        owned[0] = try allocator.dupeZ(u8, argv0);
+        owned[0] = try allocator.dupeSentinel(u8, argv0, 0);
         initialized += 1;
         vector[0] = owned[0].ptr;
         for (args, 1..) |argument, index| {
-            owned[index] = try allocator.dupeZ(u8, argument);
+            owned[index] = try allocator.dupeSentinel(u8, argument, 0);
             initialized += 1;
             vector[index] = owned[index].ptr;
         }
         return .{ .allocator = allocator, .owned = owned, .vector = vector };
     }
 
-    fn deinit(self: *CommandArguments) void {
+    pub fn deinit(self: *CommandArguments) void {
         for (self.owned) |argument| self.allocator.free(argument);
         self.allocator.free(self.owned);
         self.allocator.free(self.vector);
@@ -387,6 +391,7 @@ fn usage() void {
         \\  antfly inference finetune workflow <workflow> ...
         \\
         \\examples:
+        \\  antfly inference finetune train laya /tmp/laya-job.json
         \\  antfly inference finetune run /tmp/recipe.json
         \\  antfly inference finetune dataset generate gemma4-pilot /tmp/pilot.jsonl --count 1000 --split train
         \\  antfly inference finetune dataset prepare gemma4-lora /models/gemma4 /tmp/pilot.jsonl train /tmp/prepared.json

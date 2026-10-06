@@ -20,24 +20,27 @@ T = TypeVar("T", bound="AntflyChunkerConfig")
 class AntflyChunkerConfig:
     r"""Configuration for the Antfly inference chunking provider.
 
-    Antfly inference is a centralized HTTP service that provides chunking with multi-tier caching.
+    Antfly inference is Antfly's built-in ML service for local chunking.
     The model name maps to ONNX model directory names (similar to how Ollama works).
 
     **Chunking Models:**
     - fixed: Simple fixed-size chunking by token count (built-in, no ONNX required)
     - Any other name will attempt to load from models/chunkers/{name}/ directory
 
-    **Caching:**
-    - L1: Memory cache with 2-minute TTL
-    - L2: Persistent Pebble database
-    - Singleflight deduplication for concurrent identical requests
+    **Deduplication:**
+    - Within a single document write, chunk results are deduplicated when multiple
+      indexes share the same source text and chunker configuration, so the source
+      is chunked at most once per write.
 
         Example:
-            {'provider': 'antfly', 'api_url': 'http://localhost:8080', 'model': 'fixed', 'max_chunks': 50, 'text':
-                {'target_tokens': 500, 'overlap_tokens': 50, 'separator': '\n\n'}}
+            {'provider': 'antfly', 'api_url': 'http://localhost:8080', 'model': 'fixed', 'text': {'target_tokens': 500,
+                'overlap_tokens': 50, 'separator': '\n\n'}}
 
         Attributes:
-            max_chunks (int | Unset): Maximum number of chunks to generate per document.
+            max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (the default when omitted)
+                means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks
+                beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially
+                truncated.
             threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
             text (TextChunkOptions | Unset): Options specific to text chunking.
             audio (AudioChunkOptions | Unset): Options specific to audio chunking.

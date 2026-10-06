@@ -27,6 +27,7 @@ const Allocator = std.mem.Allocator;
 pub const ObjectStorageRangeReader = struct {
     client: object_storage.ObjectStorage,
     retry_policy: RetryPolicy = .{},
+    cancellation: ?object_storage.CancellationToken = null,
 
     pub const RetryPolicy = struct {
         max_attempts: u8 = 1,
@@ -96,13 +97,16 @@ pub const ObjectStorageRangeReader = struct {
         key: []const u8,
         opts: object_storage.GetOptions,
     ) !object_storage.GetResult {
+        var options = opts;
+        if (self.cancellation) |token| options.cancellation = token;
         const max_attempts = self.retry_policy.attempts();
         var attempt: u8 = 0;
         while (true) {
+            if (options.cancellation) |token| try token.check();
             attempt += 1;
             var client = self.client;
             client.allocator = alloc;
-            return client.getObject(bucket, key, opts) catch |err| {
+            return client.getObject(bucket, key, options) catch |err| {
                 if (attempt >= max_attempts or !isRetryableObjectReadError(err)) return err;
                 continue;
             };
@@ -304,7 +308,7 @@ test "object storage range reader validates returned planned object metadata" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
@@ -408,7 +412,7 @@ test "lake object storage range reader validates full object checksums" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
@@ -580,7 +584,7 @@ test "object storage range reader retries transient planned reads only" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
@@ -677,7 +681,7 @@ test "object storage range reader does not retry stale object identity" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }

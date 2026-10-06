@@ -23,6 +23,7 @@ const publication = @import("../../gliner_boundary_export.zig");
 const Control = @import("../../execution_control.zig").InferenceExecutionControl;
 const Identity = @import("../seeded_gradient_trainer.zig").Identity;
 const export_mod = @import("boundary_training_export.zig");
+const teacher_mod = @import("boundary_distillation_teacher.zig");
 const Allocator = std.mem.Allocator;
 const mib = 1024 * 1024;
 
@@ -43,6 +44,19 @@ pub const Tokenization = struct {
     max_queries: usize = 64,
     word_splitter: processor.WordSplitter = .whitespace,
 };
+/// Antenna feature distillation from a frozen GLiNER2.5 checkpoint
+/// (boundary_distillation.zig). The teacher is loaded like a source and
+/// encoded on the CPU; its weights, sidecars and these settings are bound into
+/// the run fingerprint.
+pub const Distillation = struct {
+    teacher_dir: []const u8,
+    expected_teacher: ?bundle.Identity = null,
+    weight: f32 = 1,
+    /// Also train the heads on the rows' labels; pure distillation freezes them.
+    heads: bool = false,
+    /// Fit an identity neck in closed form on the first rows before training.
+    fit: @import("boundary_distillation_fit.zig").Options = .{},
+};
 pub const Config = struct {
     version: u32,
     source_dir: []const u8,
@@ -60,6 +74,7 @@ pub const Config = struct {
     attention_profile: step.AttentionProfile = .materialized_v1,
     activation_profile: step.ActivationProfile = .retained_v1,
     peft: ?peft.Config = null,
+    distillation: ?Distillation = null,
     tokenization: Tokenization = .{},
     capacities: step.Capacities = .{},
     weights: objectives.Weights = .{},
@@ -74,9 +89,24 @@ pub const Config = struct {
     training_limits: limits_mod.Config = .{},
     checkpoint_every_microbatches: u32 = 100,
     timeout_seconds: u32 = 4 * 60 * 60,
-    max_progress_bytes: usize = 64 * mib,
+    /// Cap on `progress.jsonl`. Null sizes it to the run: every remaining
+    /// report at the per-line maximum, so the log can never stop a run early.
+    /// Not part of the run fingerprint; a resume may change it.
+    max_progress_bytes: ?usize = null,
     disk_headroom_bytes: u64 = 256 * mib,
 };
+/// Largest single `progress.jsonl` report line, newline included.
+const max_progress_line = 8192;
+
+/// Bytes for every report left in the run at the per-line maximum. Each
+/// optimizer step takes `accumulation` microbatch reports; the extra one per
+/// step covers end-of-epoch flushes of a partial window.
+fn progressBudget(total_optimizer_steps: u64, accumulation: u32, microbatch_step: u64) !usize {
+    const reports = try std.math.mul(u64, total_optimizer_steps, @as(u64, accumulation) + 1);
+    const remaining = reports -| microbatch_step;
+    return std.math.cast(usize, try std.math.mul(u64, @max(remaining, 1), max_progress_line)) orelse error.BoundaryTrainingProgressLimitExceeded;
+}
+
 pub const Result = struct { version: u32 = 1, status: enum { paused, complete }, identity: Identity, accumulated_microbatches: u32, run_fingerprint: [32]u8, state_sha256: [32]u8, portable_model: ?export_mod.Result = null };
 pub const Execution = struct {
     /// A cooperative pause saves the exact unfinished accumulation window.
@@ -153,7 +183,7 @@ fn pathValid(path: []const u8) bool {
 }
 pub fn validate(config: Config) !void {
     try limits_mod.validate(config.training_limits);
-    if (config.version != 1 or config.checkpoint_every_microbatches == 0 or config.timeout_seconds == 0 or config.max_progress_bytes < 8192 or config.memory.job_bytes < 4 * mib) return error.InvalidBoundaryTrainingJob;
+    if (config.version != 1 or config.checkpoint_every_microbatches == 0 or config.timeout_seconds == 0 or (config.max_progress_bytes != null and config.max_progress_bytes.? < max_progress_line) or config.memory.job_bytes < 4 * mib) return error.InvalidBoundaryTrainingJob;
     if (try std.math.add(usize, config.export_limits.max_scratch_bytes, 4 * mib) > config.memory.job_bytes) return error.BoundaryTrainingRunLimitExceeded;
     for ([_][]const u8{ config.source_dir, config.train_file, config.output_dir }) |path| if (!pathValid(path)) return error.InvalidBoundaryTrainingJobPath;
     for ([_]?[]const u8{ config.calibration_file, config.test_file, config.resume_from }) |path| if (path) |value| if (!pathValid(value)) return error.InvalidBoundaryTrainingJobPath;
@@ -166,6 +196,11 @@ pub fn validate(config: Config) !void {
         try peft.validateConfig(p, .{});
     }
     if (config.expected_source) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
+    if (config.distillation) |value| {
+        if (!pathValid(value.teacher_dir) or !std.math.isFinite(value.weight) or value.weight <= 0 or config.activation_profile != .retained_v1 or
+            !std.math.isFinite(value.fit.ridge) or value.fit.ridge <= 0 or (value.fit.rows != 0 and config.peft != null)) return error.InvalidBoundaryTrainingJob;
+        if (value.expected_teacher) |expected| if (expected.precision != .fp32) return error.QuantizedBoundaryTrainingUnsupported;
+    }
     if (config.memory.host_bytes == 0 or config.memory.backend_bytes == 0 or config.memory.combined_bytes == 0 or config.memory.optimizer_state_bytes == 0 or config.memory.optimizer_transaction_bytes == 0 or config.dataset_limits.max_host_bytes == 0) return error.InvalidBoundaryTrainingJob;
     if (config.execution != .native and (config.memory.backend_metadata_bytes == 0 or config.memory.backend_metadata_bytes >= config.memory.backend_bytes)) return error.InvalidBoundaryTrainingJob;
     if (config.run.batch_size == 0 or config.run.batch_size > 64 or config.tokenization.max_text_words == 0 or config.tokenization.max_sequence_tokens == 0 or config.tokenization.max_queries == 0) return error.InvalidBoundaryTrainingJob;
@@ -242,8 +277,11 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         return error.PathAlreadyExists;
     } else |err| if (err != error.FileNotFound) return err;
     const source_reserved = try source_mod.reservation(io, config.source_dir, config.source_limits, control);
-    const combined = try admissionBytes(config, source_reserved);
-    var lease = try admission.tryAcquire(if (config.execution != .native) .gpu else .cpu, .{ .host_limit_bytes = config.memory.combined_bytes, .backend_limit_bytes = config.memory.backend_bytes, .combined_limit_bytes = config.memory.combined_bytes }, try admissionAmounts(config, source_reserved), true);
+    // A distillation teacher is a second, immutable source owner.
+    const teacher_reserved: usize = if (config.distillation) |value| try source_mod.reservation(io, value.teacher_dir, config.source_limits, control) else 0;
+    const reserved = try std.math.add(usize, source_reserved, teacher_reserved);
+    const combined = try admissionBytes(config, reserved);
+    var lease = try admission.tryAcquire(if (config.execution != .native) .gpu else .cpu, .{ .host_limit_bytes = config.memory.combined_bytes, .backend_limit_bytes = config.memory.backend_bytes, .combined_limit_bytes = config.memory.combined_bytes }, try admissionAmounts(config, reserved), true);
     defer lease.release();
     const scratch = budget.allocator();
     var train = try openDataset(a, config.train_file, config.dataset_limits, .train, control);
@@ -261,6 +299,10 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     source_limits.max_source_bytes = source_reserved;
     const source = try source_mod.Source.open(a, io, config.source_dir, .{ .limits = source_limits, .expected_identity = config.expected_source }, control);
     defer source.deinit();
+    var teacher_limits = config.source_limits;
+    teacher_limits.max_source_bytes = teacher_reserved;
+    const teacher_source: ?*source_mod.Source = if (config.distillation) |value| try source_mod.Source.open(a, io, value.teacher_dir, .{ .limits = teacher_limits, .expected_identity = value.expected_teacher }, control) else null;
+    defer if (teacher_source) |value| value.deinit();
     const tokenization = processor.Options{
         .max_batch_items = config.run.batch_size,
         .max_text_words = config.tokenization.max_text_words,
@@ -270,8 +312,19 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .max_queries = config.tokenization.max_queries,
         .word_splitter = config.tokenization.word_splitter,
     };
-    if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, .{ .gold_capacity = source.config.head.max_gold_per_query }, control, null);
-    if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, .{ .gold_capacity = source.config.head.max_gold_per_query }, control, null);
+    const holdout_targets = @import("boundary_targets.zig").Options{ .gold_capacity = source.config.head.max_gold_per_query, .allow_unsupervised = config.distillation != null };
+    if (calibration) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
+    if (heldout) |*value| try value.preflight(source.tokenizer(), tokenization, holdout_targets, control, null);
+    const trainer_limits = try trainerLimits(config);
+    // The teacher lives in fixed storage; the optional pointer says whether it
+    // was initialized (an optional assigned `undefined` has no defined tag).
+    var teacher_storage: teacher_mod.SourceTeacher = undefined;
+    var teacher: ?*teacher_mod.SourceTeacher = null;
+    if (teacher_source) |value| {
+        try teacher_storage.init(a, value, tokenization, trainer_limits.step.encoder.input, io);
+        teacher = &teacher_storage;
+    }
+    defer if (teacher) |value| value.deinit();
     const calibration_sha256: ?[32]u8 = if (calibration) |value| value.sha256 else null;
     const test_sha256: ?[32]u8 = if (heldout) |value| value.sha256 else null;
     if (calibration) |*value| value.deinit();
@@ -294,7 +347,8 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
         .gold_end = config.gold_end,
         .gold_hold_fraction = config.gold_hold_fraction,
         .require_gold_relation_coverage = config.require_gold_relation_coverage,
-        .limits = try trainerLimits(config),
+        .distillation = if (teacher) |value| .{ .teacher = value.teacher(), .weight = config.distillation.?.weight, .heads = config.distillation.?.heads, .fit = config.distillation.?.fit, .prefetch = io } else null,
+        .limits = trainer_limits,
     }, control);
     defer trainer.deinit();
     const restore_receipt = if (config.resume_from) |path| try trainer.restorePinned(path, config.expected_restore_state_sha256, control) else null;
@@ -302,11 +356,12 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
     defer scratch.free(executable_path);
     const executable_digest = try snapshots.digest(io, std.Io.Dir.cwd(), executable_path, 1024 * mib, control);
     const checkpoint_bytes = try checkpointSize(trainer);
+    const progress_budget = config.max_progress_bytes orelse try progressBudget(trainer.run_plan.total_optimizer_steps, trainer.run_plan.config.accumulation, trainer.optimizer.identity().microbatch_step);
     // Old and replacement checkpoint coexist until atomic publication. The
     // final model/adapter is separately staged; include its conservative size.
     const export_plan = try trainer.estimateExportSnapshot(scratch, source, config.source_dir, config.export_limits, control);
     const export_bytes = export_plan.output_bytes_upper_bound;
-    try disk(config.output_dir, try std.math.add(u64, try std.math.mul(u64, checkpoint_bytes, 2), export_bytes), config.disk_headroom_bytes);
+    try disk(config.output_dir, try std.math.add(u64, try std.math.add(u64, try std.math.mul(u64, checkpoint_bytes, 2), export_bytes), progress_budget), config.disk_headroom_bytes);
     try check(control);
     try std.Io.Dir.cwd().createDir(io, config.output_dir, .default_dir);
     // Do not erase a failed run: its immutable manifest and last checkpoint are
@@ -360,11 +415,11 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, admission: *memory.Adm
             try writeJson(scratch, io, result_path, result, control);
             return result;
         }
-        if (config.max_progress_bytes - log_bytes < 8192) return error.BoundaryTrainingProgressLimitExceeded;
+        if (progress_budget - log_bytes < max_progress_line) return error.BoundaryTrainingProgressLimitExceeded;
         const report = try trainer.next(control) orelse break;
         const bytes = try std.json.Stringify.valueAlloc(scratch, report, .{});
         defer scratch.free(bytes);
-        if (bytes.len + 1 > 8192) return error.BoundaryTrainingProgressLimitExceeded;
+        if (bytes.len + 1 > max_progress_line) return error.BoundaryTrainingProgressLimitExceeded;
         try progress.writeStreamingAll(io, bytes);
         try progress.writeStreamingAll(io, "\n");
         log_bytes += bytes.len + 1;
@@ -595,6 +650,21 @@ test "boundary training job admission retains every preflight split and checks a
     try std.testing.expectError(error.Overflow, admissionAmounts(overflow, 0));
 }
 
+test "boundary training job sizes the progress log to the remaining run" {
+    // 34,264 steps of 2 microbatches: the run that a fixed 64 MiB cap stopped
+    // at 57,505 microbatches (about 1.2 KB per report).
+    const whole = try progressBudget(34_264, 2, 0);
+    try std.testing.expectEqual(@as(usize, 34_264 * 3 * max_progress_line), whole);
+    try std.testing.expect(whole > 68_528 * 1200);
+    try std.testing.expectEqual(@as(usize, (34_264 * 3 - 48_000) * max_progress_line), try progressBudget(34_264, 2, 48_000));
+    // A finished or overshot position still admits one line (the loop exits).
+    try std.testing.expectEqual(@as(usize, max_progress_line), try progressBudget(10, 1, 50));
+    try std.testing.expectError(error.Overflow, progressBudget(std.math.maxInt(u64), 1, 0));
+    const tiny = try std.json.parseFromSlice(Config, std.testing.allocator, "{\"version\":1,\"run\":{\"mode\":\"full\"},\"source_dir\":\"s\",\"train_file\":\"t\",\"output_dir\":\"o\",\"max_progress_bytes\":100}", .{ .ignore_unknown_fields = true });
+    defer tiny.deinit();
+    try std.testing.expectEqual(@as(?usize, 100), tiny.value.max_progress_bytes);
+}
+
 test "boundary training job forwards resource overrides without changing semantic run options" {
     const a = std.testing.allocator;
     const parsed = try parse(a,
@@ -627,7 +697,7 @@ test "boundary training job forwards resource overrides without changing semanti
 test "boundary training job cooperative pause combines callback and invocation limit" {
     const Flag = struct {
         requested: bool = false,
-        fn read(raw: ?*const anyopaque) bool {
+        pub fn read(raw: ?*const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
             return self.requested;
         }

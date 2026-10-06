@@ -55,11 +55,20 @@ pub const Export = struct {
     tables: []metadata.TableRecord,
     ranges: []metadata.RangeRecord,
     system_catalog: domain.State = .{},
+    /// Immutable programs for active row-policy generations. Draft policy
+    /// definitions may already differ, so they cannot reconstruct these
+    /// programs during restore. An in-flight publication is not exportable.
+    policy_install_snapshots: []const @import("policies.zig").InstallSnapshot = &.{},
     extension_packages: []extensions.PackageManifest = &.{},
     installed_extensions: []extensions.InstalledExtension = &.{},
     extension_members: []extensions.ExtensionMember = &.{},
     extension_dependencies: []extensions.ExtensionDependency = &.{},
 };
+
+/// Validate the portable policy manifest before staging any owner. Draft
+/// records are intentionally not used here: an active generation is defined
+/// by its immutable compiled install snapshot, not the current draft.
+pub const validatePolicyPrograms = @import("portable_policy_contract.zig").validatePolicyPrograms;
 
 /// Keyset pagination concerns logical membership, not changing runtime counters.
 pub fn selectPage(entries: []TableEntry, request: domain.TableList, revision: u64) !struct { entries: []TableEntry, next: ?[]const u8 } {

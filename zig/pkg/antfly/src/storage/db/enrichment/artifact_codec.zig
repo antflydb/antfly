@@ -20,6 +20,7 @@ const edge_weight = @import("../../../graph/edge_weight.zig");
 
 pub const codec_version: u16 = 1;
 pub const graph_edge_codec_version: u16 = 2;
+pub const graph_edge_ttl_codec_version: u16 = 3;
 pub const magic: [8]u8 = .{ 'A', 'F', 'E', 'N', 'R', 'C', 'H', 0 };
 pub const header_len: usize = magic.len + @sizeOf(u16) + @sizeOf(u8) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u32);
 
@@ -35,7 +36,9 @@ pub const Flags = packed struct(u8) {
     has_source_hash: bool = false,
     has_graph_generation: bool = false,
     portable_unbound_graph_generation: bool = false,
-    _reserved: u5 = 0,
+    /// Descriptive origin only, never a substitute for accepted provenance.
+    authored: bool = false,
+    _reserved: u4 = 0,
 };
 
 pub const Header = struct {
@@ -64,6 +67,16 @@ pub fn hashEmbeddingSource(source: []const u8, semantic_producer: []const u8) u6
 }
 
 pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, source_hash, false, vector);
+}
+
+/// Only explicit user-vector ingress may set this origin. In particular, an
+/// absent source hash in old or imported output does not establish authorship.
+pub fn encodeAuthoredDenseEmbeddingAlloc(alloc: Allocator, vector: []const f32) ![]u8 {
+    return encodeDenseEmbeddingWithOriginAlloc(alloc, null, true, vector);
+}
+
+fn encodeDenseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, vector: []const f32) ![]u8 {
     const payload_len = @sizeOf(u32) + vector.len * @sizeOf(u32);
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -72,7 +85,7 @@ pub fn encodeDenseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, vector: []
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .dense_embedding,
-        .flags = .{ .has_source_hash = source_hash != null },
+        .flags = .{ .has_source_hash = source_hash != null, .authored = authored },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
@@ -173,6 +186,8 @@ pub const GraphEdge = struct {
     weight: f64,
     created_at: u64,
     updated_at: u64,
+    /// Server-assigned contribution creation time; zero denotes a legacy edge.
+    ttl_created_ns: u64 = 0,
     metadata_json: []u8,
 
     pub fn deinit(self: *GraphEdge, alloc: Allocator) void {
@@ -182,6 +197,14 @@ pub const GraphEdge = struct {
 };
 
 pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: []const u32, values: []const f32) ![]u8 {
+    return encodeSparseEmbeddingWithOriginAlloc(alloc, source_hash, false, indices, values);
+}
+
+pub fn encodeAuthoredSparseEmbeddingAlloc(alloc: Allocator, indices: []const u32, values: []const f32) ![]u8 {
+    return encodeSparseEmbeddingWithOriginAlloc(alloc, null, true, indices, values);
+}
+
+fn encodeSparseEmbeddingWithOriginAlloc(alloc: Allocator, source_hash: ?u64, authored: bool, indices: []const u32, values: []const f32) ![]u8 {
     if (indices.len != values.len) return error.InvalidSparseEmbedding;
     const payload_len = @sizeOf(u32) + indices.len * (@sizeOf(u32) + @sizeOf(u32));
     const total_len = header_len + payload_len;
@@ -191,7 +214,7 @@ pub fn encodeSparseEmbeddingAlloc(alloc: Allocator, source_hash: ?u64, indices: 
     writeHeader(out[0..header_len], .{
         .version = codec_version,
         .kind = .sparse_embedding,
-        .flags = .{ .has_source_hash = source_hash != null },
+        .flags = .{ .has_source_hash = source_hash != null, .authored = authored },
         .source_hash = source_hash orelse 0,
         .payload_len = @intCast(payload_len),
     });
@@ -274,14 +297,27 @@ pub fn encodeGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
+    return encodeGraphEdgeWithTtlAlloc(alloc, source_hash, generation, weight, created_at, updated_at, 0, metadata_json);
+}
+
+pub fn encodeGraphEdgeWithTtlAlloc(
+    alloc: Allocator,
+    source_hash: ?u64,
+    generation: u64,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    ttl_created_ns: u64,
+    metadata_json: []const u8,
+) ![]u8 {
     try edge_weight.validateStored(weight);
-    const payload_len = @sizeOf(u64) * 4 + @sizeOf(u32) + metadata_json.len;
+    const payload_len = @sizeOf(u64) * (if (ttl_created_ns == 0) @as(usize, 4) else 5) + @sizeOf(u32) + metadata_json.len;
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
     errdefer alloc.free(out);
 
     writeHeader(out[0..header_len], .{
-        .version = graph_edge_codec_version,
+        .version = if (ttl_created_ns == 0) graph_edge_codec_version else graph_edge_ttl_codec_version,
         .kind = .graph_edge,
         .flags = .{ .has_source_hash = source_hash != null, .has_graph_generation = true },
         .source_hash = source_hash orelse 0,
@@ -297,6 +333,10 @@ pub fn encodeGraphEdgeAlloc(
     pos += @sizeOf(u64);
     std.mem.writeInt(u64, out[pos..][0..8], updated_at, .little);
     pos += @sizeOf(u64);
+    if (ttl_created_ns != 0) {
+        std.mem.writeInt(u64, out[pos..][0..8], ttl_created_ns, .little);
+        pos += @sizeOf(u64);
+    }
     std.mem.writeInt(u32, out[pos..][0..4], @intCast(metadata_json.len), .little);
     pos += @sizeOf(u32);
     @memcpy(out[pos .. pos + metadata_json.len], metadata_json);
@@ -321,7 +361,18 @@ pub fn encodePortableUnboundGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
-    const out = try encodeGraphEdgeAlloc(alloc, null, 0, weight, created_at, updated_at, metadata_json);
+    return encodePortableUnboundGraphEdgeWithTtlAlloc(alloc, weight, created_at, updated_at, 0, metadata_json);
+}
+
+pub fn encodePortableUnboundGraphEdgeWithTtlAlloc(
+    alloc: Allocator,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    ttl_created_ns: u64,
+    metadata_json: []const u8,
+) ![]u8 {
+    const out = try encodeGraphEdgeWithTtlAlloc(alloc, null, 0, weight, created_at, updated_at, ttl_created_ns, metadata_json);
     var header = try decodeHeader(out);
     header.flags.portable_unbound_graph_generation = true;
     writeHeader(out[0..header_len], header);
@@ -356,13 +407,14 @@ pub fn bindGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generati
     const header = try decodeHeader(data);
     var decoded = try decodeGraphEdgeAlloc(alloc, data);
     defer decoded.deinit(alloc);
-    return encodeGraphEdgeAlloc(
+    return encodeGraphEdgeWithTtlAlloc(
         alloc,
         if (header.flags.has_source_hash) header.source_hash else null,
         generation,
         decoded.weight,
         decoded.created_at,
         decoded.updated_at,
+        decoded.ttl_created_ns,
         decoded.metadata_json,
     );
 }
@@ -387,13 +439,27 @@ pub fn authenticateGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, 
     return try alloc.dupe(u8, data);
 }
 
+pub const BorrowedGraphEdge = struct {
+    generation: u64,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    ttl_created_ns: u64,
+    metadata_json: []const u8,
+};
+
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
+    const edge = try decodeGraphEdgeBorrowed(data);
+    return .{ .generation = edge.generation, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at, .ttl_created_ns = edge.ttl_created_ns, .metadata_json = try alloc.dupe(u8, edge.metadata_json) };
+}
+
+pub fn decodeGraphEdgeBorrowed(data: []const u8) !BorrowedGraphEdge {
     const header = try decodeHeader(data);
     if (header.kind != .graph_edge) return error.InvalidArtifactKind;
 
     const payload = data[header_len..][0..header.payload_len];
     var pos: usize = 0;
-    const generation: u64 = if (header.version == graph_edge_codec_version) blk: {
+    const generation: u64 = if (header.version == graph_edge_codec_version or header.version == graph_edge_ttl_codec_version) blk: {
         if (!header.flags.has_graph_generation or header.payload_len < @sizeOf(u64) * 4 + @sizeOf(u32)) return error.InvalidArtifactPayload;
         const value = std.mem.readInt(u64, payload[pos..][0..8], .little);
         pos += @sizeOf(u64);
@@ -409,6 +475,13 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     pos += @sizeOf(u64);
     const updated_at = std.mem.readInt(u64, payload[pos..][0..8], .little);
     pos += @sizeOf(u64);
+    const ttl_created_ns: u64 = if (header.version == graph_edge_ttl_codec_version) blk: {
+        if (payload.len - pos < @sizeOf(u64) + @sizeOf(u32)) return error.InvalidArtifactPayload;
+        const value = std.mem.readInt(u64, payload[pos..][0..8], .little);
+        pos += @sizeOf(u64);
+        if (value == 0) return error.InvalidArtifactPayload;
+        break :blk value;
+    } else 0;
     const metadata_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
     pos += @sizeOf(u32);
     if (payload.len != pos + metadata_len) return error.InvalidArtifactPayload;
@@ -418,7 +491,8 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
         .weight = weight,
         .created_at = created_at,
         .updated_at = updated_at,
-        .metadata_json = try alloc.dupe(u8, payload[pos..]),
+        .ttl_created_ns = ttl_created_ns,
+        .metadata_json = payload[pos..],
     };
 }
 
@@ -440,14 +514,14 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
     const kind_raw = data[pos];
     pos += @sizeOf(u8);
     const kind: Kind = switch (kind_raw) {
-        @intFromEnum(Kind.chunk_json) => .chunk_json,
-        @intFromEnum(Kind.dense_embedding) => .dense_embedding,
-        @intFromEnum(Kind.sparse_embedding) => .sparse_embedding,
-        @intFromEnum(Kind.asset) => .asset,
-        @intFromEnum(Kind.graph_edge) => .graph_edge,
+        @backingInt(Kind.chunk_json) => .chunk_json,
+        @backingInt(Kind.dense_embedding) => .dense_embedding,
+        @backingInt(Kind.sparse_embedding) => .sparse_embedding,
+        @backingInt(Kind.asset) => .asset,
+        @backingInt(Kind.graph_edge) => .graph_edge,
         else => return error.InvalidArtifactKind,
     };
-    if (version != codec_version and !(version == graph_edge_codec_version and kind == .graph_edge)) {
+    if (version != codec_version and !((version == graph_edge_codec_version or version == graph_edge_ttl_codec_version) and kind == .graph_edge)) {
         return error.UnsupportedArtifactCodecVersion;
     }
 
@@ -456,6 +530,10 @@ pub fn decodeHeaderPrefix(data: []const u8) !Header {
 
     const source_hash = std.mem.readInt(u64, data[pos..][0..8], .little);
     pos += @sizeOf(u64);
+
+    if (flags.authored and (flags.has_source_hash or source_hash != 0 or
+        flags.has_graph_generation or flags.portable_unbound_graph_generation or
+        (kind != .dense_embedding and kind != .sparse_embedding))) return error.InvalidArtifactHeader;
 
     const payload_len = std.mem.readInt(u32, data[pos..][0..4], .little);
     pos += @sizeOf(u32);
@@ -476,13 +554,63 @@ pub fn sourceHash(data: []const u8) !?u64 {
     return header.source_hash;
 }
 
+test "ordered artifact inventory vector origin is explicit and preserves payloads" {
+    const alloc = std.testing.allocator;
+    const vector = [_]f32{ 0.25, -0.5 };
+    const indices = [_]u32{ 3, 19 };
+    const dense = try encodeAuthoredDenseEmbeddingAlloc(alloc, &vector);
+    defer alloc.free(dense);
+    const sparse = try encodeAuthoredSparseEmbeddingAlloc(alloc, &indices, &vector);
+    defer alloc.free(sparse);
+    const generated = try encodeDenseEmbeddingAlloc(alloc, 42, &vector);
+    defer alloc.free(generated);
+    const unhashed = try encodeDenseEmbeddingAlloc(alloc, null, &vector);
+    defer alloc.free(unhashed);
+    const sparse_unhashed = try encodeSparseEmbeddingAlloc(alloc, null, &indices, &vector);
+    defer alloc.free(sparse_unhashed);
+    try std.testing.expect((try decodeHeader(dense)).flags.authored);
+    try std.testing.expect((try decodeHeader(sparse)).flags.authored);
+    try std.testing.expect(!(try decodeHeader(generated)).flags.authored);
+    try std.testing.expect(!(try decodeHeader(unhashed)).flags.authored);
+    try std.testing.expect(!(try decodeHeader(sparse_unhashed)).flags.authored);
+    try std.testing.expectEqual(@as(?u64, null), try sourceHash(dense));
+    try std.testing.expectEqual(@as(?u64, 42), try sourceHash(generated));
+    try std.testing.expectEqualSlices(u8, dense[header_len..], unhashed[header_len..]);
+    try std.testing.expectEqualSlices(u8, sparse[header_len..], sparse_unhashed[header_len..]);
+    const decoded = try decodeDenseEmbeddingAlloc(alloc, dense);
+    defer alloc.free(decoded);
+    try std.testing.expectEqualSlices(f32, &vector, decoded);
+    var decoded_sparse = try decodeSparseEmbeddingAlloc(alloc, sparse);
+    defer decoded_sparse.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &indices, decoded_sparse.indices);
+    try std.testing.expectEqualSlices(f32, &vector, decoded_sparse.values);
+}
+
+test "ordered artifact inventory rejects contradictory authored vector envelopes" {
+    const alloc = std.testing.allocator;
+    const raw = try encodeAuthoredDenseEmbeddingAlloc(alloc, &.{1});
+    defer alloc.free(raw);
+    const flags_offset = magic.len + @sizeOf(u16) + @sizeOf(u8);
+    const valid_flags = raw[flags_offset];
+    for ([_]u8{ 1, 2, 4 }) |contradiction| {
+        raw[flags_offset] = valid_flags | contradiction;
+        try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
+    }
+    raw[flags_offset] = valid_flags;
+    raw[flags_offset + 1] = 1;
+    try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
+    raw[flags_offset + 1] = 0;
+    raw[flags_offset - 1] = @backingInt(Kind.asset);
+    try std.testing.expectError(error.InvalidArtifactHeader, decodeHeader(raw));
+}
+
 fn writeHeader(dst: []u8, header: Header) void {
     std.debug.assert(dst.len == header_len);
     @memcpy(dst[0..magic.len], &magic);
     var pos: usize = magic.len;
     std.mem.writeInt(u16, dst[pos..][0..2], header.version, .little);
     pos += @sizeOf(u16);
-    dst[pos] = @intFromEnum(header.kind);
+    dst[pos] = @backingInt(header.kind);
     pos += @sizeOf(u8);
     dst[pos] = @bitCast(header.flags);
     pos += @sizeOf(u8);
@@ -627,6 +755,19 @@ test "artifact codec encodes graph edge with version and source hash" {
     try std.testing.expectEqual(@as(u64, 10), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 20), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+}
+
+test "graph edge ttl creation survives portable generation binding" {
+    const alloc = std.testing.allocator;
+    const portable = try encodePortableUnboundGraphEdgeWithTtlAlloc(alloc, 1.5, 10, 20, 123_456_789, "{}");
+    defer alloc.free(portable);
+    try std.testing.expectEqual(graph_edge_ttl_codec_version, (try decodeHeader(portable)).version);
+    const bound = try bindGraphEdgeGenerationAlloc(alloc, portable, 42);
+    defer alloc.free(bound);
+    var decoded = try decodeGraphEdgeAlloc(alloc, bound);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), decoded.generation);
+    try std.testing.expectEqual(@as(u64, 123_456_789), decoded.ttl_created_ns);
 }
 
 test "artifact codec rejects weights outside the durable domain" {

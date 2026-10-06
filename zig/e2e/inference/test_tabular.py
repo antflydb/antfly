@@ -209,24 +209,39 @@ def _serve_directory(directory):
 
 
 @contextmanager
-def _serve_fake_hf(files, owner="acme", repo="stump-model"):
+def _serve_fake_hf(
+    files, owner="acme", repo="stump-model", revision="main", corrupt_download=False
+):
     payloads = {
         name: data if isinstance(data, bytes) else data.encode("utf-8")
         for name, data in files.items()
     }
+
+    # Model the real Hub contract: metadata resolves main to a commit, and
+    # bytes are available only through that immutable snapshot. A regression
+    # back to /resolve/main must fail these pull-to-predict round trips.
+    commit = hashlib.sha1(
+        b"".join(
+            name.encode() + b"\0" + data for name, data in sorted(payloads.items())
+        ),
+        usedforsecurity=False,
+    ).hexdigest()
 
     class FakeHuggingFaceHandler(QuietSimpleHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
             request_url = urlsplit(self.path)
             path = unquote(request_url.path)
             api_path = f"/api/models/{owner}/{repo}"
-            resolve_prefix = f"/{owner}/{repo}/resolve/main/"
-            if path == api_path:
+            resolve_prefix = f"/{owner}/{repo}/resolve/{commit}/"
+            if path == (
+                api_path if revision == "main" else f"{api_path}/revision/{revision}"
+            ):
                 if parse_qs(request_url.query).get("blobs") != ["true"]:
                     self.send_error(400, "blobs=true is required")
                     return
                 body = json.dumps(
                     {
+                        "sha": commit,
                         "siblings": [
                             {
                                 "rfilename": name,
@@ -237,7 +252,7 @@ def _serve_fake_hf(files, owner="acme", repo="stump-model"):
                                 ).hexdigest(),
                             }
                             for name, data in payloads.items()
-                        ]
+                        ],
                     }
                 ).encode("utf-8")
                 self.send_response(200)
@@ -250,6 +265,8 @@ def _serve_fake_hf(files, owner="acme", repo="stump-model"):
                 filename = path[len(resolve_prefix) :]
                 data = payloads.get(filename)
                 if data is not None:
+                    if corrupt_download:
+                        data = bytes([data[0] ^ 1]) + data[1:]
                     self.send_response(200)
                     self.send_header("content-type", "application/octet-stream")
                     self.send_header("content-length", str(len(data)))
@@ -346,12 +363,15 @@ def test_pull_url_then_predict(api, tmp_path):
     assert abs(preds[1][0] - 1.0) < 1e-4
 
 
-def test_pull_hf_tabular_ir_then_predict(api, tmp_path):
+@pytest.mark.parametrize("revision", [None, "main", "release/v2"])
+def test_pull_hf_tabular_ir_then_predict(api, tmp_path, revision):
     command, model_root = _local_cli_models()
     model = json.loads(json.dumps(STUMP_IR))
     model["metadata"]["name"] = "ignored-source-name"
 
-    with _serve_fake_hf({"tabular_model.json": json.dumps(model)}) as (
+    with _serve_fake_hf(
+        {"tabular_model.json": json.dumps(model)}, revision=revision or "main"
+    ) as (
         origin,
         owner,
         repo,
@@ -361,7 +381,7 @@ def test_pull_hf_tabular_ir_then_predict(api, tmp_path):
             [
                 *command,
                 "pull",
-                f"hf:{owner}/{repo}",
+                f"hf:{owner}/{repo}" + (f"@{revision}" if revision else ""),
                 "--type",
                 "predictor",
                 "--ml-dir",
@@ -796,3 +816,31 @@ def test_hostile_int_does_not_crash_loader(base_url, tmp_path):
         timeout=DEFAULT_REQUEST_TIMEOUT,
     )
     assert follow.status_code == 200, follow.text
+
+
+def test_pull_hf_rejects_changed_snapshot_bytes():
+    command, model_root = _local_cli_models()
+    with _serve_fake_hf(
+        {"tabular_model.json": json.dumps(STUMP_IR)},
+        repo="corrupt-stump",
+        corrupt_download=True,
+    ) as (origin, owner, repo):
+        result = subprocess.run(
+            [
+                *command,
+                "pull",
+                f"hf:{owner}/{repo}",
+                "--type",
+                "predictor",
+                "--ml-dir",
+                str(model_root),
+            ],
+            cwd=REPO_ROOT,
+            env={**os.environ, "ANTFLY_INFERENCE_HF_BASE_URL": origin},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    assert result.returncode != 0
+    assert "ChecksumMismatch" in result.stdout + result.stderr
+    assert not (model_root / repo / "tabular_model.json").exists()

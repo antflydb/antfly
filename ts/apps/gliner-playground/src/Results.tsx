@@ -107,7 +107,9 @@ export function Results({ value, text }: { value: Json; text: string | null }) {
           {typeof decision.true_probability === "number" && (
             <p>True probability: {score(decision.true_probability)}</p>
           )}
-          <p>Action probability: {score(decision.act_probability)} · No action is executed.</p>
+          {typeof decision.act_probability === "number" && (
+            <p>Action probability: {score(decision.act_probability)} · No action is executed.</p>
+          )}
         </section>
       ))}
       {highlighted.length > 1 && (

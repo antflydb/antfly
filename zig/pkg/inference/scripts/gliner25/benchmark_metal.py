@@ -235,7 +235,7 @@ def checked_ready(
         required = {
             "backend": "metal",
             "device": "metal",
-            "build_mode": "ReleaseFast",
+            "build_mode": "fast",
             "scheduler": "serial_requests",
             "runtime_ready": True,
             "external_frame": False,

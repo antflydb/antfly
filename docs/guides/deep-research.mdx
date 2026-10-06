@@ -1,0 +1,167 @@
+---
+title: "Write a Cited Research Report"
+description: "One request that plans a question, researches each part in parallel, and returns a report whose every citation points at a document you own"
+order: 6
+---
+
+<Questions>
+- How do I get a long-form answer with citations from my own documents?
+- How do I run a deep research agent over an Antfly table?
+- How do I keep a research run from spending unbounded model calls?
+- How do I resume a long research run after a restart?
+- How do I check that a generated report is supported by its sources?
+</Questions>
+
+## The Result
+
+One request splits a question into sub-questions, researches them in parallel against your table, and writes a report. Every `[E#]` marker resolves to a document in the response:
+
+```bash
+antfly agents research --table docs --fields title,body --limit 5 \
+  --query "How do hybrid search, reciprocal rank fusion and reranking work together, and what are the tuning trade-offs?" \
+  --generator '{"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF", "temperature": 0}' \
+  --max-rounds 1 --max-sub-questions 2 --verify --no-streaming
+```
+
+```json
+{
+  "status": "completed",
+  "usage": {"llm_calls": 5, "tool_calls": 2, "researcher_runs": 2, "evidence_count": 5, "elapsed_ms": 95725},
+  "report": {
+    "markdown": "# Synergistic Operation and Tuning Trade-offs in Antfly's Hybrid Search Pipeline\n\nThe Antfly framework integrates hybrid search by sequentially combining BM25 full-text results and vector similarity results using Reciprocal Rank Fusion (RRF) [E1]. ...\n\n## Sources\n\n- [E1] Reciprocal rank fusion table `docs` document `rrf`\n- [E2] Tuning hybrid search table `docs` document `tuning`\n..."
+  },
+  "evidence": [
+    {"id": "E1", "source": "table", "table": "docs", "doc_id": "rrf", "title": "Reciprocal rank fusion", "sub_question_ids": ["q1", "q2"]}
+  ],
+  "verification": {
+    "checked_sections": 2,
+    "unresolved_markers": [],
+    "uncited_sections": [],
+    "supported_ratio": 0.857,
+    "unsupported": [
+      {"section_index": 0, "evidence_ids": ["E1"], "reason": "Evidence [E1] mentions the merging of BM25 and vector results using RRF, but it does not explicitly state that the process begins by independently retrieving results."}
+    ]
+  }
+}
+```
+
+## Before You Start
+
+Antfly running in standalone mode with a generation model pulled:
+
+```bash
+curl -s http://127.0.0.1:8080/db/v1/tables | head -c 200
+antfly inference pull hf:ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_0 --tasks generate --projector auto
+```
+
+## Build It
+
+### 1. Load the Documents
+
+Any table with a full-text or embeddings index works. This one uses the default full-text index:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/db/v1/tables/docs -H "Content-Type: application/json" -d '{}'
+
+curl -s -X POST http://127.0.0.1:8080/db/v1/tables/docs/batch \
+  -H "Content-Type: application/json" \
+  -d '{"inserts": {
+        "rrf": {"title": "Reciprocal rank fusion", "body": "Antfly hybrid search merges BM25 and vector results with reciprocal rank fusion (RRF). The constant k defaults to 60."},
+        "rerank": {"title": "Reranking", "body": "A cross-encoder reranker rescores the top fused candidates. Limit reranking to the top 50 to 100 hits."},
+        "tuning": {"title": "Tuning hybrid search", "body": "Evaluate BM25 and vector retrieval separately, fuse with RRF, then add a reranker only if first-page precision matters more than latency."}
+      },
+      "sync_level": "full_text"}'
+```
+
+### 2. Run a Research Request
+
+Pass the table as a scope, without search text. Each researcher then plans its own query for its sub-question:
+
+<Tabs defaultValue="cli">
+  <TabsList>
+    <TabsTrigger value="cli">CLI</TabsTrigger>
+    <TabsTrigger value="curl">cURL</TabsTrigger>
+  </TabsList>
+
+  <TabsContent value="cli">
+```bash
+antfly agents research --table docs --fields title,body --limit 5 \
+  --query "How do hybrid search, reciprocal rank fusion and reranking work together?" \
+  --generator '{"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF", "temperature": 0}' \
+  --max-rounds 2 --max-sub-questions 3 --verify
+```
+  </TabsContent>
+
+  <TabsContent value="curl">
+```bash
+curl -s -X POST http://127.0.0.1:8080/db/v1/agents/research \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How do hybrid search, reciprocal rank fusion and reranking work together?",
+       "queries": [{"table": "docs", "fields": ["title", "body"], "limit": 5}],
+       "generator": {"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF", "temperature": 0},
+       "budget": {"max_rounds": 2, "max_sub_questions": 3},
+       "steps": {"verify": {"enabled": true}},
+       "stream": false}'
+```
+  </TabsContent>
+</Tabs>
+
+With streaming on (the CLI default), `step_progress` events report the plan, each sub-question as it starts, each finding, and each reflection, and the report arrives as `generation` text before the final `done` event.
+
+### 3. Run It as a Durable Job
+
+A job checkpoints after every phase, so a restart or a dropped connection costs at most one phase:
+
+```bash
+antfly agents research --table docs --fields title,body \
+  --query "How do hybrid search, reciprocal rank fusion and reranking work together?" \
+  --generator '{"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF"}' \
+  --max-rounds 2 --verify --job
+```
+
+```text
+research job rsj_43b56b2d867c7c485addc3c370dee124: queued (phase research)
+research job rsj_43b56b2d867c7c485addc3c370dee124: queued (phase write, advances 2)
+research job rsj_43b56b2d867c7c485addc3c370dee124: queued (phase verify, advances 3)
+research job rsj_43b56b2d867c7c485addc3c370dee124: succeeded (phase done, advances 4)
+```
+
+Resume a job with the same credentials using `--resume-job <id>`, or call `POST /db/v1/agents/research/jobs/<id>/advance` yourself. Durable jobs store the request, so reference API keys through the secret store (`${secret:...}`) instead of inlining them.
+
+### 4. Add the Web
+
+Give researchers a web search connection and let them read full pages:
+
+```bash
+antfly agents research --web-search-connection agent-web \
+  --query "What changed in recent reciprocal rank fusion research?" \
+  --generator '{"provider": "antfly", "model": "ggml-org/gemma-4-E4B-it-GGUF"}' \
+  --fetch-allowed-hosts arxiv.org
+```
+
+Fetch only reads URLs that web search returned in the same run or that sit on an allowed host.
+
+## Tradeoffs
+
+The budget is the decision you own. `max_rounds`, `max_sub_questions`, `researcher_iterations`, and `max_llm_calls` set the worst-case cost before the run starts, and every limit counts across resumes. More sub-questions widen coverage, and more rounds let the reflector close gaps it finds, but each researcher spends several model calls. When the budget cannot fund every sub-question, the run skips the rest and reports `incomplete` with `max_llm_calls`, and the report is still written from what was found.
+
+Read `verification` before you trust a report. `unresolved_markers` lists citations the writer invented, which the server removed. `uncited_sections` lists sections with no supporting document. `supported_ratio` and `unsupported` come from a model check and catch statements that overstate their source, as in the result above.
+
+Small local models sometimes emit tool calls that the inference runtime cannot parse. The researcher then retries without tools, searching its sub-question's text directly. The step trace records each retry, and the report stays grounded, but a researcher that cannot refine its query finds less than one that can.
+
+## Use Agent Skills
+
+Everything above is also encoded in the [Antfly skill](https://github.com/antflydb/antfly-skills),
+so a coding agent can execute this guide for you:
+
+```bash
+npx skills add antflydb/antfly-skills
+```
+
+Then prompt it with the outcome, for example "Research how our billing docs describe refunds and write a cited report with verification", and use this page to judge the result.
+
+## Next Steps
+
+- [Build a Support Answer Agent](/docs/guides/support-answer-agent): answer a single question in one retrieval call when a report is more than you need.
+- [Tune Hybrid Search](/docs/guides/hybrid-search): improve what each researcher retrieves before adding rounds.
+- [Antfly Inference](/docs/guides/inference): choose a larger generation model when verification flags too many statements.

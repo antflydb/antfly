@@ -26,6 +26,12 @@ const snapshot_payload_store = @import("raft/storage/snapshot_payload_store.zig"
 const persistent_replica_state = @import("raft/storage/replica_state.zig");
 const wal_replica_state = @import("raft/storage/wal_replica_state.zig");
 
+test {
+    _ = @import("data/storage/merge_page_projection_test.zig");
+    _ = @import("data/merge_membership_admission.zig");
+    _ = @import("data/fk_retirement_worker.zig");
+}
+
 test "data storage module tests are reachable" {
     std.testing.refAllDecls(storage.shard_state_store);
     std.testing.refAllDecls(storage.raft_apply_store);

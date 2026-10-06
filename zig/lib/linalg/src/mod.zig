@@ -14,8 +14,9 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const x86 = @import("x86.zig");
 pub const primitives = @import("primitives.zig");
-pub const gemm = @import("gemm.zig");
+pub const gemm = @import("gemm_dispatch.zig");
 pub const pool = @import("pool.zig");
 pub const attention = @import("attention.zig");
 pub const layout = @import("attention_layout.zig");
@@ -338,6 +339,12 @@ pub const t5RelativePositionBucket = attention.t5RelativePositionBucket;
 pub const ropeCore = attention.ropeCore;
 pub const flashCausalAttentionHost = attention.flashCausalAttentionHost;
 pub const flashAttentionHost = attention.flashAttentionHost;
+pub const segmentAttentionHost = attention.segmentAttentionHost;
+pub const segmentTrainingAttentionForwardHost = attention.segmentTrainingAttentionForwardHost;
+pub const segmentTrainingAttentionBackwardHost = attention.segmentTrainingAttentionBackwardHost;
+pub const SegmentTrainingAttentionForward = attention.SegmentTrainingAttentionForward;
+pub const SegmentTrainingAttentionGradient = attention.SegmentTrainingAttentionGradient;
+pub const segmentAttentionDropoutKeep = attention.segmentAttentionDropoutKeep;
 pub const crossAttentionHost = attention.crossAttentionHost;
 pub const debertaDisentangledAttentionHost = attention.debertaDisentangledAttentionHost;
 pub const WindowPack = layout.WindowPack;
@@ -461,6 +468,8 @@ pub fn sgemmTransBF16Weights(
 // them too.  Without this, only tests living directly in mod.zig are picked
 // up by the test runner.
 test {
+    std.testing.refAllDecls(x86);
+    std.testing.refAllDecls(@import("cpu_budget.zig"));
     std.testing.refAllDecls(attention);
     std.testing.refAllDecls(primitives);
     std.testing.refAllDecls(layout);

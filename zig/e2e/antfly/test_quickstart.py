@@ -1100,6 +1100,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
     single_item_enrichment_batches,
     backup_api,
     progressive_openai_embedder,
+    request: pytest.FixtureRequest,
 ):
     """Time-to-first-result gate, separate from complete-generation readiness."""
     _ = single_item_enrichment_batches
@@ -1200,7 +1201,12 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
             break
         __import__("time").sleep(0.05)
     assert partial_status is not None, __import__("json").dumps(
-        observed_states, indent=2, sort_keys=True
+        {
+            "index_observations": observed_states,
+            "provider": progressive_openai_embedder.stats(),
+        },
+        indent=2,
+        sort_keys=True,
     )
     time_to_first_artifact_s = __import__("time").monotonic() - started
     assert time_to_first_artifact_s < 30.0
@@ -1469,10 +1475,14 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         timeout_s=5.0,
         interval_s=0.05,
     )
+    activation_elapsed = time.monotonic() - activation_started
+    request.node.user_properties.append(
+        ("progressive_index_activation_seconds", activation_elapsed)
+    )
     assert activated is not None, __import__("json").dumps(
         activation_samples[-3:], indent=2, sort_keys=True
     )
-    assert __import__("time").monotonic() - activation_started < 5.0
+    assert activation_elapsed < 5.0
     second_incarnation = activated["readiness"]["incarnation"]
     second_publication_samples = deque(maxlen=3)
 
@@ -1604,7 +1614,7 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
                     indent=2,
                 )
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve the original test failure
             print(f"progressive_completion_query_error: {exc}")
         raise
     assert complete["readiness"]["state"] == "ready"
@@ -1886,13 +1896,26 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         assert written["inserted"] == len(documents)
 
         def queryable_partial() -> dict | None:
-            status = stateful_api.get_index(table_name, index_name)["status"]
+            observation = stateful_api.get_index(table_name, index_name)
+            status = observation["status"]
             milestones = status.get("milestones") or {}
             queryable = milestones.get("queryable") or {}
             complete = milestones.get("complete") or {}
             if not queryable.get("reached") or complete.get("reached"):
                 return None
-            if int(status.get("searchable_vectors", 0)) <= 0:
+            shards = observation.get("shard_status") or {}
+            if (
+                not status.get("runtime_fresh")
+                or not shards
+                or any(
+                    int(shard.get("projection_checkpoint_applied_sequence", 0)) <= 0
+                    or not shard.get("runtime_fresh")
+                    for shard in shards.values()
+                )
+            ):
+                return None
+            searchable = int(status.get("searchable_vectors", 0))
+            if searchable <= 0:
                 return None
             # Restart from a genuinely observed partial checkpoint, not the
             # intentionally conservative handoff snapshot where last-known
@@ -1908,10 +1931,22 @@ def test_progressive_publication_remains_queryable_across_process_restart(
             timeout_s=30.0,
             interval_s=0.05,
         )
-        assert before is not None
+        assert before is not None, json.dumps(
+            {
+                "index": stateful_api.get_index(table_name, index_name),
+                "logs": stateful_api.debug_logs(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
         incarnation = before["incarnation"]
         searchable_vectors = before["searchable_vectors"]
-        covered_sources = before["source_coverage"]["covered"]
+        # Each source produces two chunks. Source outcomes for the next
+        # window can be observed before its native posting WAL commits; only
+        # the immutable serving vectors are the restart baseline.
+        covered_sources = min(
+            before["source_coverage"]["covered"], searchable_vectors // 2
+        )
         assert 0 < covered_sources < len(documents)
         assert searchable_vectors > covered_sources
         assert before["source_coverage"]["pending"] > 0
@@ -1920,16 +1955,39 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         restarted_at = __import__("time").monotonic()
         restart_last_searchable = searchable_vectors
 
-        def restored_queryability() -> dict | None:
+        def note_searchable(status: dict) -> None:
+            """Fail with the complete observation when the count regresses.
+
+            pytest abbreviates a dict assertion message, which hides the
+            fields (freshness, publication, backfill) needed to diagnose a
+            restart that momentarily hides the durable checkpoint.
+            """
             nonlocal restart_last_searchable
+            current_searchable = int(status.get("searchable_vectors", 0))
+            if current_searchable < restart_last_searchable:
+                pytest.fail(
+                    "searchable_vectors regressed after restart: "
+                    f"{current_searchable} < {restart_last_searchable}\n"
+                    + json.dumps(
+                        {
+                            "before_restart": before,
+                            "index": stateful_api.get_index(table_name, index_name),
+                            "logs": stateful_api.debug_logs(),
+                            "status": status,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            restart_last_searchable = current_searchable
+
+        def restored_queryability() -> dict | None:
             status = stateful_api.get_index(table_name, index_name)["status"]
             if status.get("incarnation") != incarnation:
                 return None
             if not (status.get("milestones") or {}).get("queryable", {}).get("reached"):
                 return None
-            current_searchable = int(status.get("searchable_vectors", 0))
-            assert current_searchable >= restart_last_searchable, status
-            restart_last_searchable = current_searchable
+            note_searchable(status)
             return status
 
         after = wait_until(
@@ -1939,6 +1997,7 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert after is not None, __import__("json").dumps(
             {
+                "before_restart": before,
                 "index": stateful_api.get_index(table_name, index_name),
                 "logs": stateful_api.debug_logs(),
             },
@@ -1947,23 +2006,18 @@ def test_progressive_publication_remains_queryable_across_process_restart(
         )
         assert __import__("time").monotonic() - restarted_at < 8.0
         assert after["milestones"]["queryable"]["blockers"] == []
-        assert (
-            after["source_coverage"]["covered"] >= before["source_coverage"]["covered"]
-        )
+        assert after["source_coverage"]["covered"] >= covered_sources
 
         # Startup may first expose the durable serving checkpoint while its
         # owner is still re-establishing convergence authority. That must not
         # delay queries or erase last-known facts, and the current pending
         # count should become authoritative promptly afterward.
         def restored_convergence() -> dict | None:
-            nonlocal restart_last_searchable
             status = stateful_api.get_index(table_name, index_name)["status"]
             pending = (status.get("source_coverage") or {}).get("pending")
             if status.get("incarnation") != incarnation:
                 return None
-            current_searchable = int(status.get("searchable_vectors", 0))
-            assert current_searchable >= restart_last_searchable, status
-            restart_last_searchable = current_searchable
+            note_searchable(status)
             if not isinstance(pending, int) or pending <= 0:
                 return None
             return status

@@ -26,9 +26,11 @@ from antfly.client_generated.models import (
     CreatedEmbeddingsIndex,
     CreatedFullTextIndex,
     CreatedGraphIndex,
+    CreatedRelationalIndex,
     CreateEmbeddingsIndexRequest,
     CreateFullTextIndexRequest,
     CreateGraphIndexRequest,
+    CreateRelationalIndexRequest,
     Error,
     ExtractionRequest,
     ExtractionResponse,
@@ -37,12 +39,20 @@ from antfly.client_generated.models import (
     GraphQueries,
     GraphShortestPathQuery,
     GraphTraverseQuery,
+    IndexMaintenanceRequest,
+    IndexMaintenanceResponse,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
     OllamaEmbedderConfig,
     OpenAIEmbedderConfig,
     QueryResponses,
+    SQLDiagnostic,
+    SQLPreparedExecutionRequest,
+    SQLPreparedResponse,
+    SQLPrepareRequest,
+    SQLRequest,
+    SQLResponse,
 )
 from antfly.client_generated.models import (
     EmbedderConfig as EmbedderConfig,
@@ -79,21 +89,29 @@ MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 << 10
 MAX_GRAPH_MATCH_QUERIES = 8
 
 CreateIndexRequest: TypeAlias = (
-    CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
+    CreateFullTextIndexRequest
+    | CreateEmbeddingsIndexRequest
+    | CreateGraphIndexRequest
+    | CreateAlgebraicIndexRequest
+    | CreateRelationalIndexRequest
 )
 IndexEmbedderConfig: TypeAlias = (
     AntflyEmbedderConfig | BedrockEmbedderConfig | OllamaEmbedderConfig | OpenAIEmbedderConfig
 )
-CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
+CreatedIndex: TypeAlias = (
+    CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex | CreatedRelationalIndex
+)
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
 GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
+    CreateRelationalIndexRequest,
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
     CreateGraphIndexRequest,
     CreateAlgebraicIndexRequest,
 )
 _CREATED_INDEX_TYPES = {
+    "relational": CreatedRelationalIndex,
     "full_text": CreatedFullTextIndex,
     "embeddings": CreatedEmbeddingsIndex,
     "graph": CreatedGraphIndex,
@@ -530,6 +548,37 @@ class IndexOperations:
     def __init__(self, client: "AntflyClient") -> None:
         self._client = client
 
+    def retry(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
+        """Resume failed maintenance using exact status proofs, without automatic retries.
+
+        Owner admissions are independently atomic. After a partial/lost
+        acknowledgement, resubmit the identical request; do not refresh proofs.
+        """
+        return self._maintain("retry", table, name, request)
+
+    def repair(self, table: str, name: str, request: IndexMaintenanceRequest) -> IndexMaintenanceResponse:
+        """Start primary-authoritative repair with exact status proofs.
+
+        Selected owners do not form one global transaction. After an ambiguous
+        acknowledgement, resubmit the identical request rather than new proofs.
+        """
+        return self._maintain("repair", table, name, request)
+
+    def _maintain(
+        self, action: str, table: str, name: str, request: IndexMaintenanceRequest
+    ) -> IndexMaintenanceResponse:
+        from .index_maintenance import validate_request, validate_response
+
+        groups = validate_request(request)
+        result = self._client._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}/{action}",
+            json=request.to_dict(),
+            _max_response_bytes=32 << 10,
+            _expected_status=200,
+        )
+        return validate_response(result, groups)
+
     def create(
         self,
         table: str,
@@ -582,6 +631,15 @@ class IndexOperations:
     def drop(self, table: str, name: str) -> None:
         """Drop an index."""
         self._client._request("DELETE", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
+
+
+class SQLExecutionError(AntflyException):
+    """SQLSTATE diagnostic and optional native transaction reconciliation receipt."""
+
+    def __init__(self, status_code: int, diagnostic: SQLDiagnostic) -> None:
+        self.status_code = status_code
+        self.diagnostic = diagnostic
+        super().__init__(f"SQL execution failed ({diagnostic.code}): {diagnostic.message}")
 
 
 class AntflyClient:
@@ -656,7 +714,15 @@ class AntflyClient:
             )
         self.indexes = IndexOperations(self)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        _max_response_bytes: int | None = None,
+        _expected_status: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Make an HTTP request using the underlying httpx client.
 
         Args:
@@ -671,7 +737,9 @@ class AntflyClient:
             AntflyException: If the request fails
         """
         with self._client.get_httpx_client().stream(method, path, **kwargs) as response:
-            if response.status_code >= 400:
+            if response.status_code >= 400 or (
+                _expected_status is not None and response.status_code != _expected_status
+            ):
                 body, truncated = _read_limited_response(response, self.max_error_response_bytes)
                 if truncated:
                     msg = (
@@ -690,6 +758,14 @@ class AntflyClient:
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (
+                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/prepared"))
+                        and error_body is not None
+                        and isinstance(error_body.get("code"), str)
+                        and len(error_body["code"]) == 5
+                        and isinstance(error_body.get("message"), str)
+                    ):
+                        raise SQLExecutionError(response.status_code, SQLDiagnostic.from_dict(error_body))
                     if (
                         response.status_code == 429
                         and error_body is not None
@@ -743,9 +819,14 @@ class AntflyClient:
             if response.status_code == 204:
                 return None
 
-            body, truncated = _read_limited_response(response, self.max_json_response_bytes)
+            response_limit = (
+                min(self.max_json_response_bytes, _max_response_bytes)
+                if _max_response_bytes is not None
+                else self.max_json_response_bytes
+            )
+            body, truncated = _read_limited_response(response, response_limit)
             if truncated:
-                raise AntflyException(f"response exceeded {self.max_json_response_bytes} bytes")
+                raise AntflyException(f"response exceeded {response_limit} bytes")
             try:
                 return json.loads(body)
             except (TypeError, ValueError) as exc:
@@ -922,6 +1003,72 @@ class AntflyClient:
         """
         self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
 
+    def execute_sql(self, request: SQLRequest) -> SQLResponse:
+        """Execute one bound SQL statement without retrying ambiguous mutations.
+
+        Integer-typed result cells are decimal strings. Other JSON numbers retain
+        Python's native integer precision. The response body is bounded to 16 MiB.
+        """
+        return self._sql_result(self._sql_request("POST", "/db/v1/sql", request.to_dict()))
+
+    def prepare_sql(self, request: SQLPrepareRequest) -> SQLPreparedResponse:
+        """Create an owner-bound durable resource independent of transactions."""
+        return SQLPreparedResponse.from_dict(self._sql_request("POST", "/db/v1/sql/prepared", request.to_dict()))
+
+    def execute_prepared_sql(self, prepared_id: str, request: SQLPreparedExecutionRequest) -> SQLResponse:
+        """Execute with fresh authorization, without replaying ambiguous mutations."""
+        return self._sql_result(
+            self._sql_request("POST", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}/execute", request.to_dict())
+        )
+
+    def close_prepared_sql(self, prepared_id: str, *, connection_id: str | None = None) -> None:
+        """Close a resource; connection-bound resources require their connection ID."""
+        if connection_id is not None and (
+            not isinstance(connection_id, str)
+            or len(connection_id) != 32
+            or any(char not in "0123456789abcdefABCDEF" for char in connection_id)
+        ):
+            raise AntflyException("SQL connection ID must be 32 hexadecimal characters")
+        self._sql_request(
+            "DELETE", f"/db/v1/sql/prepared/{quote(prepared_id, safe='')}", None, connection_id=connection_id
+        )
+
+    def _sql_request(
+        self, method: str, path: str, value: dict[str, Any] | None, *, connection_id: str | None = None
+    ) -> dict[str, Any]:
+        from .sql_transport import encode_sql_request
+
+        try:
+            encoded = encode_sql_request(value) if value is not None else b""
+        except (TypeError, ValueError) as error:
+            raise AntflyException(f"Invalid SQL request: {error}") from error
+        return self._request(
+            method,
+            path,
+            content=encoded,
+            headers={
+                "Content-Type": "application/json",
+                **({"X-Antfly-SQL-Connection-Id": connection_id} if connection_id is not None else {}),
+            },
+            follow_redirects=False,
+            _expected_status=200,
+            _max_response_bytes=16 << 20,
+        )
+
+    @staticmethod
+    def _sql_result(body: dict[str, Any]) -> SQLResponse:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("rows"), list)
+            or not isinstance(body.get("columns"), list)
+        ):
+            raise AntflyException("Invalid SQL response")
+        if len(body["rows"]) > 4096:
+            raise AntflyException("SQL response exceeds 4096 rows")
+        if any(not isinstance(row, list) or len(row) != len(body["columns"]) for row in body["rows"]):
+            raise AntflyException("SQL row width differs from column metadata")
+        return SQLResponse.from_dict(body)
+
     def query(
         self,
         table: str,
@@ -996,7 +1143,8 @@ class AntflyClient:
             analyses: Analysis configuration
             graph_queries: Named canonical graph operations. Accepts generated graph query models,
                 ``GraphQueries``, or raw mappings.
-            document_renderer: Handlebars document renderer
+            document_renderer: Not supported on queries; set it on a retrieval
+                agent request instead
             pruner: Result pruning configuration
             join: Join configuration
             foreign_sources: Query-time foreign source configuration

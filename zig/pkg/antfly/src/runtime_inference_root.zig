@@ -19,9 +19,9 @@ const runtimeAllocator = process.runtimeAllocator;
 
 const inference_runtime = @import("inference_runtime/runtime.zig");
 
-const standalone_inference_host = @import("standalone/inference_host.zig");
+const standalone_inference_host = @import("antfly_inference_host");
 
-const standalone_inference_bridge = @import("standalone/inference_bridge.zig");
+const standalone_inference_bridge = @import("antfly_inference_bridge");
 
 fn runInference(init: std.process.Init, _: []const u8, args: *std.process.Args.Iterator) !void {
     return inference_runtime.runFromIterator(init, "antfly", args);
@@ -65,7 +65,7 @@ fn standaloneInferenceInvokeProvider(context: *const standalone_inference_bridge
     ))
         return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
     standalone_inference_host.linkedInferenceInvokeProvider(context) catch |err| {
-        return @import("standalone/provider_failure.zig").status(
+        return @import("antfly_inference_provider_failure").status(
             context.operation,
             context.request_json.slice(),
             context.has_deadline != 0,
@@ -124,6 +124,19 @@ fn standaloneInferenceRequestAdmissionStats(
     out.* = standalone_inference_host.linkedInferenceRequestAdmissionStats(handle);
 }
 
+fn standaloneInferencePullModel(context: *const standalone_inference_bridge.PullModelContext) callconv(.c) standalone_inference_bridge.Status {
+    if (!standalone_inference_bridge.validContext(
+        standalone_inference_bridge.PullModelContext,
+        context.abi_version,
+        context.struct_size,
+    ))
+        return standalone_inference_bridge.statusFromError(error.UnsupportedVersion);
+    standalone_inference_host.linkedInferencePullModel(context) catch |err| {
+        return standalone_inference_bridge.statusFromError(err);
+    };
+    return .ok;
+}
+
 fn standaloneInferenceDestroy(handle: *anyopaque) callconv(.c) void {
     standalone_inference_host.linkedInferenceDestroy(handle);
 }
@@ -134,7 +147,8 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .capabilities = standalone_inference_bridge.Capability.provider |
         standalone_inference_bridge.Capability.route_manifest |
         standalone_inference_bridge.Capability.resource_budget |
-        standalone_inference_bridge.Capability.request_admission,
+        standalone_inference_bridge.Capability.request_admission |
+        standalone_inference_bridge.Capability.model_pull,
     .create = &standaloneInferenceCreate,
     .configure = &standaloneInferenceConfigure,
     .invoke_provider = &standaloneInferenceInvokeProvider,
@@ -146,6 +160,7 @@ const standalone_inference_function_table: standalone_inference_bridge.FunctionT
     .release_request = &standaloneInferenceReleaseRequest,
     .request_admission_stats = &standaloneInferenceRequestAdmissionStats,
     .destroy = &standaloneInferenceDestroy,
+    .pull_model = &standaloneInferencePullModel,
 };
 
 fn standaloneInferenceGetFunctionTable() callconv(.c) *const standalone_inference_bridge.FunctionTable {

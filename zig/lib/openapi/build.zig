@@ -24,9 +24,7 @@ pub fn build(b: *std.Build) void {
 
     const run_exe = b.addRunArtifact(exe);
     run_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_exe.addArgs(args);
-    }
+    run_exe.addPassthruArgs();
     const run_step = b.step("run", "Run the openapi-zig code generator");
     run_step.dependOn(&run_exe.step);
 
@@ -42,8 +40,39 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // Compile and execute freshly generated multi-status response parsers.
+    // A small owned response fixture exercises the real client wrapper without
+    // a network listener or a dependency on the application's HTTP runtime.
+    const generate_fixture = b.addRunArtifact(exe);
+    generate_fixture.addArgs(&.{ "--spec", "test/fixtures/multi-success.json", "--output" });
+    const fixture = generate_fixture.addOutputDirectoryArg2("multi-success", .{ .make_absolute = true });
+    generate_fixture.addArgs(&.{ "--package", "multi_success", "--generate", "types,client" });
+    const http_fixture = b.createModule(.{
+        .root_source_file = b.path("test/multi_success_httpx.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const generated_client = b.createModule(.{
+        .root_source_file = fixture.path(b, "client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    generated_client.addImport("httpx", http_fixture);
+    const response_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/multi_success_runtime.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    response_tests.root_module.addImport("client", generated_client);
+    response_tests.root_module.addImport("httpx", http_fixture);
+    const run_response_tests = b.addRunArtifact(response_tests);
+    test_step.dependOn(&run_response_tests.step);
+
     // E2E test for modular code generation
-    const e2e_modular = b.addSystemCommand(&.{ "bash", "test/e2e_modular.sh" });
+    const e2e_modular = b.addSystemCommand(&.{"bash"});
+    e2e_modular.addFileArg2(b.path("test/e2e_modular.sh"), .{ .make_absolute = true });
     e2e_modular.step.dependOn(b.getInstallStep());
     const e2e_step = b.step("e2e", "Run end-to-end tests");
     e2e_step.dependOn(&e2e_modular.step);
@@ -55,7 +84,7 @@ pub fn addCompiler(
     b: *std.Build,
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Step.Compile {
     // Main library module
     const openapi_mod = b.createModule(.{
@@ -120,6 +149,7 @@ pub const ModuleImport = struct {
 pub const OpenApiModuleOptions = struct {
     spec: std.Build.LazyPath,
     package_name: []const u8 = "api",
+    external_types_module: ?[]const u8 = null,
     generate: struct {
         types: bool = true,
         client: bool = false,
@@ -141,8 +171,10 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
     const codegen = b.addRunArtifact(dep.artifact("openapi-zig"));
 
     codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(opts.spec);
+    codegen.addFileArg2(opts.spec, .{ .make_absolute = true });
     codegen.addArgs(&.{ "--package", opts.package_name });
+    if (opts.external_types_module) |module_name|
+        codegen.addArgs(&.{ "--external-types-module", module_name });
 
     // Build --generate flag
     var gen_parts = std.ArrayListUnmanaged(u8).empty;
@@ -175,7 +207,7 @@ pub fn addOpenApiModule(dep: *std.Build.Dependency, b: *std.Build, opts: OpenApi
     }
 
     codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(opts.package_name);
+    const gen_dir = codegen.addOutputDirectoryArg2(opts.package_name, .{ .make_absolute = true });
 
     const module = b.addModule(opts.package_name, .{
         .root_source_file = gen_dir.path(b, "root.zig"),

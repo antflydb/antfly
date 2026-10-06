@@ -11,15 +11,17 @@ Antfly is a search-and-inference database written in Zig with zero dependencies.
 curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
 antfly standalone
 
-# Or with Homebrew
+# Or with Homebrew (macOS or Linux)
 brew install antflydb/taps/antfly
 
 # Or build from source
 make build && ./antfly standalone
 
 # Or run with Docker
-docker run -p 8080:8080 ghcr.io/antflydb/antfly:latest
+docker run -p 127.0.0.1:8080:8080 ghcr.io/antflydb/antfly:latest standalone --host 0.0.0.0
 ```
+
+These quickstarts run without authentication and are intended for local development. Keep Docker ports bound to loopback. Before allowing remote access, [enable authentication and provision a unique admin password](docs/auth.md#secure-deployment), then configure TLS at a reverse proxy.
 
 That gives you the [Antfarm dashboard](ts/apps/antfarm) at `http://localhost:8080` — playgrounds for search, RAG, knowledge graphs, embeddings, reranking, and more.
 
@@ -40,24 +42,25 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 - **PostgreSQL CDC** — [mirror a Postgres table](docs/guides/cdc-replication.mdx) into Antfly over logical replication, every insert, update, and delete included
 - **CLI** — one `antfly` binary for the server, tables, queries, backups, auth, and the [model registry](docs/guides/inference.mdx) (`antfly inference pull owner/model`)
 - **Secrets** — reference credentials as [`${secret:...}` keystore entries or env vars](docs/secrets.md) instead of putting them in config
-- **S3 storage** — store data in [S3/MinIO/R2](docs/s3-storage.md) for big cost savings and way faster shard splits
+- **Object storage** — the [serverless engine](docs/s3-storage.md) keeps artifacts, manifests, WAL, and catalog state in S3-compatible storage (S3, MinIO, R2) or Google Cloud Storage
 - **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with a kernel JIT
-- **Distributed** — multi-Raft consensus, automatic sharding and replication, online shard splits, cross-shard transactions, horizontal scaling
+- **Distributed** — multi-Raft consensus, key-range sharding and replication, online shard splits (automatic size-based split and merge is opt-in), cross-shard transactions, horizontal scaling
 - **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage
-- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), a [Go binding](go/pkg/antflylite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
+- **Embeddable** — a [C API](zig/pkg/antfly/src/capi) (`libantfly`), [Lite bindings](docs/sdks.mdx#embedded-lite-binding) for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
 - **Extensions** — run your own code inside the engine with the [Wasmtime extension runtime](zig/pkg/antfly/src/extensions)
 - **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
-- **Bring your own models** — Ollama, OpenAI, Bedrock, Google, or run models locally with Antfly inference (GGUF, safetensors, and ONNX)
+- **Bring your own models** — Ollama, OpenAI, OpenRouter, Cohere, Bedrock, Gemini, Vertex AI, or run models locally with Antfly inference (GGUF, safetensors, and ONNX)
 - **Fine-tuning** — [LoRA, QLoRA, SFT, DPO, GRPO and more](zig/pkg/inference/src/finetune) with recipes for Gemma 4, GLiNER2, ColQwen2, LayoutLMv3, rerankers, and chunkers
 - **Auth** — built-in [user management](zig/pkg/antfly/src/usermgr) with API keys, basic auth, and bearer tokens
-- **Backup & restore** — to local disk or S3
+- **Backup & restore** — portable backups to local disk, S3, or Google Cloud Storage
 - **Kubernetes operator** — deploy and manage clusters with the [operator](go/pkg/operator) ([docs](go/pkg/operator/docs))
 - **MCP and A2A protocols** — [protocol adapters](zig/pkg/antfly/src/api/protocol_adapters.zig) let agents and LLMs use Antfly directly, and an [n8n guide](docs/guides/n8n.mdx) wires it into workflows
+- **Relational tables** — `storage_mode: relational` tables with typed packed rows, `relational` indexes, row query and mutate APIs, databases, a system catalog, and tablespaces
 - **Antfarm** — [web dashboard](ts/apps/antfarm) with playgrounds for search, RAG, chat, knowledge graphs, embeddings, reranking, chunking, extraction, OCR, transcription, and evals
 
 ### In progress
 
-- **Relational tables, SQL, and the Postgres wire protocol** — closed schemas with typed packed rows, SQL lowered to native typed plans, a `psql`-compatible server, and lake tables over Iceberg and Parquet. Tracked in [#502](https://github.com/antflydb/antfly/pull/502) (relational storage), [#691](https://github.com/antflydb/antfly/pull/691) (system catalog and tablespaces), and [#145](https://github.com/antflydb/antfly/pull/145) (SQL, pgwire, and lake query mode)
+- **SQL and the Postgres wire protocol** — SQL lowered to native typed plans, a `psql`-compatible server, and lake tables over Iceberg and Parquet. Tracked in [#145](https://github.com/antflydb/antfly/pull/145)
 
 ## Documentation
 
@@ -109,7 +112,7 @@ Antfly inference handles the ML side: embeddings, chunking, reranking, classific
 | evalaf | LLM/RAG/agent evaluation ("promptfoo for Go") | [`go/pkg/evalaf`](go/pkg/evalaf) |
 | Genkit plugin | Firebase Genkit integration for retrieval and docstore | [`go/pkg/genkit/antfly`](go/pkg/genkit/antfly) |
 | memoryaf | Shared long-term memory for AI agents over MCP and HTTP | [`go/pkg/memoryaf`](go/pkg/memoryaf) |
-| antflylite | Go binding for embedded `.aflite` databases over the C ABI | [`go/pkg/antflylite`](go/pkg/antflylite) |
+| lite | Go, Python, Rust, and TypeScript bindings for embedded `.aflite` databases over the C ABI | [`go/pkg/lite`](go/pkg/lite), [`py/packages/lite`](py/packages/lite), [`rs/crates/lite`](rs/crates/lite), [`ts/packages/lite`](ts/packages/lite) |
 
 ## Architecture
 
@@ -118,7 +121,7 @@ Antfly uses a multi-[Raft](https://raft.github.io/raft.pdf) design with separate
 - **Metadata raft** — table schemas, shard assignments, cluster topology
 - **Storage rafts** — one per shard, handling data, indexes, and queries
 
-Every dependency is our own: [Raft](zig/pkg/antfly/src/raft), the [LSM](zig/pkg/antfly/src/storage/lsm), an [LMDB-compatible B+tree](zig/pkg/antfly/src/lmdb), the WAL, [full-text search](zig/pkg/antfly/src/search), HTTP/2 and HTTP/3, and the inference runtime. The one vendored input is our [Snowball fork](zig/deps/snowball), used to generate the stemmer tables that are checked in. Because the engine owns the whole process, each of these runs under a deterministic [VOPR](zig/pkg/antfly/src/vopr) simulation harness that injects storage, network, concurrency, and clock faults, in the style of [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
+The runtime includes our own [Raft](zig/pkg/antfly/src/raft), [LSM](zig/pkg/antfly/src/storage/lsm), WAL, [full-text search](zig/pkg/antfly/src/search), HTTP/2 and HTTP/3, and inference implementations. The repository also maintains a standalone [Zig LMDB-compatible B+tree](zig/lib/lmdb/src) and vendored [C LMDB oracle](zig/lib/lmdb) for compatibility testing; neither is a production storage backend. Our [Snowball fork](zig/deps/snowball) generates the checked-in stemmer tables. The engine runs under a deterministic [VOPR](zig/pkg/antfly/src/vopr) simulation harness that injects storage, network, concurrency, and clock faults, in the style of [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 
 End-to-end [chaos tests](zig/e2e/antfly) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
 
@@ -139,4 +142,4 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. The in-process bindings that link the core — [`antfly-embedded`](zig/pkg/antfly-embedded) and the [Go Lite binding](go/pkg/antflylite) — are ELv2 as well. Everything else — the [SDKs](go/pkg/sdk) for Go, TypeScript, Python, and Rust, [React components](ts/packages/components), the [inference runtime](zig/pkg/inference), [pgaf](rs/crates/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf) — is Apache 2.0. We tried to keep as much as possible under a permissive license.
+The core server is [Elastic License 2.0 (ELv2)](LICENSE). That means you can use it, modify it, self-host it, and build products on top of it — you just can't offer Antfly itself as a managed service. The in-process Zig embedding package, [`antfly-embedded`](zig/pkg/antfly-embedded), is ELv2 as well. Everything else — the [SDKs](go/pkg/sdk) for Go, TypeScript, Python, and Rust, the public C ABI header [`antfly.h`](zig/pkg/antfly/include/antfly.h), the Antfly Lite bindings for [Go](go/pkg/lite), [Python](py/packages/lite), [Rust](rs/crates/lite), and [TypeScript](ts/packages/lite), [React components](ts/packages/components), the [inference runtime](zig/pkg/inference), [pgaf](rs/crates/pgaf), [docsaf](go/pkg/docsaf), [evalaf](go/pkg/evalaf), and the runnable [examples](examples) — is Apache 2.0. We tried to keep as much as possible under a permissive license.

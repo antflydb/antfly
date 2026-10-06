@@ -6,5 +6,9 @@ pub const implementation_tests_only = true;
 pub const storage_backend_erased = @import("storage/backend_erased.zig");
 pub const lsm_backend = @import("storage/lsm_backend.zig");
 comptime {
+    _ = @import("data/graph_cleanup_sweep.zig");
     _ = @import("data/runtime.zig").implementation_tests;
+    _ = @import("storage/db/enrichment/enrichment_runtime.zig");
+    _ = @import("storage/hot_standby/restore_terminal_ledger.zig");
+    _ = @import("data/storage/shard_state_store.zig");
 }

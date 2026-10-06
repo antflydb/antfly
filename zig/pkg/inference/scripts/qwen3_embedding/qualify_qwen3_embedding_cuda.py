@@ -33,10 +33,7 @@ TIER_MIN_COSINE = {
     "q8_0": common.TIER_MIN_COSINE["q8_0"],
 }
 CUDA_MODEL_TIERS = {
-    "qwen3-embedding": "q8_0",
-    "qwen3-embedding-0.6b": "q8_0",
     "Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1": "q8_0",
-    "qwen3-embedding-0.6b-safetensors": "bf16",
     "Qwen/Qwen3-Embedding-0.6B:bf16-safetensors-bundle-v1": "bf16",
 }
 
@@ -72,7 +69,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--oracle", type=Path, required=True)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--model", default="qwen3-embedding-0.6b")
+    parser.add_argument(
+        "--model", default="Qwen/Qwen3-Embedding-0.6B-GGUF:q8-0-bundle-v1"
+    )
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--report", type=Path)
     common.add_concurrency_arguments(parser)

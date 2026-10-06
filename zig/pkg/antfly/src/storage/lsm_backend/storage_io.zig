@@ -19,8 +19,8 @@ const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const byte_copy = @import("../../common/byte_copy.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 
 const Allocator = std.mem.Allocator;
 const CounterU64 = platform.atomic.Value(u64);
@@ -254,6 +254,10 @@ pub const RangeReadFuture = struct {
 
 pub const ReadRuntime = if (builtin.os.tag == .freestanding)
     struct {
+        pub fn getIo(_: *const ReadRuntime) ?std.Io {
+            return null;
+        }
+
         pub fn init(_: anytype) ReadRuntime {
             return .{};
         }
@@ -261,6 +265,10 @@ pub const ReadRuntime = if (builtin.os.tag == .freestanding)
 else
     struct {
         io: std.Io,
+
+        pub fn getIo(self: *const ReadRuntime) ?std.Io {
+            return self.io;
+        }
 
         pub fn init(io: std.Io) ReadRuntime {
             return .{ .io = io };
@@ -331,42 +339,54 @@ pub const NativePathLockFileOptions = struct {
 };
 
 pub const NativePathLockFile = struct {
-    io_impl: std.Io.Threaded,
+    io_impl: if (supports_native_storage) std.Io.Threaded else void,
     file: std.Io.File,
     fd_cache: *FdCache,
     locked: bool = false,
 
     pub fn lock(self: *NativePathLockFile, mode: NativePathLockMode) !void {
-        std.debug.assert(!self.locked);
-        try self.file.lock(self.io_impl.io(), switch (mode) {
-            .shared => .shared,
-            .exclusive => .exclusive,
-        });
-        self.locked = true;
+        if (comptime !supports_native_storage) {
+            return error.UnsupportedPlatform;
+        } else {
+            std.debug.assert(!self.locked);
+            try self.file.lock(self.io_impl.io(), switch (mode) {
+                .shared => .shared,
+                .exclusive => .exclusive,
+            });
+            self.locked = true;
+        }
     }
 
     pub fn tryLock(self: *NativePathLockFile, mode: NativePathLockMode) !bool {
-        std.debug.assert(!self.locked);
-        const locked = try self.file.tryLock(self.io_impl.io(), switch (mode) {
-            .shared => .shared,
-            .exclusive => .exclusive,
-        });
-        self.locked = locked;
-        return locked;
+        if (comptime !supports_native_storage) {
+            return error.UnsupportedPlatform;
+        } else {
+            std.debug.assert(!self.locked);
+            const locked = try self.file.tryLock(self.io_impl.io(), switch (mode) {
+                .shared => .shared,
+                .exclusive => .exclusive,
+            });
+            self.locked = locked;
+            return locked;
+        }
     }
 
     pub fn unlock(self: *NativePathLockFile) void {
-        if (!self.locked) return;
-        self.file.unlock(self.io_impl.io());
-        self.locked = false;
+        if (comptime supports_native_storage) {
+            if (!self.locked) return;
+            self.file.unlock(self.io_impl.io());
+            self.locked = false;
+        }
     }
 
     pub fn close(self: *NativePathLockFile) void {
-        self.unlock();
-        self.file.close(self.io_impl.io());
-        self.fd_cache.releasePersistentDescriptors(self.io_impl.io(), 1);
-        self.io_impl.deinit();
-        self.* = undefined;
+        if (comptime supports_native_storage) {
+            self.unlock();
+            self.file.close(self.io_impl.io());
+            self.fd_cache.releasePersistentDescriptors(self.io_impl.io(), 1);
+            self.io_impl.deinit();
+            self.* = undefined;
+        }
     }
 };
 
@@ -436,34 +456,38 @@ fn openNativePathLockFileWithCache(
     options: NativePathLockFileOptions,
     fd_cache: *FdCache,
 ) !NativePathLockFile {
-    var io_impl = threaded_io_limits.initService(allocator);
-    errdefer io_impl.deinit();
+    if (comptime !supports_native_storage) {
+        return error.UnsupportedPlatform;
+    } else {
+        var io_impl = threaded_io_limits.initService(allocator);
+        errdefer io_impl.deinit();
 
-    const open_descriptor_count = createPathDescriptorCount(path);
-    // Path locks live for the backend lifetime. They share the process budget,
-    // but must never queue behind other lifetime descriptors: once that class
-    // fills the budget, no waiter can make progress until a backend closes.
-    // Reserved headroom protects opens from transient load; true persistent
-    // exhaustion is reported instead of hanging startup or restore.
-    try fd_cache.reservePersistentDescriptors(io_impl.io(), open_descriptor_count);
-    var reserved_descriptor_count = open_descriptor_count;
-    errdefer fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count);
+        const open_descriptor_count = createPathDescriptorCount(path);
+        // Path locks live for the backend lifetime. They share the process budget,
+        // but must never queue behind other lifetime descriptors: once that class
+        // fills the budget, no waiter can make progress until a backend closes.
+        // Reserved headroom protects opens from transient load; true persistent
+        // exhaustion is reported instead of hanging startup or restore.
+        try fd_cache.reservePersistentDescriptors(io_impl.io(), open_descriptor_count);
+        var reserved_descriptor_count = open_descriptor_count;
+        errdefer fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count);
 
-    const file = if (options.create_if_missing)
-        try fs_paths.createFilePortable(io_impl.io(), path, .{ .read = true, .truncate = false })
-    else
-        try openNativePathFile(io_impl.io(), path);
-    errdefer file.close(io_impl.io());
-    if (reserved_descriptor_count > 1) {
-        fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count - 1);
-        reserved_descriptor_count = 1;
+        const file = if (options.create_if_missing)
+            try fs_paths.createFilePortable(io_impl.io(), path, .{ .read = true, .truncate = false })
+        else
+            try openNativePathFile(io_impl.io(), path);
+        errdefer file.close(io_impl.io());
+        if (reserved_descriptor_count > 1) {
+            fd_cache.releasePersistentDescriptors(io_impl.io(), reserved_descriptor_count - 1);
+            reserved_descriptor_count = 1;
+        }
+
+        return .{
+            .io_impl = io_impl,
+            .file = file,
+            .fd_cache = fd_cache,
+        };
     }
-
-    return .{
-        .io_impl = io_impl,
-        .file = file,
-        .fd_cache = fd_cache,
-    };
 }
 
 fn createPathDescriptorCount(path: []const u8) usize {
@@ -1407,7 +1431,7 @@ else
                     return existing;
                 }
             }
-            const owned_path = try self.allocator.dupeZ(u8, path);
+            const owned_path = try self.allocator.dupeSentinel(u8, path, 0);
             var owned_path_active = true;
             errdefer if (owned_path_active) self.allocator.free(owned_path);
 
@@ -1795,7 +1819,7 @@ else
 
 var process_native_storage_pool_mutex: std.atomic.Mutex = .unlocked;
 var process_native_fd_cache: ?*FdCache = null;
-var native_storage_cache_namespace: std.atomic.Value(u64) = .init(1);
+var native_storage_cache_namespace: @import("antfly_platform").atomic.Value(u64) = .init(1);
 
 fn processNativeFdCache() *FdCache {
     const locked = lockAtomic(&process_native_storage_pool_mutex);
@@ -2971,9 +2995,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
     defer closeFd(new_parent_fd);
 
     const allocator = std.heap.page_allocator;
-    const old_base_name_z = try allocator.dupeZ(u8, old_base_name);
+    const old_base_name_z = try allocator.dupeSentinel(u8, old_base_name, 0);
     defer allocator.free(old_base_name_z);
-    const new_base_name_z = try allocator.dupeZ(u8, new_base_name);
+    const new_base_name_z = try allocator.dupeSentinel(u8, new_base_name, 0);
     defer allocator.free(new_base_name_z);
 
     while (true) {
@@ -3002,9 +3026,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
 
 fn renameAbsoluteDirectPosix(old_path: []const u8, new_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const old_path_z = try allocator.dupeZ(u8, old_path);
+    const old_path_z = try allocator.dupeSentinel(u8, old_path, 0);
     defer allocator.free(old_path_z);
-    const new_path_z = try allocator.dupeZ(u8, new_path);
+    const new_path_z = try allocator.dupeSentinel(u8, new_path, 0);
     defer allocator.free(new_path_z);
 
     while (true) {
@@ -3058,7 +3082,7 @@ fn createAtomicWriteFdPosix(path: []const u8) !std.posix.fd_t {
 
 fn deleteFilePathPosix(path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -5136,9 +5160,10 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     // Every task intentionally holds a lease or waits in descriptor admission.
     // Give the threaded test executor one slot per task so the harness itself
     // cannot become the bottleneck before the >64 contention point is reached.
+    // Keep the platform's default stack size: the linked test graph's static
+    // TLS can exceed a hand-picked 512 KiB stack on glibc (pthread EINVAL).
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .limited(worker_count),
-        .stack_size = 512 * 1024,
     });
     defer io_impl.deinit();
     const io = io_impl.io();

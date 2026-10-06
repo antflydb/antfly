@@ -16,6 +16,123 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **Native PDF extraction** — repair demonstrably interleaved horizontal prose
+  columns without changing paint order. Require sustained prose in both columns
+  and preserve ambiguous table row associations. Preserve authored order for
+  overlapping paint sequences, already-grouped columns, and vertically separated
+  layouts. Resolve indirect CCITT decode parameters, accept valid zero-filled
+  Group 3 line markers, and correct PNG compression-buffer ownership.
+- **Durable OCR grounding** — preserve compatible Reader regions as UTF-8 byte
+  spans and page-space boxes, including rotated pages and CropBox offsets.
+  Invalid regions no longer discard valid text or shift later repeated text
+  onto an earlier occurrence.
+- **OCR content retention** — reject partial transcriptions that discard most
+  decoded text while allowing recovery from corrupted glyphs. Preserve signed
+  numeric values, singleton numeric lines, and their full source-row context
+  when combining OCR with embedded text.
+- **Native multistage OCR** — support exact transposed convolution and average
+  pooling, preserve typed constants and dynamic reshape dimensions in native
+  partitioned execution, and correct Paddle image normalization, detector aspect
+  ratio, recognition width/padding, tall-crop
+  rotation, and CTC vocabulary handling. Recognition failures propagate instead
+  of returning partial success.
+- **Reader request memory** — encode large inline-image JSON requests into one
+  exactly sized allocation, avoiding unnecessary working-set failures without
+  increasing production memory limits.
+- **Bounded compatibility rendering** — keep temporary RGBA and PNG compression
+  allocations out of retained-output budgets without increasing memory limits.
+  macOS compatibility-rendered pages remain explicitly marked as such.
+- **Research agent** — `POST /agents/research` plans a question into
+  sub-questions, researches them in parallel with the retrieval agent, reflects
+  on coverage, and writes a sectioned report whose `[E#]` citations resolve to a
+  deduplicated evidence registry. Unresolvable citation markers are removed and
+  reported, and an optional verify step checks cited statements against their
+  evidence. Every limit is declared in `budget` and is cumulative across
+  resumes; `research_state` carries a run forward. Durable jobs
+  (`/agents/research/jobs`, with `advance` and `cancel`) checkpoint after every
+  phase, are scoped to the authenticated user, and survive restarts in local
+  standalone mode. Available from the CLI (`antfly agents research`, `--job`),
+  the Go and TypeScript SDKs, `@antfly/components` (`useResearchStream`,
+  `ResearchReport`), evalaf, and as the A2A `research` skill.
+- **Retrieval agent `fetch` tool** — agents can read full web pages. Fetch is
+  opt-in and admits only URLs returned by `web_search` in the same run or on
+  `fetch_config.allowed_hosts`; private addresses are always blocked. Tool
+  results are budgeted in estimated tokens instead of bytes, and every model
+  round checks the request deadline and cancellation.
+
+- **One rerank endpoint for text and images** — `POST /ai/v1/rerank` takes
+  `documents`, where each entry is a string or an array of text and image
+  content parts, the same format generation and embedding use. Documents with
+  images need a multimodal reranker (ColQwen or Qwen3-VL); other models reject
+  them with `400`. `/ai/v1/rerank_multimodal` is removed; send those requests
+  to `/rerank` with the document content directly in `documents` (the
+  `{id, content}` wrapper is gone). `prompts` is deprecated but still accepted
+  for text. The operation id is now `rerankDocuments`, so generated SDK methods
+  are renamed (`RerankDocumentsWithResponse`, `rerank_documents`). The Go SDK
+  adds `InferenceClient.RerankMultimodal`, and the TypeScript `rerank()` accepts
+  content-part documents. Inference proxy route rules that matched the
+  `rerank_multimodal` operation should match `rerank` and select the model by
+  name instead. Inference servers advertise `rerank_documents_v1` in the model
+  catalog; Antfly sends `documents` only to servers that do and keeps sending
+  `prompts` to older ones, so clusters and inference pools can upgrade in
+  either order. `prompts` can be removed once every client sends `documents`.
+- **Embedder input types come from model capabilities** — the embedder
+  `multimodal` flag is removed. Antfly learns which inputs a model accepts from
+  its capabilities (discovered from Antfly inference, or the linked runtime).
+  For a model whose capabilities cannot be discovered yet, set `inputs`, for
+  example `["text", "image"]`, which replaces the discovered input types; only
+  the `antfly` (`image`, `audio`) and `bedrock` (`image`) providers accept media
+  inputs. Existing indexes keep working: a stored `multimodal` value is ignored,
+  and it no longer takes part in embedding producer identity.
+- **Reranker image support is resolved from the model manifest** — like image
+  embedding, a manifest declaring text-only `inputs` stays text-only, and
+  otherwise a Qwen3-VL GGUF bundle with its projector or a `colqwen` /
+  `multimodal_late_interaction` capability selects the image executor. The
+  model catalog, the executor contract, and the rerank handler share that one
+  answer.
+- **Query rerankers score images** — a reranker `template` can use the `media`
+  and `remoteMedia` helpers, and each candidate's images are sent with its
+  text to an Antfly reranker whose model accepts images, whether it runs in
+  process or on a remote inference server. Other rerankers reject such queries
+  with `400`.
+- **Aggregations on hybrid and semantic queries** — queries that combine
+  `aggregations` with `semantic_search` or `embeddings` no longer fail with
+  `query_candidate_budget_exceeded`. Aggregations now count every full-text
+  match plus each embedding index's top results at the requested limit and
+  `search_effort`, merged across shards. Previously the internal collection
+  widened each vector search to the full-result budget, which approximate
+  search could never prove complete. The ranked page is unchanged, the
+  full-result budget still bounds full-text matches, and a filter with no
+  full-text query contributes no extra rows. Separately, a vector search that
+  exhausts its traversal with a truncated top-k window now reports its total as
+  a lower bound instead of exact.
+- **Aggregation and semantic paging corrections** — full-text facets with fewer
+  matches than the collection budget now complete on larger tables. Explicit
+  `match_all` contributes its text domain to hybrid aggregations, while
+  filter-only vector requests no longer add a match-all retrieval lane to the
+  ranked page.
+- **TOON document rendering in retrieval agents** — the generation prompt now
+  encodes each retrieved document's fields as TOON instead of raw JSON, and
+  `document_renderer` on a retrieval agent request is accepted again: a
+  Handlebars template rendered per hit against `{id, score, fields}` with an
+  `encodeToon` helper (`indent`, `delimiter`). Invalid templates are rejected
+  with `400`. Queries still reject `document_renderer`.
+- **`antfly inference run` reads the rest of its config file** — `keep_alive`
+  (duration) or `keep_alive_ms` (integer; `0` never unloads idle models),
+  `prompt_cache`, and `kernel_jit` are now honored, nested under `inference` or
+  flat. CLI flags and `ANTFLY_INFERENCE_KERNEL_JIT_MODE` still win. Operator
+  InferencePool keep-alive settings now take effect.
+- **Operator: standalone keeps embedded inference** — standalone clusters no
+  longer default `inference.api_url` to `http://0.0.0.0:11433`, which disabled
+  embedded inference; `api_url` is written only when set explicitly, and a
+  user-provided value is never overwritten. Standalone and InferencePool pods
+  with a memory limit get `ANTFLY_PROCESS_MEMORY_BUDGET_MB` at 90% of it.
+- **Operator: InferencePool model `priority` orders preloads** — eager preloads
+  warm high, then medium, then low priority models; priority does not affect
+  eviction.
+- **Retrieval agent `auto_seed` stays agent-side** — the flag is cleared before
+  the internal query hop now that the generated rerank type carries it.
+
 - **`antfly standby` replaces `antfly ha`** — the hot-standby command is
   renamed; `antfly ha` remains a hidden alias for one minor release. It gains
   `--data-dir` (opens the node's standby state under `<dir>/ha/` and reads the

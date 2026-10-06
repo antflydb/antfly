@@ -132,7 +132,16 @@ def sync_detailed(
 
     Args:
         idempotency_key (str | Unset):
-        body (ClusterRestoreRequest):
+        body (ClusterRestoreRequest): Native cohort restores use the existing asynchronous restore
+            job to provision
+            hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+            and publish the dependency-complete target set atomically. Document, relational,
+            and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+            Skipping a live parent cannot substitute it for a parent generation required by
+            a restored child. Overwrite retains the old generation until validation and
+            cutover; cancellation after publication completes publication rather than rollback.
+            Reserved destination authorization is immutable: changing principal requires
+            canceling the old job and creating a new restore.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -186,7 +195,16 @@ def sync(
 
     Args:
         idempotency_key (str | Unset):
-        body (ClusterRestoreRequest):
+        body (ClusterRestoreRequest): Native cohort restores use the existing asynchronous restore
+            job to provision
+            hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+            and publish the dependency-complete target set atomically. Document, relational,
+            and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+            Skipping a live parent cannot substitute it for a parent generation required by
+            a restored child. Overwrite retains the old generation until validation and
+            cutover; cancellation after publication completes publication rather than rollback.
+            Reserved destination authorization is immutable: changing principal requires
+            canceling the old job and creating a new restore.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -235,7 +253,16 @@ async def asyncio_detailed(
 
     Args:
         idempotency_key (str | Unset):
-        body (ClusterRestoreRequest):
+        body (ClusterRestoreRequest): Native cohort restores use the existing asynchronous restore
+            job to provision
+            hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+            and publish the dependency-complete target set atomically. Document, relational,
+            and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+            Skipping a live parent cannot substitute it for a parent generation required by
+            a restored child. Overwrite retains the old generation until validation and
+            cutover; cancellation after publication completes publication rather than rollback.
+            Reserved destination authorization is immutable: changing principal requires
+            canceling the old job and creating a new restore.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -287,7 +314,16 @@ async def asyncio(
 
     Args:
         idempotency_key (str | Unset):
-        body (ClusterRestoreRequest):
+        body (ClusterRestoreRequest): Native cohort restores use the existing asynchronous restore
+            job to provision
+            hidden fresh generations, import rows, rebuild indexes and coordinated constraints,
+            and publish the dependency-complete target set atomically. Document, relational,
+            and mixed native cohorts use the same workflow (at most 128 tables/4096 ranges).
+            Skipping a live parent cannot substitute it for a parent generation required by
+            a restored child. Overwrite retains the old generation until validation and
+            cutover; cancellation after publication completes publication rather than rollback.
+            Reserved destination authorization is immutable: changing principal requires
+            canceling the old job and creating a new restore.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

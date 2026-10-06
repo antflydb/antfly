@@ -73,12 +73,12 @@ export function getEyeShape(shapeName: EyeShapeName, side: "left" | "right"): st
   }
 
   const cacheKey = `${shapeName}_right`;
-  if (!mirroredPathCache.has(cacheKey)) {
-    const dimensions = EYE_DIMENSIONS[shapeName];
-    mirroredPathCache.set(cacheKey, mirrorSvgPath(basePath, dimensions.width));
-  }
-
-  return mirroredPathCache.get(cacheKey)!;
+  const cached = mirroredPathCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const dimensions = EYE_DIMENSIONS[shapeName];
+  const mirrored = mirrorSvgPath(basePath, dimensions.width);
+  mirroredPathCache.set(cacheKey, mirrored);
+  return mirrored;
 }
 
 export function getEyeDimensions(shapeName: EyeShapeName): {

@@ -13,9 +13,10 @@
 //! never observe one without the other.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
-const fs_paths = @import("../../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const platform_sync = @import("antfly_platform").sync;
 const storage_io = @import("../../lsm_backend/storage_io.zig");
 const types = @import("../types.zig");
@@ -26,7 +27,7 @@ const magic = "AFIDXRP1";
 // admission. It deliberately does not overload the shadow candidate's build
 // cursor: source replay precedes candidate creation and has a different crash
 // boundary.
-const format_version: u32 = 12;
+const format_version: u32 = 13;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -101,6 +102,9 @@ pub const Trigger = enum(u8) {
     /// independent work class determines that this is initial materialization,
     /// not repair; the trigger preserves the exact control-plane cause.
     catalog_admission = 10,
+    /// Build receiver-local historical projection evidence without claiming
+    /// the currently serving index is corrupt or an operator requested it.
+    artifact_baseline_adoption = 11,
 };
 
 /// Durable scheduler work and its user-visible meaning are separate from the
@@ -189,6 +193,7 @@ pub const IndexRepairIntent = struct {
     previous_active_relative_path: ?[]u8 = null,
     detected_sequence: u64,
     build_floor_sequence: u64 = 0,
+    build_source_guard: ?@import("../artifact_source_gap.zig").Guard = null,
     /// Last source-store key durably incorporated into a reopenable building
     /// candidate. Resume scans begin strictly after this key. The cumulative
     /// count is diagnostic/accounting state and is not used for correctness.
@@ -417,7 +422,7 @@ pub fn newReplicaIdentity(alloc: Allocator, root_generation: u64) !ReplicaIdenti
 pub fn newReplicaIdentityWithIo(alloc: Allocator, io: std.Io, root_generation: u64) !ReplicaIdentity {
     _ = alloc;
     var entropy: [32]u8 = undefined;
-    try io.randomSecure(&entropy);
+    try @import("antfly_platform").entropy.fill(io, &entropy);
     var db_identity = std.mem.readInt(u128, entropy[0..16], .little);
     var replica_id = std.mem.readInt(u128, entropy[16..32], .little);
     if (db_identity == 0) db_identity = 1;
@@ -436,7 +441,7 @@ pub fn newRepairId(alloc: Allocator) !u128 {
 pub fn newRepairIdWithIo(alloc: Allocator, io: std.Io) !u128 {
     _ = alloc;
     var entropy: [16]u8 = undefined;
-    try io.randomSecure(&entropy);
+    try @import("antfly_platform").entropy.fill(io, &entropy);
     const value = std.mem.readInt(u128, &entropy, .little);
     return if (value == 0) 1 else value;
 }
@@ -445,7 +450,8 @@ pub fn loadOrCreate(alloc: Allocator, path: []const u8, root_generation: u64) !S
     return try loadOrCreateAt(alloc, .native(path), root_generation);
 }
 
-pub fn loadOrCreateAt(alloc: Allocator, location: Location, root_generation: u64) !State {
+pub fn loadOrCreateAt(alloc: Allocator, location: Location, root_generation: u64) anyerror!State {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     return loadUnlockedAt(alloc, location) catch |err| switch (err) {
@@ -463,7 +469,8 @@ pub fn load(alloc: Allocator, path: []const u8) !State {
     return try loadAt(alloc, .native(path));
 }
 
-pub fn loadAt(alloc: Allocator, location: Location) !State {
+pub fn loadAt(alloc: Allocator, location: Location) anyerror!State {
+    if (builtin.os.tag == .freestanding) return error.FileNotFound;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     return try loadUnlockedAt(alloc, location);
@@ -507,7 +514,8 @@ pub fn resetForRootGenerationWithIntentsAt(
     expected_identity: ReplicaIdentity,
     root_generation: u64,
     intents: []const IndexRepairIntent,
-) !State {
+) anyerror!State {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     var old = try loadUnlockedAt(alloc, location);
@@ -555,7 +563,8 @@ pub fn putEntryAt(
     expected_identity: ReplicaIdentity,
     expected: ?ExpectedTransition,
     entry: Entry,
-) !u64 {
+) anyerror!u64 {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     try validateEntry(entry);
     if (!entry.intent.identity().eql(expected_identity)) return error.ReplicaIdentityMismatch;
 
@@ -651,7 +660,8 @@ pub fn removeEntryAndPinAt(
     location: Location,
     expected_identity: ReplicaIdentity,
     expected: ExpectedTransition,
-) !u64 {
+) anyerror!u64 {
+    if (builtin.os.tag == .freestanding) return error.DurableIndexRepairStateUnavailable;
     var guard = try acquire(location.lock_key);
     defer guard.release();
     var state = try loadUnlockedAt(alloc, location);
@@ -684,6 +694,7 @@ fn findIndexByRepairId(state: *const State, repair_id: u128) ?usize {
 
 fn validateEntry(entry: Entry) !void {
     const intent = entry.intent;
+    if (intent.build_source_guard) |guard| _ = guard.encode() catch return error.InvalidIndexRepairState;
     if (intent.version != 1 or intent.repair_id == 0 or intent.db_identity == 0 or intent.replica_id == 0) return error.InvalidIndexRepairState;
     if (intent.index_name.len == 0 or intent.index_name.len > max_index_name_bytes) return error.InvalidIndexRepairState;
     if (intent.candidate_relative_path) |path| try validateCandidateRelativePath(intent.index_name, path);
@@ -808,9 +819,9 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u128, intent.replica_id);
         try appendInt(alloc, &out, u64, intent.root_generation);
         try appendString(alloc, &out, intent.index_name, max_index_name_bytes);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.kind));
+        try appendInt(alloc, &out, u8, @backingInt(intent.kind));
         try appendInt(alloc, &out, u64, intent.config_hash);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.trigger));
+        try appendInt(alloc, &out, u8, @backingInt(intent.trigger));
         try appendInt(alloc, &out, u64, intent.operator_job_id);
         try appendInt(alloc, &out, u64, intent.operator_job_created_at_ms);
         try appendOptionalString(alloc, &out, intent.candidate_relative_path, max_candidate_path_bytes);
@@ -822,7 +833,7 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         try appendInt(alloc, &out, u64, intent.build_reprocessed);
         try appendOptionalString(alloc, &out, intent.source_replay_resume_key, max_build_resume_key_bytes);
         try appendInt(alloc, &out, u64, intent.source_replay_reprocessed);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.source_replay_state));
+        try appendInt(alloc, &out, u8, @backingInt(intent.source_replay_state));
         try appendInt(alloc, &out, u64, intent.candidate_applied_sequence);
         try appendInt(alloc, &out, u64, intent.estimated_candidate_bytes);
         // Format versions 2 and 3 called this value "reserved". Its on-disk
@@ -830,16 +841,18 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
         // process-local reservation cannot survive restart.
         try appendInt(alloc, &out, u64, intent.planned_disk_bytes);
         try appendInt(alloc, &out, u64, intent.target_sequence);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.phase));
+        try appendInt(alloc, &out, u8, @backingInt(intent.phase));
         try appendInt(alloc, &out, u32, intent.attempt_count);
         try appendInt(alloc, &out, u32, intent.failure_streak);
         try appendInt(alloc, &out, u64, intent.next_retry_at_ms);
         try appendInt(alloc, &out, u64, intent.started_at_ms);
         try appendInt(alloc, &out, u64, intent.updated_at_ms);
         try appendInt(alloc, &out, u64, intent.owner_epoch);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.automation));
+        try appendInt(alloc, &out, u8, @backingInt(intent.automation));
         try appendOptionalString(alloc, &out, intent.last_error, max_error_bytes);
-        try appendInt(alloc, &out, u8, @intFromEnum(intent.work_class));
+        try appendInt(alloc, &out, u8, @backingInt(intent.work_class));
+        try appendInt(alloc, &out, u8, @intFromBool(intent.build_source_guard != null));
+        if (intent.build_source_guard) |guard| try out.appendSlice(alloc, &try guard.encode());
         try appendInt(alloc, &out, u8, if (entry.pin != null) 1 else 0);
         if (entry.pin) |pin| {
             try appendInt(alloc, &out, u8, pin.version);
@@ -943,6 +956,17 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         if (decoded_format_version >= 12) {
             intent.work_class = try readEnum(WorkClass, raw[0..payload_end], &pos);
         }
+        if (decoded_format_version >= 13) {
+            const present = try readInt(raw[0..payload_end], &pos, u8);
+            if (present > 1) return error.InvalidIndexRepairState;
+            if (present == 1) {
+                const SourceGuard = @import("../artifact_source_gap.zig").Guard;
+                const size = @sizeOf(SourceGuard.Encoded);
+                if (pos > payload_end or size > payload_end - pos) return error.InvalidIndexRepairState;
+                intent.build_source_guard = SourceGuard.decode(raw[pos..][0..size]) catch return error.InvalidIndexRepairState;
+                pos += size;
+            }
+        }
         const has_pin = try readInt(raw[0..payload_end], &pos, u8);
         if (has_pin > 1) return error.InvalidIndexRepairState;
         var pin: ?IndexRepairReplayPin = null;
@@ -985,8 +1009,8 @@ fn readInt(raw: []const u8, pos: *usize, comptime T: type) !T {
 
 fn readEnum(comptime T: type, raw: []const u8, pos: *usize) !T {
     const value = try readInt(raw, pos, u8);
-    inline for (@typeInfo(T).@"enum".fields) |field| {
-        if (field.value == value) return @enumFromInt(value);
+    inline for (@typeInfo(T).@"enum".field_values) |field_value| {
+        if (field_value == value) return @fromBackingInt(@intCast(value));
     }
     return error.InvalidIndexRepairState;
 }
@@ -1100,6 +1124,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
     var entry = try testEntry(alloc, identity, .building);
     defer entry.deinit(alloc);
     entry.intent.build_floor_sequence = 11;
+    entry.intent.build_source_guard = .{ .boundary = .{ .authority = .{ .namespace = @splat(1), .epoch = 2, .catalog_digest = @splat(3) }, .replay_sequence = 4 }, .gap_epoch = 5 };
     entry.intent.build_resume_key = try alloc.dupe(u8, "artifact-key:42");
     entry.intent.build_reprocessed = 42;
     entry.intent.source_replay_resume_key = try alloc.dupe(u8, "document-key:17");
@@ -1130,6 +1155,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
     try std.testing.expectEqual(@as(usize, 1), reopened.entries.items.len);
     try std.testing.expectEqual(@as(?u64, 0), reopened.minimumRetainAfterSequence());
     try std.testing.expectEqual(Phase.building, reopened.entries.items[0].intent.phase);
+    try std.testing.expectEqualDeep(entry.intent.build_source_guard, reopened.entries.items[0].intent.build_source_guard);
     try std.testing.expectEqualStrings("artifact-key:42", reopened.entries.items[0].intent.build_resume_key.?);
     try std.testing.expectEqual(@as(u64, 42), reopened.entries.items[0].intent.build_reprocessed);
     try std.testing.expectEqualStrings("document-key:17", reopened.entries.items[0].intent.source_replay_resume_key.?);

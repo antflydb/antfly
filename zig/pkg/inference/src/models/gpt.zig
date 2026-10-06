@@ -140,9 +140,9 @@ pub const Config = struct {
     deepseek_v4_compressed_sparse_attention_layers: u32 = 0,
     deepseek_v4_heavily_compressed_attention_layers: u32 = 0,
     deepseek_v4_attention_schedule_len: u32 = 0,
-    deepseek_v4_attention_schedule: [deepseek_v4_max_layers]DeepseekV4AttentionKind = [_]DeepseekV4AttentionKind{.unknown} ** deepseek_v4_max_layers,
+    deepseek_v4_attention_schedule: [deepseek_v4_max_layers]DeepseekV4AttentionKind = @as([deepseek_v4_max_layers]DeepseekV4AttentionKind, @splat(.unknown)),
     deepseek_v4_mlp_schedule_len: u32 = 0,
-    deepseek_v4_mlp_schedule: [deepseek_v4_max_layers]DeepseekV4MlpKind = [_]DeepseekV4MlpKind{.unknown} ** deepseek_v4_max_layers,
+    deepseek_v4_mlp_schedule: [deepseek_v4_max_layers]DeepseekV4MlpKind = @as([deepseek_v4_max_layers]DeepseekV4MlpKind, @splat(.unknown)),
     deepseek_v4_original_seq_len: u32 = 0,
     deepseek_v4_rope_factor: f32 = 0.0,
     deepseek_v4_beta_fast: f32 = 0.0,
@@ -180,9 +180,9 @@ pub const Config = struct {
     bos_token_id: i32 = -1,
     eos_token_id: i32 = -1,
     extra_eos_token_ids_len: u8 = 0,
-    extra_eos_token_ids: [max_extra_eos_token_ids]i32 = [_]i32{-1} ** max_extra_eos_token_ids,
+    extra_eos_token_ids: [max_extra_eos_token_ids]i32 = @as([max_extra_eos_token_ids]i32, @splat(-1)),
     suppress_token_ids_len: u8 = 0,
-    suppress_token_ids: [max_suppress_token_ids]i32 = [_]i32{-1} ** max_suppress_token_ids,
+    suppress_token_ids: [max_suppress_token_ids]i32 = @as([max_suppress_token_ids]i32, @splat(-1)),
     pad_token_id: i32 = -1,
     image_token_index: i32 = -1,
     video_token_index: i32 = -1,
@@ -205,7 +205,7 @@ pub const Config = struct {
     vision_temporal_patch_size: u32 = 1,
     vision_use_quick_gelu: bool = false,
     vision_deepstack_visual_indexes_len: u8 = 0,
-    vision_deepstack_visual_indexes: [max_vision_deepstack_layers]u32 = [_]u32{0} ** max_vision_deepstack_layers,
+    vision_deepstack_visual_indexes: [max_vision_deepstack_layers]u32 = @as([max_vision_deepstack_layers]u32, @splat(0)),
     vision_deepstack_visual_indexes_truncated: bool = false,
 
     // Multi-axis RoPE metadata shared by Qwen multimodal families. Keeping the
@@ -947,7 +947,14 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (text_obj.get("attention_k_eq_v")) |v| if (jsonBool(v)) |val| {
         config.attention_k_eq_v = val;
     };
-    if (config.family == .gemma and config.num_kv_shared_layers > 0 and config.shared_layer_intermediate_size == 0) {
+    // Gemma 4 only widens the MLPs in the shared-KV tail when the checkpoint
+    // explicitly opts into that topology. The HF default is false (E4B uses
+    // uniform-width MLPs), while E2B sets the flag to true.
+    const use_double_wide_mlp = if (text_obj.get("use_double_wide_mlp")) |v|
+        jsonBool(v) orelse false
+    else
+        false;
+    if (config.family == .gemma and use_double_wide_mlp and config.num_kv_shared_layers > 0 and config.shared_layer_intermediate_size == 0) {
         config.shared_layer_intermediate_size = config.intermediate_size * 2;
     }
 
@@ -3037,6 +3044,7 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
         \\    "intermediate_size": 6144,
         \\    "sliding_window": 512,
         \\    "num_kv_shared_layers": 20,
+        \\    "use_double_wide_mlp": true,
         \\    "layer_types": [
         \\      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
         \\      "full_attention",
@@ -3083,6 +3091,55 @@ test "parse gemma4 e2b config with layer_types and shared kv" {
     try std.testing.expectEqual(@as(u32, 1), config.maxKvHeads());
     try std.testing.expectEqual(@as(u32, 512), config.maxHeadDim());
     try std.testing.expectEqual(@as(usize, 512), config.maxKvWidthPerToken());
+
+    // E2B doubles the MLP width exactly at the shared-KV tail boundary.
+    try std.testing.expectEqual(@as(u32, 6144), config.intermediateSize(14));
+    try std.testing.expectEqual(@as(u32, 12288), config.intermediateSize(15));
+    try std.testing.expectEqual(@as(u32, 12288), config.intermediateSize(34));
+}
+
+test "parse gemma4 e4b uniform-width shared tail" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 2560,
+        \\    "num_hidden_layers": 42,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 2,
+        \\    "intermediate_size": 10240,
+        \\    "num_kv_shared_layers": 18,
+        \\    "use_double_wide_mlp": false
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(!config.layerSharesKv(23));
+    try std.testing.expect(config.layerSharesKv(24));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(23));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(24));
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(41));
+}
+
+test "parse gemma4 defaults to uniform-width shared tail" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "gemma4",
+        \\  "text_config": {
+        \\    "hidden_size": 2560,
+        \\    "num_hidden_layers": 42,
+        \\    "num_attention_heads": 8,
+        \\    "intermediate_size": 10240,
+        \\    "num_kv_shared_layers": 18
+        \\  }
+        \\}
+    ;
+    const config = try parseConfig(allocator, json);
+    try std.testing.expectEqual(@as(u32, 0), config.shared_layer_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 10240), config.intermediateSize(41));
 }
 
 test "parse gguf metadata for gemma4 shared kv config" {

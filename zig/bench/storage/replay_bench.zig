@@ -39,7 +39,6 @@ const PrimaryKind = enum {
     lsm,
     lsm_memory,
     mem,
-    lmdb,
 };
 
 const ResourceProfile = enum {
@@ -250,7 +249,6 @@ fn parsePrimary(raw: []const u8) ?PrimaryKind {
     if (std.mem.eql(u8, raw, "lsm")) return .lsm;
     if (std.mem.eql(u8, raw, "lsm_memory")) return .lsm_memory;
     if (std.mem.eql(u8, raw, "mem")) return .mem;
-    if (std.mem.eql(u8, raw, "lmdb")) return .lmdb;
     return null;
 }
 
@@ -471,7 +469,6 @@ fn openOptions(cfg: Config, start_index_workers: bool) db_mod.OpenOptions {
         .lsm => {},
         .lsm_memory => opts.primary_backend = .{ .lsm_memory = .{} },
         .mem => opts.primary_backend = .{ .mem = .{} },
-        .lmdb => opts.primary_backend = .lmdb,
     }
     return opts;
 }
@@ -481,19 +478,19 @@ fn resourceManagerOptions(cfg: Config) resource_manager_mod.Options {
     switch (cfg.resource_profile) {
         .normal => {},
         .full_text_stress => {
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
                 .soft_limit_bytes = 256 * 1024,
                 .hard_limit_bytes = 512 * 1024,
             };
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
                 .soft_limit_bytes = 512 * 1024,
                 .hard_limit_bytes = 1024 * 1024,
             };
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
                 .soft_limit_bytes = 512 * 1024,
                 .hard_limit_bytes = 1024 * 1024,
             };
-            opts.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{
+            opts.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{
                 .soft_limit_bytes = 256 * 1024,
                 .hard_limit_bytes = 512 * 1024,
             };

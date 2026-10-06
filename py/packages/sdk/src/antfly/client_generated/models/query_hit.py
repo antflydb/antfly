@@ -9,7 +9,9 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.query_hit_computed import QueryHitComputed
     from ..models.query_hit_hierarchy import QueryHitHierarchy
+    from ..models.query_hit_highlights import QueryHitHighlights
     from ..models.query_hit_index_scores import QueryHitIndexScores
     from ..models.query_hit_source import QueryHitSource
     from ..models.query_score_details import QueryScoreDetails
@@ -25,6 +27,7 @@ class QueryHit:
     Attributes:
         field_id (str): ID of the record.
         field_score (float): Relevance score of the hit, normalized so higher values always rank first.
+        field_computed (QueryHitComputed | Unset): Named query-time computed values, separate from stored source.
         field_distance (float | Unset): Raw vector distance for direct dense-vector hits; lower values are better.
             For a source group ranked by dense descendants, this is the distance of
             the best matching descendant that supplied the group score. Omitted for
@@ -38,22 +41,35 @@ class QueryHit:
             to paginate to the next/previous page. Values preserve their JSON
             types. Present for ordered result pages, including cursor-only
             requests whose effective order is `_id` ascending.
+        field_highlights (QueryHitHighlights | Unset): Highlighted fragments keyed by source field, present when the
+            request
+            set `highlight` and the stored document has the field. Highlights are
+            computed from the unprojected document, so a `fields` projection that
+            omits a highlighted field does not suppress its highlights. Each
+            fragment is a window of the stored field value with byte-offset spans
+            marking the text the full-text query matched.
     """
 
     field_id: str
     field_score: float
+    field_computed: QueryHitComputed | Unset = UNSET
     field_distance: float | Unset = UNSET
     field_index_scores: QueryHitIndexScores | Unset = UNSET
     field_score_details: QueryScoreDetails | Unset = UNSET
     field_source: QueryHitSource | Unset = UNSET
     hierarchy: QueryHitHierarchy | Unset = UNSET
     field_sort: list[Any] | Unset = UNSET
+    field_highlights: QueryHitHighlights | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         field_id = self.field_id
 
         field_score = self.field_score
+
+        field_computed: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.field_computed, Unset):
+            field_computed = self.field_computed.to_dict()
 
         field_distance = self.field_distance
 
@@ -77,6 +93,10 @@ class QueryHit:
         if not isinstance(self.field_sort, Unset):
             field_sort = self.field_sort
 
+        field_highlights: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.field_highlights, Unset):
+            field_highlights = self.field_highlights.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -85,6 +105,8 @@ class QueryHit:
                 "_score": field_score,
             }
         )
+        if field_computed is not UNSET:
+            field_dict["_computed"] = field_computed
         if field_distance is not UNSET:
             field_dict["_distance"] = field_distance
         if field_index_scores is not UNSET:
@@ -97,12 +119,16 @@ class QueryHit:
             field_dict["hierarchy"] = hierarchy
         if field_sort is not UNSET:
             field_dict["_sort"] = field_sort
+        if field_highlights is not UNSET:
+            field_dict["_highlights"] = field_highlights
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.query_hit_computed import QueryHitComputed
         from ..models.query_hit_hierarchy import QueryHitHierarchy
+        from ..models.query_hit_highlights import QueryHitHighlights
         from ..models.query_hit_index_scores import QueryHitIndexScores
         from ..models.query_hit_source import QueryHitSource
         from ..models.query_score_details import QueryScoreDetails
@@ -111,6 +137,13 @@ class QueryHit:
         field_id = d.pop("_id")
 
         field_score = d.pop("_score")
+
+        _field_computed = d.pop("_computed", UNSET)
+        field_computed: QueryHitComputed | Unset
+        if isinstance(_field_computed, Unset):
+            field_computed = UNSET
+        else:
+            field_computed = QueryHitComputed.from_dict(_field_computed)
 
         field_distance = d.pop("_distance", UNSET)
 
@@ -144,15 +177,24 @@ class QueryHit:
 
         field_sort = cast(list[Any], d.pop("_sort", UNSET))
 
+        _field_highlights = d.pop("_highlights", UNSET)
+        field_highlights: QueryHitHighlights | Unset
+        if isinstance(_field_highlights, Unset):
+            field_highlights = UNSET
+        else:
+            field_highlights = QueryHitHighlights.from_dict(_field_highlights)
+
         query_hit = cls(
             field_id=field_id,
             field_score=field_score,
+            field_computed=field_computed,
             field_distance=field_distance,
             field_index_scores=field_index_scores,
             field_score_details=field_score_details,
             field_source=field_source,
             hierarchy=hierarchy,
             field_sort=field_sort,
+            field_highlights=field_highlights,
         )
 
         query_hit.additional_properties = d

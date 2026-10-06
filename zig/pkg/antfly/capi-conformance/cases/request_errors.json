@@ -1,0 +1,11 @@
+{
+  "name": "request_errors",
+  "description": "Malformed requests map to ANTFLY_INVALID_ARGUMENT consistently across bindings.",
+  "open": {"create": true, "no_sync": true},
+  "steps": [
+    {"op": "search", "request": {"full_text_search": {"match": 42}}, "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}},
+    {"op": "scan", "request": {"limit": "ten"}, "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}},
+    {"op": "set_schema", "schema": {"version": "one"}, "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}},
+    {"op": "add_enrichment", "config": {"name": "x"}, "expect": {"error": "ANTFLY_INVALID_ARGUMENT"}}
+  ]
+}

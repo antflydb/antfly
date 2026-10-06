@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const artifact_store = @import("../artifacts/store.zig");
 const external_source = @import("../external_source/types.zig");
@@ -1224,7 +1224,7 @@ const LakeTextIndexSpec = struct {
     name: []u8,
     config_json: []u8,
 
-    fn deinit(self: *LakeTextIndexSpec, alloc: Allocator) void {
+    pub fn deinit(self: *LakeTextIndexSpec, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.config_json);
         self.* = undefined;
@@ -1235,7 +1235,7 @@ const EmbeddingIndexSpec = struct {
     name: []u8,
     sparse: bool = false,
 
-    fn deinit(self: *EmbeddingIndexSpec, alloc: Allocator) void {
+    pub fn deinit(self: *EmbeddingIndexSpec, alloc: Allocator) void {
         alloc.free(self.name);
         self.* = undefined;
     }
@@ -2179,7 +2179,7 @@ const TestRowSourceState = struct {
         return batch;
     }
 
-    fn deinit(ptr: *anyopaque, alloc: Allocator) void {
+    pub fn deinit(ptr: *anyopaque, alloc: Allocator) void {
         const self: *TestRowSourceState = @ptrCast(@alignCast(ptr));
         alloc.destroy(self);
     }
@@ -2193,7 +2193,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         for (self.entries.keys()) |key| self.alloc.free(key);
         for (self.entries.values()) |bytes| self.alloc.free(bytes);
         self.entries.deinit(self.alloc);
@@ -2228,7 +2228,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         const bytes = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, bytes);
     }

@@ -16,7 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const catalog_types = @import("types.zig");
 const head_coordination = @import("../head_coordination.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const work_lease = @import("../build/work_lease.zig");
 
 pub const PublicationFence = head_coordination.Fence;
@@ -319,7 +319,7 @@ pub const ProgressStore = struct {
     }
 
     pub fn getEnrichmentStageHeadVersion(self: *ProgressStore, namespace: []const u8, stage: catalog_types.EnrichmentStage) !?u64 {
-        return try self.vtable.get_enrichment_stage_head_version(self.ptr, namespace, @intFromEnum(stage));
+        return try self.vtable.get_enrichment_stage_head_version(self.ptr, namespace, @backingInt(stage));
     }
 
     pub fn compareAndSwapEnrichmentStageHeadVersion(
@@ -334,14 +334,14 @@ pub const ProgressStore = struct {
         if (expected) |current| {
             if (head_version < current) return false;
         }
-        return try self.vtable.compare_and_swap_enrichment_stage_head_version(self.ptr, namespace, @intFromEnum(stage), expected, head_version);
+        return try self.vtable.compare_and_swap_enrichment_stage_head_version(self.ptr, namespace, @backingInt(stage), expected, head_version);
     }
 
     pub fn getEnrichmentStageDocOffset(self: *ProgressStore, namespace: []const u8, stage: catalog_types.EnrichmentStage) !?u64 {
         if (try self.getEnrichmentStageHeadVersion(namespace, stage)) |head_version| {
             if (try self.getEnrichmentStageHeadDocOffset(namespace, stage, head_version)) |offset| return offset;
         }
-        return try self.vtable.get_enrichment_stage_doc_offset(self.ptr, namespace, @intFromEnum(stage));
+        return try self.vtable.get_enrichment_stage_doc_offset(self.ptr, namespace, @backingInt(stage));
     }
 
     pub fn compareAndSwapEnrichmentStageDocOffset(
@@ -362,7 +362,7 @@ pub const ProgressStore = struct {
                     doc_offset,
                 );
             }
-            const legacy = try self.vtable.get_enrichment_stage_doc_offset(self.ptr, namespace, @intFromEnum(stage));
+            const legacy = try self.vtable.get_enrichment_stage_doc_offset(self.ptr, namespace, @backingInt(stage));
             if (legacy != expected) return false;
             return try self.compareAndSwapEnrichmentStageHeadDocOffset(
                 namespace,
@@ -372,7 +372,7 @@ pub const ProgressStore = struct {
                 doc_offset,
             );
         }
-        return try self.vtable.compare_and_swap_enrichment_stage_doc_offset(self.ptr, namespace, @intFromEnum(stage), expected, doc_offset);
+        return try self.vtable.compare_and_swap_enrichment_stage_doc_offset(self.ptr, namespace, @backingInt(stage), expected, doc_offset);
     }
 
     /// Progress for a particular published head. Head-scoped offsets isolate
@@ -388,7 +388,7 @@ pub const ProgressStore = struct {
         return try self.vtable.get_enrichment_stage_head_doc_offset(
             self.ptr,
             namespace,
-            @intFromEnum(stage),
+            @backingInt(stage),
             head_version,
         );
     }
@@ -404,7 +404,7 @@ pub const ProgressStore = struct {
         return try self.vtable.compare_and_swap_enrichment_stage_head_doc_offset(
             self.ptr,
             namespace,
-            @intFromEnum(stage),
+            @backingInt(stage),
             head_version,
             expected,
             doc_offset,
@@ -420,7 +420,7 @@ pub const ProgressStore = struct {
         return try self.vtable.delete_enrichment_stage_head_doc_offset(
             self.ptr,
             namespace,
-            @intFromEnum(stage),
+            @backingInt(stage),
             head_version,
         );
     }
@@ -436,7 +436,7 @@ pub const ProgressStore = struct {
         return try self.vtable.get_enrichment_stage_progress(
             self.ptr,
             namespace,
-            @intFromEnum(stage),
+            @backingInt(stage),
         );
     }
 
@@ -456,7 +456,7 @@ pub const ProgressStore = struct {
         return try self.vtable.compare_and_swap_enrichment_stage_progress(
             self.ptr,
             namespace,
-            @intFromEnum(stage),
+            @backingInt(stage),
             expected,
             desired,
         );

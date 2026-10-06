@@ -1328,7 +1328,7 @@ pub const Handler = union(enum) {
             switch (@typeInfo(Instance)) {
                 .pointer => |pointer| {
                     if (pointer.size != .one) @compileError("httpx.Handler.bind requires a single-item pointer");
-                    if (pointer.is_const) @compileError("httpx.Handler.bind currently requires a mutable instance pointer");
+                    if (pointer.attrs.@"const") @compileError("httpx.Handler.bind currently requires a mutable instance pointer");
                 },
                 else => @compileError("httpx.Handler.bind requires an instance pointer"),
             }
@@ -1355,7 +1355,7 @@ pub const Handler = union(enum) {
             switch (@typeInfo(Instance)) {
                 .pointer => |pointer| {
                     if (pointer.size != .one) @compileError("httpx.Handler.wrap requires a single-item pointer");
-                    if (pointer.is_const) @compileError("httpx.Handler.wrap currently requires a mutable instance pointer");
+                    if (pointer.attrs.@"const") @compileError("httpx.Handler.wrap currently requires a mutable instance pointer");
                 },
                 else => @compileError("httpx.Handler.wrap requires an instance pointer"),
             }
@@ -1726,6 +1726,11 @@ pub const Server = struct {
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
+    }
+
+    /// Register bounded request bodies without losing route-owned context.
+    pub fn routeWithDataAndBodyLimit(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque, max_body_size: usize) !void {
+        try self.router.addWithDataAndBodyLimit(method, path, handler, data, max_body_size);
     }
 
     /// Registers a GET route.
@@ -2161,16 +2166,27 @@ pub const Server = struct {
             try sock.setSendTimeout(self.config.response_write_timeout_ms);
         }
 
-        // Peek at the first bytes to detect HTTP/2 "prior knowledge" (RFC 7540 §3.4).
+        // Read enough bytes to distinguish HTTP/2 prior knowledge from HTTP/1.
+        // A single TCP recv may return only part of the 24-byte H2 preface.
         // The h2 preface is "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes).
         var peek_buf: [8192]u8 = undefined;
         const first_header_deadline_ms = deadlineAfter(self.io, self.config.header_read_timeout_ms);
         try applyReadDeadline(&sock, self.io, first_header_deadline_ms);
-        const first_n = try sock.recv(&peek_buf);
+        var first_n = try sock.recv(&peek_buf);
         if (first_n == 0) return;
+        while (first_n < http.HTTP2_PREFACE.len and
+            mem.eql(u8, peek_buf[0..first_n], http.HTTP2_PREFACE[0..first_n]))
+        {
+            try applyReadDeadline(&sock, self.io, first_header_deadline_ms);
+            const received = try sock.recv(peek_buf[first_n..]);
+            if (received == 0) return;
+            first_n += received;
+        }
 
-        if (first_n >= 24 and mem.eql(u8, peek_buf[0..24], http.HTTP2_PREFACE)) {
-            return self.handleH2Connection(&connection.control, &sock, peek_buf[24..first_n]);
+        if (first_n >= http.HTTP2_PREFACE.len and
+            mem.eql(u8, peek_buf[0..http.HTTP2_PREFACE.len], http.HTTP2_PREFACE))
+        {
+            return self.handleH2Connection(&connection.control, &sock, peek_buf[http.HTTP2_PREFACE.len..first_n]);
         }
 
         // HTTP/1.1 path — feed the already-read bytes to the parser.
@@ -3979,7 +3995,7 @@ test "HTTP/2 oversized body before handler claim writes 413" {
 
     try std.testing.expect(wire.items.len >= 18);
     const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.headers), wire.items[3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
     var client = H2Connection.initClient(allocator, std.testing.io);
     defer client.deinit();
     const decoded = try client.decodeFrameHeaders(wire.items[9..][0..headers_len], wire.items[4]);
@@ -3992,15 +4008,15 @@ test "HTTP/2 oversized body before handler claim writes 413" {
 
     const data_offset = 9 + headers_len;
     const data_len: usize = std.mem.readInt(u24, wire.items[data_offset..][0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.data), wire.items[data_offset + 3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire.items[data_offset + 3]);
     try std.testing.expect(wire.items[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
     try std.testing.expectEqualStrings(routeErrorBody(413), wire.items[data_offset + 9 ..][0..data_len]);
 
     const reset_offset = data_offset + 9 + data_len;
     try std.testing.expect(wire.items.len >= reset_offset + 13);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.rst_stream), wire.items[reset_offset + 3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.rst_stream), wire.items[reset_offset + 3]);
     try std.testing.expectEqual(
-        @intFromEnum(http.Http2ErrorCode.cancel),
+        @backingInt(http.Http2ErrorCode.cancel),
         std.mem.readInt(u32, wire.items[reset_offset + 9 ..][0..4], .big),
     );
 }
@@ -4536,7 +4552,7 @@ test "H1 raw streaming route delivers large chunked pieces before the terminator
     );
     // Fourteen 8000-byte chunks in one burst, the way an audio client
     // that already buffered a phrase uploads it.
-    const piece = [_]u8{'a'} ** 8000;
+    const piece = @as([8000]u8, @splat('a'));
     var burst = std.ArrayListUnmanaged(u8).empty;
     defer burst.deinit(allocator);
     for (0..14) |_| {
@@ -4651,6 +4667,51 @@ test "H1 oversized content length returns 413 before handler admission" {
     }
 }
 
+test "HTTP/2 prior-knowledge preface can arrive in separate TCP reads" {
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .header_read_timeout_ms = 1_000,
+    });
+    defer server.deinit();
+    try server.bind();
+
+    var listener = try std.testing.io.concurrent(struct {
+        fn run(s: *Server) void {
+            s.listen() catch {};
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire))
+        try io_impl.io().sleep(.fromMilliseconds(1), .awake);
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+    var client = try Socket.connect(server.boundAddress().?, client_io);
+    defer client.close();
+    try client.setRecvTimeout(5_000);
+    try client.sendAll(http.HTTP2_PREFACE[0..11]);
+    try io_impl.io().sleep(.fromMilliseconds(100), .awake);
+    try client.sendAll(http.HTTP2_PREFACE[11..]);
+    var h2 = H2Connection.initClient(allocator, client_io);
+    defer h2.deinit();
+    try h2.sendSettings(&client);
+
+    var frame_header: [9]u8 = undefined;
+    var received: usize = 0;
+    while (received < frame_header.len) {
+        const count = try client.recv(frame_header[received..]);
+        if (count == 0) return error.UnexpectedEof;
+        received += count;
+    }
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.settings), frame_header[3]);
+}
+
 test "HTTP streaming headers and automatic preflight preserve middleware policy" {
     const State = struct {
         fn request(alloc: Allocator, io: Io, address: Address, http2: bool, method: types.Method, origin: ?[]const u8, path: []const u8) !Response {
@@ -4746,6 +4807,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
         try std.testing.expectEqualStrings("Origin", stream.headers.get("Vary").?);
         try std.testing.expectEqualStrings("stream-request", stream.headers.get("X-Request-ID").?);
         try std.testing.expectEqualStrings("text/event-stream; charset=utf-8", stream.contentType().?);
+        if (!http2) try std.testing.expectEqualStrings("close", stream.headers.get(HeaderName.CONNECTION).?);
         try std.testing.expectEqualStrings("event: done\ndata: {}\n\n", stream.body.?);
         var cookies: usize = 0;
         for (stream.headers.iterator()) |header| {
@@ -4936,7 +4998,7 @@ test "H2 body admission exhaustion writes retryable 429 before stream reset" {
 
     try std.testing.expect(wire.items.len >= 18);
     const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.headers), wire.items[3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
     try std.testing.expect(wire.items[4] & H2Connection.FLAG_END_HEADERS != 0);
 
     var client = H2Connection.initClient(allocator, std.testing.io);
@@ -4954,7 +5016,7 @@ test "H2 body admission exhaustion writes retryable 429 before stream reset" {
 
     const data_offset = 9 + headers_len;
     const data_len: usize = std.mem.readInt(u24, wire.items[data_offset..][0..3], .big);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.data), wire.items[data_offset + 3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.data), wire.items[data_offset + 3]);
     try std.testing.expect(wire.items[data_offset + 4] & H2Connection.FLAG_END_STREAM != 0);
     try std.testing.expectEqualStrings(routeErrorBody(429), wire.items[data_offset + 9 ..][0..data_len]);
     try std.testing.expect(stream.end_stream_sent);
@@ -5151,10 +5213,10 @@ test "H2 request rejection resets an unprocessed stream and unwinds ownership" {
     try std.testing.expectEqual(@as(u64, 1), server.runtimeStats().h2_stream_dispatch_rejections_total);
     try std.testing.expect(h2.stream_manager.getStream(1) == null);
     try std.testing.expectEqual(@as(usize, 13), wire.items.len);
-    try std.testing.expectEqual(@intFromEnum(http.Http2FrameType.rst_stream), wire.items[3]);
+    try std.testing.expectEqual(@backingInt(http.Http2FrameType.rst_stream), wire.items[3]);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, wire.items[5..9], .big));
     try std.testing.expectEqual(
-        @as(u32, @intFromEnum(http.Http2ErrorCode.refused_stream)),
+        @as(u32, @backingInt(http.Http2ErrorCode.refused_stream)),
         std.mem.readInt(u32, wire.items[9..13], .big),
     );
 }
@@ -5167,9 +5229,9 @@ test "h2c applyPeerSettings propagates INITIAL_WINDOW_SIZE and HPACK table size"
 
     // Build a SETTINGS payload: INITIAL_WINDOW_SIZE=32768, HEADER_TABLE_SIZE=2048.
     var settings_payload: [12]u8 = undefined;
-    std.mem.writeInt(u16, settings_payload[0..2], @intFromEnum(http.Http2SettingId.initial_window_size), .big);
+    std.mem.writeInt(u16, settings_payload[0..2], @backingInt(http.Http2SettingId.initial_window_size), .big);
     std.mem.writeInt(u32, settings_payload[2..6], 32768, .big);
-    std.mem.writeInt(u16, settings_payload[6..8], @intFromEnum(http.Http2SettingId.header_table_size), .big);
+    std.mem.writeInt(u16, settings_payload[6..8], @backingInt(http.Http2SettingId.header_table_size), .big);
     std.mem.writeInt(u32, settings_payload[8..12], 2048, .big);
 
     // Base64url encode (what the HTTP2-Settings header carries).
@@ -5404,7 +5466,7 @@ test "listener cancellation exits without accept error or retry" {
         var calls: usize = 0;
         var server: *Server = undefined;
 
-        fn accept(_: ?*anyopaque, _: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
+        pub fn accept(_: ?*anyopaque, _: Io.net.Socket.Handle, _: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
             calls += 1;
             // Bound a regression: an incorrect retry must fail the assertions
             // below instead of leaving the test in an infinite accept loop.
@@ -6105,6 +6167,83 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try std.testing.expect(mem.indexOf(u8, response[0..response_len], "\r\n\r\nB") != null);
 }
 
+test "H1 client cancellation reaches active server work" {
+    try testH1ClientCancellation(false);
+    try testH1ClientCancellation(true);
+}
+
+fn testH1ClientCancellation(cancel_parent_task: bool) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const Client = @import("../client/client.zig").Client;
+    const State = struct {
+        var started = std.atomic.Value(bool).init(false);
+        var canceled = std.atomic.Value(bool).init(false);
+        var release = std.atomic.Value(bool).init(false);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            started.store(true, .release);
+            while (!release.load(.acquire)) {
+                if (ctx.isCancellationRequested()) {
+                    canceled.store(true, .release);
+                    return error.Canceled;
+                }
+                try ctx.io.sleep(Io.Duration.fromMilliseconds(1), .awake);
+            }
+            return ctx.text("complete");
+        }
+    };
+    State.started.store(false, .release);
+    State.canceled.store(false, .release);
+    State.release.store(false, .release);
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var server = Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.post("/rerank", State.handler);
+    try server.bind();
+    var listener = try std.testing.io.concurrent(struct {
+        fn run(s: *Server) void {
+            s.listen() catch {};
+        }
+    }.run, .{&server});
+    defer {
+        State.release.store(true, .release);
+        server.stop();
+        listener.await(std.testing.io);
+    }
+    while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/rerank", .{server.boundAddress().?.getPort()});
+    defer alloc.free(url);
+    var client = Client.initWithConfig(alloc, io, .{ .timeouts = .uniform(5000) });
+    defer client.deinit();
+    var cancellation = std.atomic.Value(bool).init(false);
+    var request = try io.concurrent(struct {
+        fn run(c: *Client, endpoint: []const u8, signal: *std.atomic.Value(bool)) anyerror!void {
+            var response = try c.post(endpoint, .{ .json = "{}", .cancellation = .fromAtomic(signal) });
+            defer response.deinit();
+        }
+    }.run, .{ &client, url, &cancellation });
+    defer request.cancel(io) catch {};
+    for (0..5000) |_| {
+        if (State.started.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.started.load(.acquire));
+    if (cancel_parent_task) {
+        try std.testing.expectError(error.Canceled, request.cancel(io));
+    } else {
+        cancellation.store(true, .release);
+        try std.testing.expectError(error.Cancelled, request.await(io));
+    }
+    for (0..2000) |_| {
+        if (State.canceled.load(.acquire)) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(State.canceled.load(.acquire));
+}
+
 test "H1 orderly half close does not cancel an active response" {
     if (builtin.os.tag == .windows) return;
 
@@ -6388,7 +6527,7 @@ test "stream writer preserves small SSE write density and supports oversized eve
 
     capture.bytes.clearRetainingCapacity();
     capture.writes = 0;
-    const large = [_]u8{'x'} ** 9000;
+    const large = @as([9000]u8, @splat('x'));
     try Context.StreamWriter.writeEventTo(&capture, "message", &large);
     try std.testing.expect(capture.writes > 1);
     try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "event: message\ndata: "));
@@ -6415,7 +6554,7 @@ test "H1 chunked frames coalesce into one write and keep wire format for oversiz
 
     capture.bytes.clearRetainingCapacity();
     capture.writes = 0;
-    const large = [_]u8{'x'} ** 9000;
+    const large = @as([9000]u8, @splat('x'));
     try Context.StreamWriter.writeH1Chunk(&capture, &large);
     try std.testing.expectEqual(@as(usize, 3), capture.writes);
     try std.testing.expect(std.mem.startsWith(u8, capture.bytes.items, "2328\r\n"));

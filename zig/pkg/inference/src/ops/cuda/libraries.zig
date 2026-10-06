@@ -151,7 +151,7 @@ const CublasLibrary = struct {
         };
     }
 
-    fn deinit(self: *CublasLibrary) void {
+    pub fn deinit(self: *CublasLibrary) void {
         self.lib.close();
     }
 };
@@ -290,7 +290,7 @@ const CublasLtLibrary = struct {
         };
     }
 
-    fn deinit(self: *CublasLtLibrary) void {
+    pub fn deinit(self: *CublasLtLibrary) void {
         if (self.handle != null) {
             _ = self.fns.destroy(self.handle);
             self.handle = null;
@@ -360,7 +360,7 @@ test "CUDA training cuBLAS selection requires an explicit absolute library path"
     try validateTrainingLibraryPath("/opt/cuda/lib64/libcublas.so.12");
     for ([_][]const u8{ "", "libcublas.so.12", "../libcublas.so.12", "/opt/cuda/lib\x00ignored" }) |path|
         try std.testing.expectError(error.InvalidCudaTrainingLibraryPath, validateTrainingLibraryPath(path));
-    const too_long = [_]u8{'/'} ++ [_]u8{'a'} ** 4096;
+    const too_long = [_]u8{'/'} ++ @as([4096]u8, @splat('a'));
     try std.testing.expectError(error.InvalidCudaTrainingLibraryPath, validateTrainingLibraryPath(&too_long));
 }
 

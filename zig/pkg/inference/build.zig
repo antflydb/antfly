@@ -40,7 +40,7 @@ fn resolveSharedLibRoot(b: *std.Build) []const u8 {
 fn selectTestFilters(b: *std.Build, default_filters: []const []const u8) []const []const u8 {
     return build_test_filters.select(
         b.allocator,
-        b.args orelse &.{},
+        buildArguments(b) orelse &.{},
         default_filters,
     );
 }
@@ -68,19 +68,20 @@ fn targetRunsOnBuildHost(b: *std.Build, target: std.Build.ResolvedTarget) bool {
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
-        return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // xcrun observes the selected Xcode installation outside configure inputs.
+        b.graph.poisonCache();
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    };
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 fn addRootedLibraryPaths(b: *std.Build, module: *std.Build.Module, root: []const u8) void {
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
 }
 
 fn configureSystemBlas(
@@ -123,9 +124,9 @@ fn configureOnnxRuntime(
     onnx_root: []const u8,
 ) void {
     if (!enable_onnx) return;
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
     module.linkSystemLibrary("onnxruntime", .{});
     module.linkSystemLibrary("onnxruntime-genai", .{});
 }
@@ -188,11 +189,8 @@ pub fn build(b: *std.Build) void {
     const enable_native = !enable_wasm;
     // The native CPU backend is always available on native builds. System BLAS
     // remains an optional acceleration layer for hot kernels.
-    const system_blas_available = target.result.os.tag == .macos or blas_root_opt != null;
-    const enable_system_blas = if (enable_wasm or !link_libc)
-        false
-    else
-        (b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse system_blas_available);
+    const blas = @import("build/blas.zig").configure(b, !enable_wasm and link_libc, target.result.os.tag == .macos, blas_root_opt != null);
+    const enable_system_blas = blas.system;
     const blas_root = if (enable_wasm or !enable_system_blas or target.result.os.tag == .macos)
         null
     else
@@ -221,6 +219,7 @@ pub fn build(b: *std.Build) void {
     const tokenizer_proto_source = tokenizer_build.generateSentencePieceProto(b, tokenizer_protobuf.artifact("protoc-zig"), b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })));
     const tokenizer_proto = tokenizer_build.createSentencePieceProtoModule(b, tokenizer_proto_source, tokenizer_protobuf.module("protobuf"));
     const tokenizer = tokenizer_build.create(b, .{
+        .platform = configured_platform_mod,
         .root = b.path(b.pathJoin(&.{ shared_lib_root, "lib/tokenizer" })),
         .target = target,
         .optimize = optimize,
@@ -268,6 +267,7 @@ pub fn build(b: *std.Build) void {
             .enable_pjrt = enable_pjrt,
             .enable_native = enable_native,
             .enable_system_blas = enable_system_blas,
+            .enable_runtime_openblas = blas.runtime,
             .blas_root = blas_root,
             .enable_wasm = enable_wasm,
             .enable_webgpu = enable_webgpu,
@@ -287,7 +287,7 @@ pub fn build(b: *std.Build) void {
         .paths = runtime_config.paths,
         .backend = runtime_config.backend,
         .graph = runtime_graph,
-        .args = b.args,
+        .args = buildArguments(b),
         .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false,
     };
     const build_options_mod = runtime_graph.build_options_mod;
@@ -298,9 +298,28 @@ pub fn build(b: *std.Build) void {
     const onnx = runtime_graph.onnx;
     const pjrt_mod = runtime_graph.pjrt_mod;
     const httpx_mod = runtime_graph.httpx_mod;
+    const worker_rpc_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_rpc_tests_mod.addImport("httpx", httpx_mod);
+    const worker_rpc_tests = b.addTest(.{ .root_module = worker_rpc_tests_mod });
+    b.step("worker-rpc-test", "Run inference worker RPC framing and admission tests")
+        .dependOn(&b.addRunArtifact(worker_rpc_tests).step);
     const antfly_scraping_mod = runtime_graph.scraping_mod;
     const antfly_jsonschema_mod = runtime_graph.jsonschema_mod;
     const antfly_image_mod = runtime_graph.image_mod;
+    const host_work_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/host/work.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_work_tests_mod.addImport("antfly_scraping", antfly_scraping_mod);
+    host_work_tests_mod.addImport("antfly_image", antfly_image_mod);
+    const host_work_tests = b.addTest(.{ .root_module = host_work_tests_mod });
+    b.step("host-work-test", "Run inference host work and resource admission tests")
+        .dependOn(&b.addRunArtifact(host_work_tests).step);
     const prometheus_mod = runtime_graph.prometheus_mod;
     const structlog_mod = runtime_graph.structlog_mod;
     const inference_api_mod = runtime_graph.inference_api_mod;
@@ -341,7 +360,7 @@ pub fn build(b: *std.Build) void {
         break :blk host_exe;
     };
     const run_kernel_jit_package = b.addRunArtifact(kernel_jit_package_runner);
-    if (b.args) |args| run_kernel_jit_package.addArgs(args);
+    run_kernel_jit_package.addPassthruArgs();
     const kernel_jit_package_step = b.step(
         "kernel-jit-package",
         "Export, verify, or import exact-match JIT qualification packages",
@@ -400,7 +419,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_id_replay_exe.root_module, target, true);
         a4b_metal_id_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_id_replay = b.addRunArtifact(a4b_metal_id_replay_exe);
-        if (b.args) |args| run_a4b_metal_id_replay.addArgs(args);
+        run_a4b_metal_id_replay.addPassthruArgs();
         a4b_metal_id_replay_step.dependOn(&run_a4b_metal_id_replay.step);
 
         const a4b_metal_common_q4_replay_exe = b.addExecutable(.{
@@ -414,7 +433,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_common_q4_replay_exe.root_module, target, true);
         a4b_metal_common_q4_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_common_q4_replay = b.addRunArtifact(a4b_metal_common_q4_replay_exe);
-        if (b.args) |args| run_a4b_metal_common_q4_replay.addArgs(args);
+        run_a4b_metal_common_q4_replay.addPassthruArgs();
         a4b_metal_common_q4_replay_step.dependOn(&run_a4b_metal_common_q4_replay.step);
 
         const a4b_metal_route_select_replay_exe = b.addExecutable(.{
@@ -428,7 +447,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_route_select_replay_exe.root_module, target, true);
         a4b_metal_route_select_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_route_select_replay = b.addRunArtifact(a4b_metal_route_select_replay_exe);
-        if (b.args) |args| run_a4b_metal_route_select_replay.addArgs(args);
+        run_a4b_metal_route_select_replay.addPassthruArgs();
         a4b_metal_route_select_replay_step.dependOn(&run_a4b_metal_route_select_replay.step);
 
         const a4b_metal_router_projection_replay_exe = b.addExecutable(.{
@@ -442,7 +461,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_router_projection_replay_exe.root_module, target, true);
         a4b_metal_router_projection_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_router_projection_replay = b.addRunArtifact(a4b_metal_router_projection_replay_exe);
-        if (b.args) |args| run_a4b_metal_router_projection_replay.addArgs(args);
+        run_a4b_metal_router_projection_replay.addPassthruArgs();
         a4b_metal_router_projection_replay_step.dependOn(&run_a4b_metal_router_projection_replay.step);
 
         const a4b_metal_lm_head_replay_exe = b.addExecutable(.{
@@ -456,7 +475,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, a4b_metal_lm_head_replay_exe.root_module, target, true);
         a4b_metal_lm_head_replay_exe.root_module.link_libc = true;
         const run_a4b_metal_lm_head_replay = b.addRunArtifact(a4b_metal_lm_head_replay_exe);
-        if (b.args) |args| run_a4b_metal_lm_head_replay.addArgs(args);
+        run_a4b_metal_lm_head_replay.addPassthruArgs();
         a4b_metal_lm_head_replay_step.dependOn(&run_a4b_metal_lm_head_replay.step);
 
         const quant_kernel_metal_runtime_check_exe = b.addExecutable(.{
@@ -470,9 +489,7 @@ pub fn build(b: *std.Build) void {
         configureMetal(b, quant_kernel_metal_runtime_check_exe.root_module, target, true);
         quant_kernel_metal_runtime_check_exe.root_module.link_libc = true;
         const run_quant_kernel_metal_runtime_check = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
-        if (b.args) |args| {
-            run_quant_kernel_metal_runtime_check.addArgs(args);
-        }
+        run_quant_kernel_metal_runtime_check.addPassthruArgs();
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_runtime_check.step.dependOn(metal_artifact_check_step);
         }
@@ -494,9 +511,7 @@ pub fn build(b: *std.Build) void {
 
         const run_quant_kernel_metal_sweep = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_sweep.addArg("--sweep");
-        if (b.args) |args| {
-            run_quant_kernel_metal_sweep.addArgs(args);
-        }
+        run_quant_kernel_metal_sweep.addPassthruArgs();
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_sweep.step.dependOn(metal_artifact_check_step);
         }
@@ -505,12 +520,12 @@ pub fn build(b: *std.Build) void {
         const run_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_runtime_route_all.has_side_effects = true;
         run_quant_kernel_metal_runtime_route_all.addArg("--evidence-out");
-        const route_all_evidence_name = b.fmt("antfly-quant-metal-runtime-route-all-evidence-{x}.json", .{b.graph.random_seed});
-        const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg(route_all_evidence_name);
+        const route_all_evidence_name = "antfly-quant-metal-runtime-route-all-evidence.json";
+        const route_all_evidence = run_quant_kernel_metal_runtime_route_all.addOutputFileArg2(route_all_evidence_name, .{ .make_absolute = true });
         run_quant_kernel_metal_runtime_route_all.addArg("--runtime-route-all");
         const check_quant_kernel_metal_runtime_route_all = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         check_quant_kernel_metal_runtime_route_all.addArg("--check-evidence");
-        check_quant_kernel_metal_runtime_route_all.addFileArg(route_all_evidence);
+        check_quant_kernel_metal_runtime_route_all.addFileArg2(route_all_evidence, .{ .make_absolute = true });
         check_quant_kernel_metal_runtime_route_all.addArg("--require-runtime-route-all");
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             run_quant_kernel_metal_runtime_route_all.step.dependOn(metal_artifact_check_step);
@@ -522,8 +537,8 @@ pub fn build(b: *std.Build) void {
         const run_quant_kernel_metal_production_regression = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_production_regression.has_side_effects = true;
         run_quant_kernel_metal_production_regression.addArg("--evidence-out");
-        const production_regression_evidence_name = b.fmt("antfly-quant-metal-production-regression-evidence-{x}.json", .{b.graph.random_seed});
-        _ = run_quant_kernel_metal_production_regression.addOutputFileArg(production_regression_evidence_name);
+        const production_regression_evidence_name = "antfly-quant-metal-production-regression-evidence.json";
+        _ = run_quant_kernel_metal_production_regression.addOutputFileArg2(production_regression_evidence_name, .{ .make_absolute = true });
         run_quant_kernel_metal_production_regression.addArgs(&.{
             "--repeat-runs",
             "5",
@@ -543,8 +558,8 @@ pub fn build(b: *std.Build) void {
             "--refresh-blocker-evidence",
             "--blocker-evidence-dir",
         });
-        const blocker_evidence_dir_name = b.fmt("antfly-quant-metal-blocker-evidence-{x}", .{b.graph.random_seed});
-        const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg(blocker_evidence_dir_name);
+        const blocker_evidence_dir_name = "antfly-quant-metal-blocker-evidence";
+        const blocker_evidence_dir = refresh_quant_kernel_metal_blocker_evidence.addOutputDirectoryArg2(blocker_evidence_dir_name, .{ .make_absolute = true });
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             refresh_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -556,7 +571,7 @@ pub fn build(b: *std.Build) void {
             "--check-blocker-evidence",
             "--blocker-evidence-dir",
         });
-        check_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
+        check_quant_kernel_metal_blocker_evidence.addDirectoryArg2(blocker_evidence_dir, .{ .make_absolute = true });
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             check_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -570,7 +585,7 @@ pub fn build(b: *std.Build) void {
             "--fail-on-cleared-blocker",
             "--blocker-evidence-dir",
         });
-        strict_quant_kernel_metal_blocker_evidence.addDirectoryArg(blocker_evidence_dir);
+        strict_quant_kernel_metal_blocker_evidence.addDirectoryArg2(blocker_evidence_dir, .{ .make_absolute = true });
         if (quant_kernel_metal_artifact_check_step) |metal_artifact_check_step| {
             strict_quant_kernel_metal_blocker_evidence.step.dependOn(metal_artifact_check_step);
         }
@@ -632,7 +647,7 @@ pub fn build(b: *std.Build) void {
         runtime_graph.identities.addImports(quant_kernel_cuda_attention_diff_exe.root_module);
         quant_kernel_cuda_attention_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_attention_diff = b.addRunArtifact(quant_kernel_cuda_attention_diff_exe);
-        if (b.args) |args| run_quant_kernel_cuda_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_attention_diff.addPassthruArgs();
         run_quant_kernel_cuda_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         quant_kernel_cuda_attention_diff_step.dependOn(&run_quant_kernel_cuda_attention_diff.step);
     } else {
@@ -651,15 +666,15 @@ pub fn build(b: *std.Build) void {
             "bash",
             "scripts/compile-generated-cuda-candidate.sh",
         });
-        compile_score_prework_hd256.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd256.cu"));
-        const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg("attention_decode_score_prework_hd256.sm89.cubin");
+        compile_score_prework_hd256.addFileArg2(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd256.cu"), .{ .make_absolute = true });
+        const score_prework_hd256_cubin = compile_score_prework_hd256.addOutputFileArg2("attention_decode_score_prework_hd256.sm89.cubin", .{ .make_absolute = true });
 
         const compile_score_prework_hd512 = b.addSystemCommand(&.{
             "bash",
             "scripts/compile-generated-cuda-candidate.sh",
         });
-        compile_score_prework_hd512.addFileArg(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd512.cu"));
-        const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg("attention_decode_score_prework_hd512.sm89.cubin");
+        compile_score_prework_hd512.addFileArg2(b.path("src/ops/cuda/generated/attention_decode_score_prework_hd512.cu"), .{ .make_absolute = true });
+        const score_prework_hd512_cubin = compile_score_prework_hd512.addOutputFileArg2("attention_decode_score_prework_hd512.sm89.cubin", .{ .make_absolute = true });
 
         const quant_kernel_cuda_paged_attention_diff_exe = b.addExecutable(.{
             .name = "antfly-quant-kernel-cuda-paged-attention-diff",
@@ -685,10 +700,10 @@ pub fn build(b: *std.Build) void {
         const run_quant_kernel_cuda_paged_attention_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_tests);
         const run_quant_kernel_cuda_paged_attention_diff = b.addRunArtifact(quant_kernel_cuda_paged_attention_diff_exe);
         run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd256");
-        run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd256_cubin);
+        run_quant_kernel_cuda_paged_attention_diff.addFileArg2(score_prework_hd256_cubin, .{ .make_absolute = true });
         run_quant_kernel_cuda_paged_attention_diff.addArg("--candidate-hd512");
-        run_quant_kernel_cuda_paged_attention_diff.addFileArg(score_prework_hd512_cubin);
-        if (b.args) |args| run_quant_kernel_cuda_paged_attention_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_attention_diff.addFileArg2(score_prework_hd512_cubin, .{ .make_absolute = true });
+        run_quant_kernel_cuda_paged_attention_diff.addPassthruArgs();
         run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         run_quant_kernel_cuda_paged_attention_diff.step.dependOn(&run_quant_kernel_cuda_paged_attention_diff_tests.step);
         quant_kernel_cuda_paged_attention_diff_step.dependOn(&run_quant_kernel_cuda_paged_attention_diff.step);
@@ -727,7 +742,7 @@ pub fn build(b: *std.Build) void {
         quant_kernel_cuda_paged_prefill_diff_tests.root_module.link_libc = true;
         const run_quant_kernel_cuda_paged_prefill_diff_tests = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_tests);
         const run_quant_kernel_cuda_paged_prefill_diff = b.addRunArtifact(quant_kernel_cuda_paged_prefill_diff_exe);
-        if (b.args) |args| run_quant_kernel_cuda_paged_prefill_diff.addArgs(args);
+        run_quant_kernel_cuda_paged_prefill_diff.addPassthruArgs();
         run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&cuda_artifacts_freshness_check.step);
         run_quant_kernel_cuda_paged_prefill_diff.step.dependOn(&run_quant_kernel_cuda_paged_prefill_diff_tests.step);
@@ -756,7 +771,7 @@ pub fn build(b: *std.Build) void {
         runtime_graph.identities.addImports(quant_kernel_cuda_ffn_diff_exe.root_module);
         quant_kernel_cuda_ffn_diff_exe.root_module.link_libc = true;
         const run_quant_kernel_cuda_ffn_diff = b.addRunArtifact(quant_kernel_cuda_ffn_diff_exe);
-        if (b.args) |args| run_quant_kernel_cuda_ffn_diff.addArgs(args);
+        run_quant_kernel_cuda_ffn_diff.addPassthruArgs();
         run_quant_kernel_cuda_ffn_diff.step.dependOn(&cuda_artifact_source_policy_check.step);
         quant_kernel_cuda_ffn_diff_step.dependOn(&run_quant_kernel_cuda_ffn_diff.step);
     } else {
@@ -829,7 +844,7 @@ pub fn build(b: *std.Build) void {
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
-    metal_gemma4_prefill_frame_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_test.addFileArg2(exe.getEmittedBin(), .{ .make_absolute = true });
     const metal_gemma4_prefill_frame_test_step = b.step(
         "test-metal-gemma4-prefill-frame",
         "Run the local Metal Gemma4 handwritten/generated stage-sync parity smoke test",
@@ -841,7 +856,7 @@ pub fn build(b: *std.Build) void {
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
-    metal_gemma4_prefill_frame_generated_q8_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_generated_q8_test.addFileArg2(exe.getEmittedBin(), .{ .make_absolute = true });
     metal_gemma4_prefill_frame_generated_q8_test.addArg(
         "--generated-q8-smoke",
     );
@@ -856,7 +871,7 @@ pub fn build(b: *std.Build) void {
         "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
-    metal_gemma4_prefill_frame_e4b_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_e4b_test.addFileArg2(exe.getEmittedBin(), .{ .make_absolute = true });
     metal_gemma4_prefill_frame_e4b_test.addArg(
         "--e4b-smoke",
     );
@@ -873,7 +888,7 @@ pub fn build(b: *std.Build) void {
         "--generated-q8-smoke",
         "--antfly-bin",
     });
-    metal_gemma4_prefill_frame_e4b_generated_q8_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_e4b_generated_q8_test.addFileArg2(exe.getEmittedBin(), .{ .make_absolute = true });
     const metal_gemma4_prefill_frame_e4b_generated_q8_test_step = b.step(
         "test-metal-gemma4-prefill-frame-e4b-generated-q8",
         "Run the local Metal Gemma4 E4B generated-Q8_0 parity smoke against handwritten",
@@ -892,7 +907,7 @@ pub fn build(b: *std.Build) void {
         "--generated-q8-smoke",
         "--antfly-bin",
     });
-    metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.addFileArg(exe.getEmittedBin());
+    metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test.addFileArg2(exe.getEmittedBin(), .{ .make_absolute = true });
     const metal_gemma4_prefill_frame_e4b_generated_q8_q4_0_test_step = b.step(
         "test-metal-gemma4-prefill-frame-e4b-generated-q8-q4-0",
         "Run the local Metal Gemma4 E4B generated-Q8_0/Q4_0 parity smoke against handwritten",
@@ -1068,9 +1083,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_metal_prefill_bucket_bench = b.addRunArtifact(metal_prefill_bucket_bench_exe);
     run_metal_prefill_bucket_bench.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_metal_prefill_bucket_bench.addArgs(args);
-    }
+    run_metal_prefill_bucket_bench.addPassthruArgs();
     const metal_prefill_bucket_bench_step = b.step(
         "bench-metal-prefill-buckets",
         "Run Metal Gemma4 pp10/pp128/pp512 prefill plus tg16 decode bucket benchmarks",
@@ -1092,9 +1105,7 @@ pub fn build(b: *std.Build) void {
     // Metal again here compiles metal_kernels.m twice into this executable.
     metal_bench_exe.root_module.link_libc = true;
     const run_metal_bench = b.addRunArtifact(metal_bench_exe);
-    if (b.args) |args| {
-        run_metal_bench.addArgs(args);
-    }
+    run_metal_bench.addPassthruArgs();
     const metal_bench_step = b.step(
         "inference-metal-bench",
         "Run the focused Metal kernel benchmark; pass --mode and shape filters after --",
@@ -1260,9 +1271,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_turboquant_distortion_bench = b.addRunArtifact(turboquant_distortion_bench_exe);
-    if (b.args) |args| {
-        run_turboquant_distortion_bench.addArgs(args);
-    }
+    run_turboquant_distortion_bench.addPassthruArgs();
     const turboquant_distortion_bench_step = b.step("bench-turboquant-distortion", "Run TurboQuant dot-product distortion benchmark");
     turboquant_distortion_bench_step.dependOn(&run_turboquant_distortion_bench.step);
 
@@ -1283,9 +1292,7 @@ pub fn build(b: *std.Build) void {
     }
     clipclap_bench_exe.root_module.link_libc = true;
     const run_clipclap_bench = b.addRunArtifact(clipclap_bench_exe);
-    if (b.args) |args| {
-        run_clipclap_bench.addArgs(args);
-    }
+    run_clipclap_bench.addPassthruArgs();
     const clipclap_bench_step = b.step("bench-clipclap-kernels", "Run the CLIPCLAP native kernel microbenchmark (baseline vs optimized)");
     clipclap_bench_step.dependOn(&run_clipclap_bench.step);
 
@@ -1296,7 +1303,7 @@ pub fn build(b: *std.Build) void {
     const gliner2_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-gliner2-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/gliner2_e2e.zig"),
+            .root_source_file = b.path("src/bench/gliner2_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1315,10 +1322,9 @@ pub fn build(b: *std.Build) void {
     runtime_graph.identities.addImports(gliner2_e2e_bench_exe.root_module);
     gliner2_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, gliner2_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
+    b.step("bench-gliner2-e2e-build", "Build the GLiNER2 end-to-end benchmark").dependOn(&b.addInstallArtifact(gliner2_e2e_bench_exe, .{}).step);
     const run_gliner2_e2e_bench = b.addRunArtifact(gliner2_e2e_bench_exe);
-    if (b.args) |args| {
-        run_gliner2_e2e_bench.addArgs(args);
-    }
+    run_gliner2_e2e_bench.addPassthruArgs();
     const gliner2_e2e_bench_step = b.step("bench-gliner2-e2e", "Run real-bundle GLiNER2 recognition E2E benchmarks");
     gliner2_e2e_bench_step.dependOn(&run_gliner2_e2e_bench.step);
 
@@ -1346,16 +1352,14 @@ pub fn build(b: *std.Build) void {
     configureNativeTool(b, clipclap_native_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_native_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_native_bench = b.addRunArtifact(clipclap_native_bench_exe);
-    if (b.args) |args| {
-        run_clipclap_native_bench.addArgs(args);
-    }
+    run_clipclap_native_bench.addPassthruArgs();
     const clipclap_native_bench_step = b.step("bench-clipclap-native", "Run end-to-end CLIP/CLAP native encoder benches with random quantized weights");
     clipclap_native_bench_step.dependOn(&run_clipclap_native_bench.step);
 
     const clipclap_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/clipclap_e2e.zig"),
+            .root_source_file = b.path("src/bench/clipclap_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1376,9 +1380,7 @@ pub fn build(b: *std.Build) void {
     configureNativeTool(b, clipclap_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, clipclap_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_clipclap_e2e_bench = b.addRunArtifact(clipclap_e2e_bench_exe);
-    if (b.args) |args| {
-        run_clipclap_e2e_bench.addArgs(args);
-    }
+    run_clipclap_e2e_bench.addPassthruArgs();
     const clipclap_e2e_bench_step = b.step("bench-clipclap-e2e", "Run real-bundle CLIP/CLAP embedding E2E benchmarks");
     clipclap_e2e_bench_step.dependOn(&run_clipclap_e2e_bench.step);
 
@@ -1386,16 +1388,14 @@ pub fn build(b: *std.Build) void {
     const bge_m3_e2e_bench_exe = bge_benchmark.bge_m3_e2e_bench_exe;
 
     const run_bge_m3_e2e_bench = b.addRunArtifact(bge_m3_e2e_bench_exe);
-    if (b.args) |args| {
-        run_bge_m3_e2e_bench.addArgs(args);
-    }
+    run_bge_m3_e2e_bench.addPassthruArgs();
     const bge_m3_e2e_bench_step = b.step("bench-bge-m3-e2e", "Run node-request and pretokenized BGE-M3 encoder benchmarks");
     bge_m3_e2e_bench_step.dependOn(&run_bge_m3_e2e_bench.step);
 
     const qwen3_embedding_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-qwen3-embedding-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/qwen3_embedding_e2e.zig"),
+            .root_source_file = b.path("src/bench/qwen3_embedding_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1416,16 +1416,14 @@ pub fn build(b: *std.Build) void {
     configureNativeTool(b, qwen3_embedding_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, qwen3_embedding_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_qwen3_embedding_e2e_bench = b.addRunArtifact(qwen3_embedding_e2e_bench_exe);
-    if (b.args) |args| {
-        run_qwen3_embedding_e2e_bench.addArgs(args);
-    }
+    run_qwen3_embedding_e2e_bench.addPassthruArgs();
     const qwen3_embedding_e2e_bench_step = b.step("bench-qwen3-embedding-e2e", "Run pretokenized Qwen3-Embedding encoder E2E benchmarks");
     qwen3_embedding_e2e_bench_step.dependOn(&run_qwen3_embedding_e2e_bench.step);
 
     const nomic_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-nomic-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/nomic_e2e.zig"),
+            .root_source_file = b.path("src/bench/nomic_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1446,16 +1444,14 @@ pub fn build(b: *std.Build) void {
     configureNativeTool(b, nomic_e2e_bench_exe, target, enable_system_blas, blas_root, false);
     configureOnnxRuntime(b, nomic_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_nomic_e2e_bench = b.addRunArtifact(nomic_e2e_bench_exe);
-    if (b.args) |args| {
-        run_nomic_e2e_bench.addArgs(args);
-    }
+    run_nomic_e2e_bench.addPassthruArgs();
     const nomic_e2e_bench_step = b.step("bench-nomic-e2e", "Run pretokenized Nomic v1.5 encoder E2E benchmarks");
     nomic_e2e_bench_step.dependOn(&run_nomic_e2e_bench.step);
 
     const reranker_e2e_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-reranker-e2e-bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/reranker_e2e.zig"),
+            .root_source_file = b.path("src/bench/reranker_bench.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1475,9 +1471,7 @@ pub fn build(b: *std.Build) void {
     reranker_e2e_bench_exe.root_module.link_libc = true;
     configureOnnxRuntime(b, reranker_e2e_bench_exe.root_module, enable_onnx, effective_onnx_root);
     const run_reranker_e2e_bench = b.addRunArtifact(reranker_e2e_bench_exe);
-    if (b.args) |args| {
-        run_reranker_e2e_bench.addArgs(args);
-    }
+    run_reranker_e2e_bench.addPassthruArgs();
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
 
@@ -1550,6 +1544,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"wasm_compute:"},
     });
+    runtime_build.applyCBindings(wasm_compute_tests.root_module, runtime_graph.c_bindings);
     wasm_compute_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     wasm_compute_tests.root_module.addImport("httpx", httpx_mod);
     wasm_compute_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1607,6 +1602,7 @@ pub fn build(b: *std.Build) void {
         }),
         .filters = &.{"projector"},
     });
+    runtime_build.applyCBindings(web_projector_tests.root_module, runtime_graph.c_bindings);
     web_projector_tests.root_module.addImport("build_options", runtime_graph.qualification_build_options_mod);
     web_projector_tests.root_module.addImport("httpx", httpx_mod);
     web_projector_tests.root_module.addImport("inference_api", inference_api_mod);
@@ -1662,6 +1658,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    runtime_build.addX86Kernels(
+        b,
+        linalg_tests.root_module,
+        b.path(b.pathJoin(&.{ shared_lib_root, "lib/linalg" })),
+        target,
+        optimize,
+    );
     const run_linalg_tests = b.addRunArtifact(linalg_tests);
     const linalg_test_step = b.step("test-linalg", "Run linalg tests");
     linalg_test_step.dependOn(&run_linalg_tests.step);
@@ -1686,6 +1689,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     hf_tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
+    hf_tok_tests.root_module.addImport("antfly_platform", configured_platform_mod);
     const run_hf_tok_tests = b.addRunArtifact(hf_tok_tests);
 
     const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");
@@ -1710,21 +1714,21 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("{s}/lib/audio/open_corpus_root.zig", .{shared_lib_root})),
             .target = target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     audio_open_corpus.root_module.link_libc = true;
     const run_audio_open_corpus = b.addRunArtifact(audio_open_corpus);
-    if (b.args) |args| run_audio_open_corpus.addArgs(args);
+    run_audio_open_corpus.addPassthruArgs();
     const audio_open_corpus_step = b.step("audio-open-corpus", "Run the non-MP3 audio open corpus runner");
     audio_open_corpus_step.dependOn(&run_audio_open_corpus.step);
 
     const audio_xiph_corpora_e2e = b.addExecutable(.{
         .name = "audio_xiph_corpora_e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_xiph_corpora_e2e.zig", .{shared_lib_root})),
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_xiph_corpora_runner.zig", .{shared_lib_root})),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         }),
     });
     audio_xiph_corpora_e2e.root_module.link_libc = true;
@@ -1747,9 +1751,9 @@ pub fn build(b: *std.Build) void {
     const audio_misc_corpora_e2e = b.addExecutable(.{
         .name = "audio_misc_corpora_e2e",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_misc_corpora_e2e.zig", .{shared_lib_root})),
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_misc_corpora_runner.zig", .{shared_lib_root})),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         }),
     });
     audio_misc_corpora_e2e.root_module.link_libc = true;
@@ -1984,7 +1988,35 @@ pub fn build(b: *std.Build) void {
         "decode real silk and hybrid opus fixtures to interleaved pcm",
         "mdct backward produces a bounded sinusoid for a single coefficient",
         "fixed point helpers match the reference definitions",
+        // MP3 low sampling frequencies: the checked-in corpus is what keeps a
+        // 24 kHz or 22.05 kHz file from reaching a band table that has no
+        // entry for it, which used to abort the whole process.
+        "checked-in mp3 conformance corpus passes through zig backend",
+        "checked-in mp3 conformance corpus passes through facade backend selection",
+        "a silent frame keeps its place in the timeline",
+        "a truncated final frame decodes from the reservoir",
+        "a leading vbr tag frame is metadata, not a frame of silence",
+        "low sampling frequency mp3 fixtures decode instead of aborting",
+        "low sampling frequency short scalefactor band tables cover mpeg2 and mpeg2.5",
+        "8 kHz long scalefactor bands are its own table, not the 48 kHz fallback",
+        "every sample rate a frame header can carry has well formed band tables",
+        "side info parsing rejects a sample rate the band tables do not cover",
+        "mpeg2.5 8 kHz decodes with its own long bands, not the 48 kHz fallback",
     };
+    // The curated filters below keep individual tests addressable, but a
+    // filtered run analyzes only what the filter names, which is how whole
+    // codec suites went years without running. This one runs the lot.
+    const audio_module_tests_all = b.addTest(.{
+        .name = "audio-internals-all",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("{s}/lib/audio/audio_module_test_root.zig", .{shared_lib_root})),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    audio_module_tests_all.root_module.link_libc = true;
+    audio_module_test_step.dependOn(&b.addRunArtifact(audio_module_tests_all).step);
+
     for (audio_module_test_filters, 0..) |filter, filter_index| {
         const audio_module_tests = b.addTest(.{
             .name = b.fmt("audio-internal-{d}", .{filter_index}),
@@ -2025,8 +2057,23 @@ pub fn build(b: *std.Build) void {
 
     if (enable_wasm) {
         const wasm_target = workflows_wasm.resolveTarget(workflow_ctx);
-        const wasm_jinja = b.dependency("jinja", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("jinja");
-        const wasm_platform = b.dependency("antfly_platform", .{ .target = wasm_target, .optimize = .ReleaseSafe, .link_libc = false }).module("antfly_platform");
+        const wasm_jinja = b.dependency("jinja", .{ .target = wasm_target, .optimize = .safe }).module("jinja");
+        const wasm_platform = b.dependency("antfly_platform", .{ .target = wasm_target, .optimize = .safe, .link_libc = false }).module("antfly_platform");
         _ = workflows_wasm.addWasm(workflow_ctx, wasm_jinja, wasm_platform);
     }
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

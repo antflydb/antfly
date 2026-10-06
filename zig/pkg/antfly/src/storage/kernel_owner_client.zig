@@ -26,12 +26,21 @@ pub const LocalTransitionPhase = abi.LocalTransitionPhase;
 pub const LocalTransitionResultKind = abi.LocalTransitionResultKind;
 pub const LocalTransitionRequest = abi.LocalTransitionRequest;
 pub const LocalTransitionResult = abi.LocalTransitionResult;
+pub const ContextResourceBudgetStats = abi.ContextResourceBudgetStats;
+pub const ContextMetricsResult = abi.ContextMetricsResult;
 pub const AggregationHit = abi.AggregationHit;
 pub const AggregationRequest = abi.AggregationRequest;
 pub const singleNamespaceStore = system_store_client.singleNamespaceStore;
 
 pub const Context = struct {
     handle: ?*anyopaque = null,
+
+    pub fn reclaimBackupPinJson(self: *Context, request: abi.BackupPinReclaimRequest) !Response {
+        try self.ensure();
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_backup_pin_reclaim_json(self.handle, &request, &response.buffer));
+        return response;
+    }
 
     pub fn ensure(self: *Context) !void {
         return try self.ensureWith(.{});
@@ -63,6 +72,11 @@ pub const Context = struct {
             self.handle,
             inference_handle,
         ));
+    }
+
+    pub fn configureSecrets(self: *Context, store: ?*anyopaque) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_secrets(self.handle, store));
     }
 
     pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
@@ -211,24 +225,28 @@ pub const VersionedResponse = struct {
         return self.response.version;
     }
 
+    pub fn expectedContentDigest(self: VersionedResponse) ?[32]u8 {
+        return if (self.response.has_expected_content_digest != 0) self.response.expected_content_digest else null;
+    }
+
     pub fn deinit(self: *VersionedResponse) void {
         abi.antfly_storage_owner_buffer_destroy(&self.response.buffer);
         self.* = undefined;
     }
 };
 
-fn haSeedRequest(operation: abi.HASeedOperation, request_json: []const u8) abi.HASeedJsonRequest {
+fn hotStandbySeedRequest(operation: abi.HASeedOperation, request_json: []const u8) abi.HASeedJsonRequest {
     return .{
         .operation = operation,
         .request_json = .fromSlice(request_json),
     };
 }
 
-pub fn haSeedActivate(request_json: []const u8) !Response {
+pub fn hotStandbySeedActivate(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_storage_hot_standby_seed_activate_json(
-        &haSeedRequest(.activate, request_json),
+        &hotStandbySeedRequest(.activate, request_json),
         &response.buffer,
         &failure,
     );
@@ -236,11 +254,11 @@ pub fn haSeedActivate(request_json: []const u8) !Response {
     return response;
 }
 
-pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
+pub fn hotStandbySeedValidateActivatedGeneration(request_json: []const u8) !u64 {
     var result: abi.HASeedValidationResult = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_storage_hot_standby_seed_validate_json(
-        &haSeedRequest(.validate_activated_generation, request_json),
+        &hotStandbySeedRequest(.validate_activated_generation, request_json),
         &result,
         &failure,
     );
@@ -250,11 +268,11 @@ pub fn haSeedValidateActivatedGeneration(request_json: []const u8) !u64 {
     return result.checkpoint_lsn;
 }
 
-pub fn haSeedPruneActivatedGenerations(request_json: []const u8) !Response {
+pub fn hotStandbySeedPruneActivatedGenerations(request_json: []const u8) !Response {
     var response: Response = .{};
     var failure: abi.FailureIdentity = .{};
     const status = abi.antfly_storage_hot_standby_seed_prune_json(
-        &haSeedRequest(.prune_activated_generations, request_json),
+        &hotStandbySeedRequest(.prune_activated_generations, request_json),
         &response.buffer,
         &failure,
     );
@@ -272,6 +290,20 @@ pub fn aggregate(request: AggregationRequest) !Response {
 
 pub const Owner = struct {
     handle: ?*anyopaque,
+
+    /// Caller owns the Raft completion fence until capture returns. Ownership
+    /// transfers only when PreparedSnapshot.attachNative succeeds.
+    pub fn captureNativeRaftSnapshot(self: *Owner, group_id: u64, through_index: u64) !NativeSnapshotCapture {
+        var handle: ?*anyopaque = null;
+        try statusToError(abi.antfly_storage_owner_snapshot_capture(self.handle, group_id, through_index, &handle));
+        return .{ .handle = handle orelse return error.StorageKernelFailure };
+    }
+
+    pub fn restoreControlJson(self: *Owner, request: abi.RestoreOwnerControlRequest) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_restore_control_json(self.handle, &request, &response.buffer));
+        return response;
+    }
 
     pub fn open(request: abi.OpenRequest) !Owner {
         var handle: ?*anyopaque = null;
@@ -486,6 +518,27 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn nativeFkGenerationControlJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_fk_generation_control_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+        }, &response.buffer));
+        return response;
+    }
+
+    pub fn nativeInitialChildControlJson(self: *Owner, table_name: []const u8, request_json: []const u8, operation_index: u64) !Response {
+        if (operation_index < 1 or operation_index > 3) return error.InvalidArgument;
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_native_initial_child_control_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .request_json = .fromSlice(request_json),
+            .operation_term = 1,
+            .operation_index = operation_index,
+        }, &response.buffer));
+        return response;
+    }
+
     pub fn transactionStatus(
         self: *Owner,
         table_name: []const u8,
@@ -508,17 +561,17 @@ pub const Owner = struct {
         return try self.waitForSyncWithCancellation(table_name, sync_level, .none);
     }
 
-    pub fn waitForSyncWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !void {
+    pub fn waitForSyncWithCancellation(self: *Owner, table_name: []const u8, sync_level: abi.SyncLevel, cancellation: @import("antfly_cancellation").CancellationToken) !void {
         const Callback = struct {
             fn cancelled(ptr: ?*anyopaque) callconv(.c) u8 {
-                const token: *const @import("../common/cancellation.zig").CancellationToken = @ptrCast(@alignCast(ptr.?));
+                const token: *const @import("antfly_cancellation").CancellationToken = @ptrCast(@alignCast(ptr.?));
                 return @intFromBool(token.isCancelled());
             }
         };
         try statusToError(abi.antfly_storage_owner_wait_for_sync(
             self.handle,
             &.{
-                .sync_level = @intFromEnum(sync_level),
+                .sync_level = @backingInt(sync_level),
                 .table_name = .fromSlice(table_name),
                 .cancellation_ctx = @ptrCast(@constCast(&cancellation)),
                 .cancellation_fn = Callback.cancelled,
@@ -526,12 +579,12 @@ pub const Owner = struct {
         ));
     }
 
-    pub fn applyHAReplicationRecord(
+    pub fn applyHotStandbyReplicationRecord(
         self: *Owner,
         table_name: []const u8,
-        record: HAReplicationRecord,
+        record: HotStandbyReplicationRecord,
     ) !void {
-        try statusToError(abi.antfly_storage_owner_apply_ha_replication_record(
+        try statusToError(abi.antfly_storage_owner_apply_hot_standby_replication_record(
             self.handle,
             &.{
                 .flags = record.flags,
@@ -558,17 +611,40 @@ pub const Owner = struct {
         backup_id: []const u8,
         format: abi.BackupFormat,
     ) !Response {
+        return self.backupWithControl(.{ .format = @backingInt(format), .table_name = .fromSlice(table_name), .backup_root = .fromSlice(backup_root), .backup_id = .fromSlice(backup_id) });
+    }
+
+    pub fn backupWithControl(self: *Owner, request: abi.BackupRequest) !Response {
         var response: Response = .{};
         try statusToError(abi.antfly_storage_owner_backup_json(
             self.handle,
-            &.{
-                .format = @intFromEnum(format),
-                .table_name = .fromSlice(table_name),
-                .backup_root = .fromSlice(backup_root),
-                .backup_id = .fromSlice(backup_id),
-            },
+            &request,
             &response.buffer,
         ));
+        return response;
+    }
+
+    pub fn backupPinControlJson(self: *Owner, request: abi.ControlledJsonOperationRequest) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_backup_pin_control_json(self.handle, &request, &response.buffer));
+        return response;
+    }
+
+    pub fn prepareSourcePinPublicationJson(self: *Owner, request: abi.ControlledJsonOperationRequest) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_pin_publication_json(self.handle, &request, &response.buffer));
+        return response;
+    }
+
+    pub fn sourceArtifactJson(self: *Owner, request: abi.ControlledJsonOperationRequest) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_source_artifact_json(self.handle, &request, &response.buffer));
+        return response;
+    }
+
+    pub fn onlineMergeIoJson(self: *Owner, request: abi.ControlledJsonOperationRequest) !Response {
+        var response: Response = .{};
+        try statusToError(abi.antfly_storage_owner_online_merge_io_json(self.handle, &request, &response.buffer));
         return response;
     }
 
@@ -637,6 +713,10 @@ pub const Owner = struct {
     }
 
     pub fn scanStream(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink) !void {
+        return self.scanStreamWithOptions(table_name, request_json, sink, .{});
+    }
+
+    pub fn scanStreamWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink, options: QueryOptions) !void {
         const Bridge = struct {
             sink: @import("../runtime_scan_sink.zig").ScanStreamSink,
             failure: ?anyerror = null,
@@ -659,24 +739,27 @@ pub const Owner = struct {
         };
         var bridge = Bridge{ .sink = sink };
         var failure: abi.FailureIdentity = .{};
-        const status = abi.antfly_storage_owner_scan_stream(self.handle, &.{
-            .table_name = .fromSlice(table_name),
-            .request_json = .fromSlice(request_json),
-        }, &.{ .context = &bridge, .start = Bridge.start, .write = Bridge.write }, &failure);
+        const request = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        const status = abi.antfly_storage_owner_scan_stream(self.handle, &request, &.{ .context = &bridge, .start = Bridge.start, .write = Bridge.write }, &failure);
         if (bridge.failure) |err| return err;
         try acceptStorageOwnerFailure(status, failure, "storage-owner scan");
     }
 
     pub fn scanNdjson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
+        return self.scanNdjsonWithOptions(table_name, request_json, .{});
+    }
+
+    pub fn scanNdjsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !Response {
         var response: Response = .{};
-        try statusToError(abi.antfly_storage_owner_scan_ndjson(
+        const request = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_scan_ndjson(
             self.handle,
-            &.{
-                .table_name = .fromSlice(table_name),
-                .request_json = .fromSlice(request_json),
-            },
+            &request,
             &response.buffer,
-        ));
+            &failure,
+        );
+        try acceptStorageOwnerFailure(status, failure, "storage-owner scan");
         return response;
     }
 
@@ -857,7 +940,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_artifact_operation_json(
             self.handle,
             &.{
-                .operation = @intFromEnum(operation),
+                .operation = @backingInt(operation),
                 .table_name = .fromSlice(table_name),
                 .request_json = .fromSlice(request_json),
                 .cancellation_ctx = cancellation_ctx,
@@ -936,7 +1019,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
-                .action = @intFromEnum(action),
+                .action = @backingInt(action),
                 .table_name = .fromSlice(table_name),
             },
             &result,
@@ -945,10 +1028,10 @@ pub const Owner = struct {
         return result;
     }
 
-    pub fn captureHASeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
+    pub fn captureHotStandbySeedSnapshot(self: *Owner, table_name: []const u8, token: []const u8, destination: []const u8) !void {
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(self.handle, &.{
-            .action = @intFromEnum(abi.MaintenanceAction.capture_ha_seed_snapshot),
+            .action = @backingInt(abi.MaintenanceAction.capture_ha_seed_snapshot),
             .table_name = .fromSlice(table_name),
             .snapshot_token = .fromSlice(token),
             .destination_root = .fromSlice(destination),
@@ -956,7 +1039,7 @@ pub const Owner = struct {
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
     }
 
-    pub fn prepareHASeedSnapshot(
+    pub fn prepareHotStandbySeedSnapshot(
         self: *Owner,
         table_name: []const u8,
         deadline_ns: u64,
@@ -965,7 +1048,7 @@ pub const Owner = struct {
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
             &.{
-                .action = @intFromEnum(abi.MaintenanceAction.prepare_ha_seed_snapshot),
+                .action = @backingInt(abi.MaintenanceAction.prepare_ha_seed_snapshot),
                 .table_name = .fromSlice(table_name),
                 .deadline_ns = deadline_ns,
             },
@@ -975,7 +1058,7 @@ pub const Owner = struct {
     }
 };
 
-pub const HAReplicationRecord = struct {
+pub const HotStandbyReplicationRecord = struct {
     record_kind: u16,
     payload_codec: u16,
     flags: u32 = 0,
@@ -988,6 +1071,17 @@ pub const HAReplicationRecord = struct {
     previous_lsn: u64,
     commit_timestamp_ns: i64 = 0,
     payload: []const u8 = &.{},
+};
+
+pub const NativeSnapshotCapture = struct {
+    handle: ?*anyopaque,
+    pub fn bindLease(self: *NativeSnapshotCapture, ctx: ?*anyopaque, release: *const fn (?*anyopaque) callconv(.c) void) !void {
+        try statusToError(abi.antfly_storage_snapshot_capture_bind_lease(self.handle, ctx, release));
+    }
+    pub fn deinit(self: *NativeSnapshotCapture) void {
+        abi.antfly_storage_snapshot_capture_destroy(self.handle);
+        self.handle = null;
+    }
 };
 
 pub const Snapshot = struct {

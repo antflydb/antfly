@@ -57,9 +57,12 @@ pub const State = struct {
     lease_epoch: u64,
 
     pub fn init(alloc: Allocator, store: anytype, key: []const u8, config: Config) !State {
+        var lease = try lease_mod.Lease.init(alloc, store, key);
+        errdefer lease.deinit();
+        const owner_id = try alloc.dupe(u8, config.owner_id);
         return .{
-            .lease = try lease_mod.Lease.init(alloc, store, key),
-            .owner_id = try alloc.dupe(u8, config.owner_id),
+            .lease = lease,
+            .owner_id = owner_id,
             .lease_owned = config.lease_owned,
             .lease_ttl_ms = config.lease_ttl_ms,
             .has_lease = !config.lease_owned,
@@ -145,7 +148,15 @@ pub const State = struct {
             self.noteAcquireFailure();
             return false;
         }
-        self.lease_expires_at_ms = std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64);
+        _ = self.noteFencedRenewal(self.lease_epoch, now_ms);
+        return true;
+    }
+
+    /// Record a renewal committed by an independent heartbeat task. The
+    /// caller serializes State access; a superseded tenure cannot update it.
+    pub fn noteFencedRenewal(self: *State, epoch: u64, now_ms: u64) bool {
+        if (!self.has_lease or epoch == 0 or self.lease_epoch != epoch) return false;
+        self.lease_expires_at_ms = @max(self.lease_expires_at_ms, std.math.add(u64, now_ms, self.lease_ttl_ms) catch std.math.maxInt(u64));
         self.renewal_count += 1;
         self.updateRenewalDeadline();
         return true;
@@ -297,6 +308,15 @@ test "ownership state renews only at the cached renewal deadline" {
     var renewed = (try owner.loadLease(alloc)) orelse return error.TestExpectedLease;
     defer lease_mod.deinitRecord(alloc, &renewed);
     try std.testing.expectEqual(first_deadline + 30_000, renewed.expires_at_ms);
+    const epoch = owner.lease_epoch;
+    try std.testing.expect(!owner.noteFencedRenewal(epoch + 1, first_deadline + 1));
+    try std.testing.expect(!owner.noteFencedRenewal(0, first_deadline + 1));
+    try std.testing.expectEqual(renewed.expires_at_ms, owner.lease_expires_at_ms);
+    try std.testing.expect(try owner.lease.renewFenced(owner.owner_id, epoch, first_deadline + 1000, owner.lease_ttl_ms));
+    try std.testing.expect(owner.noteFencedRenewal(epoch, first_deadline + 1000));
+    try std.testing.expectEqual(first_deadline + 31_000, owner.lease_expires_at_ms);
+    try std.testing.expect(owner.lease_renew_after_ms > first_deadline);
+    try std.testing.expectEqual(@as(u64, 2), owner.renewal_count);
 }
 
 test "ownership state works with memory backend store" {
@@ -353,4 +373,20 @@ test "ownership state works with lsm backend store" {
     try std.testing.expect(try owner_b.ensureLease(1_300));
     try std.testing.expect(!(try owner_a.ensureLease(1_320)));
     try std.testing.expectEqual(@as(u64, 1), owner_a.lost_leases);
+}
+
+test "ownership init releases its lease adapter on every allocation failure" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime = try backend.runtimeStore(alloc, .{ .name = "ownership-init" });
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime);
+    defer store.close();
+    const Check = struct {
+        fn run(failing: Allocator, target: *docstore_mod.DocStore) !void {
+            var state = try State.init(failing, target, "ownership-init", .{ .lease_owned = true, .owner_id = "worker" });
+            defer state.deinitPreserveLease(failing);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
 }

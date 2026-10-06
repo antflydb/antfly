@@ -16,7 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
-const cache_budget = @import("../common/cache_budget.zig");
+const cache_budget = @import("antfly_cache_budget");
 pub const DenseWorkAdmission = @import("dense_work_admission.zig");
 const admission = @import("admission_waiter.zig");
 const dense_perf = @import("dense_perf_experiments.zig");
@@ -74,7 +74,7 @@ fn IdentityLedger(comptime K: type, comptime V: type) type {
             return true;
         }
 
-        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.map.deinit(allocator);
             self.* = .empty;
         }
@@ -99,6 +99,8 @@ const foreground_write_maintenance_quiet_ns: u64 = 2 * std.time.ns_per_ms;
 const foreground_query_compaction_yield_max_ns: u64 = 50 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
+    builtin.os.tag != .wasi and
+    !builtin.single_threaded and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
@@ -106,7 +108,7 @@ const PressureChange = if (supports_pressure_wait)
     struct {
         mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
         cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: std.atomic.Value(u64) = .init(0),
+        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
@@ -129,7 +131,7 @@ const PressureChange = if (supports_pressure_wait)
     }
 else
     struct {
-        epoch: std.atomic.Value(u64) = .init(0),
+        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
@@ -233,7 +235,7 @@ pub const Slice = enum(u8) {
     }
 };
 
-pub const slice_count: usize = @typeInfo(Slice).@"enum".fields.len;
+pub const slice_count: usize = @typeInfo(Slice).@"enum".field_names.len;
 
 pub const Budget = struct {
     soft_limit_bytes: u64 = 0,
@@ -427,7 +429,7 @@ pub const Options = struct {
     /// owners exceed their previous high-water mark. Production owners should
     /// pass their lifetime allocator; the page allocator keeps lightweight
     /// tests source-compatible.
-    identity_allocator: std.mem.Allocator = std.heap.page_allocator,
+    identity_allocator: std.mem.Allocator = platformAllocator(),
 
     pub fn defaultBudgets() [slice_count]Budget {
         // Name every slice: additions cannot silently shift another owner's policy.
@@ -509,6 +511,13 @@ pub const Options = struct {
         }).values;
     }
 };
+
+fn platformAllocator() std.mem.Allocator {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) {
+        return std.heap.wasm_allocator;
+    }
+    return std.heap.page_allocator;
+}
 
 pub const SliceStats = struct {
     name: []const u8,
@@ -662,6 +671,12 @@ pub const DenseReplayWindowBudgetOptions = struct {
     default_bytes: u64,
     max_bytes: u64,
     min_bytes: u64 = dense_replay_window_min_bytes,
+    working_set_factor: u64 = 1,
+};
+
+pub const DenseReplayWindowLimits = struct {
+    work_bytes: u64,
+    working_set_bytes: u64,
 };
 
 pub const DenseReplayWindowResult = struct {
@@ -700,12 +715,12 @@ pub const DerivedRecoverableRetryStats = struct {
 };
 
 const DerivedRecoverableRetryCounters = struct {
-    total: std.atomic.Value(u64) = .init(0),
-    writer_locked: std.atomic.Value(u64) = .init(0),
-    resource_budget: std.atomic.Value(u64) = .init(0),
-    replay_document_not_visible: std.atomic.Value(u64) = .init(0),
-    artifact_repair_required: std.atomic.Value(u64) = .init(0),
-    not_found: std.atomic.Value(u64) = .init(0),
+    total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    writer_locked: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resource_budget: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
@@ -745,6 +760,234 @@ const MutableSlice = struct {
     soft_limit_events: u64 = 0,
     hard_limit_rejections: u64 = 0,
     oversized_single_grants: u64 = 0,
+};
+
+fn replayEscalationEnvU64(name: [:0]const u8, default: u64) u64 {
+    const raw_z = if (builtin.link_libc) std.c.getenv(name) else null;
+    const raw = std.mem.span(raw_z orelse return default);
+    if (raw.len == 0) return default;
+    return std.fmt.parseUnsigned(u64, raw, 10) catch default;
+}
+
+// catch_up_policy.RecoverableRetryBackoff's delay doubles from 10ms and caps
+// at 250ms after the 6th attempt (10+20+40+80+160+250 = 560ms), so every
+// retry after that adds a flat 250ms. 1200 retries is therefore about
+// 560ms + 1194 * 250ms =~ 299s, five minutes. Ordinary replay-visibility lag
+// between a primary-store commit and the derived journal record landing is
+// sub-second to low seconds even under heavy write pressure; a document
+// still missing after five full minutes of continuous retrying is not a
+// transient commit-ordering race, it is a document that is never going to
+// gain content (issue #938's `_edges`-only shape, or another producer like
+// #928's never-written chunk). Minutes, not seconds, so a slow but honest
+// catch-up window is never mistaken for one of these.
+const replay_document_not_visible_default_max_retries: u64 = 1200;
+
+fn replayDocumentNotVisibleMaxRetries() u32 {
+    const configured = replayEscalationEnvU64(
+        "ANTFLY_REPLAY_DOCUMENT_NOT_VISIBLE_MAX_RETRIES",
+        replay_document_not_visible_default_max_retries,
+    );
+    return @intCast(@min(configured, std.math.maxInt(u32)));
+}
+
+/// One index's replay-visibility tracking: how many consecutive times its
+/// current stuck window has retried, and how many documents it has ever
+/// given up on entirely.
+const ReplayWindowState = struct {
+    sequence: u64 = 0,
+    consecutive_failures: u32 = 0,
+    /// Cumulative documents this index has given up on across every window
+    /// that has ever escalated. Never reset by recordSuccess -- this is the
+    /// operator-visible "documents given up on" count, not a liveness signal.
+    skipped_total: u64 = 0,
+};
+
+/// One index's cumulative replay-document-not-visible skip count, summed
+/// across every owner that has an index of this name, as returned by
+/// `snapshotSkipped` for /metrics. The caller owns `index_name`.
+pub const IndexReplayDocumentNotVisibleSkipped = struct {
+    index_name: []u8,
+    count: u64,
+};
+
+/// Opaque per-owner identity for ReplayNotVisibleTracker: distinguishes two
+/// storage owners (table/shard replicas, each with its own DB-lifetime
+/// IndexManager) that happen to have same-named indexes -- the default
+/// `full_text_index_v0` is the common case -- or that happen to be at the
+/// same replay sequence by coincidence. PR #957 review: without this, the
+/// tracker (keyed only by index name) let two such owners alternately reset
+/// or combine each other's retry counts, so neither ever escalated.
+///
+/// Callers pass `replayOwnerIdFromPtr` on their IndexManager (or another
+/// pointer stable for exactly that owner's lifetime). The identity is only
+/// ever compared for equality within one process's lifetime, never
+/// persisted or compared across restarts.
+pub const ReplayOwnerId = usize;
+
+pub fn replayOwnerIdFromPtr(ptr: anytype) ReplayOwnerId {
+    return @intFromPtr(ptr);
+}
+
+/// Bounds how long the derived full-text/algebraic/dense/sparse replay
+/// workers retry `error.ReplayDocumentNotVisible` for the same replay
+/// window, tracked independently per (owner, index), before giving up on
+/// the still-missing documents there and letting the window advance
+/// without them.
+///
+/// Without this, a document that will never gain visible content wedges the
+/// worker -- and anything waiting on it to drain, such as Lite's
+/// run_until_idle() -- forever. Issue #938 is one concrete trigger (a
+/// document whose only content was `_edges` was reconstructed by the replay
+/// window as a synthetic full-text candidate with no primary row to find);
+/// this is the backstop for that whole class of bug, not a fix for one shape
+/// of document. This ResourceManager, and therefore this tracker, is shared
+/// process-wide across every storage owner, so tracking must be keyed by
+/// (owner, index name), not index name alone -- see ReplayOwnerId.
+pub const ReplayNotVisibleTracker = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    owners: std.AutoHashMapUnmanaged(ReplayOwnerId, std.StringHashMapUnmanaged(ReplayWindowState)) = .empty,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        lockAtomic(&self.mutex);
+        var owner_it = self.owners.valueIterator();
+        while (owner_it.next()) |windows| freeWindows(alloc, windows);
+        self.owners.deinit(alloc);
+        self.owners = .empty;
+        self.mutex.unlock();
+    }
+
+    fn freeWindows(alloc: std.mem.Allocator, windows: *std.StringHashMapUnmanaged(ReplayWindowState)) void {
+        var key_it = windows.keyIterator();
+        while (key_it.next()) |key_ptr| alloc.free(@constCast(key_ptr.*));
+        windows.deinit(alloc);
+    }
+
+    fn getOrPutLocked(self: *@This(), alloc: std.mem.Allocator, owner: ReplayOwnerId, index_name: []const u8) ?*ReplayWindowState {
+        const owner_gop = self.owners.getOrPut(alloc, owner) catch return null;
+        if (!owner_gop.found_existing) owner_gop.value_ptr.* = .empty;
+        const gop = owner_gop.value_ptr.getOrPut(alloc, index_name) catch return null;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = alloc.dupe(u8, index_name) catch {
+                _ = owner_gop.value_ptr.remove(index_name);
+                return null;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
+
+    /// Records one more failed attempt at `owner`'s `index_name` replay
+    /// window ending at `sequence` and reports whether that (owner, index)
+    /// pair has now retried more than `max_retries` times in a row without
+    /// making progress. A different window on the SAME (owner, index) pair
+    /// (a new sequence) resets that pair's count; a different owner or a
+    /// different index name is tracked entirely independently, even if the
+    /// index name or the sequence number happens to coincide.
+    fn recordFailure(self: *@This(), alloc: std.mem.Allocator, owner: ReplayOwnerId, index_name: []const u8, sequence: u64, max_retries: u32) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.getOrPutLocked(alloc, owner, index_name) orelse return false;
+        if (state.sequence != sequence) {
+            state.sequence = sequence;
+            state.consecutive_failures = 0;
+        }
+        state.consecutive_failures +|= 1;
+        return state.consecutive_failures > max_retries;
+    }
+
+    /// Clears the tracked window once it makes progress, so a later stall on
+    /// the same (owner, index, sequence) is not mistaken for a continuation
+    /// of an already-escalated stall. The cumulative skipped_total is
+    /// untouched.
+    fn recordSuccess(self: *@This(), owner: ReplayOwnerId, index_name: []const u8, sequence: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const windows = self.owners.getPtr(owner) orelse return;
+        const state = windows.getPtr(index_name) orelse return;
+        if (state.sequence == sequence) state.consecutive_failures = 0;
+    }
+
+    /// Records that one document in `owner`'s `index_name` was given up on
+    /// (its content will never arrive) rather than indexed, for operator
+    /// visibility through index status and /metrics.
+    fn recordSkipped(self: *@This(), alloc: std.mem.Allocator, owner: ReplayOwnerId, index_name: []const u8) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.getOrPutLocked(alloc, owner, index_name) orelse return;
+        state.skipped_total +|= 1;
+    }
+
+    fn skippedTotal(self: *@This(), owner: ReplayOwnerId, index_name: []const u8) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const windows = self.owners.getPtr(owner) orelse return 0;
+        const state = windows.getPtr(index_name) orelse return 0;
+        return state.skipped_total;
+    }
+
+    fn skippedTotalAll(self: *@This()) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var total: u64 = 0;
+        var owner_it = self.owners.valueIterator();
+        while (owner_it.next()) |windows| {
+            var it = windows.valueIterator();
+            while (it.next()) |state| total +|= state.skipped_total;
+        }
+        return total;
+    }
+
+    /// Snapshots skipped counts summed by index name across every owner.
+    /// Owner identity is not a meaningful /metrics label -- there can be
+    /// many owners, and ReplayOwnerId is not stable across restarts -- so
+    /// this aggregates by index name, matching what operators scanning
+    /// /metrics for "is this index losing documents" actually want. The
+    /// caller frees each entry's `index_name` and the returned slice.
+    fn snapshotSkipped(self: *@This(), alloc: std.mem.Allocator) ![]IndexReplayDocumentNotVisibleSkipped {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var totals = std.StringHashMapUnmanaged(u64).empty;
+        defer totals.deinit(alloc);
+        var owner_it = self.owners.valueIterator();
+        while (owner_it.next()) |windows| {
+            var it = windows.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.skipped_total == 0) continue;
+                const gop = try totals.getOrPut(alloc, entry.key_ptr.*);
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* +|= entry.value_ptr.skipped_total;
+            }
+        }
+        // The final size is known: reserve the output before copying names,
+        // then transfer each allocation directly into an initialized entry.
+        const out = try alloc.alloc(IndexReplayDocumentNotVisibleSkipped, totals.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |item| alloc.free(item.index_name);
+            alloc.free(out);
+        }
+        var totals_it = totals.iterator();
+        while (totals_it.next()) |entry| {
+            out[initialized] = .{
+                .index_name = try alloc.dupe(u8, entry.key_ptr.*),
+                .count = entry.value_ptr.*,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    /// Removes every tracked window for `owner` (called when its
+    /// IndexManager/DB closes), so the tracker cannot grow without bound
+    /// across DB/table open-close churn, and so a later owner reusing the
+    /// same ReplayOwnerId (e.g. a pointer address reused by the allocator)
+    /// never inherits a closed owner's retry or skip history.
+    fn removeOwner(self: *@This(), alloc: std.mem.Allocator, owner: ReplayOwnerId) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var removed = self.owners.fetchRemove(owner) orelse return;
+        freeWindows(alloc, &removed.value);
+    }
 };
 
 const MutableMemory = struct {
@@ -831,18 +1074,18 @@ pub const ResourceManager = struct {
     reclaimers: std.ArrayListUnmanaged(ReclaimerSlot) = .empty,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
-    reclaim_requests: std.atomic.Value(u64) = .init(0),
-    reclaimed_bytes: std.atomic.Value(u64) = .init(0),
-    hbc_benefit_sample_counter: std.atomic.Value(u64) = .init(0),
-    hbc_cache_benefit: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitState = .{HbcCacheBenefitState{}} ** @typeInfo(HbcCacheClass).@"enum".fields.len,
+    reclaim_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    reclaimed_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    hbc_benefit_sample_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    hbc_cache_benefit: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitState = @splat(HbcCacheBenefitState{}),
     pressure_change: PressureChange = .{},
     memory: MutableMemory,
-    latency_sensitive_derived_replay_sessions: std.atomic.Value(u64) = .init(0),
-    latency_sensitive_derived_replay_quiet_until_ns: std.atomic.Value(u64) = .init(0),
-    foreground_query_sessions: std.atomic.Value(u64) = .init(0),
-    foreground_query_quiet_until_ns: std.atomic.Value(u64) = .init(0),
-    foreground_write_sessions: std.atomic.Value(u64) = .init(0),
-    foreground_write_quiet_until_ns: std.atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_query_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_query_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_write_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    foreground_write_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
     dense_search_admission_mutex: std.atomic.Mutex = .unlocked,
     dense_search_bandwidth_capacity_bytes: u64 = 0,
     dense_search_active_bytes: u64 = 0,
@@ -895,10 +1138,11 @@ pub const ResourceManager = struct {
     dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
     dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
     dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
-    dense_read_denied_tasks: std.atomic.Value(u64) = .init(0),
-    dense_physically_ordered_batches: std.atomic.Value(u64) = .init(0),
-    dense_physically_ordered_requests: std.atomic.Value(u64) = .init(0),
+    dense_read_denied_tasks: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    dense_physically_ordered_batches: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    dense_physically_ordered_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
+    /// Adaptive window size in original work units, independent of storage estimates.
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
     dense_replay_last_write_pressure_ns: u64 = 0,
@@ -915,6 +1159,7 @@ pub const ResourceManager = struct {
     query_embedding_max_inflight: usize,
     index_repair_activation: IndexRepairActivationStats = .{},
     derived_recoverable_retry_counters: DerivedRecoverableRetryCounters = .{},
+    replay_not_visible_tracker: ReplayNotVisibleTracker = .{},
     capacity_source: ?CapacitySource = null,
     identity_allocator: std.mem.Allocator,
     next_identity: u64 = 1,
@@ -923,6 +1168,7 @@ pub const ResourceManager = struct {
     observer_identities: IdentityLedger(ObserverKey, ObserverIdentity) = .empty,
 
     pub fn init(options: Options) ResourceManager {
+        const cpu_count = if (comptime builtin.os.tag == .freestanding) 1 else std.Thread.getCpuCount() catch 1;
         var slices: [slice_count]MutableSlice = undefined;
         for (&slices, 0..) |*slice, i| {
             slice.* = .{
@@ -947,11 +1193,11 @@ pub const ResourceManager = struct {
             .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
             .dense_search_bandwidth_capacity_bytes = options.dense_search_bandwidth_capacity_bytes orelse
-                options.budgets[@intFromEnum(Slice.dense_search_working_set)].soft_limit_bytes,
+                options.budgets[@backingInt(Slice.dense_search_working_set)].soft_limit_bytes,
             .dense_read_extra_task_limit = options.dense_read_extra_task_limit orelse
-                @intCast(@min(std.math.maxInt(u32), (std.Thread.getCpuCount() catch 1) *| 2)),
-            .dense_rerank_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
-            .dense_driver_admission = .{ .capacity = @intCast(std.Thread.getCpuCount() catch 1) },
+                @intCast(@min(std.math.maxInt(u32), cpu_count *| 2)),
+            .dense_rerank_admission = .{ .capacity = @intCast(cpu_count) },
+            .dense_driver_admission = .{ .capacity = @intCast(cpu_count) },
             .dense_aggregate_admission = dense_perf.enabled("ANTFLY_EXPERIMENT_AGGREGATE_ADMISSION"),
             .dense_query_snapshot = dense_perf.enabled("ANTFLY_EXPERIMENT_QUERY_SNAPSHOT"),
             .dense_query_snapshot_native_only = dense_perf.enabled("ANTFLY_EXPERIMENT_QUERY_SNAPSHOT_NATIVE_ONLY"),
@@ -1152,6 +1398,7 @@ pub const ResourceManager = struct {
             // evicting an unrelated cache cannot raise this slice's ceiling.
             const requester_slice_reclaimable = requester == .dense_search_working_set or
                 requester == .hbc_node_metadata_cache or
+                requester == .relational_preparation_working_set or
                 requester == .document_extraction_working_set;
             const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
                 0
@@ -1182,7 +1429,7 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache };
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache };
         for (candidates, 0..) |candidate_slice, candidate_index| {
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
@@ -1196,6 +1443,7 @@ pub const ResourceManager = struct {
             if (candidate_slice == requester and
                 candidate_slice != .dense_search_working_set and
                 candidate_slice != .hbc_node_metadata_cache and
+                candidate_slice != .relational_preparation_working_set and
                 candidate_slice != .document_extraction_working_set) continue;
             // Preserve weighted fairness on the first pass. If some owners
             // cannot use their share, offer the remaining debt once more to
@@ -1504,6 +1752,60 @@ pub const ResourceManager = struct {
         return self.derived_recoverable_retry_counters.snapshot();
     }
 
+    /// Reports whether replay of `owner`'s `index_name` window ending at
+    /// `sequence` has now failed with `error.ReplayDocumentNotVisible` more
+    /// times in a row than `ANTFLY_REPLAY_DOCUMENT_NOT_VISIBLE_MAX_RETRIES`
+    /// allows. The caller is expected to treat this as "stop waiting for the
+    /// still-missing documents in this window" rather than retrying again --
+    /// see ReplayNotVisibleTracker's doc comment. `owner` must distinguish
+    /// this storage owner from any other that might have a same-named index
+    /// or coincidentally be at the same sequence (see ReplayOwnerId).
+    pub fn shouldEscalateReplayDocumentNotVisible(self: *ResourceManager, owner: ReplayOwnerId, index_name: []const u8, sequence: u64) bool {
+        return self.replay_not_visible_tracker.recordFailure(self.identity_allocator, owner, index_name, sequence, replayDocumentNotVisibleMaxRetries());
+    }
+
+    /// Clears escalation tracking for `owner`'s `index_name` window ending
+    /// at `sequence` once it has actually applied successfully.
+    pub fn clearReplayDocumentNotVisibleEscalation(self: *ResourceManager, owner: ReplayOwnerId, index_name: []const u8, sequence: u64) void {
+        self.replay_not_visible_tracker.recordSuccess(owner, index_name, sequence);
+    }
+
+    /// Records that one document in `owner`'s `index_name` was given up on
+    /// by replay (its content will never arrive) rather than indexed.
+    /// Surfaced through
+    /// `replayDocumentNotVisibleSkippedTotal`/`...All`/`snapshotReplayDocumentNotVisibleSkipped`
+    /// for index status and /metrics.
+    pub fn recordReplayDocumentNotVisibleSkipped(self: *ResourceManager, owner: ReplayOwnerId, index_name: []const u8) void {
+        self.replay_not_visible_tracker.recordSkipped(self.identity_allocator, owner, index_name);
+    }
+
+    /// Cumulative documents `owner`'s `index_name` has ever given up on via
+    /// bounded replay-document-not-visible escalation.
+    pub fn replayDocumentNotVisibleSkippedTotal(self: *ResourceManager, owner: ReplayOwnerId, index_name: []const u8) u64 {
+        return self.replay_not_visible_tracker.skippedTotal(owner, index_name);
+    }
+
+    /// Sum of `replayDocumentNotVisibleSkippedTotal` across every owner and
+    /// index, for a single process-wide /metrics counter.
+    pub fn replayDocumentNotVisibleSkippedTotalAll(self: *ResourceManager) u64 {
+        return self.replay_not_visible_tracker.skippedTotalAll();
+    }
+
+    /// Per-index breakdown (summed across owners) for a labeled /metrics
+    /// sample. The caller frees each entry's `index_name` and the returned
+    /// slice.
+    pub fn snapshotReplayDocumentNotVisibleSkipped(self: *ResourceManager, alloc: std.mem.Allocator) ![]IndexReplayDocumentNotVisibleSkipped {
+        return self.replay_not_visible_tracker.snapshotSkipped(alloc);
+    }
+
+    /// Removes every tracked replay-document-not-visible window and skip
+    /// count for `owner`. Callers must invoke this when the owner (its
+    /// IndexManager/DB) closes, so this process-wide tracker cannot grow
+    /// without bound across DB/table open-close churn.
+    pub fn removeReplayNotVisibleOwner(self: *ResourceManager, owner: ReplayOwnerId) void {
+        self.replay_not_visible_tracker.removeOwner(self.identity_allocator, owner);
+    }
+
     /// Install the capacity source for this manager's storage domain.
     ///
     /// A source is part of the manager's lifetime contract: DBs copy the
@@ -1585,6 +1887,8 @@ pub const ResourceManager = struct {
         self.batch_reservation_identities = .empty;
         self.observer_identities.deinit(self.identity_allocator);
         self.observer_identities = .empty;
+        self.replay_not_visible_tracker.deinit(self.identity_allocator);
+        self.replay_not_visible_tracker = .{};
     }
 
     pub fn reserveCapacity(
@@ -1794,7 +2098,7 @@ pub const ResourceManager = struct {
     fn normalizeSliceAmounts(
         amounts: []const SliceAmount,
     ) error{DuplicateResourceSlice}![slice_count]u64 {
-        var normalized = [_]u64{0} ** slice_count;
+        var normalized = @as([slice_count]u64, @splat(0));
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
             const index = sliceIndex(amount.slice);
@@ -2904,6 +3208,24 @@ pub const ResourceManager = struct {
         return sliceStatsFromState(slice, state);
     }
 
+    /// Advisory headroom for sizing a bounded unit of work. Admission still
+    /// checks both limits atomically; concurrent users can consume this space.
+    /// Unlike snapshot(), this avoids collecting unrelated slice statistics.
+    pub fn availableAdmissionBytes(self: *ResourceManager, slice: Slice) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.slices[sliceIndex(slice)];
+        const slice_available = if (state.budget.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            state.budget.hard_limit_bytes -| state.used_bytes;
+        const memory_available = if (self.memory.budget.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
+        return @min(slice_available, memory_available);
+    }
+
     /// Stable capacity, not momentary free space: durable transaction admission
     /// must not turn unrelated concurrent requests into permanent size limits.
     /// Zero means neither the node nor this slice has a hard limit.
@@ -2947,7 +3269,7 @@ pub const ResourceManager = struct {
         const projected_memory = self.memory.used_bytes +| additional_bytes;
         const memory_pressure = pressureFor(self.memory.budget, projected_memory);
         const aggregate_dominates = memory_pressure != .normal and
-            @intFromEnum(memory_pressure) >= @intFromEnum(slice_pressure);
+            @backingInt(memory_pressure) >= @backingInt(slice_pressure);
         const pressure = if (aggregate_dominates) memory_pressure else slice_pressure;
         return .{
             .pressure = pressure,
@@ -3102,10 +3424,10 @@ pub const ResourceManager = struct {
         // minima above remain intact, so noisy feedback cannot starve routing
         // state or make one observation swing the whole cache.
         const adaptive_pool = target_bytes / 4;
-        const node_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.node)].score, total_score);
-        const quantized_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.quantized)].score, total_score);
-        const vector_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.vector)].score, total_score);
-        const metadata_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.metadata)].score, total_score);
+        const node_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.node)].score, total_score);
+        const quantized_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.quantized)].score, total_score);
+        const vector_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.vector)].score, total_score);
+        const metadata_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.metadata)].score, total_score);
         policy.node_protected_bytes = @min(target_bytes / 3, policy.node_protected_bytes +| node_share);
         policy.quantized_protected_bytes = @min(target_bytes / 2, policy.quantized_protected_bytes +| quantized_share);
         policy.vector_protected_bytes = @min(target_bytes / 2, vector_share);
@@ -3122,7 +3444,7 @@ pub const ResourceManager = struct {
         return ticket & 63 == 0;
     }
 
-    pub fn observeHbcCacheBenefitSampled(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitSample) void {
+    pub fn observeHbcCacheBenefitSampled(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitSample) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (samples, 0..) |sample, i| {
@@ -3147,12 +3469,18 @@ pub const ResourceManager = struct {
     }
 
     /// Convenience entry point for non-hot-path callers and tests.
-    pub fn observeHbcCacheBenefit(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitSample) void {
+    pub fn observeHbcCacheBenefit(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitSample) void {
         if (!self.beginHbcCacheBenefitSample()) return;
         self.observeHbcCacheBenefitSampled(samples);
     }
 
     pub fn denseReplayWindowBudget(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) u64 {
+        return self.denseReplayWindowLimits(options).working_set_bytes;
+    }
+
+    /// Adapt in original work units. Scale only the memory estimate, then
+    /// cap it against the same live slice headroom under this lock.
+    pub fn denseReplayWindowLimits(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) DenseReplayWindowLimits {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -3176,7 +3504,14 @@ pub const ResourceManager = struct {
 
         current = clampU64(current, options.min_bytes, cap);
         self.dense_replay_window_budget_bytes = current;
-        return current;
+        const factor = @max(@as(u64, 1), options.working_set_factor);
+        if (factor == 1) return .{ .work_bytes = current, .working_set_bytes = current };
+        const memory_cap = self.denseReplayWindowHardCapLocked(.{
+            .default_bytes = options.default_bytes *| factor,
+            .max_bytes = options.max_bytes *| factor,
+            .min_bytes = options.min_bytes,
+        });
+        return .{ .work_bytes = current, .working_set_bytes = @min(current *| factor, memory_cap) };
     }
 
     pub fn noteDenseReplayWindowResult(self: *ResourceManager, result: DenseReplayWindowResult) void {
@@ -3395,7 +3730,7 @@ pub const BudgetedAllocator = struct {
 
     fn recordAllocationFailure(self: *BudgetedAllocator, cause: @FieldType(AllocationFailure, "cause"), bytes: usize, ret_addr: usize) void {
         const snapshot = self.reservation.manager.snapshot();
-        const slice = snapshot.slices[@intFromEnum(self.reservation.slice)];
+        const slice = snapshot.slices[@backingInt(self.reservation.slice)];
         self.last_allocation_failure = .{
             .cause = cause,
             .requested_bytes = bytes,
@@ -3512,8 +3847,65 @@ pub const BudgetedAllocator = struct {
         free(ctx, memory, alignment, ret_addr);
     }
 
+    /// Operation-local raw allocation failure receipt, captured under the allocator lock.
+    /// Resize/remap refusals are advisory; a failed fallback alloc records its cause.
+    /// Shared owners' failures cannot misclassify this operation's backing OOM
+    /// as admission pressure. Storage remains owned by the original allocator.
+    pub const FailureTrackingAllocator = struct {
+        owner: *BudgetedAllocator,
+        last_failure: ?@FieldType(AllocationFailure, "cause") = null,
+
+        pub fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = trackedAlloc, .resize = trackedResize, .remap = trackedRemap, .free = trackedFree } };
+        }
+
+        fn trackedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            const result = alloc(self.owner, len, alignment, ra);
+            self.last_failure = if (result == null) self.owner.last_allocation_failure.?.cause else null;
+            return result;
+        }
+        fn trackedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return lockedResize(self.owner, memory, alignment, new_len, ra);
+        }
+        fn trackedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return lockedRemap(self.owner, memory, alignment, new_len, ra);
+        }
+        fn trackedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            lockedFree(self.owner, memory, alignment, ra);
+        }
+    };
+
     pub fn denied(self: *const BudgetedAllocator) bool {
         return self.budget_denied;
+    }
+
+    /// True when the latest denial would also happen with this allocator as
+    /// the slice's sole owner: its own live bytes plus the failed request
+    /// exceed what a sole owner may reserve. False means other owners' usage
+    /// filled the slice, which is transient contention rather than evidence
+    /// that the operation itself is oversized.
+    pub fn deniedByOwnDemand(self: *const BudgetedAllocator) bool {
+        std.debug.assert(self.budget_denied);
+        const failure = self.last_allocation_failure orelse return true;
+        if (failure.cause != .admission) return true;
+        const requested = std.math.cast(u64, failure.requested_bytes) orelse return true;
+        const own_need = std.math.add(u64, failure.live_bytes, requested) catch return true;
+        // A sole owner may exceed the slice limit by the allocator's multiple,
+        // but never the node-wide memory limit.
+        if (failure.aggregate_limit_bytes > 0 and own_need > failure.aggregate_limit_bytes) return true;
+        const limit = failure.slice_limit_bytes;
+        if (limit == 0) return failure.aggregate_limit_bytes == 0;
+        const sole_owner_limit = if (self.max_hard_limit_multiple <= 1)
+            limit
+        else
+            std.math.mul(u64, limit, self.max_hard_limit_multiple) catch std.math.maxInt(u64);
+        return own_need > sole_owner_limit;
     }
 
     /// Distinguish a new admission failure from backing-allocator resize or
@@ -3528,6 +3920,12 @@ pub const BudgetedAllocator = struct {
         const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
         self.reservation.shrink(bytes);
         return bytes;
+    }
+
+    pub fn releaseUnusedCreditThreadSafe(self: *BudgetedAllocator) u64 {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.releaseUnusedCredit();
     }
 
     fn recordDenial(self: *BudgetedAllocator) void {
@@ -3625,7 +4023,10 @@ pub const BudgetedAllocator = struct {
     ) bool {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return false;
+        if (growth > 0 and !self.reserveGrowth(growth)) {
+            self.recordAllocationFailure(.admission, growth, ret_addr);
+            return false;
+        }
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
             if (growth > 0) self.releaseBytes(growth);
             return false;
@@ -3643,7 +4044,10 @@ pub const BudgetedAllocator = struct {
     ) ?[*]u8 {
         const self: *BudgetedAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return null;
+        if (growth > 0 and !self.reserveGrowth(growth)) {
+            self.recordAllocationFailure(.admission, growth, ret_addr);
+            return null;
+        }
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
             if (growth > 0) self.releaseBytes(growth);
             return null;
@@ -3677,7 +4081,7 @@ test "durable admission capacity honors both node and slice limits" {
 test "source vector payloads scratch admission accounts credits and records denial cause" {
     const alloc = std.testing.allocator;
     var budgets = Options.defaultBudgets();
-    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
+    budgets[@backingInt(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
     var manager = ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
@@ -3701,10 +4105,46 @@ test "source vector payloads scratch admission accounts credits and records deni
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_source_payload_state).used_bytes);
 }
 
+test "budgeted allocator denial separates slice contention from own oversize demand" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@backingInt(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 4096 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+
+    var other = try manager.reserve(.document_extraction_working_set, 3900);
+    var contended = BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1);
+    defer contended.deinit();
+    try std.testing.expectError(error.OutOfMemory, contended.threadSafeAllocator().alloc(u8, 512));
+    try std.testing.expect(contended.denied());
+    try std.testing.expect(!contended.deniedByOwnDemand());
+    other.release();
+
+    var oversized = BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1);
+    defer oversized.deinit();
+    try std.testing.expectError(error.OutOfMemory, oversized.threadSafeAllocator().alloc(u8, 4097));
+    try std.testing.expect(oversized.denied());
+    try std.testing.expect(oversized.deniedByOwnDemand());
+}
+
+test "budgeted allocator denial over the node memory limit is own demand" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@backingInt(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
+    var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(alloc);
+
+    var budgeted = BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1);
+    defer budgeted.deinit();
+    try std.testing.expectError(error.OutOfMemory, budgeted.threadSafeAllocator().alloc(u8, 150));
+    try std.testing.expect(budgeted.denied());
+    try std.testing.expect(budgeted.deniedByOwnDemand());
+}
+
 test "default tokenizer cache budget is aligned with its resource slice" {
     const budgets = Options.defaultBudgets();
     const policies = Options.defaultPolicies();
-    const tokenizer_idx = @intFromEnum(Slice.inference_tokenizer_cache);
+    const tokenizer_idx = @backingInt(Slice.inference_tokenizer_cache);
     try std.testing.expectEqual(
         @as(u64, 64 * 1024 * 1024),
         budgets[tokenizer_idx].soft_limit_bytes,
@@ -3726,7 +4166,7 @@ test "default tokenizer cache budget is aligned with its resource slice" {
 test "default lake range cache queue budget is aligned with its terminal resource slice" {
     const budgets = Options.defaultBudgets();
     const policies = Options.defaultPolicies();
-    const index = @intFromEnum(Slice.lake_range_cache_queue);
+    const index = @backingInt(Slice.lake_range_cache_queue);
     try std.testing.expectEqual(slice_count - 1, index);
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
@@ -3784,10 +4224,10 @@ test "manager teardown retires live observer snapshots" {
 }
 
 fn sliceIndex(slice: Slice) usize {
-    return @intFromEnum(slice);
+    return @backingInt(slice);
 }
 
-fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
+pub fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
     if (budget.hard_limit_bytes > 0 and used_bytes > budget.hard_limit_bytes) return .hard;
     if (budget.soft_limit_bytes > 0 and used_bytes > budget.soft_limit_bytes) return .soft;
     return .normal;
@@ -4834,7 +5274,7 @@ test "adaptive HBC benefit retains miss cost through all-hit samples" {
         .{ .hits = 8, .misses = 8, .miss_service_ns = 80_000, .resident_bytes = 4096 },
         .{},
     });
-    const before = manager.hbc_cache_benefit[@intFromEnum(HbcCacheClass.vector)].score;
+    const before = manager.hbc_cache_benefit[@backingInt(HbcCacheClass.vector)].score;
     try std.testing.expect(before > 0);
 
     manager.observeHbcCacheBenefitSampled(.{
@@ -4843,7 +5283,7 @@ test "adaptive HBC benefit retains miss cost through all-hit samples" {
         .{ .hits = 16, .resident_bytes = 4096 },
         .{},
     });
-    const after = manager.hbc_cache_benefit[@intFromEnum(HbcCacheClass.vector)].score;
+    const after = manager.hbc_cache_benefit[@backingInt(HbcCacheClass.vector)].score;
     try std.testing.expect(after >= before);
 }
 
@@ -5126,7 +5566,7 @@ test "resource manager grows reclaimer registry beyond 128 owners" {
 
     var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
     defer manager.deinit(std.testing.allocator);
-    var contexts = [_]PassiveContext{.{}} ** owner_count;
+    var contexts = @as([owner_count]PassiveContext, @splat(.{}));
     var identities: [owner_count]u64 = undefined;
     for (&contexts, 0..) |*context, index| {
         identities[index] = try manager.registerReclaimer(
@@ -5593,4 +6033,254 @@ test "resource manager records index repair activation pause separately from cle
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.last_pause_ns);
     try std.testing.expectEqual(@as(u64, 30 * std.time.ns_per_ms), stats.max_pause_ns);
     try std.testing.expectEqual(@as(u64, 25 * std.time.ns_per_ms), stats.last_budget_ns);
+}
+
+const test_owner_a: ReplayOwnerId = 0x1001;
+const test_owner_b: ReplayOwnerId = 0x2002;
+
+test "resource manager escalates replay-document-not-visible only after bounded retries on one window" {
+    var manager = ResourceManager.init(.{});
+
+    var attempt: u64 = 0;
+    while (attempt < replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
+    }
+    // One more consecutive failure on the SAME (owner, index, sequence)
+    // window finally escalates -- this is the bounded backstop for issue
+    // #938's whole class of bug: a document that will never gain visible
+    // content must not wedge the replay worker (and anything waiting for
+    // it to drain, like Lite's run_until_idle()) forever.
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
+
+    // A different sequence is a different window: it starts back at zero.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 8));
+
+    // A different index on the same owner is tracked independently too.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "other_index", 7));
+}
+
+test "resource manager clears replay-document-not-visible escalation once a window succeeds" {
+    var manager = ResourceManager.init(.{});
+
+    var attempt: u64 = 0;
+    while (attempt <= replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        _ = manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7);
+    }
+    manager.clearReplayDocumentNotVisibleEscalation(test_owner_a, "full_text_index_v0", 7);
+
+    // A later stall that happens to land on the same window starts counting
+    // from zero again instead of escalating immediately.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
+}
+
+test "resource manager tracks replay-document-not-visible escalation independently per index" {
+    var manager = ResourceManager.init(.{});
+
+    // Drive two different indexes' windows (same owner) in lockstep.
+    // Per-index tracking means interleaving one index's failures must not
+    // reset or otherwise perturb the other's count.
+    var attempt: u64 = 0;
+    while (attempt < replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "index_a", 1));
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "index_b", 1));
+    }
+    // Both failed exactly as many times, so both cross their threshold on
+    // the same next attempt -- neither is ahead of or behind the other.
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "index_a", 1));
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "index_b", 1));
+}
+
+// PR #957 review on the #938 escalation commit: two storage owners
+// (table/shard replicas) commonly have same-named indexes -- the default
+// `full_text_index_v0` is the common case -- and this ResourceManager is
+// shared process-wide across every owner. Keying the tracker by index name
+// alone let two such owners alternately reset each other's count (neither
+// ever escalated) or, when their sequences happened to coincide, combine
+// into one count. Both must now be impossible.
+
+test "resource manager escalates two owners with the same index name independently when they alternate failures" {
+    var manager = ResourceManager.init(.{});
+
+    // Alternate failures between two owners that both have an index named
+    // "full_text_index_v0", at DIFFERENT sequences, mirroring the reviewer's
+    // tracker-level repro (ten alternating failures per owner at a limit of
+    // two). Before the fix this reset each owner's count on every turn, so
+    // neither ever escalated no matter how many rounds ran.
+    var round: u64 = 0;
+    while (round < replay_document_not_visible_default_max_retries) : (round += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 100));
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_b, "full_text_index_v0", 200));
+    }
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 100));
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_b, "full_text_index_v0", 200));
+}
+
+test "resource manager does not combine two owners' attempts when their sequences coincide" {
+    var manager = ResourceManager.init(.{});
+
+    // Two owners, same index name, same sequence number by coincidence
+    // (sequence counters are per owner, not global). Owner A alone drives
+    // all the way to its threshold; owner B must not have inherited any of
+    // owner A's progress just because the (index, sequence) pair matched.
+    var attempt: u64 = 0;
+    while (attempt < replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 42));
+    }
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 42));
+
+    // Owner B's first-ever attempt at the identical (index, sequence) pair
+    // starts from zero, not from owner A's already-escalated count.
+    try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_b, "full_text_index_v0", 42));
+}
+
+test "resource manager records and snapshots replay-document-not-visible skips per owner and index" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+
+    manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, "full_text_index_v0");
+    manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, "full_text_index_v0");
+    manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, "other_index");
+    // owner_b has an index of the SAME name as owner_a's; its count must
+    // stay distinct per-owner but fold into the same /metrics label.
+    manager.recordReplayDocumentNotVisibleSkipped(test_owner_b, "full_text_index_v0");
+
+    // A skipped document is not silently lost: it is counted per owner and
+    // index...
+    try std.testing.expectEqual(@as(u64, 2), manager.replayDocumentNotVisibleSkippedTotal(test_owner_a, "full_text_index_v0"));
+    try std.testing.expectEqual(@as(u64, 1), manager.replayDocumentNotVisibleSkippedTotal(test_owner_a, "other_index"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal(test_owner_a, "never_skipped"));
+    try std.testing.expectEqual(@as(u64, 1), manager.replayDocumentNotVisibleSkippedTotal(test_owner_b, "full_text_index_v0"));
+    // ...and summed for the single process-wide /metrics counter.
+    try std.testing.expectEqual(@as(u64, 4), manager.replayDocumentNotVisibleSkippedTotalAll());
+
+    const snapshot = try manager.snapshotReplayDocumentNotVisibleSkipped(std.testing.allocator);
+    defer {
+        for (snapshot) |entry| std.testing.allocator.free(entry.index_name);
+        std.testing.allocator.free(snapshot);
+    }
+    // owner_a's and owner_b's "full_text_index_v0" counts fold into one
+    // labeled /metrics sample (owner identity is not a meaningful label).
+    try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+    var saw_full_text = false;
+    var saw_other = false;
+    for (snapshot) |entry| {
+        if (std.mem.eql(u8, entry.index_name, "full_text_index_v0")) {
+            try std.testing.expectEqual(@as(u64, 3), entry.count);
+            saw_full_text = true;
+        } else if (std.mem.eql(u8, entry.index_name, "other_index")) {
+            try std.testing.expectEqual(@as(u64, 1), entry.count);
+            saw_other = true;
+        }
+    }
+    try std.testing.expect(saw_full_text);
+    try std.testing.expect(saw_other);
+}
+
+test "resource manager forgets an owner's replay-document-not-visible state when it is removed" {
+    var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+
+    manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, "full_text_index_v0");
+    _ = manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7);
+    try std.testing.expectEqual(@as(u64, 1), manager.replayDocumentNotVisibleSkippedTotal(test_owner_a, "full_text_index_v0"));
+
+    // Closing the owner (its IndexManager/DB) must drop every window and
+    // skip count it ever accumulated -- otherwise this process-wide tracker
+    // grows without bound across repeated DB/table open-close churn.
+    manager.removeReplayNotVisibleOwner(test_owner_a);
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotal(test_owner_a, "full_text_index_v0"));
+    try std.testing.expectEqual(@as(u64, 0), manager.replayDocumentNotVisibleSkippedTotalAll());
+
+    // A later owner that happens to reuse the same ReplayOwnerId (e.g. an
+    // allocator reusing a freed IndexManager's address) starts completely
+    // fresh, never inheriting the removed owner's retry count.
+    var attempt: u64 = 0;
+    while (attempt < replay_document_not_visible_default_max_retries) : (attempt += 1) {
+        try std.testing.expect(!manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
+    }
+    try std.testing.expect(manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "full_text_index_v0", 7));
+}
+
+test "resource manager replay skip snapshots clean up every allocation failure" {
+    const Case = struct {
+        fn validate(snapshot: []const IndexReplayDocumentNotVisibleSkipped, index_count: usize) !void {
+            try std.testing.expectEqual(index_count, snapshot.len);
+            var seen = @as([17]bool, @splat(false));
+            for (snapshot) |entry| {
+                try std.testing.expect(std.mem.startsWith(u8, entry.index_name, "index_"));
+                const index = try std.fmt.parseUnsigned(usize, entry.index_name[6..], 10);
+                try std.testing.expect(index < index_count);
+                try std.testing.expect(!seen[index]);
+                seen[index] = true;
+                try std.testing.expectEqual(@as(u64, 3), entry.count);
+            }
+        }
+
+        fn run(alloc: std.mem.Allocator, index_count: usize) !void {
+            // Populate the tracker independently of the failing snapshot
+            // allocator, so every injected failure exercises snapshot cleanup.
+            var manager = ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            defer manager.deinit(std.testing.allocator);
+            for (0..index_count) |i| {
+                var buf: [32]u8 = undefined;
+                const name = try std.fmt.bufPrint(&buf, "index_{d}", .{i});
+                manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, name);
+                manager.recordReplayDocumentNotVisibleSkipped(test_owner_a, name);
+                manager.recordReplayDocumentNotVisibleSkipped(test_owner_b, name);
+            }
+            // A tracked retry without a skip must not appear in the snapshot.
+            _ = manager.shouldEscalateReplayDocumentNotVisible(test_owner_a, "unskipped", 7);
+
+            const snapshot = manager.snapshotReplayDocumentNotVisibleSkipped(alloc) catch |err| {
+                // Failure cannot consume tracker state or prevent a later
+                // metrics scrape from recovering the same aggregate counts.
+                try std.testing.expectEqual(@as(u64, @intCast(index_count * 3)), manager.replayDocumentNotVisibleSkippedTotalAll());
+                const recovered = try manager.snapshotReplayDocumentNotVisibleSkipped(std.testing.allocator);
+                defer {
+                    for (recovered) |entry| std.testing.allocator.free(entry.index_name);
+                    std.testing.allocator.free(recovered);
+                }
+                try validate(recovered, index_count);
+                return err;
+            };
+            defer {
+                for (snapshot) |entry| alloc.free(entry.index_name);
+                alloc.free(snapshot);
+            }
+            try validate(snapshot, index_count);
+            try std.testing.expectEqual(@as(u64, @intCast(index_count * 3)), manager.replayDocumentNotVisibleSkippedTotalAll());
+        }
+    };
+    // Cover empty output, the original single-entry leak, map growth, and
+    // cleanup after any prefix of successfully copied names.
+    for ([_]usize{ 0, 1, 17 }) |index_count| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{index_count});
+    }
+}
+
+test "source vector payloads scoped allocator receipts distinguish admission and backing across shared failures" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
+    defer budget.deinit();
+    var first: BudgetedAllocator.FailureTrackingAllocator = .{ .owner = &budget };
+    var second: BudgetedAllocator.FailureTrackingAllocator = .{ .owner = &budget };
+    var held = try manager.reserve(.dense_source_payload_state, 64);
+    defer held.release();
+    try std.testing.expectError(error.OutOfMemory, first.allocator().alloc(u8, 1));
+    try std.testing.expect(first.last_failure == .admission);
+    held.release();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    budget.backing = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, second.allocator().alloc(u8, 1));
+    try std.testing.expect(second.last_failure == .backing);
+    try std.testing.expect(first.last_failure == .admission);
+    budget.backing = alloc;
+    const memory = try first.allocator().alloc(u8, 1);
+    // Allocations and frees are interchangeable with the original allocator.
+    budget.threadSafeAllocator().free(memory);
+    try std.testing.expect(first.last_failure == null);
 }

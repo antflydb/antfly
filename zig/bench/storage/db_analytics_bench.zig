@@ -27,14 +27,12 @@ const algebraic_namespace_prefix = "\x00\x00__algebraic__:";
 const AlgebraicBackendKind = enum {
     all,
     mem,
-    lmdb,
     lsm,
 
     fn label(self: AlgebraicBackendKind) []const u8 {
         return switch (self) {
             .all => "all",
             .mem => "mem",
-            .lmdb => "lmdb",
             .lsm => "lsm",
         };
     }
@@ -82,7 +80,7 @@ const Dataset = struct {
     doc_json_bytes: usize,
     derived_json_bytes: usize,
 
-    fn deinit(self: *Dataset, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Dataset, alloc: std.mem.Allocator) void {
         for (self.hits) |hit| {
             alloc.free(hit.id);
             if (hit.stored_data) |stored| alloc.free(stored);
@@ -122,7 +120,7 @@ const SidecarStats = struct {
     value_bytes: usize = 0,
     kinds: []SidecarKindStats = &.{},
 
-    fn deinit(self: *SidecarStats, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SidecarStats, alloc: std.mem.Allocator) void {
         for (self.kinds) |kind| alloc.free(kind.kind);
         if (self.kinds.len > 0) alloc.free(self.kinds);
         self.* = undefined;
@@ -163,10 +161,6 @@ const AlgebraicBackend = union(enum) {
     mem: struct {
         backend: antfly.mem_backend.Backend,
     },
-    lmdb: struct {
-        backend: antfly.lmdb_backend.Backend,
-        path: []u8,
-    },
     lsm: struct {
         backend: antfly.lsm_backend.Backend,
         path: []u8,
@@ -175,7 +169,6 @@ const AlgebraicBackend = union(enum) {
     fn runtimeStore(self: *AlgebraicBackend, alloc: std.mem.Allocator) !antfly.storage_backend_erased.Store {
         return switch (self.*) {
             .mem => |*opened| try opened.backend.runtimeStore(alloc, .{}),
-            .lmdb => |*opened| try opened.backend.runtimeStore(alloc, .{}),
             .lsm => |*opened| try opened.backend.runtimeStore(alloc, .{}),
         };
     }
@@ -183,14 +176,13 @@ const AlgebraicBackend = union(enum) {
     fn path(self: *const AlgebraicBackend) ?[]const u8 {
         return switch (self.*) {
             .mem => null,
-            .lmdb => |*opened| opened.path,
             .lsm => |*opened| opened.path,
         };
     }
 
     fn lsmWriteStats(self: *const AlgebraicBackend) antfly.lsm_backend.Backend.WriteStats {
         return switch (self.*) {
-            .mem, .lmdb => .{},
+            .mem => .{},
             .lsm => |*opened| opened.backend.snapshotWriteStats(),
         };
     }
@@ -198,11 +190,6 @@ const AlgebraicBackend = union(enum) {
     fn close(self: *AlgebraicBackend, io: std.Io, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .mem => |*opened| opened.backend.close(),
-            .lmdb => |*opened| {
-                opened.backend.close();
-                cleanupTempPath(io, opened.path);
-                alloc.free(opened.path);
-            },
             .lsm => |*opened| {
                 opened.backend.close();
                 cleanupTempPath(io, opened.path);
@@ -215,10 +202,6 @@ const AlgebraicBackend = union(enum) {
     fn closeKeepPath(self: *AlgebraicBackend, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .mem => |*opened| opened.backend.close(),
-            .lmdb => |*opened| {
-                opened.backend.close();
-                alloc.free(opened.path);
-            },
             .lsm => |*opened| {
                 opened.backend.close();
                 alloc.free(opened.path);
@@ -558,7 +541,7 @@ pub fn run(init: std.process.Init, args: *std.process.Args.Iterator) !void {
     const cfg = try parseArgs(args);
 
     if (cfg.algebraic_backend == .all) {
-        const backends = [_]AlgebraicBackendKind{ .mem, .lmdb, .lsm };
+        const backends = [_]AlgebraicBackendKind{ .mem, .lsm };
         for (backends) |backend| {
             var next = cfg;
             next.algebraic_backend = backend;
@@ -1420,12 +1403,10 @@ fn runBackendTuningCases(io: std.Io, alloc: std.mem.Allocator, cfg: Config) !voi
         standard_join_query: bool = true,
     }{
         .{ .case_name = "backend_tuning", .name = "normal", .backend = .mem, .bulk = false, .compact = false },
-        .{ .case_name = "backend_tuning", .name = "normal", .backend = .lmdb, .bulk = false, .compact = false },
         .{ .case_name = "backend_tuning", .name = "normal", .backend = .lsm, .bulk = false, .compact = false },
         .{ .case_name = "backend_tuning", .name = "bulk_flush", .backend = .lsm, .bulk = true, .compact = false },
         .{ .case_name = "backend_tuning", .name = "bulk_compact", .backend = .lsm, .bulk = true, .compact = true },
         .{ .case_name = "backend_tuning_direct", .name = "direct_normal", .backend = .mem, .bulk = false, .compact = false, .config_json = algebraic_direct_config, .standard_join_query = false },
-        .{ .case_name = "backend_tuning_direct", .name = "direct_normal", .backend = .lmdb, .bulk = false, .compact = false, .config_json = algebraic_direct_config, .standard_join_query = false },
         .{ .case_name = "backend_tuning_direct", .name = "direct_normal", .backend = .lsm, .bulk = false, .compact = false, .config_json = algebraic_direct_config, .standard_join_query = false },
         .{ .case_name = "backend_tuning_direct", .name = "direct_bulk_flush", .backend = .lsm, .bulk = true, .compact = false, .config_json = algebraic_direct_config, .standard_join_query = false },
         .{ .case_name = "backend_tuning_direct", .name = "direct_bulk_compact", .backend = .lsm, .bulk = true, .compact = true, .config_json = algebraic_direct_config, .standard_join_query = false },
@@ -1680,23 +1661,6 @@ fn openAlgebraicBackend(
         .mem => .{ .mem = .{
             .backend = antfly.mem_backend.Backend.init(alloc, .{}),
         } },
-        .lmdb => blk: {
-            const path = if (existing_path) |path|
-                try alloc.dupe(u8, path)
-            else
-                try std.fmt.allocPrint(alloc, "/tmp/antfly-algebraic-lmdb-{d}", .{nowNs()});
-            errdefer alloc.free(path);
-            const path_z = try alloc.dupeZ(u8, path);
-            defer alloc.free(path_z);
-            const backend = try antfly.lmdb_backend.Backend.open(alloc, path_z.ptr, .{
-                .backend = .{ .create_if_missing = true },
-                .env = .{ .map_size = algebraicLmdbMapSize() },
-            });
-            break :blk .{ .lmdb = .{
-                .backend = backend,
-                .path = path,
-            } };
-        },
         .lsm => blk: {
             const path = if (existing_path) |path|
                 try alloc.dupe(u8, path)
@@ -1901,7 +1865,6 @@ fn parseArgs(args: *std.process.Args.Iterator) !Config {
 fn parseAlgebraicBackend(raw: []const u8) !AlgebraicBackendKind {
     if (std.mem.eql(u8, raw, "all")) return .all;
     if (std.mem.eql(u8, raw, "mem")) return .mem;
-    if (std.mem.eql(u8, raw, "lmdb")) return .lmdb;
     if (std.mem.eql(u8, raw, "lsm")) return .lsm;
     std.debug.print("invalid --algebraic-backend: {s}\n", .{raw});
     return error.InvalidArgument;

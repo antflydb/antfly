@@ -29,7 +29,8 @@ pub fn ApiResponse(comptime T: type) type {
             if (resp.ok()) {
                 if (resp.status.code == 204 or resp.status.code == 205) return .{ .status_code = resp.status.code, .allocator = allocator };
                 if (resp.body) |body| {
-                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true }) catch |err| {
+                    const parse_result = if (comptime @typeInfo(T) == .@"union" and @hasDecl(T, "parseResponse")) T.parseResponse(allocator, resp.status.code, body) else std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+                    const parsed = parse_result catch |err| {
                         return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidApiResponse;
                     };
                     return .{ .status_code = resp.status.code, .data = parsed, .allocator = allocator };
@@ -124,6 +125,17 @@ pub const Client = struct {
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.ChunkResponse).fromResponse(self.allocator, &resp);
+    }
+
+    /// Answer named choice, ordinal score, and Boolean questions
+    /// POST /decide
+    pub fn decide(self: *@This(), body: types.DecideRequest) !ApiResponse(types.DecideResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/decide", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.DecideResponse).fromResponse(self.allocator, &resp);
     }
 
     /// Dictate speech into clean written text
@@ -242,25 +254,10 @@ pub const Client = struct {
         return ApiResponse(types.ReadResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Rerank prompts by relevance
+    /// Rerank documents by relevance
     /// POST /rerank
-    pub fn rerankPrompts(self: *@This(), body: types.RerankRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
+    pub fn rerankDocuments(self: *@This(), body: types.RerankRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank", .{self.base_url});
-        defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
-        defer self.allocator.free(json_body);
-        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
-        defer request_headers.deinit(self.allocator);
-        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
-        if (accept) |value| try request_headers.append(self.allocator, .{ "Accept", value });
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
-        return ApiResponse(types.RerankResponse).fromNegotiatedResponse(self.allocator, &resp);
-    }
-
-    /// Rerank multimodal documents by relevance
-    /// POST /rerank_multimodal
-    pub fn rerankMultimodalPrompts(self: *@This(), body: types.RerankMultimodalRequest, accept: ?[]const u8) !ApiResponse(types.RerankResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/rerank_multimodal", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);

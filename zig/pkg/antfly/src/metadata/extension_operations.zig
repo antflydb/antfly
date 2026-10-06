@@ -89,7 +89,7 @@ test "metadata extension operations stop canceled requests before mutation" {
         fn unsupportedConfigure(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: extension_domain.ConfigureExtensionRequest) !extension_domain.InstalledExtension {
             return error.UnsupportedOperation;
         }
-        fn restore(ptr: *anyopaque, _: std.mem.Allocator, _: []const extension_domain.InstalledExtension, _: []const extension_domain.ExtensionMember, _: []const extension_domain.ExtensionDependency) !void {
+        pub fn restore(ptr: *anyopaque, _: std.mem.Allocator, _: []const extension_domain.InstalledExtension, _: []const extension_domain.ExtensionMember, _: []const extension_domain.ExtensionDependency) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
         }

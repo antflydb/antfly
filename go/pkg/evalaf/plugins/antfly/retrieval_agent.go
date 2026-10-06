@@ -2,6 +2,7 @@ package antflyevalaf
 
 import (
 	"github.com/antflydb/antfly/go/pkg/evalaf/agent"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 )
 
 // NewRetrievalAgentClassificationEvaluator creates a classification evaluator for Antfly's Retrieval Agent.
@@ -25,13 +26,15 @@ func NewRetrievalAgentConfidenceEvaluator(name string, minConfidence float64) *a
 	return agent.NewConfidenceEvaluator(name, minConfidence)
 }
 
-// RetrievalAgentResponse represents the structured response from Antfly's Retrieval Agent.
+// RetrievalAgentResponse represents the structured response from Antfly's Retrieval Agent,
+// mirroring the subset of RetrievalAgentResult (specs/openapi/antfly/metadata.yaml) that
+// evaluators care about. Route type, improved/semantic query, confidence, and reasoning
+// live under Classification, which is only populated when steps.classification was
+// configured on the request.
 type RetrievalAgentResponse struct {
-	RouteType         string   `json:"route_type"`                    // "question" or "search"
-	ImprovedQuery     string   `json:"improved_query"`                // Improved version of query
-	SemanticQuery     string   `json:"semantic_query"`                // Query optimized for semantic search
-	Confidence        float64  `json:"confidence"`                    // Confidence score (0-1)
-	Generation        string   `json:"generation,omitempty"`          // Generated answer (for questions)
-	Reasoning         string   `json:"reasoning,omitempty"`           // Reasoning (if enabled)
-	FollowUpQuestions []string `json:"follow_up_questions,omitempty"` // Follow-up questions
+	Classification       *antfly.ClassificationTransformationResult `json:"classification,omitempty"`
+	Generation           string                                     `json:"generation,omitempty"`            // Generated answer, present when steps.generation was configured
+	GenerationConfidence float64                                    `json:"generation_confidence,omitempty"` // Requires steps.confidence
+	ContextRelevance     float64                                    `json:"context_relevance,omitempty"`     // Requires steps.confidence
+	FollowupQuestions    []string                                   `json:"followup_questions,omitempty"`    // Requires steps.followup
 }

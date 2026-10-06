@@ -32,7 +32,7 @@ const Storage = struct {
         return .{ .allocator = allocator, .arena = arena };
     }
 
-    fn deinit(self: *Storage) void {
+    pub fn deinit(self: *Storage) void {
         self.arena.deinit();
         self.allocator.destroy(self.arena);
         self.* = undefined;

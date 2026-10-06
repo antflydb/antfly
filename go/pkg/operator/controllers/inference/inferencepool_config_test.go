@@ -21,6 +21,7 @@ import (
 	"time"
 
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -87,6 +88,47 @@ func TestGenerateCompleteConfigBuildsEagerPreloadArtifactSelection(t *testing.T)
 	g.Expect(config.Preload[0]).NotTo(HaveKey("backend"))
 	g.Expect(config.Preload[0]).To(HaveKeyWithValue("format", "gguf"))
 	g.Expect(config.Preload[0]).To(HaveKeyWithValue("quantization", "Q4_K"))
+}
+
+// TestGenerateCompleteConfigOrdersPreloadByPriority verifies ModelSpec.Priority
+// controls the emitted config.preload order: the Zig runtime
+// (server.Node.warmConfiguredModels) warms config.preload sequentially in
+// list order, so high-priority models must be emitted before medium, which
+// must be emitted before low, regardless of spec.models.preload declaration
+// order. Same-priority models keep their declaration order.
+func TestGenerateCompleteConfigOrdersPreloadByPriority(t *testing.T) {
+	g := NewWithT(t)
+	pool := &antflyaiv1alpha1.InferencePool{
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Models: antflyaiv1alpha1.ModelConfig{
+				Preload: []antflyaiv1alpha1.ModelSpec{
+					{Name: "hf:owner/low-a:gguf", Tasks: []string{"embed"}, Priority: antflyaiv1alpha1.ModelPriorityLow},
+					{Name: "hf:owner/medium:gguf", Tasks: []string{"embed"}},
+					{Name: "hf:owner/high-a:gguf", Tasks: []string{"embed"}, Priority: antflyaiv1alpha1.ModelPriorityHigh},
+					{Name: "hf:owner/low-b:gguf", Tasks: []string{"embed"}, Priority: antflyaiv1alpha1.ModelPriorityLow},
+					{Name: "hf:owner/high-b:gguf", Tasks: []string{"embed"}, Priority: antflyaiv1alpha1.ModelPriorityHigh},
+				},
+				LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
+			},
+		},
+	}
+
+	raw, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	var config struct {
+		Preload []map[string]any `json:"preload"`
+	}
+	g.Expect(json.Unmarshal([]byte(raw), &config)).To(Succeed())
+	g.Expect(config.Preload).To(HaveLen(5))
+	names := make([]string, len(config.Preload))
+	for i, entry := range config.Preload {
+		names[i] = entry["name"].(string)
+	}
+	g.Expect(names).To(Equal([]string{
+		"owner/high-a:gguf", "owner/high-b:gguf",
+		"owner/medium:gguf",
+		"owner/low-a:gguf", "owner/low-b:gguf",
+	}))
 }
 
 func TestGenerateCompleteConfigPreservesExplicitRuntimeOverrides(t *testing.T) {
@@ -314,4 +356,67 @@ func TestInferenceWarmModelNamePreservesVariant(t *testing.T) {
 	g.Expect(inferenceWarmModelName("hf:owner/model:i8")).To(Equal("owner/model:i8"))
 	g.Expect(inferenceWarmModelName("owner/model")).To(Equal("owner/model"))
 	g.Expect(inferenceWarmModelName("s3://bucket/model")).To(Equal("s3://bucket/model"))
+}
+
+// TestProcessMemoryBudgetMB covers the ANTFLY_PROCESS_MEMORY_BUDGET_MB
+// derivation: 90% of an explicit memory limit, in MiB, and no budget when no
+// limit is set (an unbounded/"max" cgroup gives nothing safe to derive from).
+func TestProcessMemoryBudgetMB(t *testing.T) {
+	g := NewWithT(t)
+
+	budget, ok := processMemoryBudgetMB(corev1.ResourceList{
+		corev1.ResourceMemory: resource.MustParse("8Gi"),
+	})
+	g.Expect(ok).To(BeTrue())
+	g.Expect(budget).To(Equal(int64(7372)))
+
+	_, ok = processMemoryBudgetMB(nil)
+	g.Expect(ok).To(BeFalse())
+
+	_, ok = processMemoryBudgetMB(corev1.ResourceList{
+		corev1.ResourceCPU: resource.MustParse("2"),
+	})
+	g.Expect(ok).To(BeFalse())
+}
+
+// TestReconcileStatefulSetSetsProcessMemoryBudget verifies the InferencePool
+// pod gets ANTFLY_PROCESS_MEMORY_BUDGET_MB set below its container memory
+// limit. buildResources defaults to a 4Gi/8Gi request/limit split (Burstable
+// QoS), so this applies even without spec.resources set. See
+// zig/MANAGERS.md "Budget derivation".
+func TestReconcileStatefulSetSetsProcessMemoryBudget(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	s := newInferenceUnitTestScheme(g)
+	pool := &antflyaiv1alpha1.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{Name: "budget-pool", Namespace: "default", UID: types.UID("budget-pool")},
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Models: antflyaiv1alpha1.ModelConfig{Preload: []antflyaiv1alpha1.ModelSpec{{Name: "test-model", Tasks: []string{"embed"}}}},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(pool).Build()
+	reconciler := &InferencePoolReconciler{Client: client, Scheme: s, AntflyImage: "ghcr.io/antflydb/antfly:zig-test"}
+
+	g.Expect(reconciler.reconcileConfigMap(ctx, pool)).To(Succeed())
+	g.Expect(reconciler.reconcileStatefulSet(ctx, pool)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(ctx, types.NamespacedName{Name: pool.Name, Namespace: pool.Namespace}, sts)).To(Succeed())
+	var container corev1.Container
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name == "inference" {
+			container = c
+		}
+	}
+	g.Expect(container.Name).To(Equal("inference"))
+	var budgetValue string
+	var found bool
+	for _, env := range container.Env {
+		if env.Name == antflyProcessMemoryBudgetEnvVar {
+			found = true
+			budgetValue = env.Value
+		}
+	}
+	g.Expect(found).To(BeTrue(), "expected %s to be set", antflyProcessMemoryBudgetEnvVar)
+	g.Expect(budgetValue).To(Equal("7372")) // 90% of the default 8Gi limit, in MiB
 }

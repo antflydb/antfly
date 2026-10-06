@@ -24,14 +24,20 @@ class RunTestPartitionsTest(unittest.TestCase):
             Path("test-binary"),
             ["db restore", "db dense"],
             ["simulation", "release scale"],
-            ["--seed=123", "--skip-test-filter", "caller skip"],
+            [
+                "--seed=123",
+                "--skip-test-filter",
+                "caller skip",
+                "--test-filter",
+                "requested case",
+            ],
         )
         self.assertEqual(
             [
                 "test-binary",
-                "--test-filter",
+                "--suite-filter",
                 "db restore",
-                "--test-filter",
+                "--suite-filter",
                 "db dense",
                 "--skip-test-filter",
                 "simulation",
@@ -40,13 +46,15 @@ class RunTestPartitionsTest(unittest.TestCase):
                 "--seed=123",
                 "--skip-test-filter",
                 "caller skip",
+                "--test-filter",
+                "requested case",
             ],
             partition,
         )
         self.assertEqual(
             [
                 "test-binary",
-                "--test-filter",
+                "--suite-filter",
                 "storage.",
                 "--skip-test-filter",
                 "simulation",
@@ -59,6 +67,8 @@ class RunTestPartitionsTest(unittest.TestCase):
                 "--seed=123",
                 "--skip-test-filter",
                 "caller skip",
+                "--test-filter",
+                "requested case",
             ],
             complement,
         )

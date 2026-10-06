@@ -2,7 +2,7 @@
 // Browser bundle inspection is independent of the inference implementation.
 const decoder = new TextDecoder('utf-8', { fatal: true });
 export const LIMITS = Object.freeze({ file: 1024 ** 3, bundle: 1536 * 1024 ** 2, header: 16 * 1024 ** 2, tensor: 512 * 1024 ** 2, text: 256 * 1024, schema: 64 * 1024 });
-const blockTypes = new Map([[0, [1, 4]], [1, [1, 2]], [2, [32, 18]], [8, [32, 34]], [12, [256, 144]]]);
+const blockTypes = new Map([[0, [1, 4]], [1, [1, 2]], [2, [32, 18]], [8, [32, 34]], [12, [256, 144]], [30, [1, 2]]]);
 function integer(n, max = Number.MAX_SAFE_INTEGER) {
   if (!Number.isSafeInteger(n) || n < 0 || n > max) throw new Error('Invalid or oversized bundle integer');
   return n;
@@ -55,7 +55,7 @@ export async function inspectBundle(input, precision) {
     laya.mask_token = typeof mask === 'string' ? mask : mask.content;
     config = { ...config, laya };
   }
-  const isLaya = config.model_type === 'modernbert' && config.laya && typeof config.laya === 'object';
+  const isLaya = ['modernbert', 'modern_bert'].includes(config.model_type) && config.laya && typeof config.laya === 'object';
   if (isLaya) {
     for (const key of ['attention_bias', 'mlp_bias', 'norm_bias']) if (config[key]) throw new Error(`Unsupported Laya encoder: ${key}`);
     for (const [kind, key] of [['full_attention', 'global_rope_theta'], ['sliding_attention', 'local_rope_theta']]) {
@@ -69,7 +69,8 @@ export async function inspectBundle(input, precision) {
   const encoderConfig = isLaya ? config : await readJson(files, 'encoder_config/config.json');
   await readJson(files, 'tokenizer_config.json');
   if (!files.has('tokenizer.json') || files.get('tokenizer.json').size > 32 * 1024 ** 2) throw new Error('Missing or oversized tokenizer.json');
-  const architecture = isLaya ? 'laya' : config.architecture === 'boundary' ? 'boundary' : config.model_type === 'extractor' && !config.boundary_head && (!config.config_version || config.config_version < 3) ? 'span' : null;
+  const isDecide = config.model_type === 'extractor' && !config.boundary_head && config.architecture === 'span' && config.config_version === 3 && config.architecture_version === 1 && config.span_head?.span_mode === 'markerV0';
+  const architecture = isLaya ? 'laya' : config.architecture === 'boundary' ? 'boundary' : isDecide ? 'decide' : config.model_type === 'extractor' && !config.boundary_head && (!config.config_version || config.config_version < 3) ? 'span' : null;
   if (!architecture) throw new Error('Unsupported extraction architecture');
   const variants = [...files.keys()].filter(p => /(^|\/)model\.gguf$/.test(p) || /(^|\/)encoder_model\.gguf$/.test(p));
   let weights;
@@ -84,20 +85,28 @@ export async function inspectBundle(input, precision) {
     const candidates = precision ? encoders.filter(p => p.toLowerCase().replaceAll('-', '_').includes(precision.toLowerCase())) : encoders;
     if (candidates.length !== 1) throw new Error('Select a directory containing exactly one complete encoder/head precision pair');
     const encoder = candidates[0];
-    const head = encoder.replace('encoder_model', 'head_model').replace('gliner2-encoder.', 'gliner2-head.');
-    if (!files.has(head)) throw new Error('Missing head GGUF matching the encoder precision');
-    weights = [encoder, head];
+    const matchingHead = encoder.replace('encoder_model', 'head_model').replace('gliner2-encoder.', 'gliner2-head.');
+    const heads = [...new Set([matchingHead, ...(architecture === 'decide' ? [encoder.slice(0, encoder.lastIndexOf('/') + 1) + 'gliner_head.gguf'] : [])])].filter(p => files.has(p));
+    if (heads.length !== 1) throw new Error('Select exactly one head GGUF matching the encoder precision');
+    weights = [encoder, heads[0]];
   }
   if (architecture === 'boundary' && weights.length !== 1) throw new Error('Select exactly one boundary model variant');
   let receipt = null;
   if (files.has('antfly_inference_bundle.json')) receipt = await readJson(files, 'antfly_inference_bundle.json', 65536);
-  const layaPrecision = architecture === 'laya' && !precision ? ((await tensorDirectory(files.get(weights[0]), 'safetensors')).some(t => t.kind === 1) ? 'fp16' : 'fp32') : null;
+  const layaTensors = architecture === 'laya' && !precision ? await tensorDirectory(files.get(weights[0]), 'safetensors') : null;
+  const layaPrecision = layaTensors ? (layaTensors.some(t => t.kind === 30) ? 'bf16' : layaTensors.some(t => t.kind === 1) ? 'fp16' : 'fp32') : null;
   const selectedPrecision = precision || receipt?.precision || layaPrecision || (weights.every(p => p.endsWith('.safetensors')) ? 'fp32' : /q4_k/i.test(weights[0]) ? 'q4_k' : /q8_0/i.test(weights[0]) ? 'q8_0' : /q4_0/i.test(weights[0]) ? 'q4_0' : null);
-  if (!['fp32', 'fp16', 'fp16_encoder', 'q8_0', 'q4_k', 'q4_0'].includes(selectedPrecision)) throw new Error('Unknown precision: provide a bundle receipt or select precision explicitly');
-  if (architecture === 'laya' && !['fp16', 'fp32'].includes(selectedPrecision)) throw new Error('Laya supports dense FP16/FP32 SafeTensors, not GLiNER quantized bundles');
+  if (!['fp32', 'fp16', 'bf16', 'fp16_encoder', 'q8_0', 'q4_k', 'q4_0'].includes(selectedPrecision)) throw new Error('Unknown precision: provide a bundle receipt or select precision explicitly');
+  if (architecture === 'laya' && !['fp16', 'fp32', 'bf16'].includes(selectedPrecision)) throw new Error('Laya supports dense FP16/FP32/BF16 SafeTensors, not GLiNER quantized bundles');
+  if (architecture !== 'laya' && selectedPrecision === 'bf16') throw new Error('BF16 browser bundles are supported for Laya/OpenDecider');
   const bytes = weights.reduce((sum, p) => sum + files.get(p).size, 0);
   integer(bytes, LIMITS.bundle);
-  return { architecture, config, encoderConfig, precision: selectedPrecision, weights, bytes, files, receipt, qualified: false };
+  // Packed attention uses main's segment-aware CPU implementation. Keep a
+  // whole request on CPU rather than crossing the GPU bridge per segment.
+  const cpuReason = architecture === 'laya' && config.laya.packing?.mode && config.laya.packing.mode !== 'none'
+    ? 'Packed Laya uses WASM CPU segment attention.'
+    : architecture === 'laya' && selectedPrecision !== 'fp16' ? 'Laya GPU residency requires an FP16 bundle; this bundle uses WASM CPU.' : undefined;
+  return { architecture, config, encoderConfig, precision: selectedPrecision, weights, bytes, files, receipt, qualified: false, cpuReason };
 }
 
 export async function tensorDirectory(file, format) {
@@ -112,7 +121,7 @@ export async function tensorDirectory(file, format) {
     const header = JSON.parse(await file.slice(8, dataOffset).text());
     for (const [name, value] of Object.entries(header)) {
       if (name === '__metadata__') continue;
-      const kind = { F32: 0, F16: 1 }[value.dtype];
+      const kind = { F32: 0, F16: 1, BF16: 30 }[value.dtype];
       if (kind === undefined) throw new Error(`Unsupported SafeTensors dtype: ${value.dtype}`);
       const [start, end] = value.data_offsets;
       const length = byteLength(value.shape, kind);

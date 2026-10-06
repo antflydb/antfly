@@ -118,6 +118,7 @@ pub const WriteProfile = struct {
 };
 
 pub const SparseIndex = struct {
+    doc_count: u64 = 0,
     next_doc_num: u64 = 0,
     chunk_size: u32 = 1024,
 
@@ -149,7 +150,13 @@ pub const SparseIndex = struct {
 
     pub fn close(_: *SparseIndex) void {}
 
+    pub fn abandonAfterCrash(_: *SparseIndex) void {}
+
     pub fn sync(_: *SparseIndex, _: bool) !void {}
+
+    pub fn checkpointLsmWalAfterDurableBoundary(_: *SparseIndex) !void {
+        return error.UnsupportedPlatform;
+    }
 
     pub fn syncReplayState(_: *SparseIndex) !void {
         return error.UnsupportedPlatform;

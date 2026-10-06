@@ -7,6 +7,10 @@ import createClient, { type Client } from "openapi-fetch";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import { validateGraphQueryResponses } from "./graph-results.js";
 import { validateCreateIndexRequestRelationships } from "./index-config.js";
+import {
+  validateIndexMaintenanceRequest,
+  validateIndexMaintenanceResponse,
+} from "./index-maintenance.js";
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
 import type { paths } from "./public-api.js";
 import { parseSSEFrames } from "./sse.js";
@@ -37,6 +41,8 @@ import type {
   DocumentArtifactTableReprocessResponse,
   EnrichmentConfig,
   GlobalQueryRequest,
+  IndexMaintenanceRequest,
+  IndexMaintenanceResponse,
   IndexStatus,
   LinearMergeRequest,
   LinearMergeResult,
@@ -48,13 +54,40 @@ import type {
   QueryRequest,
   QueryResponses,
   QueryResult,
+  RelationalConstraintRetirementRequest,
+  RelationalConstraintRetryRequest,
+  RelationalConstraintRetryResponse,
+  RelationalConstraintStatus,
+  RelationalRowMutationRequest,
+  RelationalRowQueryRequest,
+  ResearchAgentRequest,
+  ResearchAgentResult,
+  ResearchAgentStreamCallbacks,
+  ResearchFinding,
+  ResearchJob,
+  ResearchJobAdvanceRequest,
+  ResearchJobStartRequest,
+  ResearchPlanProgress,
+  ResearchReflection,
+  ResearchSectionProgress,
+  ResearchSubQuestionStartedProgress,
+  ResearchVerification,
   ResourceType,
   RestoreJob,
   RestoreRequest,
   RetrievalAgentRequest,
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
+  RunResearchJobOptions,
   ScanKeysRequest,
+  SQLConnectionOpenRequest,
+  SQLConnectionResponse,
+  SQLDiagnostic,
+  SQLPreparedExecutionRequest,
+  SQLPreparedResponse,
+  SQLPrepareRequest,
+  SQLRequest,
+  SQLResponse,
   Table,
   TableArtifactEnrichmentList,
   TableQueryRequest,
@@ -67,6 +100,44 @@ import type {
 export interface RestoreOptions {
   /** Stable key used to safely retry creation of the same restore job. */
   idempotencyKey?: string;
+}
+
+export class SQLExecutionError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly diagnostic: SQLDiagnostic
+  ) {
+    super(`SQL execution failed (${diagnostic.code}): ${diagnostic.message}`);
+    this.name = "SQLExecutionError";
+  }
+}
+
+export interface SchemaMutationOptions {
+  expectedVersion?: number;
+  /** Build and atomically publish a fresh generation through a durable restore job. */
+  rewrite?: boolean;
+  /** Reuse this key when retrying the same rewrite admission after a lost response. */
+  idempotencyKey?: string;
+}
+
+function schemaMutationParams(tableName: string, options?: SchemaMutationOptions) {
+  return {
+    params: {
+      path: { tableName },
+      ...(options?.rewrite === undefined ? {} : { query: { rewrite: options.rewrite } }),
+    },
+    headers:
+      options?.expectedVersion === undefined && options?.idempotencyKey === undefined
+        ? undefined
+        : {
+            ...(options.expectedVersion === undefined
+              ? {}
+              : { "If-Match": `"schema-${options.expectedVersion}"` }),
+            ...(options.idempotencyKey === undefined
+              ? {}
+              : { "Idempotency-Key": options.idempotencyKey }),
+          },
+  };
 }
 
 export interface QueryExecutionOptions {
@@ -107,6 +178,20 @@ export interface IndexOperations {
   get(tableName: string, indexName: string): Promise<IndexStatus>;
   create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
+  /** Resume the identical proof request after a partial/lost acknowledgement; proofs are never refreshed automatically. */
+  retry(
+    tableName: string,
+    indexName: string,
+    request: IndexMaintenanceRequest,
+    options?: QueryExecutionOptions
+  ): Promise<IndexMaintenanceResponse>;
+  /** Primary-authoritative repair; selected owner admissions are not one global transaction. */
+  repair(
+    tableName: string,
+    indexName: string,
+    request: IndexMaintenanceRequest,
+    options?: QueryExecutionOptions
+  ): Promise<IndexMaintenanceResponse>;
 }
 
 export const QUERY_TEMPORARILY_UNAVAILABLE_CODES = [
@@ -181,6 +266,20 @@ export class StorageReadTemporarilyUnavailableError extends QueryTemporarilyUnav
   constructor(message: string, retryAfterSeconds: number | undefined) {
     super(message, "storage_read_temporarily_unavailable", retryAfterSeconds);
     this.name = "StorageReadTemporarilyUnavailableError";
+  }
+}
+
+/** Another advance call already holds the lease for this research job. */
+export class ResearchJobAdvanceConflictError extends Error {
+  readonly status = 409 as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "ResearchJobAdvanceConflictError";
   }
 }
 
@@ -354,12 +453,26 @@ function normalizedWriteOptions(
   };
 }
 
-function encodeBoundedJSON(value: unknown, maxBytes: number): string {
-  const encoded = JSON.stringify(value);
+function encodeBoundedJSON(value: unknown, maxBytes: number, relational = false): string {
+  const encoded = JSON.stringify(value, relational ? relationalNumberReplacer : undefined);
   if (new TextEncoder().encode(encoded).byteLength > maxBytes) {
     throw new Error(`encoded request exceeded ${maxBytes} bytes`);
   }
   return encoded;
+}
+
+/** Typed cells and predicate operands must not silently acquire a different
+ * integer value on the wire. JavaScript bigint is not a JSON number either;
+ * callers needing the full int64 domain can use a lossless JSON raw value. */
+function relationalNumberReplacer(_key: string, value: unknown): unknown {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+      throw new Error(
+        "Relational numbers must be finite; integer values must be safe JavaScript integers or lossless JSON raw values"
+      );
+    }
+  }
+  return value;
 }
 
 export async function readLimitedResponseBytes(
@@ -423,6 +536,24 @@ export async function readLimitedResponseText(
 
 function parseJSON<T>(text: string): T {
   return JSON.parse(text) as T;
+}
+
+/** Resolves after `ms`, or rejects immediately/on abort when `signal` fires. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason instanceof Error ? signal.reason : new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class AntflyClient {
@@ -500,33 +631,49 @@ export class AntflyClient {
     body: unknown,
     options: WriteOptions | undefined,
     errorPrefix: string,
-    marshalErrorPrefix: string
-  ): Promise<{ data?: T; text: string }> {
+    marshalErrorPrefix: string,
+    relational = false,
+    errorFactory?: (status: number, body: unknown) => Error | undefined,
+    redirect?: RequestRedirect,
+    method: "POST" | "DELETE" = "POST",
+    credentials?: RequestCredentials,
+    extraHeaders?: Record<string, string>
+  ): Promise<{ data?: T; text: string; status: number }> {
     const opts = normalizedWriteOptions(options);
-    let encodedBody: string;
-    try {
-      encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes);
-    } catch (error) {
-      throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+    let encodedBody: string | undefined;
+    if (method === "POST") {
+      try {
+        encodedBody = encodeBoundedJSON(body, opts.maxRequestBytes, relational);
+      } catch (error) {
+        throw new Error(`${marshalErrorPrefix}: ${(error as Error).message}`);
+      }
     }
 
     const response = await fetch(this.url(path), {
-      method: "POST",
-      headers: this.requestHeaders(),
+      method,
+      headers: this.requestHeaders(extraHeaders),
       body: encodedBody,
       signal: opts.signal,
+      ...(redirect ? { redirect } : {}),
+      ...(credentials ? { credentials } : {}),
     });
 
     if (!response.ok) {
       const { text, truncated } = await readLimitedResponseText(response, MAX_ERROR_RESPONSE_BYTES);
       let message = apiErrorMessage(text);
+      let errorBody: unknown;
       try {
-        message = apiErrorMessage(parseJSON<unknown>(text), message);
+        errorBody = parseJSON<unknown>(text);
+        message = apiErrorMessage(errorBody, message);
       } catch {
         // Non-JSON error bodies are reported as-is below.
       }
       if (truncated) {
         message = `${message} (response body exceeded ${MAX_ERROR_RESPONSE_BYTES} bytes)`;
+      }
+      if (!truncated && errorFactory) {
+        const structured = errorFactory(response.status, errorBody);
+        if (structured) throw structured;
       }
       throw new Error(`${errorPrefix}: ${response.status} ${message}`);
     }
@@ -536,9 +683,9 @@ export class AntflyClient {
       throw new Error(`${errorPrefix} response exceeded ${opts.maxResponseBytes} bytes`);
     }
     if (!text.trim()) {
-      return { text };
+      return { text, status: response.status };
     }
-    return { data: parseJSON<T>(text), text };
+    return { data: parseJSON<T>(text), text, status: response.status };
   }
 
   /**
@@ -674,6 +821,178 @@ export class AntflyClient {
       if (error) throw queryError("Multi-query failed", error, response);
       validateGraphQueryResponses(data as QueryResponses, requests);
       return data as QueryResponses;
+    }
+  }
+
+  private async sqlRequest<T>(
+    path: string,
+    request: unknown,
+    options?: WriteOptions,
+    method: "POST" | "DELETE" = "POST",
+    extraHeaders?: Record<string, string>
+  ): Promise<T | undefined> {
+    const { data } = await this.postBoundedJSON<T>(
+      path,
+      request,
+      {
+        ...options,
+        maxRequestBytes: Math.min(normalizedWriteOptions(options).maxRequestBytes, 4 << 20),
+        maxResponseBytes: Math.min(
+          options?.maxResponseBytes && options.maxResponseBytes > 0
+            ? options.maxResponseBytes
+            : 16 << 20,
+          16 << 20
+        ),
+      },
+      "SQL execution failed",
+      "Invalid SQL request",
+      true,
+      (status, body) => {
+        if (typeof body !== "object" || body === null) return undefined;
+        const diagnostic = body as SQLDiagnostic;
+        if (
+          typeof diagnostic.code !== "string" ||
+          diagnostic.code.length !== 5 ||
+          typeof diagnostic.message !== "string"
+        )
+          return undefined;
+        return new SQLExecutionError(status, diagnostic);
+      },
+      "error",
+      method,
+      "omit",
+      extraHeaders
+    );
+    return data;
+  }
+
+  private sqlResponse(data: SQLResponse | undefined): SQLResponse {
+    if (!data || !Array.isArray(data.columns) || !Array.isArray(data.rows)) {
+      throw new Error("Invalid SQL response");
+    }
+    if (data.rows.length > 4096) throw new Error("SQL response exceeds 4096 rows");
+    for (const row of data.rows) {
+      if (!Array.isArray(row) || row.length !== data.columns.length) {
+        throw new Error("SQL row width differs from column metadata");
+      }
+    }
+    return data;
+  }
+
+  /** Execute one statement with bounded transport and no automatic mutation retries. */
+  async executeSQL(request: SQLRequest, options?: WriteOptions): Promise<SQLResponse> {
+    return this.sqlResponse(await this.sqlRequest<SQLResponse>("/db/v1/sql", request, options));
+  }
+
+  /** Open a durable, principal-bound SQL connection on this API node. Keep its owner for routing. */
+  async openSQLConnection(
+    request: SQLConnectionOpenRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLConnectionResponse> {
+    const data = await this.sqlRequest<SQLConnectionResponse>(
+      "/db/v1/sql/connections",
+      request,
+      options
+    );
+    if (
+      !data ||
+      typeof data.connection_id !== "string" ||
+      !/^[0-9a-f]{32}$/.test(data.connection_id) ||
+      typeof data.owner_node_id !== "string" ||
+      !/^(0|[1-9][0-9]{0,19})$/.test(data.owner_node_id) ||
+      !Number.isSafeInteger(data.expires_at_ms) ||
+      data.expires_at_ms <= 0 ||
+      typeof data.database !== "string" ||
+      !data.database ||
+      typeof data.namespace !== "string" ||
+      !data.namespace
+    )
+      throw new Error("Invalid SQL connection response");
+    return data;
+  }
+
+  /** Close an idle SQL connection on its owner. Unknown mutation outcomes are never replayed. */
+  async closeSQLConnection(connectionId: string, options?: WriteOptions): Promise<void> {
+    if (!/^[0-9a-f]{32}$/.test(connectionId))
+      throw new Error("SQL connection ID must be 32 lowercase hexadecimal characters");
+    const data = await this.sqlRequest<Record<string, never>>(
+      `/db/v1/sql/connections/${encodeURIComponent(connectionId)}`,
+      undefined,
+      options,
+      "DELETE"
+    );
+    if (!data || Array.isArray(data) || typeof data !== "object" || Object.keys(data).length !== 0)
+      throw new Error("Invalid SQL connection close response");
+  }
+
+  /**
+   * Bind a durable, owner-bound statement without executing it. The resource survives
+   * transaction commit; keep its owner_node_id and expires_at_ms for routing and cleanup.
+   * Creation is never retried or redirected automatically.
+   */
+  async prepareSQL(
+    request: SQLPrepareRequest,
+    options?: WriteOptions
+  ): Promise<SQLPreparedResponse> {
+    const data = await this.sqlRequest<SQLPreparedResponse>(
+      "/db/v1/sql/prepared",
+      request,
+      options
+    );
+    if (
+      !data ||
+      typeof data.prepared_id !== "string" ||
+      !data.prepared_id ||
+      !Number.isSafeInteger(data.expires_at_ms) ||
+      typeof data.owner_node_id !== "string" ||
+      !/^[0-9]{1,20}$/.test(data.owner_node_id) ||
+      !Array.isArray(data.parameter_types) ||
+      !Array.isArray(data.columns)
+    )
+      throw new Error("Invalid prepared SQL response");
+    return data;
+  }
+
+  /** Execute on the resource owner; reconcile ambiguous outcomes instead of replaying. */
+  async executePreparedSQL(
+    preparedId: string,
+    request: SQLPreparedExecutionRequest = {},
+    options?: WriteOptions
+  ): Promise<SQLResponse> {
+    if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    return this.sqlResponse(
+      await this.sqlRequest<SQLResponse>(
+        `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}/execute`,
+        request,
+        options
+      )
+    );
+  }
+
+  /** Release an owner-bound resource; connection-bound resources require their connection ID. */
+  async closePreparedSQL(
+    preparedId: string,
+    options?: WriteOptions & { connectionId?: string }
+  ): Promise<void> {
+    if (!preparedId) throw new Error("Prepared SQL resource ID is required");
+    if (options?.connectionId !== undefined && !/^[0-9a-fA-F]{32}$/.test(options.connectionId))
+      throw new Error("SQL connection ID must be 32 hexadecimal characters");
+    const data = await this.sqlRequest<Record<string, never>>(
+      `/db/v1/sql/prepared/${encodeURIComponent(preparedId)}`,
+      undefined,
+      options,
+      "DELETE",
+      options?.connectionId !== undefined
+        ? { "X-Antfly-SQL-Connection-Id": options.connectionId }
+        : undefined
+    );
+    if (
+      !data ||
+      Array.isArray(data) ||
+      typeof data !== "object" ||
+      Object.keys(data).length !== 0
+    ) {
+      throw new Error("Invalid prepared SQL close response");
     }
   }
 
@@ -884,6 +1203,318 @@ export class AntflyClient {
     // result rather than dropping it, while keeping the streaming return shape.
     callbacks.onDone?.(result);
     return new AbortController();
+  }
+
+  /**
+   * Private helper for Research Agent requests to handle streaming and non-streaming responses
+   */
+  private async performResearchAgent(
+    request: ResearchAgentRequest,
+    callbacks?: ResearchAgentStreamCallbacks,
+    signal?: AbortSignal
+  ): Promise<ResearchAgentResult | AbortController> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream, application/json",
+    };
+
+    // Add auth header if configured
+    const authHeader = this.getAuthHeader();
+    if (authHeader) {
+      headers.Authorization = authHeader;
+    }
+
+    // Merge with any additional headers
+    Object.assign(headers, this.config.headers);
+
+    const abortController = new AbortController();
+    // A caller signal aborts the request too, including while it connects.
+    if (signal) {
+      if (signal.aborted) abortController.abort(signal.reason);
+      else
+        signal.addEventListener("abort", () => abortController.abort(signal.reason), {
+          once: true,
+        });
+    }
+    const response = await fetch(`${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/research`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(request),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let error: unknown = errorText;
+      try {
+        error = JSON.parse(errorText);
+      } catch {
+        // Older servers may return plain text.
+      }
+      throw queryError("Research agent request failed", error, response);
+    }
+
+    if (!response.body) {
+      throw new Error("Response body is null");
+    }
+
+    // Check content type to determine response format
+    const contentType = response.headers.get("content-type") || "";
+    const isJSON = contentType.includes("application/json");
+
+    // Handle JSON response (non-streaming)
+    if (isJSON) {
+      const result = (await response.json()) as ResearchAgentResult;
+      return result;
+    }
+
+    if (contentType.split(";", 1)[0]?.trim().toLowerCase() !== "text/event-stream") {
+      await response.body.cancel();
+      throw new Error("Research agent returned an unsupported content type");
+    }
+
+    // A JSON caller must not leave an unexpected stream open.
+    if (!callbacks) {
+      await response.body.cancel();
+      return abortController;
+    }
+
+    const stream = response.body;
+    // The controller is returned immediately; terminal failures are delivered
+    // through onError, including read errors, malformed frames, and early EOF.
+    void (async () => {
+      try {
+        for await (const frame of parseSSEFrames(stream, "Research agent")) {
+          if (abortController.signal.aborted) return;
+          switch (frame.event) {
+            case "generation":
+              callbacks.onGeneration?.(JSON.parse(frame.data));
+              break;
+            case "step_started":
+              callbacks.onStepStarted?.(JSON.parse(frame.data));
+              break;
+            case "step_progress": {
+              const progress = JSON.parse(frame.data) as { phase?: string } & Record<
+                string,
+                unknown
+              >;
+              switch (progress.phase) {
+                case "plan":
+                  callbacks.onPlan?.(progress as unknown as ResearchPlanProgress);
+                  break;
+                case "sub_question_started":
+                  callbacks.onSubQuestionStarted?.(
+                    progress as unknown as ResearchSubQuestionStartedProgress
+                  );
+                  break;
+                case "finding":
+                  callbacks.onFinding?.(progress as unknown as ResearchFinding);
+                  break;
+                case "reflection":
+                  callbacks.onReflection?.(progress as unknown as ResearchReflection);
+                  break;
+                case "section":
+                  callbacks.onSection?.(progress as unknown as ResearchSectionProgress);
+                  break;
+                case "verification":
+                  callbacks.onVerification?.(progress as unknown as ResearchVerification);
+                  break;
+              }
+              break;
+            }
+            case "step_completed":
+              callbacks.onStepCompleted?.(JSON.parse(frame.data));
+              break;
+            case "done": {
+              const result = JSON.parse(frame.data);
+              if (
+                result === null ||
+                typeof result !== "object" ||
+                Array.isArray(result) ||
+                typeof result.status !== "string"
+              ) {
+                throw new Error("Research agent returned an invalid done result");
+              }
+              callbacks.onDone?.(result);
+              return;
+            }
+            case "error": {
+              const parsed = JSON.parse(frame.data);
+              if (isTransientCapacityError(parsed)) throw new InferenceCapacityError(parsed);
+              const message =
+                parsed !== null && typeof parsed === "object" && parsed.error
+                  ? String(parsed.error)
+                  : String(parsed);
+              throw new Error(message);
+            }
+          }
+        }
+        throw new Error("Research agent stream ended before done");
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          const detail = error instanceof Error ? error : new Error(String(error));
+          callbacks.onErrorDetail?.(detail);
+          callbacks.onError?.(detail.message);
+        }
+      }
+    })();
+
+    return abortController;
+  }
+
+  /**
+   * Run the research agent and return one complete JSON result.
+   *
+   * Use streamResearchAgent when incremental plan/finding/report events are
+   * required. For runs that may exceed one request's wall-clock budget, use
+   * startResearchJob/advanceResearchJob or the runResearchJob convenience.
+   */
+  async researchAgent(
+    request: ResearchAgentRequest,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<ResearchAgentResult> {
+    const result = await this.performResearchAgent(
+      { ...request, stream: false },
+      undefined,
+      options.signal
+    );
+    if (result instanceof AbortController) {
+      result.abort();
+      throw new Error("Research agent returned a stream for a JSON request");
+    }
+    return result;
+  }
+
+  /** Run the research agent as an SSE stream. */
+  async streamResearchAgent(
+    request: ResearchAgentRequest,
+    callbacks: ResearchAgentStreamCallbacks,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<AbortController> {
+    const result = await this.performResearchAgent(
+      { ...request, stream: true },
+      callbacks,
+      options.signal
+    );
+    if (result instanceof AbortController) return result;
+
+    // A proxy or older server may still answer with JSON. Preserve the complete
+    // result rather than dropping it, while keeping the streaming return shape.
+    callbacks.onDone?.(result);
+    return new AbortController();
+  }
+
+  /**
+   * Start a durable research job. The job advances one bounded phase at a
+   * time via advanceResearchJob and survives server restarts.
+   */
+  async startResearchJob(request: ResearchJobStartRequest): Promise<ResearchJob> {
+    const { data, error } = await this.client.POST("/db/v1/agents/research/jobs", {
+      body: request,
+    });
+    if (error) {
+      throw new Error(`Failed to start research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to start research job: unexpected empty response");
+    return data;
+  }
+
+  /** Get a durable research job's current state and latest checkpointed result. */
+  async getResearchJob(jobId: string): Promise<ResearchJob> {
+    const { data, error } = await this.client.GET("/db/v1/agents/research/jobs/{jobId}", {
+      params: { path: { jobId } },
+    });
+    if (error) {
+      throw new Error(`Failed to get research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to get research job: unexpected empty response");
+    return data;
+  }
+
+  /**
+   * Advance a durable research job by up to `request.max_phases` phases.
+   * Throws ResearchJobAdvanceConflictError (409) when another advance call
+   * currently holds the job's lease.
+   */
+  async advanceResearchJob(
+    jobId: string,
+    request?: ResearchJobAdvanceRequest
+  ): Promise<ResearchJob> {
+    const { data, error, response } = await this.client.POST(
+      "/db/v1/agents/research/jobs/{jobId}/advance",
+      {
+        params: { path: { jobId } },
+        body: request,
+      }
+    );
+    if (error) {
+      if (response?.status === 409) {
+        const retryAfter = Number.parseInt(response.headers.get("Retry-After") ?? "", 10);
+        const retryAfterSeconds =
+          Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined;
+        throw new ResearchJobAdvanceConflictError(
+          `Failed to advance research job: ${apiErrorMessage(error)}`,
+          retryAfterSeconds
+        );
+      }
+      throw new Error(`Failed to advance research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to advance research job: unexpected empty response");
+    return data;
+  }
+
+  /** Cancel a durable research job. Returns the job unchanged if already terminal. */
+  async cancelResearchJob(jobId: string): Promise<ResearchJob> {
+    const { data, error } = await this.client.POST("/db/v1/agents/research/jobs/{jobId}/cancel", {
+      params: { path: { jobId } },
+    });
+    if (error) {
+      throw new Error(`Failed to cancel research job: ${apiErrorMessage(error)}`);
+    }
+    if (!data) throw new Error("Failed to cancel research job: unexpected empty response");
+    return data;
+  }
+
+  /**
+   * Start a durable research job and advance it until it reaches a terminal
+   * state (succeeded, failed or cancelled). A 409 from a concurrent advance
+   * is treated as "someone else is advancing": this waits Retry-After (or 1s)
+   * and polls with getResearchJob instead of racing another advance call.
+   */
+  async runResearchJob(
+    request: ResearchAgentRequest,
+    options?: RunResearchJobOptions
+  ): Promise<ResearchJob> {
+    const advanceRequest: ResearchJobAdvanceRequest | undefined =
+      options?.maxPhasesPerAdvance === undefined
+        ? undefined
+        : { max_phases: options.maxPhasesPerAdvance };
+
+    let job = await this.startResearchJob({ request });
+    options?.onJob?.(job);
+
+    while (job.state === "queued" || job.state === "running") {
+      if (options?.signal?.aborted) {
+        throw options.signal.reason instanceof Error
+          ? options.signal.reason
+          : new Error("runResearchJob aborted");
+      }
+      try {
+        job = await this.advanceResearchJob(job.job_id, advanceRequest);
+      } catch (error) {
+        if (error instanceof ResearchJobAdvanceConflictError) {
+          const delayMs = (error.retryAfterSeconds ?? 1) * 1000;
+          await sleep(delayMs, options?.signal);
+          job = await this.getResearchJob(job.job_id);
+          options?.onJob?.(job);
+          continue;
+        }
+        throw error;
+      }
+      options?.onJob?.(job);
+    }
+
+    return job;
   }
 
   /**
@@ -1152,15 +1783,11 @@ export class AntflyClient {
     replaceSchema: async (
       tableName: string,
       config: TableSchema,
-      options?: { expectedVersion?: number }
-    ): Promise<Table | CommittedMutationOutcome> => {
+      options?: SchemaMutationOptions
+    ): Promise<Table | CommittedMutationOutcome | RestoreJob> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
-        params: { path: { tableName } },
+        ...schemaMutationParams(tableName, options),
         body: config,
-        headers:
-          options?.expectedVersion === undefined
-            ? undefined
-            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       if (!data) throw new Error("Failed to replace table schema: unexpected empty response");
@@ -1171,15 +1798,11 @@ export class AntflyClient {
     patchSchema: async (
       tableName: string,
       patch: Record<string, unknown>,
-      options?: { expectedVersion?: number }
-    ): Promise<Table | CommittedMutationOutcome> => {
+      options?: SchemaMutationOptions
+    ): Promise<Table | CommittedMutationOutcome | RestoreJob> => {
       const { data, error } = await this.client.PATCH("/db/v1/tables/{tableName}/schema", {
-        params: { path: { tableName } },
+        ...schemaMutationParams(tableName, options),
         body: patch,
-        headers:
-          options?.expectedVersion === undefined
-            ? undefined
-            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to patch table schema: ${error.error}`);
       if (!data) throw new Error("Failed to patch table schema: unexpected empty response");
@@ -1190,15 +1813,11 @@ export class AntflyClient {
     updateSchema: async (
       tableName: string,
       config: TableSchema,
-      options?: { expectedVersion?: number }
-    ): Promise<Table | CommittedMutationOutcome> => {
+      options?: SchemaMutationOptions
+    ): Promise<Table | CommittedMutationOutcome | RestoreJob> => {
       const { data, error } = await this.client.PUT("/db/v1/tables/{tableName}/schema", {
-        params: { path: { tableName } },
+        ...schemaMutationParams(tableName, options),
         body: config,
-        headers:
-          options?.expectedVersion === undefined
-            ? undefined
-            : { "If-Match": `"schema-${options.expectedVersion}"` },
       });
       if (error) throw new Error(`Failed to replace table schema: ${error.error}`);
       if (!data) throw new Error("Failed to replace table schema: unexpected empty response");
@@ -1252,6 +1871,121 @@ export class AntflyClient {
           transformed: request.transforms?.length ?? 0,
         }
       );
+    },
+
+    rows: {
+      /** One bounded NDJSON page. Raw text preserves int64 cells for a lossless
+       * JSON parser; ordinary JSON.parse would round integers above 2^53. */
+      queryRaw: async (
+        tableName: string,
+        request: RelationalRowQueryRequest,
+        signal?: AbortSignal
+      ): Promise<string> => {
+        const response = await fetch(
+          this.url(`/db/v1/tables/${encodeURIComponent(tableName)}/rows/query`),
+          {
+            method: "POST",
+            headers: this.requestHeaders(),
+            body: encodeBoundedJSON(request, DEFAULT_WRITE_MAX_REQUEST_BYTES, true),
+            signal,
+          }
+        );
+        const { text, truncated } = await readLimitedResponseText(
+          response,
+          response.ok ? 16 * 1024 * 1024 : MAX_ERROR_RESPONSE_BYTES
+        );
+        if (truncated) throw new Error("Relational row query exceeded its response byte limit");
+        if (!response.ok)
+          throw new Error(
+            `Relational row query failed: ${response.status} ${apiErrorMessage(text)}`
+          );
+        return text;
+      },
+
+      /** Atomic schema- and version-conditional mutations; ambiguous results
+       * are never retried automatically. */
+      mutate: async (
+        tableName: string,
+        request: RelationalRowMutationRequest,
+        options?: WriteOptions
+      ): Promise<BatchResult> => {
+        const { data } = await this.postBoundedJSON<BatchResult>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/rows/mutate`,
+          request,
+          options,
+          "Relational mutation failed",
+          "marshalling relational mutation",
+          true
+        );
+        if (!data) throw new Error("Relational mutation returned no commit outcome");
+        return data;
+      },
+    },
+
+    constraints: {
+      /** Start a durable constraint drain; acceptance is not publication. */
+      retire: async (
+        tableName: string,
+        request: RelationalConstraintRetirementRequest,
+        options?: WriteOptions
+      ): Promise<RelationalConstraintRetryResponse> => {
+        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retire`,
+          request,
+          options,
+          "Constraint retirement failed",
+          "marshalling constraint retirement",
+          true
+        );
+        if (result?.status !== "accepted")
+          throw new Error("Constraint retirement returned no acceptance outcome");
+        return result;
+      },
+      /** Admin repair preserves FK/UNIQUE checks; activation must be failed. */
+      repair: async (
+        tableName: string,
+        request: RelationalRowMutationRequest,
+        options?: WriteOptions
+      ): Promise<BatchResult> => {
+        const { data: result } = await this.postBoundedJSON<BatchResult>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/repair`,
+          request,
+          options,
+          "Constraint repair failed",
+          "marshalling constraint repair",
+          true
+        );
+        if (!result) throw new Error("Constraint repair returned no commit outcome");
+        return result;
+      },
+      /** Idempotently restart failed owners; inspect status for completion. */
+      retry: async (
+        tableName: string,
+        request: RelationalConstraintRetryRequest,
+        options?: WriteOptions
+      ): Promise<RelationalConstraintRetryResponse> => {
+        const { data: result } = await this.postBoundedJSON<RelationalConstraintRetryResponse>(
+          `/db/v1/tables/${encodeURIComponent(tableName)}/constraints/retry`,
+          request,
+          options,
+          "Constraint retry failed",
+          "marshalling constraint retry",
+          true
+        );
+        if (!result) throw new Error("Constraint retry returned no acceptance outcome");
+        return result;
+      },
+      /** Distributed UNIQUE/FK coverage; local CHECK validation is separate. */
+      status: async (tableName: string): Promise<RelationalConstraintStatus> => {
+        const { data, error } = await this.client.GET(
+          "/db/v1/tables/{tableName}/constraints/status",
+          {
+            params: { path: { tableName } },
+          }
+        );
+        if (error || !data) throw new Error(`Constraint status failed: ${apiErrorMessage(error)}`);
+        return data;
+      },
     },
 
     /**
@@ -1697,7 +2431,36 @@ export class AntflyClient {
   /**
    * Index operations
    */
+  private async maintainIndex(
+    action: "retry" | "repair",
+    tableName: string,
+    indexName: string,
+    request: IndexMaintenanceRequest,
+    options?: QueryExecutionOptions
+  ): Promise<IndexMaintenanceResponse> {
+    const groups = validateIndexMaintenanceRequest(request);
+    // Keep the submitted proof and its acknowledgement expectation stable even
+    // when the caller reuses/mutates their request while awaiting this operation.
+    const body = { ...request, owners: request.owners.map((owner) => ({ ...owner })) };
+    const { data, status } = await this.postBoundedJSON<IndexMaintenanceResponse>(
+      `/db/v1/tables/${encodeURIComponent(tableName)}/indexes/${encodeURIComponent(indexName)}/${action}`,
+      body,
+      { signal: options?.signal, maxRequestBytes: 128 * 1024, maxResponseBytes: 32 * 1024 },
+      `Failed to ${action} index; resubmit identical proofs after an ambiguous acknowledgement`,
+      "Encoding index maintenance"
+    );
+    if (status !== 200)
+      throw new Error(
+        "Invalid index maintenance acknowledgement status; resubmit identical proofs"
+      );
+    return validateIndexMaintenanceResponse(data, groups);
+  }
+
   indexes: IndexOperations = {
+    retry: (tableName, indexName, request, options) =>
+      this.maintainIndex("retry", tableName, indexName, request, options),
+    repair: (tableName, indexName, request, options) =>
+      this.maintainIndex("repair", tableName, indexName, request, options),
     /**
      * List all indexes for a table
      */

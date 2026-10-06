@@ -31,6 +31,116 @@ const LeaderFixture = struct {
     raft: raft_mod.Raft,
 };
 
+const AdmissionFenceFixture = struct {
+    durable_fenced: bool = false,
+    saw_pending_configuration: bool = false,
+    calls: usize = 0,
+
+    fn check(ptr: *anyopaque, context: raft_mod.ProposalAdmission.Context) !void {
+        const self: *AdmissionFenceFixture = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        var fenced = self.durable_fenced;
+        for (context.retained_entries) |entry| {
+            if (entry.index > context.applied_index and std.mem.eql(u8, entry.data, "acquire")) fenced = true;
+        }
+        for (context.proposed_entries) |entry| {
+            if (entry.entry_type != .normal and fenced) return error.MembershipChangeFenced;
+            if (std.mem.eql(u8, entry.data, "acquire")) {
+                if (context.pending_conf_index > context.applied_index) {
+                    self.saw_pending_configuration = true;
+                    return error.PendingConfChange;
+                }
+                if (context.conf_state.voters_outgoing.len > 0) return error.MustLeaveJointFirst;
+                fenced = true;
+            }
+        }
+    }
+};
+
+test "append admission fences direct forwarded and batched membership before barrier apply" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+    fixture.raft.storage = fixture.storage.storage();
+    var fence = AdmissionFenceFixture{};
+    fixture.raft.cfg.proposal_admission = .{ .ptr = &fence, .check = AdmissionFenceFixture.check };
+    fixture.raft.pending_conf_index = 0;
+    try fixture.raft.propose("acquire");
+    const last = fixture.raft.log.lastIndex();
+    const change = types.ConfChange{ .change_type = .add_learner_node, .node_id = 3 };
+    try std.testing.expectError(error.MembershipChangeFenced, fixture.raft.proposeConfChange(change));
+    try std.testing.expectError(error.MembershipChangeFenced, fixture.raft.proposeConfChangeV2(.{
+        .changes = @constCast(&[_]types.ConfChangeSingle{.{ .change_type = .add_learner_node, .node_id = 3 }}),
+    }));
+    const encoded = try change.encode(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectError(error.MembershipChangeFenced, fixture.raft.step(.{
+        .msg_type = .propose,
+        .from = 2,
+        .to = 1,
+        .entries = @constCast(&[_]types.Entry{.{ .entry_type = .conf_change, .data = encoded }}),
+    }));
+    try std.testing.expectEqual(last, fixture.raft.log.lastIndex());
+
+    // A committed/application-restored fence still guards configuration when
+    // its acquisition entry has been compacted out of the retained suffix.
+    fence.durable_fenced = true;
+    fixture.raft.log.applied = last;
+    try fixture.raft.compactAppliedLogTo(last);
+    try std.testing.expectError(error.MembershipChangeFenced, fixture.raft.proposeConfChange(change));
+}
+
+test "append admission exposes pending configuration and validates complete atomic batches" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+    fixture.raft.storage = fixture.storage.storage();
+    var fence = AdmissionFenceFixture{};
+    fixture.raft.cfg.proposal_admission = .{ .ptr = &fence, .check = AdmissionFenceFixture.check };
+    fixture.raft.pending_conf_index = fixture.raft.log.lastIndex();
+    const last = fixture.raft.log.lastIndex();
+    var first_index: ?u64 = null;
+    var last_index: ?u64 = null;
+    try std.testing.expectError(error.PendingConfChange, fixture.raft.proposeBatchWithReceipt(
+        &.{ "ordinary", "acquire" },
+        &first_index,
+        &last_index,
+    ));
+    try std.testing.expect(fence.saw_pending_configuration);
+    try std.testing.expect(first_index == null and last_index == null);
+    try std.testing.expectEqual(last, fixture.raft.log.lastIndex());
+
+    fixture.raft.pending_conf_index = 0;
+    try fixture.raft.proposeBatchWithReceipt(&.{ "ordinary", "acquire" }, &first_index, &last_index);
+    try std.testing.expectEqual(last + 1, first_index.?);
+    try std.testing.expectEqual(last + 2, last_index.?);
+    try std.testing.expectError(error.MembershipChangeFenced, fixture.raft.proposeConfChange(.{
+        .change_type = .add_learner_node,
+        .node_id = 3,
+    }));
+}
+
+test "append admission also fences implicit and explicit joint exit" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+    fixture.raft.storage = fixture.storage.storage();
+    var fence = AdmissionFenceFixture{ .durable_fenced = true };
+    fixture.raft.cfg.proposal_admission = .{ .ptr = &fence, .check = AdmissionFenceFixture.check };
+    fixture.raft.pending_conf_index = 0;
+    const last = fixture.raft.log.lastIndex();
+    _ = try fixture.raft.applyConfChangeV2(.{
+        .transition = .joint_implicit,
+        .changes = @constCast(&[_]types.ConfChangeSingle{.{ .change_type = .add_node, .node_id = 3 }}),
+    });
+    try std.testing.expect(fixture.raft.conf_state.auto_leave);
+    try std.testing.expectEqual(last, fixture.raft.log.lastIndex());
+    try std.testing.expectError(error.MembershipChangeFenced, fixture.raft.proposeConfChangeV2(.{}));
+    fence.durable_fenced = false;
+    try fixture.raft.proposeConfChangeV2(.{});
+    try std.testing.expectEqual(last + 1, fixture.raft.log.lastIndex());
+}
+
 const CapturedLog = struct {
     level: logger_mod.LogLevel,
     message: []u8,
@@ -49,7 +159,7 @@ const CaptureLogger = struct {
         };
     }
 
-    fn deinit(self: *CaptureLogger) void {
+    pub fn deinit(self: *CaptureLogger) void {
         for (self.records.items) |record| self.alloc.free(record.message);
         self.records.deinit(self.alloc);
     }
@@ -78,7 +188,7 @@ const CaptureTraceLogger = struct {
         };
     }
 
-    fn deinit(self: *CaptureTraceLogger, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CaptureTraceLogger, alloc: std.mem.Allocator) void {
         self.events.deinit(alloc);
     }
 
@@ -2796,6 +2906,32 @@ test "rolling upgrade leader catches up legacy follower rejection" {
         try std.testing.expectEqual(@as(usize, 1), raft.messages.items.len);
         try std.testing.expectEqual(next, raft.messages.items[0].entries[0].index);
     }
+}
+
+test "leader status reports lagging voter replication without changing commit state" {
+    var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    var voters = [_]types.NodeId{ 1, 2, 3 };
+    try storage.seedConfState(.{ .voters = &voters });
+    var raft = try raft_mod.Raft.init(std.testing.allocator, .{
+        .id = 1,
+        .group_id = 7,
+        .peers = &voters,
+        .check_quorum = false,
+        .pre_vote = false,
+    }, storage.storage());
+    defer raft.deinit();
+    try raft.campaign();
+    clearMessages(&raft);
+    try raft.step(.{ .msg_type = .request_vote_response, .from = 2, .to = 1, .term = 1 });
+    const last = raft.log.lastIndex();
+    raft.progress[1].match_index = last;
+    raft.progress[1].recent_active = true;
+    const status = raft.status();
+    try std.testing.expectEqual(types.StateRole.leader, status.soft.role);
+    try std.testing.expectEqual(@as(usize, 2), status.voters_at_last_index);
+    try std.testing.expectEqual(@as(usize, 2), status.recent_active_voters);
+    try std.testing.expectEqual(@as(types.Index, 0), status.lowest_voter_match_index);
 }
 
 test "legacy append rejections coalesce until heartbeat and forward progress cancels fallback" {

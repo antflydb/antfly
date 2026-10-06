@@ -16,7 +16,7 @@ pub const build_options = @import("build_options");
 
 // Encoding & data structures
 pub const roaring = @import("encoding/roaring.zig");
-pub const vellum = @import("antfly_vellum");
+pub const fst = @import("antfly_fst");
 pub const snappy = @import("encoding/snappy.zig");
 pub const streamvbyte = @import("encoding/streamvbyte.zig");
 pub const simd_bitpack = @import("encoding/simd_bitpack.zig");
@@ -79,6 +79,7 @@ pub const sparse = @import("sparse/sparse.zig");
 // Inference clients (Antfly, OpenAI/Ollama)
 pub const inference = @import("inference/mod.zig");
 pub const table_schema = @import("schema/mod.zig");
+pub const capi_dependencies = @import("capi_dependencies.zig");
 pub const image = @import("antfly_image");
 pub const font = @import("antfly_font");
 pub const pdf = @import("antfly_pdf");
@@ -119,6 +120,7 @@ pub const restore_admission_vopr = @import("vopr/restore_admission.zig");
 pub const generation_lifecycle_vopr = @import("vopr/generation_lifecycle.zig");
 pub const backfill_marker_discovery_vopr = @import("vopr/backfill_marker_discovery.zig");
 pub const config_extension_lifecycle_vopr = @import("vopr/config_extension_lifecycle.zig");
+pub const secrets_vopr = @import("vopr/secrets.zig");
 pub const vopr_determinism_audit = @import("vopr/determinism_audit.zig");
 pub const external_lake_vopr = @import("vopr/external_lake.zig");
 pub const media_runtime_vopr = @import("vopr/media_runtime.zig");
@@ -185,15 +187,11 @@ pub const lite = @import("storage/lite/mod.zig");
 pub const lite_backend = lite.backend;
 pub const lite_native = lite.native;
 pub const storage_lsm = @import("storage/lsm/mod.zig");
-pub const lmdb_backend = @import("storage/lmdb_backend.zig");
 pub const mem_backend = @import("storage/mem_backend.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const backend_conformance_test = @import("storage/backend_conformance_test.zig");
 pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
 pub const lsm_vopr = @import("storage/lsm_vopr.zig");
-pub const lmdb = @import("storage/lmdb.zig");
-pub const lmdb_vopr = @import("storage/lmdb_vopr.zig");
-pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const posting_segment_store = @import("storage/posting_segment_store.zig");
 pub const vector_block_store = @import("storage/vector_block_store.zig");
@@ -222,13 +220,14 @@ pub const index_manager_vopr = @import("storage/index_manager_vopr.zig");
 pub const db_split_vopr = @import("storage/db_split_vopr.zig");
 
 test {
+    _ = @import("system_catalog/server_call.zig");
     _ = @import("vopr/index_maintenance.zig");
     _ = @import("cmd/serverless.zig");
     // Storage shard builds compile this authoritative discovery root and then
     // select disjoint test-name prefixes. Keep it unconditional in test mode:
     // an unimported test file must fail the pre-build audit, never disappear.
     _ = @import("storage/test_manifest.zig");
-    _ = @import("runtime_private_error_diagnostics.zig");
+    _ = @import("antfly_private_error_diagnostics");
 
     if (comptime build_options.standalone_runtime_focused_test) {
         _ = standalone;
@@ -237,7 +236,7 @@ test {
 
     // Encoding
     _ = roaring;
-    _ = vellum;
+    _ = fst;
     _ = snappy;
     _ = streamvbyte;
     _ = simd_bitpack;
@@ -316,6 +315,10 @@ test {
 
     // Public API
     _ = public_api;
+    _ = public_api.row_policy_install;
+    _ = public_api.relational_fk_generation_publication;
+    _ = public_api.row_policy_publication_coordinator;
+    _ = public_api.fk_generation_publication_coordinator;
     _ = public_api.http_server;
     _ = public_api.internal_query_operations;
     _ = public_api.tables;
@@ -362,9 +365,6 @@ test {
     _ = asset_producer_runtime;
 
     // Storage
-    _ = lmdb;
-    _ = lmdb_vopr;
-    _ = lmdb_engine;
     _ = hbc;
     _ = hot_standby;
     _ = standby_vopr;
@@ -407,6 +407,7 @@ test {
     _ = generation_lifecycle_vopr;
     _ = backfill_marker_discovery_vopr;
     _ = config_extension_lifecycle_vopr;
+    _ = secrets_vopr;
     _ = vopr_determinism_audit;
     _ = external_lake_vopr;
     _ = media_runtime_vopr;
@@ -433,3 +434,7 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+test "online graph snapshot native receiver module" {
+    _ = @import("storage/db/online_graph_receiver_test.zig");
+}

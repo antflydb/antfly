@@ -39,7 +39,9 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_evaluation import QueryEvaluation
     from ..models.query_hierarchy import QueryHierarchy
+    from ..models.query_highlight import QueryHighlight
     from ..models.query_request_aggregations import QueryRequestAggregations
     from ..models.query_request_embeddings import QueryRequestEmbeddings
     from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -59,10 +61,15 @@ T = TypeVar("T", bound="GlobalStatefulQueryRequest")
 
 @_attrs_define
 class GlobalStatefulQueryRequest:
-    r"""A stateful global query. The target table is required on this route.
+    """A stateful global query. The target table is required on this route.
 
     Attributes:
         table (str): Name of the table to query. Example: wikipedia.
+        evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
+            offset/limit. Candidates require candidate_count; matches require
+            max_rows and fail if the full qualifying population exceeds that budget.
+            Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+            be combined with evaluation. NULL inputs skip inference; errors fail.
         table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
             do not qualify a string table name.
         query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
@@ -221,6 +228,14 @@ class GlobalStatefulQueryRequest:
             matches are returned. `ancestors` only controls projected context and never changes result
             cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
             source-grouped result shape.
+        highlight (QueryHighlight | Unset): Ask for highlighted fragments of the stored fields matched by
+            `full_text_search` and by named full-text queries. Matches are located
+            by re-analyzing the stored value with the field's analyzer, so stemmed
+            and stop-word-filtered terms highlight the surface form. `prefix`,
+            `wildcard`, `regexp`, and `fuzzy` clauses mark whole tokens; `match`,
+            `match_phrase`, or `prefix` on a `substring` companion
+            (`field._substring`) marks the exact contained bytes, including
+            matches that span two adjacent words.
         limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
             parameter.
             This does not limit nested matches attached through hierarchy.group_by.matches;
@@ -313,42 +328,9 @@ class GlobalStatefulQueryRequest:
         graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
             contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH
             operations. Keys use the versioned GraphIdentifier policy.
-        document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG
-            queries.
-            Template has access to document fields via `{{this.fields.fieldName}}`.
-
-            **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction:
-            ```handlebars
-            {{encodeToon this.fields}}
-            ```
-
-            **Available Helpers**:
-            - `encodeToon` - Renders fields in compact TOON format with configurable options:
-              - `lengthMarker` (bool): Add # prefix to array counts (default: true)
-              - `indent` (int): Indentation spacing (default: 2)
-              - `delimiter` (string): Field separator for tabular arrays
-            - `scrubHtml` - Removes HTML tags and extracts text
-            - `media` - Wraps data URIs for GenKit multimodal support
-            - `eq` - Equality comparison for conditionals
-
-            **Examples**:
-            - Basic TOON: `{{encodeToon this.fields}}`
-            - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}`
-            - Tabular data: `{{encodeToon this.fields delimiter="\t"}}`
-            - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}`
-            - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}`
-
-            TOON format produces compact, LLM-optimized output like:
-            ```
-            title: Introduction to Vector Search
-            author: Jane Doe
-            tags[#3]: ai,search,ml
-            ```
-
-            **References**:
-            - TOON Specification: https://github.com/toon-format/toon
-            - Go Implementation: https://github.com/alpkeskin/gotoon
-             Example: {{encodeToon this.fields}}.
+        document_renderer (str | Unset): Not supported on queries, which do not generate text; requests that
+            set it are rejected. Set `document_renderer` on a retrieval agent
+            request to control how documents appear in the generation prompt.
         pruner (Pruner | Unset): Configuration for pruning search results based on score quality.
             Helps filter out low-relevance results in RAG pipelines by detecting
             score gaps or deviations from top results. Pruning runs once on the
@@ -403,6 +385,7 @@ class GlobalStatefulQueryRequest:
     """
 
     table: str
+    evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
@@ -502,6 +485,7 @@ class GlobalStatefulQueryRequest:
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
+    highlight: QueryHighlight | Unset = UNSET
     limit: int | Unset = UNSET
     offset: int | Unset = UNSET
     timeout_ms: int | Unset = UNSET
@@ -554,6 +538,10 @@ class GlobalStatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         table = self.table
+
+        evaluate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.evaluate, Unset):
+            evaluate = self.evaluate.to_dict()
 
         table_target: dict[str, Any] | Unset = UNSET
         if not isinstance(self.table_target, Unset):
@@ -761,6 +749,10 @@ class GlobalStatefulQueryRequest:
         if not isinstance(self.hierarchy, Unset):
             hierarchy = self.hierarchy.to_dict()
 
+        highlight: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.highlight, Unset):
+            highlight = self.highlight.to_dict()
+
         limit = self.limit
 
         offset = self.offset
@@ -843,6 +835,8 @@ class GlobalStatefulQueryRequest:
                 "table": table,
             }
         )
+        if evaluate is not UNSET:
+            field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
             field_dict["table_target"] = table_target
         if query is not UNSET:
@@ -873,6 +867,8 @@ class GlobalStatefulQueryRequest:
             field_dict["fields"] = fields
         if hierarchy is not UNSET:
             field_dict["hierarchy"] = hierarchy
+        if highlight is not UNSET:
+            field_dict["highlight"] = highlight
         if limit is not UNSET:
             field_dict["limit"] = limit
         if offset is not UNSET:
@@ -951,7 +947,9 @@ class GlobalStatefulQueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_evaluation import QueryEvaluation
         from ..models.query_hierarchy import QueryHierarchy
+        from ..models.query_highlight import QueryHighlight
         from ..models.query_request_aggregations import QueryRequestAggregations
         from ..models.query_request_embeddings import QueryRequestEmbeddings
         from ..models.query_request_foreign_sources import QueryRequestForeignSources
@@ -967,6 +965,13 @@ class GlobalStatefulQueryRequest:
 
         d = dict(src_dict)
         table = d.pop("table")
+
+        _evaluate = d.pop("evaluate", UNSET)
+        evaluate: QueryEvaluation | Unset
+        if isinstance(_evaluate, Unset):
+            evaluate = UNSET
+        else:
+            evaluate = QueryEvaluation.from_dict(_evaluate)
 
         _table_target = d.pop("table_target", UNSET)
         table_target: CatalogTableTarget | Unset
@@ -1740,6 +1745,13 @@ class GlobalStatefulQueryRequest:
         else:
             hierarchy = QueryHierarchy.from_dict(_hierarchy)
 
+        _highlight = d.pop("highlight", UNSET)
+        highlight: QueryHighlight | Unset
+        if isinstance(_highlight, Unset):
+            highlight = UNSET
+        else:
+            highlight = QueryHighlight.from_dict(_highlight)
+
         limit = d.pop("limit", UNSET)
 
         offset = d.pop("offset", UNSET)
@@ -1848,6 +1860,7 @@ class GlobalStatefulQueryRequest:
 
         global_stateful_query_request = cls(
             table=table,
+            evaluate=evaluate,
             table_target=table_target,
             query=query,
             full_text_search=full_text_search,
@@ -1863,6 +1876,7 @@ class GlobalStatefulQueryRequest:
             search_effort=search_effort,
             fields=fields,
             hierarchy=hierarchy,
+            highlight=highlight,
             limit=limit,
             offset=offset,
             timeout_ms=timeout_ms,

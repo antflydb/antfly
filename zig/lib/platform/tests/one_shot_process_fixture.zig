@@ -28,7 +28,7 @@ fn parent(init: std.process.Init) !supervisor.Outcome {
     while (iterator.next()) |argument| try arguments.append(init.gpa, argument);
     const timeout_ms = try std.fmt.parseUnsigned(u64, init.environ_map.get("FIXTURE_TIMEOUT_MS") orelse "1000", 10);
     const grace_ms = try std.fmt.parseUnsigned(u64, init.environ_map.get("FIXTURE_GRACE_MS") orelse "200", 10);
-    return try supervisor.runParent(init, arguments.items, .{ .timeout_ns = timeout_ms * std.time.ns_per_ms, .shutdown_grace_ns = grace_ms * std.time.ns_per_ms, .fingerprint = .{7} ** 32 });
+    return try supervisor.runParent(init, arguments.items, .{ .timeout_ns = timeout_ms * std.time.ns_per_ms, .shutdown_grace_ns = grace_ms * std.time.ns_per_ms, .fingerprint = @splat(7) });
 }
 
 fn announce(io: std.Io) !void {
@@ -54,7 +54,7 @@ fn child(init: std.process.Init) !void {
     const worker = try supervisor.Worker.create(init.gpa, init.io, init.environ_map);
     // Process exit keeps the independent monitor alive through all runtime
     // teardown. Pure allocation tests exercise explicit destroy separately.
-    worker.verifyFingerprint(if (std.mem.eql(u8, mode, "wrong_fingerprint")) .{8} ** 32 else .{7} ** 32) catch worker.finish(9);
+    worker.verifyFingerprint(if (std.mem.eql(u8, mode, "wrong_fingerprint")) @splat(8) else @splat(7)) catch worker.finish(9);
     try announce(init.io);
     if (std.mem.eql(u8, mode, "clean") or std.mem.eql(u8, mode, "clean_atexit")) worker.finish(0);
     if (std.mem.eql(u8, mode, "fail")) worker.finish(7);

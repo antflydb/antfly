@@ -225,11 +225,11 @@ const AntflyRerankingPlaygroundPage: React.FC = () => {
     const startTime = performance.now();
 
     try {
-      const prompts = searchResults.map((r) => r.text);
+      const documents = searchResults.map((r) => r.text);
       const raw = await fetch(inferenceUrl("rerank"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: selectedModel, query, prompts }),
+        body: JSON.stringify({ model: selectedModel, query, documents }),
       });
       if (!raw.ok) throw new Error(`Rerank failed: ${raw.status}`);
       const response: RerankResponse = await raw.json();

@@ -25,6 +25,8 @@ const schema = @import("../../pipelines/extraction_schema.zig");
 const targets = @import("boundary_targets.zig");
 const seeded = @import("../../graph/seeded_training.zig");
 const objectives = @import("boundary_train_objectives.zig");
+const distillation = @import("boundary_distillation.zig");
+const neck_fit = @import("boundary_distillation_fit.zig");
 const regex = @import("../../pipelines/extraction_regex.zig");
 const export_mod = @import("boundary_training_export.zig");
 const source_mod = @import("boundary_training_source.zig");
@@ -51,6 +53,23 @@ pub const Limits = struct {
     differentiation: seeded.Options = .{},
 };
 pub const DecisionEvents = @import("boundary_training_decisions.zig");
+pub const TeacherStates = distillation.TeacherStates;
+pub const Teacher = distillation.Teacher;
+pub const Distillation = struct {
+    teacher: Teacher,
+    weight: f32 = 1,
+    /// Also train the task heads on the rows' labels. Pure distillation
+    /// builds no head, so every head weight stays exactly as loaded.
+    heads: bool = false,
+    /// Fit the (identity) neck in closed form before the first update.
+    fit: neck_fit.Options = .{},
+    /// Borrowed diagnostics: sees each step's aligned student and teacher rows.
+    observer: ?distillation.Observer = null,
+    /// Encode the next microbatch's teacher states on this `Io` while the
+    /// current step runs. The prefetch is a cache: it never enters the
+    /// checkpoint or fingerprint, and a mismatched one is discarded.
+    prefetch: ?std.Io = null,
+};
 pub const Options = struct {
     /// Borrowed diagnostics over decisions already produced by the step.
     decision_observer: ?DecisionEvents.Observer = null,
@@ -72,7 +91,14 @@ pub const Options = struct {
     gold_hold_fraction: f32 = 0.15,
     require_gold_relation_coverage: bool = false,
     regex: regex.ContextOptions = .{},
+    /// Antenna feature distillation (boundary_distillation.zig).
+    distillation: ?Distillation = null,
     limits: Limits = .{},
+
+    pub fn stepObjectives(self: Options) step.Objectives {
+        const value = self.distillation orelse return .{};
+        return .{ .heads = value.heads, .distillation = true };
+    }
 };
 pub const Report = struct {
     epoch: u64,
@@ -205,6 +231,9 @@ pub const Trainer = struct {
     recomputed_future_host_bytes: usize = 0,
     order: []u32 = &.{},
     order_epoch: ?u64 = null,
+    prefetch: ?*Prefetch = null,
+    /// Microbatches whose teacher states came from a prefetch (diagnostics).
+    prefetched_microbatches: u64 = 0,
     fingerprint: [32]u8,
     resident_device_upper_bound_bytes: usize = 0,
     busy: std.atomic.Value(bool) = .init(false),
@@ -266,9 +295,13 @@ pub const Trainer = struct {
         self.run_plan = try run.Plan.init(run_config, source, .{ .train_sha256 = dataset.sha256, .schema_sha256 = dataset.schemas_sha256, .calibration_sha256 = options.calibration_sha256, .test_sha256 = options.test_sha256, .examples = std.math.cast(u32, dataset.index.len) orelse return error.BoundaryTrainingRunLimitExceeded }, options.limits.run);
         // Validate the actual schedule before reading or updating any batch.
         _ = try objectives.scales(config.head, .{ .optimizer_step = 0, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction });
-        inline for (std.meta.fields(objectives.Weights)) |field| {
-            const weight = @field(options.weights, field.name);
+        inline for (comptime std.meta.fieldNames(objectives.Weights)) |reflected_name| {
+            const weight = @field(options.weights, reflected_name);
             if (!std.math.isFinite(weight) or weight < 0) return error.InvalidBoundaryTrainingRun;
+        }
+        if (options.distillation) |value| {
+            // Recomputation regions end at the trunk, before the neck.
+            if (!std.math.isFinite(value.weight) or value.weight <= 0 or options.activation_profile != .retained_v1) return error.InvalidBoundaryTrainingRun;
         }
         var arena = std.heap.ArenaAllocator.init(host);
         defer arena.deinit();
@@ -288,6 +321,9 @@ pub const Trainer = struct {
             try parameters.append(scratch, .{ .name = descriptor.a_name, .canonical_name = descriptor.a_name, .dimensions = a_dims, .values = initialized.a, .kind = .adapter });
             try parameters.append(scratch, .{ .name = descriptor.b_name, .canonical_name = descriptor.b_name, .dimensions = b_dims, .values = initialized.b, .kind = .adapter });
             if (initialized.magnitude) |values| try parameters.append(scratch, .{ .name = descriptor.magnitude_name.?, .canonical_name = descriptor.magnitude_name.?, .dimensions = try scratch.dupe(i32, &.{@intCast(descriptor.target.out_dim)}), .values = values, .kind = .adapter });
+        };
+        if (options.distillation) |value| if (value.fit.rows != 0) {
+            try self.fitNeck(store, parameters.items, value, scratch, control);
         };
         const selected = try self.run_plan.selectParameters(scratch, parameters.items);
         const backend_limits = backend_mod.Limits{
@@ -361,15 +397,57 @@ pub const Trainer = struct {
             hash.update(@tagName(options.activation_profile));
             hash.update("\x00");
         }
-        const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = config, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
+        // The model serializes its pre-neck fields exactly as before the neck
+        // existed, so existing run fingerprints (and durable resumes) hold.
+        const model_settings = .{ .version = config.version, .architecture_version = config.architecture_version, .max_len = config.max_len, .backbone = config.backbone, .head = config.head, .encoder = config.encoder };
+        const settings = try std.json.Stringify.valueAlloc(scratch, .{ .model = model_settings, .capacities = options.capacities, .weights = options.weights, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction, .require_gold_relation_coverage = options.require_gold_relation_coverage, .word_splitter = options.processor.word_splitter, .validators = "native_python312_unicode15_v1" }, .{});
         hash.update(settings);
+        if (config.neck != .none) {
+            hash.update("\x00neck\x00");
+            hash.update(@tagName(config.neck));
+            hash.update("\x00");
+        }
+        if (options.distillation) |value| {
+            hash.update("\x00distillation.zspace_mse.v1\x00");
+            hash.update(&value.teacher.identity);
+            hash.update(std.mem.asBytes(&value.weight));
+            hash.update(&.{@intFromBool(value.heads)});
+            if (value.fit.rows != 0) {
+                hash.update("\x00neck_fit.ridge_normal_equations.v1\x00");
+                hash.update(std.mem.asBytes(&value.fit.rows));
+                hash.update(std.mem.asBytes(&value.fit.ridge));
+            }
+        }
         self.fingerprint = hash.finalResult();
         var processor_options = options.processor;
         processor_options.control = control;
         var target_options = options.limits.step.targets;
         target_options.gold_capacity = options.capacities.gold_per_query orelse config.head.max_gold_per_query;
+        target_options.allow_unsupervised = options.distillation != null;
         try dataset.preflight(tokenizer, processor_options, target_options, control, null);
         try check(control);
+    }
+
+    /// Replaces the identity neck in `parameters` (borrowed source values) with
+    /// its closed-form fit; the optimizer copies the fitted values.
+    fn fitNeck(self: *Trainer, store: *native.WeightStore, parameters: []run.Parameter, value: Distillation, scratch: Allocator, control: ?Control) !void {
+        const config = self.model_config;
+        if (config.neck != .linear or self.options.peft != null) return error.InvalidBoundaryNeckFit;
+        const h = config.encoder.hidden_size;
+        var weight_index: ?usize = null;
+        var bias_index: ?usize = null;
+        for (parameters, 0..) |parameter, index| {
+            if (std.mem.eql(u8, parameter.name, model.neck_prefix ++ ".weight")) weight_index = index;
+            if (std.mem.eql(u8, parameter.name, model.neck_prefix ++ ".bias")) bias_index = index;
+        }
+        const w = weight_index orelse return error.InvalidBoundaryNeckFit;
+        const b = bias_index orelse return error.InvalidBoundaryNeckFit;
+        try neck_fit.requireIdentity(parameters[w].values, parameters[b].values, h);
+        var fitted = try neck_fit.fit(self.host_budget.allocator(), .{ .store = store, .config = config, .dataset = self.dataset, .tokenizer = self.tokenizer, .processor = self.options.processor, .batch_size = self.options.run.batch_size, .execution = self.options.execution, .encoder_limits = self.options.limits.step.encoder }, value.teacher, value.fit, control);
+        defer fitted.deinit();
+        std.log.info("Antenna neck fit: rows={d} explained_variance={d:.4}", .{ fitted.rows, fitted.r2 });
+        parameters[w].values = try scratch.dupe(f32, fitted.weight);
+        parameters[b].values = try scratch.dupe(f32, fitted.bias);
     }
 
     fn initializeAdapterLayout(self: *const Trainer, a: Allocator, source: bundle.Identity, config: peft.Config, original: []const run.Parameter) !adapters.Layout {
@@ -388,6 +466,7 @@ pub const Trainer = struct {
 
     pub fn deinit(self: *Trainer) void {
         std.debug.assert(!self.busy.load(.acquire));
+        self.discardPrefetch();
         const a = self.host_budget.allocator();
         if (self.plan) |*plan| plan.deinit();
         self.validators.deinit();
@@ -433,6 +512,7 @@ pub const Trainer = struct {
         if (self.plan) |*plan| plan.deinit();
         self.plan = null;
         self.plan_key = null;
+        self.discardPrefetch();
         self.host_budget.allocator().free(self.order);
         self.order = &.{};
         self.order_epoch = null;
@@ -527,19 +607,30 @@ pub const Trainer = struct {
             self.validators.options.match_options.control = null;
         }
         const a = self.host_budget.allocator();
-        if (self.order_epoch != pos.epoch) {
-            a.free(self.order);
-            self.order = &.{};
-            self.order_epoch = null;
-            self.order = try self.run_plan.epochOrder(a, pos.epoch, control);
-            self.order_epoch = pos.epoch;
+        // The microbatch and its teacher states come from the prefetch when
+        // it was loaded for this position, else they are loaded here.
+        var batch: Microbatch = undefined;
+        var teacher_states: ?TeacherStates = null;
+        defer if (teacher_states) |*states| states.deinit();
+        if (self.takePrefetch(pos)) |prefetched| {
+            // Join before taking the batch: the worker borrows its items and
+            // prepared batch until the encode returns.
+            const encoded = prefetched.future.await(prefetched.io);
+            batch = prefetched.batch;
+            a.destroy(prefetched);
+            errdefer batch.deinit();
+            teacher_states = try encoded;
+        } else {
+            batch = try self.loadMicrobatch(a, pos, control);
+            errdefer batch.deinit();
+            if (self.options.distillation) |value| teacher_states = try value.teacher.encode(value.teacher.ptr, a, batch.inputs, &batch.prepared, control);
         }
-        const samples = try a.alloc(data.Sample, pos.count);
-        var initialized: usize = 0;
-        defer {
-            for (samples[0..initialized]) |*sample| sample.deinit();
-            a.free(samples);
-        }
+        defer batch.deinit();
+        const schemas = batch.schemas;
+        const annotations = batch.annotations;
+        const prepared = &batch.prepared;
+        // Overlap the next microbatch's teacher encode with this step.
+        self.startPrefetch(a, control);
         var caller_budget = Budget{ .backing = a, .limit = self.options.limits.max_recomputed_batch_scratch_bytes };
         var caller_observer = MemoryObserver{ .failures = &self.memory_failures, .domain = .host };
         caller_observer.attach(&caller_budget);
@@ -548,22 +639,8 @@ pub const Trainer = struct {
         var arena = std.heap.ArenaAllocator.init(if (self.options.activation_profile == .layer_recompute_v1) caller_budget.allocator() else a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const schemas = try scratch.alloc(*const schema.CompiledSchema, pos.count);
-        const annotations = try scratch.alloc(targets.Annotations, pos.count);
-        const inputs = try scratch.alloc(processor.Item, pos.count);
-        for (samples, schemas, annotations, inputs, self.order[pos.offset..][0..pos.count]) |*sample, *s, *annotation, *input, index| {
-            sample.* = try self.dataset.sample(index, control, null);
-            initialized += 1;
-            s.* = &sample.schema;
-            annotation.* = sample.annotations;
-            input.* = .{ .text = sample.row.text, .schema = &sample.schema };
-        }
-        var processor_options = self.options.processor;
-        processor_options.control = control;
-        var prepared = try processor.prepare(a, self.tokenizer, inputs, processor_options);
-        defer prepared.deinit();
         self.memory_failures.begin(.graph_preparation);
-        try self.ensurePlan(&prepared, schemas, control);
+        try self.ensurePlan(prepared, schemas, control);
         self.memory_failures.begin(.batch_preparation);
         const plan = &self.plan.?;
         const instruction_control_readback_upper_bound = try plan.instructionControlReadbackUpperBound();
@@ -574,7 +651,7 @@ pub const Trainer = struct {
         const negative_draws = try scratch.alloc(f32, @as(usize, plan.encoder.layout.batch) * plan.encoder.layout.queries);
         var negative_rng = run.Random.init(self.run_plan.config.seed, identity.microbatch_step, "negative_queries");
         for (negative_draws) |*value| value.* = negative_rng.uniform();
-        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage };
+        const context = step.StepContext{ .decision_observer = self.options.decision_observer, .identity = .{ .binding = self.fingerprint, .optimizer_step = identity.optimizer_step, .microbatch = identity.microbatch_step }, .replay = .{ .seed = self.run_plan.config.seed, .micro_batch = identity.microbatch_step }, .progress = .{ .optimizer_step = identity.optimizer_step, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = self.options.gold_start, .gold_end = self.options.gold_end, .gold_hold_fraction = self.options.gold_hold_fraction }, .weights = self.options.weights, .injection_draws = draws, .negative_query_draws = negative_draws, .require_gold_relation_coverage = self.options.require_gold_relation_coverage, .distillation = if (teacher_states) |states| .{ .text = states.text, .queries = states.queries, .classifications = states.classifications, .parents = states.parents, .weight = self.options.distillation.?.weight, .observer = self.options.distillation.?.observer } else null };
         var result = blk: {
             self.memory_failures.begin(.forward_backward);
             var bindings = try self.optimizer.bind(plan.graph, control);
@@ -588,7 +665,7 @@ pub const Trainer = struct {
                 break :combine all;
             };
             try self.checkRecomputedHost();
-            break :blk try plan.run(&self.cb, parameters, &prepared, schemas, annotations, context, control);
+            break :blk try plan.run(&self.cb, parameters, prepared, schemas, annotations, context, control);
         };
         var result_live = true;
         defer if (result_live) result.deinit(&self.cb);
@@ -621,7 +698,7 @@ pub const Trainer = struct {
                     .tensor = if (route.kind != .absent) if (route.gradient_index) |index| result.backward.gradients.outputs[index] else null else null,
                     .elements = slot.weights.len,
                 };
-                try observe(fixture.observer_context, .{ .backend = &self.cb, .prepared = &prepared, .result = &result, .gradients = gradients, .optimizer_loss = optimizer_loss, .zero_loss_fallback = zero_loss_fallback });
+                try observe(fixture.observer_context, .{ .backend = &self.cb, .prepared = prepared, .result = &result, .gradients = gradients, .optimizer_loss = optimizer_loss, .zero_loss_fallback = zero_loss_fallback });
             };
         }
         var gradient_control_bytes: usize = 0;
@@ -670,6 +747,142 @@ pub const Trainer = struct {
         return .{ .epoch = pos.epoch, .batch = pos.batch, .examples = pos.count, .terms = terms, .coverage = coverage, .optimizer = updated, .decision_fingerprint = decisions, .host_peak_bytes = self.host_budget.peak, .backend_peak_bytes = self.backend_budget.peak, .resident_device_upper_bound_bytes = self.resident_device_upper_bound_bytes, .transfers = transfers, .resident_gradient_control_bytes = gradient_control_bytes, .resident_instruction_control_readback_upper_bound_bytes = instruction_control_readback_upper_bound, .zero_loss_fallback = zero_loss_fallback };
     }
 
+    /// One microbatch's samples, schemas, annotations, items and prepared
+    /// student batch. The items borrow the samples; a teacher borrows the
+    /// items and the prepared batch.
+    const Microbatch = struct {
+        allocator: Allocator,
+        position: run.Position,
+        samples: []data.Sample,
+        schemas: []*const schema.CompiledSchema,
+        annotations: []targets.Annotations,
+        inputs: []processor.Item,
+        prepared: processor.PreparedBatch,
+
+        fn deinit(self: *Microbatch) void {
+            self.prepared.deinit();
+            for (self.samples) |*sample| sample.deinit();
+            self.allocator.free(self.samples);
+            self.allocator.free(self.schemas);
+            self.allocator.free(self.annotations);
+            self.allocator.free(self.inputs);
+            self.* = undefined;
+        }
+
+        fn matches(self: *const Microbatch, pos: run.Position) bool {
+            return self.position.epoch == pos.epoch and self.position.offset == pos.offset and self.position.count == pos.count;
+        }
+    };
+
+    /// The next microbatch, loaded while the current step runs, with its
+    /// teacher encode in flight on `io`. Never part of checkpoint state.
+    const Prefetch = struct {
+        io: std.Io,
+        batch: Microbatch,
+        future: std.Io.Future(anyerror!TeacherStates),
+    };
+
+    fn loadMicrobatch(self: *Trainer, a: Allocator, pos: run.Position, control: ?Control) !Microbatch {
+        if (self.order_epoch != pos.epoch) {
+            a.free(self.order);
+            self.order = &.{};
+            self.order_epoch = null;
+            self.order = try self.run_plan.epochOrder(a, pos.epoch, control);
+            self.order_epoch = pos.epoch;
+        }
+        const samples = try a.alloc(data.Sample, pos.count);
+        var initialized: usize = 0;
+        errdefer {
+            for (samples[0..initialized]) |*sample| sample.deinit();
+            a.free(samples);
+        }
+        const schemas = try a.alloc(*const schema.CompiledSchema, pos.count);
+        errdefer a.free(schemas);
+        const annotations = try a.alloc(targets.Annotations, pos.count);
+        errdefer a.free(annotations);
+        const inputs = try a.alloc(processor.Item, pos.count);
+        errdefer a.free(inputs);
+        for (samples, schemas, annotations, inputs, self.order[pos.offset..][0..pos.count]) |*sample, *s, *annotation, *input, index| {
+            sample.* = try self.dataset.sample(index, control, null);
+            initialized += 1;
+            s.* = &sample.schema;
+            annotation.* = sample.annotations;
+            input.* = .{ .text = sample.row.text, .schema = &sample.schema };
+        }
+        var processor_options = self.options.processor;
+        processor_options.control = control;
+        const prepared = try processor.prepare(a, self.tokenizer, inputs, processor_options);
+        return .{ .allocator = a, .position = pos, .samples = samples, .schemas = schemas, .annotations = annotations, .inputs = inputs, .prepared = prepared };
+    }
+
+    /// The position the next call will load items for, assuming this call's
+    /// microbatch is submitted: null at the run's end (including a final
+    /// partial flush or `max_optimizer_steps`).
+    fn predictedNext(self: *const Trainer) ?run.Position {
+        const identity = self.optimizer.identity();
+        const accumulated = self.optimizer.owner.accum_count + 1;
+        const stepped = accumulated == self.run_plan.config.accumulation;
+        var following = controller.Identity{ .optimizer_step = identity.optimizer_step + @intFromBool(stepped), .microbatch_step = identity.microbatch_step + 1 };
+        var accum: u32 = if (stepped) 0 else @intCast(accumulated);
+        var pos = self.run_plan.position(following, accum) catch return null;
+        if (pos.requires_flush) {
+            following.optimizer_step += 1;
+            accum = 0;
+            pos = self.run_plan.position(following, accum) catch return null;
+        }
+        if (pos.complete or pos.count == 0) return null;
+        return pos;
+    }
+
+    fn encodeTeacher(teacher: Teacher, a: Allocator, inputs: []const processor.Item, prepared: *const processor.PreparedBatch) anyerror!TeacherStates {
+        return teacher.encode(teacher.ptr, a, inputs, prepared, null);
+    }
+
+    /// Loads the predicted next microbatch on this thread (borrowing this
+    /// call's control) and starts its teacher encode concurrently. Any
+    /// failure only skips the prefetch; the next call loads synchronously.
+    fn startPrefetch(self: *Trainer, a: Allocator, control: ?Control) void {
+        const value = self.options.distillation orelse return;
+        const io = value.prefetch orelse return;
+        std.debug.assert(self.prefetch == null);
+        const pos = self.predictedNext() orelse return;
+        const prefetch = a.create(Prefetch) catch return;
+        prefetch.* = .{ .io = io, .batch = self.loadMicrobatch(a, pos, control) catch {
+            a.destroy(prefetch);
+            return;
+        }, .future = undefined };
+        prefetch.future = io.concurrent(encodeTeacher, .{ value.teacher, a, prefetch.batch.inputs, &prefetch.batch.prepared }) catch {
+            prefetch.batch.deinit();
+            a.destroy(prefetch);
+            return;
+        };
+        self.prefetch = prefetch;
+    }
+
+    /// The pending prefetch when it was loaded for `pos`; any other is
+    /// discarded (a retried step, a restore, or a misprediction).
+    fn takePrefetch(self: *Trainer, pos: run.Position) ?*Prefetch {
+        const prefetch = self.prefetch orelse return null;
+        if (!prefetch.batch.matches(pos)) {
+            self.discardPrefetch();
+            return null;
+        }
+        self.prefetch = null;
+        self.prefetched_microbatches += 1;
+        return prefetch;
+    }
+
+    fn discardPrefetch(self: *Trainer) void {
+        const prefetch = self.prefetch orelse return;
+        self.prefetch = null;
+        if (prefetch.future.cancel(prefetch.io)) |states| {
+            var owned = states;
+            owned.deinit();
+        } else |_| {}
+        prefetch.batch.deinit();
+        self.host_budget.allocator().destroy(prefetch);
+    }
+
     fn ensurePlan(self: *Trainer, prepared: *const processor.PreparedBatch, schemas: []const *const schema.CompiledSchema, control: ?Control) !void {
         try check(control);
         const a = self.host_budget.allocator();
@@ -701,10 +914,11 @@ pub const Trainer = struct {
         var step_limits = self.options.limits.step;
         step_limits.targets.regex_context = &self.validators;
         step_limits.targets.validate_value_fn = regex.Context.validateValue;
+        step_limits.targets.allow_unsupervised = self.options.distillation != null;
         step_limits.recomputation.max_backend_bytes = @min(step_limits.recomputation.max_backend_bytes, self.options.limits.max_backend_bytes);
         step_limits.recomputation.max_host_bytes = @min(step_limits.recomputation.max_host_bytes, try std.math.add(usize, self.options.source_reserved_bytes, self.options.limits.max_host_bytes));
         const arithmetic: step.AttentionArithmetic = if (self.options.execution == .resident_cuda and self.options.attention_profile == .materialized_v1) .pytorch_fp32 else .scale_after_sum;
-        var plan = try step.buildWithTrainingArithmetic(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, step_limits);
+        var plan = try step.buildWithObjectives(a, self.model_config, prepared, schemas, self.options.capacities, .training, self.options.attention_profile, self.options.activation_profile, .{ .encoder = arithmetic, .boundary = if (self.options.execution == .resident_cuda and self.backend.cuda_backend.?.boundary_attention != null) .cuda_fused_d32_v1 else .materialized_v1, .prefix = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .tree_v1, .score = if (self.options.execution == .resident_cuda) .pytorch_sequential_v1 else .grouped_v1, .candidate_features = if (self.options.execution == .resident_cuda) .cuda_pytorch_v1 else .host_v1, .input_gradients = if (self.options.execution == .resident_cuda) .pytorch_v2 else .grouped_v1, .gather = if (self.options.execution == .resident_cuda) .pytorch_gather_v1 else .serial_v1, .sigmoid = if (self.options.execution == .resident_cuda) .pytorch_saved_v1 else .decomposed_v1, .record = if (self.options.execution == .resident_cuda) .pytorch_batch_v1 else .per_group_v1 }, self.options.stepObjectives(), step_limits);
         errdefer plan.deinit();
         if (self.options.execution == .resident_cuda) try plan.enableCudaTrainingFusion();
         if (self.adapter_layout) |adapter_layout| {
@@ -845,6 +1059,9 @@ fn gradientRoute(plan: *const step.Plan, result: *const step.StepResult, name: [
         route = .{ .kind = presence.kind, .gradient_index = std.mem.indexOfScalar(ml.NodeId, result.backward.parameter_ids, presence.parameter) };
         if (route.kind == .computed and route.gradient_index == null) return error.MissingBoundaryTrainingGradient;
     }
-    if (route.kind == .absent and step.isTouchParameter(name, plan.config.head)) route.kind = .computed_zero;
+    // Upstream touches the optional record and relation heads with a zero
+    // loss. A plan without heads touches nothing, so they stay absent (and
+    // untouched by weight decay).
+    if (route.kind == .absent and plan.objectives.heads and step.isTouchParameter(name, plan.config.head)) route.kind = .computed_zero;
     return route;
 }

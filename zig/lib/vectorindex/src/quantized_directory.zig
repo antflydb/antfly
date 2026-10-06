@@ -71,7 +71,7 @@ const ReorderedLeaf = struct {
         return .{ .set = reordered, .members = ids, .projections = values, .plan_bytes = encoded };
     }
 
-    fn deinit(self: *ReorderedLeaf, alloc: Allocator) void {
+    pub fn deinit(self: *ReorderedLeaf, alloc: Allocator) void {
         self.set.deinit(alloc);
         alloc.free(self.members);
         alloc.free(self.projections);
@@ -136,7 +136,7 @@ pub const AdmissionStats = struct {
         self.observeLeaf(count, .{ .unfiltered = scan_bytes, .filtered = scan_bytes });
     }
 
-    pub fn observeLeaf(self: *AdmissionStats, count: usize, scan_bytes: ScanBytes) void {
+    pub fn observeLeaf(self: *AdmissionStats, count: u64, scan_bytes: ScanBytes) void {
         self.max_leaf_vectors = @max(self.max_leaf_vectors, @as(u64, @intCast(count)));
         self.max_unfiltered_scan_bytes = @max(self.max_unfiltered_scan_bytes, scan_bytes.unfiltered);
         self.max_filtered_scan_bytes = @max(self.max_filtered_scan_bytes, scan_bytes.filtered);
@@ -840,7 +840,7 @@ pub const View = struct {
 
     pub fn asProto(self: View) proto.RaBitQuantizedVectorSet {
         return .{
-            .metric = @enumFromInt(self.metric),
+            .metric = @fromBackingInt(self.metric),
             .centroid = @constCast(self.centroid),
             .codes = .{
                 .count = @intCast(self.count),
@@ -1322,7 +1322,7 @@ const TestingSink = struct {
     alloc: Allocator,
     out: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn deinit(self: *TestingSink) void {
+    pub fn deinit(self: *TestingSink) void {
         self.out.deinit(self.alloc);
     }
 

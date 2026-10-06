@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
-const catalog = @import("../catalog.zig");
+const catalog = @import("catalog.zig");
 const host = @import("../host.zig");
 const state_machine = @import("../state_machine/mod.zig");
 const storage_mod = @import("mod.zig");
@@ -94,6 +94,9 @@ pub const WalReplicaProvider = struct {
                 .vtable = &.{
                     .persist_ready = persistReady,
                     .persist_ready_diagnostics = persistReadyWithDiagnostics,
+                    .begin_ready = beginReady,
+                    .begin_maintenance = beginMaintenance,
+                    .begin_compact_snapshot = beginCompactSnapshot,
                     .compact_snapshot = compactSnapshot,
                     .compact_snapshot_artifact = compactSnapshotArtifact,
                     .retire_group = retireGroup,
@@ -149,7 +152,8 @@ pub const WalReplicaProvider = struct {
         errdefer self.base_factory.freeDescriptor(self.alloc, &desc);
         try state.seedConfStateIfEmpty(desc.initial_voters orelse desc.group.raft_config.peers);
         desc.group.storage = state.storage();
-        desc.group.raft_config.applied = state.appliedIndex();
+        desc.group.raft_config.applied = state.completedAppliedIndex();
+        desc.recover_persisted_snapshot = state.completedAppliedIndex() < state.store.snapshot_state.metadata.index;
         return desc;
     }
 
@@ -167,6 +171,24 @@ pub const WalReplicaProvider = struct {
         const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
         const state = self.states.get(group_id) orelse return error.UnknownGroup;
         try state.groupStorage().persistReady(group_id, ready);
+    }
+
+    fn beginReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready, wake: ?raft_engine.runtime.storage_iface.PersistenceWake) !?raft_engine.runtime.storage_iface.PendingReadyPersistence {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        return try state.groupStorage().vtable.begin_ready.?(state, group_id, ready, wake);
+    }
+
+    fn beginMaintenance(ptr: *anyopaque, group_id: u64, admission: *raft_engine.runtime.storage_iface.PersistenceAdmission, wake: ?raft_engine.runtime.storage_iface.PersistenceWake) !?raft_engine.runtime.storage_iface.PendingReadyPersistence {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        return try state.groupStorage().vtable.begin_maintenance.?(state, group_id, admission, wake);
+    }
+
+    fn beginCompactSnapshot(ptr: *anyopaque, group_id: u64, metadata: raft_engine.core.types.SnapshotMetadata, payload: raft_engine.runtime.storage_iface.SnapshotMaterialization, compact_index: u64, admission: *raft_engine.runtime.storage_iface.PersistenceAdmission, wake: ?raft_engine.runtime.storage_iface.PersistenceWake) !?raft_engine.runtime.storage_iface.PendingReadyPersistence {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        const state = self.states.get(group_id) orelse return error.UnknownGroup;
+        return try state.groupStorage().vtable.begin_compact_snapshot.?(state, group_id, metadata, payload, compact_index, admission, wake);
     }
 
     fn persistReadyWithDiagnostics(

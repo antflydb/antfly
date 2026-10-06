@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
         }
         if (artifact.root_module.root_source_file) |source| switch (source) {
             .src_path => |path| {
-                if (artifact.kind.isTest() and artifact.filters.len == 0 and std.mem.endsWith(u8, path.sub_path, "/storage/lmdb.zig")) {
+                if (artifact.kind.isTest() and artifact.filters.len == 0 and std.mem.endsWith(u8, path.sub_path, "lib/lmdb/src/lmdb.zig")) {
                     artifact.root_module.root_source_file = b.addWriteFiles().add("lmdb_test.zig",
                         \\test "LMDB cache probe" {
                         \\    const lmdb = @import("lmdb_engine");
@@ -84,8 +84,13 @@ pub fn build(b: *std.Build) void {
                     b.step("cache-lmdb-tests", "Exercise actual LMDB consumer imports and options").dependOn(&b.addRunArtifact(artifact).step);
                     lmdb_test_found = true;
                 }
-                if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig")) {
-                    // Keep the actual API test's imports, flags, and runner.
+                if (artifact.kind.isTest() and std.mem.eql(u8, artifact.name, "test") and
+                    artifact.test_runner != null and artifact.test_runner.?.mode == .simple and
+                    std.mem.endsWith(u8, path.sub_path, "/api_http_runtime_test_root.zig"))
+                {
+                    // Several artifacts share this root module. Select the owning
+                    // API suite before mutating it; pointer-hash iteration must
+                    // not choose a different runner or compiler profile per build.
                     artifact.root_module.root_source_file = sources.add("vopr_test.zig",
                         \\test "VOPR cache probe" {
                         \\    const revision = @import("vopr").cache_test_revision;
@@ -111,7 +116,7 @@ pub fn build(b: *std.Build) void {
             // yacc-zig also has an installed, product-configured executable.
             // Select the instance actually used for SQL generation.
             if (std.mem.eql(u8, name, "yacc-zig") and !isSqlGenerator(b, artifact)) continue;
-            if (artifact.root_module.optimize != .ReleaseSafe or
+            if (artifact.root_module.optimize != .safe or
                 !artifact.root_module.resolved_target.?.query.eql(b.graph.host.query))
                 std.debug.panic("{s} inherits product configuration", .{name});
             if (artifact.root_module.import_table.contains("build_options"))
@@ -135,8 +140,8 @@ pub fn build(b: *std.Build) void {
     wasm.root_module.root_source_file = sources.add("wasm_profile.zig",
         \\export fn profile_ok() void {
         \\    comptime {
-        \\        if (@import("httpx_profile").cache_test_profile != .ReleaseSafe or
-        \\            @import("json_profile").cache_test_profile != .ReleaseSafe)
+        \\        if (@import("httpx_profile").cache_test_profile != .safe or
+        \\            @import("json_profile").cache_test_profile != .safe)
         \\            @compileError("WASM dependencies must use ReleaseSafe");
         \\    }
         \\}
@@ -169,9 +174,18 @@ pub fn build(b: *std.Build) void {
         b.step(probe[0], "Read actual configured backend options").dependOn(&b.addRunArtifact(executable).step);
     }
     inline for (std.meta.tags(runtime.RuntimeLibraryUnit)) |unit| {
-        const artifact = artifacts.runtime.runtime_library_artifacts[@intFromEnum(unit)].?;
+        const artifact = artifacts.runtime.runtime_library_artifacts[@backingInt(unit)].?;
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+        if (unit != .inference) {
+            var identity_seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+            if (inferenceIdentityPath(b, artifact.root_module, &identity_seen, @tagName(unit))) |path|
+                std.debug.panic("{s} archive depends on inference backend identity through {s}", .{ @tagName(unit), path });
+        }
         inspect(artifact.root_module, unit, artifacts.inference.build_info_object, &seen);
+        if (unit == .inference) profiles.addObservabilityProbe(
+            artifact.root_module,
+            artifact.root_module.import_table.get("inference_server").?,
+        );
         if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/storage/lite/capabilities.zig"),
             .target = artifact.root_module.resolved_target,
@@ -181,16 +195,26 @@ pub fn build(b: *std.Build) void {
         const expression = if (unit == .api_kernel)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ std.hash.Wyhash.hash(0, specs.ard) ^ std.hash.Wyhash.hash(0, specs.antfly) ^ " ++
                 "std.hash.Wyhash.hash(0, specs.metadata) ^ std.hash.Wyhash.hash(0, specs.extensions) ^ " ++
-                "std.hash.Wyhash.hash(0, specs.auth) ^ std.hash.Wyhash.hash(0, specs.inference_config)"
+                "std.hash.Wyhash.hash(0, specs.auth) ^ std.hash.Wyhash.hash(0, specs.inference_config) ^ " ++
+                "ownerRevision(@import(\"antfly_mcp\")) ^ (ownerRevision(@import(\"antfly_a2a\")) << 8) ^ (ownerRevision(@import(\"raft_engine\")) << 16)"
         else if (unit == .inference)
-            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @sizeOf(@import(\"inference_server\").execution_control.Cancellation)"
+            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @sizeOf(@import(\"inference_server\").execution_control.Cancellation) ^ " ++
+                "observabilityRevision(@import(\"cache_prometheus\")) ^ (observabilityRevision(@import(\"cache_structlog\")) << 8)"
         else if (unit == .distributed)
-            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime)"
+            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime) ^ ownerRevision(@import(\"raft_engine\"))"
+        else if (unit == .storage_kernel)
+            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ ownerRevision(@import(\"raft_engine\"))"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
+        const declarations = switch (unit) {
+            .api_kernel => "const specs = @import(\"antfly_openapi_specs\");\n" ++ profiles.owner_probe_source,
+            .distributed, .storage_kernel => profiles.owner_probe_source,
+            .inference => profiles.observability_probe_source,
+            else => "",
+        };
         artifact.root_module.root_source_file = sources.add(b.fmt("{s}.zig", .{@tagName(unit)}), b.fmt(
             "const std = @import(\"std\");\n{s}export fn probe_{s}() u64 {{ return {s}; }}\n",
-            .{ if (unit == .api_kernel) "const specs = @import(\"antfly_openapi_specs\");\n" else "", @tagName(unit), expression },
+            .{ declarations, @tagName(unit), expression },
         ));
         artifact.step.max_rss = 0;
     }
@@ -247,6 +271,18 @@ pub fn build(b: *std.Build) void {
     }
 }
 
+fn inferenceIdentityPath(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void), path: []const u8) ?[]const u8 {
+    if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return null;
+    var imports = module.import_table.iterator();
+    while (imports.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const next = b.fmt("{s}/{s}", .{ path, name });
+        if (std.mem.eql(u8, name, "metal_jit_identity") or std.mem.eql(u8, name, "cuda_jit_identity")) return next;
+        if (inferenceIdentityPath(b, entry.value_ptr.*, seen, next)) |found| return found;
+    }
+    return null;
+}
+
 fn findSourceModule(module: *std.Build.Module, suffix: []const u8, seen: *std.AutoHashMap(*std.Build.Module, void)) ?*std.Build.Module {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return null;
     if (module.root_source_file) |source| switch (source) {
@@ -263,7 +299,7 @@ fn findSourceModule(module: *std.Build.Module, suffix: []const u8, seen: *std.Au
 
 fn inspectWasmProfile(module: *std.Build.Module, target: std.Build.ResolvedTarget, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
-    if (module.optimize) |optimize| if (optimize != .ReleaseSafe) @panic("WASM module inherits native optimization");
+    if (module.optimize) |optimize| if (optimize != .safe) @panic("WASM module inherits native optimization");
     if (module.resolved_target) |actual| {
         if (!std.Target.Query.fromTarget(&actual.result).eql(std.Target.Query.fromTarget(&target.result)))
             @panic("WASM module inherits a foreign runtime target");

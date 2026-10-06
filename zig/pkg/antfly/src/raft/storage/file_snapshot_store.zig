@@ -16,8 +16,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const http_server = @import("../transport/http_server.zig");
 const snapshot_transfer = @import("../transport/snapshot_transfer.zig");
 const raft_engine = @import("raft_engine");
@@ -86,7 +86,7 @@ pub const FileSnapshotStore = struct {
     cfg: FileSnapshotStoreConfig,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
-    upload_locks: [1024]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 1024,
+    upload_locks: [1024]std.atomic.Mutex = @as([1024]std.atomic.Mutex, @splat(.unlocked)),
     artifact_ledger_mutex: std.atomic.Mutex = .unlocked,
     artifact_usage: ArtifactUsage = .{},
     artifact_reserved: ArtifactUsage = .{},
@@ -1786,7 +1786,9 @@ test "active chunked fetch lease fences committed artifact expiry" {
         .root_dir = root_dir,
         .artifact_policy = .{
             .committed_ttl_ns = std.time.ns_per_ms,
-            .active_fetch_lease_ns = 20 * std.time.ns_per_ms,
+            // Control lease expiry explicitly below. A 20 ms lease can expire
+            // while the CI runner is descheduled waiting for maintenance.
+            .active_fetch_lease_ns = std.math.maxInt(u64),
         },
     });
     defer store.deinit();
@@ -1833,8 +1835,15 @@ test "active chunked fetch lease fences committed artifact expiry" {
     defer std.testing.allocator.free(chunk);
     try std.testing.expectEqualStrings(body, chunk);
 
-    // An abandoned fetch eventually becomes reclaimable again.
-    try store.io().sleep(.fromMilliseconds(25), .awake);
+    // An abandoned fetch becomes reclaimable once its recorded deadline has
+    // passed. Drive that transition without depending on scheduler timing.
+    {
+        platform_sync.lockYielding(&store.fetch_lease_mutex);
+        defer store.fetch_lease_mutex.unlock();
+        const lease = store.fetch_leases.getPtr("leased") orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(std.math.maxInt(u64), lease.deadline_ns);
+        lease.deadline_ns = 0;
+    }
     maintenance_runs = store.artifactUsageSnapshot().maintenance_runs;
     store.requestArtifactMaintenance();
     try waitForArtifactMaintenance(&store, maintenance_runs);

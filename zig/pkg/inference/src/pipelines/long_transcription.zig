@@ -247,7 +247,7 @@ const FakeTranscriber = struct {
     text: []const u8 = "hello",
     language: ?[]const u8 = "en",
     /// Prefix length observed on each call, for conditioning assertions.
-    prefix_lens: [8]usize = [_]usize{0} ** 8,
+    prefix_lens: [8]usize = @as([8]usize, @splat(0)),
     /// When set, every result carries two timed phrases instead of plain text.
     timed: bool = false,
     /// Copied, because the window result that carried the code is freed

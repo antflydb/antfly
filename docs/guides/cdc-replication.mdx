@@ -14,11 +14,15 @@ order: 6
 
 ## The Result
 
+The authenticated examples use `ANTFLY_ADMIN_PASSWORD` for your provisioned
+administrator credential. See [secure deployment](https://github.com/antflydb/antfly/blob/main/docs/auth.md#secure-deployment)
+for setup; do not use the legacy `admin:admin` password.
+
 Every insert, update, and delete on a PostgreSQL table lands in an Antfly table without a sync job or a daemon in between. Antfly subscribes to PostgreSQL logical replication, backfills the existing rows, then follows the stream. Nothing changes in the application that writes to PostgreSQL. The table is created with a replication source, and rows can be read back from Antfly as soon as they land:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "replication_sources": [
@@ -33,7 +37,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
 ```
 
 ```bash
-curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u admin:admin
+curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u "admin:${ANTFLY_ADMIN_PASSWORD}"
 ```
 
 ```json
@@ -80,7 +84,7 @@ The DSN carries a password, so it goes in the secret store and the table config 
 
 ```bash
 curl -X PUT http://127.0.0.1:8080/db/v1/secrets/pg_dsn \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{"value": "postgres://antfly:secret@pg-host:5432/mydb?sslmode=require"}'
 ```
@@ -104,7 +108,7 @@ The Antfly table, with a `replication_sources` block naming it:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
-  -u admin:admin \
+  -u "admin:${ANTFLY_ADMIN_PASSWORD}" \
   -H "Content-Type: application/json" \
   -d '{
     "replication_sources": [
@@ -121,7 +125,7 @@ curl -X POST http://127.0.0.1:8080/db/v1/tables/users \
 Antfly creates a replication slot and a publication, snapshots the rows already in the table through the normal batch path, then polls the slot for changes. The source's `status.phase` in the table detail moves from `snapshot` to `streaming`:
 
 ```bash
-curl -s http://127.0.0.1:8080/db/v1/tables/users -u admin:admin
+curl -s http://127.0.0.1:8080/db/v1/tables/users -u "admin:${ANTFLY_ADMIN_PASSWORD}"
 ```
 
 Three failures show up here. `status.last_error` names the Antfly error, such as `ForeignQueryFailed`; PostgreSQL's own message is in the Antfly log. `permission denied to create replication slot` means the user lacks `REPLICATION` (or the managed-service role); pre-create the slot and pass `slot_name`. `publication does not exist` means the user cannot create publications; have the table owner create one and pass `publication_name`. `wal_level is not logical` means step 1 did not take effect, usually because the restart is still pending.
@@ -137,7 +141,7 @@ INSERT INTO users (id, name, email, score) VALUES ('user-1', 'Alice', 'alice@exa
 Read it back from Antfly:
 
 ```bash
-curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u admin:admin
+curl -s http://127.0.0.1:8080/db/v1/tables/users/documents/user-1 -u "admin:${ANTFLY_ADMIN_PASSWORD}"
 ```
 
 ```json
@@ -224,6 +228,8 @@ Several PostgreSQL tables can feed one Antfly table. Give each source its own `o
 ]
 ```
 
+To fan one PostgreSQL table out to several Antfly tables, use `routes` instead. Each route has its own `where` filter, `target_table`, `key_template`, and `on_update`/`on_delete` transforms. Every route whose filter matches a row receives it, and when routes are present the top-level `on_update`/`on_delete` are ignored.
+
 ### Managed PostgreSQL Setup
 
 Every provider needs the same two things, `wal_level = logical` and a user allowed to replicate, and each exposes them differently. Pre-create the publication as the table owner whenever the replication user does not own the table, then pass `publication_name`. Antfly still checks for the named publication on every poll and creates it if it is missing, so the name has to exist before the replication user connects:
@@ -248,7 +254,7 @@ Two things are yours to decide: what happens to the replication slot when Antfly
 
 Replication runs one way. Antfly never writes back, so your application keeps its transactions, constraints, and backups exactly where they are, and Antfly holds a searchable copy that is as current as the stream.
 
-The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber, and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
+The cost of that arrangement is the replication slot. A slot makes PostgreSQL retain WAL until the subscriber has consumed it. While Antfly is up, that is a few seconds of WAL. While Antfly is down for a long stretch, PostgreSQL keeps every change since the last checkpoint, and disk usage grows until the stream resumes. Monitor slot lag the way you would for any logical subscriber (Antfly also reports `status.lag_records` and `status.lag_millis` in the table detail), and if you decommission an Antfly table, drop its slot in PostgreSQL rather than leaving it to hold WAL forever.
 
 That one-way flow is also why the delete decision is yours. PostgreSQL knows a row is gone; only you know whether the document should vanish from search or stay, marked inactive, so that history remains retrievable. `$delete_document` is right for data that should not be found once removed. A soft delete is right when the document is evidence, such as a resolved ticket that still teaches a classifier.
 

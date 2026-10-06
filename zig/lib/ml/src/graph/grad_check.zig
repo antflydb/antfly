@@ -40,16 +40,31 @@ const Shape = shape_mod.Shape;
 const Builder = builder_mod.Builder;
 
 /// Result of evaluating a graph on concrete f32 data.
-const EvalResult = struct {
+pub const EvalResult = struct {
     /// Output values, one slice per graph output.
     values: [][]f32,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *EvalResult) void {
+    pub fn deinit(self: *EvalResult) void {
         for (self.values) |v| self.allocator.free(v);
         self.allocator.free(self.values);
     }
 };
+
+/// Evaluate a primitive-only graph on the host reference interpreter and
+/// return its output values. Tests use this to pin a graph's forward result
+/// against a hand-computed reference independently of any backend.
+pub fn evaluateOutputs(
+    allocator: std.mem.Allocator,
+    graph: *const Graph,
+    param_values: []const []const f32,
+) !EvalResult {
+    // Fused ops carry their primitive decomposition as `vjp_alternate`; the
+    // reference interpreter only evaluates primitives, so lower first.
+    var lowered = try lower_mod.lower(allocator, graph);
+    defer lowered.deinit();
+    return eval(allocator, &lowered.graph, param_values);
+}
 
 /// Evaluate a primitive-only graph on concrete f32 parameter values.
 /// Returns the output tensor values.
@@ -1756,8 +1771,8 @@ test "grad_check batched dot storage layouts have strict seeded gradients" {
                 }
                 var result = try eval(a, &ad.graph, &.{ &q_values, &k_values, &seed_values });
                 defer result.deinit();
-                var expected_q = [_]f64{0} ** 12;
-                var expected_k = [_]f64{0} ** 16;
+                var expected_q = @as([12]f64, @splat(0));
+                var expected_k = @as([16]f64, @splat(0));
                 for (0..2) |batch| {
                     for (0..3) |m| {
                         for (0..4) |n| {
@@ -1808,8 +1823,8 @@ test "grad_check dense retained storage has strict seeded gradients" {
                 }
                 var result = try eval(a, &ad.graph, &.{ &xv, &wv, &sv });
                 defer result.deinit();
-                var dx = [_]f64{0} ** 6;
-                var dw = [_]f64{0} ** 8;
+                var dx = @as([6]f64, @splat(0));
+                var dw = @as([8]f64, @splat(0));
                 for (0..3) |m| {
                     for (0..4) |n| {
                         for (0..2) |k| {
