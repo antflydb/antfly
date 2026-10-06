@@ -6,6 +6,7 @@ Run: uv run --extra lake --project e2e/antfly pytest e2e/antfly/test_lake_sql.py
 """
 
 import hashlib
+import json
 import os
 import struct
 import time
@@ -123,6 +124,30 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             assert response.status_code in (404, 409, 503), response.text
             assert time.monotonic() < deadline, response.text
             time.sleep(0.1)
+        request(
+            "POST",
+            "/tables/lake_events/indexes/label_text",
+            {"type": "full_text", "field": "label"},
+        )
+
+        def await_publication():
+            deadline = time.monotonic() + 30
+            while True:
+                resource = request("GET", "/tables/lake_events/indexes/label_text")
+                status = resource["status"]
+                if status.get("published_revision") is not None:
+                    return status["published_revision"]
+                assert status["readiness"]["state"] != "failed", (
+                    json.dumps(resource) + "\n" + server.debug_logs()
+                )
+                assert time.monotonic() < deadline, (
+                    str(resource) + "\n" + server.debug_logs()
+                )
+                time.sleep(0.1)
+
+        published_generation = await_publication()
+        artifact_root = server.root / "artifacts" / "buckets" / "native-lake-indexes"
+        assert artifact_root.exists()
         # Both independent empty-file layouts must remain valid attachments.
         for row_group in (False, True):
             empty_root = tmp_path / f"empty-{row_group}"
@@ -325,6 +350,7 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             if restart:
                 server.restart()
                 assert request("POST", "/sql", {"statement": sql})["rows"] == expected
+                assert await_publication() == published_generation
             with (
                 psycopg.connect(
                     host="127.0.0.1",

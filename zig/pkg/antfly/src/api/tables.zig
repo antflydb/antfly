@@ -149,6 +149,7 @@ fn normalizeRawCreateTableIndexesAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
     comptime preserve_canonical_default: bool,
+    external_source: bool,
 ) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
     // Trusted, normalized catalogs may explicitly omit search indexes.
@@ -156,7 +157,9 @@ fn normalizeRawCreateTableIndexesAlloc(
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    if (preserve_canonical_default) {
+    if (external_source) {
+        try out.appendSlice(alloc, "{}");
+    } else if (preserve_canonical_default) {
         if (value.object.get(default_full_text_index_name)) |canonical_default| {
             const encoded = try stringifyJsonValue(alloc, canonical_default);
             defer alloc.free(encoded);
@@ -192,9 +195,8 @@ fn normalizeRawCreateTableIndexesAlloc(
                 // by metadata. Accept the canonical entry on that second hop,
                 // but never let its reserved name select another index kind.
                 if (!is_full_text) return error.InvalidCreateTableRequest;
-                continue;
-            }
-            if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
+                if (!external_source) continue;
+            } else if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
             // `default` is the released compatibility alias for the canonical
             // system index. Other named full-text indexes are caller-owned and
             // must survive create-table normalization like every other kind.
@@ -212,7 +214,7 @@ fn normalizeRawCreateTableIndexesAlloc(
         // the object again. This preserves type-specific fields that generated
         // OpenAPI structs may not yet understand.
         out.items.len -= 1;
-        try out.append(alloc, ',');
+        if (out.items.len > 1) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, name);
         try out.append(alloc, ':');
         const encoded = try stringifyJsonValue(alloc, config);
@@ -1170,6 +1172,14 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             else => return error.InvalidCreateTableRequest,
         };
     }
+    const external_source = if (exact_schema.value.schema) |schema| external: {
+        if (schema != .object) break :external false;
+        const source = schema.object.get("base_source") orelse break :external false;
+        if (source != .object) break :external false;
+        const kind = source.object.get("kind") orelse break :external false;
+        break :external kind == .string and std.mem.eql(u8, kind.string, "external");
+    } else false;
+    const implicit_indexes = if (external_source) "{}" else default_indexes_json;
     if (root.get("indexes")) |value| {
         if (value != .null) {
             try validateIndexesValue(value, allow_private_index_fields);
@@ -1177,12 +1187,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
                 alloc,
                 value,
                 allow_private_index_fields,
+                external_source,
             );
             defer alloc.free(normalized_indexes_json);
             req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
-        } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
+        } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, implicit_indexes);
     } else {
-        req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
+        req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, implicit_indexes);
     }
     if (exact_schema.value.schema) |value| {
         if (value != .null) {
@@ -5192,6 +5203,27 @@ test "create table rejects caller-managed schema versions" {
     defer stored_indexes.deinit();
     const default_index = stored_indexes.value.object.get("full_text_index_v0") orelse return error.TestUnexpectedResult;
     try std.testing.expect(coverage_policy_mod.incarnation(default_index) != null);
+}
+
+test "external lake create table preserves opt-in indexes across metadata normalization" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "parquet", "iceberg" }) |format| {
+        for ([_][]const u8{ "", ",\"indexes\":{}", ",\"indexes\":{\"label_text\":{\"type\":\"full_text\",\"field\":\"label\"}}" }) |indexes| {
+            const body = try std.fmt.allocPrint(a, "{{\"schema\":{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"lake\",\"format\":\"{s}\",\"uri\":\"file:///lake\"}}}}{s}}}", .{ format, indexes });
+            defer a.free(body);
+            var request = try parseCreateTableRequest(a, body);
+            defer request.deinit(a);
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, request.indexes_json.?, .{});
+            defer parsed.deinit();
+            try std.testing.expect(!parsed.value.object.contains(default_full_text_index_name));
+            try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, indexes, "label_text") != null) 1 else 0), parsed.value.object.count());
+            const encoded = try encodeStoredCreateTableRequestAlloc(a, request);
+            defer a.free(encoded);
+            var stored = try parseStoredCreateTableRequest(a, encoded);
+            defer stored.deinit(a);
+            try std.testing.expectEqualStrings(request.indexes_json.?, stored.indexes_json.?);
+        }
+    }
 }
 
 test "create table raw parser merges default full text with quickstart embedding index" {

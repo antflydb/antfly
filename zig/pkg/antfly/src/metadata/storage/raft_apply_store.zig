@@ -14212,19 +14212,27 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
+        var retained: ?metadata.TableRecord = null;
+        defer if (retained) |existing| metadata_table_manager.freeTable(self.alloc, existing);
+        var admission = record;
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
-            defer metadata_table_manager.freeTable(self.alloc, existing);
-            if (metadata_table_manager.tableDefinitionsEqual(existing, record)) return;
-            if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, record)) return;
-            if ((existing.relational_retirement_json.len != 0 or record.relational_retirement_json.len != 0) and
-                !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, record)) return;
-            if (!std.mem.eql(u8, existing.name, record.name) and
+            retained = existing;
+            // Reconciliation may retain a generation but never publish, clear,
+            // or steal one through an unconditional table upsert. Omission
+            // retains internal state so schema reconciliation can continue
+            // without taking ownership of the publication lifecycle.
+            if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return;
+            if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return;
+            if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return;
+            if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
+                !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, admission)) return;
+            if (!std.mem.eql(u8, existing.name, admission.name) and
                 try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
-            if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, existing, record)) return;
-        } else if (record.relational_retirement_json.len != 0) return;
+            if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, existing, admission)) return;
+        } else if (record.relational_retirement_json.len != 0 or record.lake_index_catalog_json.len != 0) return;
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
-        try self.putTableRecordTxn(txn, group_id, key, record);
+        try self.putTableRecordTxn(txn, group_id, key, admission);
     }
 
     fn indexedTableRangeIdsTxn(
@@ -15737,6 +15745,11 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        const lake_transition_allowed = @import("antfly_local_sources").metadata_lake_index_catalog.transitionAllowed(self.alloc, current, replacement) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => false,
+        };
+        if (!lake_transition_allowed) return;
         if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, current, replacement)) return;
         var admission = replacement;
         // A completed subtract-only retirement changes active policy, not
@@ -19319,6 +19332,7 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     errdefer alloc.free(name);
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
+    var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
         if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
@@ -19332,6 +19346,7 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
             if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
             pos += length;
         }
+        lake_index_catalog_json = try readLakeIndexCatalogExtension(encoded, &pos);
         _ = try readTableStorageExtension(encoded, &pos);
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
@@ -19342,6 +19357,7 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
+        .lake_index_catalog_json = if (mode == .query) lake_index_catalog_json else "",
     }).clone(alloc) else null };
 }
 
@@ -20868,6 +20884,8 @@ fn appendPlacementIntent(
 
 const table_storage_metadata_magic: u32 = 0x31535441; // ATS1
 const table_storage_metadata_version: u16 = 1;
+const lake_index_catalog_magic: u32 = 0x31434c41; // ALC1
+const max_lake_index_catalog_bytes: usize = 256 * 1024;
 
 fn appendTableRecord(
     alloc: std.mem.Allocator,
@@ -20898,6 +20916,13 @@ fn appendTableRecord(
     if (record.relational_retirement_json.len != 0) {
         try appendInt(alloc, out, u32, 0x31524941);
         try appendRequiredString(alloc, out, record.relational_retirement_json);
+    }
+    if (record.lake_index_catalog_json.len != 0) {
+        if (record.lake_index_catalog_json.len > max_lake_index_catalog_bytes) return error.InvalidMetadataTransitionEncoding;
+        var validated = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(alloc, record.lake_index_catalog_json);
+        defer validated.deinit();
+        try appendInt(alloc, out, u32, lake_index_catalog_magic);
+        try appendRequiredString(alloc, out, record.lake_index_catalog_json);
     }
     if (record.requiresStorageMetadataExtension()) {
         try appendInt(alloc, out, u32, table_storage_metadata_magic);
@@ -21332,6 +21357,16 @@ const BorrowedTableStorage = struct {
 
 /// Shared strict extension decoder. Point projections validate the entire
 /// framing without allocating unrelated schemas, retirement jobs or indexes.
+fn readLakeIndexCatalogExtension(encoded: []const u8, pos: *usize) ![]const u8 {
+    if (encoded.len - pos.* < 4 or std.mem.readInt(u32, encoded[pos.*..][0..4], .little) != lake_index_catalog_magic) return "";
+    pos.* += 4;
+    const length = try readInt(encoded, pos, u32);
+    if (length == 0 or length > max_lake_index_catalog_bytes or length > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
+    const result = encoded[pos.*..][0..length];
+    pos.* += length;
+    return result;
+}
+
 fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableStorage {
     var result: BorrowedTableStorage = .{};
     if (pos.* == encoded.len) return result;
@@ -21399,12 +21434,15 @@ fn readTableRecordWithRestoreIntent(
         break :blk try readRequiredString(alloc, encoded, pos);
     } else try alloc.dupe(u8, "");
     errdefer alloc.free(relational_retirement_json);
+    const lake_index_catalog_json = try alloc.dupe(u8, try readLakeIndexCatalogExtension(encoded, pos));
+    errdefer alloc.free(lake_index_catalog_json);
     var extension = try readTableStorageExtension(encoded, pos);
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
         .storage = extension.storage,
         .storage_migration = extension.migration,
         .relational_retirement_json = relational_retirement_json,
+        .lake_index_catalog_json = lake_index_catalog_json,
         .table_id = table_id,
         .name = name,
         .description = description,
@@ -30849,4 +30887,115 @@ test "system catalog borrowed authority retains ownership and recovers a failed 
     const recovered = (try store.loadStandaloneCatalog(alloc)) orelse return error.TestUnexpectedResult;
     defer alloc.free(recovered);
     try std.testing.expectEqualStrings("{\"recovered\":true}", recovered);
+}
+
+test "metadata.lake index catalog extension pins generations and preserves legacy records" {
+    const a = std.testing.allocator;
+    const base: metadata.TableRecord = .{ .table_id = 9, .name = "lake", .schema_json = "{}", .indexes_json = "{}" };
+    const old_bytes = try encodeTableRecord(a, base);
+    defer a.free(old_bytes);
+    inline for (.{ false, true }) |storage_extension| inline for (.{ false, true }) |retirement| {
+        var table = base;
+        table.lake_index_catalog_json = "{\"version\":1,\"generation\":7}";
+        if (storage_extension) table.storage.dense_embeddings = .vector_store;
+        if (retirement) table.relational_retirement_json = "retiring";
+        const encoded = try encodeTableRecord(a, table);
+        defer a.free(encoded);
+        const decoded = try decodeTableRecord(a, encoded);
+        defer metadata_table_manager.freeTable(a, decoded);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+        const query = try decodeTableQueryProjection(a, encoded, true);
+        defer query.deinit(a);
+        try std.testing.expectEqualStrings(table.lake_index_catalog_json, query.query_definition.?.lake_index_catalog_json);
+        const identity = try decodeTableIdentity(a, encoded);
+        defer identity.deinit(a);
+        try std.testing.expect(identity.query_definition == null);
+        try std.testing.expect(!std.mem.eql(u8, &metadata_table_manager.tableDefinitionFingerprint(base), &metadata_table_manager.tableDefinitionFingerprint(table)));
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, encoded[0 .. encoded.len - 1]));
+    };
+    const round_trip = try decodeTableRecord(a, old_bytes);
+    defer metadata_table_manager.freeTable(a, round_trip);
+    try std.testing.expectEqualStrings("", round_trip.lake_index_catalog_json);
+    const reencoded = try encodeTableRecord(a, round_trip);
+    defer a.free(reencoded);
+    try std.testing.expectEqualSlices(u8, old_bytes, reencoded);
+}
+
+test "metadata.lake index Raft CAS rejects stale builders and unconditional catalog writes" {
+    const a = std.testing.allocator;
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lake-catalog", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = 22;
+    const table: metadata.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
+    const signature: lake.Signature = .{ .desired = lake.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const first = try (lake.State{}).begin(signature, @splat(5), 100, 20);
+    const first_bytes = try lake.encode(a, first);
+    defer a.free(first_bytes);
+    var building = table;
+    building.lake_index_catalog_json = first_bytes;
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    try store.applyTableUpsertTxn(&txn, group_id, table);
+    var key_buf: [160]u8 = undefined;
+    const key = try tableKeyForGroup(&key_buf, group_id, table.table_id);
+    try store.applyTableUpsertTxn(&txn, group_id, building);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings("", current.lake_index_catalog_json);
+    }
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, table, building);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings(first_bytes, current.lake_index_catalog_json);
+    }
+    const retry = try first.begin(signature, @splat(6), 120, 20);
+    const retry_bytes = try lake.encode(a, retry);
+    defer a.free(retry_bytes);
+    var retrying = building;
+    retrying.lake_index_catalog_json = retry_bytes;
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, building, retrying);
+    const stale_failure = try first.fail(@splat(5), "late worker", 200);
+    const stale_bytes = try lake.encode(a, stale_failure);
+    defer a.free(stale_bytes);
+    var failed = building;
+    failed.lake_index_catalog_json = stale_bytes;
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, building, failed);
+    // Even with a fresh expected record, the old generation cannot publish.
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, retrying, failed);
+    try store.applyTableUpsertTxn(&txn, group_id, table);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings(retry_bytes, current.lake_index_catalog_json);
+    }
+    const valid_failure = try retry.fail(@splat(6), "source changed", 300);
+    const valid_bytes = try lake.encode(a, valid_failure);
+    defer a.free(valid_bytes);
+    failed.lake_index_catalog_json = valid_bytes;
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, retrying, failed);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings(valid_bytes, current.lake_index_catalog_json);
+    }
+    var malformed = failed;
+    malformed.lake_index_catalog_json = "{invalid";
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, failed, malformed);
+    const current = try decodeTableRecord(a, try txn.get(key));
+    defer metadata_table_manager.freeTable(a, current);
+    try std.testing.expectEqualStrings(valid_bytes, current.lake_index_catalog_json);
+    var reconciled = table;
+    reconciled.description = "updated by reconciliation";
+    try store.applyTableUpsertTxn(&txn, group_id, reconciled);
+    const updated = try decodeTableRecord(a, try txn.get(key));
+    defer metadata_table_manager.freeTable(a, updated);
+    try std.testing.expectEqualStrings(reconciled.description, updated.description);
+    try std.testing.expectEqualStrings(valid_bytes, updated.lake_index_catalog_json);
 }

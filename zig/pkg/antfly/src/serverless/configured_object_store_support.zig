@@ -27,6 +27,28 @@ const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 
 const Allocator = std.mem.Allocator;
 
+/// Opens Antfly-owned publication storage. Source lake credentials never grant
+/// artifact write authority; this requires an independently configured lane.
+pub fn openNativeArtifactObjectStoreAlloc(
+    alloc: Allocator,
+    node_config: *const common_config.Config,
+    secret_store: ?*common_secrets.FileStore,
+    read_only: bool,
+) !object_store_support.OpenedObjectStore {
+    const location = node_config.storage.artifacts;
+    const connection_id = location.connection orelse return error.NativeArtifactStorageRequired;
+    const bucket = location.bucket orelse return error.NativeArtifactStorageRequired;
+    const prefix = location.prefix orelse "native-lake-indexes";
+    const connection = node_config.connections.get(connection_id) orelse return error.NativeArtifactStorageRequired;
+    if (connection.kind != .external_io or !hasConnectionCapability(connection, "storage.primary")) return error.NativeArtifactStorageUnauthorized;
+    const external_io = connection.external_io orelse return error.NativeArtifactStorageUnauthorized;
+    return switch (external_io.protocol) {
+        .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
+        .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
+        else => error.NativeArtifactStorageUnauthorized,
+    };
+}
+
 pub const BindingObjectStoreOpenOptions = struct {
     /// Borrowed options must outlive synchronous lake source opening.
     pub fn lakeOptions(self: *const @This()) @import("antfly_local_sources").serverless_lake_host.OpenOptions {

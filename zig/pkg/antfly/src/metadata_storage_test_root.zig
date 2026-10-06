@@ -22,6 +22,7 @@ const storage = @import("metadata/storage/mod.zig");
 
 test {
     _ = storage.raft_apply_store;
+    _ = @import("antfly_local_sources").metadata_lake_index_catalog;
 }
 
 test {

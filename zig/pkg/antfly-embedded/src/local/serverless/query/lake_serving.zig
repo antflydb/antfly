@@ -486,6 +486,12 @@ pub const ServingSource = struct {
         std.crypto.hash.sha2.Sha256.hash(scope_bytes, &scope, .{});
         return scope;
     }
+    /// Credential identity is available only after opening an authorized source.
+    /// Persist the digest, never the credential material used to compute it.
+    pub fn credentialIdentity(self: *ServingSource, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
+        try serverless_query.validateLakeBindingInventory(binding, self.inventory);
+        return cacheScope(self.alloc, self.store, binding);
+    }
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
         errdefer self.alloc.destroy(reader);

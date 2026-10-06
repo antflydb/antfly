@@ -35,6 +35,13 @@ pub const Index = struct {
 };
 
 pub const Table = struct {
+    pub const ExternalIndexes = struct {
+        /// Fresh query-definition metadata, allocated for this execution. A
+        /// schema/prepared-plan cache must never retain a publication pointer.
+        catalog_json: []const u8,
+        indexes_json: []const u8,
+        desired: [32]u8,
+    };
     pub const Scope = struct {
         database: []const u8,
         namespace: []const u8,
@@ -47,6 +54,7 @@ pub const Table = struct {
     storage_mode: enum { relational, document } = .relational,
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
+    external_indexes: ?ExternalIndexes = null,
     columns: []const Column,
     indexes: []const Index = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last

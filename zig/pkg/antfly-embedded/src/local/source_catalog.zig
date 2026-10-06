@@ -118,6 +118,7 @@ pub const metadata_catalog_mutation_stamp = @import("metadata/catalog_mutation_s
 pub const metadata_catalog_route_contract = @import("metadata/catalog_route_contract.zig");
 pub const metadata_incarnation = @import("metadata/incarnation.zig");
 pub const metadata_local_catalog = @import("metadata/catalog.zig");
+pub const metadata_lake_index_catalog = @import("metadata/lake_index_catalog.zig");
 pub const metadata_local_index_reconcile = @import("metadata/index_reconcile.zig");
 pub const metadata_record_memory = @import("metadata/record_memory.zig");
 pub const runtime_callback_abi = @import("runtime_callback_abi.zig");

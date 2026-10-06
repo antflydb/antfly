@@ -13,7 +13,15 @@
 // limitations.
 
 test {
+    _ = @import("api/tables.zig");
+    _ = @import("api/table_contract.zig");
+    _ = @import("serverless/build/lake_sidecar_text.zig");
     _ = @import("api/lake_sql_cursor.zig");
+    _ = @import("api/lake_index_row_source.zig");
+    _ = @import("api/lake_index_publication.zig");
+    _ = @import("api/lake_index_store.zig");
+    _ = @import("api/lake_index_coordinator.zig");
+    _ = @import("api/lake_index_selection.zig");
     _ = @import("api/lake_schema_detection.zig");
     _ = @import("api/lake_table_reads.zig");
     _ = @import("antfly_local_sources").serverless_query_lake_schema;

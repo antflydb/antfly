@@ -260,6 +260,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const system_catalog_store_step = b.step("antfly-system-catalog-store-test", "Run catalog report persistence, snapshot, drain, and migration regressions");
     system_catalog_store_step.dependOn(&b.addRunArtifact(system_catalog_store_tests).step);
+    const lake_catalog_step = b.step("antfly-lake-index-catalog-test", "Run durable native lake index generation framing and decoder admission contracts");
+    for ([_]*std.Build.Module{ metadata_unit_baseline_mods[8], metadata_unit_baseline_mods[1] }) |module| {
+        const tests = b.addTest(.{ .root_module = module, .filters = &.{"metadata.lake index"} });
+        lake_catalog_step.dependOn(&b.addRunArtifact(tests).step);
+    }
     const system_catalog_projection_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
         .filters = &.{ "catalog projection", "catalog retained WAL replay", "system catalog forwarding retains" },

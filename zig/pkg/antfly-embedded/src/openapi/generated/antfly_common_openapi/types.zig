@@ -2317,6 +2317,8 @@ pub const SecretsConfig = struct {
 
 /// Tagged storage-engine configuration. Engine is required and exactly the matching engine member must be present.
 pub const StorageConfig = struct {
+    /// Shared Antfly-owned artifact storage, independent of the primary storage engine. Native remote-table index generations use this location. Connection and bucket are required when configured; the connection must have storage.primary capability. Distributed serving requires shared storage. Standalone deployments may use the local storage directory when this location is absent.
+    artifacts: ?std.json.Value = null,
     engine: StorageEngine,
     lite: ?LiteStorageConfig = null,
     object: ?ObjectStorageConfig = null,
@@ -2324,6 +2326,7 @@ pub const StorageConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "artifacts", "artifacts", true },
         .{ "engine", "engine", true },
         .{ "lite", "lite", true },
         .{ "object", "object", true },
@@ -2340,6 +2343,10 @@ pub const StorageConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.artifacts) |value| {
+            try jw.objectField("artifacts");
+            try jw.write(value);
+        }
         try jw.objectField("engine");
         try jw.write(self.engine);
         if (self.lite) |value| {

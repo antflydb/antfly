@@ -43,13 +43,63 @@ The following paths remain required before claiming complete remote index servin
 | Path | Current implementation | Remaining integration |
 | --- | --- | --- |
 | Range caching | Public SQL/rows RAM → disk → source reads | Shared artifact-reader admission and per-statement explain accounting |
-| Index construction | RowSource sidecar builders, scoped artifact uploads, rebuild planning | Declared remote index scheduling, durable generation publication and public status |
-| Index selection | Snapshot/column/config bindings and candidate/hydration helpers | Catalog-bound SQL/rows/search selection, complete coverage proofs and explicit-index errors |
+| Index construction | RowSource sidecar builders, scoped artifact uploads; native catalog CAS leases, API creation/deletion, maintenance recovery and catalog status | Lease renewal during long builds, streaming builders beyond bounded replay |
+| Index selection | Fresh per-execution catalog definitions, authorized complete-coverage selection proofs, explicit mismatch errors and automatic fallback helpers | Connect proofs and candidate/hydration readers to SQL/rows/search |
 | Algebraic execution | Native exact typed reducers; separate legacy lake fold artifacts | Bound semantic matcher, durable native state artifacts and catalog-selected SQL substitution |
 | Incremental refresh | Immutable file identities and invalidation foundations | Per-file contribution manifests, append merging and delete-aware correction |
 
 This table is an acceptance gate. Helper tests or a configured index alone do not
 make any unfinished path query-ready.
+
+Native metadata owns external index generations in an internal, versioned table
+record extension. The query-definition projection carries that extension with
+the schema and desired indexes; identity-only projections omit it. Empty legacy
+records retain their original binary encoding and JSON shape. Publication requires
+metadata decoder capability 22 on every coordinated replica.
+
+Each build attempt records a monotonic generation, a unique token, a bounded
+lease, and separate digests for desired definitions, resolved source coverage,
+source credentials, and artifact-store identity. Renewing, completing, failing,
+or clearing an attempt uses a full table-definition compare-and-set. Raft
+application rejects stale generations and tokens, publication after a definition
+change, and unconditional catalog writes through table reconciliation. A failed
+or pending rebuild retains the preceding immutable publication; selection must
+still prove that publication matches the current authorized source and desired
+definition before reading it. Clearing retained roots advances the attempt
+counter so a previously admitted worker cannot resurrect them.
+
+Native API creation and deletion wake an idempotent maintenance reconciler. It
+does not synthesize a default text index during Parquet/Iceberg attachment;
+external indexes are explicitly declared at creation or added afterward. It
+commits the attempt before uploading artifacts, caps construction allocations,
+revalidates coverage, then publishes through the exact pending-record CAS.
+Ambiguous metadata replies are re-read rather than replayed; expired attempts
+can be replaced. The periodic supervisor rediscovers definitions and pending
+generations after restart. Dropping the last index clears retained roots through
+a fenced generation change. Public remote status follows this catalog instead
+of empty native shard indexes. Uploaded generations remain non-queryable until
+the serving paths consume the coverage and candidate proofs.
+
+Configure shared immutable artifacts separately from source credentials:
+`storage.artifacts` contains `connection`, `bucket`, and optional `prefix` (default
+`native-lake-indexes`). The named S3/GCS connection requires `storage.primary`
+capability and its bucket/prefix allowlist must contain the location. Distributed
+nodes require shared artifact storage. Standalone/embedded deployments can use
+`<resolved engine data directory>/artifacts` when no shared location is configured.
+This durability directory is separate from the evictable read cache. Artifact
+readers cannot provision buckets, upload, or delete objects. Storage identity
+includes the actual location and resolved credential digest; credential material
+is never persisted in the publication catalog.
+
+The native builder input adapter borrows typed vectors and dictionary IDs from
+one authorized source. It emits live contiguous runs after applying deletion
+masks, including equality-delete columns absent from the index projection.
+Coverage preparation requires real provider versions for every covered data and
+delete object. Its canonical data-file digest excludes discovered footer details
+and pins the delete-object versions used by the builder; publication must compare
+the completed build with that original coverage proof. The native maintenance
+worker uses this adapter and fencing protocol. Query cursors still need to consume
+the catalog selection proof before using the resulting sidecars.
 
 ## Native execution and delivery
 
@@ -78,7 +128,10 @@ dictionaries through selection and slicing. Unique numeric columns stay flat.
 Logical timestamp conversion currently retains its expanded numeric path.
 
 Spilled joins admit compact blocks into typed hash state and reuse bounded
-candidate workspace. Group partitions consume compact blocks using reusable row
+candidate workspace. Probing borrows compact blocks through a forward reader,
+retains at most 16 KiB of its reusable arena between blocks, and expands only the
+current row into a reusable buffer. That row remains valid until all duplicate
+matches and residual checks have drained. Group partitions consume compact blocks using reusable row
 scratch and import exact partial states without expanding a whole block into a
 `Datum` matrix. Singleton records and already-expanded replay spans borrow the
 source's read arena; typed multi-row blocks own compact payloads until admission

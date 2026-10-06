@@ -51,6 +51,7 @@ pub const ObjectStore = struct {
     gcs_client: ?*objectstore.Gcs.JsonApiClient = null,
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
+    read_only: bool = false,
     bucket: []u8,
     prefix: []u8,
     verified_mu: std.atomic.Mutex = .unlocked,
@@ -172,8 +173,18 @@ pub const ObjectStore = struct {
     }
 
     pub fn initWithClient(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !ObjectStore {
+        return initWithClientOptions(alloc, client, bucket, prefix, .{ .ensure_bucket = true });
+    }
+
+    /// Borrow a configured client without widening its provisioning authority.
+    /// Readers and require-existing writers must not create missing buckets.
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false }) !ObjectStore {
+        if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (!(try owned_client.bucketExists(bucket))) {
+            if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
+            try owned_client.makeBucket(bucket);
+        }
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
@@ -182,6 +193,7 @@ pub const ObjectStore = struct {
             .alloc = alloc,
             .client = owned_client,
             .owns_client = false,
+            .read_only = options.read_only,
             .bucket = owned_bucket,
             .prefix = owned_prefix,
         };
@@ -223,6 +235,7 @@ pub const ObjectStore = struct {
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         try cancellation.check();
+        if (self.read_only) return error.ArtifactStoreReadOnly;
         const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
         const artifact_id = if (scope) |value| scoped: {
@@ -500,6 +513,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
+        if (self.read_only) return error.ArtifactStoreReadOnly;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
@@ -848,6 +862,20 @@ test "objectstore-backed artifacts store round-trips over file uri" {
     const got = try store.getAlloc(meta.artifact_id);
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("payload", got);
+}
+
+test "objectstore-backed artifact readers preserve bucket provisioning authority" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    try std.testing.expectError(error.ArtifactBucketNotFound, ObjectStore.initWithClientOptions(alloc, memory.client(), "missing-bucket", "tenant/a", .{}));
+    try std.testing.expect(!(try memory.client().bucketExists("missing-bucket")));
+    var impl = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .ensure_bucket = true });
+    defer impl.deinit();
+    var reader = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .read_only = true });
+    defer reader.deinit();
+    try std.testing.expectError(error.ArtifactStoreReadOnly, reader.put(alloc, "denied"));
+    try std.testing.expectError(error.ArtifactStoreReadOnly, reader.delete("sha256:abcd"));
 }
 
 test "objectstore-backed artifacts reject malformed content addresses before I/O" {

@@ -186,6 +186,7 @@ pub const Config = struct {
         object_bucket: ?[]u8 = null,
         object_prefix: ?[]u8 = null,
         object_lanes: ObjectStorageLanes = .{},
+        artifacts: ObjectStorageLocation = .{},
 
         pub fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
             if (self.lite_path) |value| alloc.free(value);
@@ -194,6 +195,7 @@ pub const Config = struct {
             if (self.object_bucket) |value| alloc.free(value);
             if (self.object_prefix) |value| alloc.free(value);
             self.object_lanes.deinit(alloc);
+            self.artifacts.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -985,6 +987,16 @@ pub const Config = struct {
 
         const value = storage orelse return parsed;
         parsed.engine = value.engine;
+        if (raw_storage) |raw| {
+            if (raw != .object) return error.InvalidConfig;
+            if (raw.object.get("artifacts")) |location| {
+                if (location != .object or !objectContainsOnly(location.object, &.{ "connection", "bucket", "prefix" })) return error.InvalidConfig;
+                const connection = location.object.get("connection") orelse return error.InvalidConfig;
+                const bucket = location.object.get("bucket") orelse return error.InvalidConfig;
+                if (connection != .string or connection.string.len == 0 or bucket != .string or bucket.string.len < 3 or bucket.string.len > 63) return error.InvalidConfig;
+            }
+            parsed.artifacts = try parseObjectStorageLocation(alloc, raw.object.get("artifacts"));
+        }
 
         switch (parsed.engine) {
             .lite => {
@@ -1112,7 +1124,7 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
-        if (!objectContainsOnly(storage_object, &.{ "engine", "lite", "local", "object" })) return error.InvalidConfig;
+        if (!objectContainsOnly(storage_object, &.{ "engine", "lite", "local", "object", "artifacts" })) return error.InvalidConfig;
         const engine = value.engine;
         const has_lite = value.lite != null;
         const has_local = value.local != null;
@@ -1457,6 +1469,37 @@ test "common config resolves capability-scoped object storage connections and la
         \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket" } }
         \\}
     ));
+}
+
+test "common config native artifact storage is independent and capability scoped" {
+    const alloc = std.testing.allocator;
+    const template =
+        \\{{"deployment_mode":"distributed","storage":{{"engine":"local","local":{{}},"artifacts":{s}}},
+        \\"connections":{{"artifacts":{{"kind":"external_io","capabilities":["{s}"],"external_io":{{"protocol":"s3","buckets":["artifact-bucket"],"prefix":"cluster"}}}}}}}}
+    ;
+    const valid = try std.fmt.allocPrint(alloc, template, .{ "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}", "storage.primary" });
+    defer alloc.free(valid);
+    var cfg = try Config.parseFromSlice(alloc, valid);
+    defer cfg.deinit();
+    try std.testing.expectEqual(common_openapi.StorageEngine.local, cfg.storage.engine);
+    try std.testing.expectEqualStrings("artifacts", cfg.storage.artifacts.connection.?);
+    try std.testing.expectEqualStrings("cluster/native-lake-indexes", cfg.storage.artifacts.prefix.?);
+    const invalid = [_][]const u8{
+        "{}",
+        "{\"connection\":\"artifacts\"}",
+        "{\"connection\":\"\",\"bucket\":\"artifact-bucket\"}",
+        "{\"connection\":\"artifacts\",\"bucket\":\"other-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}",
+        "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster-other\"}",
+        "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\",\"typo\":true}",
+    };
+    for (invalid) |location| {
+        const json = try std.fmt.allocPrint(alloc, template, .{ location, "storage.primary" });
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, json));
+    }
+    const read_only = try std.fmt.allocPrint(alloc, template, .{ "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}", "lake_read" });
+    defer alloc.free(read_only);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, read_only));
 }
 
 test "common config isolates named AWS credential sources and rejects credential typos" {
@@ -1838,6 +1881,9 @@ fn validateStorageConnections(
     storage: *const Config.StorageConfig,
     connections: *const Config.ConnectionsConfig,
 ) !void {
+    if (storage.artifacts.connection != null or storage.artifacts.bucket != null or storage.artifacts.prefix != null) {
+        try validateStorageConnection(connections, storage.artifacts.connection orelse return error.InvalidConfig, storage.artifacts.bucket orelse return error.InvalidConfig, storage.artifacts.prefix, "", "native-lake-indexes");
+    }
     if (storage.engine != .object) return;
     const default_connection = storage.object_connection orelse return error.InvalidConfig;
     const default_bucket = storage.object_bucket orelse return error.InvalidConfig;

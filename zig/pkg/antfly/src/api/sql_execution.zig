@@ -622,6 +622,17 @@ pub const Adapter = struct {
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
         if (binding.external_base_source != null and action != .read) return error.ExternalLakeReadOnly;
+        if (binding.external_base_source != null) binding.external_indexes = .{
+            .catalog_json = definition.lake_index_catalog_json,
+            .indexes_json = definition.indexes_json,
+            .desired = @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(.{
+                .table_id = table.table_id,
+                .name = table.name,
+                .schema_json = definition.schema_json,
+                .read_schema_json = definition.read_schema_json,
+                .indexes_json = definition.indexes_json,
+            }),
+        };
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = snapshot.revision };
         self.revision = snapshot.revision;
         self.target = target;

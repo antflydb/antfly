@@ -1714,6 +1714,9 @@ pub const ApiHttpServerConfig = struct {
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,
+    /// Borrowed engine-owned local durability root for standalone/embedded
+    /// native lake artifacts. Distributed serving requires storage.artifacts.
+    native_lake_artifact_base_dir: ?[]const u8 = null,
     /// Optional persistent lake cache root. By default use the node's local
     /// storage directory; null without local storage keeps memory-only reads.
     lake_cache_root: ?[]const u8 = null,
@@ -3892,6 +3895,8 @@ pub const ApiHttpServer = struct {
     index_installation_reserved_slots: usize = 0,
     index_installation_next_generation: u64 = 1,
     index_installation_cursor: usize = 0,
+    lake_index_recovery_cursor: usize = 0,
+    lake_index_recovery_after_ns: u64 = 0,
     backup_maintenance_closing: std.atomic.Value(bool) = .init(false),
     backup_maintenance_mutex: std.atomic.Mutex = .unlocked,
     backup_maintenance_queue: BackupRepositoryMaintenanceQueue = .{},
@@ -5146,6 +5151,9 @@ pub const ApiHttpServer = struct {
         // supervisor is the independent wake source that makes such an
         // obligation self-healing without retaining a sleeping worker solely
         // to retry admission.
+        self.resumeNativeLakeIndexPublication() catch |err| {
+            std.log.warn("failed to resume native lake index publication err={s}", .{@errorName(err)});
+        };
         self.ensurePendingIndexInstallationWorker() catch |err| {
             std.log.warn("failed to resume pending index installation reconciliation err={s}", .{@errorName(err)});
         };
@@ -15412,6 +15420,11 @@ pub const ApiHttpServer = struct {
         var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        if (table.schema_json.len > 0) {
+            var schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
+            defer schema.deinit(alloc);
+            if (schema.external_base_source != null) return indexes_api.encodeLakeIndexList(alloc, table.*) catch return error.InternalFailure;
+        }
         var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return error.InternalFailure;
         defer if (local_statuses) |*status| status.deinit(self.alloc);
         const artifacts = (indexes_api.encodeIndexList(
@@ -15483,6 +15496,11 @@ pub const ApiHttpServer = struct {
         if (table.schema_json.len != 0) {
             var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return error.InternalFailure;
             defer parsed.deinit(alloc);
+            if (parsed.external_base_source != null) {
+                var lookup = (indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name) catch return error.InternalFailure) orelse return error.NotFound;
+                defer lookup.deinit();
+                return indexes_api.encodeLakeIndexResource(alloc, table.*, index_name, lookup.config, false) catch return error.InternalFailure;
+            }
             if (parsed.relational_indexes) |definitions| for (definitions.value) |definition| {
                 if (std.mem.eql(u8, definition.name, index_name)) return self.relationalIndexResource(alloc, table, &parsed, definition, request);
             };
@@ -15746,6 +15764,46 @@ pub const ApiHttpServer = struct {
         try self.ensureIndexInstallationWorkerLocked(runtime);
     }
 
+    /// Durable definitions and pending generations are the recovery source;
+    /// the in-memory queue is only an idempotent wakeup. One table per pass
+    /// also rechecks external coverage after source replacement or append.
+    fn resumeNativeLakeIndexPublication(self: *ApiHttpServer) !void {
+        const runtime = self.cfg.backend_runtime orelse return;
+        if (runtime.threaded_jobs == null or self.index_installation_closing.load(.acquire)) return;
+        const now = platform_time.monotonicNs();
+        if (now < self.lake_index_recovery_after_ns) return;
+        self.lake_index_recovery_after_ns = now +| std.time.ns_per_s;
+        var snapshot = (try self.statusAdminSnapshot()) orelse return;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        if (snapshot.tables.len == 0) {
+            self.lake_index_recovery_cursor = 0;
+            return;
+        }
+        const table = snapshot.tables[self.lake_index_recovery_cursor % snapshot.tables.len];
+        self.lake_index_recovery_cursor = (self.lake_index_recovery_cursor + 1) % snapshot.tables.len;
+        if (self.lake_index_recovery_cursor == 0) self.lake_index_recovery_after_ns = now +| 60 * std.time.ns_per_s;
+        if (table.schema_json.len == 0) return;
+        if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}")) {
+            var state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(self.alloc, table.lake_index_catalog_json);
+            defer state.deinit();
+            if (state.value.pending == null and state.value.published == null and state.value.failure == null) return;
+        }
+        var schema = try schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json);
+        defer schema.deinit(self.alloc);
+        if (schema.external_base_source == null) return;
+        // A slow or leased attempt retains its retry/backoff rather than being
+        // superseded on every supervisor tick.
+        platform_sync.lockYielding(&self.index_installation_mutex);
+        const queued = for (self.index_installation_queue.items) |pending| {
+            if (std.mem.eql(u8, pending.table_name, table.name)) break true;
+        } else false;
+        self.index_installation_mutex.unlock();
+        if (queued) return;
+        var prepared = (try self.prepareIndexInstallationReconcile(table.name, "__lake_publication", null)) orelse return;
+        defer prepared.deinit(self);
+        _ = self.activatePreparedIndexInstallation(&prepared, true);
+    }
+
     fn runIndexInstallationReconciler(self: *ApiHttpServer) void {
         while (!self.index_installation_closing.load(.acquire)) {
             const next = self.nextIndexInstallationSnapshot() catch {
@@ -15812,11 +15870,30 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         pending: *const PendingIndexInstallationSnapshot,
     ) IndexInstallationReconcileResult {
-        const writes = self.table_writes orelse return .complete;
         const alloc = std.heap.page_allocator;
         var authoritative_snapshot = (self.source.linearizableSnapshot(.{}) catch return .retry) orelse return .retry;
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
         const table = tables_api.findTableByName(&authoritative_snapshot, pending.table_name) orelse return .complete;
+        var schema = if (table.schema_json.len == 0) schema_mod.ParsedTableSchema{} else schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return .retry;
+        defer schema.deinit(alloc);
+        if (schema.external_base_source != null) {
+            self.reconcileNativeLakeIndexes(table.*, schema) catch |err| {
+                switch (err) {
+                    error.LakeIndexBuildInProgress,
+                    error.LakeIndexRetryDeferred,
+                    error.TableGenerationChanged,
+                    error.MetadataMutationOutcomeUnknown,
+                    error.NotLeader,
+                    error.Canceled,
+                    error.Cancelled,
+                    => {},
+                    else => std.log.warn("external lake index publication deferred table={s} err={s}", .{ table.name, @errorName(err) }),
+                }
+                return .retry;
+            };
+            return .complete;
+        }
+        const writes = self.table_writes orelse return .complete;
         const current = indexes_api.storedIndexConfigJsonAlloc(alloc, table.indexes_json, pending.index_name) catch return .retry;
         defer if (current) |value| alloc.free(value);
 
@@ -15851,6 +15928,49 @@ pub const ApiHttpServer = struct {
             else => return .retry,
         };
         return .complete;
+    }
+
+    fn reconcileNativeLakeIndexes(self: *ApiHttpServer, table: metadata_table_manager.TableRecord, schema: schema_mod.ParsedTableSchema) !void {
+        const local = @import("antfly_local_sources");
+        if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}")) {
+            var state = try local.metadata_lake_index_catalog.parse(std.heap.page_allocator, table.lake_index_catalog_json);
+            defer state.deinit();
+            if (state.value.pending == null and state.value.published == null and state.value.failure == null) return;
+            const cleared = try local.metadata_lake_index_catalog.encode(std.heap.page_allocator, try state.value.clear());
+            defer std.heap.page_allocator.free(cleared);
+            var replacement = table;
+            replacement.lake_index_catalog_json = cleared;
+            _ = try self.source.replaceTableDefinitionStamped(table, replacement);
+            return;
+        }
+        const config = self.cfg.node_config;
+        const Hooks = struct {
+            fn replace(raw: *anyopaque, before: metadata_table_manager.TableRecord, after: metadata_table_manager.TableRecord) !void {
+                const server: *ApiHttpServer = @ptrCast(@alignCast(raw));
+                _ = try server.source.replaceTableDefinitionStamped(before, after);
+            }
+            fn canceled(raw: *const anyopaque) bool {
+                const server: *const ApiHttpServer = @ptrCast(@alignCast(raw));
+                return server.index_installation_closing.load(.acquire);
+            }
+            fn now(_: *const anyopaque) !u64 {
+                return @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
+            }
+        };
+        const a = std.heap.page_allocator;
+        const lease_ms: u64 = 5 * 60 * 1000;
+        const cancel: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = Hooks.canceled };
+        const context: local.serverless_query_lake_read_context.Context = .{
+            .io = self.embedding_provider_runtime.io,
+            .deadline_ns = platform_time.monotonicNs() +| lease_ms * std.time.ns_per_ms,
+            .cancellation = local.storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn),
+        };
+        var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+        defer store.deinit();
+        const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = config, .secret_store = self.cfg.secret_store };
+        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, options.lakeOptions(), context, &self.lake_read_cache);
+        defer source.deinit();
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms });
     }
 
     fn completeIndexInstallation(self: *ApiHttpServer, generation: u64) void {
@@ -15895,6 +16015,9 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
+        var table_schema = if (table_before.schema_json.len == 0) schema_mod.ParsedTableSchema{} else schema_mod.parseValidatedTableSchema(alloc, table_before.schema_json) catch return error.InvalidIndexRequest;
+        defer table_schema.deinit(alloc);
+        const external_table = table_schema.external_base_source != null;
         const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
             return error.InvalidIndexRequest;
         };
@@ -16057,7 +16180,7 @@ pub const ApiHttpServer = struct {
         // catalog commit. It remains inactive until consensus succeeds, so a
         // failed proposal cannot mutate local state, while post-commit
         // supersession and fallback enqueue are allocation-free.
-        var prepared_installation = if (self.table_writes != null)
+        var prepared_installation = if (external_table or self.table_writes != null)
             self.prepareIndexInstallationReconcile(table_name, index_name, stored_index_json) catch return error.InternalFailure
         else
             null;
@@ -16092,6 +16215,13 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        if (external_table) {
+            const scheduled = if (prepared_installation) |*prepared| self.activatePreparedIndexInstallation(prepared, true) else false;
+            if (!scheduled) self.reconcileNativeLakeIndexes(replacement, table_schema) catch |err| {
+                std.log.warn("external lake create index committed; publication deferred table={s} index={s} err={s}", .{ table_name, index_name, @errorName(err) });
+            };
+            return response_body;
+        }
         if (self.table_writes) |table_writes_source| {
             const committed_activation_accepted = if (mutation_stamp) |stamp|
                 (table_writes_source.acceptCommittedIndexMutation(
@@ -16480,8 +16610,14 @@ pub const ApiHttpServer = struct {
         // A schema-owned index uses the same exact whole-definition CAS as
         // create. Missing projected metadata still falls through to the
         // authoritative drop source, preserving immediate create/delete races.
+        var external_table = false;
         if (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) |before| {
             defer metadata_table_manager.freeTable(alloc, before);
+            if (before.schema_json.len > 0) {
+                var schema = schema_mod.parseValidatedTableSchema(alloc, before.schema_json) catch return error.InternalFailure;
+                defer schema.deinit(alloc);
+                external_table = schema.external_base_source != null;
+            }
             if (@import("relational_index_mutation.zig").drop(alloc, before, index_name) catch |err| switch (err) {
                 error.TableTransitionActive, error.TableGenerationChanged => return error.Conflict,
                 else => return error.InternalFailure,
@@ -16495,7 +16631,7 @@ pub const ApiHttpServer = struct {
         // whether the table or index exists: their create routes intentionally
         // return before that projection catches up. Reserve recovery capacity
         // now, then let the authoritative mutation below decide NotFound.
-        var prepared_installation = if (self.table_writes != null)
+        var prepared_installation = if (external_table or self.table_writes != null)
             self.prepareIndexInstallationReconcile(table_name, index_name, null) catch return error.InternalFailure
         else
             null;
@@ -16522,6 +16658,19 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        if (external_table) {
+            const scheduled = if (prepared_installation) |*prepared| self.activatePreparedIndexInstallation(prepared, true) else false;
+            if (!scheduled) {
+                const after = (self.loadOwnedTableRecord(alloc, table_name) catch return) orelse return;
+                defer metadata_table_manager.freeTable(alloc, after);
+                var schema = schema_mod.parseValidatedTableSchema(alloc, after.schema_json) catch return;
+                defer schema.deinit(alloc);
+                self.reconcileNativeLakeIndexes(after, schema) catch |err| {
+                    std.log.warn("external lake delete index committed; publication deferred table={s} index={s} err={s}", .{ table_name, index_name, @errorName(err) });
+                };
+            }
+            return;
+        }
         if (self.table_writes) |table_writes_source| {
             const committed_activation_accepted = if (mutation_stamp) |stamp|
                 (table_writes_source.acceptCommittedIndexMutation(
