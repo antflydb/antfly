@@ -24,9 +24,9 @@ pub fn attach(consumer: *std.Build.Module) void {
     const b = consumer.owner;
     const root = consumer.root_source_file orelse return;
     const path = @import("../antfly/source_paths.zig").authored(b, root) orelse return;
-    if (std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/local/") != null) return;
+    if (std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/") != null) return;
     const local = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/source_catalog.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/source_catalog.zig"),
         .target = consumer.resolved_target,
         .optimize = consumer.optimize,
     });

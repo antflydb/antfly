@@ -1843,7 +1843,7 @@ func TestLiteNativeGraphEdgesFromExtractionArtifact(t *testing.T) {
 // capture, this reconstructs the shape from three first-party sources that
 // agree with each other: (1) zig/EXTRACT.md's response envelope plus its
 // "Model support" note that fastino/gliner2.5-base-v1 answers the same
-// endpoint/shape family; (2) zig/pkg/antfly-embedded/src/local/asset_producer_runtime.zig's
+// endpoint/shape family; (2) zig/pkg/antfly-embedded/src/asset_producer_runtime.zig's
 // own `extraction_v2_response_fixture` test fixture, which is the
 // schema_version=2 shape the antfly-side response validator
 // (validateExtractionResult, v2=true) already accepts -- entities/relations

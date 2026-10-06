@@ -23,9 +23,9 @@ const Violation = struct {
 
 const default_roots = [_][]const u8{
     "pkg/antfly/src/api",
-    "pkg/antfly-embedded/src/local/api",
-    "pkg/antfly-embedded/src/local/graph",
-    "pkg/antfly-embedded/src/local/storage/db",
+    "pkg/antfly-embedded/src/api",
+    "pkg/antfly-embedded/src/graph",
+    "pkg/antfly-embedded/src/storage/db",
 };
 
 test "algebraic planner owns production tensor construction" {
@@ -119,11 +119,11 @@ fn scanFile(
 }
 
 fn isPlannerOwnedSource(path: []const u8) bool {
-    return std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/local/storage/db/algebraic/planner.zig") or
+    return std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/storage/db/algebraic/planner.zig") or
         // Control owns index-free plans; physical index planning stays in planner.zig.
-        std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/local/storage/db/algebraic/planner_control.zig") or
-        std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/local/storage/db/algebraic/ir.zig") or
-        std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/local/storage/db/algebraic/ownership_test.zig");
+        std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/storage/db/algebraic/planner_control.zig") or
+        std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/storage/db/algebraic/ir.zig") or
+        std.mem.endsWith(u8, path, "pkg/antfly-embedded/src/storage/db/algebraic/ownership_test.zig");
 }
 
 fn startsTestBlock(trimmed: []const u8) bool {

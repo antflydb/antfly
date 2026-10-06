@@ -33,8 +33,8 @@ class LocalTestPartitions(unittest.TestCase):
             "build_support/antfly/test_partitions.zig",
             "build_support/antfly/source_paths.zig",
             "build_support/embedded/source_owner.zig",
-            "pkg/antfly-embedded/src/local/test_runner.zig",
-            "pkg/antfly-embedded/src/local/test_error_logs.zig",
+            "pkg/antfly-embedded/src/test_runner.zig",
+            "pkg/antfly-embedded/src/test_error_logs.zig",
             "tools/audit_test_selection.py",
             "tools/run_test_partitions.py",
             "pkg/antfly/build/unit_test_ownership.zig",
@@ -53,7 +53,7 @@ pub fn configureTestRun(run: *std.Build.Step.Run) void {
 """,
         )
         self.write(
-            "pkg/antfly-embedded/src/local/source_catalog.zig",
+            "pkg/antfly-embedded/src/source_catalog.zig",
             """pub const local = @import("local.zig");
 comptime {
     for (@import("antfly_local_test_sources").names) |name| _ = @field(@This(), name);
@@ -61,7 +61,7 @@ comptime {
 """,
         )
         self.write(
-            "pkg/antfly-embedded/src/local/local.zig",
+            "pkg/antfly-embedded/src/local.zig",
             """const std = @import("std");
 pub const Token = struct { value: u32 };
 test "local owned" {
@@ -102,12 +102,12 @@ pub fn build(b: *std.Build) void {
     options.addOption(u32, "value", 42);
     root.addOptions("options", options);
     root.addImport("antfly_test_error_logs", b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/test_error_logs.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
         .target = target, .optimize = .debug,
     }));
     const tests = b.addTest(.{
         .name = "fixture", .root_module = root,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const wrapped = b.option(bool, "wrapper", "Use the partition wrapper") orelse false;
     const run = if (wrapped) b.addSystemCommand(&.{"python3"}) else b.addRunArtifact(tests);
@@ -180,20 +180,20 @@ pub fn build(b: *std.Build) void {
         self.assertNotIn("local owned...", output)
 
     def test_control_profile_ignores_inactive_physical_imports(self):
-        catalog = self.root / "pkg/antfly-embedded/src/local/source_catalog.zig"
+        catalog = self.root / "pkg/antfly-embedded/src/source_catalog.zig"
         catalog.write_text(
             catalog.read_text()
             + '\n pub const physical = @import("physical.zig");\n'
             + 'pub const storage_db_generation_lifecycle = @import("lifecycle.zig");\n'
         )
         self.write(
-            "pkg/antfly-embedded/src/local/physical.zig",
+            "pkg/antfly-embedded/src/physical.zig",
             """const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 test "physical owned" { _ = DB; }
 """,
         )
         self.write(
-            "pkg/antfly-embedded/src/local/lifecycle.zig",
+            "pkg/antfly-embedded/src/lifecycle.zig",
             'test "physical lifecycle owned" {}\n',
         )
         fixture = self.root / "pkg/antfly/src/fixture.zig"
