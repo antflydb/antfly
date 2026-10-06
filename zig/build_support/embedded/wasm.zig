@@ -175,6 +175,8 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     embedded_support_wasm_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    wasm_credentials_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    wasm_credentials_mod.addImport("antfly_platform", wasm_platform_mod);
     const wasm_cache_budget_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/cache_budget.zig"),
         .target = wasm_target,
