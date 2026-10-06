@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const platform = @import("antfly_platform");
@@ -126,6 +127,88 @@ test "reader execution report preserves mixed native and fallback completion" {
     try std.testing.expectEqual(@as(usize, 1), report.fallback_items);
     try std.testing.expectEqual(@as(usize, 2), report.native_batches);
     try std.testing.expectEqualStrings("native_batch_failed", report.fallback_reason.?);
+}
+
+test "asset producer runtime apple OCR uses local media without embedded inference" {
+    if (!readers.apple.enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{});
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    defer runtime.deinit();
+    const media = [_]asset_producer.EncodedMedia{.{ .bytes = readers.apple.testing.fixture_png, .mime_type = "image/png" }};
+    const request = asset_producer.Request{
+        .producer_type = .reader,
+        .config_json = "{\"provider\":\"apple\"}",
+        .source_text = "",
+        .media = &media,
+        .content_type = "text/plain",
+        .inline_media_trusted = true,
+        .item_id = "page-1",
+        .source_fingerprint = "doc-1",
+        .page_number = 1,
+    };
+    var producer = runtime.producer();
+    const caps = (try producer.capabilitiesForRequests(alloc, &.{request})).?;
+    try std.testing.expect(caps.borrowed_rasters);
+    try std.testing.expectEqual(inference_work.BatchMode.serial_compatibility, caps.batch.mode);
+    const plan = try producer.invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(inference_work.AttachmentTransport.borrowed_binary, plan.attachment_transport);
+    try std.testing.expect(plan.fixed_bytes >= readers.apple.native_workspace_reservation_bytes);
+    // The server's host-budget tests qualify the 1 GiB document slice on a
+    // 36 GiB host. Local sources consume that envelope without owning policy.
+    try std.testing.expect(plan.fixed_bytes < 1024 * 1024 * 1024);
+    try std.testing.expect(!try runtime.requestForegroundBounded(alloc, request));
+    const output = try producer.produce(alloc, request);
+    defer alloc.free(output);
+    try std.testing.expectEqualStrings("Antfly local OCR\nInvoice 12345\nTotal USD 42.00", output);
+
+    const decoded = try @import("antfly_image").png.decodeRgba(alloc, media[0].bytes);
+    defer alloc.free(decoded.rgba);
+    var raster_request = request;
+    raster_request.media = &.{};
+    const raster = readers.RasterImage{
+        .bytes = decoded.rgba,
+        .width = decoded.width,
+        .height = decoded.height,
+        .stride_bytes = @as(usize, decoded.width) * 4,
+        .item_id = request.item_id,
+        .source_fingerprint = request.source_fingerprint,
+        .page_number = request.page_number,
+    };
+    try std.testing.expect(try producer.borrowedRasterBatchAvailable(alloc, &.{raster_request}));
+    var batch = try producer.produceBorrowedRasterBatchReported(alloc, &.{raster_request}, &.{raster});
+    defer batch.deinit(alloc);
+    try std.testing.expectEqualStrings(output, batch.items[0].result.value);
+    try std.testing.expectEqualStrings("page-1", batch.items[0].identity.item_id);
+    try std.testing.expectEqual(@as(usize, 1), batch.execution.serial_items);
+}
+
+test "Apple transcription admission uses the effective download ceiling" {
+    if (!transcribing.apple_native.enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    defer runtime.deinit();
+    var producer = runtime.producer();
+    var request = asset_producer.Request{
+        .producer_type = .transcriber,
+        .config_json = "{\"provider\":\"apple\"}",
+        .source_text = "https://example.com/recording.wav",
+        .content_type = "text/plain",
+    };
+    const baseline = try producer.invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expect(baseline.fixed_bytes >= transcribing.apple_native.workspace_bytes + transcribing.default_max_download_bytes);
+    // Pad with JSON whitespace so config-buffer overhead is identical.
+    request.config_json = "{\"provider\":\"apple\",\"max_download_bytes\":0}        ";
+    const zero = try producer.invocationMemoryForRequests(alloc, &.{request});
+    request.config_json = "{\"provider\":\"apple\",\"max_download_bytes\":134217728}";
+    const explicit = try producer.invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(zero.fixed_bytes, explicit.fixed_bytes);
+    try std.testing.expectEqual(zero.allocator_limit_bytes, explicit.allocator_limit_bytes);
 }
 
 test "asset producer runtime derives coherent logical and wire result ceilings" {
@@ -639,6 +722,7 @@ pub const Runtime = struct {
         }
         var remote = false;
         var allocator_owner: inference_work.InvocationAllocatorOwner = .caller;
+        var native_workspace_bytes: usize = 0;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
             .copy, .document_extraction => .borrowed_binary,
             .decision => blk: {
@@ -654,6 +738,11 @@ pub const Runtime = struct {
                 const cfg = self.routedReaderConfig(parsed.value);
                 try cfg.validate();
                 remote = !isLocalReaderProvider(cfg.provider, cfg.resolvedUrl());
+                if (cfg.provider == .apple) {
+                    try readers.apple.checkAvailable();
+                    native_workspace_bytes = readers.apple.native_workspace_reservation_bytes;
+                    break :blk .borrowed_binary;
+                }
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -672,7 +761,12 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, requests[0].config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
-                remote = parsed.generator.url.len > 0 or parsed.generator.provider != .antfly;
+                remote = parsed.generator.provider != .apple and (parsed.generator.url.len > 0 or parsed.generator.provider != .antfly);
+                if (parsed.generator.provider == .apple) {
+                    try @import("antfly_generating").apple_native.checkAvailable();
+                    native_workspace_bytes = @import("antfly_generating").apple_native.workspace_bytes;
+                    break :blk .borrowed_binary;
+                }
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -709,7 +803,15 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const cfg = self.routedTranscriberConfig(parsed.value);
-                remote = !isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl());
+                try cfg.validate();
+                remote = cfg.provider != .apple and !isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl());
+                if (cfg.provider == .apple) {
+                    try transcribing.apple_native.checkAvailable();
+                    // The adapter owns its bounded downloaded recording; Swift
+                    // borrows it while AVAudioFile streams decoded samples.
+                    native_workspace_bytes = transcribing.apple_native.workspace_bytes + transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes);
+                    break :blk .borrowed_binary;
+                }
                 if (!remote) {
                     const local = self.antfly_provider orelse return error.InferenceInvocationMemoryUnavailable;
                     allocator_owner = try localInvocationAllocatorOwner(local);
@@ -733,6 +835,7 @@ pub const Runtime = struct {
         const control = std.math.mul(usize, requests.len, invocation_control_bytes_per_item) catch
             return error.InferenceEncodedBytesExceeded;
         fixed = std.math.add(usize, fixed, control) catch return error.InferenceEncodedBytesExceeded;
+        fixed = std.math.add(usize, fixed, native_workspace_bytes) catch return error.InferenceEncodedBytesExceeded;
         const configured_results = try self.configuredResultLimit(requests[0].producer_type, requests.len);
         const results = if (remote)
             self.remoteLogicalResultLimit(requests[0].producer_type, requests.len)
@@ -849,6 +952,7 @@ pub const Runtime = struct {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);
                 try self.routeGeneratorConfig(alloc, &parsed.generator);
+                if (parsed.generator.provider == .apple) break :blk false;
                 const local = self.antfly_provider orelse break :blk true;
                 if (parsed.generator.provider != .antfly or parsed.generator.url.len != 0)
                     break :blk true;
@@ -864,6 +968,9 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const cfg = self.routedReaderConfig(parsed.value);
+                // Vision cancellation is cooperative; retain the background invocation
+                // until native work returns instead of promising a hard deadline.
+                if (cfg.provider == .apple) break :blk false;
                 const local = self.antfly_provider orelse break :blk true;
                 if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
                 break :blk if (request.media.len > 0)
@@ -879,6 +986,7 @@ pub const Runtime = struct {
                 });
                 defer parsed.deinit();
                 const cfg = self.routedTranscriberConfig(parsed.value);
+                if (cfg.provider == .apple) break :blk false;
                 const local = self.antfly_provider orelse break :blk true;
                 if (!isLocalTranscriberProvider(cfg.provider, cfg.resolvedUrl())) break :blk true;
                 break :blk local.transcribe_audio_with_context != null;
@@ -1145,6 +1253,7 @@ pub const Runtime = struct {
         // node cannot opt a storage node into an in-process borrowed ABI by
         // publishing a logically valid but physically unusable capability.
         if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) return false;
+        if (cfg.provider == .apple) return readers.apple.enabled and requests.len <= readers.apple.max_images;
         const local = self.antfly_provider orelse return false;
         if (local.read_raster_images_reported == null and
             local.read_raster_images_reported_with_context == null) return false;
@@ -1209,6 +1318,7 @@ pub const Runtime = struct {
     ) !?inference_work.InferenceCapabilities {
         const cfg = self.routedReaderConfig(raw_cfg);
         try cfg.validate();
+        if (cfg.provider == .apple) return try readers.apple.capabilities();
         if (!isLocalReaderProvider(cfg.provider, cfg.resolvedUrl())) {
             if (cfg.provider != .antfly) return null;
             const endpoint = cfg.resolvedUrl() orelse return null;
@@ -1253,6 +1363,10 @@ pub const Runtime = struct {
     // Planning already owns a parsed, routed configuration. Reuse it so the
     // bounded contract resolver need not retain a second JSON/config tree.
     fn canGenerateBatchWithConfig(self: *Runtime, parsed: GeneratorProducerConfig, requests: []const asset_producer.Request) bool {
+        if (parsed.generator.provider == .apple) {
+            for (requests) |request| if (request.media.len > 0) return false;
+            return parsed.tool_output == .content;
+        }
         var all_have_media = true;
         for (requests) |request| {
             if (request.media.len > 0 and !request.inline_media_trusted) return false;
@@ -1978,6 +2092,10 @@ pub const Runtime = struct {
                 for (content_parts) |part| if (part != .text) return error.UnsupportedMediaTokenBudget;
             }
         };
+        if (cfg.provider == .apple) {
+            const outputs = try self.produceBatchSequential(alloc, requests);
+            return asset_producer.producedBatchFromOutputs(alloc, requests, outputs, inference_work.ExecutionReport.serial(requests.len));
+        }
         if (cfg.provider != .antfly) return error.BatchIncompatible;
         if (cfg.project_id != null or cfg.location != null or cfg.credentials_path != null) return error.BatchIncompatible;
         if (cfg.tools_json != null or cfg.tool_choice_json != null or parsed_cfg.tool_output != .content) return error.BatchIncompatible;
@@ -2217,6 +2335,7 @@ pub const Runtime = struct {
         // from durable user configuration.
         cfg_parsed.value.framed_attachments = false;
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
+        if (cfg_parsed.value.provider == .apple) return self.produceBatchSequential(alloc, requests);
         if (!isLocalTranscriberProvider(cfg_parsed.value.provider, cfg_parsed.value.resolvedUrl()))
             return self.produceRemoteCompatibilityBatch(alloc, requests);
         const model = requiredAntflyTranscriberModel(cfg_parsed.value) catch return error.BatchIncompatible;
@@ -2623,6 +2742,13 @@ pub const Runtime = struct {
         return try encodeReaderResults(alloc, request.content_type, results);
     }
 
+    fn appleReaderOptions(self: *Runtime) !readers.RemoteOptions {
+        return .{
+            .timeout_ms = try self.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms),
+            .cancellation = httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn),
+        };
+    }
+
     fn readImagesWithConfig(self: *Runtime, alloc: Allocator, cfg: readers.Config, request: readers.Request) ![]readers.Result {
         return (try self.readImagesWithConfigReported(alloc, cfg, request)).items;
     }
@@ -2680,6 +2806,8 @@ pub const Runtime = struct {
             // retain their provider-owned validation until they expose one.
             return error.InvalidInferenceCapabilities;
         }
+        if (execution_cfg.provider == .apple)
+            return readers.readWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             const items = if (local.read_images_with_context) |read_images|
@@ -2825,6 +2953,8 @@ pub const Runtime = struct {
         } else if (local_reader) {
             return error.InvalidInferenceCapabilities;
         }
+        if (execution_cfg.provider == .apple)
+            return readers.readEncodedWithConfigReported(alloc, self.http, execution_cfg, request, try self.appleReaderOptions());
         if (local_reader) {
             const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
             if (local.read_encoded_images_reported_with_context) |read_reported|
@@ -2946,6 +3076,8 @@ pub const Runtime = struct {
         const capabilities = (try self.readerCapabilities(alloc, execution_cfg)) orelse
             return error.InvalidInferenceCapabilities;
         if (!capabilities.borrowed_rasters) return error.BorrowedRasterUnsupported;
+        if (execution_cfg.provider == .apple)
+            return readers.readRasterWithConfigReported(alloc, execution_cfg, request, try self.appleReaderOptions());
         const local = self.antfly_provider orelse return error.UnsupportedReaderProvider;
         if (local.read_raster_images_reported == null and
             local.read_raster_images_reported_with_context == null)
@@ -3394,7 +3526,7 @@ fn toolCallArgumentsOutputAlloc(alloc: Allocator, calls: []const generating_runt
 }
 
 fn isLocalReaderProvider(provider: readers.Provider, url: ?[]const u8) bool {
-    return provider == .antfly and url == null;
+    return provider == .apple or (provider == .antfly and url == null);
 }
 
 fn isLocalTranscriberProvider(provider: transcribing.Provider, url: ?[]const u8) bool {
@@ -5395,7 +5527,7 @@ test "asset producer runtime accepts an unrequested boundary-model schema_versio
 // `extractionResultJsonAlloc` path, whenever more than one document changes
 // in the same replay pass -- exactly what
 // TestLiteNativeGraphEdgesFromExtractionArtifactBoundaryV2
-// (go/pkg/lite/lite_cgo_test.go) exercises with its two documents.
+// (go/pkg/embedded/lite_cgo_test.go) exercises with its two documents.
 test "asset producer runtime batch path accepts an unrequested boundary-model schema_version upgrade" {
     const a = std.testing.allocator;
     const item_shape =

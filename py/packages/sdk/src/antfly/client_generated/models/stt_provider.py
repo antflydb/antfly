@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class STTProvider(StrEnum):
     ANTFLY = "antfly"
+    APPLE = "apple"
     OPENAI = "openai"
     VERTEX = "vertex"
 

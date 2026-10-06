@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Inspect production module profiles before fixtures substitute entry bodies.
 const std = @import("std");
@@ -41,6 +42,18 @@ pub const owner_probe_source =
     \\
 ;
 
+// Canonicalizing a resolved CPU expands its feature dependencies. Modules are
+// shared by many artifacts; their configured target remains fixed while probes
+// replace source bodies, so compute that projection once per module.
+var target_queries: std.AutoHashMapUnmanaged(*std.Build.Module, std.Target.Query) = .empty;
+
+fn targetQuery(module: *std.Build.Module) std.Target.Query {
+    const entry = target_queries.getOrPut(module.owner.allocator, module) catch @panic("OOM");
+    if (!entry.found_existing)
+        entry.value_ptr.* = std.Target.Query.fromTarget(&module.resolved_target.?.result);
+    return entry.value_ptr.*;
+}
+
 pub fn check(artifact: *std.Build.Step.Compile) void {
     var seen = std.AutoHashMap(*std.Build.Module, void).init(artifact.step.owner.allocator);
     inspect(artifact, artifact.root_module, &seen);
@@ -49,8 +62,8 @@ pub fn check(artifact: *std.Build.Step.Compile) void {
 fn inspect(artifact: *std.Build.Step.Compile, module: *std.Build.Module, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
     const root = artifact.root_module;
-    if (module.resolved_target) |target| {
-        if (!std.Target.Query.fromTarget(&target.result).eql(std.Target.Query.fromTarget(&root.resolved_target.?.result)))
+    if (module.resolved_target != null) {
+        if (!targetQuery(module).eql(targetQuery(root)))
             std.debug.panic("{s}: runtime dependency has a different target", .{artifact.name});
     }
     if (module.optimize) |optimize| {

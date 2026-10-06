@@ -1,18 +1,21 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
+const chatgpt_manager = @import("../chatgpt/manager.zig");
+const chatgpt_responses = @import("../chatgpt/responses.zig");
 const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
@@ -30,6 +33,7 @@ const provider_defaults = @import("antfly_inference_provider_defaults");
 
 const remote_generate_max_timeout_ms: u64 = 300_000;
 
+pub const ChatGPTFailure = chatgpt_responses.Failure;
 pub const Role = lib.Role;
 pub const ContentPart = lib.ContentPart;
 pub const ChatMessageContent = lib.ChatMessageContent;
@@ -78,7 +82,30 @@ test "embedded canonical generation preserves tool definitions returned calls an
 }
 pub const parseConfigFromValue = lib.parseConfigFromValue;
 
+test "Apple generation backend bypasses HTTP quotas and honors request deadlines" {
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var factory = BackendFactory.initWithOptions(alloc, &client, .{
+        .request_context = .{ .io = std.testing.io, .deadline_ns = 1 },
+    });
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
+    if (!lib.apple_native.enabled) {
+        try std.testing.expectError(error.AppleIntelligenceProviderUnavailable, factory.factory().create(alloc, cfg));
+        return;
+    }
+    var generator = try factory.factory().create(alloc, cfg);
+    defer generator.deinit();
+    const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
+    try std.testing.expect(state.quota == null);
+    try std.testing.expectError(error.Timeout, generator.generate(alloc, "", &.{.{ .role = .user, .content = .{ .text = "hello" } }}));
+}
+
 pub const BackendFactory = struct {
+    chatgpt: ?*chatgpt_manager.Manager = null,
+    personal_owner: ?[]const u8 = null,
+    chatgpt_failure: ?*ChatGPTFailure = null,
+    chatgpt_pin: ?chatgpt_manager.Pin = null,
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -103,6 +130,10 @@ pub const BackendFactory = struct {
     }
 
     pub const Options = struct {
+        chatgpt: ?*chatgpt_manager.Manager = null,
+        personal_owner: ?[]const u8 = null,
+        chatgpt_failure: ?*ChatGPTFailure = null,
+        chatgpt_pin: ?chatgpt_manager.Pin = null,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
@@ -122,6 +153,10 @@ pub const BackendFactory = struct {
         if (execution.routing.source_table.len == 0)
             execution.routing.source_table = options.source_table;
         return .{
+            .chatgpt = options.chatgpt,
+            .personal_owner = options.personal_owner,
+            .chatgpt_failure = options.chatgpt_failure,
+            .chatgpt_pin = options.chatgpt_pin,
             .alloc = alloc,
             .http = http,
             .antfly_provider = options.antfly_provider,
@@ -144,7 +179,34 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
+        if (cfg.provider == .chatgpt) {
+            try cfg.validate();
+            const manager = self.chatgpt orelse return error.ChatGPTDisabled;
+            const owner = self.personal_owner orelse return error.ChatGPTInteractiveOnly;
+            const state = try alloc.create(ChatGPTBackend);
+            state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
+            return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
+        }
         return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits);
+    }
+};
+
+const ChatGPTBackend = struct {
+    alloc: std.mem.Allocator,
+    provider: chatgpt_responses.Provider,
+    context: ?RequestContext,
+    fn generate(raw: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.context) |context| {
+            try context.check();
+            self.provider.timeout_ms = try context.remainingTimeoutMs() orelse 120_000;
+            self.provider.request_context = context;
+        }
+        return self.provider.generate(alloc, model, messages);
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.alloc.destroy(self);
     }
 };
 
@@ -164,6 +226,7 @@ const BackendState = struct {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
         embedded_antfly: managed_embedder.AntflyProvider,
+        apple: void,
         vertex: vertex_provider.Provider,
         gemini: vertex_provider.GeminiProvider,
     },
@@ -183,6 +246,8 @@ const BackendState = struct {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
 
+        try cfg.validate();
+        if (cfg.provider == .apple) try lib.apple_native.checkAvailable();
         state.limits = limits;
         _ = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         state.alloc = alloc;
@@ -243,13 +308,15 @@ const BackendState = struct {
                 if (cfg.capability_revision) |revision| try provider.setCapabilityRevision(revision);
                 break :blk .{ .remote_antfly = provider };
             },
+            .apple => .{ .apple = {} },
             else => return error.UnsupportedGeneratorProvider,
         };
 
         errdefer switch (state.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.deinit(),
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
         };
+        if (state.provider == .apple) return .{ .ptr = state, .vtable = &.{ .generate = generate, .deinit = deinit } };
         const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
         if (state.provider == .embedded_antfly and policy.enabled()) return error.UnsupportedLocalRateLimit;
         state.quota = try limits.acquire(state.quotaIdentity(cfg.model), policy);
@@ -268,7 +335,7 @@ const BackendState = struct {
         switch (self.provider) {
             .openai => |*provider| provider.deinit(),
             .remote_antfly => |*provider| provider.deinit(),
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
             .vertex => |*provider| provider.deinit(),
             .gemini => |*provider| provider.deinit(),
         }
@@ -288,7 +355,7 @@ const BackendState = struct {
             .remote_antfly => |provider| provider.base_url,
             .vertex => |provider| provider.base_url,
             .gemini => |provider| provider.base_url,
-            .embedded_antfly => "",
+            .embedded_antfly, .apple => "",
         };
         return .{
             .operation = .generation,
@@ -323,8 +390,14 @@ const BackendState = struct {
                     .cancellation = cancellation,
                 }),
                 .gemini => |*provider| provider.setRequestControl(timeout_ms, cancellation),
-                .embedded_antfly => {},
+                .embedded_antfly, .apple => {},
             }
+        }
+        if (self.provider == .apple) {
+            const timeout = if (self.request_context) |context| try context.remainingTimeoutMs() else try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), 120_000);
+            const cancellation = if (self.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn);
+            if (model.len > 0) return error.UnsupportedAppleGenerationOptions;
+            return lib.generateApple(alloc, self.cfg, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
         try validateGenerationMessagesTokenBudget(self.cfg, messages);
@@ -338,13 +411,14 @@ const BackendState = struct {
         const observer = quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = observer,
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
         }
         defer switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini => |*provider| provider.attempt_observer = null,
-            .embedded_antfly => {},
+            .embedded_antfly, .apple => {},
         };
         var result = switch (self.provider) {
+            .apple => unreachable,
             .openai => |*provider| blk: {
                 if (self.api_key) |*api_key_ref| {
                     if (try optionalBearerAuthHeaderOwned(self, alloc, api_key_ref)) |auth_header| {
@@ -603,6 +677,7 @@ pub fn executeChainWithOptions(
     options: BackendFactory.Options,
     messages: []const ChatMessage,
 ) !GenerateResult {
+    for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
     var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
     return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
 }
@@ -1386,6 +1461,13 @@ test "generating backend tools complete agent conversations across all remote ad
         try group.await(io);
         if (failure) |err| return err;
     }
+}
+
+test "chatgpt disabled factory rejects inference without upstream work" {
+    const a = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    try std.testing.expectError(error.ChatGPTDisabled, executeChainWithOptions(a, &client, &.{.{ .generator = .{ .provider = .chatgpt, .connection_id = "one", .model = "model", .url = "" } }}, .{}, &.{}));
 }
 
 test "generating backend defaults OpenAI and OpenRouter credentials from the store" {

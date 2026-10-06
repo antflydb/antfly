@@ -206,6 +206,18 @@ components:
           $ref: "#/components/schemas/TLSInfo"
         remote_content:
           $ref: "../shared/scraping.yaml#/components/schemas/RemoteContentConfig"
+        connectors:
+          type: object
+          additionalProperties: false
+          description: Deployment policy for integrations, separate from named connections and login providers.
+          properties:
+            chatgpt:
+              type: object
+              additionalProperties: false
+              properties:
+                enabled:
+                  type: boolean
+                  description: Disable ChatGPT connections when false. Omission preserves local loopback standalone support; true does not enable remote or distributed use. Applied at startup.
         connections:
           type: object
           additionalProperties:

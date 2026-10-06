@@ -134,8 +134,10 @@ The storage archive owns `storage/db/db.zig`, `storage/query.zig`, and
 live in `api/query_execution_contract.zig` and `api/write_contract.zig`;
 physical resource setup lives under `storage/`.
 
-The executable dispatches Lite administration to storage and `lite serve` to
-the distributed runtime. Storage never links back to a server entry point.
+The Apache Lite executable links its local engine owner, enrichment, and
+inference without database server owners. The ELv2 standalone executable
+serves Lite files through `standalone --storage-engine lite --storage-path`.
+Storage never links back to a server entry point.
 Storage owner tests link the same production archives and are included in the
 storage and integration aggregates, using module-name test filters.
 

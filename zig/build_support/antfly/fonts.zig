@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +15,11 @@
 
 const std = @import("std");
 
-/// PDF and web UI consume the same canonical design-system font assets.
+/// PDF products embed reviewed Apache-2.0 Roboto fonts, independently of server UI assets.
 pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const files = b.addWriteFiles();
-    _ = files.addCopyFile(b.path("../ts/packages/design-system/src/fonts/aeonik/Aeonik-Regular.ttf"), "Aeonik-Regular.ttf");
-    _ = files.addCopyFile(b.path("../ts/packages/design-system/src/fonts/aeonik/Aeonik-Bold.ttf"), "Aeonik-Bold.ttf");
+    _ = files.addCopyFile(b.path("lib/pdf/fonts/roboto/Roboto-Regular.ttf"), "lib/pdf/fonts/roboto/Roboto-Regular.ttf");
+    _ = files.addCopyFile(b.path("lib/pdf/fonts/roboto/Roboto-Bold.ttf"), "lib/pdf/fonts/roboto/Roboto-Bold.ttf");
     return b.createModule(.{
         .root_source_file = files.add("pdf_standard_fonts.zig", @embedFile("../../pdf_standard_fonts.zig")),
         .target = target,

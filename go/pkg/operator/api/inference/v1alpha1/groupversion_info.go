@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +19,7 @@
 package v1alpha1
 
 //go:generate go tool controller-gen object paths="."
+//go:generate python3 ../../../../../../scripts/license_headers.py --group apache zz_generated.deepcopy.go
 //go:generate go tool controller-gen crd:maxDescLen=0 paths="." output:crd:artifacts:config=../../../manifests/crd
 
 import (

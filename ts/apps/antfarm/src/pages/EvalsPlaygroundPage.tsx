@@ -103,7 +103,10 @@ const SAMPLE_EVAL_SET = {
 
 const EvalsPlaygroundPage: React.FC = () => {
   const apiClient = useApi();
-  const { dashboardGenerator } = useGeneratorPreference();
+  const { dashboardGenerator: savedDashboardGenerator } = useGeneratorPreference();
+  // A personal plan preference applies to interactive Chat and RAG only.
+  const dashboardGenerator =
+    savedDashboardGenerator?.provider === "chatgpt" ? null : savedDashboardGenerator;
   const {
     evalSets,
     createEvalSet,
@@ -361,22 +364,14 @@ const EvalsPlaygroundPage: React.FC = () => {
               stream: false,
               ...(effectiveAnswerGenerator
                 ? {
-                    generator: {
-                      provider: effectiveAnswerGenerator.provider,
-                      model: effectiveAnswerGenerator.model,
-                      temperature: effectiveAnswerGenerator.temperature,
-                    },
+                    generator: effectiveAnswerGenerator,
                   }
                 : {}),
               steps: {
                 generation: {},
                 eval: {
                   evaluators: ["correctness"],
-                  judge: {
-                    provider: effectiveJudge.provider,
-                    model: effectiveJudge.model,
-                    temperature: effectiveJudge.temperature,
-                  },
+                  judge: effectiveJudge,
                   ground_truth: {
                     expectations: item.referenceAnswer,
                   },

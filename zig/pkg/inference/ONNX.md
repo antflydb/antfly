@@ -169,13 +169,13 @@ least 21, since block-wise dequantization requires that opset.
 
 ## Quantized ONNX Status
 
-> **Relocated:** The dated Q8_0 export/validation campaign that previously lived here (143 lines) is preserved verbatim in [work-log/completed/inference/onnx-quantized-status-history.md](../../../work-log/completed/inference/onnx-quantized-status-history.md). Durable decisions from it are in Core Decision in this document.
+> **Relocated:** The dated Q8_0 export/validation campaign that previously lived here (143 lines) is preserved verbatim in [docs/design/inference/history/onnx-quantized-status-history.md](../../../docs/design/inference/history/onnx-quantized-status-history.md). Durable decisions from it are in Core Decision in this document.
 
 ## Debugger Flags
 
 `--node-range START END` is the preferred localized ONNX correctness debugger when a new exact-shape graph diff appears. `--debug-output-node N` exposes traced nodes as extra ONNX graph outputs so `run-artifact --compare-host` can compare them against captured native graph values. `--onnx-reuse-initializers-from <artifact.onnx>` lets debug ONNX protobufs reuse an existing external weight blob instead of writing duplicate multi-GiB weights.
 
-> **Relocated:** The debugger bisection history and status previously under "Debugger Status" (24 lines) is preserved verbatim in [work-log/completed/inference/onnx-quantized-status-history.md](../../../work-log/completed/inference/onnx-quantized-status-history.md). Durable decisions from it are in this Debugger Flags section.
+> **Relocated:** The debugger bisection history and status previously under "Debugger Status" (24 lines) is preserved verbatim in [docs/design/inference/history/onnx-quantized-status-history.md](../../../docs/design/inference/history/onnx-quantized-status-history.md). Durable decisions from it are in this Debugger Flags section.
 
 ## Quantized ONNX Plan
 
