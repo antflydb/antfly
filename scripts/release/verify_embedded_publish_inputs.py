@@ -75,7 +75,7 @@ def verify_identity(
     document = verify_release_spec(request, tag, commit)
     if (
         document.get("schema_version") != 5
-        or document.get("build_contract_schema") != 2
+        or document.get("build_contract_schema") not in {2, 3}
         or document.get("build_controller_commit") != controller
         or document.get("release_line") != line.name
         or document.get("source_ref") != line.source_ref
@@ -98,6 +98,7 @@ def verify_identity(
     git(root, "merge-base", "--is-ancestor", commit, document["source_ref_head"])
     channel = load_policy()["channels"][document["channel"]]
     return {
+        "build_contract_schema": str(document["build_contract_schema"]),
         "commit": commit,
         "version": document["version"],
         "python_version": document["registry_versions"]["python"],

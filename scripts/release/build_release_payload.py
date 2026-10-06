@@ -54,7 +54,7 @@ def copy_payload_file(src: Path, out_dir: Path) -> Path:
 def artifact_kind(path: Path) -> str:
     name = path.name
     if name.startswith(
-        ("antfly_", "antfly-lite_", "antfly-inference_")
+        ("antfly_", "antfly-embedded_", "antfly-lite_", "antfly-inference_")
     ) and name.endswith(".tar.gz"):
         return "runtime-archive"
     if name.endswith("_checksums.txt"):
@@ -221,7 +221,7 @@ def main() -> int:
         "--archive-dir",
         type=Path,
         required=True,
-        help="directory containing matching antfly_*, antfly-lite_*, and antfly-inference_* archives",
+        help="directory containing matching runtime archives declared by the source build contract",
     )
     parser.add_argument(
         "--extra-dir",

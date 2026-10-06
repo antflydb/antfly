@@ -255,13 +255,13 @@ jobs:
       zig_version: ${{ needs.release-plan.outputs.zig_version }}
       zig_x86_64_linux_sha256: ${{ needs.release-plan.outputs.zig_x86_64_linux_sha256 }}
 
-  package-lite-artifacts:
-    if: ${{ contains(fromJSON(needs.release-plan.outputs.runtime_products), 'lite') }}
-    name: Build Apache Lite and Inference packages
+  package-embedded-artifacts:
+    if: ${{ needs.release-plan.outputs.build_contract_schema != '1' }}
+    name: Build Apache Embedded packages
     needs:
       - release-plan
       - build-zig-runtime-archives
-    uses: ./.github/workflows/lite-package.yml
+    uses: ./.github/workflows/embedded-package.yml
     with:
       version: ${{ inputs.tag_name }}
       source_commit: ${{ inputs.source_commit }}
@@ -295,7 +295,7 @@ jobs:
       - release-plan
       - build-zig-runtime-archives
       - package-cli-artifacts
-      - package-lite-artifacts
+      - package-embedded-artifacts
       - package-release-source
       - test-macos-homebrew
     runs-on: ubuntu-latest

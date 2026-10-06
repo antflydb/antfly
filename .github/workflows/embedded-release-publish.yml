@@ -26,6 +26,7 @@ jobs:
       contents: read
       actions: read
     outputs:
+      build_contract_schema: ${{ steps.identity.outputs.build_contract_schema }}
       commit: ${{ steps.identity.outputs.commit }}
       version: ${{ steps.identity.outputs.version }}
       python_version: ${{ steps.identity.outputs.python_version }}
@@ -98,6 +99,7 @@ jobs:
             --commit "${{ steps.identity.outputs.commit }}"
           python scripts/packaging/verify_lite_release.py \
             --version "${{ steps.identity.outputs.version }}" \
+            --build-contract-schema "${{ steps.identity.outputs.build_contract_schema }}" \
             --archive-dir dist/release-archives \
             --wheel-dir dist/lite-snapshot \
             --npm-dir dist/lite-snapshot

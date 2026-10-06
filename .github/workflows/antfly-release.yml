@@ -513,6 +513,7 @@ jobs:
           cp dist/release-payload/artifacts.json dist/release-ledger/artifacts.json
           shopt -s nullglob
           runtime_archives=(dist/release-payload/antfly_*.tar.gz
+            dist/release-payload/antfly-embedded_*.tar.gz
             dist/release-payload/antfly-lite_*.tar.gz
             dist/release-payload/antfly-inference_*.tar.gz)
           shopt -u nullglob

@@ -333,6 +333,11 @@ Every handle is safe to share across threads (Python, Rust) or concurrent promis
 
 ## Building from Source
 
+The Apache `antfly-embedded` release archive includes both `antfly-lite` and
+`antfly-inference`, along with `libantfly`, `include/antfly.h`, the private
+inference worker, runtime files and license notices. Embedded Python/npm packages
+bundle the library and private worker without installing the public CLIs.
+
 From the `zig` directory, `zig build lite` installs the Lite-only CLI as `zig-out/bin/antfly-lite` together with the `libantfly` library and its C header. It links the Apache local engine, enrichment, and inference archives without the database server runtime, and runs no tests. For the full Antfly CLI with the Lite commands and the C library, use the existing targets:
 
 ```bash

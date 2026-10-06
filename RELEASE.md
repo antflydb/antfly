@@ -15,7 +15,7 @@ The canonical Zig runtime artifacts are tarballs named:
 - `antfly_<version>_Linux_x86_64.tar.gz`
 - `antfly_<version>_Linux_x86_64_gnu.tar.gz`
 
-Each archive has this root layout:
+Each server archive has this root layout:
 
 ```text
 antfly
@@ -27,6 +27,25 @@ README.md
 LICENSE
 THIRD_PARTY_NOTICES.md
 ```
+
+For each platform, the Apache runtime is distributed as
+`antfly-embedded_<version>_<OS>_<arch>[_gnu].tar.gz`. It contains both public
+CLIs (`antfly-lite` and `antfly-inference`), `libantfly`, `include/antfly.h`, the
+private inference worker, runtime files and notices. The root license is Apache;
+third-party components retain their original notices. Database serving remains
+in the separate ELv2 server product.
+
+Build contract schema 3 declares `server` and `embedded`. Schema 1 retains the
+historical server-only layout; schema 2 retains separate Lite and inference
+archives. The controller follows the immutable source contract and promotion
+requires every declared runtime archive for each supported platform.
+
+`.github/workflows/embedded-package.yml` assembles Python wheels and npm packages
+from the embedded archives, bundling only the native library and private worker.
+Dispatch `.github/workflows/embedded-release-publish.yml` with the immutable tag
+and successful build run to verify and publish that snapshot. Go and Rust link
+`libantfly` from an embedded archive or local build. See
+[licensing maintenance](docs/reference/licensing.md) for trusted publisher setup.
 
 Linux has an explicit two-ABI contract:
 

@@ -36,6 +36,7 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "scripts/packaging/build_zig_release_archive.sh",
                 "scripts/packaging/create_reproducible_tar.py",
                 "scripts/packaging/lite-release-README.md",
+                "scripts/packaging/embedded-release-README.md",
                 "scripts/packaging/inference-release-README.md",
                 "scripts/apache_engine_files.txt",
                 "scripts/source_license_roots.json",
@@ -61,7 +62,9 @@ class ReleaseLicenseTests(unittest.TestCase):
                 "args = sys.argv[1:]\n"
                 "Path('build-args.json').write_text(json.dumps(args))\n"
                 "prefix = Path(args[args.index('--prefix') + 1])\n"
-                "for name in ('bin/antfly', 'bin/antfly-lite', 'bin/antfly-inference', 'lib/libantfly.dylib', 'include/antfly.h'):\n"
+                "inference = Path.cwd().name == 'inference'\n"
+                "names = ('bin/antfly-inference',) if inference else (('bin/antfly-lite',) if 'lite' in args else ('bin/antfly',)) + ('lib/libantfly.dylib', 'include/antfly.h')\n"
+                "for name in names:\n"
                 "    path = prefix / name\n"
                 "    path.parent.mkdir(parents=True, exist_ok=True)\n"
                 "    path.write_text('fixture artifact\\n')\n"
@@ -74,6 +77,7 @@ class ReleaseLicenseTests(unittest.TestCase):
             )
             completions.chmod(0o755)
             for product, steps, license_name in (
+                ("embedded", ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("lite", ["lite"], "LICENSES/Apache-2.0.txt"),
                 ("inference", [], "LICENSES/Apache-2.0.txt"),
                 ("server", ["antfly", "capi"], "LICENSE"),
@@ -113,6 +117,22 @@ class ReleaseLicenseTests(unittest.TestCase):
                         steps,
                         [arg for arg in args if arg in ("lite", "antfly", "capi")],
                     )
+                    if product == "embedded":
+                        inference_args = json.loads(
+                            (root / "zig/pkg/inference/build-args.json").read_text()
+                        )
+                        self.assertNotIn("--build-file", inference_args)
+                        for option in (
+                            "-Dtarget=aarch64-macos",
+                            "-Dantfly-version=test",
+                            "-Doptimize=fast",
+                        ):
+                            self.assertIn(option, args)
+                            self.assertIn(option, inference_args)
+                        self.assertEqual(
+                            args[args.index("--prefix") + 1],
+                            inference_args[inference_args.index("--prefix") + 1],
+                        )
                     with tarfile.open(root / "out" / (product + ".tar.gz")) as archive:
                         self.assertEqual(
                             (ROOT / license_name).read_bytes(),
@@ -201,7 +221,15 @@ class ReleaseLicenseTests(unittest.TestCase):
                             else (
                                 {"./antfly-inference"}
                                 if product == "inference"
-                                else {"./antfly-lite", "./antfly-inference-worker"}
+                                else (
+                                    {
+                                        "./antfly-lite",
+                                        "./antfly-inference-worker",
+                                        "./antfly-inference",
+                                    }
+                                    if product == "embedded"
+                                    else {"./antfly-lite", "./antfly-inference-worker"}
+                                )
                             )
                         )
                         self.assertEqual(

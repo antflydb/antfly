@@ -38,12 +38,20 @@ def require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> None:
+def verify(
+    version: str,
+    archive_dir: Path,
+    wheel_dir: Path,
+    npm_dir: Path,
+    build_contract_schema: int = 3,
+) -> None:
     version = normalize_release_version(version)
     python_version = python_version_from_release(version)
     apache = (ROOT / "LICENSES/Apache-2.0.txt").read_bytes()
     for platform in PACKAGE_PLATFORMS:
-        archive_path = archive_dir / archive_name(version, platform)
+        archive_path = archive_dir / archive_name(
+            version, platform, build_contract_schema
+        )
         with tarfile.open(archive_path, "r:gz") as source:
             names = {name.removeprefix("./"): name for name in source.getnames()}
             require("antfly" not in names, f"server executable in {archive_path}")
@@ -62,6 +70,8 @@ def verify(version: str, archive_dir: Path, wheel_dir: Path, npm_dir: Path) -> N
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
             source_bytes("./antfly-lite")
+            if build_contract_schema == 3:
+                source_bytes("./antfly-inference")
             worker = source_bytes("./antfly-inference-worker")
             source_maps = {
                 name: source_bytes(f"./scripts/{name}") for name in SOURCE_LICENSE_FILES
@@ -204,9 +214,16 @@ def main() -> int:
     parser.add_argument("--archive-dir", type=Path, required=True)
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
+    parser.add_argument("--build-contract-schema", type=int, choices=(2, 3), default=3)
     args = parser.parse_args()
-    verify(args.version, args.archive_dir, args.wheel_dir, args.npm_dir)
-    print("Apache Lite and Inference release artifacts verified")
+    verify(
+        args.version,
+        args.archive_dir,
+        args.wheel_dir,
+        args.npm_dir,
+        args.build_contract_schema,
+    )
+    print("Apache embedded release artifacts verified")
     return 0
 
 

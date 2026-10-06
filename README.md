@@ -35,6 +35,12 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 | [Antfly inference](zig/pkg/inference) | In-process inference, browser WASM (wasm32/wasm64), or the independent `antfly-inference` executable and inference APIs | [Apache 2.0](LICENSES/Apache-2.0.txt) |
 | Antfly database server | `antfly standalone`, distributed clusters, or serverless deployment; database HTTP APIs and the dashboard | [ELv2](LICENSES/Elastic-2.0.txt) |
 
+The Apache `antfly-embedded` release archive bundles `antfly-lite`,
+`antfly-inference`, `libantfly`, its C header, and the private inference worker,
+with runtime files and license notices. Python/npm embedded packages use the same
+library and private worker without installing public commands. Go/Rust consumers
+link the library from the archive or a local build.
+
 Build the Apache Lite CLI and native library from source:
 
 ```bash

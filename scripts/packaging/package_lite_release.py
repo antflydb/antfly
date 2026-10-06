@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build Apache-only Lite platform wheels and npm platform packages."""
+"""Build embedded wheels and npm packages from the Apache runtime archive."""
 
 from __future__ import annotations
 
@@ -57,9 +57,14 @@ SOURCE_LICENSE_FILES = (
 )
 
 
-def archive_name(version: str, platform: Platform) -> str:
+def archive_name(
+    version: str, platform: Platform, build_contract_schema: int = 3
+) -> str:
     variant = f"_{platform.release_variant}" if platform.release_variant else ""
-    return f"antfly-lite_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
+    if build_contract_schema not in {2, 3}:
+        raise ValueError("unsupported embedded release build contract")
+    product = "lite" if build_contract_schema == 2 else "embedded"
+    return f"antfly-{product}_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
 
 
 def extract_lite_archive(
@@ -67,11 +72,12 @@ def extract_lite_archive(
 ) -> None:
     path = archive_dir / archive_name(version, platform)
     if not path.is_file():
-        raise ValueError(f"missing Lite release archive: {path}")
+        raise ValueError(f"missing embedded release archive: {path}")
     with tarfile.open(path, "r:gz") as archive:
         safe_extract(archive, dest)
     required = (
         dest / "antfly-lite",
+        dest / "antfly-inference",
         dest / "antfly-inference-worker",
         dest / "lib" / lite_library_name(platform),
         dest / "include" / "antfly.h",
@@ -82,16 +88,18 @@ def extract_lite_archive(
     )
     for item in required:
         if not item.is_file():
-            raise ValueError(f"Lite archive missing {item.relative_to(dest)}: {path}")
+            raise ValueError(
+                f"Embedded archive missing {item.relative_to(dest)}: {path}"
+            )
     if (dest / "antfly").exists() or (dest / "LICENSES" / "Elastic-2.0.txt").exists():
         raise ValueError(
-            f"Lite archive contains server artifacts or ELv2 license: {path}"
+            f"Embedded archive contains server artifacts or ELv2 license: {path}"
         )
     if (dest / "LICENSE").read_bytes() != (
         ROOT / "LICENSES" / "Apache-2.0.txt"
     ).read_bytes():
         raise ValueError(
-            f"Lite archive does not carry the Apache-2.0 product license: {path}"
+            f"Embedded archive does not carry the Apache-2.0 product license: {path}"
         )
 
 

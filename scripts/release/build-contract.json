@@ -1,9 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "runtime_products": [
     "server",
-    "lite",
-    "inference"
+    "embedded"
   ],
   "required_source_paths": [
     "LICENSES/Apache-2.0.txt",
@@ -14,6 +13,7 @@
     "scripts/embedded_asset_licenses.json",
     "scripts/install.sh",
     "scripts/packaging/build_zig_release_archive.sh",
+    "scripts/packaging/embedded-release-README.md",
     "scripts/packaging/package_cli_release.py",
     "scripts/packaging/package_lite_release.py",
     "scripts/packaging/test_cabi_packaging.py",

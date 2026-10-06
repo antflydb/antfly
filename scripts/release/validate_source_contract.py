@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 CONTRACT_PATH = "scripts/release/build-contract.json"
-SUPPORTED_SCHEMAS = (1, 2)
+SUPPORTED_SCHEMAS = (1, 2, 3)
 LEGACY_REQUIRED_PATHS = {
     "zig/build.zig",
     "scripts/install.sh",
@@ -61,13 +61,18 @@ APACHE_REQUIRED_PATHS = {
     "ts/packages/embedded/package.json",
     "py/packages/embedded/pyproject.toml",
 }
-REQUIRED_PATHS = LEGACY_REQUIRED_PATHS | APACHE_REQUIRED_PATHS
+SPLIT_REQUIRED_PATHS = LEGACY_REQUIRED_PATHS | APACHE_REQUIRED_PATHS
+REQUIRED_PATHS = SPLIT_REQUIRED_PATHS | {"scripts/packaging/embedded-release-README.md"}
 
 
 def runtime_products(schema: int) -> tuple[str, ...]:
     if type(schema) is not int or schema not in SUPPORTED_SCHEMAS:
         raise SystemExit("unsupported release build contract schema")
-    return ("server",) if schema == 1 else ("server", "lite", "inference")
+    return {
+        1: ("server",),
+        2: ("server", "lite", "inference"),
+        3: ("server", "embedded"),
+    }[schema]
 
 
 def git_object(repo_root: Path, commit: str, path: str) -> bytes:
@@ -94,11 +99,15 @@ def validate(repo_root: Path, commit: str) -> int:
         raise SystemExit("invalid release build contract")
     schema = contract.get("schema_version")
     products = runtime_products(schema)
-    if (schema == 2 or "runtime_products" in contract) and contract.get(
+    if (schema >= 2 or "runtime_products" in contract) and contract.get(
         "runtime_products"
     ) != list(products):
         raise SystemExit("release build contract has invalid runtime products")
-    required_paths = LEGACY_REQUIRED_PATHS if schema == 1 else REQUIRED_PATHS
+    required_paths = {
+        1: LEGACY_REQUIRED_PATHS,
+        2: SPLIT_REQUIRED_PATHS,
+        3: REQUIRED_PATHS,
+    }[schema]
     paths = contract.get("required_source_paths")
     if not isinstance(paths, list) or not paths:
         raise SystemExit("release build contract has no required_source_paths")

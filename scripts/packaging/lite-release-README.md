@@ -1,6 +1,6 @@
-# Antfly Lite and Inference
+# Antfly Lite (legacy archive)
 
-This archive contains the Apache-2.0 Antfly Lite executable, the Apache-2.0
+This legacy split-product archive contains the Apache-2.0 Antfly Lite executable, the Apache-2.0
 inference worker, and the `libantfly` C ABI for embedding. The bundled native
 library and worker must be kept together when installing the archive.
 

@@ -49,7 +49,9 @@ to build and host their own services using that engine.
 
 ## Distributions and third-party material
 
-Apache Lite archives contain the Apache LICENSE, the source license list,
+Apache Embedded archives contain both public CLIs (`antfly-lite` and
+`antfly-inference`), `libantfly`, its public header, the private inference worker,
+the Apache LICENSE, the source license list,
 and relevant third-party notices. This file is the repository's mixed-license
 map. Full server archives retain the ELv2 LICENSE and also carry the Apache
 license for their shared engine and native library. Language binding licenses

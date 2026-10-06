@@ -100,7 +100,7 @@ class ReleasePromotionTests(unittest.TestCase):
         document = {
             "schema_version": 2,
             "runtime_products": ["server", "lite", "inference"],
-            "required_source_paths": sorted(contract.REQUIRED_PATHS),
+            "required_source_paths": sorted(contract.SPLIT_REQUIRED_PATHS),
         }
 
         def read_object(_root: Path, _commit: str, path: str) -> bytes:
@@ -118,6 +118,33 @@ class ReleasePromotionTests(unittest.TestCase):
             document["runtime_products"] = ["server", "lite", "inference"]
             document["required_source_paths"].remove(
                 "scripts/packaging/package_lite_release.py"
+            )
+            with self.assertRaisesRegex(SystemExit, "required builder inputs"):
+                contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_combined_source_contract_requires_embedded_product_and_readme(
+        self,
+    ) -> None:
+        contract = load_module(
+            "combined_source_contract_test", "validate_source_contract.py"
+        )
+        document = json.loads((RELEASE_DIR / "build-contract.json").read_text())
+
+        def read_object(_root: Path, _commit: str, path: str) -> bytes:
+            return (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            )
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 3)
+            document["runtime_products"] = ["server", "lite", "inference"]
+            with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
+                contract.validate(RELEASE_DIR, COMMIT)
+            document["runtime_products"] = ["server", "embedded"]
+            document["required_source_paths"].remove(
+                "scripts/packaging/embedded-release-README.md"
             )
             with self.assertRaisesRegex(SystemExit, "required builder inputs"):
                 contract.validate(RELEASE_DIR, COMMIT)
@@ -145,6 +172,15 @@ class ReleasePromotionTests(unittest.TestCase):
                 payload.collect_runtime_archives(archive_dir, 2),
                 sorted([server, lite, inference]),
             )
+            with self.assertRaisesRegex(SystemExit, "missing matching antfly-embedded"):
+                payload.collect_runtime_archives(archive_dir, 3)
+            embedded = archive_dir / "antfly-embedded_0.3.0_Linux_x86_64_gnu.tar.gz"
+            embedded.write_bytes(b"combined database and inference")
+            self.assertEqual(
+                payload.collect_runtime_archives(archive_dir, 3),
+                sorted([server, embedded]),
+            )
+            self.assertEqual(payload.artifact_kind(embedded), "runtime-archive")
             with self.assertRaisesRegex(
                 SystemExit, "unsupported release build contract"
             ):
@@ -172,7 +208,7 @@ class ReleasePromotionTests(unittest.TestCase):
         contract = load_module(
             "workflow_dispatch_source_contract_test", "validate_source_contract.py"
         )
-        for schema, jobs in ((1, ""), (1, "2"), (2, ""), (2, "2")):
+        for schema, jobs in ((1, ""), (1, "2"), (2, ""), (2, "2"), (3, ""), (3, "2")):
             with (
                 self.subTest(schema=schema, jobs=jobs),
                 tempfile.TemporaryDirectory() as directory,
@@ -217,7 +253,7 @@ class ReleasePromotionTests(unittest.TestCase):
         payload = load_module(
             "apache_release_spec_payload_test", "build_release_payload.py"
         )
-        for schema in (1, 2):
+        for schema in (1, 2, 3):
             with (
                 self.subTest(schema=schema),
                 tempfile.TemporaryDirectory() as directory,
@@ -1601,7 +1637,16 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_release_ledger_is_deterministic_and_includes_registry_artifacts(
         self,
     ) -> None:
+        self.assert_release_ledger(2)
+
+    def test_combined_release_ledger_checksums_and_promotion_scope(self) -> None:
+        self.assert_release_ledger(3)
+
+    def assert_release_ledger(self, schema: int) -> None:
         payload = load_module("build_release_payload_test", "build_release_payload.py")
+        products = (
+            ("antfly-lite", "antfly-inference") if schema == 2 else ("antfly-embedded",)
+        )
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
             archives, extras, source, output = (
@@ -1614,12 +1659,10 @@ class ReleasePromotionTests(unittest.TestCase):
             extras.mkdir()
             source.mkdir()
             (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
-            (archives / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
-                b"lite"
-            )
-            (archives / "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
-                b"inference"
-            )
+            for product in products:
+                (archives / f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
+                    product.encode()
+                )
             (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
@@ -1671,7 +1714,7 @@ class ReleasePromotionTests(unittest.TestCase):
                         "source_ref": "refs/heads/main",
                         "source_ref_head": SOURCE_HEAD,
                         "build_controller_commit": "f" * 40,
-                        "build_contract_schema": 2,
+                        "build_contract_schema": schema,
                         "registry_versions": {
                             "npm": "0.2.1",
                             "python": "0.2.1",
@@ -1727,8 +1770,10 @@ class ReleasePromotionTests(unittest.TestCase):
                 runtime_names,
                 {
                     "antfly_0.2.1_Linux_x86_64_gnu.tar.gz",
-                    "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz",
-                    "antfly-inference_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    *(
+                        f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
+                        for product in products
+                    ),
                 },
             )
             checksums = (output / "antfly_zig_checksums.txt").read_text()
@@ -1743,7 +1788,7 @@ class ReleasePromotionTests(unittest.TestCase):
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
 
-            for product in ("antfly-lite", "antfly-inference"):
+            for product in products:
                 missing_archive = archives / f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
                 contents = missing_archive.read_bytes()
                 missing_archive.unlink()
@@ -1783,7 +1828,7 @@ class ReleasePromotionTests(unittest.TestCase):
             ]
             with mock.patch.object(sys, "argv", runtime_argv):
                 self.assertEqual(verifier.main(), 0)
-            (runtime / "antfly-lite_0.2.1_Linux_x86_64_gnu.tar.gz").unlink()
+            (runtime / f"{products[0]}_0.2.1_Linux_x86_64_gnu.tar.gz").unlink()
             with (
                 mock.patch.object(sys, "argv", runtime_argv),
                 self.assertRaisesRegex(SystemExit, "release runtime scope mismatch"),

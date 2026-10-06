@@ -1,4 +1,4 @@
-name: Package Apache Lite and Inference
+name: Package Apache Embedded
 
 on:
   workflow_call:
@@ -21,7 +21,7 @@ env:
 
 jobs:
   package:
-    name: Build Apache Lite wheels and npm packages
+    name: Build Apache Embedded wheels and npm packages
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,7 +50,7 @@ jobs:
         working-directory: ts
         run: pnpm install --frozen-lockfile
 
-      - name: Verify Lite packaging contract
+      - name: Verify embedded packaging contract
         run: python -m unittest scripts.packaging.test_lite_packaging scripts.packaging.test_release_licenses
 
       - name: Populate platform packages and wheels
@@ -60,7 +60,7 @@ jobs:
           python scripts/packaging/package_lite_release.py \
             --version "$RELEASE_VERSION" \
             --archive-dir dist/release-archives \
-            --out-dir dist/lite-packages
+            --out-dir dist/embedded-packages
 
       - name: Build and check TypeScript binding
         working-directory: ts
@@ -72,31 +72,31 @@ jobs:
       - name: Pack Apache npm packages
         run: |
           set -euo pipefail
-          mkdir -p dist/lite-packages/npm
+          mkdir -p dist/embedded-packages/npm
           for name in embedded-darwin-arm64 embedded-linux-arm64 embedded-linux-x64 embedded; do
-            npm pack --pack-destination dist/lite-packages/npm "./ts/packages/$name"
+            npm pack --pack-destination dist/embedded-packages/npm "./ts/packages/$name"
           done
           python scripts/packaging/verify_lite_release.py \
             --version "${{ inputs.version }}" \
             --archive-dir dist/release-archives \
-            --wheel-dir dist/lite-packages/python \
-            --npm-dir dist/lite-packages/npm
+            --wheel-dir dist/embedded-packages/python \
+            --npm-dir dist/embedded-packages/npm
 
-      - name: Seal immutable Lite package snapshot
+      - name: Seal immutable embedded package snapshot
         run: |
           python scripts/release/lite_snapshot.py build \
             --version "${{ inputs.version }}" \
             --commit "${{ inputs.source_commit }}" \
-            --npm-dir dist/lite-packages/npm \
-            --wheel-dir dist/lite-packages/python \
-            --out-dir dist/lite-snapshot
+            --npm-dir dist/embedded-packages/npm \
+            --wheel-dir dist/embedded-packages/python \
+            --out-dir dist/embedded-snapshot
           python scripts/release/lite_snapshot.py verify \
-            --snapshot-dir dist/lite-snapshot \
+            --snapshot-dir dist/embedded-snapshot \
             --version "${{ inputs.version }}" \
             --commit "${{ inputs.source_commit }}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: antfly-embedded-package-snapshot
-          path: dist/lite-snapshot/
+          path: dist/embedded-snapshot/
           if-no-files-found: error

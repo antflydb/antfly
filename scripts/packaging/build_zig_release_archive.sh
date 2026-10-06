@@ -18,19 +18,20 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|lite|inference] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--product server|embedded|lite|inference] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
-  antfly (server), antfly-lite and antfly-inference-worker (Lite), or antfly-inference (Inference)
+  antfly (server), or antfly-lite, antfly-inference, and antfly-inference-worker (embedded)
+  legacy Lite and inference products remain supported for schema 2 sources
   completions/ (server only)
   share/
-  lib/ and include/ (server and Lite only)
+  lib/ and include/ (server and embedded; legacy Lite too)
   README.md
   LICENSE
   THIRD_PARTY_NOTICES.md
   LICENSING.md (server only)
-  scripts/{apache_engine_files.txt,source_license_roots.json,embedded_asset_licenses.json} (server and Lite only)
+  scripts/{apache_engine_files.txt,source_license_roots.json,embedded_asset_licenses.json} (server and embedded; legacy Lite too)
   LICENSES/Apache-2.0.txt
   LICENSES/Elastic-2.0.txt (server only)
 EOF
@@ -102,8 +103,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$product" in
-  server|lite|inference) ;;
-  *) echo "invalid --product: $product (expected server, lite, or inference)" >&2; exit 2 ;;
+  server|embedded|lite|inference) ;;
+  *) echo "invalid --product: $product (expected server, embedded, lite, or inference)" >&2; exit 2 ;;
 esac
 
 if [ -z "$version" ] || [ -z "$target" ] || [ -z "$archive_name" ] || [ -z "$out_dir" ]; then
@@ -191,7 +192,6 @@ zig_build_options=(
   -Doptimize="$optimize"
   -Dstrip="$strip"
   -Dcpu=baseline
-  -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
   -Dmetal="$metal"
@@ -199,19 +199,8 @@ zig_build_options=(
   -Dpjrt="$pjrt"
   -Dsystem-blas="$system_blas"
 )
-if [ "$product" = inference ]; then
-  zig_build_options=(
-    -Dtarget="$target"
-    -Doptimize="$optimize"
-    -Dstrip="$strip"
-    -Dcpu=baseline
-    -Dantfly-version="$version"
-    -Donnx=false
-    -Dmetal="$metal"
-    -Dcuda="$cuda"
-    -Dpjrt="$pjrt"
-    -Dsystem-blas="$system_blas"
-  )
+if [ "$product" = server ]; then
+  zig_build_options+=(-Dantfly-bin-name=antfly)
 fi
 
 zig_install_args=(
@@ -232,7 +221,7 @@ run_zig_build_steps() {
     build
   )
 
-  if [ "$product" = lite ]; then
+  if [[ "$product" = lite || "$product" = embedded ]]; then
     command+=(--build-file embedded.build.zig)
   fi
   if [ -n "$jobs" ]; then
@@ -293,14 +282,22 @@ run_zig_build_steps_with_retry() {
   # no artificial ordering dependencies between those compilations.
   if [ "$product" = inference ]; then
     run_zig_build_steps_with_retry archive
-  elif [ "$product" = lite ]; then
+  elif [[ "$product" = lite || "$product" = embedded ]]; then
     run_zig_build_steps_with_retry archive lite
   else
     run_zig_build_steps_with_retry archive antfly capi
   fi
 )
 
-if [ "$product" = lite ]; then
+if [ "$product" = embedded ]; then
+  (
+    cd "$repo_root/zig/pkg/inference"
+    product=inference
+    run_zig_build_steps_with_retry inference
+  )
+fi
+
+if [[ "$product" = lite || "$product" = embedded ]]; then
   binary_name=antfly-lite
 elif [ "$product" = inference ]; then
   binary_name=antfly-inference
@@ -317,7 +314,11 @@ if [ "$product" != inference ]; then
   fi
 fi
 cp "$prefix/bin/$binary_name" "$stage/$binary_name"
-if [ "$product" = lite ]; then
+if [ "$product" = embedded ]; then
+  test -x "$prefix/bin/antfly-inference"
+  cp "$prefix/bin/antfly-inference" "$stage/antfly-inference"
+fi
+if [[ "$product" = lite || "$product" = embedded ]]; then
   # The Lite executable understands `inference _worker`. A second filename
   # gives embedded hosts a dedicated Apache worker candidate without another
   # native compile or a dependency on the ELv2 server executable.
@@ -332,7 +333,9 @@ fi
 if [ "$product" != inference ] && [ -d "$prefix/include" ]; then
   cp -R "$prefix/include" "$stage/include"
 fi
-if [ "$product" = lite ]; then
+if [ "$product" = embedded ]; then
+  cp "$repo_root/scripts/packaging/embedded-release-README.md" "$stage/README.md"
+elif [ "$product" = lite ]; then
   cp "$repo_root/scripts/packaging/lite-release-README.md" "$stage/README.md"
 elif [ "$product" = inference ]; then
   cp "$repo_root/scripts/packaging/inference-release-README.md" "$stage/README.md"
@@ -368,7 +371,10 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
   --mtime "$source_date_epoch"
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 grep -Fx "./$binary_name" "$work_root/archive-contents.txt" >/dev/null
-if [ "$product" = lite ]; then
+if [ "$product" = embedded ]; then
+  grep -Fx "./antfly-inference" "$work_root/archive-contents.txt" >/dev/null
+fi
+if [[ "$product" = lite || "$product" = embedded ]]; then
   grep -Fx "./antfly-inference-worker" "$work_root/archive-contents.txt" >/dev/null
   if grep -Fx './antfly' "$work_root/archive-contents.txt" >/dev/null; then
     echo "Lite archive unexpectedly includes the server executable" >&2

@@ -126,12 +126,16 @@ class EmbeddedPublishTests(unittest.TestCase):
             self.assertEqual(
                 verify(document),
                 {
+                    "build_contract_schema": "2",
                     "commit": source,
                     "version": "0.3.0",
                     "python_version": "0.3.0",
                     "npm_tag": "latest",
                 },
             )
+            combined = copy.deepcopy(document)
+            combined["build_contract_schema"] = 3
+            self.assertEqual(verify(combined)["build_contract_schema"], "3")
             for field, value in {
                 "build_controller_commit": "4" * 40,
                 "source_ref": "refs/heads/feature",

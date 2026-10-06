@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exercise the complete Apache Lite archive-to-wheel/npm path with fixtures."""
+"""Exercise the complete Apache embedded archive-to-wheel/npm path with fixtures."""
 
 import importlib.util
 import json
@@ -83,6 +83,7 @@ class LitePackagingTests(unittest.TestCase):
                     shutil.copy2(ROOT / "scripts" / name, stage / "scripts" / name)
                 (stage / "LICENSES/third-party").mkdir(parents=True)
                 (stage / "antfly-lite").write_text("lite executable")
+                (stage / "antfly-inference").write_text("inference executable")
                 (stage / "antfly-inference-worker").write_text("worker executable")
                 (stage / "lib" / package.lite_library_name(platform)).write_text(
                     "apache native library"
@@ -222,6 +223,26 @@ class LitePackagingTests(unittest.TestCase):
                 )
             with mock.patch.object(verifier, "ROOT", root):
                 verifier.verify("1.2.3", archives, root / "out/python", npm_dir)
+            # Older immutable requests still verify their split Lite archives;
+            # schema 2 never requires the newly bundled public inference CLI.
+            for platform in package.PACKAGE_PLATFORMS:
+                with (
+                    tarfile.open(
+                        archives / package.archive_name("1.2.3", platform), "r:gz"
+                    ) as combined,
+                    tarfile.open(
+                        archives / package.archive_name("1.2.3", platform, 2), "w:gz"
+                    ) as legacy,
+                ):
+                    for member in combined.getmembers():
+                        if member.name.removeprefix("./") == "antfly-inference":
+                            continue
+                        legacy.addfile(
+                            member,
+                            combined.extractfile(member) if member.isfile() else None,
+                        )
+            with mock.patch.object(verifier, "ROOT", root):
+                verifier.verify("1.2.3", archives, root / "out/python", npm_dir, 2)
             sealed = root / "snapshot"
             commit = "a" * 40
             snapshot.build("1.2.3", commit, npm_dir, root / "out/python", sealed)
@@ -239,6 +260,24 @@ class LitePackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "digest differs"):
                 snapshot.verify(sealed, "1.2.3", commit)
 
+    def test_missing_public_inference_command_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            platform = package.PACKAGE_PLATFORMS[0]
+            stage = root / "stage"
+            stage.mkdir()
+            (stage / "antfly-lite").write_text("lite")
+            (stage / "lib").mkdir()
+            (stage / "lib" / package.lite_library_name(platform)).write_text("library")
+            path = root / package.archive_name("1.2.3", platform)
+            with tarfile.open(path, "w:gz") as archive:
+                archive.add(stage / "antfly-lite", arcname="antfly-lite")
+                archive.add(stage / "lib", arcname="lib")
+            with self.assertRaisesRegex(ValueError, "antfly-inference"):
+                package.extract_lite_archive(root, "1.2.3", platform, root / "unpacked")
+            with self.assertRaisesRegex(ValueError, "antfly-inference"):
+                verifier.verify("1.2.3", root, root / "wheels", root / "npm")
+
     def test_server_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -253,6 +292,7 @@ class LitePackagingTests(unittest.TestCase):
             for name in (
                 "antfly",
                 "antfly-lite",
+                "antfly-inference",
                 "antfly-inference-worker",
                 "include/antfly.h",
                 "THIRD_PARTY_NOTICES.md",

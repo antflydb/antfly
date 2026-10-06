@@ -47,23 +47,27 @@ consumes the same local implementation through its source catalog.
 The embedded package, inference package, shared libraries, schema inputs, and
 generated OpenAPI contracts have explicit Apache licenses. Lite installation
 and inference installation carry license and third-party notices.
-`build_zig_release_archive.sh --product lite` packages the Apache Lite CLI,
-`libantfly`, and a private `antfly-inference-worker`. The `inference` product
-packages the real Apache `antfly-inference` CLI with commands such as `run`,
-`embed`, `generate`, and `pull`. The default server archive retains ELv2 and
-includes the Apache license for the shared engine and native library.
+`build_zig_release_archive.sh --product embedded` packages both public CLIs
+(`antfly-lite` and `antfly-inference`), `libantfly`, `include/antfly.h`, and the
+private `antfly-inference-worker`, with runtime files and license notices.
+The inference CLI exposes commands such as `run`, `embed`, `generate`, and `pull`.
+The default server archive retains ELv2 and includes the Apache license for the
+shared engine and native library.
 
-Release source contract schema 2 declares `server`, `lite`, and `inference`
-products and requires the Apache package and licensing inputs. The trusted
-controller validates the contract at the exact source commit, builds its declared
-products, and records the contract version in the immutable release request.
-Schema 1 remains supported for historical and maintenance sources: it builds
-server archives and CLI packages, skips embedded package assembly, and promotes
-the server-only runtime scope. Schema 2 promotion requires matching Lite and
-inference archives for every server platform; missing Apache artifacts fail the
-release rather than falling back to a server-only payload.
+Release source contract schema 3 declares `server` and `embedded` products and
+requires the Apache package and licensing inputs. The trusted controller validates
+the contract at the exact source commit, builds its declared products, and records
+the contract version in the immutable release request. Schema 3 promotion requires
+one matching `antfly-embedded` archive for every server platform; missing embedded
+artifacts fail the release.
 
-The schema 2 release build creates separate Apache Lite and inference archives for each
+Older contracts retain their immutable layouts. Schema 1 builds server archives
+and CLI packages and skips embedded package assembly. Schema 2 builds separate
+Lite and inference archives and requires both for every server platform. Its
+package publisher verifies against the historical Lite archives. A contract
+version is never reinterpreted as a different artifact layout.
+
+The schema 3 release build creates a combined Apache Embedded archive for each
 platform. `package_lite_release.py` assembles
 platform wheels for `antfly-embedded` and native npm packages for
 `@antfly/embedded`;
@@ -74,11 +78,11 @@ a local build. The Rust SDK bundles its OpenAPI build input inside its crate;
 `make generate` refreshes it from the joined public spec and SDK CI verifies both
 synchronization and the build of the published archive. Publish `antfly-sdk`
 before `antfly-postgres`, whose registry dependency requires SDK version `0.1.0`.
-`verify_lite_release.py` compares each wheel and npm package with its Lite
+`verify_lite_release.py` compares each wheel and npm package with its Embedded
 archive and rejects server executables and ELv2 license files. Both package
 formats carry the package roots, additional-file map, and asset manifest in
 `LICENSES/source-map`; verification compares those files with the archive. The immutable
-package snapshot is produced by `.github/workflows/lite-package.yml` as part
+package snapshot is produced by `.github/workflows/embedded-package.yml` as part
 of the release build. After a successful tagged release build, dispatch
 `.github/workflows/embedded-release-publish.yml` on `main` with that tag and build
 run ID. It authenticates the successful release-controller workflow on `main`,
