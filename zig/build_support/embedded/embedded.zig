@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Translator = @import("translate_c").Translator;
-const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
+const AntflyRootImports = @import("../antfly/imports.zig").AntflyRootImports;
 
 /// Freestanding composition has no native cloud authentication or lake I/O.
 pub fn configureBrowserModule(
@@ -78,9 +78,9 @@ pub fn configureBrowserModule(
     add_snowball_module(b, mod);
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
-const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
+const addFilteredTestRunArtifact = @import("../antfly/test_support.zig").addFilteredTestRunArtifact;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
-const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
+const selectTestFilters = @import("../antfly/test_support.zig").selectTestFilters;
 
 pub const AddEmbeddedOptions = struct {
     version: []const u8,
@@ -209,7 +209,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     // Server integration tests supply their own root. Independent tests and
     // the installed library own only local public C API sources.
-    const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
+    const test_imports = @import("../antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     test_imports.configure(b, capi_root_mod, false, link_libc);
     if (options.server_integration_tests) {
         const capi_usermgr_storage_mod = b.createModule(.{
@@ -301,7 +301,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         libantfly.headerpad_max_install_names = true;
     }
     const install_libantfly = b.addInstallArtifact(libantfly, .{});
-    const pc_template = @embedFile("../libantfly.pc.in");
+    b.dependOnFileContents(b.path("pkg/antfly-embedded/libantfly.pc.in"));
+    const pc_path = b.root.join(b.allocator, "pkg/antfly-embedded/libantfly.pc.in") catch @panic("OOM");
+    const pc_template = pc_path.root_dir.handle.readFileAlloc(b.graph.io, pc_path.sub_path, b.allocator, .limited(16 * 1024)) catch @panic("unable to read libantfly.pc.in");
     const pc_contents = std.mem.replaceOwned(u8, b.allocator, pc_template, "@VERSION@", options.version) catch @panic("OOM");
     const pc_file = b.addWriteFiles().add("libantfly.pc", pc_contents);
     const install_pkg_config = b.addInstallFileWithDir(pc_file, .lib, "pkgconfig/libantfly.pc");
@@ -326,7 +328,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const package_boundary = @import("embedded_boundary.zig").add(b, antfly_embedded_pkg_mod);
     b.top_level_steps.get("embedded-native-module-boundary-check").?.step.dependOn(&package_boundary.step);
 
-    const install_licenses = @import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-lite", "share/licenses/antfly-lite");
+    const install_licenses = @import("../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-lite", "share/licenses/antfly-lite");
     b.getInstallStep().dependOn(install_licenses);
     const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
     capi_step.dependOn(install_licenses);

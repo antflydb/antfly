@@ -70,13 +70,13 @@ pub const Imports = struct {
         module.addImport("antfly_vectorindex", imports.vectorindex);
         module.addImport("vopr", self.vopr);
         imports.storage_boundary.configureProfile(module, true, true, .owner);
-        @import("../../pkg/antfly-embedded/build/snowball.zig").addSnowballModule(b, module);
+        @import("../embedded/snowball.zig").addSnowballModule(b, module);
     }
 
     /// Tests and simulation tools explicitly own VOPR and LMDB dependencies.
     pub fn configure(self: Imports, b: *std.Build, module: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         self.runtime.configure(b, module, link_libc);
-        @import("../../pkg/antfly-embedded/build/storage.zig").configureLmdb(b, module, self.lmdb_engine, include_lmdb_c);
+        @import("../embedded/storage.zig").configureLmdb(b, module, self.lmdb_engine, include_lmdb_c);
         module.addImport("vopr", self.vopr);
     }
 };

@@ -110,7 +110,7 @@ pub fn add(
     var physical_imports = imports;
     physical_imports.boundary_profile = .owner;
     physical_imports.configureStorage(b, physical_module, true);
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, physical_module, lmdb_engine, true);
     physical_imports.storage_boundary.configureProfile(physical_module, true, true, .owner);
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",

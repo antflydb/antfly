@@ -148,7 +148,7 @@ fn splitNativeSources(
     }
     for (original.import_table.keys(), original.import_table.values()) |key, dependency|
         copy.addImport(key, splitNativeSources(b, dependency, final, name, clones));
-    @import("../../antfly-embedded/build/source_owner.zig").adopt(copy);
+    @import("../../../build_support/embedded/source_owner.zig").adopt(copy);
     return copy;
 }
 

@@ -42,6 +42,11 @@ library without installing public commands. Go/Rust consumers
 link the library from the archive or a local build using its relocatable
 `lib/pkgconfig/libantfly.pc` metadata.
 
+Zig applications can fetch the independent Apache
+`antfly-embedded-source_<version>.tar.gz` release package. It exports the
+embedded and inference modules and native/WASM artifacts without a server
+checkout; see the [Zig package guide](zig/pkg/antfly-embedded/README.md).
+
 Build the Apache Lite CLI and native library from source:
 
 ```bash

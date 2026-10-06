@@ -35,7 +35,7 @@ private inference worker, runtime files and notices. The root license is Apache;
 third-party components retain their original notices. Database serving remains
 in the separate ELv2 server product.
 
-Build contract schema 4 declares `server` and `embedded`, includes pkg-config
+Build contract schema 5 declares `server` and `embedded`, includes pkg-config
 metadata, and omits unused workers from language packages. Schema 3 retains
 the original combined archive/package contract. Schema 1 retains the
 historical server-only layout; schema 2 retains separate Lite and inference
@@ -64,6 +64,16 @@ package names. Its supported Node.js 24 runtime has the same glibc 2.28 floor as
 the GNU archive. The standalone shell installer still checks the glibc version
 and falls back to the portable musl archive when the GNU compatibility floor is
 not met.
+
+Zig source consumers receive `antfly-embedded-source_<version>.tar.gz`, its
+`.zig-hash`, and `embedded-zig-source.json`. The package has a public
+`build.zig.zon` and bundles the Apache build/dependency closure, source
+manifest, and notices; it excludes ELv2 implementations. The artifact builder
+packages the immutable source commit and computes its Zig hash with the pinned
+compiler. Promotion requires matching commit/version provenance and digests;
+development packages made with `--working-tree` cannot be promoted. The source
+archive is included in the checksum ledger and runtime publication scope.
+Schema 4 retains the native pkg-config shape without this source artifact.
 
 All release targets use `ReleaseFast`. Linux amd64 and GNU arm64 build on their
 native Linux architectures; portable musl arm64 and macOS arm64 cross-compile

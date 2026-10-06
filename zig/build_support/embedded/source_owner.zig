@@ -23,7 +23,7 @@ pub fn attach(consumer: *std.Build.Module) void {
     if (consumer.import_table.contains("antfly_local_sources")) return;
     const b = consumer.owner;
     const root = consumer.root_source_file orelse return;
-    const path = @import("../../../build_support/antfly/source_paths.zig").authored(b, root) orelse return;
+    const path = @import("../antfly/source_paths.zig").authored(b, root) orelse return;
     if (std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/local/") != null) return;
     const local = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/local/source_catalog.zig"),
@@ -52,7 +52,7 @@ pub fn finalize(b: *std.Build) void {
         binding.local.addImport("antfly_server_test_sources", binding.consumer);
         binding.local.link_libc = binding.consumer.link_libc;
     }
-    @import("../../../build_support/antfly/test_partitions.zig").add(b);
+    @import("../antfly/test_partitions.zig").add(b);
 }
 
 /// Cloned consumer graphs retain their own late-bound source configuration.

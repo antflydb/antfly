@@ -138,7 +138,7 @@ class ReleasePromotionTests(unittest.TestCase):
             )
 
         with mock.patch.object(contract, "git_object", side_effect=read_object):
-            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 4)
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 5)
             document["runtime_products"] = ["server", "lite", "inference"]
             with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
                 contract.validate(RELEASE_DIR, COMMIT)
@@ -237,6 +237,8 @@ class ReleasePromotionTests(unittest.TestCase):
             (3, "2"),
             (4, ""),
             (4, "2"),
+            (5, ""),
+            (5, "2"),
         ):
             with (
                 self.subTest(schema=schema, jobs=jobs),
@@ -282,7 +284,7 @@ class ReleasePromotionTests(unittest.TestCase):
         payload = load_module(
             "apache_release_spec_payload_test", "build_release_payload.py"
         )
-        for schema in (1, 2, 3, 4):
+        for schema in (1, 2, 3, 4, 5):
             with (
                 self.subTest(schema=schema),
                 tempfile.TemporaryDirectory() as directory,
@@ -1674,6 +1676,71 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_pkgconfig_release_ledger(self) -> None:
         self.assert_release_ledger(4)
 
+    def test_fetchable_source_release_ledger(self) -> None:
+        self.assert_release_ledger(5)
+
+    def test_historical_pkgconfig_source_contract_is_preserved(self) -> None:
+        contract = load_module(
+            "historical_pkgconfig_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 4,
+            "runtime_products": ["server", "embedded"],
+            "required_source_paths": sorted(contract.PKGCONFIG_REQUIRED_PATHS),
+        }
+        with mock.patch.object(
+            contract,
+            "git_object",
+            side_effect=lambda _root, _commit, path: (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            ),
+        ):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 4)
+
+    def test_source_package_identity_and_digests_fail_closed(self) -> None:
+        payload = load_module("source_package_payload_test", "build_release_payload.py")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest = self.source_package_fixture(root, payload)
+            self.assertEqual(
+                len(payload.verify_embedded_source(root, "0.2.1", COMMIT)), 3
+            )
+            for field, value in {
+                "commit": "f" * 40,
+                "version": "0.3.0",
+                "working_tree": True,
+                "sha256": "0" * 64,
+                "zig_hash": "not-a-zig-hash",
+            }.items():
+                changed = dict(manifest, **{field: value})
+                (root / "embedded-zig-source.json").write_text(json.dumps(changed))
+                with self.subTest(field=field), self.assertRaises(SystemExit):
+                    payload.verify_embedded_source(root, "0.2.1", COMMIT)
+            (root / "embedded-zig-source.json").write_text(json.dumps(manifest))
+            (root / "unexpected").write_text("stale")
+            with self.assertRaisesRegex(SystemExit, "artifact set"):
+                payload.verify_embedded_source(root, "0.2.1", COMMIT)
+
+    def source_package_fixture(self, root: Path, payload) -> dict:
+        root.mkdir(exist_ok=True)
+        archive = root / "antfly-embedded-source_0.2.1.tar.gz"
+        archive.write_bytes(b"Apache source fixture")
+        zig_hash = "antfly_embedded-0.2.1-fixtureHash"
+        (root / (archive.name + ".zig-hash")).write_text(zig_hash + "\n")
+        manifest = {
+            "schema_version": 1,
+            "version": "0.2.1",
+            "commit": COMMIT,
+            "working_tree": False,
+            "archive": archive.name,
+            "sha256": payload.sha256(archive),
+            "zig_hash": zig_hash,
+        }
+        (root / "embedded-zig-source.json").write_text(json.dumps(manifest))
+        return manifest
+
     def assert_release_ledger(self, schema: int) -> None:
         payload = load_module("build_release_payload_test", "build_release_payload.py")
         products = (
@@ -1774,6 +1841,10 @@ class ReleasePromotionTests(unittest.TestCase):
                 "--promotion-controller-commit",
                 "e" * 40,
             ]
+            if schema >= 5:
+                source_package = root / "embedded-source"
+                self.source_package_fixture(source_package, payload)
+                argv.extend(["--embedded-source-dir", str(source_package)])
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.dict("os.environ", {"SOURCE_DATE_EPOCH": "0"}),
@@ -1802,6 +1873,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 runtime_names,
                 {
                     "antfly_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    *(["antfly-embedded-source_0.2.1.tar.gz"] if schema >= 5 else []),
                     *(
                         f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
                         for product in products

@@ -29,8 +29,8 @@ const platform_build = lib_platform_build_support;
 const addMacosSdkPaths = lib_platform_build_support.addMacosSdkPaths;
 const pkg_antfly_build_imports = @import("imports.zig");
 const AntflyRootImports = pkg_antfly_build_imports.AntflyRootImports;
-const pkg_antfly_build_snowball = @import("../../pkg/antfly-embedded/build/snowball.zig");
-const antfly_storage_build = @import("../../pkg/antfly-embedded/build/storage.zig");
+const pkg_antfly_build_snowball = @import("../embedded/snowball.zig");
+const antfly_storage_build = @import("../embedded/storage.zig");
 const inference_runtime_build = @import("../../pkg/inference/build/runtime.zig");
 const antfly_tests_build = @import("test_support.zig");
 const LmdbBackend = antfly_storage_build.LmdbBackend;
@@ -147,7 +147,7 @@ pub const Shared = struct {
 };
 
 /// Shared dependency composition; product owners select their own roots.
-pub fn create(b: *std.Build) ?Shared {
+pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const api_bench_standalone = b.option(bool, "api-bench-standalone", "Build only the API benchmark for an existing server process") orelse false;
     const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
     const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures") orelse "/tmp";
@@ -279,7 +279,7 @@ pub fn create(b: *std.Build) ?Shared {
     const snowball_steps = pkg_antfly_build_snowball.addSteps(b);
     b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers").dependOn(&snowball_steps.regen.step);
     b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current").dependOn(&snowball_steps.compare.step);
-    const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
+    const openapi_build = b.lazyImport(asking_build_zig, "openapi") orelse return null;
     const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .safe);
     const openapi_sources = addOpenApiSourceSteps(b, openapi_build, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
@@ -352,7 +352,7 @@ pub fn create(b: *std.Build) ?Shared {
         .optimize = optimize,
         .link_libc = link_libc,
     });
-    @import("../../pkg/antfly-embedded/build/source_owner.zig").attach(pgwire_test_mod);
+    @import("../embedded/source_owner.zig").attach(pgwire_test_mod);
     pgwire_test_mod.addImport("sql_parser", sql_parser_mod);
     // This intentionally remains a storage-independent test root. Every
     // pgwire-owned test has the pgwire prefix; without a compile filter Zig
@@ -1118,7 +1118,7 @@ pub fn create(b: *std.Build) ?Shared {
     }
     const antfly_imports = AntflyRootImports{
         .sql_parser = sql_parser_mod,
-        .storage_boundary = @import("../../pkg/antfly-embedded/build/storage_boundary.zig").create(b, target, optimize),
+        .storage_boundary = @import("../embedded/storage_boundary.zig").create(b, target, optimize),
         .cancellation = cancellation_mod,
         .cache_budget = cache_budget_mod,
         .runtime_abi = runtime_abi_mod,

@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "runtime_products": [
     "server",
     "embedded"
@@ -15,6 +15,7 @@
     "scripts/packaging/build_zig_release_archive.sh",
     "scripts/packaging/embedded-release-README.md",
     "scripts/packaging/package_cli_release.py",
+    "scripts/packaging/package_embedded_zig_source.py",
     "scripts/packaging/package_lite_release.py",
     "scripts/packaging/render_libantfly_pkgconfig.py",
     "scripts/packaging/test_cabi_packaging.py",
@@ -33,8 +34,12 @@
     "ts/packages/cli/package.json",
     "ts/packages/embedded/package.json",
     "zig/build.zig",
+    "zig/build_support/embedded/embedded.zig",
     "zig/embedded.build.zig",
     "zig/pkg/antfly-embedded/LICENSE",
+    "zig/pkg/antfly-embedded/README.md",
+    "zig/pkg/antfly-embedded/build.zig",
+    "zig/pkg/antfly-embedded/build.zig.zon",
     "zig/pkg/antfly-embedded/libantfly.pc.in",
     "zig/pkg/inference/LICENSE",
     "zig/pkg/inference/build.zig"

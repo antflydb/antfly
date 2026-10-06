@@ -43,7 +43,7 @@ def verify(
     archive_dir: Path,
     wheel_dir: Path,
     npm_dir: Path,
-    build_contract_schema: int = 4,
+    build_contract_schema: int = 5,
 ) -> None:
     version = normalize_release_version(version)
     python_version = python_version_from_release(version)
@@ -243,7 +243,7 @@ def main() -> int:
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
     parser.add_argument(
-        "--build-contract-schema", type=int, choices=(2, 3, 4), default=4
+        "--build-contract-schema", type=int, choices=(2, 3, 4, 5), default=5
     )
     args = parser.parse_args()
     verify(

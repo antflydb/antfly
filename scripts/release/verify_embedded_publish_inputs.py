@@ -75,7 +75,7 @@ def verify_identity(
     document = verify_release_spec(request, tag, commit)
     if (
         document.get("schema_version") != 5
-        or document.get("build_contract_schema") not in {2, 3, 4}
+        or document.get("build_contract_schema") not in {2, 3, 4, 5}
         or document.get("build_controller_commit") != controller
         or document.get("release_line") != line.name
         or document.get("source_ref") != line.source_ref

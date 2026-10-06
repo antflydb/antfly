@@ -17,10 +17,10 @@
 const std = @import("std");
 const storage_build = @import("storage.zig");
 const platform_build = @import("antfly_platform");
-const image_build = @import("../../../lib/image/build_support.zig");
-const pdf_build = @import("../../../lib/pdf/build_support.zig");
-const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");
-const codegen = @import("../../../build_support/openapi.zig");
+const image_build = @import("../../lib/image/build_support.zig");
+const pdf_build = @import("../../lib/pdf/build_support.zig");
+const tokenizer_build = @import("../../lib/tokenizer/build_support.zig");
+const codegen = @import("../openapi.zig");
 const configureBrowserModule = @import("embedded.zig").configureBrowserModule;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
@@ -98,7 +98,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     const wasm_image_mod = image_build.createModule(b, b.path("lib/image"), wasm_target, optimize, wasm_hash_mod);
-    const wasm_pdf_standard_fonts_mod = @import("../../../build_support/antfly/fonts.zig").create(b, wasm_target, optimize);
+    const wasm_pdf_standard_fonts_mod = @import("../antfly/fonts.zig").create(b, wasm_target, optimize);
     const wasm_font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
         .target = wasm_target,
@@ -512,7 +512,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .artifact = antfly_wasm,
         .install = std.mem.concat(b.allocator, *std.Build.Step, &.{
             &.{
-                @import("../../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-wasm", "antfly-wasm"),
+                @import("../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-wasm", "antfly-wasm"),
                 &install_antfly_wasm.step,
                 &install_antfly_wasm_smoke_run.step,
                 &install_antfly_wasm_client.step,

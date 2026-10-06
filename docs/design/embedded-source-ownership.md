@@ -15,7 +15,7 @@ classification and third-party exceptions.
 | `pkg/inference` | Model execution, inference host and native provider exports |
 | `lib/credentials` | Credential-source identities and native AWS discovery/cache shared by lake, backups and Bedrock |
 | `pkg/antfly/src` | HTTP handlers, distributed transactions, Raft coordination, cluster metadata, hot standby, server storage-owner adapters and private C API |
-| `pkg/antfly-embedded/build` | Local storage profiles, public C API, native provider archives and browser build |
+| `build_support/embedded` | Local storage profiles, public C API, native provider archives and browser build |
 | `build_support/antfly` | Shared module composition, dependency configuration, runtime contracts and test collection |
 
 Portable local transaction receipts and replication records remain with the DB.

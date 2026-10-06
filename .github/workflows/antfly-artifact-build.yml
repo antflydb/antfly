@@ -267,6 +267,34 @@ jobs:
       source_commit: ${{ inputs.source_commit }}
       python_build: ${{ needs.release-plan.outputs.python_build }}
 
+  package-embedded-zig-source:
+    if: ${{ needs.release-plan.outputs.build_contract_schema == '5' }}
+    name: Package independently fetchable Apache Zig sources
+    needs: release-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release-plan.outputs.build_controller_commit }}
+          fetch-depth: 0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ needs.release-plan.outputs.zig_version }}
+      - name: Build immutable Apache source archive and Zig hash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_TAG: ${{ inputs.tag_name }}
+        run: |
+          git fetch --no-tags origin "$SOURCE_COMMIT"
+          python3 scripts/packaging/package_embedded_zig_source.py \
+            --commit "$SOURCE_COMMIT" --version "${RELEASE_TAG#v}" \
+            --out-dir dist/embedded-zig-source
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: antfly-embedded-zig-source
+          path: dist/embedded-zig-source/
+          if-no-files-found: error
+
   package-release-source:
     name: Stage commit-bound release support files
     needs: release-plan
@@ -296,6 +324,7 @@ jobs:
       - build-zig-runtime-archives
       - package-cli-artifacts
       - package-embedded-artifacts
+      - package-embedded-zig-source
       - package-release-source
       - test-macos-homebrew
     runs-on: ubuntu-latest

@@ -58,7 +58,15 @@ There are two primary release products: the ELv2 server and the Apache embedded
 runtime. Source ownership remains separated between the embedded integration
 and inference engine packages.
 
-Independent Apache-only Zig fetching is tracked in
-[issue #988](https://github.com/antflydb/antfly/issues/988). The package
-currently requires a monorepo checkout; a standalone manifest, dependency
-closure, and immutable source artifact remain to be implemented.
+Zig consumers fetch the versioned `antfly-embedded-source_<version>.tar.gz`
+archive directly with `zig fetch --save=antfly_embedded`. It exposes the
+`antfly-embedded` and `antfly-inference` modules, native Lite/C API artifacts,
+and the browser artifact, with its complete Apache composition and pinned
+third-party dependencies. The archive contains no ELv2 server or server test
+sources. Its Zig hash and commit-bound source manifest travel with the
+release checksum ledger. The full Zig suite builds an external native and
+WASM consumer from this fetched package. See
+[`zig/pkg/antfly-embedded/README.md`](../../zig/pkg/antfly-embedded/README.md)
+for the public build API. Neutral build composition lives in
+`zig/build_support/embedded`; the package's `build.zig.zon` is an independent
+entry point, so it cannot own helpers imported by other package builds.

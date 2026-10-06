@@ -1,0 +1,43 @@
+# Antfly Embedded for Zig
+
+This Apache-2.0 package provides local databases, SQL and lake readers, and
+inference without the Antfly server. Use the versioned
+`antfly-embedded-source_<version>.tar.gz` asset from GitHub Releases. Its
+`.zig-hash` asset records the Zig package hash; the release checksum ledger
+also authenticates the archive bytes.
+
+```sh
+zig fetch --save=antfly_embedded https://github.com/antflydb/antfly/releases/download/vVERSION/antfly-embedded-source_VERSION.tar.gz
+```
+
+In `build.zig`:
+
+```zig
+const dependency = b.dependency("antfly_embedded", .{
+    .target = target,
+    .optimize = optimize,
+});
+app.root_module.addImport("antfly-embedded", dependency.module("antfly-embedded"));
+app.root_module.addImport("antfly-inference", dependency.module("antfly-inference"));
+app.root_module.link_libc = true;
+```
+
+The embedded module exports `db`, `api`, object storage, and `lake`. Local
+`.aflite` and directory storage and database-free native inference use the
+same Apache source owners as the C API. Defaults disable optional accelerator
+backends; opt in with `metal`, `cuda`, `pjrt`, or `onnx` dependency options
+when their target/runtime prerequisites are available.
+
+The package also exposes the native `antfly` shared-library artifact
+(`libantfly`), `antfly-lite`, and `antfly_wasm`. The browser artifact contains
+both embedded database and inference APIs. Use `dependency.artifact(...)`
+with `b.addInstallArtifact` to install a selected product. Standalone source
+package commands include `zig build lite`, `capi`, `wasm`, and `wasm-test`;
+the default builds native Lite and its C API.
+
+The source archive includes the complete first-party Apache composition and
+shared library tree, generated contracts, pinned dependency manifests,
+source provenance, and third-party notices. It contains no ELv2 server or
+server test sources. Third-party dependencies retain their own licenses.
+A downloaded package has no dependency on a monorepo checkout. Development
+checkouts can use the same package entry point under `zig/pkg/antfly-embedded`.

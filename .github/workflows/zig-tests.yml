@@ -280,7 +280,7 @@ jobs:
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
-            ':(glob)zig/pkg/antfly-embedded/build/**' \
+            ':(glob)zig/build_support/embedded/**' \
             ':(glob)zig/build_support/antfly/**' \
             zig/embedded.build.zig \
             ':(glob)zig/pkg/inference/build/**' \
@@ -321,7 +321,7 @@ jobs:
             Makefile \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
-            ':(glob)zig/pkg/antfly-embedded/build/**' \
+            ':(glob)zig/build_support/embedded/**' \
             ':(glob)zig/build_support/antfly/**' \
             zig/embedded.build.zig \
             ':(glob)zig/pkg/inference/build/**' \
@@ -858,6 +858,13 @@ jobs:
             echo "::endgroup::"
           fi
           exit "$status"
+
+      - name: Verify externally fetched Apache Zig source package
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 zig/tools/check_embedded_zig_package.py --
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
+          --summary all
 
       - name: Release correctness-fixture workspace
         if: always() && env.ANTFLY_TEST_WORKSPACE != ''

@@ -15,11 +15,11 @@
 
 const std = @import("std");
 const platform_build = @import("antfly_platform");
-const addSnowballModule = @import("../../pkg/antfly-embedded/build/snowball.zig").addSnowballModule;
+const addSnowballModule = @import("../embedded/snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {
     sql_parser: *std.Build.Module,
-    storage_boundary: @import("../../pkg/antfly-embedded/build/storage_boundary.zig").Modules,
+    storage_boundary: @import("../embedded/storage_boundary.zig").Modules,
     cancellation: *std.Build.Module,
     cache_budget: *std.Build.Module,
     runtime_abi: *std.Build.Module,
@@ -49,7 +49,7 @@ pub const AntflyRootImports = struct {
     inference_runtime_paths: *std.Build.Module,
     inference_query_embedding_cache: *std.Build.Module,
     inference_host: *std.Build.Module,
-    boundary_profile: @import("../../pkg/antfly-embedded/build/storage_boundary.zig").Profile = .all,
+    boundary_profile: @import("../embedded/storage_boundary.zig").Profile = .all,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     build_options: *std.Build.Step.Options,
     lite_options: *std.Build.Module,
@@ -222,7 +222,7 @@ pub const AntflyRootImports = struct {
     /// Remote commands depend on client contracts and transport. In particular,
     /// they do not depend on local tokenization, inference, or storage engines.
     pub fn configureCli(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
-        @import("../../pkg/antfly-embedded/build/source_owner.zig").attach(mod);
+        @import("../embedded/source_owner.zig").attach(mod);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_runtime_fs", self.runtime_fs);
         mod.addImport("antfly_runtime_abi", self.runtime_abi);

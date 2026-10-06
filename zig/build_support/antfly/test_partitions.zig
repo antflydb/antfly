@@ -17,7 +17,7 @@
 //! from named dependencies, even when their implementation is exercised by a
 //! server test. Selection audits therefore include both compilation owners.
 const std = @import("std");
-const source_owner = @import("../../pkg/antfly-embedded/build/source_owner.zig");
+const source_owner = @import("../embedded/source_owner.zig");
 const paths = @import("source_paths.zig");
 const support = @import("test_support.zig");
 

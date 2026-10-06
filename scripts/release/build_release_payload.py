@@ -54,7 +54,13 @@ def copy_payload_file(src: Path, out_dir: Path) -> Path:
 def artifact_kind(path: Path) -> str:
     name = path.name
     if name.startswith(
-        ("antfly_", "antfly-embedded_", "antfly-lite_", "antfly-inference_")
+        (
+            "antfly_",
+            "antfly-embedded_",
+            "antfly-embedded-source_",
+            "antfly-lite_",
+            "antfly-inference_",
+        )
     ) and name.endswith(".tar.gz"):
         return "runtime-archive"
     if name.endswith("_checksums.txt"):
@@ -211,6 +217,37 @@ def collect_runtime_archives(archive_dir: Path, schema: int) -> list[Path]:
     return sorted(archives)
 
 
+def verify_embedded_source(directory: Path, version: str, commit: str) -> list[Path]:
+    manifest = directory / "embedded-zig-source.json"
+    document = json.loads(manifest.read_text())
+    archive_name = f"antfly-embedded-source_{version}.tar.gz"
+    archive = directory / archive_name
+    package_hash = directory / (archive_name + ".zig-hash")
+    if (
+        document.get("schema_version") != 1
+        or document.get("version") != version
+        or document.get("commit") != commit
+        or document.get("working_tree") is not False
+        or document.get("archive") != archive_name
+    ):
+        raise SystemExit("embedded Zig source identity differs from release")
+    if (
+        document.get("sha256") != sha256(archive)
+        or document.get("zig_hash") != package_hash.read_text().strip()
+        or not re.fullmatch(
+            r"antfly_embedded-[A-Za-z0-9.+_-]+", document.get("zig_hash", "")
+        )
+    ):
+        raise SystemExit("embedded Zig source archive or package hash differs")
+    if {p.name for p in directory.iterdir()} != {
+        manifest.name,
+        archive.name,
+        package_hash.name,
+    }:
+        raise SystemExit("embedded Zig source artifact set differs")
+    return [archive, package_hash, manifest]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -222,6 +259,11 @@ def main() -> int:
         type=Path,
         required=True,
         help="directory containing matching runtime archives declared by the source build contract",
+    )
+    parser.add_argument(
+        "--embedded-source-dir",
+        type=Path,
+        help="commit-bound Apache Zig package artifacts (schema 5+)",
     )
     parser.add_argument(
         "--extra-dir",
@@ -296,6 +338,18 @@ def main() -> int:
         if cli_registry_versions != expected_cli_registry_versions:
             raise SystemExit("CLI registry versions do not match the release spec")
         registry_versions = release_registry_versions
+
+    if release_spec["build_contract_schema"] >= 5:
+        if args.embedded_source_dir is None:
+            raise SystemExit("schema 5 requires Apache Zig source package artifacts")
+        for source in verify_embedded_source(
+            args.embedded_source_dir, version, args.commit
+        ):
+            copied.append(copy_payload_file(source, out_dir))
+    elif args.embedded_source_dir is not None:
+        raise SystemExit(
+            "historical build contract does not declare a Zig source package"
+        )
 
     checksums = out_dir / "antfly_zig_checksums.txt"
     with checksums.open("w", encoding="utf-8") as dst:

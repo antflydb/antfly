@@ -45,12 +45,12 @@ const assignDefaultAggregateMaxRss = pkg_antfly_build_tests.assignDefaultAggrega
 const pkg_antfly_build_imports = @import("build_support/antfly/imports.zig");
 const AntflyRootImports = pkg_antfly_build_imports.AntflyRootImports;
 
-const pkg_antfly_build_snowball = @import("pkg/antfly-embedded/build/snowball.zig");
+const pkg_antfly_build_snowball = @import("build_support/embedded/snowball.zig");
 
 const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
-const antfly_embedded_build = @import("pkg/antfly-embedded/build/embedded.zig");
-const antfly_storage_build = @import("pkg/antfly-embedded/build/storage.zig");
+const antfly_embedded_build = @import("build_support/embedded/embedded.zig");
+const antfly_storage_build = @import("build_support/embedded/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 const platform_build = @import("antfly_platform");
@@ -62,6 +62,10 @@ const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
 pub fn build(b: *std.Build) void {
+    if (b.option(bool, "embedded-only", "Compose only the Apache embedded products") orelse false) {
+        return @import("embedded.build.zig").buildDependency(b, @This());
+    }
+
     _ = create(b);
 }
 
@@ -76,8 +80,8 @@ pub const Artifacts = struct {
 /// artifacts used by public targets without maintaining a second build graph.
 pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
-    defer @import("pkg/antfly-embedded/build/source_owner.zig").finalize(b);
-    const shared = @import("build_support/antfly/dependencies.zig").create(b) orelse return null;
+    defer @import("build_support/embedded/source_owner.zig").finalize(b);
+    const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
     const api_bench_standalone = shared.api_bench_standalone;
     const conformance_fetch = shared.conformance_fetch;
     const conformance_fixtures = shared.conformance_fixtures;
@@ -96,6 +100,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
     const build_info = shared.build_info;
+    b.modules.put(b.allocator, "antfly-inference", shared.inference_graph.inference_mod) catch @panic("OOM");
     const platform_test_step = shared.platform_test_step;
     const standalone_runtime_build_options = shared.standalone_runtime_build_options;
     const lmdb_engine_mod = shared.lmdb_engine_mod;
@@ -164,7 +169,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
-    const wasm = @import("pkg/antfly-embedded/build/wasm.zig").add(b, sentencepiece_proto_source);
+    const wasm = @import("build_support/embedded/wasm.zig").add(b, sentencepiece_proto_source);
     const wasm_step = b.step("wasm", "Build and install the unified Antfly WASM bundle");
     dependOnAll(wasm_step, wasm.install);
     wasm.smoke.step.dependOn(wasm_step);
@@ -854,7 +859,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     antfly_imports.configure(b, maintenance_process_mod, link_libc);
-    @import("pkg/antfly-embedded/build/storage.zig").configureLmdb(b, maintenance_process_mod, lmdb_engine_mod, true);
+    @import("build_support/embedded/storage.zig").configureLmdb(b, maintenance_process_mod, lmdb_engine_mod, true);
     maintenance_process_mod.addImport("vopr", vopr_mod);
     maintenance_process_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     maintenance_process_mod.addImport("antfly_platform", platform_mod);
@@ -1051,7 +1056,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
     @import("build_support/antfly/test_support.zig").configureSimpleTestRuns(b, test_step);
-    @import("pkg/antfly-embedded/build/source_owner.zig").finalize(b);
+    @import("build_support/embedded/source_owner.zig").finalize(b);
     const unit_ownership_baseline = @import("pkg/antfly/build/unit_test_ownership.zig").applyWithSourceOwners(b, unit_test_step, @import("build_support/antfly/test_partitions.zig").consumerFor);
     @import("pkg/antfly/build/unit_test_inventory.zig").add(b, unit_test_step, unit_ownership_baseline, &.{
         lib_test_step,

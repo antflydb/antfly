@@ -94,7 +94,7 @@ pub fn addSnowballCompiler(b: *std.Build) *std.Build.Step.Compile {
     return snowball_compiler;
 }
 
-const addFileCompareTool = @import("../../../tools/build_support.zig").addFileCompareTool;
+const addFileCompareTool = @import("../../tools/build_support.zig").addFileCompareTool;
 
 fn formatGenerated(b: *std.Build, source: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
     // Formatting produces a separate cached file; the compiler's output stays immutable.

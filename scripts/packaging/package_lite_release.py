@@ -58,10 +58,10 @@ SOURCE_LICENSE_FILES = (
 
 
 def archive_name(
-    version: str, platform: Platform, build_contract_schema: int = 4
+    version: str, platform: Platform, build_contract_schema: int = 5
 ) -> str:
     variant = f"_{platform.release_variant}" if platform.release_variant else ""
-    if build_contract_schema not in {2, 3, 4}:
+    if build_contract_schema not in {2, 3, 4, 5}:
         raise ValueError("unsupported embedded release build contract")
     product = "lite" if build_contract_schema == 2 else "embedded"
     return f"antfly-{product}_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
