@@ -517,7 +517,14 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = pdf_bench_optimize,
     });
     const pdf_bench_fonts = @import("build_support/antfly/fonts.zig").create(b, target, pdf_bench_optimize);
-    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts, platform_mod);
+    const pdf_bench_platform = if (pdf_bench_optimize == optimize) platform_mod else platform_build.createModule(b, .{
+        .root_source_file = b.path("lib/platform/src/root.zig"),
+        .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
+        .target = target,
+        .optimize = pdf_bench_optimize,
+        .link_libc = link_libc,
+    });
+    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts, pdf_bench_platform);
     const pdf_bench = pdf_build.addBenchmark(b, .{
         .root = b.path("lib/pdf"),
         .target = target,
