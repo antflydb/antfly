@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Private module boundary for server consumers of local source contracts.
 const builtin = @import("builtin");
@@ -739,3 +740,6 @@ pub const serverless_lake_host = @import("serverless/lake_host.zig");
 pub const sql_lake_cursor = @import("sql/lake_cursor.zig");
 pub const sql_lake_values = @import("sql/lake_values.zig");
 pub const serverless_query_lake_fixtures = @import("serverless/query/lake_fixtures.zig");
+
+pub const chatgpt_manager = @import("chatgpt/manager.zig");
+pub const chatgpt_responses = @import("chatgpt/responses.zig");

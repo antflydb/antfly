@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -643,15 +644,12 @@ const Credential = struct {
 
     fn identity(self: *Credential, alloc: std.mem.Allocator) !http.AuthenticatedIdentity {
         try self.validate();
-        var receiver = try self.manager.io_borrow.receive();
-        const io = receiver.io();
-        try self.manager.mutation_mutex.lock(io);
-        // These snapshot methods do not take the mutation mutex internally.
-        // Copy one coherent policy view without keeping a login-time grant or
-        // row-policy cache across later statements.
+        var lease = try self.manager.acquireSnapshotLease();
+        // Copy credentials and policies under one lease without recursively
+        // acquiring the user-manager mutex or retaining a login-time grant.
         const result = blk: {
-            defer self.manager.mutation_mutex.unlock(io);
-            var user = try self.manager.getUser(self.username);
+            defer lease.release();
+            var user = try lease.getUser(self.username);
             defer user.deinit(self.manager.alloc);
             const permissions = try self.manager.getPermissionsForUser(self.username);
             defer http.freePermissions(self.manager.alloc, permissions);
@@ -680,11 +678,9 @@ const Credential = struct {
 };
 
 fn snapshotUser(manager: *usermgr.UserManager, username: []const u8) !usermgr.User {
-    var receiver = try manager.io_borrow.receive();
-    const io = receiver.io();
-    try manager.mutation_mutex.lock(io);
-    defer manager.mutation_mutex.unlock(io);
-    return manager.getUser(username);
+    var lease = try manager.acquireSnapshotLease();
+    defer lease.release();
+    return lease.getUser(username);
 }
 
 fn validateRequest(request: wire.Request) !void {
@@ -1302,11 +1298,12 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             // through the failing allocator. Never deinitialize the borrowed maps.
             var borrowed = original.*;
             borrowed.alloc = failing;
-            var snapshot = try borrowed.getUser("alice");
+            var snapshot = try snapshotUser(&borrowed, "alice");
             defer snapshot.deinit(failing);
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, SnapshotAllocation.check, .{&manager});
+    try std.testing.expectError(error.Unauthorized, Credential.authenticate(alloc, &manager, "missing", "secret"));
     try std.testing.expectError(error.InvalidPassword, Credential.authenticate(alloc, &manager, "alice", "wrong"));
     const credential = try Credential.authenticate(alloc, &manager, "alice", "secret");
     defer Credential.release(credential, alloc);
@@ -1454,6 +1451,11 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try manager.updatePassword("alice", "new-secret");
     try std.testing.expectError(error.Unauthorized, credential.validate());
     try std.testing.expectError(error.Unauthorized, credential.identity(alloc));
+    const replacement = try Credential.authenticate(alloc, &manager, "alice", "new-secret");
+    defer Credential.release(replacement, alloc);
+    var replacement_identity = try replacement.identity(alloc);
+    defer replacement_identity.deinit(alloc);
+    try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
 }
 
 test "SQL pgwire native adapter admits sessions for principal scoped native validation" {

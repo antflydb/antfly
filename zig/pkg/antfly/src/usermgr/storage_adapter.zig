@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -97,7 +98,20 @@ pub const StorageUserStore = struct {
                 error.NotFound => "{}",
                 else => return err,
             };
+            const instance_key = try std.fmt.allocPrint(alloc, "userinstance:{s}", .{username});
+            defer alloc.free(instance_key);
+            const instance_bytes = txn.get(users_namespace, instance_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            var instance_id: [16]u8 = @splat(0);
+            if (instance_bytes) |bytes| {
+                if (bytes.len != instance_id.len) return error.InvalidUserIdentity;
+                @memcpy(&instance_id, bytes);
+                if (std.mem.allEqual(u8, &instance_id, 0)) return error.InvalidUserIdentity;
+            }
             try out.append(alloc, .{
+                .instance_id = instance_id,
                 .username = try alloc.dupe(u8, username),
                 .password_hash = try alloc.dupe(u8, entry.value),
                 .metadata_json = try alloc.dupe(u8, metadata_json),
@@ -115,6 +129,10 @@ pub const StorageUserStore = struct {
         defer self.alloc.free(key);
         const metadata_key = try std.fmt.allocPrint(self.alloc, "usermeta:{s}", .{user.username});
         defer self.alloc.free(metadata_key);
+        const instance_key = try std.fmt.allocPrint(self.alloc, "userinstance:{s}", .{user.username});
+        defer self.alloc.free(instance_key);
+        if (std.mem.allEqual(u8, &user.instance_id, 0)) return error.InvalidUserIdentity;
+        try txn.put(users_namespace, instance_key, &user.instance_id);
         try txn.put(users_namespace, key, user.password_hash);
         try txn.put(users_namespace, metadata_key, if (user.metadata_json.len > 0) user.metadata_json else "{}");
         try txn.commit();
@@ -140,6 +158,12 @@ pub const StorageUserStore = struct {
             }) != null) {
                 try txn.delete(users_namespace, metadata_key);
             }
+            const instance_key = try std.fmt.allocPrint(self.alloc, "userinstance:{s}", .{username});
+            defer self.alloc.free(instance_key);
+            if ((txn.get(users_namespace, instance_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            }) != null) try txn.delete(users_namespace, instance_key);
             try txn.commit();
             return true;
         }
@@ -324,6 +348,7 @@ fn validPortableSeedKey(namespace: backend_types.Namespace, key: []const u8) boo
     if (std.mem.eql(u8, namespace.name.?, users_namespace.name.?)) {
         return std.mem.startsWith(u8, key, "userpass:") or
             std.mem.startsWith(u8, key, "usermeta:") or
+            std.mem.startsWith(u8, key, "userinstance:") or
             std.mem.startsWith(u8, key, "apikey:");
     }
     return std.mem.startsWith(u8, key, "p::") or
@@ -633,6 +658,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
 
     var authed = try reloaded.authenticateUser("alice", "secret");
     defer authed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(created.instance_id, authed.instance_id);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", authed.metadata_json);
     try std.testing.expect(try reloaded.enforce("alice", .table, "docs", .read));
     const filter = try reloaded.getRowFilter("alice", "docs");
@@ -652,6 +678,23 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
     try std.testing.expectEqual(@as(usize, 1), validated.row_filter.len);
+    try reloaded.updatePassword("alice", "changed");
+    const persisted_users = try reloaded_user_store.iface().loadUsers(std.testing.allocator);
+    defer {
+        for (persisted_users) |*user| user.deinit(std.testing.allocator);
+        std.testing.allocator.free(persisted_users);
+    }
+    try std.testing.expectEqual(created.instance_id, persisted_users[0].instance_id);
+    try reloaded.deleteUser("alice");
+    var replacement = try reloaded.createUser("alice", "replacement", &.{});
+    defer replacement.deinit(std.testing.allocator);
+    try std.testing.expect(!std.mem.eql(u8, &created.instance_id, &replacement.instance_id));
+    const replaced_users = try reloaded_user_store.iface().loadUsers(std.testing.allocator);
+    defer {
+        for (replaced_users) |*user| user.deinit(std.testing.allocator);
+        std.testing.allocator.free(replaced_users);
+    }
+    try std.testing.expectEqual(replacement.instance_id, replaced_users[0].instance_id);
 }
 
 test "portable auth seed preserves credentials policies roles filters and api keys" {
@@ -711,6 +754,7 @@ test "portable auth seed preserves credentials policies roles filters and api ke
 
     var authenticated = try restored.authenticateUser("alice", "secret");
     defer authenticated.deinit(alloc);
+    try std.testing.expectEqual(alice.instance_id, authenticated.instance_id);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", authenticated.metadata_json);
     try std.testing.expect(try restored.enforce("alice", .table, "docs", .read));
     const roles = try restored.getRolesForUser("alice");

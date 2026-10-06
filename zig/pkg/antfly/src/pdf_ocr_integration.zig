@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: ELv2
+// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 const std = @import("std");
 const httpx = @import("httpx");
@@ -28,6 +40,11 @@ pub fn main(init: std.process.Init) !void {
     defer args.deinit();
     _ = args.next();
     if (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--qualify-apple")) {
+            var runtime = asset_producer_runtime.Runtime.init(alloc, &client);
+            defer runtime.deinit();
+            return enrichment_runtime.runApplePdfOcrGroundingIntegration(alloc, fixture.reader_two_lines_scanned_pdf, runtime.producer(), @import("storage/memory_budget.zig").smartResourceBudgets(0).options);
+        }
         if (!std.mem.eql(u8, arg, "--qualify-real")) return error.InvalidIntegrationArgument;
         return try runRealModelQualification(alloc, &client);
     }
@@ -351,6 +368,7 @@ pub fn main(init: std.process.Init) !void {
         alloc,
         fixture.reader_two_lines_scanned_pdf,
         producer,
+        @import("storage/memory_budget.zig").smartResourceBudgets(0).options,
     );
     if (local.read_calls != 4) return error.IntegrationGroundingReaderWasNotInvoked;
 }

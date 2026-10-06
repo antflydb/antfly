@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,12 +45,12 @@ const assignDefaultAggregateMaxRss = pkg_antfly_build_tests.assignDefaultAggrega
 const pkg_antfly_build_imports = @import("build_support/antfly/imports.zig");
 const AntflyRootImports = pkg_antfly_build_imports.AntflyRootImports;
 
-const pkg_antfly_build_snowball = @import("pkg/antfly-embedded/build/snowball.zig");
+const pkg_antfly_build_snowball = @import("build_support/embedded/snowball.zig");
 
 const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
-const antfly_embedded_build = @import("pkg/antfly-embedded/build/embedded.zig");
-const antfly_storage_build = @import("pkg/antfly-embedded/build/storage.zig");
+const antfly_embedded_build = @import("build_support/embedded/embedded.zig");
+const antfly_storage_build = @import("build_support/embedded/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 const platform_build = @import("antfly_platform");
@@ -61,6 +62,10 @@ const makeRootBuildOptions = antfly_storage_build.makeRootBuildOptions;
 const selectTestFilters = antfly_tests_build.selectTestFilters;
 
 pub fn build(b: *std.Build) void {
+    if (b.option(bool, "embedded-only", "Compose only the Apache embedded products") orelse false) {
+        return @import("embedded.build.zig").buildDependency(b, @This());
+    }
+
     _ = create(b);
 }
 
@@ -75,8 +80,8 @@ pub const Artifacts = struct {
 /// artifacts used by public targets without maintaining a second build graph.
 pub fn create(b: *std.Build) ?Artifacts {
     defer @import("antfly_platform").finalizeMacosSdk(b);
-    defer @import("pkg/antfly-embedded/build/source_owner.zig").finalize(b);
-    const shared = @import("build_support/antfly/dependencies.zig").create(b) orelse return null;
+    defer @import("build_support/embedded/source_owner.zig").finalize(b);
+    const shared = @import("build_support/antfly/dependencies.zig").create(b, @This()) orelse return null;
     const api_bench_standalone = shared.api_bench_standalone;
     const conformance_fetch = shared.conformance_fetch;
     const conformance_fixtures = shared.conformance_fixtures;
@@ -95,9 +100,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_enable_metal = shared.inference_enable_metal;
     const inference_enable_cuda = shared.inference_enable_cuda;
     const build_info = shared.build_info;
+    b.modules.put(b.allocator, "antfly-inference", shared.inference_graph.inference_mod) catch @panic("OOM");
     const platform_test_step = shared.platform_test_step;
     const standalone_runtime_build_options = shared.standalone_runtime_build_options;
-    const production_build_options = shared.production_build_options;
     const lmdb_engine_mod = shared.lmdb_engine_mod;
     const raft_engine_mod = shared.raft_engine_mod;
     const json_mod = shared.json_mod;
@@ -151,6 +156,63 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureRuntimeContracts(usermgr_mod);
     production_antfly_imports.storage_boundary.configureSources(usermgr_mod, false, false);
     const onnx_build = @import("onnx_graph").support;
+    const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
+    if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))
+        @panic("-Dapple-providers=true requires macOS and libc");
+    const apple_reader_options = b.addOptions();
+    apple_reader_options.addOption(bool, "enabled", apple_reader_enabled);
+    const apple_options_module = apple_reader_options.createModule();
+    readers_mod.addImport("apple_reader_options", apple_options_module);
+    readers_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
+    readers_mod.addImport("antfly_platform", platform_mod);
+    const apple_native_mod = b.createModule(.{
+        .root_source_file = b.path("lib/apple_native/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    apple_native_mod.addImport("apple_native_options", apple_options_module);
+    apple_native_mod.addImport("antfly_platform", platform_mod);
+    apple_native_mod.addImport("httpx", httpx_mod);
+    generating_mod.addImport("antfly_apple_native", apple_native_mod);
+    transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
+    const loader_tests = b.addSystemCommand(&.{"python3"});
+    loader_tests.addFileArg(b.path("../scripts/test_apple_bridge_loader.py"));
+    loader_tests.has_side_effects = true;
+    b.step("apple-bridge-loader-test", "Test Apple bridge OS gating, ABI, concurrency, and relocated CLI/Lite layouts").dependOn(&loader_tests.step);
+    var install_apple_bridge: ?*std.Build.Step.InstallFile = null;
+    if (apple_reader_enabled) {
+        const swift = b.addSystemCommand(&.{ "xcrun", "swiftc", "-parse-as-library", "-swift-version", "6", "-target", if (target.result.cpu.arch == .aarch64) "arm64-apple-macos26.0" else "x86_64-apple-macos26.0", "-module-cache-path" });
+        swift.addDirectoryArg(std.Build.LazyPath.cache_root.path(b, "apple-swift-modules"));
+        swift.addArg(switch (optimize) {
+            .debug => "-Onone",
+            .small => "-Osize",
+            .safe, .fast => "-O",
+        });
+        swift.addArgs(&.{ "-emit-library", "-Xlinker", "-install_name", "-Xlinker", "@rpath/libantfly-apple.dylib", "-Xlinker", "-adhoc_codesign" });
+        swift.addFileArg(b.path("lib/apple_native/src/bridge.swift"));
+        swift.addArg("-o");
+        const bridge = swift.addOutputFileArg("libantfly-apple.dylib");
+        install_apple_bridge = b.addInstallFileWithDir(bridge, .lib, "libantfly-apple.dylib");
+        b.getInstallStep().dependOn(&install_apple_bridge.?.step);
+        b.step("apple-native-bridge", "Build and install the optional Apple Swift sidecar").dependOn(&install_apple_bridge.?.step);
+        apple_native_mod.link_libc = true;
+        addMacosSdkPaths(b, apple_native_mod, target);
+        apple_native_mod.addCSourceFile(.{
+            .file = b.path("lib/apple_native/src/loader.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        });
+    }
+    if (apple_reader_enabled) {
+        addMacosSdkPaths(b, readers_mod, target);
+        readers_mod.linkFramework("Foundation", .{});
+        readers_mod.linkFramework("CoreGraphics", .{});
+        readers_mod.linkFramework("ImageIO", .{});
+        readers_mod.linkFramework("Vision", .{});
+        readers_mod.addCSourceFile(.{
+            .file = b.path("lib/readers/src/apple_vision.m"),
+            .flags = &.{ "-fobjc-arc", "-fblocks" },
+        });
+    }
 
     // The public package has the same storage boundary as the linked server:
     // LMDB is retained only by explicitly configured test/benchmark modules.
@@ -164,12 +226,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_mod.addImport("vopr", vopr_mod);
     antfly_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
 
-    const wasm = @import("pkg/antfly-embedded/build/wasm.zig").add(b, sentencepiece_proto_source);
+    const wasm = @import("build_support/embedded/wasm.zig").add(b, sentencepiece_proto_source);
     const wasm_step = b.step("wasm", "Build and install the unified Antfly WASM bundle");
     dependOnAll(wasm_step, wasm.install);
     wasm.smoke.step.dependOn(wasm_step);
     b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test").dependOn(&wasm.smoke.step);
     const embedded = antfly_embedded_build.addEmbedded(b, .{
+        .version = shared.antfly_version,
         .server_integration_tests = true,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
@@ -187,6 +250,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const capi_mod = embedded.capi_mod;
     const libantfly_link_mod = embedded.libantfly_link_mod;
     const install_libantfly = embedded.install_libantfly;
+    if (install_apple_bridge) |install| install_libantfly.step.dependOn(&install.step);
     const install_capi_header = embedded.install_capi_header;
     const run_capi_smoke = embedded.run_capi_smoke;
     const run_capi_conformance = embedded.run_capi_conformance;
@@ -365,7 +429,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = generating_mod,
     });
     const run_lib_generating_tests = b.addRunArtifact(lib_generating_tests);
+    @import("lib/apple_native/build_support.zig").configureTest(b, run_lib_generating_tests, if (install_apple_bridge) |install| install.source else null);
+    // Model readiness and installed speech assets can change without code edits.
+    run_lib_generating_tests.has_side_effects = apple_reader_enabled;
     const lib_generating_test_step = b.step("lib-generating-test", "Run standalone lib/generating tests");
+    b.step("lib-generating-check", "Compile generating tests without executing them").dependOn(&lib_generating_tests.step);
     lib_generating_test_step.dependOn(&run_lib_generating_tests.step);
 
     const lib_embeddings_tests = b.addTest(.{
@@ -447,6 +515,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
     const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
     lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
+    b.step("lib-readers-check", "Compile reader tests without executing them").dependOn(&lib_readers_tests.step);
 
     const lib_extracting_tests = b.addTest(.{
         .root_module = extracting_mod,
@@ -492,6 +561,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const pdf_test_step = b.step("lib-pdf-test", "Run shared PDF tests");
     pdf_test_step.dependOn(&run_lib_pdf_tests.step);
     pdf_test_step.dependOn(&pdf_integration.run.step);
+    b.step("apple-pdf-ocr-test", "Run scanned PDF OCR and grounding through Apple Vision").dependOn(&pdf_integration.apple.step);
     b.step("pdf-ocr-integration-test", "Run native PDF rendering and encoded reader batching through the OCR coordinator").dependOn(&pdf_integration.run.step);
     b.step("pdf-model-qualification-test", "Run opt-in real Florence/Gemma4/ClipClap PDF qualification against ANTFLY_PDF_QUALIFICATION_URL").dependOn(&pdf_integration.qualification.step);
 
@@ -579,6 +649,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .apple_bridge = if (install_apple_bridge) |install| install.source else null,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
         .optimize = optimize,
@@ -662,7 +733,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = transcribing_mod,
     });
     const run_lib_transcribing_tests = b.addRunArtifact(lib_transcribing_tests);
+    @import("lib/apple_native/build_support.zig").configureTest(b, run_lib_transcribing_tests, if (install_apple_bridge) |install| install.source else null);
+    run_lib_transcribing_tests.has_side_effects = apple_reader_enabled;
     const lib_transcribing_test_step = b.step("lib-transcribing-test", "Run standalone lib/transcribing tests");
+    b.step("lib-transcribing-check", "Compile transcribing tests without executing them").dependOn(&lib_transcribing_tests.step);
     lib_transcribing_test_step.dependOn(&run_lib_transcribing_tests.step);
 
     const audio_conformance = audio_build.addConformance(b, .{
@@ -853,7 +927,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     antfly_imports.configure(b, maintenance_process_mod, link_libc);
-    @import("pkg/antfly-embedded/build/storage.zig").configureLmdb(b, maintenance_process_mod, lmdb_engine_mod, true);
+    @import("build_support/embedded/storage.zig").configureLmdb(b, maintenance_process_mod, lmdb_engine_mod, true);
     maintenance_process_mod.addImport("vopr", vopr_mod);
     maintenance_process_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     maintenance_process_mod.addImport("antfly_platform", platform_mod);
@@ -887,6 +961,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     );
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
+    if (install_apple_bridge) |install| install_antfly.step.dependOn(&install.step);
     const install_antfarm_assets = b.addInstallDirectory(.{
         .source_dir = b.path("pkg/antfly/antfarm"),
         .install_dir = .prefix,
@@ -899,27 +974,21 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_step.dependOn(&install_antfarm_assets.step);
 
     const lite_module_options: std.Build.Module.CreateOptions = .{
-        .root_source_file = b.path("pkg/antfly/src/lite_main.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/local/lite_main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "build_info", .module = build_info.module },
-            .{ .name = "build_options", .module = production_build_options.createModule() },
-            .{ .name = "structlog", .module = structlog_mod },
-            .{ .name = "antfly_platform", .module = platform_mod },
-            .{ .name = "antfly_hash", .module = hash_mod },
-        },
     };
     const lite_main_mod = b.createModule(lite_module_options);
+    production_antfly_imports.configureEmbedded(b, lite_main_mod, link_libc);
+    lite_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    lite_main_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
     build_info.link(lite_main_mod);
     const lite_main = b.addExecutable(.{
         .name = "antfly-lite",
         .root_module = lite_main_mod,
     });
-    // Lite administration shares storage; serving shares the server runtime.
-    for ([_]RuntimeLibraryUnit{ .storage_kernel, .distributed, .api_kernel, .enrichment_compute, .inference }) |unit| {
-        lite_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
-    }
+    lite_main_mod.linkLibrary(embedded.native_inference);
+    lite_main_mod.linkLibrary(embedded.native_enrichment);
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
         .root_module = b.createModule(.{
@@ -940,10 +1009,16 @@ pub fn create(b: *std.Build) ?Artifacts {
             .mode = .simple,
         },
     });
+    production_antfly_imports.configureEmbedded(b, lite_main_tests.root_module, link_libc);
+    lite_main_tests.root_module.addImport("antfly-client", antfly_client_pkg_mod);
+    lite_main_tests.root_module.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    // Unit tests use the stable test version; only final products link release metadata.
+    lite_main_tests.root_module.addImport("build_info", build_info.module);
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
-    const install_lite_main = b.addInstallArtifact(lite_main, .{ .dest_sub_path = antfly_bin_name });
+    const install_lite_main = b.addInstallArtifact(lite_main, .{});
 
     const lite_step = b.step("lite", "Build and install the Antfly Lite CLI and libantfly C ABI");
+    lite_step.dependOn(&b.top_level_steps.get("licenses-antfly-lite").?.step);
     lite_step.dependOn(&install_lite_main.step);
     lite_step.dependOn(&install_libantfly.step);
     lite_step.dependOn(&install_capi_header.step);
@@ -1050,7 +1125,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         antfly_tests_build.labelTestRuns(b, lib_test_step);
     }
     @import("build_support/antfly/test_support.zig").configureSimpleTestRuns(b, test_step);
-    @import("pkg/antfly-embedded/build/source_owner.zig").finalize(b);
+    @import("build_support/embedded/source_owner.zig").finalize(b);
     const unit_ownership_baseline = @import("pkg/antfly/build/unit_test_ownership.zig").applyWithSourceOwners(b, unit_test_step, @import("build_support/antfly/test_partitions.zig").consumerFor);
     @import("pkg/antfly/build/unit_test_inventory.zig").add(b, unit_test_step, unit_ownership_baseline, &.{
         lib_test_step,

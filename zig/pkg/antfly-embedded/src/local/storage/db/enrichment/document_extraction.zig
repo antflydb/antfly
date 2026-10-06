@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
@@ -1218,6 +1219,7 @@ pub const OcrMode = enum {
 pub const OcrPromptPolicy = enum {
     generic,
     florence,
+    plain,
 };
 
 pub const default_ocr_prompt = "Transcribe this page faithfully. Preserve reading order, headings, lists, and table structure. Render tables as Markdown with one row per visual row. Do not summarize, infer, or omit text. Return only the transcription.";
@@ -1229,6 +1231,7 @@ pub fn effectiveOcrPrompt(config: Config) []const u8 {
     return switch (config.ocr_prompt_policy) {
         .generic => default_ocr_prompt,
         .florence => florence_ocr_prompt,
+        .plain => "",
     };
 }
 
@@ -1800,7 +1803,7 @@ pub fn parseConfig(alloc: Allocator, raw: []const u8) !Config {
     if (config.ocr_executor == .generator and config.ocr_config_json.len == 0)
         return error.InvalidDocumentExtractionConfig;
     if (config.ocr_config_json.len > 0) switch (config.ocr_executor) {
-        .reader => try validateReaderConfigJson(alloc, config.ocr_config_json),
+        .reader => try validateReaderConfigJson(alloc, config.ocr_config_json, effectiveOcrPrompt(config)),
         .generator => try validateGeneratorConfigJson(alloc, config.ocr_config_json),
     };
     config.transcription_enabled = (try boolField(object, "transcribe_audio")) orelse false;
@@ -1869,6 +1872,8 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
             .generic
         else if (std.mem.eql(u8, policy.string, "florence"))
             .florence
+        else if (std.mem.eql(u8, policy.string, "plain"))
+            .plain
         else
             return error.InvalidDocumentExtractionConfig;
     } else {
@@ -1877,7 +1882,15 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
         if (config.ocr_executor == .reader and config.ocr_config_json.len > 0 and isFlorenceModel(config.ocr_model)) {
             std.log.warn("OCR prompt policy inferred as florence for compatibility; configure ocr.prompt_policy explicitly model={s}", .{config.ocr_model});
         }
-        config.ocr_prompt_policy = if (config.ocr_executor == .generator)
+        const apple_reader = if (ocr.get("config")) |producer| blk: {
+            if (producer == .object) if (producer.object.get("provider")) |provider| {
+                break :blk provider == .string and std.mem.eql(u8, provider.string, "apple");
+            };
+            break :blk false;
+        } else false;
+        config.ocr_prompt_policy = if (config.ocr_executor == .reader and apple_reader)
+            .plain
+        else if (config.ocr_executor == .generator)
             .generic
         else if (config.ocr_config_json.len == 0 or isFlorenceModel(config.ocr_model))
             .florence
@@ -2004,7 +2017,7 @@ fn parseOptionalProducerConfigJsonAlloc(
     }
 }
 
-fn validateReaderConfigJson(alloc: Allocator, raw: []const u8) !void {
+fn validateReaderConfigJson(alloc: Allocator, raw: []const u8, prompt: []const u8) !void {
     var parsed = std.json.parseFromSlice(reader_config.Config, alloc, raw, .{
         .allocate = .alloc_always,
         // Provider-owned options remain forward-compatible; the fields known
@@ -2017,6 +2030,24 @@ fn validateReaderConfigJson(alloc: Allocator, raw: []const u8) !void {
     };
     defer parsed.deinit();
     parsed.value.validate() catch return error.InvalidDocumentExtractionConfig;
+    if (parsed.value.provider == .apple)
+        reader_config.validateAppleRequest(prompt, null) catch return error.InvalidDocumentExtractionConfig;
+}
+
+test "document extraction Apple OCR defaults to a plain prompt" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"config":{"provider":"apple"}}}
+    );
+    defer config.deinit(alloc);
+    try std.testing.expectEqual(OcrPromptPolicy.plain, config.ocr_prompt_policy);
+    try std.testing.expectEqualStrings("", effectiveOcrPrompt(config));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"prompt":"Describe the page","config":{"provider":"apple"}}}
+    ));
+    try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
+        \\{"ocr":{"enabled":true,"prompt_policy":"generic","config":{"provider":"apple"}}}
+    ));
 }
 
 fn validateGeneratorConfigJson(alloc: Allocator, raw: []const u8) !void {

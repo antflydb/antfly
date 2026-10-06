@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const antfly = @import("../lite_cli_root.zig");
@@ -80,27 +81,21 @@ const OwnedScanRequest = struct {
     }
 };
 
-pub const ServeHandler = *const fn (std.process.Init, *std.process.Args.Iterator) anyerror!void;
-
 pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator) !void {
-    return runWithServe(init, argv0, args, null);
-}
-
-pub fn runWithServe(init: std.process.Init, argv0: []const u8, args: *std.process.Args.Iterator, serve_handler: ?ServeHandler) !void {
     const subcommand = args.next() orelse {
-        printUsage(argv0, serve_handler != null);
+        printUsage(argv0);
         return error.InvalidArguments;
     };
 
     if (std.mem.eql(u8, subcommand, "--help") or std.mem.eql(u8, subcommand, "-h") or std.mem.eql(u8, subcommand, "help")) {
-        printUsage(argv0, serve_handler != null);
+        printUsage(argv0);
         return;
     }
 
-    return try dispatchSubcommand(init, argv0, subcommand, args, serve_handler);
+    return try dispatchSubcommand(init, argv0, subcommand, args);
 }
 
-fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []const u8, args: *std.process.Args.Iterator, serve_handler: ?ServeHandler) !void {
+fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
     const allocator = init.gpa;
     const io = init.io;
     if (std.mem.eql(u8, subcommand, "init")) return try initLite(allocator, io, args);
@@ -121,13 +116,9 @@ fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []c
     if (std.mem.eql(u8, subcommand, "check")) return try check(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "compact")) return try compact(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(allocator, io, args);
-    if (std.mem.eql(u8, subcommand, "serve")) {
-        const handler = serve_handler orelse return error.InvalidArguments;
-        return try handler(init, args);
-    }
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
-    printUsage(argv0, serve_handler != null);
+    printUsage(argv0);
     return error.InvalidArguments;
 }
 
@@ -168,7 +159,7 @@ fn openEmbeddedDataSurface(allocator: Allocator, path: []const u8, mode: db_mod.
     var lite = try LiteDb.open(allocator, path, mode);
     errdefer lite.close();
     if (try lite.backend.isStandaloneArtifact() and !lite.backend.hasStandaloneRootAdoption()) {
-        std.debug.print("error: this Lite artifact contains standalone table namespaces; use antfly lite serve and the /db/v1 API\n", .{});
+        std.debug.print("error: this Lite artifact contains standalone table namespaces; use antfly standalone --storage-engine lite --storage-path <db.aflite> and the /db/v1 API\n", .{});
         return error.StandaloneLiteRequiresApi;
     }
     return lite;
@@ -1373,7 +1364,7 @@ fn mutationJson(allocator: Allocator, field_name: []const u8, name: []const u8, 
     return try out.toOwnedSlice(allocator);
 }
 
-fn printUsage(argv0: []const u8, has_serve: bool) void {
+fn printUsage(argv0: []const u8) void {
     std.debug.print(
         \\usage: {s} <subcommand> [options]
         \\
@@ -1406,7 +1397,6 @@ fn printUsage(argv0: []const u8, has_serve: bool) void {
         \\  vacuum <db.aflite>
         \\
     , .{argv0});
-    if (has_serve) std.debug.print("  serve <db.aflite> --addr 127.0.0.1:8080 [--fsync <true|false>] [standalone options]\n", .{});
 }
 
 test "lite info subcommand aliases status" {
@@ -1793,7 +1783,7 @@ test "lite export subcommand dispatches portable backup alias" {
     var init: std.process.Init = undefined;
     init.gpa = allocator;
     init.io = io;
-    try dispatchSubcommand(init, "antfly lite", "export", &args, null);
+    try dispatchSubcommand(init, "antfly lite", "export", &args);
 
     const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
     defer allocator.free(body);
@@ -2515,7 +2505,7 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"lsm") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_namespace\":\"__antfly_lite\"") != null);
-    const expected_format_version = try std.fmt.allocPrint(allocator, "\"format_version\":{d}", .{antfly.lite.native.format_version});
+    const expected_format_version = try std.fmt.allocPrint(allocator, "\"format_version\":{d}", .{antfly.lite.native.indexed_format_version});
     defer allocator.free(expected_format_version);
     try std.testing.expect(std.mem.indexOf(u8, json, expected_format_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"page_size\":4096") != null);

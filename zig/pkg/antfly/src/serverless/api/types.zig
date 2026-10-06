@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -652,6 +653,7 @@ pub const RuntimeStatusResult = struct {
     health: RuntimeHealth = .healthy,
     deployment_mode: RuntimeDeploymentMode = .serverless,
     index_capabilities: IndexRuntimeCapabilities = .{},
+    connectors: struct { chatgpt: struct { enabled: bool = false, reason: []const u8 = "local_runtime_required" } = .{} } = .{},
     role: RuntimeRole,
     combined_mode: bool = false,
     tick_interval_ms: u64,

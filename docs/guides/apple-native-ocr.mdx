@@ -1,0 +1,257 @@
+---
+title: Native Apple providers
+description: Use macOS native OCR, file transcription, and Apple Intelligence text generation in Antfly
+---
+
+Antfly's opt-in `apple` provider uses Vision for OCR, SpeechAnalyzer for file
+transcription, and Foundation Models for on-device text generation. All three
+use one build flag, `-Dapple-providers=true`, and task-specific native APIs.
+They have independent availability: working OCR or transcription does not imply
+that the Apple Intelligence generation model is ready.
+
+## Build
+
+From the repository's `zig` directory, use its required Zig 0.17 toolchain:
+
+```bash
+zig build antfly -Dapple-providers=true
+```
+
+The build requires a macOS 27 SDK / Swift 6 command-line toolchain. Vision OCR
+is linked directly; generation and transcription are bundled in
+`lib/libantfly-apple.dylib`, whose minimum macOS version is 26. The CLI and
+`libantfly` can retain an older deployment target, for example:
+
+```bash
+zig build antfly capi -Dapple-providers=true -Dtarget=aarch64-macos.15.0
+```
+
+Antfly checks the running OS before loading the sidecar. On macOS below 26,
+generation and transcription return `AppleIntelligenceProviderUnavailable`;
+OCR remains independent. Older/ineligible hardware on newer macOS is checked
+by the native APIs. The current validation host is macOS 27.0.1 / Apple M4 Max;
+a build with a macOS 15 deployment target does not itself establish that it
+launches correctly on an actual macOS 15 machine.
+
+The flag defaults to false. Disabled and Linux builds do not compile the loader
+or Swift sidecar. Metal inference is independent; add `-Dmetal=false` to disable
+Metal for Antfly's other inference providers.
+
+### Library loading and installation
+
+The Swift library is opened once, on the first generation/transcription call,
+with local symbol scope and an ABI version check. The handle and entry point
+remain cached for the process lifetime. Model readiness is checked separately
+on every generation request, so setup or an OS model update can recover without
+reloading the library. Failed library loads are cached; install or replace a
+missing/incompatible bridge and restart Antfly.
+
+Both `antfly` and `capi` build steps install the sidecar. Keep it beside
+`libantfly` in `lib/`; the CLI also finds it in its installation's `lib/` directory
+whether the executable is in `bin/` or at the archive root. Discovery uses the
+actual executable/shared-library location, including symlink resolution, and
+never searches the current directory or `PATH`.
+
+For a custom Lite layout, explicitly set `ANTFLY_APPLE_BRIDGE_PATH` to an
+absolute trusted library path before starting the host. An invalid override
+fails instead of falling through to other paths. Missing/unloadable and ABI
+incompatible libraries return `AppleNativeBridgeUnavailable` and
+`AppleNativeBridgeIncompatible`, respectively. Swift optimization follows `-Doptimize` (`-O` for release safe/fast, `-Osize`
+for release small). The build gives the dylib an ad-hoc signature; distribution signing should include this file whenever the
+CLI or Lite package is signed.
+
+## Generate text
+
+Use this generator configuration in the existing generation endpoints or a
+generator enrichment:
+
+```json
+{"provider": "apple", "max_tokens": 256, "temperature": 0.2}
+```
+
+Apple generation does not accept `model`; macOS selects its system model. Each
+request creates a fresh on-device session. System instructions and alternating
+user/assistant text history preserve their roles. Tools, image/audio attachments, remote endpoints,
+API keys, HTTP rate limits, and other sampling options are rejected.
+
+Availability is checked on every call. `AppleModelNotReady` means macOS has not
+made its local model available; `AppleIntelligenceDisabled` and
+`AppleIntelligenceProviderUnavailable` identify distinct states. On macOS 27,
+Apple's settings are under **Siri**. No model download, cloud fallback, or settings
+change is performed by a generation request. Context overflow and refusal are
+explicit errors; output is bounded rather than silently truncated.
+
+## Transcribe recordings
+
+Use this transcriber configuration in a transcriber enrichment:
+
+```json
+{
+  "provider": "apple",
+  "language_code": "en-US",
+  "timestamps": true,
+  "download_assets": false
+}
+```
+
+Apple transcription does not accept `model`. The locale defaults to `en-US` and
+must be supported by the installed SpeechTranscriber runtime. Installed assets
+are used without a setup download. Set `download_assets: true` explicitly to allow Apple's asset installer
+when a requested locale is missing. Unsupported locales and missing assets have
+distinct errors. Diarization and live transcription are not supported.
+
+Audio URLs use Antfly's bounded downloader, including inline data URIs, HTTP(S),
+and S3 credentials supplied with the request. The default download limit is
+128 MiB, which is also the adapter's maximum. Recordings must be readable by
+AVAudioFile and no longer than one hour. A unique temporary recording is removed
+when analysis ends. Responses contain final text, phrase segments, and word
+time ranges when requested; no confidence or speaker IDs are fabricated.
+
+Generation and speech share one active native invocation per process. Competing
+calls receive retryable `AppleNativeBusy`; batches execute serially. Each call
+reserves a 512 MiB native workspace allowance; transcription also reserves its
+bounded recording download. These are scheduling allowances, not hard limits on
+Apple's model memory. Cancellation and deadlines are cooperative and retain all
+borrowed buffers until the native task actually finishes.
+
+## Configure an image reader
+
+Use this producer on an asset enrichment whose field contains a PNG or JPEG URL:
+
+```json
+{
+  "type": "reader",
+  "config": {
+    "provider": "apple",
+    "recognition_languages": ["en-US"],
+    "recognition_level": "accurate",
+    "uses_language_correction": false
+  }
+}
+```
+
+Apple OCR does not accept `model`; it uses Vision text recognition. Language tags
+must be supported by the installed Vision runtime. `recognition_level` accepts
+`accurate` or `fast`. The defaults are accurate recognition, English, and no
+language correction. HTTP(S) and inline `data:image/...;base64,...` inputs use
+bounded downloads with private IP blocking. Local file URLs are blocked by the
+reader's default content security policy.
+
+Plain-text output contains recognized lines. For `content_type:
+"application/json"`, the reader returns its normal result array, including
+`regions_json`: a serialized array of text, confidence, bounding boxes, and
+`coordinate_space: "image_pixels_top_left"`.
+
+## Index scanned PDFs
+
+Use a document extraction producer to render PDF pages and feed their pixels
+directly to Vision. The PDF pipeline maps OCR boxes to page coordinates and
+retains text spans for grounding. This example creates an index over OCR chunks:
+
+```json
+{
+  "num_shards": 1,
+  "indexes": {
+    "document_text": {
+      "type": "full_text",
+      "field": "text",
+      "artifact_name": "document_chunks",
+      "enrichments": [
+        {
+          "name": "document_units",
+          "kind": "asset",
+          "field": "document_url",
+          "content_type": "application/json",
+          "producer": {
+            "type": "document_extraction",
+            "config": {
+              "ocr": {
+                "enabled": true,
+                "executor": "reader",
+                "mode": "always",
+                "render_dpi": 150,
+                "prompt_policy": "plain",
+                "config": {
+                  "provider": "apple",
+                  "recognition_languages": ["en-US"]
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "document_chunks",
+          "kind": "chunk",
+          "field": "text",
+          "source_artifact_name": "document_units",
+          "chunk_size": 256,
+          "full_text_index": true
+        }
+      ]
+    }
+  }
+}
+```
+
+Send that body to `POST /db/v1/tables/documents`, then write documents whose
+`document_url` points to a PDF. An inline `data:application/pdf;base64,...` URL
+can carry a local PDF. `mode: "always"` forces OCR; use `auto` to retain the
+document pipeline's text-quality fallback behavior. An Apple reader implicitly
+selects the plain prompt policy when none is specified.
+
+## Limits and verification
+
+OCR accepts empty prompts or the compatibility marker `<OCR>`; arbitrary
+instructions and `max_tokens` are rejected. It recognizes text without table or
+multi-column reconstruction. Image batches execute serially, preserve order and
+page identity, and report serial execution. One native invocation runs at a time
+per process; competing invocations receive the retryable `AppleOcrBusy` error.
+
+Input limits are 16 Mi pixels per image, 64 Mi pixels per batch, eight images,
+64 MiB of encoded media, and 256 MiB of raw raster data. Output defaults to an
+8 MiB total response limit and fails instead of truncating. Cancellation and
+deadlines are cooperative; resources remain retained until Vision returns.
+
+Each invocation reserves a 384 MiB native workspace allowance in addition to
+Antfly buffers. This is scheduling admission, not a hard cap on OS model memory.
+Production document budgets now scale from 256 MiB to 1 GiB with host memory;
+small process envelopes can reject work with `DocumentExtractionWorkingSetTooLarge`.
+
+```bash
+zig build apple-bridge-loader-test lib-readers-test lib-generating-test lib-transcribing-test \
+  antfly-apple-provider-test apple-pdf-ocr-test \
+  -Dapple-providers=true -Dmetal=false -j2
+zig build lib-readers-check lib-generating-check lib-transcribing-check \
+  -Dtarget=x86_64-linux-gnu -Dmetal=false
+```
+
+The native tests recognize a generated invoice image through encoded, borrowed
+RGBA, and inline data URI paths. The scanned PDF qualification uses real Vision
+OCR and checks exact text, page bounds, and grounding spans. They require access
+to macOS Vision services; restrictive process sandboxes may prevent recognition.
+The cross-build check verifies that disabled Linux readers compile without Apple
+frameworks. `scripts/apple-provider-probe.swift` also provides an independent
+Vision smoke test and can regenerate the image fixture with `--write-fixture`.
+
+The speech fixture checks exact text and phrase/word timestamps. Generation tests
+exercise configuration, cancellation, and the model's readiness error; when the
+model is available they also check real output and its byte limit. On the macOS 27 test machine, Foundation Models initially reported
+`modelNotReady`, then became available. Real generation, role-preserving history
+recall, and output-limit enforcement passed once the OS model was ready. The standalone C driver
+`scripts/apple-intelligence-probe.c` can query availability or exercise the same
+Swift C ABI independently of Antfly.
+
+To probe the installed Lite library from a separate C host, run from the repository
+root after building `capi`:
+
+```bash
+xcrun clang -DANTFLY_APPLE_HOSTED_PROBE scripts/apple-intelligence-probe.c \
+  -o /tmp/antfly-apple-hosted-probe
+ANTFLY_APPLE_HOST_LIBRARY="$PWD/zig/zig-out/lib/libantfly.dylib" \
+  /tmp/antfly-apple-hosted-probe
+```
+
+The default operation reports generation and speech availability. This exercises
+sidecar discovery from `libantfly`, independently of the probe executable's
+location. The same host probe has been qualified with real generation and file
+transcription on macOS 27.

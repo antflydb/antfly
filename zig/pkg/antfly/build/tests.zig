@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -36,15 +37,16 @@ pub const addFilteredTestRunArtifact = @import("../../../build_support/antfly/te
 pub const addCuratedTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact;
 pub const expectQuietSuccess = @import("../../../build_support/antfly/test_support.zig").expectQuietSuccess;
 pub const release_scale_test_filters = @import("../../../build_support/antfly/test_support.zig").release_scale_test_filters;
-const addSnowballModule = @import("../../antfly-embedded/build/snowball.zig").addSnowballModule;
-const makeLmdbBuildOptions = @import("../../antfly-embedded/build/storage.zig").makeLmdbBuildOptions;
-const makeLmdbEngineModule = @import("../../antfly-embedded/build/storage.zig").makeLmdbEngineModule;
-const makeLmdbModule = @import("../../antfly-embedded/build/storage.zig").makeLmdbModule;
+const addSnowballModule = @import("../../../build_support/embedded/snowball.zig").addSnowballModule;
+const makeLmdbBuildOptions = @import("../../../build_support/embedded/storage.zig").makeLmdbBuildOptions;
+const makeLmdbEngineModule = @import("../../../build_support/embedded/storage.zig").makeLmdbEngineModule;
+const makeLmdbModule = @import("../../../build_support/embedded/storage.zig").makeLmdbModule;
 
 const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
-const LmdbBackend = @import("../../antfly-embedded/build/storage.zig").LmdbBackend;
+const LmdbBackend = @import("../../../build_support/embedded/storage.zig").LmdbBackend;
 
 pub const AddTestsOptions = struct {
+    apple_bridge: ?std.Build.LazyPath = null,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
     optimize: std.lang.Optimize,
@@ -141,6 +143,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const apple_provider_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
+    });
+    const apple_provider_test_step = b.step("antfly-apple-provider-test", "Run Apple OCR provider and PDF integration tests");
+    const run_apple_provider_tests = b.addRunArtifact(apple_provider_tests);
+    @import("../../../lib/apple_native/build_support.zig").configureTest(b, run_apple_provider_tests, options.apple_bridge);
+    apple_provider_test_step.dependOn(&run_apple_provider_tests.step);
+    const apple_local_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/local/apple_provider_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, apple_local_test_mod, true, true);
+    const apple_local_tests = b.addTest(.{
+        .root_module = apple_local_test_mod,
+        .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
+    });
+    const run_apple_local_tests = b.addRunArtifact(apple_local_tests);
+    @import("../../../lib/apple_native/build_support.zig").configureTest(b, run_apple_local_tests, options.apple_bridge);
+    apple_provider_test_step.dependOn(&run_apple_local_tests.step);
     // The audit embeds library sources outside the Antfly package boundary.
     antfly_test_mod.addAnonymousImport("lmdb_vopr_source", .{
         .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
@@ -349,7 +372,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configureConsumer(b, data_consumer_module);
     // Control-plane session/lease stores also support the legacy engine. This
     // does not expose the physical DB owner to the consumer compilation unit.
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, data_consumer_module, lmdb_engine_mod, true);
     data_consumer_module.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     data_consumer_module.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     // HA replication test fixtures in data/runtime.zig construct a real
@@ -662,6 +685,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = generating_test_mod,
         .filters = &.{
+            "chatgpt",
             "generating backend",
             "generating backend factory executes fallback chain across providers",
             "asset producer runtime",
@@ -1018,6 +1042,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_client_pkg_mod,
         .filters = &.{
             "antfly client pkg compiles",
+            "personal connections",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",
@@ -1673,6 +1698,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "ChatGPT connector policy",
         "storage-kernel query request preserves final projection while raw retrieval defers it",
         "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
@@ -7076,7 +7102,7 @@ pub fn createPdfIntegration(b: *std.Build, options: struct {
     fixture: std.Build.LazyPath,
     imports: AntflyRootImports,
     optimize: std.lang.Optimize,
-}) struct { run: *std.Build.Step.Run, qualification: *std.Build.Step.Run } {
+}) struct { run: *std.Build.Step.Run, qualification: *std.Build.Step.Run, apple: *std.Build.Step.Run } {
     const target = options.imports.platform_target;
     const module = b.createModule(.{
         .root_source_file = options.root.path(b, "src/pdf_ocr_integration.zig"),
@@ -7093,7 +7119,9 @@ pub fn createPdfIntegration(b: *std.Build, options: struct {
     const run = b.addRunArtifact(executable);
     const qualification = b.addRunArtifact(executable);
     qualification.addArg("--qualify-real");
-    return .{ .run = run, .qualification = qualification };
+    const apple = b.addRunArtifact(executable);
+    apple.addArg("--qualify-apple");
+    return .{ .run = run, .qualification = qualification, .apple = apple };
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

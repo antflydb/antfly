@@ -17,7 +17,7 @@ panels, and embedding metadata resolution avoids unnecessary tokenizer JSON
 parsing. New BF16 vector loads and gate/up/SiLU fusion default only to the
 measured base Apple M4 shapes; other devices and shapes remain explicit-only.
 
-> **Relocated:** The dated ReleaseFast/ReleaseSafe measurement campaigns, pass counts, and validation-limit tallies that previously lived here (122 lines, 2026-09-08 and earlier) are preserved verbatim in [work-log/completed/inference/qwen-performance-evidence.md](../../../../../work-log/completed/inference/qwen/performance-evidence.md). Durable decisions from it are in Resource and correctness checks in this document.
+> **Relocated:** The dated ReleaseFast/ReleaseSafe measurement campaigns, pass counts, and validation-limit tallies that previously lived here (122 lines, 2026-09-08 and earlier) are preserved verbatim in [docs/design/inference/history/qwen/performance-evidence.md](../../../../../docs/design/inference/history/qwen/performance-evidence.md). Durable decisions from it are in Resource and correctness checks in this document.
 
 ## Reproduce endpoint measurements
 
@@ -118,5 +118,5 @@ other devices and shapes stay explicit-only until they clear the same gate.
 > **Relocated:** The evidence-artifact ledger (local report paths, evidence
 > archives, and executable/model SHA-256 digests) that previously lived here
 > (76 lines) is preserved verbatim in
-> [work-log/completed/inference/qwen-performance-evidence.md](../../../../../work-log/completed/inference/qwen/performance-evidence.md).
+> [docs/design/inference/history/qwen/performance-evidence.md](../../../../../docs/design/inference/history/qwen/performance-evidence.md).
 > Durable decisions from it are in Performance promotion gate in this document.

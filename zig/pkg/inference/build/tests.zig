@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -58,17 +59,22 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_extraction_openapi", ctx.graph.extraction_openapi_mod);
     tests.root_module.addImport("antfly_extracting", ctx.graph.extracting_mod);
     // Direct reader API tests share the runtime's request and result types.
-    const readers_mod = b.createModule(.{
-        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
-        .target = ctx.target,
-        .optimize = ctx.optimize,
-    });
-    readers_mod.addImport("httpx", ctx.graph.httpx_mod);
-    readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
-    readers_mod.addImport("antfly_google", ctx.graph.google_mod);
-    readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
-    readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
-    readers_mod.addImport("antfly_image", ctx.graph.image_mod);
+    // Reuse the root owner so native reader options, imports, and framework
+    // linkage stay consistent with the runtime under test.
+    const readers_mod = ctx.graph.inference_mod.import_table.get("antfly_readers") orelse blk: {
+        const standalone_readers_mod = b.createModule(.{
+            .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/readers/src/mod.zig" })),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        });
+        standalone_readers_mod.addImport("httpx", ctx.graph.httpx_mod);
+        standalone_readers_mod.addImport("inference_api", ctx.graph.inference_api_mod);
+        standalone_readers_mod.addImport("antfly_google", ctx.graph.google_mod);
+        standalone_readers_mod.addImport("antfly_reader_config", ctx.graph.reader_config_mod);
+        standalone_readers_mod.addImport("antfly_scraping", ctx.graph.scraping_mod);
+        standalone_readers_mod.addImport("antfly_image", ctx.graph.image_mod);
+        break :blk standalone_readers_mod;
+    };
     tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
@@ -241,8 +247,8 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     const b = ctx.b;
     const no_error_tracing = b.option(bool, "gliner25-fuzz-no-error-tracing", "Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)") orelse false;
     // Keep the standard test runner for deterministic corpus and --fuzz runs.
-    // Reuse the runtime graph's platform module. A second instance gives Zig
-    // two owners for transitive tokenizer sources imported by this test.
+    // Reuse the runtime graph's platform module so tokenizer sources have one
+    // module owner even when this test imports them through multiple paths.
     const platform = ctx.graph.platform_mod;
     const ml = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/ml/src/root.zig" })),
