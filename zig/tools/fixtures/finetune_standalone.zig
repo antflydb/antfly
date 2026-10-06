@@ -35,8 +35,14 @@ pub fn build(b: *std.Build) void {
         if (run.argv.items[0].artifact.artifact != executable)
             @panic("focused finetuning target recompiles the shared executable");
         const filters = if (spec.focused_filters.len != 0) spec.focused_filters else &.{b.fmt("{s}.test", .{std.fs.path.stem(spec.root_source_file)})};
-        if (run.argv.items.len != 1 + 2 * filters.len)
+        if (run.argv.items.len < 1 + 2 * filters.len)
             @panic("focused finetuning target lost its runtime selection");
+        for (run.argv.items[1 + 2 * filters.len ..]) |arg| {
+            if (arg == .passthru) continue;
+            if (arg != .bytes or (!std.mem.eql(u8, arg.bytes, "--allow-empty-test-filter") and
+                !std.mem.eql(u8, arg.bytes, "--allow-empty-owner")))
+                std.debug.panic("{s}: unexpected runtime argument {any}", .{ spec.step_name, arg });
+        }
         for (filters, 0..) |filter, index| {
             if (!std.mem.eql(u8, run.argv.items[1 + 2 * index].bytes, "--test-filter") or
                 !std.mem.eql(u8, run.argv.items[2 + 2 * index].bytes, filter))

@@ -123,11 +123,11 @@ fn linuxHwcap() usize {
     // libc owns auxv initialization for C-hosted executables and shared libs.
     // Zig owns it for libc-free executables. A libc-free library without a
     // startup-provided auxv simply stays portable.
-    if (builtin.link_libc) return std.c.getauxval(std.elf.AT_HWCAP);
+    if (builtin.link_libc) return std.c.getauxval(std.elf.AT.HWCAP);
     const auxv = std.os.linux.elf_aux_maybe orelse return 0;
     var index: usize = 0;
-    while (auxv[index].a_type != std.elf.AT_NULL) : (index += 1) {
-        if (auxv[index].a_type == std.elf.AT_HWCAP) return auxv[index].a_un.a_val;
+    while (auxv[index].a_type != std.elf.AT.NULL) : (index += 1) {
+        if (auxv[index].a_type == std.elf.AT.HWCAP) return auxv[index].a_un.a_val;
     }
     return 0;
 }

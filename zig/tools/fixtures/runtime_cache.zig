@@ -273,9 +273,10 @@ pub fn build(b: *std.Build) void {
     // Pointer-keyed step traversal must not change the shared generated source
     // directory when an input is removed and restored. Stable paths are part
     // of the cache contract for every runtime archive in this fixture.
-    std.mem.sort(std.Build.Step.WriteFile.File, sources.files.items, {}, struct {
-        fn lessThan(_: void, a: std.Build.Step.WriteFile.File, c: std.Build.Step.WriteFile.File) bool {
-            return std.mem.lessThan(u8, a.sub_path, c.sub_path);
+    const configuration: *const std.Build.Configuration.Wip = &b.graph.wip_configuration;
+    std.mem.sort(std.Build.Step.WriteFile.Embed, sources.embeds.items, configuration, struct {
+        fn lessThan(config: *const std.Build.Configuration.Wip, a: std.Build.Step.WriteFile.Embed, c: std.Build.Step.WriteFile.Embed) bool {
+            return std.mem.lessThan(u8, config.stringSlice(a.sub_path), config.stringSlice(c.sub_path));
         }
     }.lessThan);
 }
