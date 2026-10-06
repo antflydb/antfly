@@ -15,6 +15,7 @@
 // Model registry: discovers local models and downloads from HuggingFace Hub.
 
 const std = @import("std");
+const ascii_compat = @import("../util/ascii_compat.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
 const build_options = @import("build_options");
@@ -667,8 +668,8 @@ pub const ModelRegistry = struct {
     ) !?[]const u8 {
         const suffix = "-gguf";
         if (!std.mem.endsWith(u8, ref.name, suffix)) return null;
-        if (std.ascii.indexOfIgnoreCase(ref.name, "gemma-4-") == null) return null;
-        if (std.ascii.indexOfIgnoreCase(ref.name, "-qat-") == null) return null;
+        if (ascii_compat.indexOfIgnoreCase(ref.name, "gemma-4-") == null) return null;
+        if (ascii_compat.indexOfIgnoreCase(ref.name, "-qat-") == null) return null;
         return try std.fmt.allocPrint(
             allocator,
             "{s}/{s}-unquantized-assistant",

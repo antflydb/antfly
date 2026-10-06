@@ -15,7 +15,7 @@
 const std = @import("std");
 const casbin = @import("antfly_casbin");
 const storage = @import("usermgr_storage");
-const user_manager = @import("user_manager.zig");
+const user_manager = @import("antfly_local_sources").usermgr_user_manager;
 
 const Allocator = std.mem.Allocator;
 const backend_erased = storage.backend_erased;
@@ -103,7 +103,7 @@ pub const StorageUserStore = struct {
                 error.NotFound => null,
                 else => return err,
             };
-            var instance_id: [16]u8 = .{0} ** 16;
+            var instance_id: [16]u8 = @splat(0);
             if (instance_bytes) |bytes| {
                 if (bytes.len != instance_id.len) return error.InvalidUserIdentity;
                 @memcpy(&instance_id, bytes);
@@ -137,7 +137,7 @@ pub const StorageUserStore = struct {
         try txn.commit();
     }
 
-    fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
+    pub fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
         const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginWrite();
         errdefer txn.abort();
@@ -209,7 +209,7 @@ pub const StorageUserStore = struct {
         try txn.commit();
     }
 
-    fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
+    pub fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
         const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginWrite();
         errdefer txn.abort();
@@ -251,7 +251,7 @@ const OwnedPortableSeedEntry = struct {
     key_base64: []u8,
     value_base64: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.namespace);
         alloc.free(self.key_base64);
         alloc.free(self.value_base64);

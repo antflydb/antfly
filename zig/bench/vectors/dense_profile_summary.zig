@@ -95,7 +95,7 @@ const FieldStats = struct {
     values: std.ArrayListUnmanaged(u64) = .empty,
     total: u128 = 0,
 
-    fn deinit(self: *FieldStats, alloc: Allocator) void {
+    pub fn deinit(self: *FieldStats, alloc: Allocator) void {
         self.values.deinit(alloc);
         self.* = undefined;
     }
@@ -150,14 +150,14 @@ const FileSummary = struct {
     ingest_summary: ?IngestSummaryRow = null,
     stats: []FieldStats,
 
-    fn deinit(self: *FileSummary, alloc: Allocator) void {
+    pub fn deinit(self: *FileSummary, alloc: Allocator) void {
         for (self.stats) |*stat| stat.deinit(alloc);
         alloc.free(self.stats);
     }
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa_state.deinit();
     const alloc = gpa_state.allocator();
 

@@ -22,7 +22,7 @@ ZIG_GLOBAL_CACHE_DIR="${RESOURCE_CACHE_MATRIX_ZIG_GLOBAL_CACHE_DIR:-$ZIG_ROOT/.z
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="${RESOURCE_CACHE_MATRIX_OUT:-$ZIG_ROOT/bench/results/resource-manager-cache-matrix/$STAMP}"
 SMOKE="${RESOURCE_CACHE_MATRIX_SMOKE:-0}"
-OPTIMIZE="${RESOURCE_CACHE_MATRIX_OPTIMIZE:-ReleaseFast}"
+OPTIMIZE="${RESOURCE_CACHE_MATRIX_OPTIMIZE:-fast}"
 RESUME="${RESOURCE_CACHE_MATRIX_RESUME:-0}"
 
 if [[ "$SMOKE" == "1" ]]; then
@@ -182,9 +182,8 @@ run_case() {
 }
 
 if [[ "$RUN_BUILD" == "1" ]]; then
-  (cd "$ZIG_ROOT" && zig build \
+  (cd "$ZIG_ROOT" && ZIG_GLOBAL_CACHE_DIR="$ZIG_GLOBAL_CACHE_DIR" zig build \
     --cache-dir "$ZIG_CACHE_DIR" \
-    --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
     -Doptimize="$OPTIMIZE" \
     -Dapi-bench-standalone=true \
     antfly antfly-api-bench release-blocker-regression-test)

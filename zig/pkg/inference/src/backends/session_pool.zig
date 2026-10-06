@@ -157,7 +157,7 @@ test "pool acquire release" {
         fn load(_: *anyopaque, _: []const u8) !SessionPool.OwnedSession {
             return error.FileNotFound;
         }
-        fn deinit(_: *anyopaque) void {}
+        pub fn deinit(_: *anyopaque) void {}
     };
     var context: u8 = 0;
     const input_path = try allocator.dupe(u8, "/nonexistent");

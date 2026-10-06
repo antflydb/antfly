@@ -16,10 +16,10 @@
 //! routing resolves a qualified name with point reads. Derived indexes are rebuilt
 //! from authoritative records at projection initialization and snapshot install.
 const std = @import("std");
-const docstore = @import("../storage/docstore.zig");
-const domain = @import("domain.zig");
-const settings = @import("settings.zig");
-const policies = @import("policies.zig");
+const docstore = @import("antfly_local_sources").storage_docstore;
+const domain = @import("antfly_local_sources").system_catalog_domain;
+const settings = @import("antfly_local_sources").system_catalog_settings;
+const policies = @import("antfly_local_sources").system_catalog_policies;
 
 pub const Meta = domain.Meta;
 
@@ -200,11 +200,11 @@ pub fn loadPolicyPublication(alloc: std.mem.Allocator, txn: *docstore.DocStore.T
     return parsed;
 }
 
-pub fn loadPolicyPublicationStamp(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !policies.PublicationStamp {
+pub fn loadPolicyPublicationStamp(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !?policies.PublicationStamp {
     const key = try policyPublicationStampKeyAlloc(alloc, group_id, table_id);
     defer alloc.free(key);
     const bytes = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return error.RowPolicyCatalogChanged,
+        error.NotFound => return null,
         else => return err,
     };
     var parsed = try std.json.parseFromSlice(policies.PublicationStamp, alloc, bytes, .{});

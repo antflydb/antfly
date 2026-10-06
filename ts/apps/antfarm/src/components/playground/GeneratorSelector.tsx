@@ -28,6 +28,7 @@ export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, stri
 
 export const GENERATOR_PROVIDER_LABELS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "Antfly (Local)",
+  apple: "Apple (On Device)",
   ollama: "Ollama (Local)",
   gemini: "Google AI (Gemini)",
   openai: "OpenAI",
@@ -45,6 +46,7 @@ export const GENERATOR_DEFAULT_CONFIG: GeneratorConfig = {
 
 /** Providers shown in the query-builder generator selectors. */
 export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
+  "apple",
   "gemini",
   "vertex",
   "openai",
@@ -54,9 +56,10 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
 ];
 
 export function formatGeneratorSummary(
-  config: Pick<GeneratorConfig, "provider" | "model"> | null | undefined,
+  config: { provider: string; model?: string } | null | undefined,
   defaultLabel = "Server default"
 ): string {
+  if (config?.provider === "apple") return GENERATOR_PROVIDER_LABELS.apple!;
   if (!config?.provider || !config?.model) {
     return defaultLabel;
   }
@@ -188,10 +191,21 @@ export function GeneratorSelector({
       return;
     }
     const liveDefault = liveGenerators[nextProvider]?.[0];
+    if (nextProvider === "apple") {
+      onChange({
+        provider: "apple",
+        max_tokens: value.max_tokens ?? 256,
+        ...(value.temperature !== undefined && { temperature: value.temperature }),
+      });
+      return;
+    }
     onChange({
       ...value,
       provider: nextProvider,
-      model: liveDefault || GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
+      model:
+        liveDefault ||
+        GENERATOR_PROVIDER_DEFAULTS[nextProvider] ||
+        ("model" in value ? value.model : undefined),
     } as GeneratorConfig);
   };
 
@@ -255,7 +269,9 @@ export function GeneratorSelector({
         <div
           className={cn(
             "grid gap-4",
-            showTemperature ? "grid-cols-1 lg:grid-cols-3" : "grid-cols-1 lg:grid-cols-2"
+            showTemperature && value.provider !== "apple"
+              ? "grid-cols-1 lg:grid-cols-3"
+              : "grid-cols-1 lg:grid-cols-2"
           )}
         >
           <div className="space-y-2">
@@ -299,18 +315,20 @@ export function GeneratorSelector({
               </Select>
             </div>
           )}
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Model</Label>
-            <Combobox
-              options={modelOptions}
-              value={value.model}
-              onChange={(model) => onChange({ ...value, model })}
-              placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
-              searchPlaceholder="Search or type a model..."
-              emptyText="Type a model name."
-              allowCustomValue={value.provider !== "chatgpt"}
-            />
-          </div>
+          {value.provider !== "apple" && (
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">Model</Label>
+              <Combobox
+                options={modelOptions}
+                value={"model" in value ? value.model : undefined}
+                onChange={(model) => onChange({ ...value, model })}
+                placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
+                searchPlaceholder="Search or type a model..."
+                emptyText="Type a model name."
+                allowCustomValue={value.provider !== "chatgpt"}
+              />
+            </div>
+          )}
           {showTemperature && value.provider !== "chatgpt" && (
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">Temperature</Label>

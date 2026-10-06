@@ -98,7 +98,7 @@ test "fixture consumer" {
         return output
 
     def assert_compile(self, output, kind, name, state):
-        self.assertRegex(output, rf"compile {kind} fixture-{name} Debug \S+ {state}")
+        self.assertRegex(output, rf"compile {kind} fixture-{name} debug \S+ {state}")
 
     def test_cache_and_linked_behavior(self):
         self.assertIn("provider-value=42", self.build("test"))

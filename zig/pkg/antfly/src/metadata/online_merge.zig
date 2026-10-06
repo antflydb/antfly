@@ -17,17 +17,17 @@
 //! An effect and the metadata CAS deliberately are separate steps: after an
 //! ambiguous response/restart the same immutable attempt is observed again.
 const std = @import("std");
-const source = @import("../storage/db/online_source_contract.zig");
-const snapshot = @import("../storage/source_snapshot.zig");
-const page = @import("../storage/db/merge_page_contract.zig");
+const source = @import("antfly_local_sources").storage_db_online_source_contract;
+const snapshot = @import("antfly_local_sources").storage_source_snapshot;
+const page = @import("antfly_local_sources").storage_db_merge_page_contract;
 
 pub const Phase = enum { admit, publish, snapshot, tail, freeze, final_tail, cutover, release, complete, cancel_receiver, cancel_release, cancelled };
 pub const State = struct {
     version: u8 = 1,
     revision: u64 = 1,
     scope: source.Scope,
-    artifact_catalog: ?@import("../storage/db/artifact_inventory.zig").Binding = null,
-    receiver_artifact_catalog: ?@import("../storage/db/artifact_inventory.zig").Binding = null,
+    artifact_catalog: ?@import("antfly_local_sources").storage_db_artifact_inventory.Binding = null,
+    receiver_artifact_catalog: ?@import("antfly_local_sources").storage_db_artifact_inventory.Binding = null,
     phase: Phase = .admit,
     certificate: ?snapshot.Certificate = null,
     acknowledged: u64 = 0,
@@ -95,7 +95,7 @@ pub fn updateAllowed(previous: State, next: State) bool {
     if (previous.final_applied_index != 0 and (next.final_applied_index != previous.final_applied_index or next.final_sequence != previous.final_sequence or
         !std.mem.eql(u8, &next.final_cut_digest, &previous.final_cut_digest))) return false;
     if (next.phase == previous.phase) return (previous.phase == .tail or previous.phase == .final_tail) and next.acknowledged > previous.acknowledged;
-    if (next.phase == .cancel_receiver) return @intFromEnum(previous.phase) < @intFromEnum(Phase.cutover);
+    if (next.phase == .cancel_receiver) return @backingInt(previous.phase) < @backingInt(Phase.cutover);
     const successor: Phase = switch (previous.phase) {
         .admit => .publish,
         .publish => .snapshot,
@@ -141,7 +141,7 @@ pub const Capabilities = struct {
     receiver_receipts: bool = false,
     transactional_headroom: bool = false,
     pub fn require(self: Capabilities) !void {
-        inline for (std.meta.fields(Capabilities)) |field| if (!@field(self, field.name)) return error.OnlineMergeUnavailable;
+        inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| if (!@field(self, reflected_name)) return error.OnlineMergeUnavailable;
     }
 };
 
@@ -151,7 +151,7 @@ pub const Observation = struct {
     /// Adapter-owned immutable context, valid until release_observation.
     execution_context: ?*const anyopaque = null,
     scope: source.Scope,
-    source_progress: ?@import("../storage/db/online_source.zig").Progress = null,
+    source_progress: ?@import("antfly_local_sources").storage_db_online_source.Progress = null,
     certificate: ?snapshot.Certificate = null,
     receiver: ?page.Progress = null,
     retained_head: u64 = 0,
@@ -223,7 +223,7 @@ pub fn decide(current: State, observation: Observation, cancel: bool) !Decision 
     // durably cancel, clean the exact legacy tuple, and revoke the new scope.
     if (current.phase == .admit and observation.ordinary_conflict) return advance(current, .cancel_receiver);
     // Once cutover might have been submitted, cancellation is no longer safe.
-    if (cancel and @intFromEnum(current.phase) < @intFromEnum(Phase.cutover)) return advance(current, .cancel_receiver);
+    if (cancel and @backingInt(current.phase) < @backingInt(Phase.cutover)) return advance(current, .cancel_receiver);
     const progress = observation.source_progress;
     switch (current.phase) {
         .admit => {
@@ -350,7 +350,7 @@ pub const Driver = struct {
             .execute => |action| {
                 self.execute(self.ptr, current, action, &observation) catch |err| {
                     if ((err != error.OnlineMergeArtifactCatalogUncoordinated and err != error.OnlineMergeArtifactCatalogChanged) or
-                        @intFromEnum(current.phase) >= @intFromEnum(Phase.cutover)) return err;
+                        @backingInt(current.phase) >= @backingInt(Phase.cutover)) return err;
                     // A pre-gate attempt may have committed metadata before
                     // distributed admission was disabled. A rejected new pin
                     // or receiver checkpoint is definitively not proposed;
@@ -396,7 +396,7 @@ fn testReceipt(state: State) !page.Progress {
 }
 
 test "metadata transition driver online reclaims acknowledged frames before healthy tail consumes quota" {
-    var retained: @import("../storage/retained_effects.zig").State = .{ .latest = 30, .reclaimed = 11 };
+    var retained: @import("antfly_local_sources").storage_retained_effects.State = .{ .latest = 30, .reclaimed = 11 };
     retained.consumers[0] = .{ .epoch = 1, .acknowledged = 20 };
     retained.consumers[1] = .{ .epoch = 2, .acknowledged = 15 };
     try std.testing.expectEqual(@as(u64, 15), retained.reclaimableThrough());
@@ -569,7 +569,7 @@ test "metadata transition driver online observation lives through ambiguous effe
     };
     var fake: Fake = .{};
     var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas, .release_observation = Fake.release };
-    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
     const initial = testState();
     try std.testing.expectError(error.TestLostReply, driver.step(initial, false));
     try std.testing.expectEqual(@as(usize, 1), fake.releases);
@@ -601,7 +601,7 @@ test "distributed online admission barrier durably cancels a pre-gate attempt" {
     const initial = testState();
     var fake: Fake = .{ .durable = initial };
     var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas };
-    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
     const next = try driver.step(initial, false);
     try std.testing.expectEqual(Phase.cancel_receiver, next.phase);
     try std.testing.expect(fake.durable.eql(next));
@@ -635,7 +635,7 @@ test "metadata ordered artifact inventory drift durably cancels before effects a
     const state = testState();
     var fake: Fake = .{ .durable = state };
     var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas, .current_state = Fake.current };
-    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
     const cancelled = try driver.step(state, false);
     try std.testing.expectEqual(Phase.cancel_receiver, cancelled.phase);
     // A controller restarting from its stale local state observes the durable
@@ -682,7 +682,7 @@ test "metadata transition driver online bounded effect retries survive lost meta
     var driver: Driver = .{ .ptr = &fake, .capabilities = .{}, .observe = Fake.observe, .execute = Fake.execute, .compare_and_set = Fake.cas };
     try std.testing.expectError(error.OnlineMergeUnavailable, driver.step(initial, false));
     try std.testing.expectEqual(@as(usize, 0), fake.observations);
-    inline for (std.meta.fields(Capabilities)) |field| @field(driver.capabilities, field.name) = true;
+    inline for (comptime std.meta.fieldNames(Capabilities)) |reflected_name| @field(driver.capabilities, reflected_name) = true;
     try std.testing.expect(initial.eql(try driver.step(initial, false)));
     try std.testing.expectEqual(@as(usize, 1), fake.effects);
     try std.testing.expectError(error.TestLostReply, driver.step(initial, false));
@@ -854,9 +854,9 @@ test "metadata transition driver online reconstructs every forward phase after e
     const initial = testState();
     var harness: Harness = .{ .durable = initial, .endpoint = .{ .scope = initial.scope } };
     var controller = initial;
-    var visited = [_]bool{false} ** std.meta.fields(Phase).len;
+    var visited = @as([@typeInfo(Phase).@"enum".field_names.len]bool, @splat(false));
     for (0..128) |_| {
-        visited[@intFromEnum(controller.phase)] = true;
+        visited[@backingInt(controller.phase)] = true;
         if (controller.terminal()) break;
         const prior = harness.effects + harness.cas_count;
         // Reconstruct the adapter for every retry; only endpoint/metadata
@@ -869,7 +869,7 @@ test "metadata transition driver online reconstructs every forward phase after e
         try std.testing.expect(std.meta.eql(initial.scope, controller.scope));
     }
     try std.testing.expectEqual(Phase.complete, controller.phase);
-    for ([_]Phase{ .admit, .publish, .snapshot, .tail, .freeze, .final_tail, .cutover, .release, .complete }) |phase| try std.testing.expect(visited[@intFromEnum(phase)]);
+    for ([_]Phase{ .admit, .publish, .snapshot, .tail, .freeze, .final_tail, .cutover, .release, .complete }) |phase| try std.testing.expect(visited[@backingInt(phase)]);
     try std.testing.expectEqual(@as(usize, 2), harness.snapshots);
     try std.testing.expectEqual(@as(usize, 4), harness.tails);
     try std.testing.expectEqual(@as(usize, 2), harness.releases);

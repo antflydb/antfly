@@ -1,0 +1,381 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const backend_erased = @import("../backend_erased.zig");
+const lsm_backend = @import("../lsm_backend.zig");
+const platform_time = @import("antfly_platform").time;
+const docstore_mod = @import("../docstore.zig");
+const mem_backend = @import("../mem_backend.zig");
+
+pub const LeaseRecord = struct {
+    owner_id: []const u8,
+    expires_at_ms: u64,
+    /// Monotonic tenure identity. Legacy records decode as epoch zero and are
+    /// upgraded on their next successful acquisition.
+    epoch: u64 = 0,
+};
+
+pub const AcquireResult = struct {
+    acquired: bool,
+    epoch: u64 = 0,
+    expires_at_ms: u64 = 0,
+    kind: AcquireKind = .blocked,
+};
+
+pub const AcquireKind = enum {
+    acquired,
+    renewed,
+    takeover,
+    blocked,
+};
+
+pub const Lease = struct {
+    allocator: Allocator,
+    store: RuntimeStoreHandle,
+    key: []const u8,
+
+    pub fn init(alloc: Allocator, store: anytype, key: []const u8) !Lease {
+        return .{
+            .allocator = alloc,
+            .store = try initRuntimeStore(alloc, store),
+            .key = key,
+        };
+    }
+
+    pub fn deinit(self: *Lease) void {
+        self.store.deinit();
+        self.* = undefined;
+    }
+
+    pub fn load(self: *Lease, alloc: Allocator) !?LeaseRecord {
+        var txn = try self.store.store.beginRead();
+        defer txn.abort();
+        const raw = txn.get(self.key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const data = try alloc.dupe(u8, raw);
+        defer alloc.free(data);
+
+        const parsed = try std.json.parseFromSlice(LeaseRecord, alloc, data, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        if (parsed.value.expires_at_ms == 0) return null;
+        return try cloneRecord(alloc, parsed.value);
+    }
+
+    pub fn tryAcquire(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
+        return (try self.tryAcquireFenced(owner_id, now_ms, ttl_ms)).acquired;
+    }
+
+    pub fn tryAcquireFenced(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !AcquireResult {
+        var txn = try self.store.store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+
+        const current_raw = txn.get(self.key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+
+        var epoch: u64 = 1;
+        var kind: AcquireKind = .acquired;
+        var expires_at_ms = std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64);
+        if (current_raw) |raw| {
+            const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{
+                .allocate = .alloc_always,
+            });
+            defer parsed.deinit();
+
+            const current = parsed.value;
+            if (current.expires_at_ms > now_ms and std.mem.eql(u8, current.owner_id, owner_id))
+                expires_at_ms = @max(expires_at_ms, current.expires_at_ms);
+            if (current.expires_at_ms > now_ms and !std.mem.eql(u8, current.owner_id, owner_id)) {
+                return .{ .acquired = false, .epoch = current.epoch, .expires_at_ms = current.expires_at_ms };
+            }
+            epoch = if (current.expires_at_ms > now_ms and std.mem.eql(u8, current.owner_id, owner_id))
+                @max(current.epoch, 1)
+            else
+                std.math.add(u64, current.epoch, 1) catch return error.LeaseEpochOverflow;
+            kind = if (current.expires_at_ms == 0) .acquired else if (current.expires_at_ms > now_ms) .renewed else .takeover;
+        }
+
+        const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
+            .owner_id = owner_id,
+            .expires_at_ms = expires_at_ms,
+            .epoch = epoch,
+        }, .{});
+        defer self.allocator.free(payload);
+
+        try txn.put(self.key, payload);
+        try txn.commit();
+        committed = true;
+        return .{ .acquired = true, .epoch = epoch, .expires_at_ms = expires_at_ms, .kind = kind };
+    }
+
+    pub fn renew(self: *Lease, owner_id: []const u8, now_ms: u64, ttl_ms: u64) !bool {
+        return try self.tryAcquire(owner_id, now_ms, ttl_ms);
+    }
+
+    /// Renew only the exact live tenure. An expired owner must acquire a new
+    /// epoch, even if no competitor has written yet, so work from the expired
+    /// tenure can never be published under a revived identity.
+    pub fn renewFenced(self: *Lease, owner_id: []const u8, epoch: u64, now_ms: u64, ttl_ms: u64) !bool {
+        var txn = try self.store.store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+        const raw = txn.get(self.key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.owner_id, owner_id) or
+            parsed.value.epoch != epoch or parsed.value.expires_at_ms <= now_ms) return false;
+        // Independently scheduled heartbeats can sample their clocks out of
+        // commit order. An older sample must never shorten the durable tenure.
+        const expires_at_ms = @max(parsed.value.expires_at_ms, std.math.add(u64, now_ms, ttl_ms) catch std.math.maxInt(u64));
+        const payload = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
+            .owner_id = owner_id,
+            .expires_at_ms = expires_at_ms,
+            .epoch = epoch,
+        }, .{});
+        defer self.allocator.free(payload);
+        try txn.put(self.key, payload);
+        try txn.commit();
+        committed = true;
+        return true;
+    }
+
+    pub fn release(self: *Lease, owner_id: []const u8) !bool {
+        return try self.releaseMatching(owner_id, null);
+    }
+
+    /// Release only the exact tenure. This is the safe operation for durable
+    /// workers because a process restart may reuse the configured owner ID.
+    pub fn releaseFenced(self: *Lease, owner_id: []const u8, epoch: u64) !bool {
+        return try self.releaseMatching(owner_id, epoch);
+    }
+
+    fn releaseMatching(self: *Lease, owner_id: []const u8, epoch: ?u64) !bool {
+        var txn = try self.store.store.beginWrite();
+        var committed = false;
+        defer if (!committed) txn.abort();
+
+        const current_raw = txn.get(self.key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        const parsed = try std.json.parseFromSlice(LeaseRecord, self.allocator, current_raw, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+
+        if (!std.mem.eql(u8, parsed.value.owner_id, owner_id) or
+            parsed.value.expires_at_ms == 0 or
+            (epoch != null and parsed.value.epoch != epoch.?)) return false;
+        // Keep the tenure counter after release. Deleting it would let a
+        // restarted owner reuse epoch one and revive stale work or releases.
+        const released = try std.json.Stringify.valueAlloc(self.allocator, LeaseRecord{
+            .owner_id = "",
+            .expires_at_ms = 0,
+            .epoch = parsed.value.epoch,
+        }, .{});
+        defer self.allocator.free(released);
+        try txn.put(self.key, released);
+        try txn.commit();
+        committed = true;
+        return true;
+    }
+};
+
+const RuntimeStoreHandle = struct {
+    store: backend_erased.Store,
+    owned: bool,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.owned) self.store.deinit();
+    }
+};
+
+fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
+    const T = @TypeOf(store);
+    if (T == backend_erased.Store) return .{ .store = store, .owned = false };
+    if (T == *backend_erased.Store) return .{ .store = store.*, .owned = false };
+
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| {
+            if (@hasDecl(ptr.child, "backendStore")) {
+                return .{
+                    .store = try backend_erased.storeFrom(alloc, store.backendStore()),
+                    .owned = true,
+                };
+            }
+        },
+        else => {
+            if (@hasDecl(T, "backendStore")) {
+                return .{
+                    .store = try backend_erased.storeFrom(alloc, store.backendStore()),
+                    .owned = true,
+                };
+            }
+        },
+    }
+
+    return .{
+        .store = try backend_erased.storeFrom(alloc, store),
+        .owned = true,
+    };
+}
+
+pub fn cloneRecord(alloc: Allocator, record: LeaseRecord) !LeaseRecord {
+    return .{
+        .owner_id = try alloc.dupe(u8, record.owner_id),
+        .expires_at_ms = record.expires_at_ms,
+        .epoch = record.epoch,
+    };
+}
+
+pub fn deinitRecord(alloc: Allocator, record: *LeaseRecord) void {
+    alloc.free(record.owner_id);
+    record.* = undefined;
+}
+
+var temp_path_nonce: u64 = 0;
+
+fn tempPath(buf: []u8) [*:0]const u8 {
+    const base = "/tmp/antfly-db-lease-test-";
+    const ts = platform_time.monotonicNs();
+    const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
+    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+    return @ptrCast(path.ptr);
+}
+
+fn cleanupTempDir(path: [*:0]const u8) void {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "lease acquires renews and releases by owner" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var lease = try Lease.init(alloc, &store, "\x00\x00__metadata__:lease_test");
+    defer lease.deinit();
+    try std.testing.expect(try lease.tryAcquire("worker-a", 1000, 250));
+    try std.testing.expect(!(try lease.tryAcquire("worker-b", 1100, 250)));
+    try std.testing.expect(try lease.renew("worker-a", 1200, 250));
+    try std.testing.expect(!(try lease.release("worker-b")));
+    try std.testing.expect(try lease.release("worker-a"));
+    try std.testing.expect(try lease.tryAcquire("worker-b", 1300, 250));
+}
+
+test "lease epochs fence renewal and release after takeover" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var lease = try Lease.init(alloc, &store, "\x00\x00__metadata__:lease_fence_test");
+    defer lease.deinit();
+    const first = try lease.tryAcquireFenced("stable-worker-id", 1_000, 100);
+    try std.testing.expect(first.acquired);
+    try std.testing.expectEqual(@as(u64, 1), first.epoch);
+
+    const second = try lease.tryAcquireFenced("stable-worker-id", 1_101, 100);
+    try std.testing.expect(second.acquired);
+    try std.testing.expectEqual(@as(u64, 2), second.epoch);
+    try std.testing.expect(!(try lease.renewFenced("stable-worker-id", first.epoch, 1_102, 100)));
+    try std.testing.expect(!(try lease.releaseFenced("stable-worker-id", first.epoch)));
+    try std.testing.expect(try lease.releaseFenced("stable-worker-id", second.epoch));
+}
+
+test "lease release preserves tenure fencing across owner ID reuse" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "lease-tenure" });
+    defer runtime.deinit();
+    var lease = try Lease.init(alloc, runtime, "\x00\x00__metadata__:lease_tenure");
+    defer lease.deinit();
+    const first = try lease.tryAcquireFenced("worker", 1000, 250);
+    try std.testing.expect(first.acquired);
+    try std.testing.expect(try lease.releaseFenced("worker", first.epoch));
+    try std.testing.expect((try lease.load(alloc)) == null);
+    const second = try lease.tryAcquireFenced("worker", 1100, 250);
+    try std.testing.expect(second.acquired);
+    try std.testing.expect(second.epoch > first.epoch);
+    try std.testing.expect(!(try lease.releaseFenced("worker", first.epoch)));
+    try std.testing.expect(!(try lease.renewFenced("worker", first.epoch, 1200, 250)));
+    try std.testing.expect(try lease.renewFenced("worker", second.epoch, 1200, 250));
+    try std.testing.expect(try lease.renewFenced("worker", second.epoch, 1150, 250));
+    const renewed = (try lease.load(alloc)).?;
+    defer alloc.free(renewed.owner_id);
+    try std.testing.expectEqual(@as(u64, 1450), renewed.expires_at_ms);
+    const same_tenure = try lease.tryAcquireFenced("worker", 1125, 250);
+    try std.testing.expectEqual(second.epoch, same_tenure.epoch);
+    try std.testing.expectEqual(@as(u64, 1450), same_tenure.expires_at_ms);
+    const third = try lease.tryAcquireFenced("worker", 1500, 250);
+    try std.testing.expect(third.epoch > second.epoch);
+    try std.testing.expectEqual(AcquireKind.takeover, third.kind);
+    try std.testing.expect(!(try lease.renewFenced("worker", second.epoch, 1501, 250)));
+}
+
+test "lease works with memory backend store" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var lease = try Lease.init(alloc, runtime, "\x00\x00__metadata__:lease_test");
+    defer lease.deinit();
+
+    try std.testing.expect(try lease.tryAcquire("worker-a", 1000, 250));
+    try std.testing.expect(!(try lease.tryAcquire("worker-b", 1100, 250)));
+    try std.testing.expect(try lease.release("worker-a"));
+    try std.testing.expect(try lease.tryAcquire("worker-b", 1300, 250));
+}
+
+test "lease works with lsm backend store" {
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    var lease = try Lease.init(alloc, runtime, "\x00\x00__metadata__:lease_test");
+    defer lease.deinit();
+
+    try std.testing.expect(try lease.tryAcquire("worker-a", 1000, 250));
+    try std.testing.expect(!(try lease.tryAcquire("worker-b", 1100, 250)));
+    try std.testing.expect(try lease.release("worker-a"));
+    try std.testing.expect(try lease.tryAcquire("worker-b", 1300, 250));
+}

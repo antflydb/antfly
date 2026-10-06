@@ -12,14 +12,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const data_format = @import("../../common/data_format.zig");
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const raft_catalog = @import("../../raft/storage/catalog.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const generation_lifecycle = @import("../db/generation_lifecycle.zig");
-const backend_types = @import("../backend_types.zig");
-const lsm_backend = @import("../lsm_backend.zig");
+const generation_lifecycle = @import("antfly_local_sources").storage_db_generation_lifecycle;
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 const validation = @import("validation.zig");
-const topology_records = @import("../../common/topology_records.zig");
+const topology_records = @import("antfly_local_sources").common_topology_records;
 const seed_topology = @import("seed_topology.zig");
 
 pub const topology_format_version = seed_topology.topology_format_version;
@@ -152,7 +152,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         defer alloc.free(metadata_store_root);
         var metadata_store = try @import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore.init(alloc, .{ .root_dir = metadata_store_root });
         defer metadata_store.deinit();
-        try metadata_store.importHACheckpoint(io, source_path, artifact.size_bytes);
+        try metadata_store.importHotStandbyCheckpoint(io, source_path, artifact.size_bytes);
         try verifyStandaloneMetadataTopology(alloc, &metadata_store, parsed.value);
     }
     if (parsed.value.private_provisioning) |projection| {
@@ -203,7 +203,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
-        try db_mod.DB.restoreCoherentHASeedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
+        try @import("../server_db_adapter.zig").restoreAuthenticatedReplicaToStagedGeneration(&staged, alloc, snapshot_root, staged.path(), .{
             .identity_namespace = .{
                 .table_id = replica.identity_table_id,
                 .shard_id = replica.identity_shard_id,
@@ -219,7 +219,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         try verifyReplicaRowPolicy(alloc, staged.path(), replica, parsed.value.catalog.policy_install_snapshots);
         for (initial_owners) |owner| {
             if (owner.range.group_id != replica.group_id) continue;
-            const hidden = @import("../db/relational_initial_child_publication.zig");
+            const hidden = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
             const descriptor = owner.descriptor;
             const expected: hidden.Bootstrap = .{
                 .plan_id = descriptor.plan_id,
@@ -244,15 +244,15 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
             if (try hidden.load(&probe)) |record| {
                 if (!expected.matches(record) or record.row_count != 0) return error.SeedReplicaIdentityMismatch;
             } else {
-                const hidden_catalog = probe.get(@import("../db/relational_integrity_catalog.zig").key) catch null;
+                const hidden_catalog = probe.get(@import("antfly_local_sources").storage_db_relational_integrity_catalog.key) catch null;
                 const schema_json = probe.get("\x00\x00__metadata__:schema_json") catch null;
                 if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
             }
         }
-        var native_ha_owner = false;
+        var native_hot_standby_owner = false;
         for (native_owners) |owner| {
             if (owner.scope.target_namespace.shard_id != replica.group_id) continue;
-            native_ha_owner = true;
+            native_hot_standby_owner = true;
             var verified = try db_mod.DB.open(alloc, staged.path(), .{ .open_mode = .query_readonly, .primary_only_readonly = true, .identity_namespace = owner.scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
             defer verified.close();
             var bootstrap = (try verified.readRestoreStagingBootstrap(alloc)) orelse return error.SeedReplicaIdentityMismatch;
@@ -269,7 +269,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         if (try staged.publish() != .durable) return error.LiveDBPublicationConflict;
         // Stream authority reconstructs an owner, not Raft membership. The
         // independent registry keeps it discoverable for replay and reseeding.
-        if (native_ha_owner) continue;
+        if (native_hot_standby_owner) continue;
         try catalog.catalog().upsertReplica(.{
             .group_id = replica.group_id,
             .replica_id = request.target_replica_id,
@@ -461,7 +461,7 @@ fn verifyReplicaRowPolicy(
     alloc: Allocator,
     db_path: []const u8,
     replica: ReplicaSnapshot,
-    programs: []const @import("../../system_catalog/policies.zig").InstallSnapshot,
+    programs: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot,
 ) !void {
     var db = try db_mod.DB.open(alloc, db_path, .{
         .open_mode = .query_readonly,
@@ -482,16 +482,16 @@ fn verifyOpenedReplicaRowPolicy(
     alloc: Allocator,
     db: *db_mod.DB,
     table_id: u64,
-    programs: []const @import("../../system_catalog/policies.zig").InstallSnapshot,
+    programs: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot,
 ) !void {
-    var expected: ?*const @import("../../system_catalog/policies.zig").InstallSnapshot = null;
+    var expected: ?*const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot = null;
     for (programs) |*program| if (program.table_id == table_id) {
         if (expected != null) return error.SeedMetadataTopologyMismatch;
         expected = program;
     };
     if (expected) |program| {
         if (db.core.table_catalog.row_policy_phase != .active) return error.SeedReplicaPolicyMismatch;
-        const installed = if (db.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
+        const installed = if (db.local_execution.row_policy_bundle) |*bundle| bundle else return error.SeedReplicaPolicyMismatch;
         if (!(try policyInstallSnapshotsEqual(alloc, installed.parsed.value, program.*))) return error.SeedReplicaPolicyMismatch;
     } else if (db.core.table_catalog.row_policy_phase != .disabled) {
         return error.SeedReplicaPolicyMismatch;
@@ -500,8 +500,8 @@ fn verifyOpenedReplicaRowPolicy(
 
 fn policyInstallSnapshotsEqual(
     alloc: Allocator,
-    actual: @import("../../system_catalog/policies.zig").InstallSnapshot,
-    expected: @import("../../system_catalog/policies.zig").InstallSnapshot,
+    actual: @import("antfly_local_sources").system_catalog_policies.InstallSnapshot,
+    expected: @import("antfly_local_sources").system_catalog_policies.InstallSnapshot,
 ) !bool {
     // Metadata promotes `.serving_install` to `.active` after every owner has
     // ACKed; no extra owner Raft entry rewrites the immutable installed bytes.
@@ -518,14 +518,14 @@ fn policyInstallSnapshotsEqual(
 
 fn verifyStandaloneMetadataTopology(alloc: Allocator, store: *@import("../../metadata/storage/raft_apply_store.zig").RaftApplyStore, topology: Topology) !void {
     const manager = @import("../../metadata/table_manager.zig");
-    const group_id = @import("../../common/group_ids.zig").main_metadata_group_id;
+    const group_id = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
     if (try store.standaloneRevision() != topology.catalog.epoch) return error.SeedMetadataTopologyMismatch;
     var projection = try store.captureProvisioningCatalog(alloc, group_id);
     defer projection.deinit(alloc);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const catalog = @import("../../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     var actual_catalog = try store.systemCatalogSnapshot(alloc, group_id);
     defer actual_catalog.deinit();
     const expected_catalog = topology.catalog.system_catalog orelse catalog.State{};
@@ -824,7 +824,7 @@ fn pathExists(io: std.Io, path: []const u8) !bool {
 }
 
 test "storage.ha physical owner policy snapshot must equal metadata seed program" {
-    const policies = @import("../../system_catalog/policies.zig");
+    const policies = @import("antfly_local_sources").system_catalog_policies;
     const base: policies.InstallSnapshot = .{
         .table_id = 7,
         .schema_version = 1,
@@ -864,7 +864,7 @@ test "storage.ha staged owner rejects metadata policy missing from its physical 
     });
     defer db.close();
     try verifyOpenedReplicaRowPolicy(alloc, &db, 7, &.{});
-    const program: @import("../../system_catalog/policies.zig").InstallSnapshot = .{
+    const program: @import("antfly_local_sources").system_catalog_policies.InstallSnapshot = .{
         .table_id = 7,
         .schema_version = 1,
         .schema_digest = @splat(3),
@@ -879,8 +879,8 @@ test "storage.ha staged owner rejects metadata policy missing from its physical 
 
 test "storage.ha protected owner seed accepts serving program and rejects stale promotion program" {
     const alloc = std.testing.allocator;
-    const policies = @import("../../system_catalog/policies.zig");
-    const schema_mod = @import("../schema.zig");
+    const policies = @import("antfly_local_sources").system_catalog_policies;
+    const schema_mod = @import("antfly_local_sources").storage_schema;
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var tmp = std.testing.tmpDir(.{});
@@ -889,7 +889,7 @@ test "storage.ha protected owner seed accepts serving program and rejects stale 
     defer alloc.free(root);
     const db_path = try std.fs.path.join(alloc, &.{ root, "table-db" });
     defer alloc.free(db_path);
-    const namespace: @import("../db/doc_identity_namespace.zig").Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 };
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
     ;
@@ -988,7 +988,7 @@ test "storage.ha system catalog seed versions require complete logical identitie
 }
 
 test "storage.ha system catalog portable table names preserve literal and restore identities" {
-    const domain = @import("../../system_catalog/domain.zig");
+    const domain = @import("antfly_local_sources").system_catalog_domain;
     for ([_][]const u8{ "docs", "sales/archive", "..", "docs table", "*" }) |name| try validateTableIdentityName(name);
     try std.testing.expectError(error.InvalidSeedTopology, validateTableIdentityName("bad\nname"));
     const component: [domain.max_name_bytes]u8 = @splat('a');

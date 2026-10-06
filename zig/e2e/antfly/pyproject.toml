@@ -9,6 +9,9 @@ dependencies = [
     "requests>=2.31",
 ]
 
+[project.optional-dependencies]
+lake = ["pyarrow>=18", "psycopg[binary]>=3.2"]
+
 [tool.pytest.ini_options]
 testpaths = ["."]
 addopts = "-v --durations=50 --durations-min=1.0 --dist=loadgroup"

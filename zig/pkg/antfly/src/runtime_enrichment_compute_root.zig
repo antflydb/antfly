@@ -15,10 +15,13 @@ const runtimeEntry = process.runtimeEntry;
 
 const exportInternal = process.exportInternal;
 
-const enrichment_compute_exports = @import("storage/enrichment_compute_provider.zig");
+const enrichment_compute_exports = @import("antfly_local_sources").storage_enrichment_compute_provider;
 
 comptime {
     exportInternal(&enrichment_compute_exports.extractStream, "antfly_enrichment_extract_stream");
     exportInternal(&enrichment_compute_exports.renderPdfPagePng, "antfly_enrichment_render_pdf_page_png");
     exportInternal(&enrichment_compute_exports.bufferDestroy, "antfly_enrichment_buffer_destroy");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

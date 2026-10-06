@@ -42,7 +42,7 @@ pub const Executor = struct {
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
-    const BoundaryAbi = @import("../../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, request: Request) anyerror!OwnedResponse,
     };
@@ -66,7 +66,7 @@ test "storage.ha HTTP executor preserves error identity across a foreign runtime
         fn execute(_: *anyopaque, _: Request) !OwnedResponse {
             return error.OutOfMemory;
         }
-        fn dispatch(contract: *const @import("../../runtime_native_abi.zig").CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("../../runtime_error_abi.zig").Status {
+        fn dispatch(contract: *const @import("antfly_runtime_abi").native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
             return Executor.BoundaryAbi.local_dispatch(contract, callback, args, output);
         }
     };

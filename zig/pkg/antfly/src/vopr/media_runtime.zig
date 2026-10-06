@@ -10,12 +10,12 @@ const std = @import("std");
 const httpx = @import("httpx");
 const vopr = @import("vopr");
 const audio_runtime = @import("../common/audio_runtime.zig");
-const config_mod = @import("../common/config.zig");
-const provider_registry = @import("../common/provider_registry.zig");
+const config_mod = @import("antfly_local_sources").common_config;
+const provider_registry = @import("antfly_local_sources").common_provider_registry;
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 const valid_transcript =
     "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"vopr transcript\",\"language\":\"en\"}],\"model\":\"vopr-stt\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}";
@@ -339,7 +339,7 @@ pub const Scenario = struct {
             return false;
         }
 
-        fn finalize(self: *State) void {
+        pub fn finalize(self: *State) void {
             const mode = self.mode.?;
             switch (mode) {
                 .stt_success => self.result_classified = self.request_error == null and std.mem.eql(u8, self.transcript orelse "", "vopr transcript"),
@@ -403,7 +403,7 @@ pub const Scenario = struct {
     pub fn init(allocator: std.mem.Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.fixture_allocator = .init;
+        state.fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
         errdefer _ = state.fixture_allocator.deinit();
         state.allocator = state.fixture_allocator.allocator();
         state.sim = try vopr.vopr_io.VoprIo.init(.{

@@ -4,13 +4,13 @@
 //! production child-owner apply still verifies the source fence, exact schema
 //! and catalog digests, and Raft marker before installing the new schema.
 const std = @import("std");
-const db_mod = @import("../storage/db/db.zig");
-const topology = @import("../storage/db/relational_integrity_topology.zig");
-const public_schema = @import("../schema/mod.zig");
-const runtime_schema = @import("../storage/schema.zig");
+const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology;
+const public_schema = @import("antfly_local_sources").schema_mod;
+const runtime_schema = @import("antfly_local_sources").storage_schema;
 
 pub fn install(alloc: std.mem.Allocator, db: *db_mod.DB, before_json: []const u8, after_json: []const u8, raft_index: u64) !void {
-    const before_catalog = (try db.core.getStoreValue(alloc, @import("../storage/db/relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+    const before_catalog = (try db.core.getStoreValue(alloc, @import("antfly_local_sources").storage_db_relational_integrity_catalog.key)) orelse return error.IntegrityCatalogChanged;
     defer alloc.free(before_catalog);
     var before_catalog_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(before_catalog, &before_catalog_digest, .{});
@@ -47,5 +47,5 @@ pub fn install(alloc: std.mem.Allocator, db: *db_mod.DB, before_json: []const u8
         .before_catalog_digest = before_catalog_digest,
         .after_catalog_digest = after_catalog_digest,
     } };
-    try db.batchRaftReplicatedApply(.{ .relational_topology = command }, .{ .term = 1, .index = raft_index });
+    try @import("../storage/server_db_adapter.zig").applyOrdered(&db, .{ .relational_topology = command }, .{ .term = 1, .index = raft_index });
 }

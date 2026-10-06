@@ -31,16 +31,17 @@ const StorageRecorder = struct {
     compact_failures_remaining: usize = 0,
     compact_failure_group: ?core.types.GroupId = null,
     compact_successes: usize = 0,
-    compacted_groups: [8]core.types.GroupId = [_]core.types.GroupId{0} ** 8,
+    compacted_groups: [8]core.types.GroupId = @as([8]core.types.GroupId, @splat(0)),
     retired_groups: usize = 0,
     async_begin: bool = false,
     maintenance_due: bool = false,
     release_persistence: bool = true,
+    release_compaction: bool = true,
     retained_ready: ?core.Ready = null,
     retained_group: core.types.GroupId = 0,
     retained_compact_index: ?u64 = null,
 
-    fn deinit(self: *StorageRecorder) void {
+    pub fn deinit(self: *StorageRecorder) void {
         if (self.retained_ready) |*ready| ready.deinit(self.alloc);
         self.stores.deinit(self.alloc);
         self.* = undefined;
@@ -86,7 +87,7 @@ const StorageRecorder = struct {
 
     fn isComplete(ptr: *anyopaque) bool {
         const self: *StorageRecorder = @ptrCast(@alignCast(ptr));
-        return self.release_persistence;
+        return if (self.retained_compact_index != null) self.release_compaction and self.release_persistence else self.release_persistence;
     }
 
     fn beginCompactSnapshot(ptr: *anyopaque, group_id: u64, metadata: core.types.SnapshotMetadata, payload: runtime.storage_iface.SnapshotMaterialization, index: u64, admission: *runtime.storage_iface.PersistenceAdmission, wake: ?runtime.storage_iface.PersistenceWake) !?runtime.storage_iface.PendingReadyPersistence {
@@ -245,7 +246,7 @@ const DiskBatcherRecorder = struct {
     persist_calls: usize = 0,
     persisted_entries: usize = 0,
 
-    fn deinit(self: *DiskBatcherRecorder) void {
+    pub fn deinit(self: *DiskBatcherRecorder) void {
         self.stores.deinit(self.alloc);
         self.* = undefined;
     }
@@ -325,7 +326,7 @@ const TestSnapshotArtifact = struct {
         return try alloc.dupe(u8, self.bytes);
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *TestSnapshotArtifact = @ptrCast(@alignCast(ptr));
         const alloc = self.alloc;
         alloc.free(self.bytes);
@@ -339,12 +340,12 @@ const ApplyRecorder = struct {
     applied_entries: usize = 0,
     applied_read_states: usize = 0,
     last_applied_index: core.types.Index = 0,
-    last_applied_by_group: [128]core.types.Index = [_]core.types.Index{0} ** 128,
+    last_applied_by_group: [128]core.types.Index = @as([128]core.types.Index, @splat(0)),
     last_read_index: core.types.Index = 0,
     snapshot_materializations: std.atomic.Value(usize) = .init(0),
     snapshot_failures_remaining: std.atomic.Value(usize) = .init(0),
     snapshot_prepare_failures_remaining: usize = 0,
-    materialized_groups: [8]std.atomic.Value(core.types.GroupId) = [_]std.atomic.Value(core.types.GroupId){.init(0)} ** 8,
+    materialized_groups: [8]std.atomic.Value(core.types.GroupId) = @as([8]std.atomic.Value(core.types.GroupId), @splat(.init(0))),
     block_snapshot_materialization: bool = false,
     snapshot_materialization_started: std.Io.Event = .unset,
     release_snapshot_materialization: std.Io.Event = .unset,
@@ -388,7 +389,7 @@ const ApplyRecorder = struct {
             } };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.heap.page_allocator.destroy(self);
         }
@@ -504,7 +505,7 @@ const ApplyQueueRecorder = struct {
 const PartialApplyRecorder = struct {
     attempts: usize = 0,
     failed_once: bool = false,
-    successful_by_group: [256]usize = [_]usize{0} ** 256,
+    successful_by_group: [256]usize = @as([256]usize, @splat(0)),
 
     fn iface(self: *@This()) runtime.storage_iface.StateMachine {
         return .{
@@ -3612,7 +3613,9 @@ test "multi raft election waits for its own durable term and vote without restar
 test "multi raft asynchronous snapshot publication retries startup, fences compaction and keeps durable reads live" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
-    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true };
+    // Arm publication failure and hold before a Ready can schedule compaction.
+    // Ordinary log persistence stays live throughout this scenario.
+    var storage = StorageRecorder{ .alloc = std.testing.allocator, .async_begin = true, .release_compaction = false, .compact_failures_remaining = 1 };
     defer storage.deinit();
     try storage.registerStore(24, &store);
     var apply = ApplyRecorder{ .alloc = std.testing.allocator };
@@ -3627,8 +3630,6 @@ test "multi raft asynchronous snapshot publication retries startup, fences compa
     try host.propose(24, "published-before-compaction");
     _ = try drainGroup(&host, 24);
     // Ready persistence is complete; hold only the snapshot's publication.
-    storage.release_persistence = false;
-    storage.compact_failures_remaining = 1;
     const deadline = clock.monotonicNs() +| 5 * std.time.ns_per_s;
     while (storage.retained_compact_index == null and clock.monotonicNs() < deadline) {
         _ = try host.drainReady(0);
@@ -3645,7 +3646,7 @@ test "multi raft asynchronous snapshot publication retries startup, fences compa
     _ = try host.processReady(24);
     try std.testing.expectEqual(reads + 1, apply.applied_read_states);
     try std.testing.expect(host.snapshot_publish != null);
-    storage.release_persistence = true;
+    storage.release_compaction = true;
     _ = try drainGroup(&host, 24);
     try std.testing.expectEqual(@as(u64, 2), try store.storage().firstIndex());
     try std.testing.expectEqual(@as(u64, 2), host.group(24).?.raw_node.raft.log.firstIndex());

@@ -2078,6 +2078,7 @@ components:
             - index_rebuilding
             - query_embedding_temporarily_unavailable
             - reranker_temporarily_unavailable
+            - decision_provider_unavailable
           description: Stable machine-readable retry classification.
         message:
           type: string
@@ -2089,7 +2090,7 @@ components:
     QueryDependencyError:
       type: object
       additionalProperties: false
-      description: A stable failure envelope for query embedding and reranking dependencies.
+      description: A stable failure envelope for query embedding, reranking, and decision dependencies.
       required: [code, error, message, retryable]
       properties:
         code:
@@ -2102,6 +2103,11 @@ components:
             - query_embedding_upstream_failure
             - reranker_rate_limited
             - reranker_upstream_failure
+            - decision_limit_exceeded
+            - invalid_decision_evaluation
+            - decision_provider_unavailable
+            - decision_rate_limited
+            - decision_upstream_failure
             - query_timeout
         error:
           type: string
@@ -9141,6 +9147,86 @@ components:
       required: [table]
       additionalProperties: false
 
+    QueryEvaluation:
+      type: object
+      additionalProperties: false
+      required: [scope, compute]
+      description: |
+        Evaluate expressions after global retrieval merging, before final
+        offset/limit. Candidates require candidate_count; matches require
+        max_rows and fail if the full qualifying population exceeds that budget.
+        Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+        be combined with evaluation. NULL inputs skip inference; errors fail.
+      properties:
+        graph_query:
+          type: string
+          description: Evaluate completed bindings of this named graph MATCH instead of retrieval hits. Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined with this stage.
+        scope: {type: string, enum: [candidates, matches]}
+        candidate_count: {type: integer, minimum: 1, maximum: 10000}
+        max_rows: {type: integer, minimum: 1, maximum: 10000}
+        compute:
+          type: object
+          minProperties: 1
+          maxProperties: 64
+          additionalProperties:
+            $ref: "#/components/schemas/QueryExpression"
+        where:
+          type: object
+          description: Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression), not (predicate), and, or (predicate arrays). Comparisons propagate NULL.
+          additionalProperties: true
+        order_by:
+          type: array
+          maxItems: 16
+          items:
+            type: object
+            additionalProperties: false
+            required: [expression]
+            properties:
+              expression: {$ref: "#/components/schemas/QueryExpression"}
+              descending: {type: boolean}
+        aggregations:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: false
+            required: [type, expression]
+            properties:
+              type: {type: string, enum: [terms, avg, sum, count]}
+              expression: {$ref: "#/components/schemas/QueryExpression"}
+    QueryExpression:
+      x-zig-type: std.json.Value
+      x-go-type-skip-optional-pointer: false
+      type: object
+      additionalProperties: false
+      description: |
+        Exactly one of literal, field, ref, or call. A call requires input and
+        decider. ai_decide requires questions; ai_probability requires statement;
+        ai_choice and ai_score require instructions and criteria. Named refs may
+        select nested JSON members with dotted paths. Binding cycles are invalid.
+      properties:
+        literal:
+          x-go-type: json.RawMessage
+        field: {type: string, minLength: 1}
+        ref: {type: string, minLength: 1}
+        call: {type: string, enum: [ai_decide, ai_choice, ai_score, ai_probability]}
+        input:
+          $ref: "#/components/schemas/QueryExpression"
+          x-go-type-skip-optional-pointer: false
+        decider: {type: string, minLength: 1}
+        questions:
+          type: object
+          additionalProperties: true
+        statement: {type: string, minLength: 1}
+        instructions: {type: string, minLength: 1}
+        criteria:
+          description: Choice ID map or ordered score level array.
+          oneOf:
+            - type: object
+              additionalProperties: {type: string}
+            - type: array
+              minItems: 2
+              maxItems: 64
+              items: {type: string}
     QueryRequest: # Based on remoteindex.Query
       type: object
       not:
@@ -9246,9 +9332,12 @@ components:
                   - required: [graph_queries]
                   - required: [document_renderer]
                   - required: [pruner]
+                  - required: [evaluate]
                   - required: [join]
                   - required: [foreign_sources]
       properties:
+        evaluate:
+          $ref: "#/components/schemas/QueryEvaluation"
         table_target:
           $ref: "#/components/schemas/CatalogTableTarget"
         table:
@@ -10611,6 +10700,10 @@ components:
         - _id
         - _score
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
+          description: Named query-time computed values, separate from stored source.
         _id:
           type: string
           description: ID of the record.
@@ -10806,6 +10899,10 @@ components:
         - took
         - status
       properties:
+        evaluation:
+          type: object
+          additionalProperties: true
+          description: Function evaluation scope, population, usage, and scoped aggregations.
         hits:
           $ref: "#/components/schemas/QueryHits"
         aggregations:

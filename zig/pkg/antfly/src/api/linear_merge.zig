@@ -13,14 +13,14 @@
 // limitations.
 
 const std = @import("std");
-const api_operation = @import("operation.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const document_content_hash = @import("../storage/db/document_content_hash.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const document_content_hash = @import("antfly_local_sources").storage_db_document_content_hash;
 const raft_mod = @import("../raft/mod.zig");
-const table_reads = @import("table_read_source.zig");
-const table_writes = @import("table_write_source.zig");
-const query_api = @import("query.zig");
-const public_limits = @import("public_limits.zig");
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const table_writes = @import("antfly_local_sources").api_table_write_source;
+const query_api = @import("antfly_local_sources").api_query;
+const public_limits = @import("antfly_public_limits");
 const platform_time = @import("antfly_platform").time;
 
 pub const OwnedLinearMergeRequest = struct {

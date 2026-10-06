@@ -19,6 +19,119 @@ immutable lake files:
 - Materialize only hot rows, hot projections, and derived summaries when the
   workload proves they are worth owning inside Antfly.
 
+## Native SQL Serving Implementation
+
+Read-only lake attachments now use the native SQL catalog and execution runtime.
+The serving cursor aligns independently decoded Parquet column pages into typed
+`ColumnBatch` vectors. SQL aggregates can consume selected vector cells without constructing row
+JSON; row pages remain available to public queries and existing operators. The
+provider contract exposes optional column pulls and exact metadata counts, so
+other native sources can adopt the same execution interface incrementally.
+
+Cursor identities bind source, snapshot, file and physical row ordinals. Ordering
+file metadata by identity and scanning ordinals in order preserves public `_id`
+pagination without sorting all rows. Public lower and upper continuation IDs
+must belong to a file in the opened source snapshot; stale, foreign or malformed
+IDs fail with `ExternalLakeSnapshotMismatch` instead of selecting newer rows.
+Safe min/max predicates prune row groups;
+unsupported comparisons remain residual. Unfiltered, delete-free `COUNT(*)`
+reads footer counts, and Iceberg deletes use the existing snapshot/sequence rules
+before emitting selected rows. API SQL reads reuse a bounded server-owned cache
+keyed by credential scope, endpoint, immutable object version and byte range.
+
+The native executor now runs bounded instruction-major numeric/boolean kernels
+on selected cells, with four-lane exact integer arithmetic and comparisons.
+Lazy and unsupported expressions fall back intact to scalar evaluation. API
+lake cursors overlap up to four version-pinned projected range reads in a
+32 MiB lookahead batch through the existing I/O runtime. Cancellation reaches
+provider tokens; workers join before source metadata is released.
+
+Blocking sorts, mergeable grouped aggregates (including DISTINCT), and hash-join
+build rows can spill through statement-owned temporary storage. Bounded merge
+runs support sorting and per-key state reduction; joins use a bounded bucket
+directory and persistent match markers for outer joins. The shared statement
+spill quota defaults to 1 GiB and 64 open files. Private files are immediately
+unlinked and close on success/error/cancellation. Small inputs keep the existing
+in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
+
+Native SQL and public typed lake scans decode decimal columns as lossless,
+fixed-scale strings through precision 38. INT32/INT64 and binary/fixed binary
+(up to 16 bytes), nullable pages and cached dictionaries share exact integer
+formatting. The older row-scanner numeric contract remains an explicit decoding
+mode. Timestamp predicates normalize wire strings and numeric operands to exact
+signed epoch nanoseconds; canonical SQL projections preserve pre-1970 values.
+
+Table creation can infer and persist columns/fingerprints from every Parquet
+footer or the selected Iceberg schema. Inference preserves requiredness and
+rejects incompatible or unsupported flat types; nested/binary schemas need a
+compatible source. SQL never changes catalog types while reading files. Empty
+Parquet files (including both independent PyArrow layouts) and Iceberg tables
+serve zero rows. Optional missing Parquet columns are SQL NULL.
+Iceberg projection resolves the selected schema's field IDs against each footer,
+so renames preserve values and reused names with new IDs yield NULL for absent
+optional fields. Row-group pruning uses the same mapping. Required missing IDs,
+duplicate IDs and missing physical field IDs fail closed. Root attachments use
+the supported `metadata/version-hint.text` pointer; metadata directory listings
+never select a commit. Catalog-managed object-store tables supply an explicit committed
+metadata URI. Inventory, delete planning, fields and partitions share one read
+of that pinned metadata object.
+
+Parquet integer annotations retain both bit width and signedness in legacy and
+modern metadata. Signed integer annotations use native SQL integer decoding;
+unsigned annotations are rejected during inference and scanning until the SQL
+type system provides a lossless unsigned contract. They never become negative
+signed values. Public filtering normalizes operands once and releases row/page
+scratch memory as it scans, under a shared 64 MiB scan allocation budget and a
+32 MiB serialized result bound.
+
+Parquet cursors decode each column dictionary once and retain one decoded page
+per projected column, aligning page boundaries while preserving physical row
+ordinals. Native SQL keeps byte dictionary indices through scan vectors and
+normalizes referenced dictionary entries once, using declared SQL coercion.
+Missing evolved optional fields also project NULL when matching equality deletes. Prefetch targets exact next-page ranges and next-group header probes
+so decoder reads reuse the versioned cache entries.
+The active page set retains the 32 MiB input/decoded budgets; oversized individual
+pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
+and inclusive identity, bucket, truncate and temporal projections. Unknown
+transforms or values remain residual.
+
+Window partition rows, peer/group directories and frame trees now share the
+statement spill quota, with small tracked caches. Separate cell records store
+window outputs without rewriting input payloads. Live expression vectors reuse
+workspace slots; floating-point SIMD, string comparisons, boolean unary kernels
+and batch global aggregate reductions extend native vector execution. Quantified
+pattern sets use external DISTINCT and a reusable file, reading one pattern per match step.
+Sorted/grouped/window pgwire results can spool final rows and serve bounded portal
+pages without retaining the entire response or rescanning sources. HTTP JSON
+response limits and bounded materialization for blocking external decision
+projections remain. These layers use the same native snapshot-bound providers. Execution batches
+remain independent of delivery page sizes. Eligible exact aggregates use up to
+four workers claiming pinned row-group tasks from a shared queue. Larger compressed
+groups start first; private readers share immutable metadata and decoded pages.
+Local typed states can spill and merge exact partial sums without rescanning
+input. Floating-point, DISTINCT and pattern reductions retain ordered execution.
+Shared scheduling bounds all workers and releases
+speculative warming admission on completion. Sequential sort/join/group spills
+use typed, checksummed column blocks where multiple rows fit, compact records
+for wide rows, and optional Snappy compression.
+
+Borrowed operator batches preserve physical scan vectors and selection masks
+through simple filters, projections and join admission. Probe payloads are
+gathered only for candidates or required outer rows; relational adapters expose
+columns to subsequent aggregation and projection without per-row JSON objects.
+Delivery retains typed projected columns until HTTP/pgwire needs a bounded row
+page. Lazy/provider and pattern-set plans keep their scalar/row semantics.
+
+Decoded cache identity describes the physical page interpretation, independently
+of projection width or scan memory policy. Each hit validates consumer admission,
+so bounded lookahead pages are reusable by foreground readers. Expression groups
+share lazy column normalization; batches use CPU tasks only with multiple useful
+lanes and enough work to amortize scheduling. Larger external sorts build one run
+in the background while ingesting the next; partitioned joins prepare independent
+builds ahead of probing. Small budgets retain inline paths. Parallel operators
+share synchronized statement allocation, disk quotas and task admission, and join
+workers before releasing their buffers or snapshots.
+
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 
 These are related, but they are not one layer:
@@ -652,8 +765,9 @@ The concrete work left for the data-lake path is therefore:
    ETag/version identity while preserving those Iceberg sequence numbers. The
    Iceberg schema planning now also fails closed when the pinned schema carries
    top-level `struct`, `list`, or `map` fields, because Antfly's current scan
-   contract still resolves Parquet columns by flat names rather than Iceberg
-   field IDs. Parquet footer discovery and the external-source inventory codec
+   native scan contract supports flat fields. SQL serving resolves these by
+   Iceberg field ID, preserving renames and preventing name-reuse mistakes.
+   Parquet footer discovery and the external-source inventory codec
    now preserve optional Parquet schema field IDs on column chunks. Lazy footer
    discovery/enrichment accepts Iceberg inventories as well as raw Parquet
    inventories, carries those footer-derived field IDs into the enriched
@@ -661,8 +775,7 @@ The concrete work left for the data-lake path is therefore:
    lack those IDs so name-only Parquet metadata is not treated as
    schema-evolution-safe. The remaining work is to broaden equality deletes to
    nested/complex fields, tighten real-provider version/ETag fixtures, and use
-   field IDs for actual rename/reorder/nested read compatibility instead of only
-   enforcing their presence.
+   field IDs for nested read compatibility and the legacy row scanner.
 5. Complete sidecar builders over real external row refs: full-text, dense
    vector, sparse, graph, algebraic group-by, and algebraic expression-fold
    paths now consume pinned `RowSource` batches and publish declared sidecar

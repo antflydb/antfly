@@ -87,7 +87,7 @@ pub const HttpFrameDriver = struct {
         group_ids: []u64,
         replaceable_heartbeat: bool = false,
 
-        fn deinit(self: *QueuedFrame, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *QueuedFrame, alloc: std.mem.Allocator) void {
             alloc.free(self.base_uri);
             alloc.free(self.body);
             alloc.free(self.content_type);
@@ -573,7 +573,7 @@ test "http frame driver posts batch frames to raft batch route" {
         alloc: std.mem.Allocator,
         last_req: ?common.HttpRequest = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.last_req) |req| {
                 self.alloc.free(req.uri);
                 if (req.content_type) |content_type| self.alloc.free(content_type);

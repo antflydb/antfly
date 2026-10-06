@@ -15,16 +15,21 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const linalg = @import("inference_linalg");
+pub const openblas = @import("openblas.zig");
+
+pub fn useBlas() bool {
+    return build_options.enable_system_blas or openblas.available();
+}
 
 // Optional system BLAS bindings. CBLAS enum values are stable across vecLib
 // and OpenBLAS; declaring the small surface we use avoids translate-c in
 // optimized builds.
-const c = if (build_options.enable_system_blas) struct {
+const c = struct {
     pub const CblasRowMajor: c_int = 101;
     pub const CblasNoTrans: c_int = 111;
     pub const CblasTrans: c_int = 112;
 
-    pub extern "c" fn cblas_sgemm(
+    extern "c" fn cblas_sgemm(
         layout: c_int,
         transa: c_int,
         transb: c_int,
@@ -40,7 +45,15 @@ const c = if (build_options.enable_system_blas) struct {
         c_out: [*]f32,
         ldc: c_int,
     ) void;
-} else struct {};
+
+    pub fn sgemm(layout: c_int, transa: c_int, transb: c_int, m: c_int, n: c_int, k: c_int, alpha: f32, a: [*]const f32, lda: c_int, b: [*]const f32, ldb: c_int, beta: f32, c_out: [*]f32, ldc: c_int) void {
+        if (comptime build_options.enable_system_blas) {
+            cblas_sgemm(layout, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c_out, ldc);
+        } else {
+            openblas.sgemm(layout, transa, transb, m, n, k, alpha, a, lda, b, ldb, beta, c_out, ldc);
+        }
+    }
+};
 
 pub const Io = std.Io;
 pub const Cancelable = std.Io.Cancelable;
@@ -48,7 +61,7 @@ pub const Cancelable = std.Io.Cancelable;
 // --- Canonical Io-aware API ---
 //
 // These take an `io: std.Io` and dispatch via `linalg.sgemm*`, which uses
-// `io.Group.async` for parallel work.  When `enable_system_blas` is on, Io
+// `io.Group.async` for parallel work.  When system BLAS is available, Io
 // is ignored: cblas owns its own thread pool, so per-call runtime dispatch
 // would just thrash.
 
@@ -64,7 +77,7 @@ pub fn sgemm(
     beta: f32,
     c_out: []f32,
 ) Cancelable!void {
-    if (!build_options.enable_system_blas) {
+    if (!useBlas()) {
         return linalg.sgemm(io, m, n, k, alpha, a, b, beta, c_out);
     }
     sgemmSync(m, n, k, alpha, a, b, beta, c_out);
@@ -83,7 +96,7 @@ pub fn sgemmTransB(
     beta: f32,
     c_out: []f32,
 ) Cancelable!void {
-    if (!build_options.enable_system_blas) {
+    if (!useBlas()) {
         return linalg.sgemmTransB(io, m, n, k, alpha, a, b, beta, c_out);
     }
     sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
@@ -117,8 +130,8 @@ pub fn sgemmTransBStrided(
         }
         return;
     }
-    if (build_options.enable_system_blas) {
-        c.cblas_sgemm(
+    if (useBlas()) {
+        c.sgemm(
             c.CblasRowMajor,
             c.CblasNoTrans,
             c.CblasTrans,
@@ -158,7 +171,7 @@ pub fn sgemmTransBStrided(
 test "sgemmTransBStrided preserves padding offsets and beta" {
     const a = [_]f32{ 1, -2, 3, 4, 5, -6 };
     const b = [_]f32{ 1, 2, 3, -4, 5, 6, 7, 8, -9 };
-    var output = [_]f32{17} ** 13;
+    var output = @as([13]f32, @splat(17));
     try sgemmTransBStrided(null, 2, 3, 3, 0.5, &a, &b, 0.25, output[1..], 6);
     for (0..2) |row| {
         for (0..3) |column| {
@@ -210,11 +223,11 @@ pub fn sgemmSync(
     beta: f32,
     c_out: []f32,
 ) void {
-    if (!build_options.enable_system_blas) {
+    if (!useBlas()) {
         linalg.sgemmSync(m, n, k, alpha, a, b, beta, c_out);
         return;
     }
-    c.cblas_sgemm(
+    c.sgemm(
         c.CblasRowMajor,
         c.CblasNoTrans,
         c.CblasNoTrans,
@@ -242,11 +255,11 @@ pub fn sgemmTransBSync(
     beta: f32,
     c_out: []f32,
 ) void {
-    if (!build_options.enable_system_blas) {
+    if (!useBlas()) {
         linalg.sgemmTransBSync(m, n, k, alpha, a, b, beta, c_out);
         return;
     }
-    c.cblas_sgemm(
+    c.sgemm(
         c.CblasRowMajor,
         c.CblasNoTrans,
         c.CblasTrans,
@@ -290,11 +303,11 @@ pub fn sgemmTransA(
     beta: f32,
     c_out: []f32,
 ) void {
-    if (!build_options.enable_system_blas) {
+    if (!useBlas()) {
         linalg.sgemmTransA(m, n, k, alpha, a, b, beta, c_out);
         return;
     }
-    c.cblas_sgemm(
+    c.sgemm(
         c.CblasRowMajor,
         c.CblasTrans,
         c.CblasNoTrans,

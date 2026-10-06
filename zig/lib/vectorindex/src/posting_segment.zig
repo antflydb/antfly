@@ -566,28 +566,28 @@ pub const Reader = struct {
         const pos = self.index_offset + index * index_entry_size;
         const raw = self.data[pos .. pos + index_entry_size];
         const kind: EntryKind = switch (raw[8]) {
-            @intFromEnum(EntryKind.base) => .base,
-            @intFromEnum(EntryKind.delta) => .delta,
-            @intFromEnum(EntryKind.centroid_directory) => .centroid_directory,
-            @intFromEnum(EntryKind.quantized_checkpoint) => .quantized_checkpoint,
-            @intFromEnum(EntryKind.tombstone) => .tombstone,
-            @intFromEnum(EntryKind.posting_state) => .posting_state,
-            @intFromEnum(EntryKind.node_range) => .node_range,
-            @intFromEnum(EntryKind.vector_leaf) => .vector_leaf,
-            @intFromEnum(EntryKind.vector_metadata) => .vector_metadata,
-            @intFromEnum(EntryKind.index_metadata) => .index_metadata,
-            @intFromEnum(EntryKind.vector_directory) => .vector_directory,
-            @intFromEnum(EntryKind.base_tombstone) => .base_tombstone,
-            @intFromEnum(EntryKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
-            @intFromEnum(EntryKind.posting_state_tombstone) => .posting_state_tombstone,
-            @intFromEnum(EntryKind.node_range_tombstone) => .node_range_tombstone,
-            @intFromEnum(EntryKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
-            @intFromEnum(EntryKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
-            @intFromEnum(EntryKind.index_metadata_tombstone) => .index_metadata_tombstone,
-            @intFromEnum(EntryKind.base_patch) => .base_patch,
-            @intFromEnum(EntryKind.quantized_checkpoint_patch) => .quantized_checkpoint_patch,
-            @intFromEnum(EntryKind.quantized_directory) => .quantized_directory,
-            @intFromEnum(EntryKind.row_chunk) => .row_chunk,
+            @backingInt(EntryKind.base) => .base,
+            @backingInt(EntryKind.delta) => .delta,
+            @backingInt(EntryKind.centroid_directory) => .centroid_directory,
+            @backingInt(EntryKind.quantized_checkpoint) => .quantized_checkpoint,
+            @backingInt(EntryKind.tombstone) => .tombstone,
+            @backingInt(EntryKind.posting_state) => .posting_state,
+            @backingInt(EntryKind.node_range) => .node_range,
+            @backingInt(EntryKind.vector_leaf) => .vector_leaf,
+            @backingInt(EntryKind.vector_metadata) => .vector_metadata,
+            @backingInt(EntryKind.index_metadata) => .index_metadata,
+            @backingInt(EntryKind.vector_directory) => .vector_directory,
+            @backingInt(EntryKind.base_tombstone) => .base_tombstone,
+            @backingInt(EntryKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
+            @backingInt(EntryKind.posting_state_tombstone) => .posting_state_tombstone,
+            @backingInt(EntryKind.node_range_tombstone) => .node_range_tombstone,
+            @backingInt(EntryKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
+            @backingInt(EntryKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
+            @backingInt(EntryKind.index_metadata_tombstone) => .index_metadata_tombstone,
+            @backingInt(EntryKind.base_patch) => .base_patch,
+            @backingInt(EntryKind.quantized_checkpoint_patch) => .quantized_checkpoint_patch,
+            @backingInt(EntryKind.quantized_directory) => .quantized_directory,
+            @backingInt(EntryKind.row_chunk) => .row_chunk,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
@@ -785,7 +785,7 @@ pub const DeltaIterator = struct {
 
 fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: IndexEntry) !void {
     try appendU64(alloc, out, entry.posting_id);
-    try out.append(alloc, @intFromEnum(entry.kind));
+    try out.append(alloc, @backingInt(entry.kind));
     try appendU64(alloc, out, entry.sequence);
     try appendU64(alloc, out, @intCast(entry.offset));
     try appendU64(alloc, out, @intCast(entry.len));
@@ -795,7 +795,7 @@ fn appendIndexEntry(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), entry: I
 fn encodeIndexEntry(entry: IndexEntry) [index_entry_size]u8 {
     var out: [index_entry_size]u8 = undefined;
     std.mem.writeInt(u64, out[0..8], entry.posting_id, .big);
-    out[8] = @intFromEnum(entry.kind);
+    out[8] = @backingInt(entry.kind);
     std.mem.writeInt(u64, out[9..17], entry.sequence, .big);
     std.mem.writeInt(u64, out[17..25], @intCast(entry.offset), .big);
     std.mem.writeInt(u64, out[25..33], @intCast(entry.len), .big);
@@ -840,8 +840,8 @@ fn pendingEntryLessThan(_: void, lhs: PendingEntry, rhs: PendingEntry) bool {
 fn compareEntryKey(lhs_posting_id: PostingId, lhs_kind: EntryKind, lhs_sequence: u64, rhs_posting_id: PostingId, rhs_kind: EntryKind, rhs_sequence: u64) std.math.Order {
     if (lhs_posting_id < rhs_posting_id) return .lt;
     if (lhs_posting_id > rhs_posting_id) return .gt;
-    if (@intFromEnum(lhs_kind) < @intFromEnum(rhs_kind)) return .lt;
-    if (@intFromEnum(lhs_kind) > @intFromEnum(rhs_kind)) return .gt;
+    if (@backingInt(lhs_kind) < @backingInt(rhs_kind)) return .lt;
+    if (@backingInt(lhs_kind) > @backingInt(rhs_kind)) return .gt;
     if (lhs_sequence < rhs_sequence) return .lt;
     if (lhs_sequence > rhs_sequence) return .gt;
     return .eq;

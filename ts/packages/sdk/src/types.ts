@@ -439,6 +439,7 @@ export const indexEmbedderProviders = embedderProviders.filter(
 export type GeneratorProvider = components["schemas"]["GeneratorProvider"];
 export const generatorProviderCapabilities = {
   antfly: {},
+  apple: {},
   gemini: {},
   ollama: {},
   openai: {},
@@ -695,6 +696,9 @@ export interface QueryOptions {
   aggregations?: Record<string, AggregationRequest>;
 }
 
+export type GraphRelationshipFilter = components["schemas"]["GraphRelationshipFilter"];
+export type GraphRelationshipPropertyPredicate =
+  components["schemas"]["GraphRelationshipPropertyPredicate"];
 // System catalog resources and lifecycle requests.
 export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord"];
 export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];

@@ -16,7 +16,7 @@
 const std = @import("std");
 const effects = @import("metadata_effects.zig");
 // Reserve the replication-record envelope as well as the chunk envelope.
-pub const max_frame_bytes: usize = 1024 * 1024 - @as(usize, @import("replication_record.zig").header_size);
+pub const max_frame_bytes: usize = 1024 * 1024 - @as(usize, @import("antfly_local_sources").storage_db_replication_record.header_size);
 pub const frame_overhead = 120;
 pub const max_payload_bytes = max_frame_bytes - frame_overhead;
 pub const max_chunk_payload_bytes = max_payload_bytes;
@@ -128,7 +128,7 @@ test "metadata chunks reject corrupt envelopes and noncanonical partitions" {
     const frame = try encodeFrame(alloc, descriptor, 0, bytes);
     defer alloc.free(frame);
     try std.testing.expect((try decodeFrame(frame)).descriptor.eql(descriptor));
-    try std.testing.expect(frame.len + @import("replication_record.zig").header_size <= 1024 * 1024);
+    try std.testing.expect(frame.len + @import("antfly_local_sources").storage_db_replication_record.header_size <= 1024 * 1024);
     frame[88] ^= 1;
     try std.testing.expectError(error.InvalidMetadataHAEffectChunk, decodeFrame(frame));
     var invalid = descriptor;

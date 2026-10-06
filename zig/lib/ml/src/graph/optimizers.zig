@@ -121,8 +121,8 @@ pub fn LearningRateScheduleOf(comptime Float: type) type {
                 .constant => |value| .{ .constant = @floatCast(value) },
                 inline else => |value, tag| blk: {
                     var result: @FieldType(LearningRateScheduleOf(Other), @tagName(tag)) = undefined;
-                    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |field| {
-                        @field(result, field.name) = if (field.type == Float) @floatCast(@field(value, field.name)) else @field(value, field.name);
+                    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names, @typeInfo(@TypeOf(value)).@"struct".field_types) |reflected_name, field_type| {
+                        @field(result, reflected_name) = if (field_type == Float) @floatCast(@field(value, reflected_name)) else @field(value, reflected_name);
                     }
                     break :blk @unionInit(LearningRateScheduleOf(Other), @tagName(tag), result);
                 },

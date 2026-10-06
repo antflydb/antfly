@@ -125,14 +125,13 @@ mkdir -p "$cache_dir"
 echo "Building $arch Zig runtime artifact for $zig_target"
 (
   cd "$repo_root/zig"
-  python3 tools/run_bounded_zig_build.py --zig zig -- build \
+  ZIG_GLOBAL_CACHE_DIR="$cache_dir" python3 tools/run_bounded_zig_build.py --zig zig -- build \
     antfly \
     -Dtarget="$zig_target" \
-    -Doptimize=ReleaseFast \
+    -Doptimize=fast \
     -Dcuda=true \
     -Dpjrt=true \
-    --prefix "$out_dir" \
-    --global-cache-dir "$cache_dir"
+    --prefix "$out_dir"
 )
 
 test -x "$out_dir/bin/antfly"

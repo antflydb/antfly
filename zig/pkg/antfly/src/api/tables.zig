@@ -13,30 +13,32 @@
 // limitations.
 
 const std = @import("std");
-const group_ids = @import("../common/group_ids.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const indexes_openapi = @import("antfly_indexes_openapi");
 const indexes_api = @import("indexes.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const schema_openapi = @import("antfly_schema_openapi");
-const schema_mod = @import("../schema/mod.zig");
-const runtime_schema_mod = @import("../storage/schema.zig");
-const algebraic_mod = @import("../storage/db/algebraic/mod.zig");
-const lsm_backend = @import("../storage/lsm_backend/mod.zig");
-const full_text_indexes = @import("full_text_indexes.zig");
-const json_helpers = @import("json_helpers.zig");
-const table_reads = @import("table_read_source.zig");
-const coverage_policy_mod = @import("coverage_policy.zig");
-const table_create_contract = @import("table_create_contract.zig");
+const schema_mod = @import("antfly_local_sources").schema_mod;
+const runtime_schema_mod = @import("antfly_local_sources").storage_schema;
+const algebraic_mod = @import("antfly_local_sources").storage_db_algebraic_mod;
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const table_reads = @import("antfly_local_sources").api_table_read_source;
+const coverage_policy_mod = @import("antfly_local_sources").api_coverage_policy;
+const table_create_contract = @import("antfly_local_sources").api_table_create_contract;
 
-pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
-pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
+pub const default_full_text_index_name = @import("antfly_local_sources").api_local_tables.default_full_text_index_name;
+
+pub const default_indexes_json = @import("antfly_local_sources").api_local_tables.default_indexes_json;
+
 pub const max_table_name_bytes: usize = 255;
 pub const max_table_initial_ranges: u32 = metadata_topology_protocol.max_initial_ranges;
 pub const table_initial_ranges_error_message = std.fmt.comptimePrint(
@@ -75,12 +77,12 @@ pub fn validateTableMutationName(table_name: []const u8) !void {
 /// publication. Public names keep their existing 255-byte validation contract.
 pub fn validateInternalTableMutationName(table_name: []const u8) !void {
     if (table_name.len <= max_table_name_bytes) return validateTableMutationName(table_name);
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     try catalog.validateStorageName(table_name);
 }
 
 test "system catalog maximum restore identity can be dropped internally" {
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const component: [catalog.max_name_bytes]u8 = @splat('a');
     const name = try catalog.restoreStorageNameAlloc(std.testing.allocator, "table:00000000000000000000000000000000", .{ .database = &component, .namespace = &component, .table = &component });
     defer std.testing.allocator.free(name);
@@ -131,18 +133,7 @@ test "create table rejects unbounded initial shard fanout" {
     );
 }
 
-fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: bool) !void {
-    if (value != .object) return error.InvalidCreateTableRequest;
-    var index_it = value.object.iterator();
-    while (index_it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-        if (trusted_catalog) {
-            coverage_policy_mod.validateStoredIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
-        } else {
-            coverage_policy_mod.validateIndexConfig(entry.value_ptr.*) catch return error.InvalidCreateTableRequest;
-        }
-    }
-}
+const validateIndexesValue = @import("antfly_local_sources").api_local_tables.validateIndexesValue;
 
 pub fn validateIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
@@ -152,11 +143,7 @@ pub fn validateIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !
 
 /// Validates metadata read from Antfly-owned durable catalogs or backup
 /// manifests. Public request paths must use validateIndexesJson instead.
-pub fn validateStoredIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch return error.InvalidCreateTableRequest;
-    defer parsed.deinit();
-    try validateIndexesValue(parsed.value, true);
-}
+pub const validateStoredIndexesJson = @import("antfly_local_sources").api_local_tables.validateStoredIndexesJson;
 
 fn normalizeRawCreateTableIndexesAlloc(
     alloc: std.mem.Allocator,
@@ -164,6 +151,8 @@ fn normalizeRawCreateTableIndexesAlloc(
     comptime preserve_canonical_default: bool,
 ) ![]u8 {
     if (value != .object) return error.InvalidCreateTableRequest;
+    // Trusted, normalized catalogs may explicitly omit search indexes.
+    if (preserve_canonical_default and value.object.count() == 0) return alloc.dupe(u8, "{}");
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -233,16 +222,12 @@ fn normalizeRawCreateTableIndexesAlloc(
     }
     return try out.toOwnedSlice(alloc);
 }
-pub const default_schema_json = "{\"version\":0,\"default_type\":\"doc\",\"enforce_types\":false,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"additionalProperties\":true,\"x-antfly-dynamic-indexing\":{\"mode\":\"infer_types\"}}}}}";
+pub const default_schema_json = @import("antfly_local_sources").api_local_tables.default_schema_json;
 
-pub fn effectiveSchemaJson(schema_json: ?[]const u8) []const u8 {
-    if (schema_json) |value| {
-        if (value.len > 0) return value;
-    }
-    return default_schema_json;
-}
+pub const effectiveSchemaJson = @import("antfly_local_sources").api_local_tables.effectiveSchemaJson;
 
-pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
+pub const ParsedTableSchema = @import("antfly_local_sources").api_local_tables.ParsedTableSchema;
+
 pub const LsmStorageStatus = struct {
     // Table status intentionally exposes a compact operational snapshot. Full
     // low-level WAL and scheduler counters remain available through metrics.
@@ -343,7 +328,7 @@ pub const LsmStorageStatus = struct {
 };
 
 pub const TableStorageStatus = struct {
-    source_vectors: ?@import("../storage/artifact_payload.zig").Stats = null,
+    source_vectors: ?@import("antfly_local_sources").storage_artifact_payload.Stats = null,
     table_name: []const u8,
     empty: bool,
     disk_usage: ?u64 = null,
@@ -362,7 +347,7 @@ pub fn freeTableStorageStatuses(alloc: std.mem.Allocator, statuses: []TableStora
 }
 
 fn readerPinCount(counts: [lsm_backend.reader_pin_kind_count]u64, kind: lsm_backend.ReaderPinKind) u64 {
-    return counts[@intFromEnum(kind)];
+    return counts[@backingInt(kind)];
 }
 
 pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {
@@ -741,7 +726,7 @@ fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) s
                 break :blk out;
             }
             var out: T = undefined;
-            inline for (info.fields) |field| @field(out, field.name) = try cloneSchemaProjection(field.type, alloc, @field(value, field.name));
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(out, reflected_name) = try cloneSchemaProjection(field_type, alloc, @field(value, reflected_name));
             break :blk out;
         },
         .@"union" => switch (value) {
@@ -1094,7 +1079,7 @@ pub fn buildSingleTableIndexWithRuntimeSchemaDebugValue(
     return value;
 }
 
-pub const CreateTableRequest = table_create_contract.CreateTableRequest;
+pub const CreateTableRequest = @import("antfly_local_sources").api_local_tables.CreateTableRequest;
 
 pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
     return parseCreateTableRequestWithOptions(alloc, body, false);
@@ -1169,11 +1154,11 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     if (root.get("tablespace_name")) |value| {
         if (value != .null) {
             if (value != .string) return error.InvalidCreateTableRequest;
-            try @import("../system_catalog/domain.zig").validateName(value.string);
+            try @import("antfly_local_sources").system_catalog_domain.validateName(value.string);
             req.tablespace_name = try alloc.dupe(u8, value.string);
         }
     }
-    if (root.get("storage")) |value| req.storage = try @import("../common/table_storage.zig").Settings.parse(value);
+    if (root.get("storage")) |value| req.storage = try @import("antfly_local_sources").common_table_storage.Settings.parse(value);
 
     if (root.get("num_shards")) |value| {
         if (value != .null) req.num_shards = try parseU32Field(value);
@@ -1203,7 +1188,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
             defer alloc.free(encoded_schema);
-            const validated_schema = parseSchemaUpdateRequest(alloc, encoded_schema) catch |err| switch (err) {
+            const validated_schema = @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, encoded_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -1215,7 +1200,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             };
             var normalized_schema_owned = true;
             errdefer if (normalized_schema_owned) alloc.free(normalized_schema);
-            validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
+            // Unpublished inference drafts are resolved at public creation
+            // ingress before strict metadata/catalog admission.
+            var draft = try std.json.parseFromSlice(std.json.Value, alloc, normalized_schema, .{});
+            defer draft.deinit();
+            const docs = draft.value.object.get("document_schemas");
+            const pending = draft.value.object.get("base_source") != null and (docs == null or docs.? == .null or (docs.? == .object and docs.?.object.count() == 0));
+            if (!pending) validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -1239,52 +1230,9 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
     return req;
 }
 
-pub fn expandSchemaDerivedAlgebraicIndexesAlloc(
-    alloc: std.mem.Allocator,
-    table_name: []const u8,
-    indexes_json: []const u8,
-    schema_json: []const u8,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len > 0) indexes_json else default_indexes_json, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return try alloc.dupe(u8, indexes_json),
-    };
+pub const expandSchemaDerivedAlgebraicIndexesAlloc = @import("antfly_local_sources").api_local_tables.expandSchemaDerivedAlgebraicIndexesAlloc;
 
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const arena = arena_impl.allocator();
-    var object = std.json.ObjectMap.empty;
-    var changed = false;
-    var it = root.iterator();
-    while (it.next()) |entry| {
-        const value = if (isSchemaDerivedAlgebraicIndex(entry.value_ptr.*)) blk: {
-            if (schema_json.len == 0) return error.InvalidCreateTableRequest;
-            changed = true;
-            break :blk try schemaDerivedAlgebraicIndexValueAlloc(arena, table_name, schema_json, entry.value_ptr.*);
-        } else try cloneJsonValueAlloc(arena, entry.value_ptr.*);
-        try object.put(arena, try arena.dupe(u8, entry.key_ptr.*), value);
-    }
-    if (!changed) return try alloc.dupe(u8, indexes_json);
-    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = object }, .{ .emit_null_optional_fields = false });
-}
-
-pub fn expandSchemaDerivedAlgebraicIndexAlloc(
-    alloc: std.mem.Allocator,
-    table_name: []const u8,
-    index_json: []const u8,
-    schema_json: []const u8,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
-    defer parsed.deinit();
-    if (!isSchemaDerivedAlgebraicIndex(parsed.value)) return try alloc.dupe(u8, index_json);
-    if (schema_json.len == 0) return error.InvalidCreateTableRequest;
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const value = try schemaDerivedAlgebraicIndexValueAlloc(arena_impl.allocator(), table_name, schema_json, parsed.value);
-    return try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
-}
+pub const expandSchemaDerivedAlgebraicIndexAlloc = @import("antfly_local_sources").api_local_tables.expandSchemaDerivedAlgebraicIndexAlloc;
 
 pub fn validatePublicAlgebraicIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
@@ -1303,13 +1251,7 @@ pub fn validatePublicAlgebraicIndexJson(alloc: std.mem.Allocator, index_json: []
     try validatePublicAlgebraicIndexValue(parsed.value);
 }
 
-fn isSchemaDerivedAlgebraicIndex(value: std.json.Value) bool {
-    if (value != .object) return false;
-    const type_value = value.object.get("type") orelse return false;
-    if (type_value != .string or !std.mem.eql(u8, type_value.string, "algebraic")) return false;
-    const derive_value = value.object.get("derive_from_schema") orelse return false;
-    return derive_value == .bool and derive_value.bool;
-}
+const isSchemaDerivedAlgebraicIndex = @import("antfly_local_sources").api_local_tables.isSchemaDerivedAlgebraicIndex;
 
 fn validatePublicAlgebraicIndexValue(value: std.json.Value) !void {
     if (value != .object) return;
@@ -1326,41 +1268,8 @@ fn validatePublicAlgebraicIndexValue(value: std.json.Value) !void {
     }
 }
 
-fn schemaDerivedAlgebraicIndexValueAlloc(
-    alloc: std.mem.Allocator,
-    table_name: []const u8,
-    schema_json: []const u8,
-    source: std.json.Value,
-) !std.json.Value {
-    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, table_name, schema_json);
-    defer alloc.free(config_json);
-    var derived = try parseJsonValueAlloc(alloc, config_json);
-    if (derived != .object) return error.InvalidCreateTableRequest;
-    try derived.object.put(alloc, try alloc.dupe(u8, "type"), .{ .string = try alloc.dupe(u8, "algebraic") });
+const schemaDerivedAlgebraicIndexValueAlloc = @import("antfly_local_sources").api_local_tables.schemaDerivedAlgebraicIndexValueAlloc;
 
-    var it = source.object.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "derive_from_schema")) continue;
-        if (isAlgebraicInternalConfigField(entry.key_ptr.*)) continue;
-        try derived.object.put(
-            alloc,
-            try alloc.dupe(u8, entry.key_ptr.*),
-            try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
-        );
-    }
-    return derived;
-}
-
-/// Regenerate the schema-derived config for every algebraic index in
-/// `indexes_json` from `schema_json`. Used on schema update so that a
-/// dynamic-template change refreshes the durable algebraic `dynamic_field_rules`
-/// (and capability fingerprint) without requiring the table to be recreated.
-///
-/// Public algebraic indexes are always schema-derived, so each is regenerated
-/// in full. User-managed runtime policy and materialization definitions are
-/// preserved from the stored config, then revalidated against the regenerated
-/// schema before publication. Returns the original bytes when there are no
-/// algebraic indexes to refresh.
 pub fn regenerateAlgebraicIndexesFromSchemaAlloc(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -1487,43 +1396,9 @@ fn regenerateAlgebraicIndexValueAlloc(
     return derived;
 }
 
-fn isAlgebraicInternalConfigField(field: []const u8) bool {
-    const internal_fields = [_][]const u8{
-        "materializations",
-        "group_fields",
-        "measure_fields",
-        "time_fields",
-        "dynamic_field_rules",
-        "dynamic_rules_backfill_pending",
-        "joins",
-        "laws",
-        "capability_fingerprint",
-        "capability_lifecycle_status",
-        "capability_change_added_fields",
-        "capability_change_removed_fields",
-        "capability_change_changed_type_fields",
-    };
-    for (internal_fields) |internal| {
-        if (std.mem.eql(u8, field, internal)) return true;
-    }
-    return false;
-}
+const isAlgebraicInternalConfigField = @import("antfly_local_sources").api_local_tables.isAlgebraicInternalConfigField;
 
-pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
-    const min_ranges = req.num_shards orelse 1;
-    return .{
-        .storage = req.storage orelse .{},
-        .table_id = deriveId(table_name, 0x54424c45),
-        .name = table_name,
-        .description = req.description orelse "",
-        .schema_json = effectiveSchemaJson(req.schema_json),
-        .indexes_json = req.indexes_json orelse default_indexes_json,
-        .replication_sources_json = req.replication_sources_json orelse "[]",
-        .placement_role = "data",
-        .desired_replica_count = 3,
-        .min_ranges = min_ranges,
-    };
-}
+pub const deriveTableRecord = @import("antfly_local_sources").api_local_tables.deriveTableRecord;
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
     return deriveInitialRangeForGeneration(table, 0);
@@ -1723,9 +1598,7 @@ pub fn applySchemaMutationRecord(
     return try applySchemaUpdateRecord(alloc, table, schema_json);
 }
 
-pub fn parseValidatedTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !ParsedTableSchema {
-    return try schema_mod.parseValidatedTableSchema(alloc, schema_json);
-}
+pub const parseValidatedTableSchema = @import("antfly_local_sources").api_local_tables.parseValidatedTableSchema;
 
 pub fn validateBatchWritesAgainstTableSchema(
     alloc: std.mem.Allocator,
@@ -1735,17 +1608,9 @@ pub fn validateBatchWritesAgainstTableSchema(
     try schema_mod.validateBatchWritesAgainstTableSchema(alloc, schema, writes);
 }
 
-pub fn validateWritesAgainstTableSchema(
-    alloc: std.mem.Allocator,
-    schema: ParsedTableSchema,
-    writes: anytype,
-) !void {
-    try schema_mod.validateWritesAgainstTableSchema(alloc, schema, writes);
-}
+pub const validateWritesAgainstTableSchema = @import("antfly_local_sources").api_local_tables.validateWritesAgainstTableSchema;
 
-pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !@import("../storage/schema.zig").TableSchema {
-    return try schema_mod.deriveRuntimeTableSchema(alloc, schema);
-}
+pub const deriveRuntimeTableSchema = @import("antfly_local_sources").api_local_tables.deriveRuntimeTableSchema;
 
 pub fn applySchemaUpdateRecord(
     alloc: std.mem.Allocator,
@@ -1764,7 +1629,7 @@ pub fn applySchemaUpdateRecordWithIncarnation(
     schema_json: []const u8,
     incarnation: u64,
 ) !metadata_table_manager.TableRecord {
-    if (!@import("../storage/coverage_identity.zig").isValid(incarnation)) return error.InvalidIndexConfig;
+    if (!@import("antfly_local_sources").storage_coverage_identity.isValid(incarnation)) return error.InvalidIndexConfig;
     return applySchemaRecord(alloc, table, schema_json, false, false, incarnation);
 }
 
@@ -1814,11 +1679,11 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
 }
 
 fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64) !metadata_table_manager.TableRecord {
-    try @import("../schema/relational_index_namespace.zig").validate(alloc, schema_json, table.indexes_json);
+    try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const schema_changed = !try schemasSemanticallyEqual(alloc, table.schema_json, schema_json);
     if (schema_changed and !rewrite) {
-        try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, table.schema_json, schema_json);
+        try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
             return error.ForeignKeyGenerationPublicationRequired;
     }
@@ -1871,9 +1736,9 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
 /// canonical fingerprints as the owner catalog, so JSON spelling/order and
 /// unrelated layout changes do not turn a safe update into a false conflict.
 pub fn foreignKeyDefinitionsUnchanged(alloc: std.mem.Allocator, previous_json: []const u8, next_json: []const u8) !bool {
-    const schema_api = @import("../schema/mod.zig");
-    const native = @import("../storage/schema.zig");
-    const declarations = @import("../schema/relational_declarations.zig");
+    const schema_api = @import("antfly_local_sources").schema_mod;
+    const native = @import("antfly_local_sources").storage_schema;
+    const declarations = @import("antfly_local_sources").schema_relational_declarations;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const a = scratch.allocator();
@@ -1979,10 +1844,10 @@ fn validateNamedFullTextQueryIndexes(
     }
 }
 
-fn generatedSourceVectorStats(stats: @import("../storage/artifact_payload.zig").Stats) metadata_openapi.VectorSourceStorageStatus {
+fn generatedSourceVectorStats(stats: @import("antfly_local_sources").storage_artifact_payload.Stats) metadata_openapi.VectorSourceStorageStatus {
     var out: metadata_openapi.VectorSourceStorageStatus = .{};
-    inline for (@typeInfo(@TypeOf(stats)).@"struct".fields) |field| {
-        @field(out, field.name) = @intCast(@min(@field(stats, field.name), std.math.maxInt(i64)));
+    inline for (comptime std.meta.fieldNames(@TypeOf(stats))) |reflected_name| {
+        @field(out, reflected_name) = @intCast(@min(@field(stats, reflected_name), std.math.maxInt(i64)));
     }
     return out;
 }
@@ -2881,13 +2746,9 @@ fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType 
     return null;
 }
 
-fn parseJsonValueAlloc(alloc: std.mem.Allocator, body: []const u8) !std.json.Value {
-    return try json_helpers.parseOwnedJsonValueAllocAlways(alloc, body);
-}
+const parseJsonValueAlloc = @import("antfly_local_sources").api_local_tables.parseJsonValueAlloc;
 
-fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
-    return try json_helpers.cloneJsonValue(alloc, value);
-}
+const cloneJsonValueAlloc = @import("antfly_local_sources").api_local_tables.cloneJsonValueAlloc;
 
 fn buildTableRuntimeSchemaDebug(
     alloc: std.mem.Allocator,
@@ -4070,10 +3931,7 @@ pub fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: 
     return null;
 }
 
-fn deriveId(name: []const u8, seed: u64) u64 {
-    const id = std.hash.Wyhash.hash(seed, name);
-    return if (id == 0) 1 else id;
-}
+const deriveId = @import("antfly_local_sources").api_local_tables.deriveId;
 
 fn deriveDataGroupId(name: []const u8, seed: u64) u64 {
     return group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(seed, name));
@@ -4243,7 +4101,7 @@ test "relational declarations public schema preserves unsafe typed literals and 
     }
     const roundtrip = try std.json.Stringify.valueAlloc(alloc, active, .{});
     defer alloc.free(roundtrip);
-    try @import("../schema/relational_expression.zig").validateSchemaUpdate(alloc, source, roundtrip);
+    try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, source, roundtrip);
     var old = try schema_mod.CompiledTableValidator.init(alloc, source);
     defer old.deinit(alloc);
     var next = try schema_mod.CompiledTableValidator.init(alloc, roundtrip);
@@ -6424,7 +6282,7 @@ test "system catalog stored create preserves tablespace and storage ownership to
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("serving", decoded.tablespace_name.?);
     try std.testing.expectEqual(@as(?u32, 1), decoded.num_shards);
-    try std.testing.expectEqual(@import("../common/table_storage.zig").DenseEmbeddings.vector_store, decoded.storage.?.dense_embeddings);
+    try std.testing.expectEqual(@import("antfly_local_sources").common_table_storage.DenseEmbeddings.vector_store, decoded.storage.?.dense_embeddings);
 }
 
 test "system catalog definition cache shares immutable content and protects hot entries from scans" {
@@ -6612,4 +6470,34 @@ test "system catalog detail preserves replication runtime through its projection
     defer std.testing.allocator.free(listed);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"action_hint\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "\"status\":{\"source_kind\":\"postgres\"") == null);
+}
+
+test "relational declarations metadata generated update admission precedes catalog publication" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"x","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"y","expression":{"op":"column","column":"x"}},{"column":"z","expression":{"op":"column","column":"y"}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"z":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const manager = @import("antfly_local_sources").metadata_local_catalog;
+    const tables = @This();
+    const table: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = json, .indexes_json = "{}" };
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const arena = parsed.arena.allocator();
+    const declarations = parsed.value.object.getPtr("generated_columns").?.array.items;
+    std.mem.swap(std.json.Value, &declarations[0], &declarations[1]);
+    const default_value = parsed.value.object.getPtr("column_defaults").?.array.items[0].object.getPtr("expression").?.object.getPtr("value").?;
+    default_value.* = .{ .string = "4" };
+    const reordered = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
+    const updated = try tables.applySchemaUpdateRecord(alloc, &table, reordered);
+    defer manager.freeTable(alloc, updated);
+    const y_expression = declarations[1].object.getPtr("expression").?;
+    y_expression.* = (try std.json.parseFromSlice(std.json.Value, arena, "{\"op\":\"literal\",\"type\":\"integer\",\"value\":99}", .{})).value;
+    const changed = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
+    try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &table, changed));
+    try std.testing.expectEqualStrings(json, table.schema_json);
+    _ = parsed.value.object.orderedRemove("generated_columns");
+    const removed = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
+    try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &table, removed));
+    const plain: manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = removed, .indexes_json = "{}" };
+    try std.testing.expectError(error.GeneratedColumnRewriteRequired, tables.applySchemaUpdateRecord(alloc, &plain, json));
 }

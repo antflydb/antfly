@@ -1,6 +1,7 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
 import importlib.util
+import os
 import shutil
 import subprocess
 import tempfile
@@ -101,14 +102,14 @@ class PruneTests(unittest.TestCase):
     def test_zig_cache_hit_and_source_rebuild_after_pruning(self):
         with tempfile.TemporaryDirectory() as root:
             project = Path(root).resolve()
-            # The self-hosted Linux Debug backend emits no disposable object.
+            # The self-hosted Linux debug backend emits no disposable object.
             # Select LLVM so this integration test actually exercises pruning.
             (project / "build.zig").write_text(
                 'const std = @import("std");\n'
                 "pub fn build(b: *std.Build) void {\n"
                 " const t = b.addTest(.{ .root_module = b.createModule(.{\n"
                 '  .root_source_file = b.path("test.zig"),\n'
-                "  .target = b.graph.host, .optimize = .Debug,\n"
+                "  .target = b.graph.host, .optimize = .debug,\n"
                 " }), .use_llvm = true });\n"
                 ' b.step("test", "run").dependOn(&b.addRunArtifact(t).step);\n'
                 "}\n"
@@ -124,13 +125,16 @@ class PruneTests(unittest.TestCase):
                 "test",
                 "--cache-dir",
                 str(cache),
-                "--global-cache-dir",
-                str(project / "global"),
             ]
 
             def build():
                 result = subprocess.run(
-                    command, cwd=project, capture_output=True, text=True, check=False
+                    command,
+                    cwd=project,
+                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(project / "global")},
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

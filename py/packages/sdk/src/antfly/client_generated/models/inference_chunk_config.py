@@ -24,7 +24,10 @@ class InferenceChunkConfig:
         Attributes:
             model (str | Unset): The chunking model to use. Either 'fixed' for simple token-based chunking, or a model name
                 from models/chunkers/{name}/. Default: 'fixed'. Example: fixed.
-            max_chunks (int | Unset): Maximum number of chunks to generate per document.
+            max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (the default when omitted)
+                means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks
+                beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially
+                truncated.
             threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0). Used by ONNX text models and
                 VAD audio models.
             text (TextChunkOptions | Unset): Options specific to text chunking.

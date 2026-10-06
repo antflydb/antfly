@@ -15,19 +15,19 @@
 //! Transport-independent system catalog admission, capability fencing, and
 //! exact receipt completion. Logical and physical table identities are separate.
 const std = @import("std");
-const domain = @import("domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const storage = @import("../metadata/storage/raft_apply_store.zig");
 const protocol = @import("../metadata/topology_protocol.zig");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const tables_api = @import("../api/tables.zig");
 const indexes_api = @import("../api/indexes.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const table_manager = @import("../metadata/table_manager.zig");
-const settings = @import("settings.zig");
+const settings = @import("antfly_local_sources").system_catalog_settings;
 
 pub const Request = domain.Request;
 
-pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
+pub fn storeRootMutation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     const enroll = input == .store_root_enroll;
     if (enroll and !context.setting_admin) return error.Forbidden;
     if (!enroll and input != .fk_initial_retirement_ack) return error.InvalidArgument;
@@ -75,7 +75,8 @@ pub fn storeRootEnrollmentStatus(svc: anytype, alloc: std.mem.Allocator, context
 pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: Request) ![]u8 {
     try context.ensureActive();
     if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.system_catalog_version);
+    const required_version = if (request.mutation.kind == .table and request.mutation.action == .drop) protocol.system_catalog_drop_version else protocol.system_catalog_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
@@ -109,6 +110,15 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         command.mutation.storage_name = storage_name;
         command.topology = .{ .create = .{ .expected_transition_generation = generation, .table = table, .ranges = ranges } };
     } else if (request.create_table_json != null) return error.InvalidCatalogMutation;
+    if (request.mutation.action == .drop and request.mutation.kind == .table) {
+        const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
+        const table = (try store.resolveSystemCatalogTable(a, svc.metadata_group_id, target)) orelse return error.CatalogNotFound;
+        const drop = try svc.captureTableDropAdmission(a, table.name);
+        if (drop.table_id != table.table_id) return error.TableGenerationChanged;
+        command.mutation.table_id = drop.table_id;
+        command.mutation.storage_name = drop.expected_name;
+        command.topology = .{ .drop = .{ .table_id = drop.table_id, .expected_name = drop.expected_name, .expected_transition_generation = drop.expected_transition_generation, .range_contract = .{ .membership = drop.range_membership } } };
+    }
     if (request.mutation.action == .set_tablespace and request.mutation.kind == .table) {
         const target: domain.Target = .{ .database = request.mutation.database, .namespace = request.mutation.namespace, .table = request.mutation.name };
         const current = (try store.resolveSystemCatalogTable(a, svc.metadata_group_id, target)) orelse return error.TableNotFound;
@@ -130,7 +140,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
     var expected_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
     if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
-    if (command.topology) |topology| svc.verifyTableCreateProjection(a, topology.create.table, topology.create.ranges) catch return error.MetadataMutationOutcomeUnknown;
+    if (command.topology) |topology| switch (topology) {
+        .create => |create| svc.verifyTableCreateProjection(a, create.table, create.ranges) catch return error.MetadataMutationOutcomeUnknown,
+        .drop => |drop| svc.verifyTableDropProjection(a, drop.table_id) catch return error.MetadataMutationOutcomeUnknown,
+    };
     return result;
 }
 
@@ -157,7 +170,7 @@ pub fn settingSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: oper
     return store.sqlSettingSnapshotJson(alloc, svc.metadata_group_id, scope);
 }
 
-pub fn policySnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("policies.zig").SnapshotRequest) ![]u8 {
+pub fn policySnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("antfly_local_sources").system_catalog_policies.SnapshotRequest) ![]u8 {
     try context.ensureActive();
     if (request.table_id == 0 or request.principal.len == 0 or request.database.len == 0) return error.InvalidRowPolicyRecord;
     // This principal-independent catalog read cannot assert roles. The API
@@ -173,7 +186,7 @@ pub fn policySnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: opera
     return store.sqlPolicySnapshotJson(alloc, svc.metadata_group_id, request.table_id, request.principal, request.database, request.roles);
 }
 
-pub fn policyInstallSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("policies.zig").InstallRequest) ![]u8 {
+pub fn policyInstallSnapshotJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("antfly_local_sources").system_catalog_policies.InstallRequest) ![]u8 {
     try context.ensureActive();
     if (!context.row_policy_install_authority or request.table_id == 0 or
         request.expected_generation == 0 or request.expected_catalog_epoch == 0)
@@ -199,14 +212,14 @@ pub fn policyPublicationWorkJson(svc: anytype, alloc: std.mem.Allocator, context
     return store.sqlPolicyPublicationWorkJson(alloc, svc.metadata_group_id, after_table_id);
 }
 
-pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("policies.zig").BeginRequest) ![]u8 {
+pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("antfly_local_sources").system_catalog_policies.BeginRequest) ![]u8 {
     if (!context.setting_admin or !context.row_policy_install_authority or request.table_id == 0) return error.Forbidden;
     try context.ensureActive();
     try svc.ensureLinearizableReadWithContext(context);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const bytes = try store.sqlPolicyBeginCommandJson(alloc, svc.metadata_group_id, request);
     defer alloc.free(bytes);
-    var command = try std.json.parseFromSlice(@import("policies.zig").PublicationCommand, alloc, bytes, .{});
+    var command = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.PublicationCommand, alloc, bytes, .{});
     defer command.deinit();
     return mutatePolicyPublication(svc, alloc, context, command.value);
 }
@@ -215,7 +228,7 @@ pub fn beginPolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: o
 /// metadata apply repeats the topology/ACK checks before committing. An
 /// ambiguous proposal is reconciled by reading publication status, not by
 /// blindly resubmitting a transition.
-pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("policies.zig").PublicationCommand) ![]u8 {
+pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.PublicationCommand) ![]u8 {
     if (!context.setting_admin or !context.row_policy_install_authority) return error.Forbidden;
     try context.ensureActive();
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
@@ -240,11 +253,11 @@ pub fn mutatePolicyPublication(svc: anytype, alloc: std.mem.Allocator, context: 
     return std.json.Stringify.valueAlloc(alloc, observed, .{});
 }
 
-fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("policies.zig").Command) ![]u8 {
+fn serializePolicyDefinitionCommand(alloc: std.mem.Allocator, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(alloc);
     defer output.deinit();
     var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
-    try @import("../storage/db/relational_integrity_json.zig").write(command, &stream);
+    try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
     return output.toOwnedSlice();
 }
 
@@ -252,7 +265,7 @@ test "policy definition command serializes logical JSON literals without map poi
     const alloc = std.testing.allocator;
     var literal = try std.json.parseFromSlice(std.json.Value, alloc, "{\"roles\":[\"reader\"],\"enabled\":true}", .{});
     defer literal.deinit();
-    const command: @import("policies.zig").Command = .{
+    const command: @import("antfly_local_sources").system_catalog_policies.Command = .{
         .expected_revision = 1,
         .change = .{ .put = .{
             .id = 1,
@@ -269,7 +282,7 @@ test "policy definition command serializes logical JSON literals without map poi
     const bytes = try serializePolicyDefinitionCommand(alloc, command);
     defer alloc.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "\"enabled\":true") != null);
-    var decoded = try std.json.parseFromSlice(@import("policies.zig").Command, alloc, bytes, .{});
+    var decoded = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_policies.Command, alloc, bytes, .{});
     defer decoded.deinit();
     try std.testing.expect(decoded.value.change.put.using.?.instructions[0].operation.literal.object.get("enabled").?.bool);
 }
@@ -373,7 +386,7 @@ pub fn mutateFkInitialCreate(svc: anytype, alloc: std.mem.Allocator, context: op
 /// administrator service grant; this transition never installs an owner
 /// bundle or flips the serving publication. Ambiguous outcomes require a
 /// status read rather than replaying an uncertain command.
-pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("policies.zig").Command) ![]u8 {
+pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: @import("antfly_local_sources").system_catalog_policies.Command) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_row_policy_publication_version);
@@ -460,7 +473,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
     return result;
 }
 
-pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: domain.Call) ![]u8 {
+pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     return switch (input) {
         .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
         .policy_snapshot => |request| policySnapshotJson(svc, alloc, context, request),

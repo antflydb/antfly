@@ -16,10 +16,10 @@
 //! regular file under an exclusive generation lease, recording a durable byte
 //! cursor; then use the same source conversion/verifier as online migration.
 const std = @import("std");
-const db = @import("db/db.zig");
-const contract = @import("../common/vector_migration.zig");
+const db = @import("antfly_local_sources").storage_db_db;
+const contract = @import("antfly_local_sources").common_vector_migration;
 const files = @import("../common/migration_files.zig");
-const fs = @import("../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const progress_file = "VECTOR-MIGRATION-COPY.json";
@@ -153,7 +153,7 @@ fn copyChunk(alloc: Allocator, io: std.Io, live: []const u8, staging: []const u8
 pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Request, options: Options) !Result {
     try request.validate();
     if (request.mode != .offline) return error.InvalidVectorMigrationState;
-    var transition = try @import("db/generation_lifecycle.zig").beginProcessExclusiveWithRuntimeAndIo(root, options.open.backend_runtime, io);
+    var transition = try @import("antfly_local_sources").storage_db_generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(root, options.open.backend_runtime, io);
     defer transition.deinit();
     try transition.reconcilePublished();
     const live = transition.path;
@@ -182,7 +182,7 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
             }
             if (job.value.active() or job.value.published()) return error.VectorMigrationAlreadyExists;
         }
-        if (source.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
+        if (source.local_execution.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
         if (source.primary_backend != .lsm) return error.VectorStoreRequiresLocalSingleShardTable;
         const cancelled_path = try std.fs.path.join(alloc, &.{ live, cancellation_file });
         defer alloc.free(cancelled_path);
@@ -262,8 +262,8 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
     // rereads current artifacts and candidate keys in adjacent compressed
     // blocks; retain that bounded working set instead of rereading/decompressing
     // a block for each point check. Preserve caller-supplied caches and budgets.
-    const resources = @import("resource_manager.zig");
-    const lsm = @import("lsm_backend/mod.zig");
+    const resources = @import("antfly_local_sources").storage_resource_manager;
+    const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
     var owned_manager: ?*resources.ResourceManager = null;
     defer if (owned_manager) |manager| {
         manager.deinit(alloc);
@@ -325,7 +325,7 @@ pub fn run(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Req
 pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.Request, options: db.OpenOptions) !void {
     try request.validate();
     if (request.mode != .offline) return error.InvalidVectorMigrationState;
-    var transition = try @import("db/generation_lifecycle.zig").beginProcessExclusiveWithRuntimeAndIo(root, options.backend_runtime, io);
+    var transition = try @import("antfly_local_sources").storage_db_generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(root, options.backend_runtime, io);
     defer transition.deinit();
     try transition.reconcilePublished();
     var open = options;
@@ -337,7 +337,7 @@ pub fn cancel(alloc: Allocator, io: std.Io, root: []const u8, request: contract.
     const identity = blk: {
         var source = try db.DB.open(alloc, transition.path, open);
         defer source.close();
-        if (source.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
+        if (source.local_execution.table_storage.dense_embeddings != .primary_lsm) return error.VectorMigrationAlreadyPublished;
         if (try source.vectorMigrationStatus(alloc)) |raw| {
             defer alloc.free(raw);
             var job = try std.json.parseFromSlice(contract.Job, alloc, raw, .{});
@@ -391,7 +391,7 @@ const CopyCrashTest = struct {
     var fail_directory: ?[]const u8 = null;
     var stop_at: ?Boundary = null;
 
-    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+    pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         const sim: *@import("vopr").vopr_io.VoprIo = @ptrCast(@alignCast(userdata.?));
         const handle = sim.files.handles.get(file.handle) orelse return error.AccessDenied;
         if (!handle.directory) return sim.files.syncFile(file);

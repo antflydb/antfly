@@ -22,8 +22,8 @@ pub const Owner = struct {
     plan_digest: [32]u8,
     table: tables.TableRecord,
     range: tables.RangeRecord,
-    scope: @import("../storage/db/restore_staging_contract.zig").Scope,
-    empty_generation_handoff: ?@import("../storage/db/restore_staging_contract.zig").EmptyGenerationHandoffExpectation = null,
+    bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap,
+    scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope,
     cancel_recovery: bool = false,
 };
 pub const InitialOwner = struct {
@@ -57,7 +57,7 @@ pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.T
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
         if (!std.mem.eql(u8, &digest, &descriptor.public_schema_json_digest)) return error.InvalidGenerationPublication;
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, table.schema_json);
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
         defer parsed.deinit(alloc);
         if (parsed.version != descriptor.schema_version or parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
         var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, table.table_id, null);
@@ -134,14 +134,21 @@ pub fn validate(alloc: std.mem.Allocator, public_tables: []const tables.TableRec
                 if (!tables.rangeRecordsEqual(expected_range, actual_range)) return error.InvalidRestoreStaging;
                 const inserted = try seen_groups.getOrPut(alloc, range.group_id);
                 if (inserted.found_existing) return error.InvalidRestoreStaging;
-                const bootstrap = try staging.ownerBootstrapForRangeIndex(alloc, parsed.value.plan, parsed.value.plan_digest, target, range_index);
+                var bootstrap = try staging.ownerBootstrapForRangeIndex(alloc, parsed.value.plan, parsed.value.plan_digest, target, range_index);
+                // Retain the complete immutable proof, borrowing strings from
+                // the projection rather than the temporary decoded job.
+                bootstrap.table_name = actual.name;
+                bootstrap.schema_json = actual.schema_json;
+                bootstrap.read_schema_json = actual.read_schema_json;
+                bootstrap.indexes_json = actual.indexes_json;
+                bootstrap.byte_range = .{ .start = actual_range.start_key, .end = actual_range.end_key orelse "" };
                 try owners.append(alloc, .{
                     .plan_id = parsed.value.plan.id,
                     .plan_digest = parsed.value.plan_digest,
                     .table = actual,
                     .range = actual_range,
+                    .bootstrap = bootstrap,
                     .scope = bootstrap.scope,
-                    .empty_generation_handoff = bootstrap.empty_generation_handoff,
                     .cancel_recovery = parsed.value.state == .canceling,
                 });
             }
@@ -221,7 +228,7 @@ test "initial FK private owner is exact, unpublished, and supports schema epoch 
     const schema_json = "{\"version\":0,\"storage_mode\":\"relational\"}";
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, 7, null);
     defer compiled.deinit();
@@ -268,6 +275,23 @@ test "private provisioning validates immutable hidden owners and rejects forged 
     var table_values = [_]tables.TableRecord{target.table};
     var range_values = [_]tables.RangeRecord{target.ranges[0]};
     var projection: staging.ProvisioningProjection = .{ .tables = &table_values, .ranges = &range_values, .jobs_json = &.{bytes} };
+    var portable_target = target;
+    portable_target.source_table_name = "source";
+    portable_target.target_schema_digest = try staging.runtimeSchemaDigestForTable(alloc, target.table.schema_json);
+    var portable_artifacts = [_]staging.SourceArtifact{target.source_artifacts[0]};
+    portable_artifacts[0].format = .portable;
+    portable_target.source_artifacts = &portable_artifacts;
+    const proof_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(portable_artifacts[0].source_namespace, &.{});
+    portable_target.source_generation_admissions = &.{.{ .target_group_id = 701, .source_namespace = portable_artifacts[0].source_namespace, .entries = &.{}, .digest = proof_digest }};
+    const portable_plan: staging.Plan = .{ .id = plan.id, .cohort_digest = plan.cohort_digest, .targets = &.{portable_target} };
+    const portable_job: staging.Job = .{ .plan = portable_plan, .plan_digest = try portable_plan.digest(alloc) };
+    const portable_bytes = try std.json.Stringify.valueAlloc(alloc, portable_job, .{});
+    var portable_projection = projection;
+    portable_projection.jobs_json = &.{portable_bytes};
+    const portable_owners = try validate(alloc, &.{}, &.{}, portable_projection);
+    const canonical = try staging.ownerBootstrapForRangeIndex(alloc, portable_plan, portable_job.plan_digest, portable_target, 0);
+    try std.testing.expectEqualDeep(proof_digest, portable_owners[0].bootstrap.source_generation_proof_digest.?);
+    try std.testing.expectEqualStrings(try canonical.encode(alloc), try portable_owners[0].bootstrap.encode(alloc));
     const owners = try validate(alloc, &.{}, &.{}, projection);
     try std.testing.expectEqual(@as(usize, 1), owners.len);
     try std.testing.expectEqual(@as(u64, 701), owners[0].range.group_id);

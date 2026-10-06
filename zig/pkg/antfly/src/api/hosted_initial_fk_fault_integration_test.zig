@@ -109,11 +109,11 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer if (metadata_alive) metadata.deinit();
     try metadata.start();
     try metadata.bootstrapLocal(2193, 1);
-    var meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+    var meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     var meta_raft_alive = true;
     defer if (meta_raft_alive) meta_raft.deinit();
     try meta_raft.start();
-    var meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+    var meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     var meta_control_alive = true;
     defer if (meta_control_alive) meta_control.deinit();
     try meta_control.start();
@@ -153,11 +153,11 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         };
         break;
     } else return error.StoreRegistrationNotVisible;
-    var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+    var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     var data_raft_alive = true;
     defer if (data_raft_alive) data_raft.deinit();
     try data_raft.start();
-    var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+    var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     var data_control_alive = true;
     defer if (data_control_alive) data_control.deinit();
     try data_control.start();
@@ -191,7 +191,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
     // Hosted owner receipts require explicit administrator enrollment of the
     // physical store key; ordinary service registration cannot authorize it.
-    const signing_root = try @import("../storage/db/root_signing_identity.zig").load(alloc, io, data_root);
+    const signing_root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, data_root);
     const proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
         .metadata_incarnation = (try metadata.server.svc.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable,
         .node_id = 9,
@@ -207,7 +207,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer enrolled.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), enrolled.status);
     for (peers, 0..) |peer, index| if (peer) |active| {
-        const peer_root = try @import("../storage/db/root_signing_identity.zig").load(alloc, io, active.replica_root);
+        const peer_root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, active.replica_root);
         const node_id: u64 = 10 + @as(u64, @intCast(index));
         const peer_proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
             .metadata_incarnation = proof.identity.metadata_incarnation,
@@ -258,10 +258,13 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     const reader = mounted_api.table_reads orelse return error.Unavailable;
     var ready = false;
     var last_error: ?anyerror = null;
-    for (0..128) |_| {
+    // A production-cadence election can exceed 128 short polling sleeps.
+    // Bound this read-only readiness barrier by elapsed time instead.
+    const ready_deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < ready_deadline) {
         const observed = reader.lookup(alloc, parent_name.?, parent_start.?, .{
             .relational_topology_json = "{\"mode\":\"identity\"}",
-            .execution_deadline_ns = platform.time.monotonicNs() +| 500 * std.time.ns_per_ms,
+            .execution_deadline_ns = @min(ready_deadline, platform.time.monotonicNs() +| 500 * std.time.ns_per_ms),
         }, .read_index) catch |err| {
             last_error = err;
             try io.sleep(.fromMilliseconds(20), .awake);
@@ -270,7 +273,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         if (observed) |value| {
             var response = value;
             defer response.deinit(alloc);
-            const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const Identity = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
             var identity = try std.json.parseFromSlice(Identity, alloc, response.json, .{ .ignore_unknown_fields = true });
             defer identity.deinit();
             try std.testing.expectEqual(parent_table_id, identity.value.namespace.table_id);
@@ -330,7 +333,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
             const index: usize = if (peers[0].?.server.data_raft.?.raftStatus(before.group_id).?.id != leader) 0 else 1;
             const node_id: u64 = 10 + @as(u64, @intCast(index));
             const active = peers[index].?;
-            const expected_phase: @import("../storage/db/relational_initial_child_publication.zig").Phase = if (scenario == .cancel_offline) .hidden else .released;
+            const expected_phase: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase = if (scenario == .cancel_offline) .hidden else .released;
             const applied_deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
             while (platform.time.monotonicNs() < applied_deadline) {
                 if (try active.server.readHiddenInitialChildRecord(before.group_id, child_id)) |cold| {
@@ -379,7 +382,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         }
         if (!leadership_transfer and !restarted and before.phase == .published_hidden) {
             const cold_before = (try data.readHiddenInitialChildRecord(before.group_id, child_id)) orelse return error.MissingHiddenReceipt;
-            try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.hidden, cold_before.phase);
+            try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.hidden, cold_before.phase);
             data_control.deinit();
             data_control_alive = false;
             data_raft.deinit();
@@ -412,10 +415,10 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
             try metadata.bootstrapLocal(2193, 1);
             meta_api = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
             try driver.pauseBackground(meta_api, io);
-            meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+            meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             meta_raft_alive = true;
             try meta_raft.start();
-            meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+            meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
             meta_control_alive = true;
             try meta_control.start();
             const reopen_deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
@@ -457,10 +460,10 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
                 };
                 break;
             } else return error.StoreRegistrationNotVisible;
-            data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+            data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             data_raft_alive = true;
             try data_raft.start();
-            data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+            data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
             data_control_alive = true;
             try data_control.start();
             const next_base = try data.baseUri(alloc);
@@ -531,7 +534,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
             // The surviving current owner remains released. Retirement of a
             // historical root must neither cancel nor unlink this public root.
             const current = (try data.readHiddenInitialChildRecord(completed.group_id, child_id)) orelse return error.CurrentPublishedOwnerRemoved;
-            try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.released, current.phase);
+            try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.released, current.phase);
             try std.testing.expect((try pendingTicket(alloc, &metadata, 9, completed.group_id)) == null);
             try metadata.server.svc.cancelNodeShutdown(node_id);
         }
@@ -542,7 +545,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     try std.testing.expectEqual(@as(usize, 1), completed.released);
     if (leadership_transfer) _ = try peers_api.awaitThreeVoters(io, &data, .{ peers[0].?, peers[1].? }, completed.group_id);
     const released = (try data.readHiddenInitialChildRecord(completed.group_id, child_id)) orelse return error.MissingHiddenReceipt;
-    try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.released, released.phase);
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.released, released.phase);
     var visible = try metadata.server.svc.adminSnapshot();
     defer metadata.server.svc.freeAdminSnapshot(&visible);
     var children: usize = 0;

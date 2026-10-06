@@ -6,7 +6,7 @@
 //! queue; pressure drops retention, never authenticated query results.
 const std = @import("std");
 const cache_mod = @import("cache.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const max_jobs = 32;
 pub const max_bytes = 16 * 1024 * 1024;

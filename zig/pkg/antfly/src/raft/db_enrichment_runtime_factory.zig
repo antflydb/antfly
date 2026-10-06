@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 
 pub const GroupDbPathResolver = struct {
@@ -127,7 +127,7 @@ const DbRuntimeHandle = struct {
         }
     }
 
-    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+    pub fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.db) |db| {
             db.close();
@@ -139,7 +139,7 @@ const DbRuntimeHandle = struct {
 };
 
 test "open db runtime factory starts real db enrichment runtime handles" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
     const Resolver = struct {
         root: []const u8,
@@ -206,8 +206,8 @@ test "open db runtime factory overrides enrichment owner id when configured" {
 }
 
 test "open db runtime factory preserves lease fencing across owner takeover" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
-    const db_types = @import("../storage/db/types.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
+    const db_types = @import("antfly_local_sources").storage_db_types;
 
     const Resolver = struct {
         root: []const u8,

@@ -49,7 +49,7 @@ AutoSchemaKG's results that matter for Antfly:
 ## Non-Goals
 
 - No new node model. `GraphNodeModel` stays `{document, external}`
-  (`pkg/antfly/src/storage/db/catalog/index_manager.zig`); entities, events,
+  (`pkg/antfly-embedded/src/local/storage/db/catalog/index_manager.zig`); entities, events,
   and concepts are ordinary documents in dedicated tables.
 - No new artifact format. All stages emit the existing `extraction_graph`
   shape consumed by `runtimeGraphWritesFromArtifactValueAlloc`.
@@ -259,6 +259,38 @@ artifact carries both classes, each with its own `resolution_artifact` (see
 two artifacts). Everything downstream — durable edge artifacts, generation
 binding, visibility inheritance, replay, split/merge — is the existing
 autograph machinery, unchanged.
+
+Graph document cleanup follows the producing document. Clearing an endpoint
+withdraws its own assertions; independently owned facts survive, even for
+legacy tuple edges with no edge ID. Primary endpoint cleanup checks endpoint tables and emits exact
+incident deletions separately from producer clears. Replay compaction therefore subsumes graph mutations only
+when their producer is cleared, never merely because a target key is cleared.
+Legacy membership has a producer-ordered metadata directory, maintained with
+reverse adjacency. Writable open upgrades historical stores once through
+bounded, durably checkpointed pages before admitting document mutations. Cleanup seeks a producer's range and
+retires its contribution history and TTL entries in bounded pages without
+hydrating surviving payloads. Recovery identities remain durable until the
+outgoing and reverse commits complete.
+
+An explicit relationship delete retires that assertion, including retained
+projection inputs. Expiring a source contribution may select another live
+contributor, but an explicit delete stays deleted through replay and rebuild.
+A new producing-document lifecycle or an exact relationship write may revive
+it; source inputs retained from the deleted lifecycle cannot do so on their own.
+
+The distributed cleanup planner and its caller share
+`GraphEndpointCleanupStatus`. Its `merge_artifacts` field carries binary-safe
+owner replay afterimages alongside guards, graph deletes, and queue deletes.
+The internal batch codec validates this complete guarded maintenance command;
+public batch requests cannot supply these fields. Dropping afterimages would
+leave owner jobs stuck at their old phase. Ordered application uses the local
+receipt contract, while the server adapter owns consensus and replication
+policy (see `docs/design/local-replication-boundary.md`).
+Cleanup planning requires both background scheduling permission and current
+write admission through the generic replication gate, including its pinned
+owner generation. A denied owner leaves maintenance queued; ordered replay
+can still apply the primary's exact page. Execution rechecks admission at the
+ordinary mutation commit barriers.
 
 Relation edges are entity-sourced with document ownership: a relation whose
 endpoints reference extraction entities materializes only once resolution

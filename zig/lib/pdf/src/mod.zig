@@ -1470,7 +1470,7 @@ const RenderLanePageCache = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (&self.entries) |*slot| if (slot.*) |entry| {
             self.backing.rawFree(entry.bytes, entry.alignment, @returnAddress());
             slot.* = null;
@@ -2908,7 +2908,7 @@ fn encryptType1EexecAlloc(alloc: Allocator, plain: []const u8) ![]u8 {
 
 test "mock pdf backend interface compiles" {
     const Mock = struct {
-        fn extract(_: *const anyopaque, alloc: Allocator, _: []const u8) ![]u8 {
+        pub fn extract(_: *const anyopaque, alloc: Allocator, _: []const u8) ![]u8 {
             return try alloc.dupe(u8, "pdf text");
         }
 
@@ -3087,10 +3087,10 @@ test "native backend renders embedded fixture pdf first page png" {
 test "parsed rendering releases reader-owned runs with the reader allocator" {
     const fixture = @embedFile("../testdata/simple_text_fixture.pdf");
 
-    var reader_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(reader_gpa.deinit() == .ok);
-    var output_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(output_gpa.deinit() == .ok);
+    var reader_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x50444601 });
+    defer std.debug.assert(reader_gpa.deinit() == 0);
+    var output_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x50444602 });
+    defer std.debug.assert(output_gpa.deinit() == 0);
 
     var parsed = try reader.Reader.init(reader_gpa.allocator(), fixture);
     defer parsed.deinit();
@@ -5200,7 +5200,7 @@ test "immutable render fork template supports concurrent encrypted readers" {
     };
 
     const worker_count = 4;
-    var workers = [_]Worker{.{ .template = &fork_template }} ** worker_count;
+    var workers = @as([worker_count]Worker, @splat(.{ .template = &fork_template }));
     var threads: [worker_count]std.Thread = undefined;
     for (&threads, &workers) |*thread, *worker|
         thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
@@ -5319,7 +5319,7 @@ test "prepared page plans preserve batch output and reject another source" {
     const parallel_scratch = try estimatePreparedPageRenderWaveScratchBytes(&parsed, &plans, 2, 12);
     try std.testing.expect(serial_scratch > try parsed.renderForkMetadataBytes());
     try std.testing.expect(parallel_scratch > serial_scratch);
-    var uneven = [_]PreparedPageRenderPlan{plans[0]} ** 6;
+    var uneven = @as([6]PreparedPageRenderPlan, @splat(plans[0]));
     const uneven_pixels = [_]u64{ 1, 1, 100, 100, 1, 1 };
     for (&uneven, uneven_pixels) |*plan, pixels| plan._geometry.pixels = pixels;
     const worker_fixed = try parsed.renderForkMetadataBytes();

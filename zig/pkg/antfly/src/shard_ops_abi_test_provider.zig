@@ -17,8 +17,8 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 const shard = @import("raft/shard_ops.zig");
 const actions = @import("metadata/transition_actions.zig");
 const state = @import("metadata/transition_state.zig");
-const errors = @import("runtime_error_abi.zig");
-const Cancel = @import("common/cancellation.zig").CancellationToken;
+const errors = @import("antfly_runtime_abi").error_abi;
+const Cancel = @import("antfly_cancellation").CancellationToken;
 
 fn check(ptr: *anyopaque, context: u64) !void {
     if (context != 42) return error.InvalidArgument;
@@ -52,8 +52,8 @@ fn operation(comptime name: []const u8) @FieldType(shard.ShardOperationAdapter.V
 }
 const vtable: shard.ShardOperationAdapter.VTable = blk: {
     var value: shard.ShardOperationAdapter.VTable = undefined;
-    for (std.meta.fields(shard.ShardOperationAdapter.VTable)) |field| {
-        @field(value, field.name) = if (std.mem.eql(u8, field.name, "topology_read")) topology else if (std.mem.eql(u8, field.name, "observe_split")) observeSplit else if (std.mem.eql(u8, field.name, "observe_merge")) observeMerge else operation(field.name);
+    for (std.meta.fieldNames(shard.ShardOperationAdapter.VTable)) |reflected_name| {
+        @field(value, reflected_name) = if (std.mem.eql(u8, reflected_name, "topology_read")) topology else if (std.mem.eql(u8, reflected_name, "observe_split")) observeSplit else if (std.mem.eql(u8, reflected_name, "observe_merge")) observeMerge else operation(reflected_name);
     }
     break :blk value;
 };
@@ -66,7 +66,7 @@ export fn shard_adapter_test_error_ordinal(failure: errors.Status) callconv(.c) 
 
 export fn routed_batch_test_provider(out: *@import("api/internal_group_operations.zig").RoutedRaftBatchWriter, failure: *errors.Status) callconv(.c) void {
     const Fixture = struct {
-        fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: @import("api/internal_group_operations.zig").RoutedBatchAuthority, group_id: u64, table: []const u8, request: @import("antfly_source_root").antfly_sources.selected_db.types.BatchRequest, forwarding: @import("api/internal_batch_forwarding.zig").Context, context: @import("api/operation.zig").RequestContext) !?void {
+        fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: @import("api/internal_group_operations.zig").RoutedBatchAuthority, group_id: u64, table: []const u8, request: @import("antfly_source_root").antfly_sources.selected_db.types.BatchRequest, forwarding: @import("api/internal_batch_forwarding.zig").Context, context: @import("antfly_local_sources").api_operation.RequestContext) !?void {
             try context.ensureActive();
             try check(ptr, 42);
             if (authority != .transaction or !std.mem.eql(u8, table, "rows") or request.writes.len != 1 or
@@ -116,10 +116,10 @@ export fn raft_batcher_test_provider(out: *@import("api/table_writes.zig").RaftB
         .txn_status_group_local_until = Fixture.statusUntil,
     } };
 }
-export fn shard_adapter_test_call_contract(out: *@import("runtime_native_abi.zig").CallContract) callconv(.c) void {
+export fn shard_adapter_test_call_contract(out: *@import("antfly_runtime_abi").native_abi.CallContract) callconv(.c) void {
     const Callback = @FieldType(shard.ShardOperationAdapter.VTable, "catch_up_merge_receiver");
     const Args = std.meta.ArgsTuple(@typeInfo(Callback).pointer.child);
-    out.* = @import("runtime_native_abi.zig").CallContract.of("catch_up_merge_receiver", Callback, Args, void);
+    out.* = @import("antfly_runtime_abi").native_abi.CallContract.of("catch_up_merge_receiver", Callback, Args, void);
 }
 export fn shard_adapter_test_callback_name(size: *usize) callconv(.c) [*]const u8 {
     const name = @typeName(@FieldType(shard.ShardOperationAdapter.VTable, "catch_up_merge_receiver"));
@@ -147,3 +147,6 @@ export fn restore_persistence_test_provider(out: *@import("api/restore_jobs.zig"
     };
     out.* = Jobs.ReplicatedPersistence.fromLocal(&Fixture.marker, .{ .load = Fixture.load, .get = Fixture.get, .put = Fixture.put, .delete = Fixture.delete, .delete_many = Fixture.deleteMany, .create_with_staging = Fixture.create });
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

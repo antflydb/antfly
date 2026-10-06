@@ -56,7 +56,7 @@ Lookup rules:
 
 Current helpers:
 
-- `go/pkg/antfly/src/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
+- `go/pkg/antfly-embedded/src/local/storage/db/artifact_ids.zig` encodes and decodes public artifact IDs and
   reconstructs internal keys from `ArtifactRef`.
 - `DB.getArtifact` looks up a stored artifact by public artifact ID.
 - `antfly_decode_artifact_id_json` decodes a public artifact ID to
@@ -132,6 +132,14 @@ boundary once 64 deferred provider requests have been queued, executes full
 provider batches, publishes that partial output
 durably, and releases the request/chunk caches before inspecting more source
 documents. `ANTFLY_ENRICHMENT_PREPARATION_WINDOW_ITEMS` can tune this quantum.
+
+The derived-record publication window itself defaults to 64 items
+(`ANTFLY_ENRICHMENT_WINDOW_ITEMS`), matching the preparation quantum above, so
+status (`total_indexed`, coverage) advances within a few seconds instead of
+only at the end of one large window. Raise it for throughput-sensitive
+deployments that would rather amortize publish overhead over a larger batch
+of derived records; the total time to drain a given backlog is unaffected by
+this knob, only how often progress becomes visible while draining it.
 Deferred asset work retains lightweight request references, not materialized
 documents or provider payloads. The execution lane materializes compatible
 batches bounded by both item count and retained bytes (including raw documents,
@@ -283,7 +291,8 @@ being configured with an unbounded model cache (`max_loaded_models = 0` for
 Lite's `createEmbeddedInferenceNode`, see `standalone/inference_provider.zig`)
 specifically so an interleaved/concurrent extract+embed workload does not
 evict and reload either model between batches. The worker-subprocess RPC
-transport (`standalone/inference_worker.zig`, `inference_worker_rpc.zig`)
+transport (`pkg/inference/src/host/worker.zig`,
+`pkg/inference/src/host/worker_rpc.zig`)
 already multiplexes concurrent in-flight requests by request ID over one
 pipe pair, so the two lanes' provider calls can be genuinely in flight at
 the same time without any transport-level change.

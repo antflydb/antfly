@@ -36,11 +36,27 @@ pub fn build(b: *std.Build) void {
         pjrt_test_found = profiles.addPjrtQualificationProbe(b, artifact) or pjrt_test_found;
         if (std.mem.eql(u8, artifact.name, "antfly-inference")) {
             // Exercise the real executable's final links without its large body.
-            artifact.root_module.root_source_file = b.addWriteFiles().add("inference_link.zig",
-                \\pub fn main() void {
-                \\    @import("std").debug.print("INFERENCE_VERSION {s}\n", .{@import("build_info").version()});
-                \\}
-            );
+            profiles.addObservabilityProbe(artifact.root_module, artifact.root_module.import_table.get("inference").?);
+            const inference = artifact.root_module.import_table.get("inference").?;
+            if (inference.import_table.get("pjrt")) |pjrt|
+                artifact.root_module.addImport("cache_pjrt", pjrt);
+            const pjrt_probe = if (inference.import_table.contains("pjrt"))
+                "    @import(\"std\").debug.print(\"PJRT_PRODUCT_REVISION {d}\\n\", .{@import(\"cache_pjrt\").cache_test_revision});\n"
+            else
+                "";
+            artifact.root_module.root_source_file = b.addWriteFiles().add("inference_link.zig", std.mem.concat(b.allocator, u8, &.{
+                profiles.observability_probe_source ++
+                    \\pub fn main() void {
+                    \\    @import("std").debug.print("INFERENCE_VERSION {s}\n", .{@import("build_info").version()});
+                    \\    @import("std").debug.print("OBSERVABILITY_REVISION {d} {d}\n", .{
+                    \\        observabilityRevision(@import("cache_prometheus")),
+                    \\        observabilityRevision(@import("cache_structlog")),
+                    \\    });
+                ,
+                "\n",
+                pjrt_probe,
+                "}\n",
+            }) catch @panic("OOM"));
             b.step("cache-inference", "Link the actual inference dependency graph").dependOn(&b.addRunArtifact(artifact).step);
         }
         if (std.mem.eql(u8, artifact.name, "generate-gemma4-pilot-dataset")) {
@@ -51,7 +67,7 @@ pub fn build(b: *std.Build) void {
                 else => {},
             };
             const run = b.addRunArtifact(artifact);
-            _ = run.addOutputFileArg("pilot.jsonl");
+            _ = run.addOutputFileArg2("pilot.jsonl", .{ .make_absolute = true });
             run.addArg("2");
             b.step("cache-pilot", "Generate actual pilot data").dependOn(&run.step);
             pilot_found = true;

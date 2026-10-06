@@ -17,18 +17,18 @@
 //! Each row page and its checkpoint share the ordinary durable 2PC decision.
 const std = @import("std");
 const metadata = @import("../metadata/relational_retirement.zig");
-const records = @import("../common/topology_records.zig");
-const native = @import("../storage/db/relational_integrity_retirement_contract.zig");
-const catalog_mod = @import("../storage/db/relational_integrity_catalog.zig");
-const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
-const planner = @import("relational_integrity_commit.zig");
-const reads = @import("table_read_source.zig");
-const writes = @import("table_write_source.zig");
-const contract = @import("distributed_txn_contract.zig");
-const schema_api = @import("../schema/mod.zig");
-const schema = @import("../storage/schema.zig");
+const records = @import("antfly_local_sources").common_topology_records;
+const native = @import("antfly_local_sources").storage_db_relational_integrity_retirement_contract;
+const catalog_mod = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
+const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
+const planner = @import("antfly_local_sources").api_relational_integrity_commit;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const writes = @import("antfly_local_sources").api_table_write_source;
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const schema_api = @import("antfly_local_sources").schema_mod;
+const schema = @import("antfly_local_sources").storage_schema;
 const Allocator = std.mem.Allocator;
-const Control = @import("operation.zig").RequestContext;
+const Control = @import("antfly_local_sources").api_operation.RequestContext;
 
 test "SQL catalog retirement permits only deletion of ordered indexes" {
     const alloc = std.testing.allocator;
@@ -60,9 +60,9 @@ fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8)
         for (indexes.array.items) |index| {
             const name = index.object.get("name") orelse return false;
             const prior = prior_indexes.get(name.string) orelse return false;
-            const prior_json = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(alloc, prior);
+            const prior_json = try @import("antfly_local_sources").storage_db_document_content_hash.canonicalJsonValueAlloc(alloc, prior);
             defer alloc.free(prior_json);
-            const current_json = try @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc(alloc, index);
+            const current_json = try @import("antfly_local_sources").storage_db_document_content_hash.canonicalJsonValueAlloc(alloc, index);
             defer alloc.free(current_json);
             if (!std.mem.eql(u8, prior_json, current_json)) return false;
         }
@@ -75,7 +75,7 @@ fn retainedSchemaEqual(alloc: Allocator, source: []const u8, target: []const u8)
     }
     // Exact decimal canonicalization accepts equivalent numeric spellings
     // without rounding large integers/decimals or losing small nonzero values.
-    const canonical = @import("../storage/db/document_content_hash.zig").canonicalJsonValueAlloc;
+    const canonical = @import("antfly_local_sources").storage_db_document_content_hash.canonicalJsonValueAlloc;
     const left = try canonical(alloc, before.value);
     defer alloc.free(left);
     const right = try canonical(alloc, after.value);
@@ -125,7 +125,7 @@ pub fn beginControlled(alloc: Allocator, reader: reads.TableReadSource, tables: 
     const target_runtime = try schema_api.deriveRuntimeTableSchema(owned, target);
     const target_bytes = try schema.serializeSchema(owned, target_runtime);
     const target_digest = metadata.digest(target_bytes);
-    const definitions = try @import("../schema/relational_declarations.zig").definitionFingerprints(owned, target, target_runtime);
+    const definitions = try @import("antfly_local_sources").schema_relational_declarations.definitionFingerprints(owned, target, target_runtime);
     var owners = std.ArrayList(metadata.Job.Owner).empty;
     for (ranges) |range| if (range.table_id == table.table_id) {
         if (range.restore_backup_id.len != 0) return error.TableTransitionActive;
@@ -186,7 +186,7 @@ pub fn beginControlled(alloc: Allocator, reader: reads.TableReadSource, tables: 
         const child = try schema_api.parseValidatedTableSchema(owned, candidate.schema_json);
         if (child.foreign_keys) |foreign| for (foreign.value) |fk| if (std.mem.eql(u8, fk.parent_table, table.name)) {
             if (drop) return error.ForeignKeyReferenced;
-            try @import("../schema/relational_foreign_key_target.zig").validate(owned, candidate.schema_json, table.name, target_json);
+            try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(owned, candidate.schema_json, table.name, target_json);
         };
     }
     const generation_set = activation.generationSet(catalog);
@@ -344,7 +344,7 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
         .generations = job.generations,
     };
     if (!std.mem.eql(u8, &progress.job_id, &job.id) or !std.mem.eql(u8, &progress.owner, &state.value.owner)) return error.ConstraintRetirementChanged;
-    if (state.value.progress == null or @intFromEnum(progress.phase) < @intFromEnum(expected_phase)) {
+    if (state.value.progress == null or @backingInt(progress.phase) < @backingInt(expected_phase)) {
         if (state.value.progress == null and expected_phase != .fenced) return error.ConstraintRetirementChanged;
         progress.phase = expected_phase;
         const command: native.Command = .{ .routing_key = owner_start, .expected = state.value.progress, .next = try progress.encode(owned) };
@@ -373,7 +373,7 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
             !std.mem.eql(u8, &proof.owner, &peer.value.owner) or proof.schema_version != catalog.schema_version or
             !std.mem.eql(u8, &proof.target_schema_digest, &job.target_schema_digest) or
             !std.mem.eql(u8, std.mem.sliceAsBytes(proof.generations), std.mem.sliceAsBytes(job.generations)) or
-            (job.phase != .fencing and @intFromEnum(proof.phase) <= @intFromEnum(expected_phase)))
+            (job.phase != .fencing and @backingInt(proof.phase) <= @backingInt(expected_phase)))
         {
             arena.deinit();
             return null;
@@ -459,7 +459,7 @@ test "distributed txn retirement verifies large owner barriers in bounded restar
         catalog: []const u8,
         reads_this_tick: usize = 0,
         expected_owner: usize = 0,
-        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, options: @import("../storage/db/types.zig").LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+        fn lookup(ptr: *anyopaque, allocator: Allocator, _: []const u8, key: []const u8, options: @import("antfly_local_sources").storage_db_types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (options.cancellation) |cancellation| try cancellation.check();
             self.reads_this_tick += 1;
@@ -482,16 +482,16 @@ test "distributed txn retirement verifies large owner barriers in bounded restar
             var output: std.Io.Writer.Allocating = .init(allocator);
             defer output.deinit();
             var json: std.json.Stringify = .{ .writer = &output.writer };
-            try @import("../storage/db/relational_integrity_json.zig").write(Status{ .catalog = self.catalog, .progress = progress, .owner = proof.owner, .range_start = owner.start, .range_end = owner.end }, &json);
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(Status{ .catalog = self.catalog, .progress = progress, .owner = proof.owner, .range_start = owner.start, .range_end = owner.end }, &json);
             return .{ .json = try allocator.dupe(u8, output.written()), .version = 0 };
         }
-        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: @import("../storage/db/types.zig").ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
+        fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: @import("antfly_local_sources").storage_db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
             return error.UnexpectedCall;
         }
-        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: @import("../storage/db/types.zig").SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: @import("antfly_local_sources").storage_db_types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
             return error.UnexpectedCall;
         }
-        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: @import("../storage/db/types.zig").BatchRequest) !?void {
+        fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: @import("antfly_local_sources").storage_db_types.BatchRequest) !?void {
             return error.UnexpectedCall;
         }
     };
@@ -521,7 +521,7 @@ test "distributed txn retirement verifies large owner barriers in bounded restar
 
 fn testRetirementDrain(pressure: RetirementPressure) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const types = @import("../storage/db/types.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -552,13 +552,13 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
         fn scan(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: read_gate.ReadConsistency) !?reads.ScanResponse {
             return error.UnexpectedCall;
         }
-        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: read_gate.ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: read_gate.ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
             return error.UnexpectedCall;
         }
         fn batch(_: *anyopaque, _: Allocator, _: []const u8, _: types.BatchRequest) !?void {
             return error.UnexpectedCall;
         }
-        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("../common/cancellation.zig").CancellationToken) !?contract.CommitOutcome {
+        fn commitBatch(ptr: *anyopaque, allocator: Allocator, requests: []const contract.TableCommitRequest, _: types.SyncLevel, cancellation: @import("antfly_cancellation").CancellationToken) !?contract.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try cancellation.check();
             try std.testing.expectEqual(@as(usize, 1), requests.len);

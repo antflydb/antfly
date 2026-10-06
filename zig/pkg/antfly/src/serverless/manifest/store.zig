@@ -15,7 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const manifest_types = @import("types.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const PublishResult = struct {
     published: bool,

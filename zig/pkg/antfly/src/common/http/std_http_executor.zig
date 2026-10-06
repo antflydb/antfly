@@ -14,9 +14,9 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const common = @import("http_common.zig");
-const std_http_listener = @import("std_http_listener.zig");
-const threaded_connect_io = @import("../threaded_connect_io.zig");
+const common = @import("antfly_local_sources").common_http_http_common;
+const std_http_listener = @import("antfly_local_sources").common_http_std_http_listener;
+const threaded_connect_io = @import("antfly_local_sources").common_threaded_connect_io;
 
 const cancellation_poll_interval_ms: i64 = 25;
 
@@ -387,7 +387,7 @@ pub const StdHttpExecutor = struct {
         while (header_it.next()) |header| : (header_index += 1)
             headers[header_index] = .{ .name = header.name, .value = header.value };
         try downstream.start(alloc, .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .content_type = response.head.content_type,
             .headers = headers,
         });
@@ -798,7 +798,7 @@ pub const StdHttpExecutor = struct {
         const connection_closing = if (request.connection) |connection| connection.closing else true;
         self.recordCompletedRequest(request_keep_alive, connection_closing);
         return .{
-            .status = @intFromEnum(response.head.status),
+            .status = @backingInt(response.head.status),
             .content_type = content_type,
             .headers = headers,
             .body = body,
@@ -956,9 +956,13 @@ fn shouldForwardRequestHeader(headers: []const common.RequestHeader, name: []con
 test "std http executor retains socket write failures and uncertain delivery" {
     const Inject = struct {
         var writes: std.atomic.Value(usize) = .init(0);
-        fn netWrite(_: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []const u8, _: []const []const u8, _: usize) std.Io.net.Stream.Writer.Error!usize {
-            _ = writes.fetchAdd(1, .monotonic);
-            return error.ConnectionResetByPeer;
+        var upstream: @FieldType(std.Io.VTable, "operate") = undefined;
+        fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            if (operation == .net_write) {
+                _ = writes.fetchAdd(1, .monotonic);
+                return .{ .net_write = error.ConnectionResetByPeer };
+            }
+            return upstream(context, operation);
         }
     };
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
@@ -969,7 +973,8 @@ test "std http executor retains socket write failures and uncertain delivery" {
     for ([_]common.Method{ .GET, .POST }) |method| {
         var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
         defer executor.deinit();
-        executor.io_vtable.netWrite = Inject.netWrite;
+        Inject.upstream = executor.io_vtable.operate;
+        executor.io_vtable.operate = Inject.operate;
         Inject.writes.store(0, .monotonic);
         var delivery: common.RequestDeliveryTracker = .{};
         try std.testing.expectError(error.ConnectionResetByPeer, executor.executor().execute(std.testing.allocator, .{
@@ -988,16 +993,21 @@ test "std http executor rejects truncated response without replaying a delivered
     const Inject = struct {
         var reads: std.atomic.Value(usize) = .init(0);
         var writes: std.atomic.Value(usize) = .init(0);
-        var net_write: *const fn (?*anyopaque, std.Io.net.Socket.Handle, []const u8, []const []const u8, usize) std.Io.net.Stream.Writer.Error!usize = undefined;
+        var upstream: @FieldType(std.Io.VTable, "operate") = undefined;
         var response: []const u8 = undefined;
-        fn netWrite(context: ?*anyopaque, handle: std.Io.net.Socket.Handle, header: []const u8, buffers: []const []const u8, splat: usize) std.Io.net.Stream.Writer.Error!usize {
-            _ = writes.fetchAdd(1, .monotonic);
-            return net_write(context, handle, header, buffers, splat);
-        }
-        fn netRead(_: ?*anyopaque, _: std.Io.net.Socket.Handle, buffers: [][]u8) std.Io.net.Stream.Reader.Error!usize {
-            if (reads.fetchAdd(1, .monotonic) != 0) return 0;
-            @memcpy(buffers[0][0..response.len], response);
-            return response.len;
+        fn operate(context: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+            switch (operation) {
+                .net_write => {
+                    _ = writes.fetchAdd(1, .monotonic);
+                },
+                .net_read => |request| {
+                    if (reads.fetchAdd(1, .monotonic) != 0) return .{ .net_read = .{ .data_len = 0 } };
+                    @memcpy(request.data[0][0..response.len], response);
+                    return .{ .net_read = .{ .data_len = response.len } };
+                },
+                else => {},
+            }
+            return upstream(context, operation);
         }
     };
     const Sink = struct {
@@ -1020,9 +1030,8 @@ test "std http executor rejects truncated response without replaying a delivered
     }) |response| for ([_]common.Method{ .GET, .POST }) |method| for ([_]bool{ false, true }) |streaming| {
         var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
         defer executor.deinit();
-        executor.io_vtable.netRead = Inject.netRead;
-        Inject.net_write = executor.io_vtable.netWrite;
-        executor.io_vtable.netWrite = Inject.netWrite;
+        Inject.upstream = executor.io_vtable.operate;
+        executor.io_vtable.operate = Inject.operate;
         Inject.response = response;
         Inject.reads.store(0, .monotonic);
         Inject.writes.store(0, .monotonic);
@@ -1342,7 +1351,7 @@ test "std http executor streams response metadata and body past buffered limit" 
         wrote_before_start: bool = false,
         body: std.ArrayListUnmanaged(u8) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.body.deinit(self.alloc);
         }
 

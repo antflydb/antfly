@@ -1,0 +1,1601 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const backend_erased = @import("../../backend_erased.zig");
+const change_journal_mod = @import("change_journal.zig");
+const docstore_mod = @import("../../docstore.zig");
+const internal_keys = @import("../../internal_keys.zig");
+const mem_backend_mod = @import("../../mem_backend.zig");
+const platform_time = @import("antfly_platform").time;
+
+pub const TargetHint = change_journal_mod.TargetHint;
+
+pub const PendingDocumentGroup = struct {
+    sequence: u64,
+    doc_key: []const u8,
+};
+
+pub const StopReplayChunk = error{StopReplayChunk};
+
+const primary_store_fallback_scan_budget_min: usize = 256;
+const primary_store_fallback_scan_budget_max: usize = 4096;
+
+pub const MatchingRecordStats = struct {
+    matched_entries: usize = 0,
+    scanned_entries: usize = 0,
+    hint_filter_skips: usize = 0,
+    scan_batches: usize = 0,
+    last_sequence: u64 = 0,
+
+    pub fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
+        self.matched_entries += other.matched_entries;
+        self.scanned_entries += other.scanned_entries;
+        self.hint_filter_skips += other.hint_filter_skips;
+        self.scan_batches += other.scan_batches;
+        self.last_sequence = @max(self.last_sequence, other.last_sequence);
+    }
+};
+
+pub const MatchingCursor = struct {
+    /// Statistics from the latest collection attempt, including accepted
+    /// entries before a consumer error. Rejected lookahead is not counted.
+    last_scan_stats: MatchingRecordStats = .{},
+    state: union(enum) {
+        journal: JournalMatchingCursor,
+        primary_store: PrimaryStoreMatchingCursor,
+    },
+
+    pub fn canFollowTail(self: *const MatchingCursor) bool {
+        return switch (self.state) {
+            .journal => true,
+            .primary_store => false,
+        };
+    }
+
+    pub fn deinit(self: *MatchingCursor, alloc: Allocator) void {
+        _ = alloc;
+        switch (self.state) {
+            .journal => {},
+            .primary_store => |*cursor| cursor.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    pub fn forEachNext(
+        self: *MatchingCursor,
+        max_matched_entries: usize,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    ) !MatchingRecordStats {
+        self.last_scan_stats = .{};
+        return switch (self.state) {
+            .journal => |*cursor| journalMatchingCursorForEachNext(
+                cursor,
+                &self.last_scan_stats,
+                max_matched_entries,
+                ctx,
+                consume,
+            ),
+            .primary_store => |*cursor| primaryStoreMatchingCursorForEachNext(
+                cursor,
+                &self.last_scan_stats,
+                max_matched_entries,
+                ctx,
+                consume,
+            ),
+        };
+    }
+};
+
+pub const Source = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        open_matching_cursor: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            from_sequence: u64,
+            hint: TargetHint,
+        ) anyerror!MatchingCursor,
+        for_each_matching_record: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            from_sequence: u64,
+            hint: TargetHint,
+            max_matched_entries: usize,
+            ctx: *anyopaque,
+            consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        ) anyerror!MatchingRecordStats,
+        latest_matching_sequence: *const fn (
+            ptr: *anyopaque,
+            alloc: Allocator,
+            from_sequence: u64,
+            hint: TargetHint,
+        ) anyerror!u64,
+        collect_enrichment_document_groups: *const fn (ptr: *anyopaque, alloc: Allocator, from_sequence: u64) anyerror![]PendingDocumentGroup,
+        is_sequence_visible: *const fn (ptr: *anyopaque, sequence: u64) anyerror!bool,
+    };
+
+    pub fn fromJournal(journal: *change_journal_mod.Journal) Source {
+        return .{
+            .ptr = journal,
+            .vtable = &journal_vtable,
+        };
+    }
+
+    pub fn fromPrimaryStore(store: *docstore_mod.DocStore, fallback_journal: ?*change_journal_mod.Journal, resource_manager: anytype) Source {
+        _ = resource_manager;
+        _ = fallback_journal;
+        return .{
+            .ptr = store,
+            .vtable = &primary_store_vtable,
+        };
+    }
+
+    pub fn forEachMatchingRecord(
+        self: Source,
+        alloc: Allocator,
+        from_sequence: u64,
+        hint: TargetHint,
+        max_matched_entries: usize,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    ) !MatchingRecordStats {
+        return try self.vtable.for_each_matching_record(
+            self.ptr,
+            alloc,
+            from_sequence,
+            hint,
+            max_matched_entries,
+            ctx,
+            consume,
+        );
+    }
+
+    pub fn openMatchingCursor(
+        self: Source,
+        alloc: Allocator,
+        from_sequence: u64,
+        hint: TargetHint,
+    ) !MatchingCursor {
+        return try self.vtable.open_matching_cursor(self.ptr, alloc, from_sequence, hint);
+    }
+
+    pub fn latestMatchingSequence(self: Source, alloc: Allocator, from_sequence: u64, hint: TargetHint) !u64 {
+        return try self.vtable.latest_matching_sequence(self.ptr, alloc, from_sequence, hint);
+    }
+
+    pub fn collectEnrichmentDocumentGroups(self: Source, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
+        return try self.vtable.collect_enrichment_document_groups(self.ptr, alloc, from_sequence);
+    }
+
+    pub fn isSequenceVisible(self: Source, sequence: u64) !bool {
+        return try self.vtable.is_sequence_visible(self.ptr, sequence);
+    }
+};
+
+pub fn freePendingDocumentGroups(alloc: Allocator, groups: []PendingDocumentGroup) void {
+    for (groups) |group| alloc.free(group.doc_key);
+    alloc.free(groups);
+}
+
+const journal_vtable = Source.VTable{
+    .open_matching_cursor = journalOpenMatchingCursor,
+    .for_each_matching_record = journalForEachMatchingRecord,
+    .latest_matching_sequence = journalLatestMatchingSequence,
+    .collect_enrichment_document_groups = journalCollectEnrichmentDocumentGroups,
+    .is_sequence_visible = journalIsSequenceVisible,
+};
+
+const primary_store_vtable = Source.VTable{
+    .open_matching_cursor = primaryStoreOpenMatchingCursor,
+    .for_each_matching_record = primaryStoreForEachMatchingRecord,
+    .latest_matching_sequence = primaryStoreLatestMatchingSequence,
+    .collect_enrichment_document_groups = primaryStoreCollectEnrichmentDocumentGroups,
+    .is_sequence_visible = primaryStoreIsSequenceVisible,
+};
+
+const JournalMatchingCursor = struct {
+    alloc: Allocator,
+    journal: *change_journal_mod.Journal,
+    next_sequence: u64,
+    hint: TargetHint,
+};
+
+const PrimaryStoreMatchingCursor = struct {
+    store: *docstore_mod.DocStore,
+    kind_ordinal: u8,
+    hint: TargetHint,
+    next_sequence: u64,
+    scan_lane_ordinal: u8,
+    scan_txn: ?docstore_mod.DocStore.Txn = null,
+    cursor: ?backend_erased.Cursor = null,
+    entry: ?backend_erased.Entry = null,
+    fallback_all: bool = false,
+    hint_exhausted: bool = false,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.cursor) |*cursor| cursor.close();
+        if (self.scan_txn) |*txn| txn.abort();
+        self.* = undefined;
+    }
+
+    fn openLane(self: *@This(), lane_ordinal: u8) !void {
+        std.debug.assert(self.scan_txn == null);
+        std.debug.assert(self.cursor == null);
+        var txn = try self.store.beginReplayLaneScanTxn(lane_ordinal, self.next_sequence + 1);
+        errdefer txn.abort();
+        var scan_cursor = try txn.openCursor();
+        errdefer scan_cursor.close();
+        const lower = internal_keys.replayRangeLower(lane_ordinal, self.next_sequence + 1);
+        const entry = try scan_cursor.seekAtOrAfter(lower[0..]);
+        self.scan_lane_ordinal = lane_ordinal;
+        self.scan_txn = txn;
+        self.cursor = scan_cursor;
+        self.entry = if (entry) |kv|
+            if (internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) != null) kv else null
+        else
+            null;
+    }
+};
+
+fn primaryStoreFallbackScanBudget(max_matched_entries: usize) usize {
+    if (max_matched_entries == 0) return primary_store_fallback_scan_budget_max;
+    const requested = max_matched_entries *| 32;
+    return @min(@max(requested, primary_store_fallback_scan_budget_min), primary_store_fallback_scan_budget_max);
+}
+
+fn journalMatchingCursorForEachNext(
+    cursor: *JournalMatchingCursor,
+    stats_out: *MatchingRecordStats,
+    max_matched_entries: usize,
+    ctx: *anyopaque,
+    consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+) !MatchingRecordStats {
+    const log_mod = @import("derived_log.zig");
+    const Scan = struct {
+        cursor: *JournalMatchingCursor,
+        max_matched: usize,
+        consumer_ctx: *anyopaque,
+        consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+        stats: MatchingRecordStats = .{ .scan_batches = 1 },
+
+        fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (!try change_journal_mod.encodedRecordHasHint(entry.payload, self.cursor.hint)) {
+                self.stats.scanned_entries += 1;
+                self.stats.hint_filter_skips += 1;
+                self.cursor.next_sequence = entry.sequence;
+                return .@"continue";
+            }
+            self.consume(self.consumer_ctx, entry.sequence, entry.payload) catch |err| switch (err) {
+                StopReplayChunk.StopReplayChunk => return .stop,
+                else => return err,
+            };
+            self.stats.scanned_entries += 1;
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = entry.sequence;
+            self.cursor.next_sequence = entry.sequence;
+            return if (self.max_matched != 0 and self.stats.matched_entries >= self.max_matched) .stop else .@"continue";
+        }
+    };
+    var scan = Scan{ .cursor = cursor, .max_matched = max_matched_entries, .consumer_ctx = ctx, .consume = consume };
+    defer stats_out.* = scan.stats;
+    // Payloads are borrowed only while collecting. The stream closes its read
+    // transaction before apply, and rejected lookahead remains at the cursor.
+    try cursor.journal.iterateOpaqueFromStreamingWithContext(cursor.next_sequence + 1, &scan, Scan.visit);
+    return scan.stats;
+}
+
+fn primaryStoreMatchingCursorForEachNext(
+    cursor: *PrimaryStoreMatchingCursor,
+    stats_out: *MatchingRecordStats,
+    max_matched_entries: usize,
+    ctx: *anyopaque,
+    consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+) !MatchingRecordStats {
+    if (cursor.hint_exhausted) return .{};
+    var stats = MatchingRecordStats{ .scan_batches = 1 };
+    defer stats_out.* = stats;
+    const max_scanned_entries = if (cursor.fallback_all)
+        primaryStoreFallbackScanBudget(max_matched_entries)
+    else
+        std.math.maxInt(usize);
+
+    while (cursor.entry) |entry| {
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.scan_lane_ordinal) orelse {
+            cursor.entry = null;
+            break;
+        };
+        if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(entry.value, cursor.hint)) {
+            stats.scanned_entries += 1;
+            stats.hint_filter_skips += 1;
+            stats.last_sequence = sequence;
+            cursor.next_sequence = sequence;
+            cursor.entry = try cursor.cursor.?.next();
+            if (stats.scanned_entries >= max_scanned_entries) return stats;
+            continue;
+        }
+
+        consume(ctx, sequence, entry.value) catch |err| switch (err) {
+            // Keep this entry current: the builder rejected it before taking
+            // ownership, so the following replay window must retry it.
+            StopReplayChunk.StopReplayChunk => return stats,
+            else => return err,
+        };
+        stats.scanned_entries += 1;
+        stats.matched_entries += 1;
+        stats.last_sequence = sequence;
+        cursor.next_sequence = sequence;
+        cursor.entry = try cursor.cursor.?.next();
+        if (max_matched_entries != 0 and stats.matched_entries >= max_matched_entries) return stats;
+    }
+    cursor.hint_exhausted = true;
+    return stats;
+}
+
+fn primaryStoreForEachMatchingRecordFallbackAll(
+    store: *docstore_mod.DocStore,
+    from_sequence: u64,
+    hint: TargetHint,
+    max_matched_entries: usize,
+    max_scanned_entries: usize,
+    ctx: *anyopaque,
+    consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+) !MatchingRecordStats {
+    const Context = struct {
+        consumer_ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        hint: TargetHint,
+        max_matched_entries: usize,
+        stats: MatchingRecordStats = .{},
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            self.stats.scanned_entries += 1;
+            if (!try change_journal_mod.encodedRecordHasHint(payload, self.hint)) {
+                self.stats.hint_filter_skips += 1;
+                return;
+            }
+            try self.consume(self.consumer_ctx, sequence, payload);
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = sequence;
+            if (self.max_matched_entries != 0 and self.stats.matched_entries >= self.max_matched_entries) {
+                return StopReplayChunk.StopReplayChunk;
+            }
+        }
+    };
+
+    var callback_ctx = Context{
+        .consumer_ctx = ctx,
+        .consume = consume,
+        .hint = hint,
+        .max_matched_entries = max_matched_entries,
+    };
+    callback_ctx.stats.scan_batches = 1;
+    const replay_stats = store.forEachReplayLaneFrom(
+        internal_keys.replay_all_kind,
+        from_sequence + 1,
+        max_scanned_entries,
+        &callback_ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return .{},
+        StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
+        else => return err,
+    };
+    callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
+    callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
+    callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
+    callback_ctx.stats.last_sequence = @max(callback_ctx.stats.last_sequence, replay_stats.last_sequence);
+    return callback_ctx.stats;
+}
+
+fn journalOpenMatchingCursor(
+    ptr: *anyopaque,
+    alloc: Allocator,
+    from_sequence: u64,
+    hint: TargetHint,
+) !MatchingCursor {
+    const journal: *change_journal_mod.Journal = @ptrCast(@alignCast(ptr));
+    return .{
+        .state = .{
+            .journal = .{
+                .alloc = alloc,
+                .journal = journal,
+                .next_sequence = from_sequence,
+                .hint = hint,
+            },
+        },
+    };
+}
+
+fn primaryStoreOpenMatchingCursor(
+    ptr: *anyopaque,
+    alloc: Allocator,
+    from_sequence: u64,
+    hint: TargetHint,
+) !MatchingCursor {
+    _ = alloc;
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+
+    const kind_ordinal: u8 = @intCast(@backingInt(hint));
+    var out = MatchingCursor{
+        .state = .{
+            .primary_store = .{
+                .store = store,
+                .kind_ordinal = kind_ordinal,
+                .hint = hint,
+                .next_sequence = from_sequence,
+                .scan_lane_ordinal = kind_ordinal,
+            },
+        },
+    };
+    const cursor = &out.state.primary_store;
+    cursor.openLane(kind_ordinal) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => {
+            cursor.hint_exhausted = true;
+            return out;
+        },
+        else => return err,
+    };
+    if (cursor.entry == null and kind_ordinal != internal_keys.replay_all_kind) {
+        if (cursor.cursor) |*scan_cursor| scan_cursor.close();
+        cursor.cursor = null;
+        if (cursor.scan_txn) |*txn| txn.abort();
+        cursor.scan_txn = null;
+        cursor.fallback_all = true;
+        cursor.openLane(internal_keys.replay_all_kind) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => cursor.hint_exhausted = true,
+            else => return err,
+        };
+    }
+    if (cursor.entry == null) cursor.hint_exhausted = true;
+    return out;
+}
+
+fn journalForEachMatchingRecord(
+    ptr: *anyopaque,
+    alloc: Allocator,
+    from_sequence: u64,
+    hint: TargetHint,
+    max_matched_entries: usize,
+    ctx: *anyopaque,
+    consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+) !MatchingRecordStats {
+    var cursor = try journalOpenMatchingCursor(ptr, alloc, from_sequence, hint);
+    defer cursor.deinit(alloc);
+    return try cursor.forEachNext(max_matched_entries, ctx, consume);
+}
+
+fn journalLatestMatchingSequence(
+    ptr: *anyopaque,
+    alloc: Allocator,
+    from_sequence: u64,
+    hint: TargetHint,
+) !u64 {
+    const journal: *change_journal_mod.Journal = @ptrCast(@alignCast(ptr));
+    const log_mod = @import("derived_log.zig");
+    const Context = struct {
+        hint: TargetHint,
+        latest: u64,
+        fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (try change_journal_mod.encodedRecordHasHint(entry.payload, self.hint)) self.latest = entry.sequence;
+            return .@"continue";
+        }
+    };
+    _ = alloc;
+    var ctx: Context = .{ .hint = hint, .latest = from_sequence };
+    try journal.iterateOpaqueFromStreamingWithContext(from_sequence + 1, &ctx, Context.visit);
+    return ctx.latest;
+}
+
+fn journalCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
+    return collectEnrichmentDocumentGroups(Source.fromJournal(@ptrCast(@alignCast(ptr))), alloc, from_sequence);
+}
+
+fn journalIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
+    const journal: *change_journal_mod.Journal = @ptrCast(@alignCast(ptr));
+    return sequence <= journal.lastSequence();
+}
+
+fn primaryStoreForEachMatchingRecord(
+    ptr: *anyopaque,
+    alloc: Allocator,
+    from_sequence: u64,
+    hint: TargetHint,
+    max_matched_entries: usize,
+    ctx: *anyopaque,
+    consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+) !MatchingRecordStats {
+    _ = alloc;
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    const Context = struct {
+        consumer_ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        stats: MatchingRecordStats = .{},
+
+        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
+            self.stats.scanned_entries += 1;
+            try self.consume(self.consumer_ctx, sequence, payload);
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = sequence;
+        }
+
+        fn handleErased(erased_ctx: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(erased_ctx));
+            return try self.handle(sequence, payload);
+        }
+    };
+
+    var callback_ctx = Context{
+        .consumer_ctx = ctx,
+        .consume = consume,
+    };
+    callback_ctx.stats.scan_batches = 1;
+    const replay_stats = store.forEachReplayLaneFrom(
+        @intCast(@backingInt(hint)),
+        from_sequence + 1,
+        max_matched_entries,
+        &callback_ctx,
+        Context.handle,
+    ) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => return try primaryStoreForEachMatchingRecordFallbackAll(
+            store,
+            from_sequence,
+            hint,
+            max_matched_entries,
+            primaryStoreFallbackScanBudget(max_matched_entries),
+            ctx,
+            consume,
+        ),
+        StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
+        else => return err,
+    };
+    if (replay_stats.matched_entries == 0) {
+        return try primaryStoreForEachMatchingRecordFallbackAll(
+            store,
+            from_sequence,
+            hint,
+            max_matched_entries,
+            primaryStoreFallbackScanBudget(max_matched_entries),
+            ctx,
+            consume,
+        );
+    }
+    callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
+    callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
+    callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
+    callback_ctx.stats.last_sequence = @max(callback_ctx.stats.last_sequence, replay_stats.last_sequence);
+    return callback_ctx.stats;
+}
+
+fn primaryStoreLatestMatchingSequence(
+    ptr: *anyopaque,
+    alloc: Allocator,
+    from_sequence: u64,
+    hint: TargetHint,
+) !u64 {
+    _ = alloc;
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    return try store.latestReplaySequenceForHint(hint, from_sequence);
+}
+
+fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
+    return collectEnrichmentDocumentGroups(Source.fromPrimaryStore(@ptrCast(@alignCast(ptr)), null, null), alloc, from_sequence);
+}
+
+const EnrichmentGroupContext = struct {
+    alloc: Allocator,
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+    scratch: *change_journal_mod.BorrowedBinaryRecordScratch,
+
+    fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+        const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        if (change_journal_mod.looksLikeBinaryRecord(payload)) {
+            const record = try change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(ctx.alloc, payload, ctx.scratch, .{
+                .deleted_doc_keys = false,
+                .overwritten_doc_keys = false,
+                .changed_artifact_keys = false,
+            });
+            defer ctx.scratch.trimRetainedCapacity(ctx.alloc, 64 * 1024);
+            if (!recordHasEnrichmentHint(record)) return;
+            // Retain only the returned group's unique keys; input payloads
+            // and scratch descriptors are borrowed through this callback.
+            for (record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+        } else {
+            var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
+            defer record.deinit();
+            if (!recordHasEnrichmentHint(record.record)) return;
+            for (record.record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+        }
+    }
+};
+
+fn collectEnrichmentDocumentGroups(replay_source: Source, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
+    var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    var ctx: EnrichmentGroupContext = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
+    _ = try replay_source.forEachMatchingRecord(alloc, from_sequence, .enrichment, 0, &ctx, EnrichmentGroupContext.consume);
+    return pendingDocumentGroupsToOwnedSlice(alloc, &pending);
+}
+
+fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
+    const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
+    if (!(try store.hasReplayEntries())) return false;
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    _ = txn.get(key[0..]) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn cleanupPendingDocumentGroupMap(alloc: Allocator, pending: *std.StringHashMapUnmanaged(PendingDocumentGroup)) void {
+    var it = pending.iterator();
+    while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+    pending.deinit(alloc);
+}
+
+fn appendPendingDocumentGroup(
+    alloc: Allocator,
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+    sequence: u64,
+    doc_key: []const u8,
+) !void {
+    // getOrPut grows before probing at capacity. Preserve allocation-free
+    // updates there; new keys otherwise need only one lookup.
+    const load_limit = @as(u64, pending.capacity()) * std.hash_map.default_max_load_percentage / 100;
+    if (pending.count() >= load_limit) {
+        if (pending.getPtr(doc_key)) |existing| {
+            existing.sequence = sequence;
+            return;
+        }
+    }
+    const gop = try pending.getOrPut(alloc, doc_key);
+    if (!gop.found_existing) {
+        // A failed ownership transfer must remove the borrowed map key.
+        errdefer _ = pending.remove(doc_key);
+        gop.key_ptr.* = try alloc.dupe(u8, doc_key);
+    }
+    gop.value_ptr.* = .{
+        .sequence = sequence,
+        .doc_key = gop.key_ptr.*,
+    };
+}
+
+fn pendingDocumentGroupsToOwnedSlice(
+    alloc: Allocator,
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+) ![]PendingDocumentGroup {
+    var groups = try alloc.alloc(PendingDocumentGroup, pending.count());
+    var index: usize = 0;
+    var it = pending.iterator();
+    while (it.next()) |entry| : (index += 1) {
+        groups[index] = entry.value_ptr.*;
+    }
+    pending.deinit(alloc);
+
+    if (groups.len > 1) {
+        std.mem.sort(PendingDocumentGroup, groups, {}, struct {
+            fn lessThan(_: void, lhs: PendingDocumentGroup, rhs: PendingDocumentGroup) bool {
+                if (lhs.sequence != rhs.sequence) return lhs.sequence < rhs.sequence;
+                return std.mem.order(u8, lhs.doc_key, rhs.doc_key) == .lt;
+            }
+        }.lessThan);
+    }
+
+    return groups;
+}
+
+fn recordHasEnrichmentHint(record: change_journal_mod.Record) bool {
+    for (record.target_hints) |hint| {
+        if (hint == .enrichment) return true;
+    }
+    return false;
+}
+
+test "replay source collects changed documents from thin change journal" {
+    const alloc = std.testing.allocator;
+
+    var temp_path_nonce: u64 = 0;
+    var path_buf: [256]u8 = undefined;
+    const path = blk: {
+        const base = "/tmp/antfly-replay-source-journal-doc-test-";
+        const ts = platform_time.monotonicNs();
+        const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
+        const path_fmt = std.fmt.bufPrint(&path_buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+        break :blk @as([*:0]const u8, @ptrCast(path_fmt.ptr));
+    };
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+    }
+
+    var journal = try change_journal_mod.Journal.open(path, .{});
+    defer journal.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{ "doc:a", "doc:b" },
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(first_payload);
+    _ = try journal.appendOpaque(first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{ .enrichment, .dense_vector },
+    });
+    defer alloc.free(second_payload);
+    _ = try journal.appendOpaque(second_payload);
+
+    const source = Source.fromJournal(&journal);
+    const groups = try source.collectEnrichmentDocumentGroups(alloc, 0);
+    defer freePendingDocumentGroups(alloc, groups);
+
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqual(@as(u64, 1), groups[0].sequence);
+    try std.testing.expectEqualStrings("doc:b", groups[0].doc_key);
+    try std.testing.expectEqual(@as(u64, 2), groups[1].sequence);
+    try std.testing.expectEqualStrings("doc:a", groups[1].doc_key);
+}
+
+test "replay source collects changed documents from replay stream" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{ "doc:a", "doc:b" },
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{ .enrichment, .dense_vector },
+    });
+    defer alloc.free(second_payload);
+    try store.appendReplayOpaque(alloc, 2, second_payload);
+
+    const source = Source.fromPrimaryStore(&store, null, null);
+    const groups = try source.collectEnrichmentDocumentGroups(alloc, 0);
+    defer freePendingDocumentGroups(alloc, groups);
+
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    try std.testing.expectEqual(@as(u64, 1), groups[0].sequence);
+    try std.testing.expectEqualStrings("doc:b", groups[0].doc_key);
+    try std.testing.expectEqual(@as(u64, 2), groups[1].sequence);
+    try std.testing.expectEqualStrings("doc:a", groups[1].doc_key);
+}
+
+test "replay source stops after first matching record" {
+    const alloc = std.testing.allocator;
+
+    var temp_path_nonce: u64 = 0;
+    var path_buf: [256]u8 = undefined;
+    const path = blk: {
+        const base = "/tmp/antfly-replay-source-journal-stop-test-";
+        const ts = platform_time.monotonicNs();
+        const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
+        const path_fmt = std.fmt.bufPrint(&path_buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+        break :blk @as([*:0]const u8, @ptrCast(path_fmt.ptr));
+    };
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+    }
+
+    var journal = try change_journal_mod.Journal.open(path, .{});
+    defer journal.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(first_payload);
+    _ = try journal.appendOpaque(first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:b"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(second_payload);
+    _ = try journal.appendOpaque(second_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+            return StopReplayChunk.StopReplayChunk;
+        }
+    };
+
+    var context = Context{};
+    const stats = try Source.fromJournal(&journal).forEachMatchingRecord(
+        alloc,
+        0,
+        .dense_vector,
+        0,
+        &context,
+        Context.consume,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 1), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 0), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.last_sequence);
+}
+
+test "replay source primary store stops after first matching record" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:b"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(second_payload);
+    try store.appendReplayOpaque(alloc, 2, second_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+            return StopReplayChunk.StopReplayChunk;
+        }
+    };
+
+    var context = Context{};
+    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+        alloc,
+        0,
+        .dense_vector,
+        0,
+        &context,
+        Context.consume,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 1), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 0), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.last_sequence);
+}
+
+test "replay source journal respects max matched entries" {
+    const alloc = std.testing.allocator;
+
+    var temp_path_nonce: u64 = 0;
+    var path_buf: [256]u8 = undefined;
+    const path = blk: {
+        const base = "/tmp/antfly-replay-source-journal-limit-test-";
+        const ts = platform_time.monotonicNs();
+        const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
+        const path_fmt = std.fmt.bufPrint(&path_buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+        break :blk @as([*:0]const u8, @ptrCast(path_fmt.ptr));
+    };
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+    }
+
+    var journal = try change_journal_mod.Journal.open(path, .{});
+    defer journal.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(first_payload);
+    _ = try journal.appendOpaque(first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:b"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(second_payload);
+    _ = try journal.appendOpaque(second_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+        }
+    };
+
+    var context = Context{};
+    const stats = try Source.fromJournal(&journal).forEachMatchingRecord(
+        alloc,
+        0,
+        .dense_vector,
+        1,
+        &context,
+        Context.consume,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 1), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+}
+
+test "replay source primary store respects max matched entries" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:b"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(second_payload);
+    try store.appendReplayOpaque(alloc, 2, second_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+        }
+    };
+
+    var context = Context{};
+    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+        alloc,
+        0,
+        .dense_vector,
+        1,
+        &context,
+        Context.consume,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 1), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+}
+
+test "replay source primary store hinted replay skips non-matching records before callback" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const full_text_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:ft"},
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(full_text_payload);
+    try store.appendReplayOpaque(alloc, 1, full_text_payload);
+
+    const dense_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:dense"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(dense_payload);
+    try store.appendReplayOpaque(alloc, 2, dense_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+        }
+    };
+
+    var context = Context{};
+    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+        alloc,
+        0,
+        .dense_vector,
+        0,
+        &context,
+        Context.consume,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 2), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 0), stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(usize, 1), stats.scan_batches);
+    try std.testing.expectEqual(@as(u64, 2), stats.last_sequence);
+}
+
+test "replay source primary store falls back to all lane when hint lane is missing" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const full_text_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:ft"},
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(full_text_payload);
+
+    const dense_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:dense"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(dense_payload);
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    const full_text_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try batch.put(full_text_key[0..], full_text_payload);
+    const dense_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    try batch.put(dense_key[0..], dense_payload);
+    try batch.commit();
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+        }
+    };
+
+    var context = Context{};
+    const stats = try Source.fromPrimaryStore(&store, null, null).forEachMatchingRecord(
+        alloc,
+        0,
+        .dense_vector,
+        0,
+        &context,
+        Context.consume,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(u64, 2), context.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 2), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 1), stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(usize, 1), stats.scan_batches);
+    try std.testing.expectEqual(@as(u64, 2), stats.last_sequence);
+}
+
+test "replay source primary fallback cursor is bounded across unrelated rows" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    var batch = try store.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    var sequence: u64 = 1;
+    while (sequence <= primary_store_fallback_scan_budget_min) : (sequence += 1) {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc:ft"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+        try batch.put(key[0..], payload);
+    }
+    const dense_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = sequence,
+        .changed_doc_keys = &.{"doc:dense"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(dense_payload);
+    const dense_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try batch.put(dense_key[0..], dense_payload);
+    try batch.commit();
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence_value: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence_value;
+        }
+    };
+
+    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    defer cursor.deinit(alloc);
+
+    var first = Context{};
+    const first_stats = try cursor.forEachNext(1, &first, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), first.calls);
+    try std.testing.expectEqual(@as(usize, 0), first_stats.matched_entries);
+    try std.testing.expectEqual(primary_store_fallback_scan_budget_min, first_stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, primary_store_fallback_scan_budget_min), first_stats.hint_filter_skips);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min), first_stats.last_sequence);
+
+    var second = Context{};
+    const second_stats = try cursor.forEachNext(1, &second, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), second_stats.matched_entries);
+    try std.testing.expectEqual(@as(usize, 1), second_stats.scanned_entries);
+    try std.testing.expectEqual(@as(u64, primary_store_fallback_scan_budget_min + 1), second_stats.last_sequence);
+}
+
+test "replay source primary cursor resumes after stop chunk progress" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:first"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:second"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(second_payload);
+    try store.appendReplayOpaque(alloc, 2, second_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        sequences: [4]u64 = .{ 0, 0, 0, 0 },
+
+        fn stopAfterFirst(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sequences[self.calls] = sequence;
+            self.calls += 1;
+            if (self.calls > 1) return StopReplayChunk.StopReplayChunk;
+        }
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sequences[self.calls] = sequence;
+            self.calls += 1;
+        }
+    };
+
+    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    defer cursor.deinit(alloc);
+
+    var context = Context{};
+    const first = try cursor.forEachNext(0, &context, Context.stopAfterFirst);
+    try std.testing.expectEqual(@as(usize, 2), context.calls);
+    try std.testing.expectEqual(@as(u64, 1), context.sequences[0]);
+    try std.testing.expectEqual(@as(u64, 2), context.sequences[1]);
+    try std.testing.expectEqual(@as(u64, 1), first.last_sequence);
+
+    const second = try cursor.forEachNext(0, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 3), context.calls);
+    try std.testing.expectEqual(@as(u64, 2), context.sequences[2]);
+    try std.testing.expectEqual(@as(u64, 2), second.last_sequence);
+}
+
+test "replay source primary store collects enrichment groups from hint lane" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const full_text_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:ft"},
+        .target_hints = &.{.full_text},
+    });
+    defer alloc.free(full_text_payload);
+
+    const enrichment_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:enriched"},
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(enrichment_payload);
+
+    try store.appendReplayOpaque(alloc, 1, full_text_payload);
+    try store.appendReplayOpaque(alloc, 2, enrichment_payload);
+
+    const groups = try Source.fromPrimaryStore(&store, null, null).collectEnrichmentDocumentGroups(alloc, 0);
+    defer freePendingDocumentGroups(alloc, groups);
+
+    try std.testing.expectEqual(@as(usize, 1), groups.len);
+    try std.testing.expectEqual(@as(u64, 2), groups[0].sequence);
+    try std.testing.expectEqualStrings("doc:enriched", groups[0].doc_key);
+}
+
+test "replay source primary store matching cursor resumes across bounded windows" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    inline for (.{ 1, 2, 3 }) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"doc"},
+            .target_hints = &.{.dense_vector},
+        });
+        defer alloc.free(payload);
+        try store.appendReplayOpaque(alloc, sequence, payload);
+    }
+
+    const Context = struct {
+        calls: usize = 0,
+        last_sequence: u64 = 0,
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_sequence = sequence;
+        }
+    };
+
+    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    defer cursor.deinit(alloc);
+
+    var first = Context{};
+    const first_stats = try cursor.forEachNext(1, &first, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(u64, 1), first.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), first_stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 1), first_stats.last_sequence);
+
+    var second = Context{};
+    const second_stats = try cursor.forEachNext(1, &second, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
+    try std.testing.expectEqual(@as(u64, 2), second.last_sequence);
+    try std.testing.expectEqual(@as(usize, 1), second_stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 2), second_stats.last_sequence);
+}
+
+test "replay source primary store missing replay index behaves as empty stream" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const Context = struct {
+        calls: usize = 0,
+
+        fn consume(ptr: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+
+    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    defer cursor.deinit(alloc);
+
+    var ctx = Context{};
+    const stats = try cursor.forEachNext(1, &ctx, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), ctx.calls);
+    try std.testing.expectEqual(@as(usize, 0), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 0), stats.last_sequence);
+}
+
+test "replay source primary visibility checks the exact replay sequence" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:one"},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const third_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 3,
+        .changed_doc_keys = &.{"doc:three"},
+    });
+    defer alloc.free(third_payload);
+    try store.appendReplayOpaque(alloc, 3, third_payload);
+
+    const source = Source.fromPrimaryStore(&store, null, null);
+    try std.testing.expect(try source.isSequenceVisible(1));
+    try std.testing.expect(!(try source.isSequenceVisible(2)));
+    try std.testing.expect(try source.isSequenceVisible(3));
+    try std.testing.expect(!(try source.isSequenceVisible(4)));
+}
+
+test "replay source journal cursor streams borrowed entries and resumes rejected records" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("streaming-cursor-regression", .{ .backend = .lsm_memory });
+    defer journal.close();
+    for (1..5) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"document"},
+            .target_hints = if (sequence == 1) &.{.graph} else &.{.full_text},
+        });
+        defer alloc.free(payload);
+        _ = try journal.appendOpaque(payload);
+    }
+    // Only cursor construction may allocate through the replay allocator.
+    // The old suffix materialization would fail on its first payload copy.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    var cursor = try Source.fromJournal(&journal).openMatchingCursor(failing.allocator(), 0, .full_text);
+    defer cursor.deinit(failing.allocator());
+    const Context = struct {
+        calls: usize = 0,
+        last: u64 = 0,
+        reject: bool = false,
+        fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject) return error.StopReplayChunk;
+            if (!try change_journal_mod.encodedRecordHasHint(payload, .full_text)) return error.InvalidPayload;
+            self.calls += 1;
+            self.last = sequence;
+        }
+    };
+    var context: Context = .{};
+    const first = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), first.hint_filter_skips);
+    try std.testing.expectEqual(@as(u64, 2), first.last_sequence);
+    context.reject = true;
+    const rejected = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), rejected.matched_entries);
+    // A write between windows must not overlap a live journal scan transaction.
+    const appended = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 5, .changed_doc_keys = &.{"new"}, .target_hints = &.{.full_text} });
+    defer alloc.free(appended);
+    _ = try journal.appendOpaque(appended);
+    context.reject = false;
+    const rest = try cursor.forEachNext(0, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 3), rest.matched_entries);
+    try std.testing.expectEqual(@as(u64, 5), context.last);
+    try std.testing.expectEqual(@as(usize, 4), context.calls);
+}
+
+fn enrichmentOwnershipAllocationFailure(alloc: Allocator) !void {
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    try appendPendingDocumentGroup(alloc, &pending, 1, "document");
+    try appendPendingDocumentGroup(alloc, &pending, 2, "document");
+    try appendPendingDocumentGroup(alloc, &pending, 3, "another");
+}
+
+test "replay source enrichment key ownership rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, enrichmentOwnershipAllocationFailure, .{});
+}
+
+test "replay source enrichment repeated document needs no new allocation" {
+    const alloc = std.testing.allocator;
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    try appendPendingDocumentGroup(alloc, &pending, 1, "document");
+    const owned = pending.get("document").?.doc_key.ptr;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try appendPendingDocumentGroup(failing.allocator(), &pending, 2, "document");
+    try std.testing.expectEqual(@as(u64, 2), pending.get("document").?.sequence);
+    try std.testing.expectEqual(owned, pending.get("document").?.doc_key.ptr);
+}
+
+test "replay source enrichment shares selective decode for binary and legacy sources" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("selected-enrichment", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    const first = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .deleted_doc_keys = &.{"unused-delete"},
+        .overwritten_doc_keys = &.{"unused-overwrite"},
+        .changed_artifact_keys = &.{"unused-artifact"},
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(first);
+    const legacy = "{\"version\":1,\"sequence\":2,\"changed_doc_keys\":[\"doc:b\",\"doc:a\"],\"target_hints\":[\"enrichment\"]}";
+    _ = try journal.appendOpaque(first);
+    _ = try journal.appendOpaque(legacy);
+    try store.appendReplayOpaque(alloc, 1, first);
+    try store.appendReplayOpaque(alloc, 2, legacy);
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }) |replay_source| {
+        const groups = try replay_source.collectEnrichmentDocumentGroups(alloc, 0);
+        defer freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 2), groups.len);
+        try std.testing.expectEqualStrings("doc:a", groups[0].doc_key);
+        try std.testing.expectEqualStrings("doc:b", groups[1].doc_key);
+        for (groups) |group| try std.testing.expectEqual(@as(u64, 2), group.sequence);
+    }
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(u64, 2), try Source.fromJournal(&journal).latestMatchingSequence(failing.allocator(), 0, .enrichment));
+    try std.testing.expectEqual(@as(u64, 1), try Source.fromJournal(&journal).latestMatchingSequence(failing.allocator(), 1, .graph));
+}
+
+test "replay source enrichment validates corruption in skipped binary fields" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("enrichment-corrupt-skipped", .{ .backend = .lsm_memory });
+    defer journal.close();
+    const encoded = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc"}, .changed_artifact_keys = &.{"artifact"}, .target_hints = &.{.enrichment} });
+    defer alloc.free(encoded);
+    _ = try journal.appendOpaque(encoded[0 .. encoded.len - 1]);
+    try std.testing.expectError(error.UnexpectedEndOfInput, Source.fromJournal(&journal).collectEnrichmentDocumentGroups(alloc, 0));
+}
+
+test "replay cursor exposes partial scan statistics on consumer failure for both sources" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("partial-scan-stats", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    for (1..4) |sequence| {
+        const encoded = try change_journal_mod.encodeRecord(alloc, .{ .sequence = sequence, .target_hints = if (sequence == 1) &.{.graph} else &.{.full_text} });
+        defer alloc.free(encoded);
+        _ = try journal.appendOpaque(encoded);
+        try store.appendReplayOpaque(alloc, sequence, encoded);
+    }
+    const Context = struct {
+        reject: bool = true,
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (sequence == 3 and self.reject) return error.ResourceBudgetExceeded;
+        }
+    };
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }, 0..) |source, i| {
+        var cursor = try source.openMatchingCursor(alloc, 0, .full_text);
+        defer cursor.deinit(alloc);
+        var ctx: Context = .{};
+        try std.testing.expectError(error.ResourceBudgetExceeded, cursor.forEachNext(0, &ctx, Context.consume));
+        try std.testing.expectEqual(@as(usize, 1), cursor.last_scan_stats.matched_entries);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 2 else 1), cursor.last_scan_stats.scanned_entries);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 1 else 0), cursor.last_scan_stats.hint_filter_skips);
+        try std.testing.expectEqual(@as(usize, 1), cursor.last_scan_stats.scan_batches);
+        ctx.reject = false;
+        const resumed = try cursor.forEachNext(0, &ctx, Context.consume);
+        try std.testing.expectEqual(@as(usize, 1), resumed.matched_entries);
+        try std.testing.expectEqual(@as(u64, 3), resumed.last_sequence);
+    }
+}
+
+test "replay source enrichment duplicate updates at map capacity do not allocate" {
+    const alloc = std.testing.allocator;
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }, 0..) |key, i|
+        try appendPendingDocumentGroup(alloc, &pending, i + 1, key);
+    try std.testing.expectEqual(@as(u32, 8), pending.capacity());
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (0..256) |i| try appendPendingDocumentGroup(failing.allocator(), &pending, i + 10, "a");
+    try std.testing.expectEqual(@as(u64, 265), pending.get("a").?.sequence);
+    try std.testing.expectEqual(@as(u32, 8), pending.capacity());
+    try std.testing.expectError(error.OutOfMemory, appendPendingDocumentGroup(failing.allocator(), &pending, 300, "g"));
+    try std.testing.expectEqual(@as(u32, 6), pending.count());
+}
+
+test "replay source enrichment trims oversized scratch on filtered callback exits" {
+    const alloc = std.testing.allocator;
+    var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    var ctx: EnrichmentGroupContext = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
+    const keys = @as([8192][]const u8, @splat("ignored"));
+    const oversized = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
+    defer alloc.free(oversized);
+    // Production scanners normally filter this record before the callback.
+    // Cleanup remains bounded even if a source supplies it directly.
+    try EnrichmentGroupContext.consume(&ctx, 1, oversized);
+    try std.testing.expectEqual(@as(u32, 0), pending.count());
+    try std.testing.expect(scratch.retainedCapacityBytes() <= 64 * 1024);
+    const ordinary = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 2, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.enrichment} });
+    defer alloc.free(ordinary);
+    try EnrichmentGroupContext.consume(&ctx, 2, ordinary);
+    try std.testing.expectEqual(@as(u64, 2), pending.get("doc").?.sequence);
+}

@@ -20,10 +20,10 @@ pub const artifact_sources_protocol_version: u16 = 1;
 pub const dense_native_storage_protocol_version: u16 = 1;
 pub const relational_topology_protocol_version: u16 = 2;
 pub const embedding_activity_protocol_version: u16 = 2;
-const group_ids = @import("../common/group_ids.zig");
-const topology_records = @import("../common/topology_records.zig");
-const index_repair_status = @import("../common/index_repair_status.zig");
-const dense_native_storage_phase = @import("../common/dense_native_storage_phase.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
+const topology_records = @import("antfly_local_sources").common_topology_records;
+const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
+const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
@@ -38,14 +38,12 @@ pub const PlacementClass = enum {
     archive,
 };
 
-pub const TableRecord = topology_records.TableRecord;
+pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.TableRecord;
 
-// TableDefinition is the preferred product/control-plane name. TableRecord
-// remains as the current storage/runtime name during the migration.
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+    return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
@@ -78,9 +76,9 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
         hashTableDefinitionPart(&hasher, "vector-migration-v1");
         hashTableDefinitionPart(&hasher, migration.request.job_id);
         hashTableDefinitionPart(&hasher, @tagName(migration.request.mode));
-        inline for (std.meta.fields(@TypeOf(migration.request.budget))) |field| {
+        inline for (comptime std.meta.fieldNames(@TypeOf(migration.request.budget))) |reflected_name| {
             var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, @field(migration.request.budget, field.name), .little);
+            std.mem.writeInt(u64, &bytes, @field(migration.request.budget, reflected_name), .little);
             hasher.update(&bytes);
         }
     }
@@ -116,38 +114,9 @@ pub const RangeRecord = topology_records.RangeRecord;
 /// Canonical ordering for every complete table keyspace projection. Keeping
 /// this in the metadata domain lets backup admission, restore planning, and
 /// Raft apply enforce exactly the same bytewise routing contract.
-pub fn sortKeyspaceRanges(comptime Range: type, ranges: []Range) void {
-    std.mem.sort(Range, ranges, {}, struct {
-        fn lessThan(_: void, lhs: Range, rhs: Range) bool {
-            return std.mem.order(u8, lhs.start_key, rhs.start_key) == .lt;
-        }
-    }.lessThan);
-}
+pub const sortKeyspaceRanges = @import("antfly_local_sources").metadata_local_catalog.sortKeyspaceRanges;
 
-/// Validate a sorted, gap-free, non-overlapping partition of the complete
-/// byte-string keyspace. The empty start and open final end are routing
-/// sentinels, not optional decoration: omitting either would publish a table
-/// for which some document keys have no owner.
-pub fn validateCompleteKeyspaceRanges(ranges: anytype) !void {
-    if (ranges.len == 0 or ranges[0].start_key.len != 0 or
-        ranges[ranges.len - 1].end_key != null)
-        return error.InvalidRangeTopology;
-
-    for (ranges, 0..) |range, index| {
-        if (range.end_key) |end_key| {
-            if (end_key.len == 0 or std.mem.order(u8, range.start_key, end_key) != .lt)
-                return error.InvalidRangeTopology;
-        } else if (index != ranges.len - 1) {
-            return error.InvalidRangeTopology;
-        }
-        if (index > 0) {
-            const previous_end = ranges[index - 1].end_key orelse
-                return error.InvalidRangeTopology;
-            if (!std.mem.eql(u8, previous_end, range.start_key))
-                return error.InvalidRangeTopology;
-        }
-    }
-}
+pub const validateCompleteKeyspaceRanges = @import("antfly_local_sources").metadata_local_catalog.validateCompleteKeyspaceRanges;
 
 test "complete keyspace range validation requires both routing sentinels" {
     const complete = [_]RangeRecord{
@@ -521,7 +490,7 @@ pub const GroupStatusReport = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     transition_pending: bool = false,
     replay_required: bool = false,
@@ -538,7 +507,7 @@ pub const ResolvedVoterSetEvidence = struct {
     voter_count: u16,
     from_leader: bool,
     voter_set_known: bool = false,
-    voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     membership_index: u64 = 0,
 };
 
@@ -625,7 +594,7 @@ pub const VoterSetEvidence = struct {
     fallback_membership_index: u64 = 0,
     ambiguous_fallback_voter_count: bool = false,
     known_voter_count: ?u16 = null,
-    known_voter_set_fingerprint: VoterSetFingerprint = [_]u8{0} ** voter_set_fingerprint_len,
+    known_voter_set_fingerprint: VoterSetFingerprint = @as([voter_set_fingerprint_len]u8, @splat(0)),
     known_membership_index: u64 = 0,
     has_known_voter_set: bool = false,
     ambiguous_known_voter_set: bool = false,
@@ -734,7 +703,7 @@ test "table manager voter set evidence is order independent when newer reports l
         .group_id = 1,
         .voter_count = 3,
         .voter_set_known = true,
-        .voter_set_fingerprint = [_]u8{0x11} ** voter_set_fingerprint_len,
+        .voter_set_fingerprint = @as([voter_set_fingerprint_len]u8, @splat(0x11)),
         .raft_membership_index = 10,
     };
     const newer_unqualified: GroupStatusReport = .{
@@ -1332,11 +1301,11 @@ pub const ReplicationSourceStatusRecord = struct {
     /// acknowledgement must match it before provider state may be changed.
     cutover_authority_id: u64 = 0,
     cutover_config_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     /// Authenticated PostgreSQL cluster, database, and database-incarnation
     /// identity. This deliberately excludes connection credentials.
     cutover_provider_identity: [std.crypto.hash.sha2.Sha256.digest_length]u8 =
-        [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     /// Provider resources from the authority superseded by the current claim.
     /// They remain durable until inactive cleanup succeeds; a newer claim is
     /// not admitted while this retirement is pending.
@@ -2146,8 +2115,9 @@ fn transitionTableContract(
 }
 
 pub fn parsePlacementClass(role: []const u8) ?PlacementClass {
-    inline for (comptime std.meta.fields(PlacementClass)) |field| {
-        if (std.mem.eql(u8, role, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(PlacementClass).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, role, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -2200,53 +2170,8 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
     if (value) |bytes| alloc.free(bytes);
 }
 
-pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
-    const relational_retirement_json = try alloc.dupe(u8, record.relational_retirement_json);
-    errdefer alloc.free(relational_retirement_json);
-    var storage_migration = record.storage_migration;
-    if (storage_migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
-    errdefer if (storage_migration) |migration| alloc.free(migration.request.job_id);
-    const name = try alloc.dupe(u8, record.name);
-    errdefer alloc.free(name);
-    const description = try alloc.dupe(u8, record.description);
-    errdefer alloc.free(description);
-    const schema_json = try alloc.dupe(u8, record.schema_json);
-    errdefer alloc.free(schema_json);
-    const read_schema_json = try alloc.dupe(u8, record.read_schema_json);
-    errdefer alloc.free(read_schema_json);
-    const indexes_json = try alloc.dupe(u8, record.indexes_json);
-    errdefer alloc.free(indexes_json);
-    const replication_sources_json = try alloc.dupe(u8, record.replication_sources_json);
-    errdefer alloc.free(replication_sources_json);
-    const placement_role = try alloc.dupe(u8, record.placement_role);
-    errdefer alloc.free(placement_role);
-    const restore_backup_id = try alloc.dupe(u8, record.restore_backup_id);
-    errdefer alloc.free(restore_backup_id);
-    const restore_location = try alloc.dupe(u8, record.restore_location);
-    errdefer alloc.free(restore_location);
-    return .{
-        .storage = record.storage,
-        .relational_retirement_json = relational_retirement_json,
-        .storage_migration = storage_migration,
-        .table_id = record.table_id,
-        .name = name,
-        .description = description,
-        .schema_json = schema_json,
-        .read_schema_json = read_schema_json,
-        .indexes_json = indexes_json,
-        .replication_sources_json = replication_sources_json,
-        .placement_role = placement_role,
-        .restore_backup_id = restore_backup_id,
-        .restore_location = restore_location,
-        .desired_replica_count = record.desired_replica_count,
-        .min_ranges = record.min_ranges,
-    };
-}
+pub const cloneTable = @import("antfly_local_sources").metadata_local_catalog.cloneTable;
 
-/// Clone only fields that participate in table/range routing. Keeping the
-/// established wire record during the rolling upgrade lets older peers decode
-/// the response, while schema, index, restore, and placement payloads no
-/// longer scale the routing hot path.
 pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const name = try alloc.dupe(u8, record.name);
     errdefer alloc.free(name);
@@ -2282,9 +2207,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     };
 }
 
-pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
-    @import("restore_provisioning_contract.zig").freeTable(alloc, record);
-}
+pub const freeTable = @import("antfly_local_sources").metadata_local_catalog.freeTable;
 
 pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     const start_key = try alloc.dupe(u8, record.start_key);
@@ -3552,4 +3475,42 @@ test "system catalog table name index replacement is atomic on allocation failur
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "source vector migration catalog fences configurations topology and stale publication" {
+    const catalog = @This();
+    var manager = catalog.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+    const before: catalog.TableRecord = .{ .table_id = 10, .name = "migrate" };
+    const range: catalog.RangeRecord = .{ .group_id = 101, .table_id = 10, .start_key = "", .end_key = null };
+    try manager.upsertTable(before);
+    try manager.upsertRange(range);
+    var admitted = before;
+    admitted.storage_migration = .{ .request = .{ .job_id = "online", .mode = .online } };
+    try manager.publishVectorMigrationTable(before, admitted);
+    try std.testing.expect(!std.mem.eql(u8, &catalog.tableDefinitionFingerprint(before), &catalog.tableDefinitionFingerprint(admitted)));
+    try manager.upsertTable(admitted);
+    try manager.upsertRange(range); // Normalized range ID is still idempotent.
+    // Restart/projected-catalog installation restores existing admission,
+    // while incremental topology changes remain fenced after reload.
+    try manager.replaceTopology(&.{admitted}, &.{range});
+    _ = try manager.replaceProjectedTopology(&.{admitted}, &.{range});
+    try manager.upsertRange(range);
+    var moved = range;
+    moved.start_key = "m";
+    try std.testing.expectError(error.VectorMigrationActive, manager.upsertRange(moved));
+    try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(before));
+    var edited = admitted;
+    edited.schema_json = "{\"version\":2}";
+    try std.testing.expectError(error.VectorMigrationActive, manager.upsertTable(edited));
+    try std.testing.expectError(error.VectorMigrationConfigurationChanged, manager.publishVectorMigrationTable(admitted, edited));
+    try std.testing.expectError(error.VectorMigrationActive, manager.requestSplit(.{ .transition_id = 1, .table_id = 10, .source_group_id = 101, .destination_group_id = 102, .split_key = "m" }));
+    var published = admitted;
+    published.storage.dense_embeddings = .vector_store;
+    try manager.publishVectorMigrationTable(admitted, published);
+    try std.testing.expectError(error.TableGenerationChanged, manager.publishVectorMigrationTable(admitted, before));
+    var complete = published;
+    complete.storage_migration = null;
+    try manager.publishVectorMigrationTable(published, complete);
+    try std.testing.expectError(error.UnsupportedVectorMigrationDirection, manager.publishVectorMigrationTable(complete, before));
 }

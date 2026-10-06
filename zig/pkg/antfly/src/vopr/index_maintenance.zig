@@ -6,7 +6,7 @@
 //! filesystem durability remain integration-test responsibilities.
 const std = @import("std");
 const vopr = @import("vopr");
-const graph_mod = @import("../graph/graph.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
 const Graph = graph_mod.GraphIndex;
 const clock_mod = @import("antfly_platform").clock;
 
@@ -76,12 +76,12 @@ pub const Scenario = struct {
             } else {
                 // Acquisition may find no work (for example, coordinator-only
                 // phases). Only a successful acquisition enables worker loss.
-                try list.append(allocator, .{ .id = id(.claim), .name = "index-maintenance.acquire-page", .kind = .maintenance, .parameter = @as(i64, @intFromEnum(status.phase)) | (@as(i64, status.build_iteration) << 32) });
+                try list.append(allocator, .{ .id = id(.claim), .name = "index-maintenance.acquire-page", .kind = .maintenance, .parameter = @as(i64, @backingInt(status.phase)) | (@as(i64, status.build_iteration) << 32) });
                 try list.append(allocator, .{ .id = id(.prepare), .name = "index-maintenance.advance-worker", .kind = .maintenance });
                 try list.append(allocator, .{ .id = id(.coordinate), .name = "index-maintenance.advance-coordinator", .kind = .maintenance });
             }
         } else if (state.step == .leased) {
-            try list.append(allocator, .{ .id = id(.lose), .name = "index-maintenance.lose-leased-worker", .kind = .fault, .parameter = @intFromEnum(state.phase) });
+            try list.append(allocator, .{ .id = id(.lose), .name = "index-maintenance.lose-leased-worker", .kind = .fault, .parameter = @backingInt(state.phase) });
             try list.append(allocator, .{ .id = id(.prepare), .name = "index-maintenance.complete-leased-work", .kind = .maintenance });
         } else {
             try list.append(allocator, .{ .id = id(state.step), .name = @tagName(state.step), .kind = .maintenance });
@@ -320,7 +320,7 @@ pub const Scenario = struct {
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, "step", @intCast(@intFromEnum(state.step)));
+        try builder.addNamed(allocator, "step", @intCast(@backingInt(state.step)));
         try builder.addNamed(allocator, "family", @intCast(state.family));
         try builder.addNamed(allocator, "time", @intCast(state.clock.clock().nowRealtimeMs()));
         try builder.addNamed(allocator, "fault-checks", @intCast(state.fault_checks));
@@ -329,7 +329,7 @@ pub const Scenario = struct {
             defer status.deinit(allocator);
             try builder.addNamed(allocator, "published", @intCast(status.published_generation));
             try builder.addNamed(allocator, "computed-at", @intCast(status.computed_at_ms));
-            try builder.addNamed(allocator, "phase", @intCast(@intFromEnum(status.phase)));
+            try builder.addNamed(allocator, "phase", @intCast(@backingInt(status.phase)));
             try builder.addNamed(allocator, "iteration", @intCast(status.build_iteration));
             try builder.addNamed(allocator, "pages", @intCast(status.build_pages.len));
             if (state.family == 3) {
@@ -417,7 +417,7 @@ pub const OwnerScenario = struct {
         .{ .id = owner_done, .name = name ++ ".complete", .kind = .reachable },
     };
     const Fixture = @import("db_index_races.zig").Fixture;
-    const Runtime = @import("../storage/db/maintenance/graph_metric_runtime.zig").GraphMetricRuntime;
+    const Runtime = @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime.GraphMetricRuntime;
     const State = struct {
         fixture: Fixture,
         clock: clock_mod.ManualClock = .{},
@@ -496,8 +496,8 @@ pub const OwnerScenario = struct {
             5 => {
                 state.owners[1].?.deinit();
                 state.owners[1] = null;
-                const runtime_mod = @import("../storage/db/maintenance/graph_metric_runtime.zig");
-                const lease_mod = @import("../storage/db/lease.zig");
+                const runtime_mod = @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime;
+                const lease_mod = @import("antfly_local_sources").storage_db_lease;
                 var lease = try lease_mod.Lease.init(state.fixture.allocator, state.fixture.db.core.asyncResources().store, runtime_mod.default_coordinator_lease_key);
                 defer lease.deinit();
                 if (try lease.load(state.fixture.allocator)) |record_value| {
@@ -529,8 +529,8 @@ pub const OwnerScenario = struct {
                 try sink.add(owner_name, encoded);
             } else try sink.add(owner_name, "closed");
         }
-        const lease_mod = @import("../storage/db/lease.zig");
-        var lease = try lease_mod.Lease.init(state.fixture.allocator, state.fixture.db.core.asyncResources().store, @import("../storage/db/maintenance/graph_metric_runtime.zig").default_coordinator_lease_key);
+        const lease_mod = @import("antfly_local_sources").storage_db_lease;
+        var lease = try lease_mod.Lease.init(state.fixture.allocator, state.fixture.db.core.asyncResources().store, @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime.default_coordinator_lease_key);
         defer lease.deinit();
         if (try lease.load(state.fixture.allocator)) |value| {
             var record = value;
@@ -576,7 +576,7 @@ const BoundaryChoices = struct {
         }
         if (self.fault_phase) |phase| {
             for (req.enabled) |candidate| {
-                if (candidate.id == id(.claim) and (candidate.parameter & 0xffffffff) == @intFromEnum(phase) and
+                if (candidate.id == id(.claim) and (candidate.parameter & 0xffffffff) == @backingInt(phase) and
                     (!self.later_iteration or candidate.parameter >> 32 > 0) and !self.acquired)
                 {
                     self.acquired = true;

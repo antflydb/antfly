@@ -18,23 +18,23 @@ const storage_source_options = @import("storage_source_options");
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const metadata_replica_root_client = @import("../storage/metadata_replica_root_client.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
-const fs_paths = @import("../common/fs_paths.zig");
-const group_ids = @import("../common/group_ids.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
-const thread_config = @import("../runtime_thread_config.zig");
+const thread_config = @import("antfly_local_sources").runtime_thread_config;
 
 const linked_storage = storage_source_options.control_only;
 const StorageKernelContext = if (linked_storage)
     kernel_owner_client.Context
 else
     struct {
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.* = .{};
         }
     };
@@ -161,7 +161,7 @@ const CliConfig = struct {
     auth_enabled: ?bool = null,
     help: bool = false,
 
-    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.secret_store_paths.deinit(alloc);
         self.* = undefined;
     }
@@ -173,7 +173,7 @@ const Factory = struct {
     metadata_group_id: u64,
     metadata_peer_node_ids: []u64 = &.{},
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.metadata_peer_node_ids.len > 0) self.alloc.free(self.metadata_peer_node_ids);
         self.* = undefined;
     }
@@ -243,7 +243,7 @@ const ResolvedPaths = struct {
     auth_store_root_dir: []u8,
     extension_package_store_dir: []u8,
 
-    fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
@@ -297,7 +297,7 @@ pub const HealthSource = struct {
         const append = antfly.common.health_server.appendPromMetric;
 
         if (self.supervisor) |supervisor| {
-            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try append(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(supervisor.currentState()));
             try append(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
 
@@ -1179,10 +1179,11 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
     try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
-    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
+    var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.initWithOptions(
         alloc,
         setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
+        .{ .secret_store = if (secret_store_initialized) &secret_store else null },
     );
     defer active_audio_runtime.deinit();
 
@@ -1606,7 +1607,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -1991,7 +1992,7 @@ fn resolveMetadataRuntimeSecretValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
         const raw = try alloc.dupe(u8, value);
@@ -3058,7 +3059,7 @@ const MetadataOwnershipTestPaths = struct {
         return .{ .local_node_id = 3, .replica_root_dir = self.replicas, .replica_catalog_path = self.catalog, .snapshot_root_dir = self.snapshots };
     }
 
-    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.replicas);
         alloc.free(self.catalog);
         alloc.free(self.snapshots);

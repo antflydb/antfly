@@ -29,12 +29,12 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Crc32 = @import("antfly_hash").Crc32;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const backup_manifest = @import("backup_manifest.zig");
 const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
-const mutation_barrier = @import("mutation_barrier.zig");
-const object_storage = @import("../object_storage.zig");
+const mutation_barrier = @import("antfly_runtime_abi").mutation_barrier;
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const primary_mod = @import("primary.zig");
 const replication_log = @import("replication_log.zig");
 const seed_artifact = @import("seed_artifact.zig");
@@ -208,7 +208,7 @@ const OwnedSource = struct {
     artifact_path: []u8,
     kind: backup_manifest.FileKind,
 
-    fn deinit(self: *OwnedSource, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedSource, alloc: Allocator) void {
         alloc.free(self.source_path);
         alloc.free(self.artifact_path);
         self.* = undefined;
@@ -1044,13 +1044,13 @@ fn sourcePlanDigest(sources: []const Source) [Sha256.digest_length]u8 {
             hash.update("file\x00");
             hashFramed(&hash, file.source_path);
             hashFramed(&hash, file.artifact_path);
-            hashInt(&hash, @intFromEnum(file.kind));
+            hashInt(&hash, @backingInt(file.kind));
         },
         .tree => |tree| {
             hash.update("tree\x00");
             hashFramed(&hash, tree.source_root);
             hashFramed(&hash, tree.artifact_prefix);
-            hashInt(&hash, @intFromEnum(tree.kind));
+            hashInt(&hash, @backingInt(tree.kind));
         },
     };
     var out: [Sha256.digest_length]u8 = undefined;
@@ -1274,7 +1274,7 @@ const TestPaths = struct {
     log: [:0]u8,
     slots: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.log);
         alloc.free(self.slots);
     }
@@ -1286,8 +1286,8 @@ fn testPrimaryPaths(alloc: Allocator, root: []const u8, label: []const u8) !Test
     const slots_raw = try std.fmt.allocPrint(alloc, "{s}/{s}.slots", .{ root, label });
     defer alloc.free(slots_raw);
     return .{
-        .log = try alloc.dupeZ(u8, log_raw),
-        .slots = try alloc.dupeZ(u8, slots_raw),
+        .log = try alloc.dupeSentinel(u8, log_raw, 0),
+        .slots = try alloc.dupeSentinel(u8, slots_raw, 0),
     };
 }
 

@@ -9,10 +9,10 @@ const std = @import("std");
 const vopr = @import("vopr");
 const replication = @import("../metadata/replication_backfill.zig");
 const foreign = @import("../foreign/source.zig");
-const table_writes = @import("../api/table_write_source.zig");
-const db_types = @import("../storage/db/types.zig");
+const table_writes = @import("antfly_local_sources").api_table_write_source;
+const db_types = @import("antfly_local_sources").storage_db_types;
 const table_manager = @import("../metadata/table_manager.zig");
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
@@ -635,7 +635,7 @@ pub const Scenario = struct {
             const intent = params.exact_cutover_intent orelse
                 return error.InvalidReplicationCutoverIntent;
             self.exact_cutover_prepares +|= 1;
-            try intent.persist([_]u8{0x7a} ** std.crypto.hash.sha2.Sha256.digest_length);
+            try intent.persist(@as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x7a)));
             try intent.check();
             if (params.retired_slot_name != null or
                 params.retired_publication_name != null)
@@ -1092,7 +1092,7 @@ pub const Scenario = struct {
 };
 
 test "replication backfill service rates compose and heal across production snapshot and stream" {
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     var world = try Scenario.init(alloc);

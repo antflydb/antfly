@@ -28,11 +28,11 @@ fn pinBytes(pin: pipeline.PublishedModelPin, bytes: []const u8) !void {
 }
 
 pub fn verifyFiles(a: Allocator, directory: []const u8, pins: pipeline.PublishedModelFiles) !void {
-    inline for (std.meta.fields(pipeline.PublishedModelFiles)) |field| {
-        const pin = @field(pins, field.name);
-        const path = try std.fs.path.join(a, &.{ directory, field.name });
+    inline for (comptime std.meta.fieldNames(pipeline.PublishedModelFiles)) |reflected_name| {
+        const pin = @field(pins, reflected_name);
+        const path = try std.fs.path.join(a, &.{ directory, reflected_name });
         defer a.free(path);
-        if (comptime std.mem.eql(u8, field.name, "model.safetensors")) {
+        if (comptime std.mem.eql(u8, reflected_name, "model.safetensors")) {
             var reader = try @import("../models/safetensors.zig").MMapReader.openFileAbsoluteLimited(a, path, pin.size_bytes, 1024 * 1024);
             defer reader.deinit();
             try pinBytes(pin, reader.file_bytes);
@@ -213,7 +213,7 @@ test "gliner boundary v2 lightweight model preflight avoids vocabulary and recov
     // Gate qualification needs the architecture, not tokenization or weights.
     // Even the raw vocabulary is larger than the entire request heap. Its
     // generic JSON tree must never be constructed by this preflight.
-    try temporary.dir.writeFile(io, .{ .sub_path = "preflight/tokenizer.json", .data = "{\"model\":{\"type\":\"Unigram\",\"vocab\":[" ++ ("[\"unused\",0]," ** 16384) ++ "[\"last\",0]]}}" });
+    try temporary.dir.writeFile(io, .{ .sub_path = "preflight/tokenizer.json", .data = "{\"model\":{\"type\":\"Unigram\",\"vocab\":[" ++ (z17RepeatString("[\"unused\",0],", 16384)) ++ "[\"last\",0]]}}" });
     try temporary.dir.writeFile(io, .{ .sub_path = "preflight/model.safetensors", .data = "gate-only fixture; never loaded" });
     var schema = try std.json.parseFromSlice(Value, a, "{\"entities\":[\"person\"]}", .{});
     defer schema.deinit();
@@ -237,7 +237,7 @@ test "gliner boundary v2 lightweight model preflight avoids vocabulary and recov
         const file = try temporary.dir.createFile(io, "preflight/config.json", .{});
         defer file.close(io);
         try file.writeStreamingAll(io, config_bytes);
-        try file.writeStreamingAll(io, " " ** (256 * 1024));
+        try file.writeStreamingAll(io, z17RepeatString(" ", (256 * 1024)));
     }
     {
         var response = try dispatch(a, &node, raw);
@@ -345,7 +345,7 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         {
             // The second row passes envelope/schema/options preflight, then
             // rejects before encoding. The first row has already decoded.
-            const too_long = "x " ** 4097;
+            const too_long = z17RepeatString("x ", 4097);
             const batch = try requestBytes(a, name, case.schema, &.{ .{ .id = "decoded-first", .content = case.text }, .{ .id = "rejected-second", .content = too_long } });
             defer a.free(batch);
             var response = try dispatch(a, &node, batch);
@@ -436,7 +436,7 @@ test "gliner boundary v2 upgrades a plain extraction request without schema_vers
 }
 
 // The in-process worker's provider "extract" operation
-// (host.linkedInferenceInvokeProvider in antfly/src/standalone/inference_host.zig)
+// (host.linkedInferenceInvokeProvider in inference/src/host/host.zig)
 // calls Node.extractDirectWithControl directly, never through extractJSON.
 // It sends a typed extracting_api.Request built from the enrichment runtime's
 // producer_json config (examples/dogfood/index_config.go's
@@ -648,7 +648,7 @@ fn extractHeadingSection(full: []const u8, heading: []const u8) ![]const u8 {
 const ResolvedModelDirectory = struct {
     models_dir: []const u8,
     name: []const u8,
-    fn deinit(self: ResolvedModelDirectory, a: Allocator) void {
+    pub fn deinit(self: ResolvedModelDirectory, a: Allocator) void {
         a.free(self.models_dir);
         a.free(self.name);
     }
@@ -1425,4 +1425,15 @@ fn longDocumentPrecisionParity(metal: bool) !void {
         .{ if (metal) "metal" else "native", deltas.items.len, max, sum / @as(f64, @floatFromInt(deltas.items.len)), median, p99, tolerance, over },
     );
     try std.testing.expectEqual(@as(usize, 0), over);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

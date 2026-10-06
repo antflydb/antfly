@@ -16,13 +16,13 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_mod = @import("../api/mod.zig");
 const build_mod = @import("../build/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const enrichment_mod = @import("../enrichment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
-const managed_embedder = @import("../../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const runtime_lifecycle = @import("../../common/runtime_lifecycle.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 

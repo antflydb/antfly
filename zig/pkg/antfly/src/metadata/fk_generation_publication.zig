@@ -4,10 +4,10 @@
 //! identity; a parent/child owner fetches this metadata record at read-index
 //! and verifies its own exact fenced descriptor before applying Raft control.
 const std = @import("std");
-const records = @import("../common/topology_records.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
-const integrity = @import("../storage/db/relational_integrity_contract.zig");
-const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+const records = @import("antfly_local_sources").common_topology_records;
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+const integrity = @import("antfly_local_sources").storage_db_relational_integrity_contract;
+const integrity_catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
 const table_manager = @import("table_manager.zig");
 
 pub const Id = [16]u8;
@@ -162,7 +162,7 @@ pub const InitialGroupReservation = struct {
         @memcpy(bytes[0..4], magic);
         bytes[4] = version;
         bytes[5] = @intFromBool(self.canceled);
-        bytes[6] = @intFromEnum(self.retirement_scope);
+        bytes[6] = @backingInt(self.retirement_scope);
         @memcpy(bytes[8..24], &self.plan_id);
         std.mem.writeInt(u64, bytes[24..32], self.child_table_id, .little);
         std.mem.writeInt(u64, bytes[32..40], self.range_id, .little);
@@ -175,7 +175,7 @@ pub const InitialGroupReservation = struct {
 
     pub fn decode(bytes: []const u8) !@This() {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], magic) or bytes[4] != version or
-            bytes[5] > 1 or bytes[6] > @intFromEnum(InitialRetirementScope.hosted_store) or bytes[7] != 0) return error.InvalidGenerationPublication;
+            bytes[5] > 1 or bytes[6] > @backingInt(InitialRetirementScope.hosted_store) or bytes[7] != 0) return error.InvalidGenerationPublication;
         const id: Id = bytes[8..24].*;
         const table_id = std.mem.readInt(u64, bytes[24..32], .little);
         const range_id = std.mem.readInt(u64, bytes[32..40], .little);
@@ -185,7 +185,7 @@ pub const InitialGroupReservation = struct {
         var checksum: Digest = undefined;
         std.crypto.hash.Blake3.hash(bytes[0 .. encoded_len - 32], &checksum, .{});
         if (!std.mem.eql(u8, &checksum, bytes[encoded_len - 32 ..])) return error.InvalidGenerationPublication;
-        return .{ .plan_id = id, .child_table_id = table_id, .range_id = range_id, .plan_digest = digest, .retirement_scope = @enumFromInt(bytes[6]), .canceled = bytes[5] == 1 };
+        return .{ .plan_id = id, .child_table_id = table_id, .range_id = range_id, .plan_digest = digest, .retirement_scope = @fromBackingInt(bytes[6]), .canceled = bytes[5] == 1 };
     }
 };
 
@@ -266,7 +266,7 @@ pub const Plan = struct {
             self.parents.len > 128 or self.child_catalog_before_b64.len == 0 or
             self.child_catalog_before_b64.len > std.base64.standard.Encoder.calcSize(integrity_catalog.max_catalog_bytes)) return error.InvalidGenerationPublication;
         if (std.mem.eql(u8, self.child_before.schema_json, self.child_after.schema_json)) return error.InvalidGenerationPublication;
-        const schema = @import("../schema/mod.zig");
+        const schema = @import("antfly_local_sources").schema_mod;
         var before = try schema.parseValidatedTableSchema(alloc, self.child_before.schema_json);
         defer before.deinit(alloc);
         var after = try schema.parseValidatedTableSchema(alloc, self.child_after.schema_json);
@@ -404,9 +404,9 @@ pub const Plan = struct {
         std.base64.standard.Decoder.decode(old_bytes, self.child_catalog_before_b64) catch return error.InvalidGenerationPublication;
         var old_digest: Digest = undefined;
         std.crypto.hash.Blake3.hash(old_bytes, &old_digest, .{});
-        var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, self.child_before.schema_json);
+        var before = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child_before.schema_json);
         defer before.deinit(alloc);
-        var after = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, self.child_after.schema_json);
+        var after = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child_after.schema_json);
         defer after.deinit(alloc);
         var old_compiled = try compileCatalog(alloc, before, self.child_before.table_id, null);
         defer old_compiled.deinit();
@@ -453,7 +453,7 @@ pub const Plan = struct {
             if (candidate.table.table_id == receipt.parent_table_id) break candidate;
         } else return error.InvalidGenerationPublication;
         try requireReceiptRange(parent.ranges, receipt.parent_group_id);
-        const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+        const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
         const transitions = try alloc.alloc(admission.Transition, parent.transitions.len);
         defer alloc.free(transitions);
         for (parent.transitions, transitions) |transition, *out| out.* = .{
@@ -476,7 +476,7 @@ pub const Plan = struct {
 /// already present on the parent: otherwise stale coverage observations for a
 /// different index could satisfy readiness for this new version.
 fn supportIndexIncarnation(alloc: std.mem.Allocator, before: records.TableRecord, after: records.TableRecord) !?u64 {
-    const coverage = @import("../api/coverage_policy.zig");
+    const coverage = @import("antfly_local_sources").api_coverage_policy;
     const tables = @import("../api/tables.zig");
     if (after.indexes_json.len == 0) return null;
     var proposed = try std.json.parseFromSlice(std.json.Value, alloc, after.indexes_json, .{});
@@ -537,7 +537,7 @@ pub const InitialCreatePlan = struct {
         if (!std.mem.eql(u8, self.child.name, expected_physical_name) or
             self.child.table_id != (if (expected_physical_id == 0) @as(u64, 1) else expected_physical_id))
             return error.InvalidGenerationPublication;
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, self.child.schema_json);
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child.schema_json);
         defer parsed.deinit(alloc);
         if (parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
         const fks = try parsed.relationalForeignKeyDefinitions(alloc);
@@ -553,7 +553,7 @@ pub const InitialCreatePlan = struct {
         var support_changes: usize = 0;
         if (transitions > max_constraints) return error.InvalidGenerationPublication;
         if (self.self_transitions.len != 0)
-            try @import("../schema/relational_foreign_key_target.zig").validate(alloc, self.child.schema_json, self.child.name, self.child.schema_json);
+            try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, self.child.schema_json, self.child.name, self.child.schema_json);
         for (self.self_transitions, 0..) |transition, ti| {
             try transition.validate(self.child);
             if (transition.expected_generation != null or transition.next_generation == null or
@@ -580,7 +580,7 @@ pub const InitialCreatePlan = struct {
             var changed = false;
             for (fks) |fk| {
                 if (fk.match != .partial or !std.mem.eql(u8, fk.parent_table, parent.table.name)) continue;
-                if (try @import("../schema/relational_witness_indexes.zig").ensureCoverage(alloc, support_json, fk.parent_columns)) |updated| {
+                if (try @import("antfly_local_sources").schema_relational_witness_indexes.ensureCoverage(alloc, support_json, fk.parent_columns)) |updated| {
                     if (changed) alloc.free(support_json);
                     support_json = updated;
                     changed = true;
@@ -685,7 +685,7 @@ pub const InitialCreatePlan = struct {
     };
 
     pub fn candidateIdentity(self: InitialCreatePlan, alloc: std.mem.Allocator) !CandidateIdentity {
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, self.child.schema_json);
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, self.child.schema_json);
         defer parsed.deinit(alloc);
         var compiled = try compileCatalog(alloc, parsed, self.child.table_id, null);
         defer compiled.deinit();
@@ -725,7 +725,7 @@ pub const InitialCreatePlan = struct {
             if (candidate.table.table_id == receipt.parent_table_id) break candidate;
         } else return error.InvalidGenerationPublication;
         try requireReceiptRange(parent.ranges, receipt.parent_group_id);
-        const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+        const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
         const transitions = try alloc.alloc(admission.Transition, parent.transitions.len);
         defer alloc.free(transitions);
         for (parent.transitions, transitions) |transition, *out| out.* = .{
@@ -745,7 +745,7 @@ pub const InitialCreatePlan = struct {
 fn validateInitialPartialParent(alloc: std.mem.Allocator, child_json: []const u8, fks: anytype, parent: records.TableRecord) !void {
     for (fks) |fk| {
         if (fk.match == .partial and std.mem.eql(u8, fk.parent_table, parent.name)) {
-            try @import("../schema/relational_foreign_key_target.zig").validate(alloc, child_json, parent.name, parent.schema_json);
+            try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child_json, parent.name, parent.schema_json);
             return;
         }
     }
@@ -755,7 +755,7 @@ fn validateInitialPartialParent(alloc: std.mem.Allocator, child_json: []const u8
 /// index name. A parent owner must prove each selected witness is ready before
 /// it can durably stage the new child generation.
 pub fn initialPartialSupportNames(alloc: std.mem.Allocator, child_json: []const u8, parent: records.TableRecord) ![]const []const u8 {
-    var child = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, child_json);
+    var child = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, child_json);
     defer child.deinit(alloc);
     const fks = try child.relationalForeignKeyDefinitions(alloc);
     defer if (fks.len != 0) alloc.free(fks);
@@ -765,12 +765,12 @@ pub fn initialPartialSupportNames(alloc: std.mem.Allocator, child_json: []const 
         break;
     };
     if (!needs_support) return &.{};
-    var parent_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, parent.schema_json);
+    var parent_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, parent.schema_json);
     defer parent_schema.deinit(alloc);
     var names: std.ArrayList([]const u8) = .empty;
     for (fks) |fk| {
         if (fk.match != .partial or !std.mem.eql(u8, fk.parent_table, parent.name)) continue;
-        const selected = try @import("../schema/relational_witness_indexes.zig").supportNames(alloc, parent_schema, fk.parent_columns);
+        const selected = try @import("antfly_local_sources").schema_relational_witness_indexes.supportNames(alloc, parent_schema, fk.parent_columns);
         defer alloc.free(selected);
         for (selected) |name| {
             var seen = false;
@@ -812,7 +812,7 @@ pub const InitialCreatePrepare = struct {
     child: records.TableRecord,
     child_ranges: []const records.RangeRecord,
     transition_generation: u64,
-    metadata_incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
 };
 
@@ -827,7 +827,7 @@ pub const InitialChildDecision = struct {
     catalog_digest: Digest,
     schema_digest: Digest,
     metadata_group_id: u64,
-    metadata_incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
     routable: bool = false,
 
@@ -844,7 +844,7 @@ pub const InitialChildDecision = struct {
 pub const InitialParentDecision = struct {
     phase: InitialPhase,
     metadata_group_id: u64,
-    metadata_incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
     plan_digest: Digest,
     fence: topology.Fence,
@@ -1192,10 +1192,10 @@ fn foreignParent(foreign: anytype, name: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn compileCatalog(alloc: std.mem.Allocator, parsed: @import("../schema/mod.zig").ParsedTableSchema, table_id: u64, previous: ?[]const u8) !integrity_catalog.Update {
-    const schema_api = @import("../schema/mod.zig");
-    const native_schema = @import("../storage/schema.zig");
-    const declarations = @import("../schema/relational_declarations.zig");
+pub fn compileCatalog(alloc: std.mem.Allocator, parsed: @import("antfly_local_sources").schema_mod.ParsedTableSchema, table_id: u64, previous: ?[]const u8) !integrity_catalog.Update {
+    const schema_api = @import("antfly_local_sources").schema_mod;
+    const native_schema = @import("antfly_local_sources").storage_schema;
+    const declarations = @import("antfly_local_sources").schema_relational_declarations;
     const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer native_schema.freeSchema(alloc, runtime);
     const bytes = try native_schema.serializeSchema(alloc, runtime);
@@ -1241,7 +1241,7 @@ fn appendDerived(result: *std.ArrayList(DerivedTransition), alloc: std.mem.Alloc
 
 pub fn deriveTransitions(alloc: std.mem.Allocator, child_table_id: u64, child_table_name: []const u8, before_json: []const u8, after_json: []const u8, old_catalog_b64: []const u8) ![]const DerivedTransition {
     if (child_table_id == 0 or child_table_name.len == 0 or child_table_name.len > 256) return error.InvalidGenerationPublication;
-    const schema = @import("../schema/mod.zig");
+    const schema = @import("antfly_local_sources").schema_mod;
     var before = try schema.parseValidatedTableSchema(alloc, before_json);
     defer before.deinit(alloc);
     var after = try schema.parseValidatedTableSchema(alloc, after_json);
@@ -1295,7 +1295,7 @@ pub fn deriveTransitions(alloc: std.mem.Allocator, child_table_id: u64, child_ta
 
 pub fn deriveInitialTransitions(alloc: std.mem.Allocator, child_table_id: u64, child_table_name: []const u8, schema_json: []const u8) ![]const DerivedTransition {
     if (child_table_id == 0 or child_table_name.len == 0 or child_table_name.len > 256) return error.InvalidGenerationPublication;
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     if (parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
     var compiled = try compileCatalog(alloc, parsed, child_table_id, null);
@@ -1550,7 +1550,7 @@ pub const SourceDecisionRequest = struct {
 pub const Decision = struct {
     phase: Phase,
     metadata_group_id: u64,
-    metadata_incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
     plan_digest: Digest,
     fence: topology.Fence,
@@ -1562,7 +1562,7 @@ pub const Decision = struct {
 pub const SourceDecision = struct {
     phase: Phase,
     metadata_group_id: u64,
-    metadata_incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    metadata_incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     metadata_epoch: u64,
     plan_digest: Digest,
     fence: topology.Fence,
@@ -1598,7 +1598,7 @@ test "self-FK generation plan binds both roles to one exact dual owner fence" {
     const after_json =
         \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"self_fk","child_columns":["parent_id"],"parent_table":"nodes","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
-    var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, before_json);
+    var before = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, before_json);
     defer before.deinit(alloc);
     var compiled = try compileCatalog(alloc, before, 101, null);
     defer compiled.deinit();
@@ -1638,7 +1638,7 @@ test "self-FK generation plan binds both roles to one exact dual owner fence" {
     const dropped_json =
         \\{"version":3,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
-    var added = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, after_json);
+    var added = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, after_json);
     defer added.deinit(alloc);
     var added_catalog = try compileCatalog(alloc, added, 101, compiled.value);
     defer added_catalog.deinit();
@@ -1668,7 +1668,7 @@ test "self-FK generation plan binds both roles to one exact dual owner fence" {
 
 fn exerciseSelfPublicationRecovery(alloc: std.mem.Allocator, plan: Plan) !void {
     const control = @import("../api/relational_fk_generation_publication.zig");
-    const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+    const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
     const digest = try plan.digest(alloc);
     const identity = try plan.childIdentity(alloc);
     const range = plan.child_ranges[0];
@@ -1785,12 +1785,12 @@ test "initial MATCH PARTIAL publication pins parent witness support" {
     const parent_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["a","b"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
     ;
-    var child = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, child_json);
+    var child = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, child_json);
     defer child.deinit(alloc);
     const fks = try child.relationalForeignKeyDefinitions(alloc);
     defer alloc.free(fks);
     try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = parent_json }));
-    const supported = (try @import("../schema/relational_witness_indexes.zig").ensureCoverage(alloc, parent_json, &.{ "a", "b" })).?;
+    const supported = (try @import("antfly_local_sources").schema_relational_witness_indexes.ensureCoverage(alloc, parent_json, &.{ "a", "b" })).?;
     defer alloc.free(supported);
     const no_full_text: records.TableRecord = .{
         .table_id = 201,
@@ -1809,8 +1809,8 @@ test "initial MATCH PARTIAL publication pins parent witness support" {
     defer names_arena.deinit();
     const names = try initialPartialSupportNames(names_arena.allocator(), child_json, .{ .table_id = 201, .name = "parent", .schema_json = supported });
     try std.testing.expectEqual(@as(usize, 2), names.len);
-    try std.testing.expectEqualStrings(&@import("../schema/relational_witness_indexes.zig").supportName("a"), names[0]);
-    try std.testing.expectEqualStrings(&@import("../schema/relational_witness_indexes.zig").supportName("b"), names[1]);
+    try std.testing.expectEqualStrings(&@import("antfly_local_sources").schema_relational_witness_indexes.supportName("a"), names[0]);
+    try std.testing.expectEqualStrings(&@import("antfly_local_sources").schema_relational_witness_indexes.supportName("b"), names[1]);
     try std.testing.expectError(error.ForeignKeyTargetNotUnique, validateInitialPartialParent(alloc, child_json, fks, .{ .table_id = 201, .name = "parent", .schema_json = child_json }));
 }
 
@@ -1826,7 +1826,7 @@ test "FK generation publication derives history-bound replacement and reparentin
         \\{"version":2,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk","child_columns":["id"],"parent_table":"parent_b","parent_columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
     try std.testing.expectEqual(@as(usize, 0), (try initialPartialSupportNames(alloc, before_json, .{ .table_id = 202, .name = "parent_a" })).len);
-    var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, before_json);
+    var before = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, before_json);
     defer before.deinit(alloc);
     var compiled = try compileCatalog(alloc, before, 101, null);
     defer compiled.deinit();
@@ -1885,7 +1885,7 @@ test "FK generation DROP requires drained child receipt and parent ACK before sc
     const after_json =
         \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    var before = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, before_json);
+    var before = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, before_json);
     defer before.deinit(alloc);
     var compiled = try compileCatalog(alloc, before, 101, null);
     defer compiled.deinit();
@@ -1924,7 +1924,7 @@ test "FK generation DROP requires drained child receipt and parent ACK before sc
     }.make;
     try std.testing.expectError(error.GenerationPublicationChanged, value.apply(alloc, command(value, .publish_child, null, null)));
     const control = @import("../api/relational_fk_generation_publication.zig");
-    const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+    const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
     const fence_bytes = try child_fence.encode();
     var fence_digest: Digest = undefined;
     std.crypto.hash.Blake3.hash(&fence_bytes, &fence_digest, .{});

@@ -23,6 +23,8 @@ fn deinitDriverIfLive(driver: *raft.ManagedProgressDriver, live: *bool) void {
     live.* = false;
 }
 
+// Real persistence can outlast the former 1 ms ticker's election window.
+// Use production Raft cadence for every voter, including the restarted owner.
 // A real second/third hosted data Raft voter, not another handle to the
 // first owner's process. Keep the server address stable while its drivers run.
 pub const DataPeer = struct {
@@ -56,11 +58,11 @@ pub const DataPeer = struct {
         errdefer peer.server.deinit();
         try peer.server.start();
         try awaitStoreRegistration(io, &peer.server);
-        peer.raft_driver = raft.ManagedProgressDriver.init(io, .{ .ptr = &peer.server, .run_once = dataRaft }, std.time.ns_per_ms);
+        peer.raft_driver = raft.ManagedProgressDriver.init(io, .{ .ptr = &peer.server, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
         try peer.raft_driver.start();
         peer.raft_live = true;
         errdefer if (peer.raft_live) peer.raft_driver.deinit();
-        peer.control_driver = raft.ManagedProgressDriver.init(io, .{ .ptr = &peer.server, .run_once = dataControl }, std.time.ns_per_ms);
+        peer.control_driver = raft.ManagedProgressDriver.init(io, .{ .ptr = &peer.server, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
         try peer.control_driver.start();
         peer.control_live = true;
         return peer;
@@ -304,6 +306,8 @@ fn tableNamed(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers
 fn awaitConstraintCoverage(alloc: std.mem.Allocator, io: std.Io, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, drivers: []const *const raft.ManagedProgressDriver) !void {
     const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     var last_status: u16 = 0;
+    var last_body: [4096]u8 = undefined;
+    var last_body_len: usize = 0;
     var logged_unavailable = false;
     while (platform.time.monotonicNs() < deadline) {
         for (drivers) |driver| try driver.checkFailure();
@@ -316,6 +320,8 @@ fn awaitConstraintCoverage(alloc: std.mem.Allocator, io: std.Io, transport: http
         };
         defer response.deinit(alloc);
         last_status = response.status;
+        last_body_len = @min(last_body.len, response.body.len);
+        @memcpy(last_body[0..last_body_len], response.body[0..last_body_len]);
         if (response.status == 200) {
             var parsed = try std.json.parseFromSlice(struct { state: []const u8, ranges: []const std.json.Value }, alloc, response.body, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -329,7 +335,7 @@ fn awaitConstraintCoverage(alloc: std.mem.Allocator, io: std.Io, transport: http
         }
         try io.sleep(.fromMilliseconds(100), .awake);
     }
-    std.debug.print("self-FK constraint coverage timeout status={d}\n", .{last_status});
+    std.debug.print("self-FK constraint coverage timeout status={d} body={s}\n", .{ last_status, last_body[0..last_body_len] });
     return error.ConstraintCoverageUnavailable;
 }
 fn batchOnce(alloc: std.mem.Allocator, transport: http.RequestExecutor, headers: []const http.RequestHeader, base: []const u8, body: []const u8) !http.HttpResponse {
@@ -744,6 +750,7 @@ fn awaitBuilderCatalogReadiness(alloc: std.mem.Allocator, io: std.Io, metadata: 
         if (builderOwnerReadReady(alloc, metadata, table_name)) |_| return else |err| {
             switch (err) {
                 error.StorageReadTemporarilyUnavailable,
+                error.GroupLeaderUnavailable,
                 error.IntegrityCatalogUnavailable,
                 error.IntegrityTopologyBusy,
                 error.OwnerIdentityNotReady,
@@ -770,7 +777,13 @@ pub fn transferOwnerLeadership(io: std.Io, first: *data_runtime.DataServer, peer
     try std.testing.expect(candidate_status.applied_index >= first_status.hard.commit_index);
     // A follower campaign cannot displace a healthy lease-holding leader.
     // Request the Raft protocol's explicit, caught-up leadership transfer.
-    try leader.data_raft.?.host.http_host.transferLeader(group_id, candidate_status.id);
+    {
+        // The mounted service's progress driver owns this runtime too.
+        // Serialize the direct fixture command with its ready pass.
+        platform.sync.lockYielding(&leader.data_raft_mutex);
+        defer leader.data_raft_mutex.unlock();
+        try leader.data_raft.?.host.http_host.transferLeader(group_id, candidate_status.id);
+    }
     const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
         const a = raftStatus(first, group_id);
@@ -850,7 +863,7 @@ fn printDropParentFailureState(alloc: std.mem.Allocator, metadata: *metadata_run
         if (publication_status) |value| {
             var response = value;
             defer response.deinit(alloc);
-            var parsed = std.json.parseFromSlice(@import("../storage/db/relational_integrity_generation_admission.zig").OwnerStatus, alloc, response.json, .{}) catch |err| {
+            var parsed = std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_generation_admission.OwnerStatus, alloc, response.json, .{}) catch |err| {
                 std.debug.print("self-FK DROP owner node={d} publication_decode_err={s}\n", .{ node_id, @errorName(err) });
                 continue;
             };
@@ -910,7 +923,7 @@ const RecoveredOwnerStatus = struct {
     digest_matches: bool,
     schema_matches: bool,
     installed: bool,
-    activation_state: @import("../storage/db/relational_integrity_activation_contract.zig").State,
+    activation_state: @import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State,
     activation_schema_version: u32,
 };
 
@@ -930,7 +943,7 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
     const reader = data.read_source.source();
     var owner_identity = (try reader.lookupGroupLocal(alloc, group_id, owner_table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.OwnerStatusUnavailable;
     defer owner_identity.deinit(alloc);
-    var parsed_identity = try std.json.parseFromSlice(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, alloc, owner_identity.json, .{ .ignore_unknown_fields = true });
+    var parsed_identity = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, alloc, owner_identity.json, .{ .ignore_unknown_fields = true });
     defer parsed_identity.deinit();
     var owner_schema = (try reader.lookupGroupLocal(alloc, group_id, owner_table_name, "", .{ .relational_topology_json = "{\"mode\":\"public_schema\"}" }, .read_index)) orelse return error.OwnerStatusUnavailable;
     defer owner_schema.deinit(alloc);
@@ -938,12 +951,12 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
     defer parsed_schema.deinit();
     var owner_publication = (try reader.lookupGroupLocal(alloc, group_id, owner_table_name, "", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index)) orelse return error.OwnerStatusUnavailable;
     defer owner_publication.deinit(alloc);
-    var parsed_owner_publication = try std.json.parseFromSlice(@import("../storage/db/relational_integrity_generation_admission.zig").OwnerStatus, alloc, owner_publication.json, .{ .ignore_unknown_fields = true });
+    var parsed_owner_publication = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_generation_admission.OwnerStatus, alloc, owner_publication.json, .{ .ignore_unknown_fields = true });
     defer parsed_owner_publication.deinit();
     var activation_response = (try reader.integrityActivation(alloc, owner_table_name, record.plan.child_ranges[0].start_key, "{\"mode\":\"status\"}")) orelse return error.OwnerStatusUnavailable;
     defer activation_response.deinit(alloc);
     var activation = try std.json.parseFromSlice(struct {
-        state: @import("../storage/db/relational_integrity_activation_contract.zig").State,
+        state: @import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State,
         schema_version: u32,
     }, alloc, activation_response.json, .{ .ignore_unknown_fields = true });
     defer activation.deinit();
@@ -955,7 +968,7 @@ fn inspectRecoveredOwner(alloc: std.mem.Allocator, metadata: *metadata_runtime.S
 
 fn awaitRecoveredOwnerReady(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, table_id: u64, drivers: []const *const raft.ManagedProgressDriver) !void {
     const deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
-    var prior_state: ?@import("../storage/db/relational_integrity_activation_contract.zig").State = null;
+    var prior_state: ?@import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State = null;
     while (true) {
         for (drivers) |driver| try driver.checkFailure();
         const observed = inspectRecoveredOwner(alloc, metadata, data, table_id) catch |err| switch (err) {
@@ -1179,11 +1192,11 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer if (metadata_live) metadata.deinit();
     try metadata.start();
     try metadata.bootstrapLocal(2297, 1);
-    var meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+    var meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     var meta_raft_live = true;
     defer if (meta_raft_live) meta_raft.deinit();
     try meta_raft.start();
-    var meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+    var meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     var meta_control_live = true;
     defer if (meta_control_live) meta_control.deinit();
     try meta_control.start();
@@ -1224,14 +1237,14 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     };
     try data.start();
     try awaitStoreRegistration(io, &data);
-    var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+    var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     var data_raft_live = true;
     defer if (data_raft_live) {
         deinitDriverIfLive(&meta_control, &meta_control_live);
         data_raft.deinit();
     };
     try data_raft.start();
-    var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+    var data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     var data_control_live = true;
     defer if (data_control_live) {
         deinitDriverIfLive(&meta_control, &meta_control_live);
@@ -1283,7 +1296,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
         defer inserted.deinit(alloc);
         if (inserted.status != 200) std.debug.print("hosted MERGE seed status={d} body={s}\n", .{ inserted.status, inserted.body });
         try std.testing.expectEqual(@as(u16, 200), inserted.status);
-        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("../sql/fixtures/sql_parity_inventory.json"), .{});
+        const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
         defer corpus.deinit();
         const original = for (corpus.value.object.get("entries").?.array.items) |entry| {
             if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0008")) break entry.object.get("sql").?.string;
@@ -1484,10 +1497,10 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
             const new_meta_api = metadata.server.owned_public_http_server orelse return error.PublicationSupervisorUnavailable;
             try http_server.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(new_meta_api, io);
             paused_metadata_fk_server = new_meta_api;
-            meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+            meta_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             meta_raft_live = true;
             try meta_raft.start();
-            meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+            meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
             meta_control_live = true;
             try meta_control.start();
             for (0..600) |_| {
@@ -1511,10 +1524,10 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
             try http_server.ApiHttpServer.FkGenerationPublicationTestDriver.pauseBackground(new_data_api, io);
             paused_data_fk_server = new_data_api;
             try awaitStoreRegistration(io, &data);
-            data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+            data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
             data_raft_live = true;
             try data_raft.start();
-            data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+            data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
             data_control_live = true;
             try data_control.start();
             const new_base = try data.baseUri(alloc);
@@ -1626,14 +1639,14 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     }, metadata_uri);
     data_live = true;
     try data.start();
-    meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+    meta_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &metadata, .run_once = metadataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     meta_control_live = true;
     try meta_control.start();
     try awaitStoreRegistration(io, &data);
-    data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
+    data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, raft.RuntimeCadence.default_raft_tick_ms * std.time.ns_per_ms);
     data_raft_live = true;
     try data_raft.start();
-    data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, std.time.ns_per_ms);
+    data_control = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataControl }, raft.RuntimeCadence.default_control_tick_ms * std.time.ns_per_ms);
     data_control_live = true;
     try data_control.start();
     const restarted_base = try data.baseUri(alloc);

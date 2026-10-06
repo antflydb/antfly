@@ -17,7 +17,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const wal_mod = @import("wal.zig");
+const wal_mod = @import("antfly_local_sources").storage_wal;
 const wire = @import("kernel_wal_wire.zig");
 
 const alloc = std.heap.c_allocator;
@@ -36,7 +36,7 @@ pub fn open(
         !validBool(request.model_commit_backend_completions) or request.path.len == 0)
         return .invalid_argument;
 
-    const path = alloc.dupeZ(u8, request.path.slice()) catch return .out_of_memory;
+    const path = alloc.dupeSentinel(u8, request.path.slice(), 0) catch return .out_of_memory;
     defer alloc.free(path);
     const group_commit_max_requests = std.math.cast(usize, request.group_commit_max_requests) orelse
         return .invalid_argument;

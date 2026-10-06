@@ -47,7 +47,7 @@ the report. Unrelated environment values are not copied into evidence.
 
 Build through the repository graph, from the zig directory:
 
-    zig build inference-bench-gliner25-metal-build -Doptimize=ReleaseFast -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -j1
+    zig build inference-bench-gliner25-metal-build -Doptimize=fast -Dmetal=true -Dcuda=false -Donnx=false -Dpjrt=false -j1
 
 These explicit flags configure the entire shared dependency graph. The worker
 rejects other optimization/backend profiles. The root build installs to

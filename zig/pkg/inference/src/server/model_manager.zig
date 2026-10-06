@@ -797,7 +797,7 @@ fn policyAllowedBackends(
 }
 
 const ComponentInspection = struct {
-    const backend_count = std.meta.fields(backends.BackendType).len;
+    const backend_count = @typeInfo(backends.BackendType).@"enum".field_names.len;
 
     allocator: std.mem.Allocator,
     base_summary: CompatibilitySummary,
@@ -806,10 +806,10 @@ const ComponentInspection = struct {
     has_native_component: bool = false,
     imported_graph_compatible: bool = true,
     native_backend_summaries: [backend_count]?CompatibilitySummary =
-        [_]?CompatibilitySummary{null} ** backend_count,
+        @as([backend_count]?CompatibilitySummary, @splat(null)),
     dependencies: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *ComponentInspection) void {
+    pub fn deinit(self: *ComponentInspection) void {
         for (self.dependencies.items) |path| self.allocator.free(path);
         self.dependencies.deinit(self.allocator);
         self.* = undefined;
@@ -836,7 +836,7 @@ const ComponentInspection = struct {
         backend: backends.BackendType,
         summary: CompatibilitySummary,
     ) void {
-        const slot = &self.native_backend_summaries[@intFromEnum(backend)];
+        const slot = &self.native_backend_summaries[@backingInt(backend)];
         slot.* = selectWorseCompatibility(slot.*, summary);
     }
 
@@ -862,7 +862,7 @@ const ComponentInspection = struct {
                 .message = "a component ONNX graph cannot be converted and validated by the selected backend",
             };
         }
-        if (self.native_backend_summaries[@intFromEnum(backend)]) |native_summary| {
+        if (self.native_backend_summaries[@backingInt(backend)]) |native_summary| {
             return selectWorseCompatibility(self.base_summary, native_summary);
         }
         return self.base_summary;
@@ -958,10 +958,10 @@ fn componentPlanKey(
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     updateComponentPlanKeySlice(&hash, model_dir);
     hash.update(&.{
-        @intFromEnum(man.model_type),
-        @intFromEnum(man.model_type_origin),
-        @intFromEnum(man.native_arch_hint),
-        @intFromEnum(contract),
+        @backingInt(man.model_type),
+        @backingInt(man.model_type_origin),
+        @backingInt(man.native_arch_hint),
+        @backingInt(contract),
         @intFromBool(policy.allow_unknown),
         @intFromBool(manifestHasNativeAssets(man.*)),
         @intFromBool(man.hasIncompleteGlinerBundle()),
@@ -974,7 +974,7 @@ fn componentPlanKey(
     updateComponentPlanKeySlice(&hash, man.inference_bundle_family);
     const backend_count: u64 = @intCast(preferred_backends.len);
     hash.update(std.mem.asBytes(&backend_count));
-    for (preferred_backends) |backend| hash.update(&.{@intFromEnum(backend)});
+    for (preferred_backends) |backend| hash.update(&.{@backingInt(backend)});
     const component_count: u64 = @intCast(component_paths.len);
     hash.update(std.mem.asBytes(&component_count));
     for (component_paths) |path| {
@@ -1581,7 +1581,7 @@ const LegacyWordPieceMeta = struct {
     sep_token_owned: ?[]u8 = null,
     mask_token_owned: ?[]u8 = null,
 
-    fn deinit(self: *LegacyWordPieceMeta, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *LegacyWordPieceMeta, allocator: std.mem.Allocator) void {
         if (self.unk_token_owned) |buf| allocator.free(buf);
         if (self.pad_token_owned) |buf| allocator.free(buf);
         if (self.cls_token_owned) |buf| allocator.free(buf);
@@ -2261,7 +2261,7 @@ const DeclaredOptionalSession = struct {
     path: ?[]const u8,
 };
 
-const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".fields.len;
+const declared_optional_session_count = @typeInfo(DeclaredOptionalSessionKind).@"enum".field_names.len;
 
 fn declaredOptionalSessions(manifest: *const manifest_mod.ModelManifest) [declared_optional_session_count]DeclaredOptionalSession {
     return .{
@@ -3431,7 +3431,7 @@ const LoadTask = struct {
     cache_default_alias: bool,
     a4b_request: ?backend_contracts.A4bInferenceRequest,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const allocator = self.manager.allocator;
         allocator.free(self.flight_key);
         allocator.free(self.model_dir);
@@ -3501,7 +3501,7 @@ const CompositeLoadTask = struct {
         return task;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const allocator = self.manager.allocator;
         for (self.paths) |path| allocator.free(path);
         allocator.free(self.paths);
@@ -3674,7 +3674,7 @@ pub const CompositeAssets = struct {
         return false;
     }
 
-    fn deinit(self: *CompositeAssets) void {
+    pub fn deinit(self: *CompositeAssets) void {
         var encoder_scope = if (self.encoder) |managed| managed.session.beginClose() else backends.Session.CloseScope{};
         defer encoder_scope.deinit();
         var decoder_scope = if (self.decoder) |managed| managed.session.beginClose() else backends.Session.CloseScope{};
@@ -3878,7 +3878,7 @@ pub const ModelManager = struct {
         tokenizer_cache_budget_source: TokenizerCacheBudgetSource = .none,
         external_tokenizer_cache_budget: ?hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = null,
         tokenizer_cache_budget_shards: [tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard =
-            [_]TokenizerCacheBudgetShard{.{}} ** tokenizer_cache_budget_shard_count,
+            @as([tokenizer_cache_budget_shard_count]TokenizerCacheBudgetShard, @splat(.{})),
         references: std.atomic.Value(usize) = .init(1),
         closing: std.atomic.Value(bool) = .init(false),
         managed_mutex: std.atomic.Mutex = .unlocked,
@@ -4679,7 +4679,7 @@ pub const ModelManager = struct {
                     // lock, which also prevents any new handle acquisition.
                     const amounts = workspace_amounts(model.session);
                     var by_backend: @FieldType(runtime.tier.memory.AdmissionLease, "amounts_by_backend") = @splat(.{});
-                    by_backend[@intFromEnum(runtime.tier.memory.BackendClass.gpu)] = amounts;
+                    by_backend[@backingInt(runtime.tier.memory.BackendClass.gpu)] = amounts;
                     if (!admissionAmountsReclaimRelevant(amounts, by_backend, pressure)) continue;
                 }
             }
@@ -4885,13 +4885,13 @@ pub const ModelManager = struct {
             .shared_unified => admissionAmountsPresent(amounts),
             .live_host => amounts.hostTotalBytes() > 0 or
                 (builtin.os.tag == .macos and amounts.backendTotalBytes() > 0),
-            .domain_host => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].hostTotalBytes() > 0,
-            .domain_backend => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].backendTotalBytes() > 0,
+            .domain_host => |backend_class| amounts_by_backend[@backingInt(backend_class)].hostTotalBytes() > 0,
+            .domain_backend => |backend_class| amounts_by_backend[@backingInt(backend_class)].backendTotalBytes() > 0,
             .domain_combined => |backend_class| admissionAmountsPresent(
-                amounts_by_backend[@intFromEnum(backend_class)],
+                amounts_by_backend[@backingInt(backend_class)],
             ),
-            .domain_kv => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].kvTotalBytes() > 0,
-            .domain_scratch => |backend_class| amounts_by_backend[@intFromEnum(backend_class)].scratchTotalBytes() > 0,
+            .domain_kv => |backend_class| amounts_by_backend[@backingInt(backend_class)].kvTotalBytes() > 0,
+            .domain_scratch => |backend_class| amounts_by_backend[@backingInt(backend_class)].scratchTotalBytes() > 0,
             // The process-owner budget is intentionally opaque. Any resident
             // admission released from the aggregate can potentially satisfy it.
             .external_budget => admissionAmountsPresent(amounts),
@@ -5383,10 +5383,10 @@ pub const ModelManager = struct {
         };
     };
 
-    fn componentPlanIo(self: *ModelManager) std.Io {
+    fn componentPlanIo(self: *ModelManager) !std.Io {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
-        return self.session_manager.io orelse std.Io.Threaded.global_single_threaded.io();
+        return self.session_manager.io orelse error.MissingIoRuntime;
     }
 
     fn applyCachedComponentPlan(
@@ -5413,7 +5413,7 @@ pub const ModelManager = struct {
         errdefer entry.release();
 
         const signature = try componentDependencySignature(
-            self.componentPlanIo(),
+            try self.componentPlanIo(),
             entry.dependencies,
         );
         if (!std.mem.eql(u8, signature[0..], entry.signature[0..])) {
@@ -5516,7 +5516,7 @@ pub const ModelManager = struct {
             );
             defer inspection.deinit();
             const signature_before = try componentDependencySignature(
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 inspection.dependencies.items,
             );
             try validateComponentNativeArtifacts(
@@ -5532,7 +5532,7 @@ pub const ModelManager = struct {
                 &inspection,
             );
             const signature_after = try componentDependencySignature(
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 inspection.dependencies.items,
             );
             if (!std.mem.eql(
@@ -5966,20 +5966,22 @@ pub const ModelManager = struct {
         _ = platform.allocator.reclaimUnusedProcessMemory();
     }
 
-    pub fn attachIo(self: *ModelManager, io: std.Io) void {
+    pub fn attachIo(self: *ModelManager, io: std.Io) std.Io.ConcurrentError!void {
         self.lockLoadedModels();
+        defer self.unlockLoadedModels();
         self.session_manager.io = io;
         var it = self.loaded.iterator();
         while (it.next()) |entry| entry.value_ptr.*.attachIo(io);
         const start_eviction_loop = self.keep_alive_ms > 0 and
             !self.eviction_loop_started;
         if (start_eviction_loop) {
+            // This loop only ends on cancellation. async may execute inline
+            // when the CPU-bound worker limit is zero or exhausted, hanging
+            // startup. concurrent must either spawn it or report failure.
+            try self.eviction_group.concurrent(io, evictionLoop, .{ self, io });
             self.eviction_loop_started = true;
             self.eviction_io = io;
         }
-        self.unlockLoadedModels();
-        if (start_eviction_loop)
-            self.eviction_group.async(io, evictionLoop, .{ self, io });
     }
 
     pub fn detachPromptCacheResourceUsageObserver(self: *ModelManager) void {
@@ -6164,7 +6166,7 @@ pub const ModelManager = struct {
         config_path: []u8,
         generation_config_path: ?[]u8,
 
-        fn deinit(self: *ResolvedWhisperSidecars) void {
+        pub fn deinit(self: *ResolvedWhisperSidecars) void {
             self.allocator.free(self.tokenizer_path);
             self.allocator.free(self.config_path);
             if (self.generation_config_path) |path| self.allocator.free(path);
@@ -6190,7 +6192,7 @@ pub const ModelManager = struct {
 
         var receipt = try managed_receipt.loadValidated(
             self.allocator,
-            self.componentPlanIo(),
+            try self.componentPlanIo(),
             model_dir,
         );
         defer if (receipt) |*validated| validated.deinit();
@@ -6202,7 +6204,7 @@ pub const ModelManager = struct {
         else
             managed_receipt.resolveContainedArtifactPath(
                 self.allocator,
-                self.componentPlanIo(),
+                try self.componentPlanIo(),
                 model_dir,
                 "generation_config.json",
             ) catch |err| switch (err) {
@@ -6253,7 +6255,7 @@ pub const ModelManager = struct {
             owned_paths.appendAssumeCapacity(path);
             try dependencies.append(self.allocator, path);
         }
-        const direct = try componentDependencySignature(self.componentPlanIo(), dependencies.items);
+        const direct = try componentDependencySignature(try self.componentPlanIo(), dependencies.items);
         if (component_paths.len == 0) return direct;
         // Artifact identity is backend-neutral. Optional graphs participate in
         // invalidation, but must not restrict the backend of the selected pair.
@@ -6271,8 +6273,8 @@ pub const ModelManager = struct {
             var inspection = try inspectComponentArtifacts(self.allocator, &man, component_paths, .multistage_ocr);
             defer inspection.deinit();
             if (inspection.invalid_summary != null) return error.IncompatibleModel;
-            const signature = try componentDependencySignature(self.componentPlanIo(), inspection.dependencies.items);
-            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
+            const signature = try componentDependencySignature(try self.componentPlanIo(), inspection.dependencies.items);
+            if (!std.mem.eql(u8, &direct, &try componentDependencySignature(try self.componentPlanIo(), dependencies.items))) return error.ModelArtifactsChanging;
             try self.publishComponentPlan(closure_key, signature, &.{}, inspection.dependencies.items);
             break :blk signature;
         };
@@ -6809,7 +6811,7 @@ pub const ModelManager = struct {
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
         @memcpy(key[0..prefix.len], prefix);
         for (preferred_backends, 0..) |backend, idx| {
-            key[prefix.len + idx] = @intCast(@intFromEnum(backend));
+            key[prefix.len + idx] = @intCast(@backingInt(backend));
         }
         return key;
     }
@@ -7678,7 +7680,7 @@ const ModelBackendHealthKey = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 fn modelBackendHealthKey(model_dir: []const u8, backend: backends.BackendType) ModelBackendHealthKey {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(model_dir);
-    hasher.update(&[_]u8{@intFromEnum(backend)});
+    hasher.update(&[_]u8{@backingInt(backend)});
     var digest: ModelBackendHealthKey = undefined;
     hasher.final(&digest);
     return digest;
@@ -8278,7 +8280,7 @@ test "admission eviction selects idle GPU workspace and never reads active works
         readable: bool = true,
         reads: usize = 0,
 
-        fn read(session: backends.Session) runtime.tier.memory.AdmissionAmounts {
+        pub fn read(session: backends.Session) runtime.tier.memory.AdmissionAmounts {
             const self: *@This() = @ptrCast(@alignCast(session.ptr));
             std.debug.assert(self.readable);
             self.reads += 1;
@@ -8702,7 +8704,7 @@ const ComponentArtifactEstimate = union(enum) {
         return .{ .native = try manifest_mod.loadFromDir(allocator, model_path) };
     }
 
-    fn deinit(self: *ComponentArtifactEstimate) void {
+    pub fn deinit(self: *ComponentArtifactEstimate) void {
         switch (self.*) {
             .native => |*man| man.deinit(),
             .disabled, .onnx => {},
@@ -9479,16 +9481,53 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     defer reloaded.release();
     // A late attachment must not move an existing Group to a different Io.
     const owned_io = manager.load_io.?;
-    manager.attachIo(std.testing.io);
+    try manager.attachIo(std.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
 }
 
+test "model eviction attachment returns with zero async workers and cancels on teardown" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer io_impl.deinit();
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureModelCache(1, 0);
+    try manager.attachIo(io_impl.io());
+    try std.testing.expect(manager.eviction_loop_started);
+    try std.testing.expectEqual(io_impl.io().userdata, manager.eviction_io.?.userdata);
+    // Reattachment must not schedule a second infinite task on the one-worker lane.
+    try manager.attachIo(io_impl.io());
+}
+
+test "model eviction attachment failure leaves maintenance retryable" {
+    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer unavailable_io.deinit();
+    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer available_io.deinit();
+    var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
+    defer manager.deinit();
+    manager.configureModelCache(1, 0);
+    try std.testing.expectError(error.ConcurrencyUnavailable, manager.attachIo(unavailable_io.io()));
+    try std.testing.expect(!manager.eviction_loop_started);
+    try std.testing.expect(manager.eviction_io == null);
+    try manager.attachIo(available_io.io());
+    try std.testing.expect(manager.eviction_loop_started);
+}
+
 test "cold load coordination reuses an attached runtime without a fallback" {
     var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
     defer manager.deinit();
-    manager.attachIo(std.testing.io);
+    try manager.attachIo(std.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
@@ -11077,7 +11116,7 @@ test "component compatibility validates explicit split ONNX graphs" {
     );
     try std.testing.expectEqual(model_compatibility.Level.compatible, multistage_summary.level);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{});
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11148,7 +11187,7 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
     const paths = try encoder_decoder.findEncoderDecoderPaths(allocator, root);
     defer allocator.free(paths.encoder);
     defer allocator.free(paths.decoder);
-    var sessions = backends.SessionManager.init(allocator);
+    var sessions = backends.SessionManager.initWithIo(allocator, std.testing.io);
     sessions.preferred_backends = &.{.native};
     var manager = ModelManager.init(allocator, sessions);
     defer manager.deinit();
@@ -11215,7 +11254,7 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
     const other_root = try std.fs.path.join(allocator, &.{ root, "other" });
     defer allocator.free(other_root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureModelCache(0, 2);
 
@@ -11317,7 +11356,7 @@ test "composite cold load cancellation abandons only the departing waiter" {
     var manager = ModelManager.init(std.testing.allocator, backends.SessionManager.init(std.testing.allocator));
     defer manager.deinit();
     const flight = try std.testing.allocator.create(CompositeAssetsLoadFlight);
-    const key = [_]u8{0} ** 32;
+    const key = @as([32]u8, @splat(0));
     flight.* = .{ .io = std.testing.io, .refs = 3, .load_state = .{ .io = std.testing.io } };
     try std.testing.expect(flight.load_state.tryAddWaiter());
     try manager.in_flight_composite_assets.put(std.testing.allocator, key, flight);
@@ -11340,7 +11379,7 @@ test "failed load flights allow immediate retry before the old task releases" {
     const alloc = std.testing.allocator;
     var manager = ModelManager.init(alloc, backends.SessionManager.init(alloc));
     defer manager.deinit();
-    const key = [_]u8{1} ** 32;
+    const key = @as([32]u8, @splat(1));
     const old = try alloc.create(CompositeAssetsLoadFlight);
     old.* = .{ .io = std.testing.io, .refs = 2, .load_state = .{ .io = std.testing.io } };
     try manager.in_flight_composite_assets.put(alloc, key, old);
@@ -11405,7 +11444,7 @@ test "component compatibility rejects malformed directory-backed native artifact
     try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     // Structurally invalid artifacts remain incompatible even when unknown
     // model contracts are explicitly permitted.
@@ -11449,7 +11488,7 @@ test "component plan invalidates when a referenced safetensors shard changes" {
     );
     defer allocator.free(root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11519,7 +11558,7 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
     );
     defer allocator.free(root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11630,11 +11669,11 @@ test "projector residency follows its request-scoped lifecycle" {
     const projector_bytes: usize = 4096;
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.gguf",
-        .data = &([_]u8{0x31} ** decoder_bytes),
+        .data = &(@as([decoder_bytes]u8, @splat(0x31))),
     });
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "mmproj.gguf",
-        .data = &([_]u8{0x32} ** projector_bytes),
+        .data = &(@as([projector_bytes]u8, @splat(0x32))),
     });
     const root = try std.fs.path.join(
         allocator,
@@ -11705,7 +11744,7 @@ test "directory-backed component admission charges native model artifacts" {
     const weight_bytes = 8192;
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "model.gguf",
-        .data = &([_]u8{0x5a} ** weight_bytes),
+        .data = &(@as([weight_bytes]u8, @splat(0x5a))),
     });
     const root = try std.fs.path.join(
         allocator,
@@ -12644,42 +12683,42 @@ fn appendTestString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(
 
 fn appendTestMetadataString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataU32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: u32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.u32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.u32));
     try appendTestLe(u32, allocator, data, value);
 }
 
 fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const i32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
 }
 
 fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }
@@ -12729,7 +12768,7 @@ const TeardownStderrBlocker = struct {
         }
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.stopping.store(true, .release);
         if (self.thread) |thread| thread.join();
         self.thread = null;

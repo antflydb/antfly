@@ -39,7 +39,7 @@ const Stats = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa_state.deinit();
     const alloc = gpa_state.allocator();
 
@@ -127,7 +127,7 @@ fn makeTempPath(alloc: std.mem.Allocator) ![:0]u8 {
     const ts = nowNs();
     const owned = try std.fmt.allocPrint(alloc, "/tmp/antfly-lmdb-commit-{d}", .{ts});
     defer alloc.free(owned);
-    const owned_z = try alloc.dupeZ(u8, owned);
+    const owned_z = try alloc.dupeSentinel(u8, owned, 0);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().createDirPath(io_impl.io(), owned);

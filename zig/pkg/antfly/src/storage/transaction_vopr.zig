@@ -7,10 +7,10 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const backend_erased = @import("backend_erased.zig");
-const mem_backend = @import("mem_backend.zig");
-const transactions = @import("transactions.zig");
-const tracing = @import("../tracing/antfly_trace_writer.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const transactions = @import("antfly_local_sources").storage_transactions;
+const tracing = @import("antfly_local_sources").tracing_antfly_trace_writer;
 
 const Allocator = std.mem.Allocator;
 const txn_id: transactions.TxnId = .{ 0xa1, 0x7f, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
@@ -46,7 +46,7 @@ pub const Scenario = struct {
         phase: Phase = .begin,
         terminal_status: ?transactions.TxnStatus = null,
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             self.manager.deinit();
             self.runtime_store.deinit();
             self.backend.close();
@@ -140,8 +140,8 @@ pub const Scenario = struct {
         const persisted_status: i64 = if (state.phase == .begin)
             -1
         else
-            @intCast(@intFromEnum(try state.manager.getTransactionStatus(txn_id)));
-        try builder.addNamed(allocator, "storage.transaction.phase", @intCast(@intFromEnum(state.phase)));
+            @intCast(@backingInt(try state.manager.getTransactionStatus(txn_id)));
+        try builder.addNamed(allocator, "storage.transaction.phase", @intCast(@backingInt(state.phase)));
         try builder.addNamed(allocator, "storage.transaction.persisted_status", persisted_status);
         try builder.addNamed(allocator, "storage.transaction.terminal", @intFromBool(state.phase == .terminal));
     }

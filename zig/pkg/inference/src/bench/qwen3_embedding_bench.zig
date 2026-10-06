@@ -320,7 +320,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-qwen3-embedding-e2e -Doptimize=ReleaseFast -- --model-dir <qwen3-embedding dir> [--backend metal|cuda|native] [--batch N] [--seq-len N] [--lengths 20,256,1024] [--warmup N] [--iters N] [--print-embedding]\n" ++
+        "usage: zig build bench-qwen3-embedding-e2e -Doptimize=fast -- --model-dir <qwen3-embedding dir> [--backend metal|cuda|native] [--batch N] [--seq-len N] [--lengths 20,256,1024] [--warmup N] [--iters N] [--print-embedding]\n" ++
             "model dir falls back to $ANTFLY_INFERENCE_QWEN3_EMBEDDING_MODEL; --lengths enables ragged mode (batch = number of lengths, padded to the max)\n",
         .{},
     );

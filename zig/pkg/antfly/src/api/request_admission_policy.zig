@@ -5,7 +5,7 @@
 // the License at https://www.antfly.io/licensing/ELv2-license.
 
 const std = @import("std");
-const request_admission = @import("../common/request_admission.zig");
+const request_admission = @import("antfly_local_sources").common_request_admission;
 const contextual_operations = @import("contextual_operations.zig");
 
 pub const Class = request_admission.Class;

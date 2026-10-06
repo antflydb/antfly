@@ -17,25 +17,25 @@ const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const inference_request_context = @import("../inference/execution_context.zig");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const antfly_provider = @import("../inference/local.zig");
-const remote_capabilities = @import("../inference/remote_capabilities.zig");
-const execution_context = @import("../inference/execution_context.zig");
-const runtime_error_abi = @import("../runtime_error_abi.zig");
-const runtime_native_abi = @import("../runtime_native_abi.zig");
-const vertex_provider = @import("../inference/vertex.zig");
-const common_secrets = @import("../common/secrets.zig");
-const request_admission = @import("../common/request_admission.zig");
-const common_cancellation = @import("../common/cancellation.zig");
-const provider_limits = @import("../common/provider_limits.zig");
-const credential_identity = @import("../common/credential_source_identity.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const inference_request_context = @import("antfly_inference_execution_context");
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const antfly_provider = @import("antfly_inference_local");
+const remote_capabilities = @import("antfly_inference_remote_capabilities");
+const execution_context = @import("antfly_inference_execution_context");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
+const runtime_native_abi = @import("antfly_runtime_abi").native_abi;
+const vertex_provider = @import("antfly_inference_vertex");
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const request_admission = @import("antfly_local_sources").common_request_admission;
+const common_cancellation = @import("antfly_cancellation");
+const provider_limits = @import("antfly_local_sources").common_provider_limits;
+const credential_identity = @import("antfly_local_sources").common_credential_source_identity;
 const google_auth = @import("antfly_google").auth;
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test)
-    @import("../storage/db/template_stub.zig")
+    @import("antfly_local_sources").storage_db_template_stub
 else
-    @import("../template.zig");
+    @import("antfly_local_sources").template;
 
 pub const ContentPart = template_mod.ContentPart;
 
@@ -215,7 +215,7 @@ pub fn normalizeOperationalError(err: anyerror) anyerror {
 }
 
 pub fn statusError(status: u16) anyerror {
-    return @import("../inference/types.zig").rerankStatusError(status);
+    return @import("antfly_inference_types").rerankStatusError(status);
 }
 
 test "reranking runtime failures use stable query dependency classes" {
@@ -312,7 +312,7 @@ const RequestAuthentication = struct {
     fn init(alloc: std.mem.Allocator, cfg: Config, store: ?*common_secrets.FileStore) !RequestAuthentication {
         const capabilities = providerCapabilities(cfg.provider);
         var secret = if (capabilities.credential_env) |env_name|
-            try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.api_key, env_name)
+            try common_secrets.SecretValue.initConfigOrProviderDefault(alloc, cfg.api_key, env_name)
         else
             try common_secrets.SecretValue.initConfig(alloc, cfg.api_key);
         errdefer if (secret) |*value| value.deinit(alloc);
@@ -331,7 +331,7 @@ const RequestAuthentication = struct {
         return credential_identity.CredentialSourceIdentity.none();
     }
 
-    fn deinit(self: *RequestAuthentication, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *RequestAuthentication, alloc: std.mem.Allocator) void {
         if (self.token) |value| alloc.free(value);
         if (self.secret) |*value| value.deinit(alloc);
         self.* = undefined;
@@ -1172,9 +1172,9 @@ test "reranking runtime remote Antfly defaults match anonymous or environment au
     const cfg = Config{ .provider = .antfly, .url = server.baseUrl(), .field = "body", .rate_limit = .{ .requests_per_minute = 1 } };
     var auth = try RequestAuthentication.init(alloc, cfg, null);
     defer auth.deinit(alloc);
-    try std.testing.expectEqualStrings("ANTFLY_INFERENCE_API_KEY", auth.secret.?.env_var);
+    try std.testing.expectEqualStrings("antfly.inference.api_key", auth.secret.?.provider_default);
     const expected_source = if (auth.token != null)
-        credential_identity.CredentialSourceIdentity.environmentVariable("ANTFLY_INFERENCE_API_KEY")
+        credential_identity.CredentialSourceIdentity.secretReference("antfly.inference.api_key")
     else
         credential_identity.CredentialSourceIdentity.none();
     try std.testing.expect(auth.identity(cfg).eql(expected_source));
@@ -1331,7 +1331,7 @@ test "reranking runtime sends image documents to linked rerankers that accept im
         fn rerankTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const []const u8, _: inference_request_context.RequestContext) anyerror![]f32 {
             return error.TestUnexpectedResult;
         }
-        fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
+        pub fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             if (state.reject) return error.InvalidArguments;
             state.document_calls += 1;
@@ -1343,7 +1343,7 @@ test "reranking runtime sends image documents to linked rerankers that accept im
             scores[1] = 0.3;
             return scores;
         }
-        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("../inference/work.zig").Task) anyerror!@import("../inference/work.zig").InferenceCapabilities {
+        fn capabilities(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, task: @import("antfly_inference_work").Task) anyerror!@import("antfly_inference_work").InferenceCapabilities {
             const state: *@This() = @ptrCast(@alignCast(ptr));
             return .{ .task = task, .input_modalities = .{ .text = true, .image = state.accepts_images }, .input_granularity = .item, .output = .ranked_items, .result_cardinality = .one_per_request };
         }

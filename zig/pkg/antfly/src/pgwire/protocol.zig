@@ -19,7 +19,7 @@ const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
 const commands = @import("session_commands.zig");
-const settings_catalog = @import("../sql/setting_catalog.zig");
+const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
 const Budget = @import("budget.zig").Budget;
 
@@ -565,7 +565,7 @@ pub const Session = struct {
         try request_.check();
         const raw = try load(self.source.context, alloc, identity, request_);
         const snapshot = struct {
-            fn read(ptr: *anyopaque, _: std.mem.Allocator, _: settings_catalog.Scope) !settings_catalog.RawSnapshot {
+            pub fn read(ptr: *anyopaque, _: std.mem.Allocator, _: settings_catalog.Scope) !settings_catalog.RawSnapshot {
                 return @as(*settings_catalog.RawSnapshot, @ptrCast(@alignCast(ptr))).*;
             }
         };
@@ -670,7 +670,7 @@ pub const Session = struct {
                     defer result.deinit();
                     if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                     if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                    for (result.rows, 0..) |row, index| try self.dataRow(result.columns, &.{}, row, if (result.sql_nulls) |flags| flags[index] else null);
+                    try self.dataRows(result.columns, &.{}, result.rows, result.sql_nulls);
                     try self.complete(result);
                     self.finishDiscardAll();
                 }
@@ -836,7 +836,7 @@ pub const Session = struct {
                 }
                 const count = if (requested == 0) result.rows.len - portal.offset else @min(@as(usize, @intCast(requested)), result.rows.len - portal.offset);
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                for (result.rows[portal.offset..][0..count], portal.offset..) |row, index| try self.dataRow(result.columns, portal.formats, row, if (result.sql_nulls) |flags| flags[index] else null);
+                try self.dataRows(result.columns, portal.formats, result.rows[portal.offset..][0..count], if (result.sql_nulls) |flags| flags[portal.offset..][0..count] else null);
                 portal.offset += count;
                 if (portal.offset < result.rows.len) try self.message('s', "") else try self.complete(result);
                 if (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
@@ -928,7 +928,7 @@ pub const Session = struct {
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-                for (result.rows, 0..) |row, index| try self.dataRow(result.columns, &.{}, row, if (result.sql_nulls) |flags| flags[index] else null);
+                try self.dataRows(result.columns, &.{}, result.rows, result.sql_nulls);
                 try self.complete(result);
                 return true;
             },
@@ -1067,27 +1067,31 @@ pub const Session = struct {
                 cursor.exhausted = true;
                 break;
             };
-            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer page_arena.deinit();
-            const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
-            var page = stream.next(stream.context, page_arena.allocator(), req, wanted) catch |err| {
-                cursor.stream = null;
-                stream.close(stream.context);
-                return err;
-            };
-            defer page.result.deinit();
-            if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
-            if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
-            if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
-            if (!fetch.move) for (page.result.rows, 0..) |row, index| try self.dataRow(page.result.columns, &.{}, row, if (page.result.sql_nulls) |flags| flags[index] else null);
-            cursor.fetched += page.result.rows.len;
-            remaining -= page.result.rows.len;
-            cursor.exhausted = page.exhausted;
+            {
+                var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer page_arena.deinit();
+                const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
+                var page = stream.next(stream.context, page_arena.allocator(), req, wanted) catch |err| {
+                    cursor.stream = null;
+                    stream.close(stream.context);
+                    return err;
+                };
+                defer page.result.deinit();
+                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+                if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+                if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
+                if (!fetch.move) try self.dataRows(page.result.columns, &.{}, page.result.rows, page.result.sql_nulls);
+                cursor.fetched += page.result.rows.len;
+                remaining -= page.result.rows.len;
+                cursor.exhausted = page.exhausted;
+                try self.writer.flush();
+            }
+            // Native pages borrow the stream's memory admission. Release the
+            // page before releasing the exhausted stream and its snapshots.
             if (cursor.exhausted) {
                 cursor.stream = null;
                 stream.close(stream.context);
             }
-            try self.writer.flush();
         }
         var tag: [64]u8 = undefined;
         try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", cursor.fetched - fetched_before }));
@@ -1117,15 +1121,17 @@ pub const Session = struct {
         while (!cursor.exhausted and spool.rows.items.len < through) {
             try req.check();
             const stream = cursor.stream orelse return error.InvalidResult;
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
-            var page = try stream.next(stream.context, arena.allocator(), req, wanted);
-            defer page.result.deinit();
-            if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
-            if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
-            spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
-            cursor.exhausted = page.exhausted;
+            {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
+                var page = try stream.next(stream.context, arena.allocator(), req, wanted);
+                defer page.result.deinit();
+                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+                if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+                spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+                cursor.exhausted = page.exhausted;
+            }
             if (cursor.exhausted) stream.detach.?(stream.context);
         }
     }
@@ -1301,7 +1307,7 @@ pub const Session = struct {
                 return error.InvalidResult;
             if (!page.exhausted and result.rows.len == 0) return error.InvalidResult;
             if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
-            for (result.rows, 0..) |row, index| try self.dataRow(result.columns, portal.formats, row, if (result.sql_nulls) |flags| flags[index] else null);
+            try self.dataRows(result.columns, portal.formats, result.rows, result.sql_nulls);
             remaining -= result.rows.len;
             portal.offset += result.rows.len;
             portal.stream_complete = page.exhausted;
@@ -1410,7 +1416,7 @@ pub const Session = struct {
     }
 
     fn ready(self: *Session) !void {
-        try self.message('Z', &.{@intFromEnum(self.status)});
+        try self.message('Z', &.{@backingInt(self.status)});
     }
 
     fn command(self: *Session, tag: []const u8) !void {
@@ -1444,6 +1450,12 @@ pub const Session = struct {
         if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
         var bytes = std.Io.Writer.Allocating.init(self.alloc);
         defer bytes.deinit();
+        try self.encodeDataRow(&bytes, columns, formats, row, null_flags);
+        try self.message('D', bytes.written());
+    }
+    fn encodeDataRow(self: *Session, bytes: *std.Io.Writer.Allocating, columns: []const backend.Column, formats: []const u16, row: []const std.json.Value, null_flags: ?[]const bool) !void {
+        if (row.len != columns.len) return error.InvalidResult;
+        if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
         try bytes.writer.writeInt(u16, @intCast(row.len), .big);
         for (row, columns, 0..) |value, column, index| {
             const sql_null = if (null_flags) |flags| flags[index] else value == .null;
@@ -1452,13 +1464,24 @@ pub const Session = struct {
                 try bytes.writer.writeInt(i32, -1, .big);
                 continue;
             }
-            const encoded = try values.encode(self.alloc, column.type, formatAt(formats, index), value);
-            defer self.alloc.free(encoded);
-            if (encoded.len > self.limits.frame_bytes) return error.ProgramLimitExceeded;
-            try bytes.writer.writeInt(i32, @intCast(encoded.len), .big);
-            try bytes.writer.writeAll(encoded);
+            const position = bytes.written().len;
+            try bytes.writer.writeInt(i32, 0, .big);
+            try values.encodeInto(self.alloc, &bytes.writer, column.type, formatAt(formats, index), value);
+            const length = bytes.written().len - position - 4;
+            if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
+            std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
         }
-        try self.message('D', bytes.written());
+        if (bytes.written().len > self.limits.frame_bytes -| 4) return error.ProgramLimitExceeded;
+    }
+    fn dataRows(self: *Session, columns: []const backend.Column, formats: []const u16, rows: []const []const std.json.Value, flags: ?[]const []const bool) !void {
+        if (flags) |bits| if (bits.len != rows.len) return error.InvalidResult;
+        var bytes = std.Io.Writer.Allocating.init(self.alloc);
+        defer bytes.deinit();
+        for (rows, 0..) |row, index| {
+            bytes.writer.end = 0;
+            try self.encodeDataRow(&bytes, columns, formats, row, if (flags) |bits| bits[index] else null);
+            try self.message('D', bytes.written());
+        }
     }
 };
 

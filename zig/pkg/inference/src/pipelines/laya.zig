@@ -38,7 +38,8 @@ pub const Decision = struct {
     confidence: f32,
     expected_value: ?f32 = null,
     true_probability: ?f32 = null,
-    act_probability: f32,
+    /// Null for checkpoints without an action head (`format: opendecider`).
+    act_probability: ?f32,
 };
 pub const Result = struct { decisions: []Decision, prompt_tokens: usize, execution_chunks: usize = 0, padded_tokens: usize = 0 };
 
@@ -61,6 +62,8 @@ pub const QuestionTokens = struct {
     per: usize,
     options_len: usize,
     head_len: usize,
+    /// Most option tokens after each `[MASK]`; OpenDecider keeps every one.
+    option_cap: usize = max_option_tokens,
 
     pub fn deinit(self: QuestionTokens, a: std.mem.Allocator) void {
         for (self.options) |ids| a.free(ids);
@@ -70,13 +73,14 @@ pub const QuestionTokens = struct {
 
     /// Option run length under the shared budget, including its `[MASK]` marker.
     pub fn optionRun(self: QuestionTokens, i: usize) usize {
-        return @min(1 + @min(self.options[i].len, max_option_tokens), self.per);
+        return @min(1 + @min(self.options[i].len, self.option_cap), self.per);
     }
 };
 
 pub fn questionTokens(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, q: Question) !QuestionTokens {
     if (q.labels.len < 2 or q.labels.len > cfg.maxOptions() or q.labels.len != q.descriptions.len) return error.InvalidLayaQuestion;
     const mask = cfg.mask_token[0..cfg.mask_token_len];
+    if (cfg.format == .opendecider) return openDeciderTokens(a, tok, mask, q);
     const head_text = try std.fmt.allocPrint(a, "{s} question: {s}", .{ @tagName(q.kind), q.instruction });
     defer a.free(head_text);
     const head = try encodeClean(a, tok, head_text, mask);
@@ -104,6 +108,31 @@ pub fn questionTokens(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, q
     return .{ .head = head, .options = options, .per = per, .options_len = options_len, .head_len = @min(head.len, @max(8, budget)) };
 }
 
+/// OpenDecider-nano's question and option text (opendecider/prompt.py,
+/// `nano_ids`), with no shared budget and no cap on option length. Yes/no
+/// options are named "yes" and "no", described "Yes" and "No" by default.
+fn openDeciderTokens(a: std.mem.Allocator, tok: Tokenizer, mask: []const u8, q: Question) !QuestionTokens {
+    const head_text = try std.fmt.allocPrint(a, "question: {s}", .{q.instruction});
+    defer a.free(head_text);
+    const head = try encodeClean(a, tok, head_text, mask);
+    errdefer a.free(head);
+    const options = try a.alloc([]i32, q.labels.len);
+    errdefer a.free(options);
+    var initialized: usize = 0;
+    errdefer for (options[0..initialized]) |ids| a.free(ids);
+    var options_len: usize = 0;
+    for (q.labels, q.descriptions, 0..) |label, desc, i| {
+        const name: []const u8 = if (q.kind == .noul) (if (i == 1) "yes" else "no") else label;
+        const shown: []const u8 = if (desc.len > 0) desc else if (q.kind == .noul) (if (i == 1) "Yes" else "No") else "";
+        const text = if (shown.len == 0 or std.mem.eql(u8, shown, name)) try std.fmt.allocPrint(a, " {s}", .{name}) else try std.fmt.allocPrint(a, " {s}: {s}", .{ name, shown });
+        defer a.free(text);
+        options[i] = try encodeClean(a, tok, text, mask);
+        initialized += 1;
+        options_len += 1 + options[i].len;
+    }
+    return .{ .head = head, .options = options, .per = std.math.maxInt(usize), .options_len = options_len, .head_len = head.len, .option_cap = std.math.maxInt(usize) };
+}
+
 /// Allocations belong to the caller's request arena. State overflow is rejected,
 /// unlike upstream's silent truncation; question/option formatting matches it.
 pub fn prepare(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, task: Task) !Sequence {
@@ -117,8 +146,11 @@ pub fn prepare(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, task: Ta
     const options = tokens.options;
     const options_len = tokens.options_len;
     const head_len = tokens.head_len;
-    const state = try encodeClean(a, tok, task.text, mask);
-    defer a.free(state);
+    const state_text = if (cfg.format == .opendecider) try std.fmt.allocPrint(a, "input: {s}", .{task.text}) else try a.dupe(u8, task.text);
+    defer a.free(state_text);
+    const encoded = try encodeClean(a, tok, state_text, mask);
+    defer a.free(encoded);
+    const state = if (cfg.truncate_state) encoded[0..@min(encoded.len, cfg.max_len -| (4 + head_len + options_len))] else encoded;
     const total = 4 + head_len + options_len + state.len;
     if (total > cfg.max_len) return error.ExtractionTextLimitExceeded;
     const ids = try a.alloc(i64, total);
@@ -133,11 +165,14 @@ pub fn prepare(a: std.mem.Allocator, tok: Tokenizer, cfg: model.Config, task: Ta
     }
     ids[pos] = special.sep_id;
     pos += 1;
-    for (options, 0..) |option, i| {
+    // OpenDecider lists "yes" before "no"; markers stay in label order.
+    const reversed = cfg.format == .opendecider and q.kind == .noul;
+    for (0..options.len) |k| {
+        const i = if (reversed) options.len - 1 - k else k;
         markers[i] = @intCast(pos);
         ids[pos] = special.mask_id;
         pos += 1;
-        for (option[0 .. tokens.optionRun(i) - 1]) |id| {
+        for (options[i][0 .. tokens.optionRun(i) - 1]) |id| {
             ids[pos] = id;
             pos += 1;
         }
@@ -157,6 +192,7 @@ pub fn decode(a: std.mem.Allocator, cfg: model.Config, q: Question, logits: []co
     const probabilities = try a.alloc(f32, logits.len);
     errdefer a.free(probabilities);
     try softmax(logits, cfg.scale(q.kind, logits.len), probabilities);
+    if (cfg.n_act == 0) return finalize(q, probabilities, null);
     var acts: [33]f32 = undefined;
     try softmax(action, 1, acts[0..action.len]);
     return finalize(q, probabilities, acts[0]);
@@ -166,7 +202,7 @@ pub fn decode(a: std.mem.Allocator, cfg: model.Config, q: Question, logits: []co
 /// (`probabilities`, which the result owns). Used both by `decode`, from a
 /// softmax, and by two-stage choice's merged distribution
 /// (`mergeTwoStage`), which never runs its own softmax over the full label set.
-fn finalize(q: Question, probabilities: []f32, act_probability: f32) Decision {
+pub fn finalize(q: Question, probabilities: []f32, act_probability: ?f32) Decision {
     var winner: usize = 0;
     var entropy: f32 = 0;
     var expected: f32 = 0;
@@ -234,10 +270,13 @@ pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, sess
         if (max_input_tokens) |limit| if (prepared.ids.len > limit) return error.InferenceInputTokensExceeded;
         tokens += prepared.ids.len;
     }
-    const order = if (session.backend() == .cuda and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_BUCKETING", true))
-        try bucketOrder(a, sequences)
+    // Group similar lengths so a chunk pads to its own longest input rather
+    // than the request's.
+    const bucketing = if (session.backend() == .cuda)
+        platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_BUCKETING", true)
     else
-        null;
+        platform.env.getenvBoolDefault("ANTFLY_LAYA_BUCKETING", true);
+    const order = if (bucketing) try bucketOrder(a, sequences) else null;
     defer if (order) |indices| a.free(indices);
     const ordered_tasks = if (order != null) try a.alloc(Task, tasks.len) else null;
     defer if (ordered_tasks) |value| a.free(value);
@@ -618,7 +657,7 @@ fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@i
         @memcpy(ids[i * seq ..][0..prepared.ids.len], prepared.ids);
         @memset(mask[i * seq ..][0..prepared.ids.len], 1);
         @memcpy(markers[i * count ..][0..prepared.markers.len], prepared.markers);
-        kinds[i] = @intFromEnum(task.question.kind);
+        kinds[i] = @backingInt(task.question.kind);
     }
     var inputs: [4]Tensor = undefined;
     var initialized: usize = 0;
@@ -667,9 +706,10 @@ fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@i
         for (outputs) |*output| output.deinit();
         scratch.free(outputs);
     }
-    if (outputs.len != 2 or outputs[0].dtype != .f32 or outputs[1].dtype != .f32) return error.UnexpectedOutputShape;
+    if (outputs.len != @as(usize, if (cfg.n_act == 0) 1 else 2)) return error.UnexpectedOutputShape;
+    for (outputs) |output| if (output.dtype != .f32) return error.UnexpectedOutputShape;
     const logits = outputs[0].asFloat32();
-    const acts = outputs[1].asFloat32();
+    const acts: []const f32 = if (cfg.n_act == 0) &.{} else outputs[1].asFloat32();
     if (logits.len != tasks.len * count or acts.len != tasks.len * cfg.n_act) return error.UnexpectedOutputShape;
     var decoded: usize = 0;
     errdefer for (decisions[0..decoded]) |decision| a.free(decision.probabilities);
@@ -686,7 +726,7 @@ test "laya decision decoding preserves ordinal expectation and boolean probabili
     const d = try decode(arena.allocator(), .{}, q, &.{ 0, 0, 0 }, &.{ 0, 0 });
     try std.testing.expectApproxEqAbs(@as(f32, 1), d.expected_value.?, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0), d.confidence, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), d.act_probability, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), d.act_probability.?, 1e-6);
     const b = try decode(arena.allocator(), .{}, .{ .name = "needed", .kind = .noul, .instruction = "needed?", .labels = &.{ "false", "true" }, .descriptions = &.{ "", "" } }, &.{ 0, @log(@as(f32, 3)) }, &.{ 0, 0 });
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), b.true_probability.?, 1e-6);
     try std.testing.expectEqualStrings("true", b.label);
@@ -713,7 +753,7 @@ test "laya CUDA chunk planning uses padded shape retained memory and 128 task ce
     var session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.info, .backend = Probe.backend, .close = undefined, .runGeometry = Probe.geometry } };
     var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
     var markers = [_]i64{ 0, 1 };
-    var sequences = [_]Sequence{.{ .ids = ids[0..2], .markers = &markers }} ** 512;
+    var sequences = @as([512]Sequence, @splat(.{ .ids = ids[0..2], .markers = &markers }));
     try std.testing.expectEqual(@as(usize, 128), try selectChunk(session, &sequences, 1024));
     session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .backend_limit_bytes = 2 * 2 * 4096 }, .static_workspace_bytes = 0, .check_live_memory = false };
     sequences[2].ids = &ids;
@@ -757,7 +797,7 @@ test "laya decoding rejects nonfinite logits without leaking probabilities" {
 
 test "laya length buckets are stable and require meaningful padding savings" {
     const a = std.testing.allocator;
-    var ids = [_]i64{0} ** 149;
+    var ids = @as([149]i64, @splat(0));
     var markers = [_]i64{ 0, 1 };
     var sequences: [8]Sequence = undefined;
     for (&sequences, [_]usize{ 61, 100, 55, 79, 149, 80, 81, 143 }) |*sequence, len|

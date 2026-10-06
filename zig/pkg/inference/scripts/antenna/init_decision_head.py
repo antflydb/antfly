@@ -3,6 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Build a Laya-format checkpoint: an Antenna trunk with a fresh decision head.
 
+With ``--hf-encoder`` the trunk is a Hugging Face ModernBERT checkpoint instead
+(LAYA.md roadmap 2d, a base-size student).
+
 The Antenna student's encoder tensors already carry the names Laya's loader
 expects (``encoder.embeddings.*``, ``encoder.layers.N.*``,
 ``encoder.final_norm.weight``), so they copy across unchanged; the GLiNER
@@ -18,6 +21,8 @@ costs, mask token) come from a released Laya checkpoint prepared by
 ``scripts/laya/prepare_laya.py``; temperatures reset to 1.
 
     python init_decision_head.py --student <antenna student dir> \\
+        --laya <prepared laya dir> --output <dir outside Git>
+    python init_decision_head.py --hf-encoder <ModernBERT dir> \\
         --laya <prepared laya dir> --output <dir outside Git>
 """
 
@@ -87,20 +92,27 @@ def head_tensors(
 def build(args: argparse.Namespace) -> dict[str, Any]:
     from safetensors.torch import load_file, save_file
 
-    encoder_config = json.loads(
-        (args.student / "encoder_config" / "config.json").read_text(encoding="utf-8")
+    source = args.student or args.hf_encoder
+    config_path = (
+        args.student / "encoder_config" / "config.json"
+        if args.student
+        else args.hf_encoder / "config.json"
     )
+    encoder_config = json.loads(config_path.read_text(encoding="utf-8"))
     if encoder_config.get("model_type") != "modernbert":
-        raise ValueError("the student's encoder is not ModernBERT")
+        raise ValueError(f"{source} is not a ModernBERT encoder")
     laya_source = json.loads((args.laya / "config.json").read_text(encoding="utf-8"))[
         "laya"
     ]
     laya = decision_config(laya_source)
-    student = load_file(str(args.student / "model.safetensors"))
+    weights = load_file(str(source / "model.safetensors"))
+    # An Antenna student names its trunk `encoder.*`; a Hugging Face
+    # ModernBERT checkpoint names it `model.*` next to its masked-LM head.
+    prefix = "encoder." if args.student else "model."
     tensors = {
-        name: value.float().contiguous()
-        for name, value in student.items()
-        if name.startswith("encoder.")
+        "encoder." + name[len(prefix) :]: value.float().contiguous()
+        for name, value in weights.items()
+        if name.startswith(prefix)
     }
     vocab = tensors["encoder.embeddings.tok_embeddings.weight"].shape[0]
     hidden = encoder_config["hidden_size"]
@@ -126,15 +138,15 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         (args.laya / "model_manifest.json").read_text(encoding="utf-8")
     )
     manifest["source"] = {
-        "antenna_student": str(args.student.resolve()),
+        ("antenna_student" if args.student else "hf_encoder"): str(source.resolve()),
         "decision_config_from": manifest.get("source"),
     }
     (args.output / "model_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     for name in TOKENIZER_FILES:
-        if (args.student / name).exists():
-            shutil.copyfile(args.student / name, args.output / name)
+        if (source / name).exists():
+            shutil.copyfile(source / name, args.output / name)
     return {
         "output": str(args.output),
         "encoder_tensors": sum(n.startswith("encoder.") for n in tensors),
@@ -149,11 +161,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument(
+    encoder = parser.add_mutually_exclusive_group(required=True)
+    encoder.add_argument(
         "--student",
         type=Path,
-        required=True,
         help="Antenna student (GLiNER2.5 boundary export)",
+    )
+    encoder.add_argument(
+        "--hf-encoder",
+        type=Path,
+        help="Hugging Face ModernBERT checkpoint (e.g. answerdotai/ModernBERT-base)",
     )
     parser.add_argument(
         "--laya",

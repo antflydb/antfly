@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
 const postgres_libpq = @import("postgres_libpq.zig");
@@ -398,7 +398,7 @@ pub const RuntimeSource = struct {
         dsn: []u8,
         snapshot_query: QueryExecutor.SnapshotQuery,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.snapshot_query.deinit(self.alloc);
             self.alloc.free(self.dsn);
             self.* = undefined;
@@ -2299,7 +2299,7 @@ test "postgres source runtime executes stats and terms aggregations with transla
         sql_texts: std.ArrayListUnmanaged([]u8) = .empty,
         args_list: std.ArrayListUnmanaged([]sql.ParameterValue) = .empty,
 
-        fn deinit(self: *@This(), inner_alloc: Allocator) void {
+        pub fn deinit(self: *@This(), inner_alloc: Allocator) void {
             for (self.sql_texts.items) |value| inner_alloc.free(value);
             self.sql_texts.deinit(inner_alloc);
             for (self.args_list.items) |args| {

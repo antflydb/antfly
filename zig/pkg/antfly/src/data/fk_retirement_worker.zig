@@ -4,11 +4,11 @@
 //! The prepared ticket survives process death before/after rename. A receipt
 //! is created only after both rename parents and the unlinked intent are synced.
 const std = @import("std");
-const fs = @import("../common/fs_paths.zig");
+const fs = @import("antfly_runtime_fs").fs_paths;
 const contract = @import("../metadata/fk_initial_retirement_contract.zig");
 const auth = @import("../metadata/fk_initial_retirement_auth.zig");
-const signing = @import("../storage/db/root_signing_identity.zig");
-const publication = @import("../storage/db/relational_initial_child_publication.zig");
+const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+const publication = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
 
 pub const Ticket = contract.Ticket;
 pub const journal_name = ".antfly-initial-fk-retirement";
@@ -564,7 +564,7 @@ const Paths = struct {
         errdefer alloc.free(group_path);
         return .{ .journal_dir = journal_dir, .done_dir = done_dir, .trash_dir = trash_dir, .intent_path = intent_path, .done_path = done_path, .group_path = group_path, .trash_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trash_dir, digest }) };
     }
-    fn deinit(self: *Paths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Paths, alloc: std.mem.Allocator) void {
         alloc.free(self.journal_dir);
         alloc.free(self.done_dir);
         alloc.free(self.trash_dir);

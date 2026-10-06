@@ -111,8 +111,16 @@ pub fn quantizedLinear(name: []const u8) bool {
 
 pub const DecisionHead = enum { scorer, pointer };
 
+/// Checkpoint family. `laya`: upstream Laya's layout and heads. `opendecider`:
+/// OpenDecider-nano (manjunathshiva/opendecider-nano), whose input is
+/// `[CLS] question: … [SEP] ([MASK] option)* [SEP] input: <state> [SEP]` and
+/// whose head is only a marker MLP, `scorer.0` (linear), GELU, `scorer.2`
+/// (LayerNorm) and `scorer.3` (linear), with no type embedding, head layers
+/// or action head.
+pub const Format = enum { laya, opendecider };
+
 pub const Config = struct {
-    mask_token: [128]u8 = "[MASK]".* ++ ([_]u8{0} ** 122),
+    mask_token: [128]u8 = "[MASK]".* ++ (@as([122]u8, @splat(0))),
     mask_token_len: usize = 6,
     head_layers: usize = 2,
     max_len: usize = 512,
@@ -130,6 +138,12 @@ pub const Config = struct {
     /// the head's output through the LayerNorm `pointer.norm`.
     decision_head: DecisionHead = .scorer,
     pointer_dim: usize = 256,
+    format: Format = .laya,
+    /// Cut the end of a state that does not fit `max_len` instead of
+    /// rejecting it, as upstream Laya and OpenDecider do. Never read from a
+    /// config; `finetune eval laya --truncate-state` sets it to score the
+    /// community benchmark, whose longest states exceed 512 tokens.
+    truncate_state: bool = false,
 
     /// The configured precision, unless ANTFLY_LAYA_WEIGHT_QUANT names one.
     pub fn effectiveWeightQuantization(self: Config) !WeightQuantization {
@@ -139,7 +153,7 @@ pub const Config = struct {
 
     pub fn scale(self: Config, kind: QuestionType, count: usize) f32 {
         const bucket: usize = if (count <= 2) 0 else if (count <= 5) 1 else if (count <= 10) 2 else 3;
-        return @max(0.001, self.buckets[@intFromEnum(kind)][bucket] orelse self.temperature[@intFromEnum(kind)]);
+        return @max(0.001, self.buckets[@backingInt(kind)][bucket] orelse self.temperature[@backingInt(kind)]);
     }
 
     pub fn maxOptions(self: Config) usize {
@@ -190,6 +204,16 @@ pub const Config = struct {
         if (obj.get("pointer_dim")) |v| {
             if (v != .integer or v.integer < 8 or v.integer > 4096 or out.decision_head != .pointer) return error.InvalidLayaConfig;
             out.pointer_dim = @intCast(v.integer);
+        }
+        if (obj.get("format")) |v| {
+            if (v != .string) return error.InvalidLayaConfig;
+            out.format = std.meta.stringToEnum(Format, v.string) orelse return error.InvalidLayaConfig;
+        }
+        if (out.format == .opendecider) {
+            // Only the marker MLP exists; the unpacked layout is the only one
+            // it was trained on.
+            if (out.head_layers != 0 or obj.get("act_costs") != null or out.decision_head != .scorer or out.packing.enabled()) return error.InvalidLayaConfig;
+            out.n_act = 0;
         }
         return out;
     }
@@ -323,6 +347,25 @@ fn positive(value: std.json.Value) !f32 {
     return n;
 }
 
+test "laya opendecider format has no action head and refuses Laya-only settings" {
+    const a = std.testing.allocator;
+    const p = try std.json.parseFromSlice(std.json.Value, a, "{\"format\":\"opendecider\",\"head_layers\":0,\"max_len\":2048}", .{});
+    defer p.deinit();
+    const cfg = try Config.parse(p.value);
+    try std.testing.expectEqual(Format.opendecider, cfg.format);
+    try std.testing.expectEqual(@as(usize, 0), cfg.n_act);
+    for ([_][]const u8{
+        "{\"format\":\"opendecider\"}",
+        "{\"format\":\"opendecider\",\"head_layers\":0,\"act_costs\":{\"tool\":1}}",
+        "{\"format\":\"opendecider\",\"head_layers\":0,\"decision_head\":\"pointer\"}",
+        "{\"format\":\"opendecider\",\"head_layers\":0,\"packing\":{\"mode\":\"question\"}}",
+    }) |json| {
+        const bad = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer bad.deinit();
+        try std.testing.expectError(error.InvalidLayaConfig, Config.parse(bad.value));
+    }
+}
+
 test "laya calibration bucket takes precedence and invalid temperatures fail" {
     const a = std.testing.allocator;
     const p = try std.json.parseFromSlice(std.json.Value, a, "{\"temperature\":[2,3,4],\"temperature_by_options\":{\"choice:3-5\":1.5}}", .{});
@@ -377,6 +420,12 @@ pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg:
         try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn.Wo.weight", .{layer}), &.{ d, d });
         try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp.Wi.weight", .{layer}), &.{ f * 2, d });
         try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp.Wo.weight", .{layer}), &.{ d, f });
+    }
+    if (cfg.format == .opendecider) {
+        try Check.pair(reader, "scorer.0", d, d);
+        try Check.norm(reader, "scorer.2", d, true);
+        try Check.pair(reader, "scorer.3", d, 1);
+        return;
     }
     try Check.tensor(reader, "type_emb.weight", &.{ 3, d });
     try Check.norm(reader, "scorer.0", d, true);

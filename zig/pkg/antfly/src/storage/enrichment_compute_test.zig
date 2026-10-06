@@ -15,8 +15,8 @@
 //! Cross-archive contract tests for the separately compiled enrichment unit.
 
 const std = @import("std");
-const client = @import("db/enrichment/document_extraction_client.zig");
-const extraction = @import("db/enrichment/document_extraction.zig");
+const client = @import("antfly_local_sources").storage_db_enrichment_document_extraction_client;
+const extraction = @import("antfly_local_sources").storage_db_enrichment_document_extraction;
 const abi = @import("enrichment_compute_abi");
 const error_identity = @import("kernel_error_identity");
 
@@ -30,7 +30,7 @@ test "enrichment compute boundary identity relay preserves origin and attributes
         error.InvalidPdfHeader,
         .enrichment_compute,
         abi.abi_version,
-        @intFromEnum(abi.EnrichmentOperation.render_pdf_page),
+        @backingInt(abi.EnrichmentOperation.render_pdf_page),
     );
     var forwarded: abi.FailureIdentity = .{};
     try client.acceptProviderFailure(
@@ -41,7 +41,7 @@ test "enrichment compute boundary identity relay preserves origin and attributes
     );
     try std.testing.expectEqualDeep(failure, forwarded);
 
-    @import("../test_error_logs.zig").expectErrorLogs(1);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     var malformed = failure;
     malformed.operation = 0;
     var replacement: abi.FailureIdentity = .{};
@@ -58,7 +58,7 @@ test "enrichment compute boundary identity relay preserves origin and attributes
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
     try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.EnrichmentOperation.validate_render_response),
+        @backingInt(abi.EnrichmentOperation.validate_render_response),
         replacement.operation,
     );
     try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
@@ -147,7 +147,7 @@ test "enrichment compute boundary preflight failures carry a complete identity" 
     try std.testing.expectEqual(abi.FailureBoundary.enrichment_compute, failure.boundary);
     try std.testing.expectEqual(abi.abi_version, failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.EnrichmentOperation.extract_stream),
+        @backingInt(abi.EnrichmentOperation.extract_stream),
         failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
@@ -155,7 +155,7 @@ test "enrichment compute boundary preflight failures carry a complete identity" 
 }
 
 test "enrichment compute boundary retains undeclared provider diagnostic identity" {
-    @import("../test_error_logs.zig").expectErrorLogs(1);
+    @import("antfly_test_error_logs").expectErrorLogs(1);
     var failure: abi.FailureIdentity = .{};
     try std.testing.expectError(error.StorageKernelFailure, client.extractDownloadedAllocWithFailure(
         std.testing.allocator,

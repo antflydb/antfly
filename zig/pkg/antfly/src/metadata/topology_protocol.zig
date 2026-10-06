@@ -42,7 +42,9 @@ const std = @import("std");
 /// Version 20 admits ordered direct-vector artifact merges. The entire ordered
 /// artifact workflow requires this capability, so a partial rolling upgrade
 /// cannot certify a source whose later pages an older voter cannot execute.
-pub const current_version: u16 = 20;
+/// Version 21 applies catalog-qualified DROP and physical topology removal in
+/// one command. Earlier voters understand the union but reject its DROP arm.
+pub const current_version: u16 = 21;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.
@@ -53,6 +55,7 @@ pub const source_scope_version: u16 = 11;
 pub const restore_job_admission_version: u16 = 5;
 pub const restore_job_expiry_version: u16 = 6;
 pub const system_catalog_version: u16 = 7;
+pub const system_catalog_drop_version: u16 = 21;
 pub const sql_setting_catalog_version: u16 = 12;
 pub const sql_row_policy_catalog_version: u16 = 13;
 pub const sql_row_policy_publication_version: u16 = 14;
@@ -131,11 +134,7 @@ pub const DropResult = struct {
 
 /// Borrowed storage-cleanup view of a committed drop. Keeping ownership out of
 /// the callback ABI lets request handlers retain and free the routed result.
-pub const DropCleanupContract = struct {
-    table_id: u64,
-    expected_transition_generation: u64,
-    group_ids: []const u64,
-};
+pub const DropCleanupContract = @import("antfly_local_sources").api_table_drop_contract.DropCleanupContract;
 
 pub const range_membership_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 
@@ -154,7 +153,7 @@ pub const RangeMembership = struct {
 
 pub const RangeMembershipAccumulator = struct {
     count: u64 = 0,
-    xor_digest: [range_membership_digest_len]u8 = [_]u8{0} ** range_membership_digest_len,
+    xor_digest: [range_membership_digest_len]u8 = @as([range_membership_digest_len]u8, @splat(0)),
 
     pub fn add(self: *@This(), range_group_id: u64) !void {
         if (self.count == std.math.maxInt(u64)) return error.RangeMembershipOverflow;
@@ -208,7 +207,7 @@ test "range membership is order independent and table scoped" {
 /// protocol. Terms are deliberately excluded: elections do not undo activation.
 pub const Activation = struct {
     version: u16,
-    incarnation: @import("incarnation.zig").MetadataClusterIncarnation,
+    incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation,
     member_count: u32,
     membership_fingerprint: @import("reallocation_request.zig").MembershipFingerprint,
 

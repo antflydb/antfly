@@ -17,7 +17,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
+usage: build_zig_release_archive.sh --version VERSION --target TARGET --archive-name NAME --out-dir DIR [--apple-providers true|false] [--metal true|false] [--system-blas true|false] [--optimize MODE] [--strip true|false] [--jobs N]
 
 Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
@@ -37,8 +37,9 @@ target=
 archive_name=
 out_dir=
 metal=false
+apple_providers=false
 system_blas=false
-optimize=ReleaseFast
+optimize=fast
 strip=true
 jobs=
 
@@ -58,6 +59,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --out-dir)
       out_dir="${2:?missing --out-dir value}"
+      shift 2
+      ;;
+    --apple-providers)
+      apple_providers="${2:?missing --apple-providers value}"
       shift 2
       ;;
     --metal)
@@ -104,10 +109,10 @@ if [ -n "$jobs" ] && ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 case "$optimize" in
-  Debug|ReleaseSafe|ReleaseFast|ReleaseSmall) ;;
+  debug|safe|fast|small) ;;
   *)
     usage
-    echo "--optimize must be one of Debug, ReleaseSafe, ReleaseFast, ReleaseSmall; got: $optimize" >&2
+    echo "--optimize must be one of debug, safe, fast, small; got: $optimize" >&2
     exit 2
     ;;
 esac
@@ -120,6 +125,17 @@ case "$strip" in
     exit 2
     ;;
 esac
+
+case "$apple_providers" in
+  true|false) ;;
+  *) echo "--apple-providers must be true or false" >&2; exit 2 ;;
+esac
+if [ "$apple_providers" = true ]; then
+  case "$target" in
+    *macos*) ;;
+    *) echo "--apple-providers requires a macOS target" >&2; exit 2 ;;
+  esac
+fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "$repo_root" show -s --format=%ct HEAD)}"
@@ -180,6 +196,7 @@ zig_build_options=(
   -Dantfly-bin-name=antfly
   -Dantfly-version="$version"
   -Donnx=false
+  -Dapple-providers="$apple_providers"
   -Dmetal="$metal"
   -Dcuda="$cuda"
   -Dpjrt="$pjrt"
@@ -189,7 +206,6 @@ zig_build_options=(
 zig_install_args=(
   --prefix "$prefix"
   --cache-dir "$local_cache"
-  --global-cache-dir "$cache_root/global"
 )
 
 run_zig_build_steps() {
@@ -208,7 +224,7 @@ run_zig_build_steps() {
     command+=("-j$jobs")
   fi
   command+=("${zig_build_options[@]}" "$@" "${zig_install_args[@]}")
-  "${command[@]}"
+  ZIG_GLOBAL_CACHE_DIR="$cache_root/global" "${command[@]}"
 }
 
 run_zig_build_steps_with_retry() {
@@ -229,14 +245,14 @@ run_zig_build_steps_with_retry() {
 
   # Zig 0.16 can fail a first ARM64 release compile in LLVM's allocation path
   # even though the runner has ample available memory. This has occurred in the
-  # historical Linux ReleaseSmall build and in the current Linux and macOS
-  # ReleaseFast builds. A replay retains completed work in the local cache and
+  # historical Linux small build and in the current Linux and macOS
+  # fast builds. A replay retains completed work in the local cache and
   # starts LLVM in a fresh process. Limit the retry to those observed production
   # combinations and allocation signatures so unrelated errors fail immediately.
   case "$target:$optimize" in
-    aarch64-linux-musl:ReleaseSmall | \
-    aarch64-linux-musl:ReleaseFast | \
-    aarch64-macos:ReleaseFast) ;;
+    aarch64-linux-musl:small | \
+    aarch64-linux-musl:fast | \
+    aarch64-macos:fast) ;;
     *) return "$status" ;;
   esac
   if ! grep -Eq 'std::bad_alloc|LLVM ERROR: out of memory|Buffer allocation failed' "$first_attempt_log"; then
@@ -266,6 +282,10 @@ if [ ! -f "$lite_lib_prefix_path" ]; then
   find "$prefix" -maxdepth 3 -type f | sort >&2
   exit 1
 fi
+if [ "$apple_providers" = true ] && [ ! -f "$prefix/lib/libantfly-apple.dylib" ]; then
+  echo "missing native Apple bridge: $prefix/lib/libantfly-apple.dylib" >&2
+  exit 1
+fi
 cp "$prefix/bin/antfly" "$stage/antfly"
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
@@ -292,4 +312,7 @@ grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./completions/antfly.bash" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./completions/antfly.zsh" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "./completions/antfly.fish" "$work_root/archive-contents.txt" >/dev/null
+if [ "$apple_providers" = true ]; then
+  grep -Fx "./lib/libantfly-apple.dylib" "$work_root/archive-contents.txt" >/dev/null
+fi
 echo "wrote $out_dir/$archive_name"

@@ -24,7 +24,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 REPO_ROOT = ROOT
@@ -34,6 +33,44 @@ ELV2_ROOTS = (
     "zig/pkg/antfly-embedded",
     "zig/e2e/antfly",
 )
+
+# Source moves preserve the original license until the licensing PR lands.
+ELV2_FILES = {
+    "zig/lib/credentials/src/aws.zig",
+    "zig/build_support/antfly/test_partitions.zig",
+    "zig/build_support/antfly/runtime_roles.zig",
+    "zig/pkg/inference/src/host/native_exports.zig",
+    "zig/build_support/antfly/imports.zig",
+    "zig/build_support/antfly/test_support.zig",
+    "zig/lib/runtime/src/mutation_barrier.zig",
+    "zig/build_support/openapi.zig",
+    "zig/build_support/openapi_exact_sort_test.zig",
+    "zig/build_support/openapi_split_test.zig",
+    "zig/lib/raft/src/read_state_observer.zig",
+    "zig/lib/runtime/src/cache_budget.zig",
+    "zig/lib/runtime/src/cancellation.zig",
+    "zig/lib/runtime/src/fs_paths.zig",
+    "zig/lib/runtime/src/private_error_diagnostics.zig",
+    "zig/lib/runtime/src/runtime_error_abi.zig",
+    "zig/lib/runtime/src/runtime_http_abi.zig",
+    "zig/lib/runtime/src/runtime_http_bridge.zig",
+    "zig/lib/runtime/src/runtime_io_abi.zig",
+    "zig/lib/runtime/src/runtime_native_abi.zig",
+    "zig/lib/runtime/src/threaded_io_limits.zig",
+    "zig/pkg/inference/src/host/bridge.zig",
+    "zig/pkg/inference/src/host/embedding_wire.zig",
+    "zig/pkg/inference/src/host/execution_control.zig",
+    "zig/pkg/inference/src/host/host.zig",
+    "zig/pkg/inference/src/host/provider_failure.zig",
+    "zig/pkg/inference/src/host/request_types.zig",
+    "zig/pkg/inference/src/host/runtime_paths.zig",
+    "zig/pkg/inference/src/host/sparse_embedding.zig",
+    "zig/pkg/inference/src/host/types.zig",
+    "zig/pkg/inference/src/host/work.zig",
+    "zig/pkg/inference/src/host/worker.zig",
+    "zig/pkg/inference/src/host/worker_rpc.zig",
+    "zig/pkg/inference/src/host/worker_wire.zig",
+}
 
 APACHE_ROOTS = (
     "zig/build.zig",
@@ -64,7 +101,8 @@ APACHE_ROOTS = (
 # Files inside an ELv2 root that are Apache-2.0 anyway. The public C ABI
 # header is vendored or transcribed by the Apache-licensed Lite bindings.
 APACHE_FILES = {
-    "zig/pkg/antfly/include/antfly.h",
+    "zig/embedded.build.zig",
+    "zig/pkg/antfly-embedded/include/antfly.h",
 }
 EXCLUDED_PARTS = {
     ".git",
@@ -191,7 +229,9 @@ def excluded(path: str) -> bool:
 
 def group_for(path: str, selected_group: str) -> str | None:
     group: str | None = None
-    if path in APACHE_FILES:
+    if path in ELV2_FILES:
+        group = "elv2"
+    elif path in APACHE_FILES:
         group = "apache"
     elif is_under(path, ELV2_ROOTS):
         group = "elv2"

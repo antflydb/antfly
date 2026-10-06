@@ -3,14 +3,14 @@
 const std = @import("std");
 const http = @import("http_server.zig");
 const truncate = @import("sql_truncate.zig");
-const domain = @import("../system_catalog/domain.zig");
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const metadata = @import("../metadata/api.zig");
-const records = @import("../common/topology_records.zig");
+const records = @import("antfly_local_sources").common_topology_records;
 const stages = @import("../metadata/restore_staging.zig");
 const jobs = @import("restore_jobs.zig");
-const compiler = @import("../sql/compiler.zig");
-const reads = @import("table_read_source.zig");
-const operation = @import("operation.zig");
+const compiler = @import("antfly_local_sources").sql_compiler;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const operation = @import("antfly_local_sources").api_operation;
 const alloc = std.testing.allocator;
 const sql_schema_json =
     \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
@@ -41,7 +41,7 @@ const Fixture = struct {
     fn cast(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.job_key) |value| alloc.free(value);
         if (self.job_value) |value| alloc.free(value);
         if (self.plan) |value| alloc.free(value);
@@ -49,7 +49,7 @@ const Fixture = struct {
     fn status(_: *anyopaque) !metadata.MetadataStatus {
         return .{ .metadata_group_id = 1, .metrics = .{} };
     }
-    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: domain.Call) ![]u8 {
+    fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self = cast(ptr);
         self.catalog_reads += 1;
         return switch (call) {
@@ -88,14 +88,14 @@ const Fixture = struct {
         return .{ .status = try status(ptr), .tables = self.tables[0..self.tableCount()], .ranges = self.ranges[0..self.tableCount()], .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
     }
     fn freeSnapshot(_: *anyopaque, _: *metadata.AdminSnapshot) void {}
-    fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: []const u8, options: @import("../storage/db/types.zig").LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
+    fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: []const u8, options: @import("antfly_local_sources").storage_db_types.LookupOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.LookupResponse {
         const self = cast(ptr);
         const archive = std.mem.eql(u8, table, "physical_archive");
         try std.testing.expect(archive or std.mem.eql(u8, table, "physical"));
         if (std.mem.eql(u8, options.relational_topology_json, "{\"mode\":\"generation_handoff_summary\"}")) {
             // Published child declarations require a matching durable parent
             // scope, even when the owner contains no user rows.
-            const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+            const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
             const EmptySnapshot = struct {
                 const Entry = struct { key: []const u8, value: []const u8 };
                 entry: ?Entry = null,
@@ -123,10 +123,10 @@ const Fixture = struct {
             defer if (scope_value) |value| a.free(value);
             const scope_key = try admission.scopeKey("physical_archive", "fk");
             if (!archive and !self.missing_parent_scope and self.second_logical_name != null and self.tables[1].schema_json.len != 0) {
-                const schema_api = @import("../schema/mod.zig");
-                const native = @import("../storage/schema.zig");
-                const declarations = @import("../schema/relational_declarations.zig");
-                const catalog_api = @import("../storage/db/relational_integrity_catalog.zig");
+                const schema_api = @import("antfly_local_sources").schema_mod;
+                const native = @import("antfly_local_sources").storage_schema;
+                const declarations = @import("antfly_local_sources").schema_relational_declarations;
+                const catalog_api = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
                 var parsed = try schema_api.parseValidatedTableSchema(a, self.tables[1].schema_json);
                 defer parsed.deinit(a);
                 const runtime = try schema_api.deriveRuntimeTableSchema(a, parsed);
@@ -153,7 +153,7 @@ const Fixture = struct {
                     empty.entry = .{ .key = &scope_key, .value = scope_value.? };
                 }
             }
-            var summary = try @import("../storage/db/empty_generation_handoff.zig").summaryAlloc(a, &empty, .{
+            var summary = try @import("antfly_local_sources").storage_db_empty_generation_handoff.summaryAlloc(a, &empty, .{
                 .table_id = if (archive) 101 else 100,
                 .shard_id = if (archive) 201 else 200,
                 .range_id = if (archive) 201 else 200,
@@ -165,10 +165,10 @@ const Fixture = struct {
         if (options.relational_integrity_catalog) {
             try std.testing.expect(archive);
             self.integrity_reads += 1;
-            const schema_api = @import("../schema/mod.zig");
-            const native_schema = @import("../storage/schema.zig");
-            const declarations = @import("../schema/relational_declarations.zig");
-            const integrity_catalog = @import("../storage/db/relational_integrity_catalog.zig");
+            const schema_api = @import("antfly_local_sources").schema_mod;
+            const native_schema = @import("antfly_local_sources").storage_schema;
+            const declarations = @import("antfly_local_sources").schema_relational_declarations;
+            const integrity_catalog = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
             var parsed = try schema_api.parseValidatedTableSchema(a, self.tables[1].schema_json);
             defer parsed.deinit(a);
             const runtime = try schema_api.deriveRuntimeTableSchema(a, parsed);
@@ -188,7 +188,7 @@ const Fixture = struct {
         try std.testing.expectEqualStrings("{\"mode\":\"identity\"}", options.relational_topology_json);
         try std.testing.expectEqual(@as(usize, 0), self.admissions);
         self.owner_reads += 1;
-        return .{ .version = 0, .json = try std.json.Stringify.valueAlloc(a, .{ .namespace = .{ .table_id = @as(u64, if (self.wrong_owner) 999 else if (archive) 101 else 100), .shard_id = @as(u64, if (archive) 201 else 200), .range_id = @as(u64, if (archive) 201 else 200) }, .catalog_digest = @as([32]u8, @splat(3)), .next_epoch = @as(u64, 1), .generation_handoff_receipt_authority = @as(@import("../storage/db/relational_integrity_topology_contract.zig").GenerationHandoffReceiptAuthority, if (self.handoff_supported[if (archive) 1 else 0]) .raft else .unsupported) }, .{}) };
+        return .{ .version = 0, .json = try std.json.Stringify.valueAlloc(a, .{ .namespace = .{ .table_id = @as(u64, if (self.wrong_owner) 999 else if (archive) 101 else 100), .shard_id = @as(u64, if (archive) 201 else 200), .range_id = @as(u64, if (archive) 201 else 200) }, .catalog_digest = @as([32]u8, @splat(3)), .next_epoch = @as(u64, 1), .generation_handoff_receipt_authority = @as(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.GenerationHandoffReceiptAuthority, if (self.handoff_supported[if (archive) 1 else 0]) .raft else .unsupported) }, .{}) };
     }
     fn load(ptr: *anyopaque, a: std.mem.Allocator) ![]jobs.ReplicatedPersistence.OwnedRow {
         const self = cast(ptr);
@@ -232,10 +232,10 @@ const Fixture = struct {
     fn persistence(self: *@This()) jobs.ReplicatedPersistence {
         return jobs.ReplicatedPersistence.fromLocal(self, .{ .load = load, .get = get, .create_with_staging = create, .put = put, .delete = delete, .delete_many = deleteMany });
     }
-    fn server(self: *@This()) !http.ApiHttpServer {
+    pub fn server(self: *@This()) !http.ApiHttpServer {
         return self.serverWith(null, null);
     }
-    fn serverWith(self: *@This(), manager: ?*@import("../usermgr/mod.zig").UserManager, runtime: ?*@import("../storage/background_runtime.zig").BackendRuntime) !http.ApiHttpServer {
+    fn serverWith(self: *@This(), manager: ?*@import("../usermgr/mod.zig").UserManager, runtime: ?*@import("antfly_local_sources").storage_background_runtime.BackendRuntime) !http.ApiHttpServer {
         var result = http.ApiHttpServer.init(alloc, .{ .user_manager = manager, .backend_runtime = runtime }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = catalog, .linearizable_snapshot = snapshot, .free_admin_snapshot = freeSnapshot, .supports_query_definitions = true } }, .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = undefined, .query = undefined } }, null);
         errdefer result.deinit();
         result.restore_job_store.io = std.testing.io;
@@ -246,7 +246,7 @@ const Fixture = struct {
     }
 };
 
-const ddl: @import("../sql/ast.zig").CatalogDdl = .{ .kind = .table, .action = .truncate, .name = .{ .table = "rows" }, .truncate_tables = &.{.{ .table = "rows" }} };
+const ddl: @import("antfly_local_sources").sql_ast.CatalogDdl = .{ .kind = .table, .action = .truncate, .name = .{ .table = "rows" }, .truncate_tables = &.{.{ .table = "rows" }} };
 
 test "SQL TRUNCATE prepared statement uses mounted durable generation admission" {
     // sql-0003: PREPARE is connection-owned and side-effect free; EXECUTE
@@ -265,7 +265,7 @@ test "SQL TRUNCATE prepared statement uses mounted durable generation admission"
     defer permission.deinit(alloc);
     var user = try manager.createUser("truncate_admin", "secret", &.{permission});
     defer user.deinit(alloc);
-    var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    var runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
     {
         var server = try fixture.serverWith(&manager, runtime.ptr());
@@ -423,7 +423,7 @@ test "SQL TRUNCATE revoked durable credential is a forbidden pre-admission failu
     try std.testing.expectError(error.StoredDestinationAuthorizationRevoked, truncate.execute(&server, identity, .{}, "default", "public", arena.allocator(), ddl));
     try std.testing.expectEqual(@as(usize, 0), fixture.owner_reads);
     try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
-    const diagnostic = @import("../sql/errors.zig").describe(error.StoredDestinationAuthorizationRevoked);
+    const diagnostic = @import("antfly_local_sources").sql_errors.describe(error.StoredDestinationAuthorizationRevoked);
     try std.testing.expectEqualStrings("42501", diagnostic.code);
     try std.testing.expectEqual(@as(u16, 403), diagnostic.httpStatus());
 }
@@ -571,7 +571,7 @@ test "SQL TRUNCATE native admission persists fresh plan and reconciles unknown r
         const outcome = try truncate.execute(&server, null, .{}, "default", "public", arena.allocator(), statement);
         try std.testing.expectEqual(@as(usize, 1), fixture.admissions);
         try std.testing.expectEqual(@as(u64, 100), fixture.tables[0].table_id);
-        try std.testing.expectEqual(if (unknown) null else @as(?@import("../sql/catalog.zig").MutationOutcome, .committed_pending), outcome.mutation_outcome);
+        try std.testing.expectEqual(if (unknown) null else @as(?@import("antfly_local_sources").sql_catalog.MutationOutcome, .committed_pending), outcome.mutation_outcome);
         try std.testing.expectEqual(@as(@TypeOf(outcome.receipt.?.state), if (unknown) .admission_unknown else .pending), outcome.receipt.?.state);
         const id = try std.fmt.parseInt(u64, outcome.receipt.?.restore_job_id.?, 10);
         var recovered = jobs.Store.initWithIo(alloc, std.testing.io);
@@ -607,10 +607,10 @@ test "SQL TRUNCATE native owner capability refuses before durable admission" {
     try std.testing.expectEqual(@as(usize, 0), fixture.summary_reads);
     try std.testing.expectEqual(@as(usize, 0), fixture.admissions);
     try std.testing.expect(fixture.job_key == null and fixture.plan == null);
-    const diagnostic = @import("../sql/errors.zig").describe(error.UnsupportedEmptyGenerationAuthority);
+    const diagnostic = @import("antfly_local_sources").sql_errors.describe(error.UnsupportedEmptyGenerationAuthority);
     try std.testing.expectEqualStrings("0A000", diagnostic.code);
     try std.testing.expectEqual(@as(u16, 501), diagnostic.httpStatus());
-    const Identity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+    const Identity = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
     var missing = try std.json.parseFromSlice(Identity, alloc,
         \\{"namespace":{"table_id":100,"shard_id":200,"range_id":200},"catalog_digest":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"next_epoch":1}
     , .{});

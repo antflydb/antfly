@@ -50,7 +50,7 @@ const Options = struct {
     owns_model_dir: bool = false,
     owns_query: bool = false,
 
-    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         if (self.owns_model_dir) allocator.free(self.model_dir);
         if (self.owns_query) allocator.free(self.query);
         for (self.docs.items) |doc| allocator.free(doc);
@@ -59,7 +59,7 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

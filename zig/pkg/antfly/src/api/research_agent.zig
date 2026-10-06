@@ -160,7 +160,7 @@ const Registry = struct {
     by_ref: std.StringHashMapUnmanaged(usize) = .empty,
     max: usize,
 
-    fn restore(self: *Registry, arena: std.mem.Allocator, items: []const Evidence) !void {
+    pub fn restore(self: *Registry, arena: std.mem.Allocator, items: []const Evidence) !void {
         for (items) |item| {
             try self.items.append(arena, item);
             try self.index(arena, self.items.items.len - 1);
@@ -1213,7 +1213,7 @@ const Run = struct {
 
     // -- state --------------------------------------------------------------
 
-    fn restore(self: *Run, state: State) !void {
+    pub fn restore(self: *Run, state: State) !void {
         // Continuation state is client-carried: its counters decide how much
         // budget remains, so a forged value must be rejected, never trusted.
         const round = state.round orelse 0;
@@ -1750,7 +1750,7 @@ pub fn execute(
 // Tests
 // ---------------------------------------------------------------------------
 
-const query_api = @import("query.zig");
+const query_api = @import("antfly_local_sources").api_query;
 
 const TestFake = struct {
     plan: []const u8 =
@@ -2336,7 +2336,7 @@ test "research rejects forged continuation counters" {
 test "research signs its checkpoints and rejects modified or unsigned ones" {
     var fake = TestFake{};
     const r = fake.runners(null);
-    const key = [_]u8{7} ** 32;
+    const key = @as([32]u8, @splat(7));
     const first_encoded = try execute(std.testing.allocator, r[0], r[1], test_request, null, .{ .max_phases = 1, .state_key = key });
     defer std.testing.allocator.free(first_encoded.body);
     var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2374,7 +2374,7 @@ test "research signs its checkpoints and rejects modified or unsigned ones" {
         try std.testing.expectError(error.InvalidResearchState, execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, forged), null, .{ .state_key = key }));
     }
     // A checkpoint from a server with another key is rejected.
-    try std.testing.expectError(error.InvalidResearchState, execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, try Resume.state(arena, state_json)), null, .{ .state_key = [_]u8{8} ** 32 }));
+    try std.testing.expectError(error.InvalidResearchState, execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, try Resume.state(arena, state_json)), null, .{ .state_key = @as([32]u8, @splat(8)) }));
     // Durable jobs hold their state server-side and skip verification.
     const trusted = try execute(std.testing.allocator, r[0], r[1], try Resume.body(arena, try Resume.state(arena, state_json)), null, .{ .state_key = key, .trusted_state = true });
     std.testing.allocator.free(trusted.body);

@@ -18,7 +18,7 @@ pub const ModuleOptions = struct {
     root_source_file: std.Build.LazyPath,
     filesystem_capacity_source_file: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     link_libc: bool,
     single_threaded: ?bool = null,
 };
@@ -71,7 +71,7 @@ fn configureModule(module: *std.Build.Module, options: ModuleOptions) *std.Build
 pub fn addTests(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     link_libc: bool,
 }) struct {
     unit: *std.Build.Step.Run,
@@ -160,13 +160,11 @@ pub fn canRunNativeProcess(b: *std.Build, fixture: *std.Build.Step.Compile) bool
     // on the host. Zig defaults musl executables to static linkage.
     const dynamic_libc = (fixture.root_module.link_libc orelse false) and
         fixture.linkage != .static and (!target.isMuslLibC() or fixture.linkage == .dynamic);
-    const executor = std.zig.system.getExternalExecutor(b.graph.io, &b.graph.host.result, &target, .{
+    const executor = std.zig.system.getExternalExecutor(b.graph.io, &target, .{
         .link_libc = dynamic_libc,
-        .allow_rosetta = false,
-        .allow_qemu = false,
-        .allow_wine = false,
-        .allow_wasmtime = false,
-        .allow_darling = false,
+        .link_mode = fixture.linkage orelse if (target.isMuslLibC()) .static else .dynamic,
+        .host_cpu_arch = b.graph.host.result.cpu.arch,
+        .host_os_tag = b.graph.host.result.os.tag,
     });
     return executor == .native;
 }
@@ -174,32 +172,94 @@ pub fn canRunNativeProcess(b: *std.Build, fixture: *std.Build.Step.Compile) bool
 pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, script: std.Build.LazyPath) *std.Build.Step {
     if (canRunNativeProcess(b, fixture)) {
         const run = b.addSystemCommand(&.{"python3"});
-        run.addFileArg(script);
-        run.addArtifactArg(fixture);
+        run.addFileArg2(script, .{ .make_absolute = true });
+        run.addArtifactArg2(fixture, .{ .make_absolute = true });
         return &run.step;
     }
-    const skipped = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    skipped.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = b.fmt("skip {s} process checks (requires a native host target)", .{fixture.name}),
-        .owner = b,
-        .makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-                return error.MakeSkipped;
-            }
-        }.make,
-    });
+    const skipped = b.step(b.fmt("skip {s} process checks (requires a native host target)", .{fixture.name}), "Requires a native executor");
     skipped.dependOn(&fixture.step);
     return skipped;
 }
 
 pub fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
-        return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    const sdk_root = macosSdkRoot(b, target) orelse return;
+    module.addSystemIncludePath(sdk_root.path(b, "usr/include"));
+    module.addLibraryPath(sdk_root.path(b, "usr/lib"));
+    module.addFrameworkPath(sdk_root.path(b, "System/Library/Frameworks"));
+}
+
+fn macosSdkRoot(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    const key = "antfly_macos_sdk_root";
+    if (b.named_lazy_paths.get(key)) |root| return root;
+    // Declare once even when discovery fails and another owner retries it.
+    const explicit = if (!b.available_options_map.contains("macos-sdk"))
+        b.option([]const u8, "macos-sdk", "Explicit macOS SDK root (otherwise SDK_PATH or xcrun)")
+    else
+        null;
+    const sdk_root = explicit orelse b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // Automatic selection depends on Xcode's external configuration. Keep
+        // rediscovering it; explicit SDK inputs can reuse configure results.
+        b.graph.poisonCache();
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return null;
+    };
+    const root = b.graph.cwdRelativePath(sdk_root);
+    b.dependOnDirectoryMetadata(root);
+    b.addNamedLazyPath(key, root);
+    return root;
+}
+
+/// Pass the selected SDK to the compiler and translator, rather than adding
+/// fallback search paths behind Zig's automatically discovered libc.
+pub fn macosSdkLibCFile(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Build.LazyPath {
+    if (target.result.os.tag != .macos) return null;
+    const key = "antfly_macos_sdk_libc";
+    if (b.named_lazy_paths.get(key)) |file| return file;
+    const root = macosSdkRoot(b, target) orelse return null;
+    const sdk = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, root.relative.sub_path, b.allocator) catch |err|
+        std.debug.panic("cannot resolve macOS SDK: {t}", .{err});
+    const file = b.addWriteFiles().add("macos-sdk-libc.txt", b.fmt(
+        "include_dir={s}/usr/include\nsys_include_dir={s}/usr/include\ncrt_dir={s}/usr/lib\ncc_dir=\nmsvc_lib_dir=\nkernel32_lib_dir=\ndarwin_sdk_dir={s}\n",
+        .{ sdk, sdk, sdk, sdk },
+    ));
+    b.addNamedLazyPath(key, file);
+    return file;
+}
+
+/// Configure every macOS artifact after its owners have constructed the graph,
+/// including linked libraries and generated host tools.
+pub fn finalizeMacosSdk(b: *std.Build) void {
+    // Host generators can target macOS even when the product targets Linux or
+    // wasm. Select the SDK lazily for those artifacts too, so their libc input
+    // does not change with the product target.
+    if (!b.named_lazy_paths.contains("antfly_macos_sdk_root") and b.graph.host.result.os.tag != .macos) return;
+    var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
+    var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
+    for (b.top_level_steps.values()) |top| visitSdkStep(b, &top.step, &steps, &modules);
+}
+
+fn visitSdkStep(b: *std.Build, step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    // setLibCFile adds a dependency; traverse existing dependencies first.
+    for (step.dependencies.items) |dependency| visitSdkStep(b, dependency, steps, modules);
+    if (step.cast(std.Build.Step.Compile)) |artifact| {
+        if (artifact.root_module.resolved_target) |target| {
+            if (target.result.os.tag == .macos and artifact.libc_file == null)
+                artifact.setLibCFile(macosSdkLibCFile(b, target));
+        }
+        visitSdkModule(b, artifact.root_module, steps, modules);
+    }
+}
+
+fn visitSdkModule(b: *std.Build, module: *std.Build.Module, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
+    if (module.root_source_file) |source| switch (source) {
+        .generated => |generated| visitSdkStep(b, b.graph.generated_files.items[@backingInt(generated.index)], steps, modules),
+        else => {},
+    };
+    for (module.link_objects.items) |object| switch (object) {
+        .other_step => |artifact| visitSdkStep(b, &artifact.step, steps, modules),
+        else => {},
+    };
+    for (module.import_table.values()) |dependency| visitSdkModule(b, dependency, steps, modules);
 }

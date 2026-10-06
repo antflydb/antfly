@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const docstore_mod = @import("../storage/docstore.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 
@@ -47,7 +47,7 @@ pub const OpenedStore = struct {
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);

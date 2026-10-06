@@ -4,13 +4,13 @@
 //! replicated transaction; local build progress is observation, never Raft state.
 const std = @import("std");
 const wire = @import("antfly_indexes_openapi").types;
-const native = @import("../storage/db/relational_index_maintenance_contract.zig");
-const status_wire = @import("../storage/db/relational_index_status_contract.zig");
-const writes = @import("table_write_source.zig");
-const reads = @import("table_read_source.zig");
-const operation = @import("operation.zig");
+const native = @import("antfly_local_sources").storage_db_relational_index_maintenance_contract;
+const status_wire = @import("antfly_local_sources").storage_db_relational_index_status_contract;
+const writes = @import("antfly_local_sources").api_table_write_source;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const operation = @import("antfly_local_sources").api_operation;
 const tables = @import("tables.zig");
-const contract = @import("distributed_txn_contract.zig");
+const contract = @import("antfly_local_sources").api_distributed_txn_contract;
 
 fn decimal(value: []const u8) !u64 {
     if (value.len == 0 or value.len > 20) return error.InvalidIndexMaintenance;
@@ -45,7 +45,7 @@ pub fn execute(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
     const table = tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     if (table.table_id != table_id) return error.PreparedGenerationChanged;
     if (table.restore_backup_id.len != 0 or table.relational_retirement_json.len != 0) return error.TableTransitionActive;
-    var schema = try @import("../schema/mod.zig").parseValidatedTableSchema(temporary, table.schema_json);
+    var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(temporary, table.schema_json);
     defer schema.deinit(temporary);
     if (schema.storage_mode != .relational) return error.MethodNotAllowed;
     if (schema.version != input.schema_version) return error.PreparedGenerationChanged;
@@ -56,7 +56,7 @@ pub fn execute(alloc: std.mem.Allocator, source: anytype, reader: reads.TableRea
         const group_id = try decimal(proof.group_id);
         const entry = try selected.getOrPut(group_id);
         if (entry.found_existing) return error.InvalidIndexMaintenance;
-        var selected_range: ?@import("../common/topology_records.zig").RangeRecord = null;
+        var selected_range: ?@import("antfly_local_sources").common_topology_records.RangeRecord = null;
         for (snapshot.ranges) |range| if (range.table_id == table_id and range.group_id == group_id) {
             if (selected_range != null or range.restore_backup_id.len != 0) return error.TopologyChanged;
             selected_range = range;
@@ -143,13 +143,13 @@ test "index maintenance requires canonical decimal and digest observations" {
     try std.testing.expectError(error.InvalidIndexMaintenance, decimal("01"));
     try std.testing.expectError(error.InvalidIndexMaintenance, decimal("+1"));
     try std.testing.expectError(error.InvalidIndexMaintenance, decimal("18446744073709551616"));
-    try std.testing.expectError(error.InvalidIndexMaintenance, digest("AA" ** 32));
-    try std.testing.expectEqual(@as([32]u8, @splat(0xaa)), try digest("aa" ** 32));
+    try std.testing.expectError(error.InvalidIndexMaintenance, digest(z17RepeatString("AA", 32)));
+    try std.testing.expectEqual(@as([32]u8, @splat(0xaa)), try digest(z17RepeatString("aa", 32)));
 }
 
 test "index maintenance resumes partial acknowledgements and fences stale owners" {
     const alloc = std.testing.allocator;
-    const db_types = @import("../storage/db/types.zig");
+    const db_types = @import("antfly_local_sources").storage_db_types;
     const metadata = @import("../metadata/api.zig");
     const Fixture = struct {
         const schema_json =
@@ -165,8 +165,8 @@ test "index maintenance resumes partial acknowledgements and fences stale owners
         pub fn adminSnapshot(self: *@This()) !?metadata.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast(&[_]@import("../common/topology_records.zig").TableRecord{.{ .table_id = 7, .name = "rows", .schema_json = schema_json }}),
-                .ranges = if (self.changed_topology) &.{} else @constCast(&[_]@import("../common/topology_records.zig").RangeRecord{
+                .tables = @constCast(&[_]@import("antfly_local_sources").common_topology_records.TableRecord{.{ .table_id = 7, .name = "rows", .schema_json = schema_json }}),
+                .ranges = if (self.changed_topology) &.{} else @constCast(&[_]@import("antfly_local_sources").common_topology_records.RangeRecord{
                     .{ .table_id = 7, .group_id = 11, .start_key = "", .end_key = "\x00\xff" },
                     .{ .table_id = 7, .group_id = 12, .start_key = "\x00\xff", .end_key = null },
                 }),
@@ -185,7 +185,7 @@ test "index maintenance resumes partial acknowledgements and fences stale owners
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.ScanResponse {
             return error.TestUnexpectedResult;
         }
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("query_response.zig").QueryResponse {
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.SearchRequest, _: @import("../raft/read_gate.zig").ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
             return error.TestUnexpectedResult;
         }
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.BatchRequest) !?void {
@@ -220,7 +220,7 @@ test "index maintenance resumes partial acknowledgements and fences stale owners
             return self.cancelled;
         }
     };
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, Fixture.schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, Fixture.schema_json);
     defer parsed.deinit(alloc);
     const comparison = try @import("relational_index_status.zig").expectedComparison(alloc, parsed, "by_id");
     const initial = status_wire.Status{ .table_id = 7, .schema_version = 2, .generation = 8, .slot = 1, .catalog = @splat(0), .comparison = comparison, .owner = @splat(3), .range_start = "", .range_end = "\x00\xff", .state = .failed, .failure = .invalid_row, .rows_scanned = 4, .progress_digest = @splat(4), .maintenance_epoch = 0, .last_maintenance_request = @splat(0) };
@@ -255,4 +255,15 @@ test "index maintenance resumes partial acknowledgements and fences stale owners
     fixture.cancel_after_first = true;
     try std.testing.expectError(error.Canceled, execute(alloc, &fixture, reader, writer, "rows", "by_id", .retry, body, .{ .cancellation = .{ .ptr = &fixture, .is_cancelled_fn = Fixture.cancelledFn } }));
     try std.testing.expectEqual(@as(usize, 3), fixture.commits);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

@@ -7,10 +7,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vopr = @import("vopr");
-const backend_types = @import("backend_types.zig");
-const mem_backend_mod = @import("mem_backend.zig");
-const lsm_backend_mod = @import("lsm_backend/mod.zig");
-const storage_sim = @import("sim_runtime.zig");
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const mem_backend_mod = @import("antfly_local_sources").storage_mem_backend;
+const lsm_backend_mod = @import("antfly_local_sources").storage_lsm_backend_mod;
+const storage_sim = @import("antfly_local_sources").storage_sim_runtime;
 
 const namespaces = [_]backend_types.Namespace{
     .{},
@@ -77,7 +77,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             maintenance_safe: bool = true,
             finished: bool = false,
 
-            fn deinit(self: *State) void {
+            pub fn deinit(self: *State) void {
                 self.faults.deinit();
                 self.lsm.close();
                 self.device.deinit();
@@ -143,7 +143,7 @@ pub fn Scenario(comptime action_budget: u64) type {
                     .name = "storage.lsm.consume_storage_fault",
                     .kind = .scheduler,
                     .resource_id = storageResource(state.pending_fault.?),
-                    .parameter = @intFromEnum(state.pending_fault.?),
+                    .parameter = @backingInt(state.pending_fault.?),
                 });
                 return;
             }
@@ -210,8 +210,8 @@ pub fn Scenario(comptime action_budget: u64) type {
                 state.pending_fault = null;
                 _ = try state.faults.consumeOneShot(.storage, spec.resource_id, events, allocator);
                 state.visible_matches = state.visible_matches and try modelMatches(state);
-                try events.emitNamed(allocator, .injected_error, "storage.lsm.fault_consumed", @intFromEnum(kind));
-                return vopr.outcome.TransitionOutcome.injectedError("storage.lsm.expected_storage_error", @intFromEnum(kind));
+                try events.emitNamed(allocator, .injected_error, "storage.lsm.fault_consumed", @backingInt(kind));
+                return vopr.outcome.TransitionOutcome.injectedError("storage.lsm.expected_storage_error", @backingInt(kind));
             }
 
             for (std.enums.values(PendingFault)) |fault_kind| {
@@ -286,7 +286,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             try builder.addNamed(allocator, "storage.lsm.compactions", @intCast(state.lsm.compaction_stats.compactions));
             try builder.addNamed(allocator, "storage.lsm.wal_append_records", @intCast(writes.wal_append_records));
             try builder.addNamed(allocator, "storage.lsm.wal_checkpoint_pending", @intFromBool(maintenance.wal_checkpoint_pending));
-            try builder.addNamed(allocator, "storage.lsm.pending_fault", if (state.pending_fault) |fault| @intFromEnum(fault) + 1 else 0);
+            try builder.addNamed(allocator, "storage.lsm.pending_fault", if (state.pending_fault) |fault| @backingInt(fault) + 1 else 0);
             try builder.addNamed(allocator, "storage.lsm.rejected_fault_probes", @intCast(state.rejected_fault_probes));
             try builder.addNamed(allocator, "storage.lsm.finished", @intFromBool(state.finished));
         }
@@ -404,7 +404,7 @@ fn consumeDeviceFullFault(state: anytype) !bool {
 
 fn storageFaultSpec(kind: PendingFault) vopr.fault.Spec {
     return .{
-        .id = vopr.id.derive("storage.lsm.fault", vopr.id.stable("fault", "storage.lsm.storage"), @intFromEnum(kind)),
+        .id = vopr.id.derive("storage.lsm.fault", vopr.id.stable("fault", "storage.lsm.storage"), @backingInt(kind)),
         .name = "storage.lsm.storage_fault",
         .kind = .storage,
         .lifecycle = .one_shot,
@@ -413,7 +413,7 @@ fn storageFaultSpec(kind: PendingFault) vopr.fault.Spec {
 }
 
 fn storageResource(kind: PendingFault) u64 {
-    return vopr.id.derive("storage.lsm.resource", vopr.id.stable("resource", "storage.lsm.device"), @intFromEnum(kind));
+    return vopr.id.derive("storage.lsm.resource", vopr.id.stable("resource", "storage.lsm.device"), @backingInt(kind));
 }
 
 fn crashSpec() vopr.fault.Spec {

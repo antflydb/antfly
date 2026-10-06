@@ -20,6 +20,7 @@ pub const GenerateOptions = struct {
     spec: std.Build.LazyPath,
     package_name: []const u8,
     generate: []const u8,
+    external_types_module: ?[]const u8 = null,
     import_mappings: []const [2][]const u8 = &.{},
     zig_type_mappings: []const [2][]const u8 = &.{},
     /// Named component -> JSON pointer into the original document. Keeps
@@ -31,21 +32,23 @@ pub const GenerateOptions = struct {
 /// The returned directory is a build output; configuring it performs no I/O.
 pub fn addGeneratedDirectory(b: *std.Build, options: GenerateOptions) std.Build.LazyPath {
     const convert = b.addSystemCommand(&.{ "uv", "run", "--project" });
-    convert.addDirectoryArg(options.scripts_root);
+    convert.addDirectoryArg2(options.scripts_root, .{ .make_absolute = true });
     convert.addArgs(&.{ "--locked", "python" });
-    convert.addFileArg(options.scripts_root.path(b, "yaml_to_json.py"));
+    convert.addFileArg2(options.scripts_root.path(b, "yaml_to_json.py"), .{ .make_absolute = true });
     convert.addFileInput(options.scripts_root.path(b, "pyproject.toml"));
     convert.addFileInput(options.scripts_root.path(b, "uv.lock"));
-    convert.addFileArg(options.spec);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{options.package_name}));
+    convert.addFileArg2(options.spec, .{ .make_absolute = true });
+    const json_spec = convert.addOutputFileArg2(b.fmt("{s}.json", .{options.package_name}), .{ .make_absolute = true });
     for (options.schema_aliases) |alias| {
         convert.addArgs(&.{ "--schema-alias", b.fmt("{s}={s}", .{ alias[0], alias[1] }) });
     }
 
     const codegen = b.addRunArtifact(options.compiler);
     codegen.addArg("--spec");
-    codegen.addFileArg(json_spec);
+    codegen.addFileArg2(json_spec, .{ .make_absolute = true });
     codegen.addArgs(&.{ "--package", options.package_name, "--generate", options.generate });
+    if (options.external_types_module) |module_name|
+        codegen.addArgs(&.{ "--external-types-module", module_name });
     for (options.import_mappings) |mapping| {
         codegen.addArgs(&.{ "--import-mapping", b.fmt("{s}={s}", .{ mapping[0], mapping[1] }) });
     }
@@ -53,5 +56,5 @@ pub fn addGeneratedDirectory(b: *std.Build, options: GenerateOptions) std.Build.
         codegen.addArgs(&.{ "--zig-type-mapping", b.fmt("{s}={s}", .{ mapping[0], mapping[1] }) });
     }
     codegen.addArg("--output");
-    return codegen.addOutputDirectoryArg(options.package_name);
+    return codegen.addOutputDirectoryArg2(options.package_name, .{ .make_absolute = true });
 }

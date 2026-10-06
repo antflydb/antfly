@@ -24,7 +24,7 @@ const Source = struct {
 fn now(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).nanoseconds;
 }
-fn read(comptime T: type, init: std.process.Init, path: []const u8, limit: usize) ![]T {
+pub fn read(comptime T: type, init: std.process.Init, path: []const u8, limit: usize) ![]T {
     const bytes = try std.Io.Dir.cwd().readFileAllocOptions(init.io, path, std.heap.smp_allocator, .limited(limit), .@"8", null);
     if (bytes.len % @sizeOf(T) != 0) return error.InvalidFixture;
     return std.mem.bytesAsSlice(T, bytes);
@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init) !void {
     const nq = queries.len / dims;
     if (train.len % dims != 0 or queries.len % dims != 0 or truth.len != nq * 100) return error.InvalidFixture;
     var source: Source = .{ .values = train, .dims = dims };
-    const path = try init.arena.allocator().dupeZ(u8, args[7]);
+    const path = try init.arena.allocator().dupeSentinel(u8, args[7], 0);
     var idx = try hbc.HBCIndex.open(alloc, path, .{
         .dims = @intCast(dims),
         .metric = .cosine,

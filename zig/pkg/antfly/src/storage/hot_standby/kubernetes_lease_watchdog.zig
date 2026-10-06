@@ -12,8 +12,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const fs_paths = @import("../../common/fs_paths.zig");
-const http_common = @import("../../common/http/http_common.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const std_http_executor = @import("../../common/http/std_http_executor.zig");
 
 pub const service_account_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token";

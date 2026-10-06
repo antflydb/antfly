@@ -49,7 +49,10 @@ class EnrichmentConfig:
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
             producer (EnrichmentConfigProducer | Unset): Write-only producer configuration. Cannot be combined with
-                producer_json or transcriber.
+                producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions},
+                where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model,
+                specification hash, version, and source fingerprint. Change version or specification to rebuild through the
+                enrichment lifecycle.
             producer_json (str | Unset): Write-only serialized producer configuration. For managed embedding enrichments
                 Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
             neighbor_context (EnrichmentNeighborContextConfig | Unset): Bounded sample of the document's same-shard graph

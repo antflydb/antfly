@@ -26,12 +26,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const fs_paths = @import("../../common/fs_paths.zig");
-const db_core = @import("../db/core.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const db_core = @import("antfly_local_sources").storage_db_core;
 const backup_manifest = @import("backup_manifest.zig");
 const lifecycle_receipt_ledger = @import("lifecycle_receipt_ledger.zig");
 const local_generation_gc = @import("local_generation_gc.zig");
-const object_storage = @import("../object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const seed_artifact = @import("seed_artifact.zig");
 const seed_capture = @import("seed_capture.zig");
 const contract = @import("seed_activation_contract.zig");
@@ -1280,7 +1280,7 @@ fn prepareTestStagingWithBinding(
     });
     defer alloc.free(manifest);
 
-    var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = [_]u8{0} ** (Sha256.digest_length * 2);
+    var capture_receipt_sha256: [Sha256.digest_length * 2]u8 = @as([(Sha256.digest_length * 2)]u8, @splat(0));
     var capture_receipt_json: ?[]u8 = null;
     defer if (capture_receipt_json) |json| alloc.free(json);
     if (binding) |authority| {

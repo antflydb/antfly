@@ -14,11 +14,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
-const manifest_base_source = @import("../manifest/base_source.zig");
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const wal_mod = @import("../wal/mod.zig");
 const query_mod = @import("../query/mod.zig");
 const query_reader = @import("../query/indexed_reader.zig");
@@ -54,7 +54,7 @@ const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const enrichment_operation_id = @import("../enrichment/operation_id.zig");
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
 const tables_api = @import("../../api/tables.zig");
 const shared_vector = @import("antfly_vector").vector;
 const objectstore = @import("objectstore");
@@ -140,7 +140,7 @@ pub const Builder = struct {
         manifest_version: u64 = 0,
         manifest: ?manifest_mod.Manifest = null,
 
-        fn deinit(self: *CurrentHeadManifest, alloc: Allocator) void {
+        pub fn deinit(self: *CurrentHeadManifest, alloc: Allocator) void {
             if (self.manifest) |*manifest| manifest.deinit(alloc);
             self.* = undefined;
         }
@@ -7687,7 +7687,7 @@ test "serverless external metadata publication retains sidecars without payload 
         .name = "docs.external-files",
         .artifact_id = "inventory-docs",
         .byte_len = 128,
-        .checksum = "a" ** 64,
+        .checksum = z17RepeatString("a", 64),
     });
     defer external.deinit(alloc);
     var plan: publication_plan.TablePublicationPlan = .{
@@ -7731,7 +7731,7 @@ test "serverless external metadata publication retains sidecars without payload 
         .name = "docs.external-files",
         .artifact_id = "inventory-replacement",
         .byte_len = 256,
-        .checksum = "f" ** 64,
+        .checksum = z17RepeatString("f", 64),
     });
     defer replacement.deinit(alloc);
     plan.external_source_plan = replacement;
@@ -7759,7 +7759,7 @@ test "serverless external selector transitions preserve resolved sidecars withou
             self.calls += 1;
             return error.UnexpectedArtifactPayloadIo;
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return deny(ptr);
         }
@@ -7775,7 +7775,7 @@ test "serverless external selector transitions preserve resolved sidecars withou
         fn delete(ptr: *anyopaque, _: []const u8) !void {
             return deny(ptr);
         }
-        fn scoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+        fn scoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !artifacts_mod.ArtifactMetadata {
             return deny(ptr);
         }
         fn expectPlanRequired(self: *@This(), builder: *Builder, plan: publication_plan.TablePublicationPlan) !void {
@@ -7872,7 +7872,7 @@ test "serverless external selector transitions preserve resolved sidecars withou
             .name = "docs.external-files",
             .artifact_id = "inventory-docs",
             .byte_len = 128,
-            .checksum = "a" ** 64,
+            .checksum = z17RepeatString("a", 64),
         });
         defer external.deinit(alloc);
         var plan: publication_plan.TablePublicationPlan = .{
@@ -7904,7 +7904,7 @@ test "serverless external selector transitions preserve resolved sidecars withou
             .name = "docs.external-files",
             .artifact_id = if (replace_snapshot) "inventory-docs" else "inventory-replaced",
             .byte_len = 128,
-            .checksum = if (replace_snapshot) "a" ** 64 else "f" ** 64,
+            .checksum = if (replace_snapshot) z17RepeatString("a", 64) else z17RepeatString("f", 64),
         });
         defer replacement.deinit(alloc);
         plan.external_source_plan = replacement;
@@ -7985,4 +7985,15 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

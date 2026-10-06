@@ -1,6 +1,6 @@
 # Antfly Zig compilation architecture
 
-Last updated: 2026-09-12
+Last updated: 2026-10-01
 
 This is the living design and operating guide for Antfly's Zig compilation
 architecture. The complete chronological investigation, including rejected
@@ -10,7 +10,8 @@ probes and superseded measurements, is preserved in
 ## Status at a glance
 
 Production builds seven static runtime archives and links them into one Antfly
-executable. The executable and `libantfly` reuse the physical storage archive.
+executable. The executable compiles its storage archive from the embedded source owner.
+`libantfly` compiles the local C API independently, without server coordination.
 The source roots are explicit: selecting one archive does not declare the other
 archives' entry files through inactive imports.
 
@@ -40,7 +41,7 @@ normal cost-efficient CI runner, without serializing compilation or treating
 extra memory as the permanent solution.
 
 The result must remain one statically linked `antfly` executable. Standalone
-must include embedded inference, the C API must reuse the compiled storage
+must include embedded inference, the C API must use the same authored local storage
 implementation, and production behavior must not be weakened to make the
 compiler succeed.
 
@@ -83,9 +84,9 @@ thin linked antfly executable
 │   ├── physical DB, LSM, indexes, DocStore and local query
 │   ├── writes, transaction participation, WAL and Raft apply
 │   ├── snapshots, restore, maintenance and Lite
-│   └── public C API implementation reused by libantfly
+│   └── private server C API and storage-owner adapters
 ├── antfly-runtime-distributed
-│   ├── data, metadata and HA control
+│   ├── data, metadata and hot-standby control
 │   └── standalone lifecycle and product composition
 ├── antfly-runtime-api_kernel
 │   └── HTTP, auth, public validation and API protocol handlers
@@ -127,10 +128,10 @@ snapshot publication execute through the storage owner.
 
 ### Compilation and source ownership
 
-The storage archive owns `storage/db/db.zig`, `storage/local_query.zig`, and
-`storage/local_write.zig`. Serving coordination in `api/table_reads.zig` and
+The storage archive owns `storage/db/db.zig`, `storage/query.zig`, and
+`storage/write.zig`. Serving coordination in `api/table_reads.zig` and
 `api/table_writes.zig` uses opaque owners. Shared request and result helpers
-live in `api/local_query_contract.zig` and `api/local_write_contract.zig`;
+live in `api/query_execution_contract.zig` and `api/write_contract.zig`;
 physical resource setup lives under `storage/`.
 
 The executable dispatches Lite administration to storage and `lite serve` to
@@ -226,7 +227,8 @@ the source-mutation matrix does not prove independence for every leaf file.
 
 These per-archive reservations, adopted from that measurement, apply only to
 native x86_64 Linux hosts building baseline x86_64 GNU, stripped ReleaseFast,
-with CPU inference and no thread sanitizer; other profiles keep their
+with CPU inference and no thread sanitizer. The same target/backend fences
+also admit the ReleaseSafe profile measured below; other profiles keep their
 previous claims.
 
 | Runtime archive | Largest sampled compiler RSS across the pair | New claim |
@@ -239,15 +241,70 @@ previous claims.
 | CLI | 1.25 GiB | 2 GiB |
 | Enrichment | 0.80 GiB | 2 GiB |
 
+The [2026-10-01 full E2E build](https://github.com/antflydb/antfly/actions/runs/36903575966/job/110509376054)
+completed all 35 build steps in stripped ReleaseSafe just as the 90-minute
+job deadline expired, preventing artifact upload. Its rounded Zig MaxRSS
+summaries support these separate admission reservations:
+
+| Runtime archive | Reported MaxRSS | ReleaseSafe claim |
+| --- | ---: | ---: |
+| Storage | 8G | 12 GiB |
+| Inference | 5G | 8 GiB |
+| Distributed | 5G | 8 GiB |
+| API | 4G | 7 GiB |
+| Serverless | 3G | 5 GiB |
+| CLI | 1G | 3 GiB |
+| Enrichment | 1G | 3 GiB |
+
+These are scheduler reservations, not process memory limits. Each leaves
+headroom above the rounded observation. Storage and inference now fit together
+inside the existing 22 GiB aggregate budget, whereas the previous 20/16 GiB
+claims serialized them. This removes that admission bottleneck without
+increasing runner size or the deadline; a matched CI rerun must establish the
+resulting wall time.
+
+### October macOS compile-memory follow-up
+
+The baseline Linux GNU reservations above remain scoped to their measured
+profiles. macOS reservations now provision 28 GiB for storage, 14 GiB for API,
+20 GiB for inference, and 4 GiB for CLI. The storage claim covers the reported
+22–23 GB peak with at least 25% headroom. The other increases are provisional
+headroom over claims reported as exceeded, **not new measured peaks**. No CPU
+kernel or Accelerate behavior changes with these scheduling reservations.
+
+Re-measure each affected unit with empty caches and `-j1` on the affected host
+and product profile. Then validate concurrent admission on a 48 GiB host with
+at least 8 GiB left outside the build budget. Do not extrapolate the historical
+Linux measurements to a different target, optimization mode, or backend set.
+
+`diagnose-zig-build-memory.sh` now assigns each polling pass a sample ID.
+Summarize its trace with:
+
+```sh
+python3 scripts/summarize_zig_compile_memory.py /tmp/build.rss.tsv \
+  --output /tmp/build.units.json
+```
+
+The report retains per-unit peak commands, recommends whole-GiB reservations
+with 25% headroom, and reports the sampled aggregate compiler RSS. Legacy
+six-column traces produce an explicitly approximate aggregate upper envelope.
+Sampling can miss short-lived peaks; retain raw traces and build provenance.
+Final reservation qualification still requires fresh cold-build evidence.
+
 ### C API composition
 
-`libantfly` links the sectioned PIC storage and enrichment artifacts, plus the
-standalone inference runtime archive, the same as the `antfly` executable.
-Function and data section GC retains public `antfly_db_*` and `antfly_lite_*`
-roots while discarding private executable entry points. The symbol audit
-rejects exported runtime, API-kernel, storage-owner, snapshot, restore, and
-data-apply symbols; inference symbols stay hidden/non-exported even though the
-archive is now linked in-process (only the public C ABI is exported).
+`libantfly` compiles its public C API and local DB from
+`pkg/antfly-embedded/src/local`. It links embedded-owned native inference and
+enrichment compute archives. It does not link the server storage archive,
+standalone runtime, Raft coordination, HTTP handlers, or private server C API.
+The server storage archive consumes the same local source through the
+`antfly_local_sources` module and retains its server adapters.
+
+The symbol audit rejects exported runtime, API-kernel, storage-owner, snapshot,
+restore, and data-apply symbols. Native provider exports remain hidden; only
+the public C ABI is exported. See
+[embedded source ownership](../docs/design/embedded-source-ownership.md) for
+physical ownership, independent builds, and test collection.
 
 There is one canonical Zig C API identity:
 
@@ -260,17 +317,13 @@ this consolidation.
 
 #### Embedded inference
 
-As of 2026-09-17, `libantfly` always embeds the standalone inference runtime
-in-process (`link_anchor.zig` no longer traps
-`antfly_standalone_inference_get_function_table`; only the executable-only
-API-kernel entry point stays trapped). This is a deliberate product decision:
-it makes `libantfly`, and therefore Antfly Lite hosts (the Go/Zig `embedded`
-package and the C ABI), get local inference out of the box without building
-or shipping a separate runtime, at the cost of a much larger shared library --
-see the raised size gate below. Opening a Lite handle with the local-runtime-
+`libantfly` embeds native inference in-process through the inference package's
+host exports. The server runtime uses the same implementation through its own
+entry point. Local inference remains available to Lite hosts and the public C
+ABI without a server binary. Opening a Lite handle with the local-runtime
 configured flag reports `inference_mode: "local_embedded"` and
 `local_inference_runtime: true` (see LITE.md's "Local Embedded Inference"
-section). There is no longer a smaller inference-free `libantfly` build.
+section). There is no inference-free `libantfly` product.
 
 ## Why compiled boundaries are required
 
@@ -576,7 +629,7 @@ Build both the executable and canonical C API:
 ```sh
 zig build antfly capi \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -596,7 +649,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-candidate-local-cache \
   --global-cache-dir /tmp/antfly-candidate-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -611,20 +664,20 @@ Do not compare a cold candidate with a warm baseline.
 
 ```sh
 zig build antfly capi \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
 
 zig build capi-test capi-smoke antfly-standalone-runtime-test \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false
 
 zig build \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Dproduction-lsm-only=false
 
 zig build lmdb-test antfly-storage-lmdb-test
@@ -660,7 +713,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-report-local-cache \
   --global-cache-dir /tmp/antfly-report-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -762,3 +815,21 @@ This work is complete when:
   failure and exact semantic error identity are covered by tests;
 - graph gates prevent broad implementation dependencies from returning; and
 - enabling the candidate as the production default receives explicit approval.
+
+### Explicit macOS SDK selection
+
+For cacheable native configuration, pass `-Dmacos-sdk=/absolute/path/to/MacOSX.sdk`
+(or set `SDK_PATH`). The shared SDK helper tracks the selected directory metadata,
+so replacing that SDK invalidates configuration. The CLI option takes precedence
+over `SDK_PATH`. A shared libc configuration makes this SDK authoritative for
+C compilation, linking, and C translation, including generated host tools. All
+storage, inference, and finetuning owners use this helper.
+Automatic `xcrun` discovery remains available and deliberately disables configure
+caching because Xcode selection is an external input. Pin an SDK for repeated
+local or CI builds; keep automatic discovery when following `xcode-select`.
+
+C bindings use the official `translate-c` package pinned to its Zig 0.17 branch.
+Zig extracts package sources into a local `zig-pkg/` cache, which is ignored by Git.
+Debug tools and ownership fixtures use `std.heap.SafeAllocator`; its `deinit()`
+returns a leak count. Memory-bounded fixtures retain a requested-byte cap outside
+the allocator metadata.

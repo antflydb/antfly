@@ -15,10 +15,10 @@
 //! Focused compile/test root for the Antfly-owned lake-native scaffold.
 
 pub const rowsource = @import("storage/rowsource/mod.zig");
-pub const local_rowsource = @import("storage/rowsource/local.zig");
-pub const external_rowsource = @import("storage/rowsource/external.zig");
-pub const row_fragment = @import("serverless/row_fragment/mod.zig");
-pub const row_fragment_stats = @import("serverless/row_fragment/stats.zig");
+pub const local_rowsource = @import("antfly_local_sources").storage_rowsource_local;
+pub const external_rowsource = @import("antfly_local_sources").storage_rowsource_external;
+pub const row_fragment = @import("antfly_local_sources").serverless_row_fragment_mod;
+pub const row_fragment_stats = @import("antfly_local_sources").serverless_row_fragment_stats;
 pub const row_fragment_build = @import("serverless/build/row_fragments.zig");
 pub const row_fragment_manifest = @import("serverless/build/row_fragment_manifest.zig");
 pub const row_fragment_publish = @import("serverless/build/row_fragment_publish.zig");
@@ -30,27 +30,27 @@ pub const algebraic_publish = @import("serverless/build/algebraic_publish.zig");
 pub const lake_gc = @import("serverless/build/lake_gc.zig");
 pub const lake_promotion = @import("serverless/build/lake_promotion.zig");
 pub const lake_rebuild = @import("serverless/build/lake_rebuild.zig");
-pub const algebraic_segment = @import("serverless/algebraic_segment/mod.zig");
-pub const external_source = @import("serverless/external_source/mod.zig");
-pub const external_source_catalog_binding = @import("serverless/external_source/catalog_binding.zig");
-pub const external_source_object_snapshot = @import("serverless/external_source/object_snapshot.zig");
-pub const external_source_iceberg_metadata = @import("serverless/external_source/iceberg_metadata.zig");
-pub const lake_rows_query = @import("serverless/query/lake_rows.zig");
+pub const algebraic_segment = @import("antfly_local_sources").serverless_algebraic_segment_mod;
+pub const external_source = @import("antfly_local_sources").serverless_external_source_mod;
+pub const external_source_catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+pub const external_source_object_snapshot = @import("antfly_local_sources").serverless_external_source_object_snapshot;
+pub const external_source_iceberg_metadata = @import("antfly_local_sources").serverless_external_source_iceberg_metadata;
+pub const lake_rows_query = @import("antfly_local_sources").serverless_query_lake_rows;
 pub const lake_sidecar_candidates = @import("serverless/query/lake_sidecar_candidates.zig");
 pub const lake_explain_query = @import("serverless/query/lake_explain.zig");
 pub const lake_cache_query = @import("serverless/query/lake_cache.zig");
-pub const lake_range_io = @import("serverless/query/lake_range_io.zig");
-pub const lake_parquet_footer = @import("serverless/query/lake_parquet_footer.zig");
-pub const lake_parquet_metadata = @import("serverless/query/lake_parquet_metadata.zig");
-pub const lake_parquet_page = @import("serverless/query/lake_parquet_page.zig");
-pub const lake_parquet_rowgroup = @import("serverless/query/lake_parquet_rowgroup.zig");
-pub const lake_scan_plan = @import("serverless/query/lake_scan_plan.zig");
-pub const lake_object_reader = @import("serverless/query/lake_object_reader.zig");
-pub const lake_iceberg_deletes = @import("serverless/query/lake_iceberg_deletes.zig");
-pub const sidecar_source_binding = @import("serverless/segment/source_binding.zig");
-pub const sidecar_manifest = @import("serverless/segment/sidecar_manifest.zig");
-pub const manifest_artifact_ref = @import("serverless/manifest/artifact_ref.zig");
-pub const manifest_base_source = @import("serverless/manifest/base_source.zig");
+pub const lake_range_io = @import("antfly_local_sources").serverless_query_lake_range_io;
+pub const lake_parquet_footer = @import("antfly_local_sources").serverless_query_lake_parquet_footer;
+pub const lake_parquet_metadata = @import("antfly_local_sources").serverless_query_lake_parquet_metadata;
+pub const lake_parquet_page = @import("antfly_local_sources").serverless_query_lake_parquet_page;
+pub const lake_parquet_rowgroup = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
+pub const lake_scan_plan = @import("antfly_local_sources").serverless_query_lake_scan_plan;
+pub const lake_object_reader = @import("antfly_local_sources").serverless_query_lake_object_reader;
+pub const lake_iceberg_deletes = @import("antfly_local_sources").serverless_query_lake_iceberg_deletes;
+pub const sidecar_source_binding = @import("antfly_local_sources").serverless_segment_source_binding;
+pub const sidecar_manifest = @import("antfly_local_sources").serverless_segment_sidecar_manifest;
+pub const manifest_artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
+pub const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 pub const manifest_compatibility = @import("serverless/manifest/compatibility.zig");
 
 test {
@@ -96,3 +96,10 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+test {
+    _ = @import("antfly_local_sources").serverless_query_lake_serving;
+    _ = @import("antfly_local_sources").serverless_external_source_schema_binding;
+}

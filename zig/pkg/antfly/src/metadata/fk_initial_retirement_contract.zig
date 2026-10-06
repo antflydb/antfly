@@ -7,7 +7,7 @@
 //! may attest completion. Metadata accepts that attestation only from the
 //! currently registered physical store root.
 const std = @import("std");
-const incarnation = @import("incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 const retirement = @import("fk_initial_retirement.zig");
 
 pub const ticket_encoded_len = 256;
@@ -82,7 +82,7 @@ pub const Intent = struct {
         var bytes: [intent_encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], "IFRI");
         bytes[4] = 1;
-        bytes[5] = @intFromEnum(self.phase);
+        bytes[5] = @backingInt(self.phase);
         const ticket_bytes = try self.ticket.encode();
         @memcpy(bytes[8..264], &ticket_bytes);
         std.crypto.hash.Blake3.hash(bytes[0..264], bytes[264..296], .{});

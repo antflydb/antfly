@@ -22,10 +22,10 @@ fn Counts(comptime Label: type) type {
         values: [std.enums.values(Label).len]u64 = @splat(0),
         const Self = @This();
         fn add(self: *Self, label: Label, value: u64) void {
-            _ = @atomicRmw(u64, &self.values[@intFromEnum(label)], .Add, value, .monotonic);
+            _ = @atomicRmw(u64, &self.values[@backingInt(label)], .Add, value, .monotonic);
         }
         pub fn get(self: *const Self, label: Label) u64 {
-            return @atomicLoad(u64, &self.values[@intFromEnum(label)], .monotonic);
+            return @atomicLoad(u64, &self.values[@backingInt(label)], .monotonic);
         }
         fn write(self: *const Self, writer: *std.Io.Writer, comptime name: []const u8, comptime help: []const u8, comptime label: []const u8) !void {
             try writer.writeAll("# HELP " ++ name ++ " " ++ help ++ "\n# TYPE " ++ name ++ " counter\n");
@@ -110,7 +110,7 @@ pub const Metrics = struct {
         try self.solver_nodes.write(writer, "antfly_inference_extract_v2_solver_nodes_total", "Visited search nodes reported by decoded solver witnesses", "solver");
         try writer.writeAll("# HELP antfly_inference_extract_v2_solver_results_total Decoded solver witnesses including subsequently rejected atomic requests\n# TYPE antfly_inference_extract_v2_solver_results_total counter\n");
         for (std.enums.values(observation.Solver)) |solver| for (std.enums.values(observation.Status)) |status| {
-            try writer.print("antfly_inference_extract_v2_solver_results_total{{solver=\"{s}\",status=\"{s}\"}} {d}\n", .{ @tagName(solver), @tagName(status), self.solver_results[@intFromEnum(solver)].get(status) });
+            try writer.print("antfly_inference_extract_v2_solver_results_total{{solver=\"{s}\",status=\"{s}\"}} {d}\n", .{ @tagName(solver), @tagName(status), self.solver_results[@backingInt(solver)].get(status) });
         };
     }
 };
@@ -154,7 +154,7 @@ pub const Trace = struct {
                 self.metrics.decoded_prompt_tokens.incrBy(@intCast(sample.prompt_tokens));
                 self.metrics.decoded_output_values.incrBy(@intCast(sample.output_values));
                 for (sample.solvers, std.enums.values(observation.Solver)) |value, solver| if (value) |diagnostic| {
-                    self.metrics.solver_results[@intFromEnum(solver)].add(diagnostic.status, 1);
+                    self.metrics.solver_results[@backingInt(solver)].add(diagnostic.status, 1);
                     self.metrics.solver_nodes.add(solver, @intCast(diagnostic.visited_nodes));
                     if (diagnostic.exhausted) self.metrics.solver_exhausted.add(solver, 1);
                 };

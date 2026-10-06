@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const catalog = @import("catalog.zig");
+const catalog = @import("storage/catalog.zig");
 const host = @import("host.zig");
 const managed_host = @import("managed_host.zig");
 const metadata_mod = @import("../metadata/mod.zig");
@@ -25,8 +25,8 @@ const service = @import("service.zig");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
 const db_enrichment_runtime_factory = @import("db_enrichment_runtime_factory.zig");
 const enrichment_runtime = @import("enrichment_runtime.zig");
-const db_types = @import("../storage/db/types.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
 const transport = @import("transport/mod.zig");
 const transition_checker = @import("transition_checker.zig");
 const transition_runtime_mod = @import("transition_runtime.zig");
@@ -35,7 +35,7 @@ const raft_state_machine = @import("state_machine/mod.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
 const data_shard_state_store = @import("../data/storage/shard_state_store.zig");
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 
 const simulation_transition_table_contract: metadata_mod.TransitionTableContract = .{
     .table_id = 1,
@@ -282,7 +282,7 @@ pub const VirtualHttpNetwork = struct {
         base_uri: []u8,
         request: transport.HttpRequest,
 
-        fn deinit(self: *QueuedRequest, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *QueuedRequest, alloc: std.mem.Allocator) void {
             alloc.free(self.base_uri);
             alloc.free(@constCast(self.request.uri));
             for (self.request.headers) |header| {
@@ -1167,8 +1167,8 @@ test "virtual http network bounds queued HTTP delivery and recovers its drain ow
     const io_http = @import("../common/http/io_http_executor.zig");
     // Native stack unwinding cannot cross VoprIo's switched fiber stacks.
     // Retain allocation/leak checking without collecting those stack traces.
-    var checked_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer std.debug.assert(checked_allocator.deinit() == .ok);
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(checked_allocator.deinit() == 0);
     const alloc = checked_allocator.allocator();
     var runtime = try vopr.vopr_io.VoprIo.init(.{});
     defer runtime.deinit();
@@ -2170,7 +2170,7 @@ const StorageRecorder = struct {
     alloc: std.mem.Allocator,
     stores: std.AutoHashMapUnmanaged(u64, *raft_engine.core.MemoryStorage) = .empty,
 
-    fn deinit(self: *StorageRecorder) void {
+    pub fn deinit(self: *StorageRecorder) void {
         self.stores.deinit(self.alloc);
         self.* = undefined;
     }
@@ -4777,7 +4777,7 @@ test "cluster simulation drives split transition actions deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -4936,7 +4936,7 @@ test "http host simulation drives queued split transitions through the service l
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5090,7 +5090,7 @@ test "http host simulation rolls back and retries queued split transitions throu
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5271,7 +5271,7 @@ test "http host simulation removes queued split transition mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5394,7 +5394,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5627,7 +5627,7 @@ test "cluster simulation drives merge transition actions deterministically" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -5771,7 +5771,7 @@ test "cluster simulation drives queued split transitions through service-owned m
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -6894,7 +6894,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7166,7 +7166,7 @@ test "http host simulation rolls back and retries queued merge transitions throu
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7330,7 +7330,7 @@ test "http host simulation removes queued merge transition mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -7434,7 +7434,7 @@ test "http host simulation updates merge transition to rollback mid-flight" {
         },
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }
@@ -10020,7 +10020,7 @@ test "managed http cluster simulation gates enrichment on explicit readable leas
 }
 
 test "managed http cluster simulation gates real db enrichment runtimes on read index" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
     const Resolver = struct {
         root: []const u8,
@@ -10244,7 +10244,7 @@ test "managed http cluster simulation gates real db enrichment runtimes on read 
 }
 
 test "managed http cluster simulation starts real db enrichment runtimes across leader transfer" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
     const Resolver = struct {
         root: []const u8,
@@ -10455,7 +10455,7 @@ test "managed http cluster simulation starts real db enrichment runtimes across 
 }
 
 test "managed http cluster simulation fences real db enrichment runtimes across leader restart" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
     const Resolver = struct {
         root: []const u8,
@@ -10687,7 +10687,7 @@ test "managed http cluster simulation fences real db enrichment runtimes across 
 }
 
 test "managed http cluster simulation fences real db enrichment runtimes across ordinary leader loss" {
-    const embedder_mod = @import("../storage/db/enrichment/embedder.zig");
+    const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 
     const Resolver = struct {
         root: []const u8,

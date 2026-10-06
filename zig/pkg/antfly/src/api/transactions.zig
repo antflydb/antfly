@@ -14,13 +14,13 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const batch_api = @import("batch.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const batch_api = @import("antfly_local_sources").api_batch;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const distributed_txn = @import("distributed_txn.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const docstore_mod = @import("../storage/docstore.zig");
-const mem_backend = @import("../storage/mem_backend.zig");
-const lease_mod = @import("../storage/db/lease.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const lease_mod = @import("antfly_local_sources").storage_db_lease;
 const sql_connection_record = @import("sql_connection_record.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -67,15 +67,15 @@ pub const TransactionReadItem = struct {
 pub const TableCommitRequest = struct {
     pub const ConflictGuards = struct {
         generation_set: [32]u8,
-        commands: []const @import("../storage/db/relational_integrity_contract.zig").Command,
+        commands: []const @import("antfly_local_sources").storage_db_relational_integrity_contract.Command,
         pub fn jsonStringify(self: @This(), stream: anytype) @TypeOf(stream.*).Error!void {
-            return @import("../storage/db/relational_integrity_json.zig").write(self, stream);
+            return @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, stream);
         }
     };
     /// Server-authored arbiter observations survive statement merging,
     /// savepoints, restart and final native dependency expansion.
     conflict_guards: ?std.json.Parsed(ConflictGuards) = null,
-    range_guards: ?@import("range_read_guards.zig").Owned = null,
+    range_guards: ?@import("antfly_local_sources").api_range_read_guards.Owned = null,
     schema_version: ?u32 = null,
     table_name: []u8,
     relational_schema_version: ?u32 = null,
@@ -123,7 +123,7 @@ pub const TableCommitRequest = struct {
     }
 
     pub fn mergeConflictGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: ConflictGuards) !void {
-        const native = @import("../storage/db/relational_integrity_contract.zig");
+        const native = @import("antfly_local_sources").storage_db_relational_integrity_contract;
         if (std.mem.allEqual(u8, &incoming.generation_set, 0)) return error.InvalidTransactionSessionRecord;
         for (incoming.commands) |command| if (command.operation != .compare_claim) return error.InvalidTransactionSessionRecord;
         const previous: []const native.Command = if (self.conflict_guards) |guards| blk: {
@@ -153,8 +153,8 @@ pub const TableCommitRequest = struct {
         self.conflict_guards = owned;
     }
 
-    pub fn mergeRangeGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: []const @import("range_read_guards.zig").OwnerRangeProof) !void {
-        const merged = try @import("range_read_guards.zig").merge(alloc, if (self.range_guards) |guards| guards.value else &.{}, incoming);
+    pub fn mergeRangeGuards(self: *TableCommitRequest, alloc: std.mem.Allocator, incoming: []const @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof) !void {
+        const merged = try @import("antfly_local_sources").api_range_read_guards.merge(alloc, if (self.range_guards) |guards| guards.value else &.{}, incoming);
         if (self.range_guards) |*guards| guards.deinit();
         self.range_guards = merged;
     }
@@ -179,7 +179,7 @@ pub const TableCommitRequest = struct {
 pub const CatalogBinding = struct { logical: []const u8, physical: []const u8 };
 
 pub const OwnedTransactionCommitRequest = struct {
-    constraint_timing: std.ArrayListUnmanaged(@import("../storage/relational_index.zig").ConstraintTiming) = .empty,
+    constraint_timing: std.ArrayListUnmanaged(@import("antfly_local_sources").storage_relational_index.ConstraintTiming) = .empty,
 
     // Server-authored identity bindings are persisted with staged operations.
     // Public JSON cannot supply them. Labels remain stable across renames.
@@ -189,7 +189,7 @@ pub const OwnedTransactionCommitRequest = struct {
     tables: []TableCommitRequest = &.{},
     sync_level: db_mod.types.SyncLevel = .propose,
 
-    pub fn setConstraintTiming(self: *@This(), alloc: std.mem.Allocator, mode: @import("../storage/relational_index.zig").ConstraintTiming) !void {
+    pub fn setConstraintTiming(self: *@This(), alloc: std.mem.Allocator, mode: @import("antfly_local_sources").storage_relational_index.ConstraintTiming) !void {
         if (mode.generation == null) self.constraint_timing.clearRetainingCapacity();
         for (self.constraint_timing.items) |*previous| if (std.meta.eql(previous.generation, mode.generation)) {
             previous.* = mode;
@@ -214,7 +214,7 @@ pub const OwnedTransactionCommitRequest = struct {
         for (self.catalog_bindings.items) |binding| if (std.mem.eql(u8, binding.logical, logical)) return binding.physical;
         return logical;
     }
-    pub fn observeRanges(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8, schema_version: u32, observations: []const @import("range_read_guards.zig").OwnerRangeProof) !void {
+    pub fn observeRanges(self: *OwnedTransactionCommitRequest, alloc: std.mem.Allocator, logical: []const u8, physical: []const u8, schema_version: u32, observations: []const @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof) !void {
         try self.bind(alloc, logical, physical);
         for (self.tables) |*table| if (std.mem.eql(u8, self.physicalName(table.table_name), physical)) {
             if (table.schema_version != null and table.schema_version != schema_version) return error.CatalogGenerationChanged;
@@ -222,7 +222,7 @@ pub const OwnedTransactionCommitRequest = struct {
             table.schema_version = schema_version;
             return;
         };
-        var guards = try @import("range_read_guards.zig").merge(alloc, &.{}, observations);
+        var guards = try @import("antfly_local_sources").api_range_read_guards.merge(alloc, &.{}, observations);
         defer guards.deinit();
         try appendTable(alloc, self, .{ .table_name = @constCast(logical), .schema_version = schema_version, .range_guards = guards });
     }
@@ -347,7 +347,7 @@ fn encodeExecutionPlan(alloc: std.mem.Allocator, tables: []const distributed_txn
     const Wire = struct {
         tables: []const distributed_txn.TableCommitRequest,
         pub fn jsonStringify(self: @This(), stream: anytype) !void {
-            try @import("../storage/db/relational_integrity_json.zig").write(self.tables, stream);
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self.tables, stream);
         }
     };
     return std.json.Stringify.valueAlloc(alloc, Wire{ .tables = tables }, .{});
@@ -370,7 +370,7 @@ pub const CommitConflict = struct {
 
 /// Stable validation causes survive participant transport and durable abort.
 /// They must not be mistaken for transient contention by activation workers.
-pub const CommitConflictReason = @import("distributed_txn_contract.zig").CommitConflictReason;
+pub const CommitConflictReason = @import("antfly_local_sources").api_distributed_txn_contract.CommitConflictReason;
 
 pub const CommitConflictKind = enum {
     version_conflict,
@@ -391,8 +391,8 @@ pub const BeginRequest = struct {
 pub const SqlMetadata = struct {
     database: []const u8,
     namespace: []const u8,
-    isolation: @import("../sql/session.zig").Isolation,
-    mode: @import("../sql/session.zig").ReadMode,
+    isolation: @import("antfly_local_sources").sql_session.Isolation,
+    mode: @import("antfly_local_sources").sql_session.ReadMode,
     failed: bool = false,
 
     pub fn clone(self: SqlMetadata, alloc: std.mem.Allocator) !SqlMetadata {
@@ -411,7 +411,7 @@ pub const SqlMetadata = struct {
     }
 };
 
-const setting_catalog = @import("../sql/setting_catalog.zig");
+const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const SettingEntries = std.ArrayListUnmanaged(setting_catalog.OverlayEntry);
 
 fn deinitSettingEntries(alloc: std.mem.Allocator, entries: *SettingEntries) void {
@@ -1597,7 +1597,7 @@ pub const OpenedSessionStore = struct {
     lease: SessionLeaseStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedSessionStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);
@@ -1694,10 +1694,10 @@ pub const SessionRegistry = struct {
     const session_lock_count = 64;
 
     mutex: AtomicMutex = .{},
-    session_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
+    session_locks: [session_lock_count]AtomicMutex = @as([session_lock_count]AtomicMutex, @splat(.{})),
     // Record locks protect individual durable mutations. Execution ownership
     // spans 2PC and its response handoff, which must not race a local replay.
-    commit_locks: [session_lock_count]AtomicMutex = [_]AtomicMutex{.{}} ** session_lock_count,
+    commit_locks: [session_lock_count]AtomicMutex = @as([session_lock_count]AtomicMutex, @splat(.{})),
     sessions: std.AutoHashMapUnmanaged(db_mod.types.TxnId, Session) = .empty,
     durable: ?*DurableSessionStore = null,
     lease_store: ?SessionLeaseStore = null,
@@ -3794,7 +3794,7 @@ pub fn parseMultiBatchRequest(alloc: std.mem.Allocator, body: []const u8) !Owned
         req.sync_level = parseSyncLevel(sync_level_value) orelse return error.InvalidTransactionCommitRequest;
     } else {
         for (req.tables) |table| {
-            if (@intFromEnum(table.batch.req.sync_level) > @intFromEnum(req.sync_level)) {
+            if (@backingInt(table.batch.req.sync_level) > @backingInt(req.sync_level)) {
                 req.sync_level = table.batch.req.sync_level;
             }
         }
@@ -3927,6 +3927,7 @@ fn encodeCommitRequestMode(alloc: std.mem.Allocator, req: OwnedTransactionCommit
                     .key = predicate.key,
                     .version = try std.fmt.bufPrint(&version_buf, "{d}", .{predicate.expected_version}),
                     .digest = predicate.expected_content_digest,
+                    .unique_absence = predicate.unique_absence,
                 }, .{});
                 defer alloc.free(encoded);
                 try out.appendSlice(alloc, encoded);
@@ -4102,7 +4103,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
     errdefer request.deinit(alloc);
     if (value.object.get("constraint_timing")) |timing| {
         if (timing != .array or timing.array.items.len > 4096) return error.InvalidTransactionSessionRecord;
-        var parsed = try std.json.parseFromValue([]const @import("../storage/relational_index.zig").ConstraintTiming, alloc, timing, .{});
+        var parsed = try std.json.parseFromValue([]const @import("antfly_local_sources").storage_relational_index.ConstraintTiming, alloc, timing, .{});
         defer parsed.deinit();
         for (parsed.value) |mode| try request.setConstraintTiming(alloc, mode);
     }
@@ -4185,7 +4186,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const table = for (request.tables) |*table| {
                 if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
             } else return error.InvalidTransactionSessionRecord;
-            var parsed = try std.json.parseFromValue([]const @import("range_read_guards.zig").OwnerRangeProof, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
+            var parsed = try std.json.parseFromValue([]const @import("antfly_local_sources").api_range_read_guards.OwnerRangeProof, alloc, entry.value_ptr.*, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             try table.mergeRangeGuards(alloc, parsed.value);
         }
@@ -4197,7 +4198,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
             const table = for (request.tables) |*table| {
                 if (std.mem.eql(u8, table.table_name, entry.key_ptr.*)) break table;
             } else return error.InvalidTransactionSessionRecord;
-            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8 };
+            const Stored = struct { key: []const u8, version: []const u8, digest: ?[32]u8, unique_absence: bool = false };
             var parsed = try std.json.parseFromValue([]const Stored, alloc, entry.value_ptr.*, .{});
             defer parsed.deinit();
             const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, parsed.value.len);
@@ -4206,6 +4207,7 @@ fn parseStoredCommitValue(alloc: std.mem.Allocator, value: std.json.Value) !Owne
                 .key = stored.key,
                 .expected_version = try parseVersionString(stored.version),
                 .expected_content_digest = stored.digest,
+                .unique_absence = stored.unique_absence,
             };
             try appendPredicates(alloc, &table.predicates, predicates);
         }
@@ -4454,6 +4456,7 @@ fn clonePredicatesInto(
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
+            .unique_absence = predicate.unique_absence,
         });
     }
 }
@@ -4842,12 +4845,14 @@ fn appendPredicates(
             if (previous.expected_content_digest) |digest| {
                 if (predicate.expected_content_digest) |next| if (!std.mem.eql(u8, &digest, &next)) return error.VersionConflict;
             } else previous.expected_content_digest = predicate.expected_content_digest;
+            previous.unique_absence = previous.unique_absence or predicate.unique_absence;
             continue;
         }
         predicates.appendAssumeCapacity(.{
             .key = try alloc.dupe(u8, predicate.key),
             .expected_version = predicate.expected_version,
             .expected_content_digest = predicate.expected_content_digest,
+            .unique_absence = predicate.unique_absence,
         });
         by_key.putAssumeCapacity(predicates.items[predicates.items.len - 1].key, predicates.items.len - 1);
     }
@@ -5610,7 +5615,7 @@ test "durable transaction sessions preserve and enforce principal bindings" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-principal", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -5884,7 +5889,7 @@ test "durable transaction sessions retain terminal commit coordinator handoff" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-terminal", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -5947,8 +5952,8 @@ test "distributed txn sessions durably seal exact binary integrity plans before 
     defer request.deinit(alloc);
     var sealed = (try writer.cloneCommitRequest(alloc, session.txn_id, &request)).?;
     defer sealed.deinit(alloc);
-    const commands = [_]@import("../storage/db/relational_integrity_contract.zig").Command{.{
-        .address = try @import("../storage/db/relational_integrity_contract.zig").Address.init(@splat(2), "\x00\xfftuple"),
+    const commands = [_]@import("antfly_local_sources").storage_db_relational_integrity_contract.Command{.{
+        .address = try @import("antfly_local_sources").storage_db_relational_integrity_contract.Address.init(@splat(2), "\x00\xfftuple"),
         .operation = .{ .check_owner = .{ .parent_table = "docs", .parent_key = "\x00\xffa" } },
     }};
     const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .relational_schema_version = 3, .relational_integrity_generation_set = @splat(0xff), .predicates = &.{.{ .key = "a", .expected_version = 7 }}, .integrity_commands = &commands, .row_policy_principal_proof = "signed-owner-admission", .row_policy_database = "default", .row_policy_admitted_at_seconds = 1_800_000_000 }};
@@ -6030,7 +6035,7 @@ test "distributed txn stage validation rejects atomically and preserves prior sa
     _ = try registry.createSavepoint(alloc, session.txn_id);
     var calls: usize = 0;
     const Validator = struct {
-        fn validate(ptr: *anyopaque, _: std.mem.Allocator, previous: ?*const OwnedTransactionCommitRequest, candidate: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
+        pub fn validate(ptr: *anyopaque, _: std.mem.Allocator, previous: ?*const OwnedTransactionCommitRequest, candidate: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
             const count: *usize = @ptrCast(@alignCast(ptr));
             count.* += 1;
             try std.testing.expectEqual(@as(usize, 1), previous.?.tables[0].batch.writes.len);
@@ -6199,7 +6204,7 @@ test "transaction session registry adopts durable session ownership" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6224,7 +6229,7 @@ test "transaction session commit request is sealed across retries" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-commit-seal-store", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -6271,7 +6276,7 @@ test "durable recovery index tracks only validated commit execution and terminal
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-recovery-index", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -6341,7 +6346,7 @@ test "durable recovery scan rotates fairly beyond one maintenance batch" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-recovery-fairness", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -6409,7 +6414,7 @@ test "background recovery adopts an expired shared-store owner lease" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-recovery-adopt", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -6446,7 +6451,7 @@ test "transaction session registry only adopts durable sessions after lease expi
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-timeout-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6478,7 +6483,7 @@ test "transaction session adoption preserves newer durable state than a local ca
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-fresh-state", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6516,7 +6521,7 @@ test "transaction session ownership and lease transition atomically on failure" 
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-atomic-owner", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6553,7 +6558,7 @@ test "transaction session registry renews and releases separate lease records" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-lease-renew-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6584,7 +6589,7 @@ test "transaction session registry reloads durable sessions from kv store" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6619,7 +6624,7 @@ test "transaction session registry reports status and cleans expired durable ses
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-cleanup-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});
@@ -6680,7 +6685,7 @@ test "distributed txn constraint timing stage rollback and durable reload are at
     defer immediate.deinit(alloc);
     try immediate.setConstraintTiming(alloc, .{ .generation = @splat(4), .deferred = false });
     const Reject = struct {
-        fn validate(_: *anyopaque, _: std.mem.Allocator, _: ?*const OwnedTransactionCommitRequest, _: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
+        pub fn validate(_: *anyopaque, _: std.mem.Allocator, _: ?*const OwnedTransactionCommitRequest, _: *OwnedTransactionCommitRequest, _: *const OwnedTransactionCommitRequest) !void {
             return error.UniqueConstraintViolation;
         }
     };
@@ -6770,7 +6775,7 @@ test "SQL session metadata and schema fences survive durable records" {
     var decoded = try decodeSessionRecord(alloc, info.txn_id, bytes);
     defer decoded.deinit(alloc);
     try std.testing.expectEqualStrings("app", decoded.sql.?.database);
-    try std.testing.expectEqual(@import("../sql/session.zig").Isolation.read_committed, decoded.sql.?.isolation);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_session.Isolation.read_committed, decoded.sql.?.isolation);
     try std.testing.expect(decoded.sql.?.failed);
     var request: OwnedTransactionCommitRequest = .{};
     defer request.deinit(alloc);
@@ -6793,7 +6798,7 @@ test "SQL session metadata and schema fences survive durable records" {
 test "distributed txn SQL range guards survive durability and savepoint rollback without restoring writes" {
     const Case = struct {
         fn run(alloc: std.mem.Allocator) !void {
-            const ranges = @import("range_read_guards.zig");
+            const ranges = @import("antfly_local_sources").api_range_read_guards;
             const observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 3, .topology_epoch = 4, .route = .{ .group_id = 5, .range_id = 6, .identity_namespace = .{ .table_id = 3, .shard_id = 5, .range_id = 6 } } }, .proofs = &.{.{ .bucket = 98, .generation = std.math.maxInt(u64) }} };
             const source_observation = ranges.OwnerRangeProof{ .fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat('1'), .catalog_revision = 2, .table_id = 4, .topology_epoch = 4, .route = .{ .group_id = 7, .range_id = 8, .identity_namespace = .{ .table_id = 4, .shard_id = 7, .range_id = 8 } } }, .proofs = &.{.{ .bucket = 99, .generation = 43 }} };
             var registry = SessionRegistry.init(null);
@@ -6844,7 +6849,7 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
 test "distributed txn SQL conflict guards retain first native observation through clone and durable round trip" {
     const Harness = struct {
         fn run(alloc: std.mem.Allocator) !void {
-            const native = @import("../storage/db/relational_integrity_contract.zig");
+            const native = @import("antfly_local_sources").storage_db_relational_integrity_contract;
             const address = try native.Address.init(@splat(3), "\x00\xfftuple");
             const first = [_]native.Command{.{ .address = address, .operation = .{ .compare_claim = null } }};
             const later = [_]native.Command{.{ .address = address, .operation = .{ .compare_claim = .{ .tuple = "\x00\xfftuple", .parent_table = "table", .parent_key = "staged", .schema_version = 7 } } }};
@@ -7029,7 +7034,7 @@ test "transaction session registry can renew owned leases opportunistically" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-opportunistic-renew-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore_mod.DocStore.open(std.testing.allocator, path_z, .{});

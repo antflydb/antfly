@@ -660,9 +660,9 @@ const TestAdapter = struct {
             }
         }
         return .{ .arena = arena, .layout = layout, .mode = mode, .slots = slots, .source = .{
-            .identity = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("synthetic immutable original FP32"), .sidecars = .{bundle.Digest.of("{}")} ** 4 },
+            .identity = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("synthetic immutable original FP32"), .sidecars = @splat(bundle.Digest.of("{}")) },
             .parameters = &.{},
-            .sidecars = .{"{}"} ** 4,
+            .sidecars = @splat("{}"),
         } };
     }
     fn makeSlot(a: Allocator, name: []const u8, dimensions: []const i32, fill: f32) !Slot {
@@ -673,7 +673,7 @@ const TestAdapter = struct {
     fn snapshot(self: *const TestAdapter) Snapshot {
         return .{ .mode = self.mode, .slots = self.slots, .adapter_layout = &self.layout, .provenance = testProvenance(), .base_model_name_or_path = "fastino/gliner2.5-small-v1" };
     }
-    fn deinit(self: *TestAdapter) void {
+    pub fn deinit(self: *TestAdapter) void {
         self.layout.deinit();
         self.arena.deinit();
         self.* = undefined;

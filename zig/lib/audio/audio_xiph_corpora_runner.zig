@@ -182,7 +182,7 @@ const Summary = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -262,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const outcome = try probeOneFile(alloc, root_dir, relative_path, print_success);
-        std.process.exit(@intFromEnum(toExitCode(outcome)));
+        std.process.exit(@backingInt(toExitCode(outcome)));
     }
 
     printUsage(argv0);

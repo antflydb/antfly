@@ -3,8 +3,8 @@
 
 const std = @import("std");
 const process_memory = @import("antfly_platform").process_memory;
-const lsm_backend = @import("lsm_backend/mod.zig");
-const resource_manager_mod = @import("resource_manager.zig");
+const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 
 pub const MiB: u64 = 1024 * 1024;
 
@@ -158,7 +158,7 @@ pub fn smartResourceBudgets(process_memory_limit_bytes: usize) SmartResourceBudg
     const explicit: ?u64 = if (process_memory_limit_bytes == 0) null else @intCast(process_memory_limit_bytes);
     const effective = resolveEffectiveMemoryLimit(explicit, detectedMemoryLimit()) orelse {
         const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
+        options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
         return .{
             .options = options,
             .lsm_cache_budget_bytes = lsm_cache_budget,
@@ -178,7 +178,7 @@ pub fn smartResourceBudgetsResolved(
     if (process_memory_limit_bytes == 0) {
         const lsm_cache_budget = lsm_backend.DefaultCacheSizeBytes;
         var options = resource_manager_mod.Options{};
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
+        options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, @intCast(lsm_cache_budget));
         return .{
             .options = options,
             .lsm_cache_budget_bytes = lsm_cache_budget,
@@ -219,27 +219,31 @@ pub fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
     const vector_block_build_hard = adaptiveSliceHardLimit(total, 16, MinSmartVectorBlockBuildBytes, MaxSmartVectorBlockBuildBytes);
+    // Native OCR needs admission for OS-owned recognition memory as well as
+    // rendered pages. Preserve the small-host floor and the process envelope.
+    const document_extraction_hard = adaptiveSliceHardLimit(total, 32, 256 * MiB, GiB);
 
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = elasticCacheBudget(hbc_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = resourceBudget(3, dense_search_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = resourceBudget(3, dense_apply_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)] = resourceBudget(3, full_text_residency_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = resourceBudget(3, shard_transition_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = elasticCacheBudget(hbc_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = resourceBudget(3, dense_search_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] = resourceBudget(3, dense_apply_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = resourceBudget(3, replay_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = resourceBudget(3, full_text_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = resourceBudget(2, full_text_build_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.full_text_segment_residency)] = resourceBudget(3, full_text_residency_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = resourceBudget(3, derived_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = resourceBudget(3, text_merge_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = resourceBudget(3, shard_transition_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
+    options.budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = resourceBudget(3, document_extraction_hard);
     // Inference slices are logical host-plus-accelerator metrics. Their host
     // component is enforced by the aggregate budget above; ModelManager and
     // BackendRuntime retain device-aware backend admission.
@@ -248,4 +252,13 @@ pub fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
         .options = options,
         .lsm_cache_budget_bytes = clampU64ToUsize(lsm_hard),
     };
+}
+
+test "apple OCR document memory budgets scale within the host envelope" {
+    const slice = @backingInt(resource_manager_mod.Slice.document_extraction_working_set);
+    const small = smartResourceBudgetsForTotal(GiB);
+    const mac = smartResourceBudgetsForTotal(36 * GiB);
+    try std.testing.expectEqual(@as(u64, 256 * MiB), small.options.budgets[slice].hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, GiB), mac.options.budgets[slice].hard_limit_bytes);
+    try std.testing.expect(mac.options.budgets[slice].hard_limit_bytes < mac.options.memory_budget.hard_limit_bytes);
 }

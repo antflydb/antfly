@@ -7,8 +7,8 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const resource_manager = @import("../storage/resource_manager.zig");
-const request_admission = @import("../common/request_admission.zig");
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
+const request_admission = @import("antfly_local_sources").common_request_admission;
 
 fn drive(
     sim: *vopr.vopr_io.VoprIo,
@@ -47,7 +47,7 @@ test "resource admission VOPR denies contention and recovers after release" {
         .identity_allocator = std.testing.allocator,
         .memory_budget = .{ .soft_limit_bytes = 3, .hard_limit_bytes = 4 },
     };
-    options.budgets[@intFromEnum(resource_manager.Slice.derived_backlog)] =
+    options.budgets[@backingInt(resource_manager.Slice.derived_backlog)] =
         .{ .soft_limit_bytes = 3, .hard_limit_bytes = 4 };
     var manager = resource_manager.ResourceManager.init(options);
     defer manager.deinit(std.testing.allocator);
@@ -144,11 +144,11 @@ test "resource admission VOPR composes request and multi-slice cancellation edge
         .identity_allocator = alloc,
         .memory_budget = .{ .soft_limit_bytes = 12, .hard_limit_bytes = 16 },
     };
-    options.budgets[@intFromEnum(resource_manager.Slice.dense_search_working_set)] =
+    options.budgets[@backingInt(resource_manager.Slice.dense_search_working_set)] =
         .{ .soft_limit_bytes = 6, .hard_limit_bytes = 8 };
-    options.budgets[@intFromEnum(resource_manager.Slice.derived_replay_window)] =
+    options.budgets[@backingInt(resource_manager.Slice.derived_replay_window)] =
         .{ .soft_limit_bytes = 6, .hard_limit_bytes = 8 };
-    options.budgets[@intFromEnum(resource_manager.Slice.inference_scratch_working_set)] =
+    options.budgets[@backingInt(resource_manager.Slice.inference_scratch_working_set)] =
         .{ .soft_limit_bytes = 2, .hard_limit_bytes = 4 };
     var manager = resource_manager.ResourceManager.init(options);
     defer manager.deinit(alloc);
@@ -232,13 +232,13 @@ test "resource admission VOPR preserves foreground priority and bounded minimum 
         .identity_allocator = alloc,
         .memory_budget = .{ .soft_limit_bytes = 20, .hard_limit_bytes = 30 },
     };
-    options.budgets[@intFromEnum(resource_manager.Slice.lsm_compaction_work)] =
+    options.budgets[@backingInt(resource_manager.Slice.lsm_compaction_work)] =
         .{ .soft_limit_bytes = 2, .hard_limit_bytes = 4 };
-    options.policies[@intFromEnum(resource_manager.Slice.lsm_compaction_work)] =
+    options.policies[@backingInt(resource_manager.Slice.lsm_compaction_work)] =
         .{ .soft_action = .defer_background_work, .hard_action = .reject_work };
-    options.budgets[@intFromEnum(resource_manager.Slice.text_merge_buffers)] =
+    options.budgets[@backingInt(resource_manager.Slice.text_merge_buffers)] =
         .{ .soft_limit_bytes = 8, .hard_limit_bytes = 10 };
-    options.budgets[@intFromEnum(resource_manager.Slice.dense_search_working_set)] =
+    options.budgets[@backingInt(resource_manager.Slice.dense_search_working_set)] =
         .{ .soft_limit_bytes = 4, .hard_limit_bytes = 8 };
     var manager = resource_manager.ResourceManager.init(options);
     defer manager.deinit(alloc);

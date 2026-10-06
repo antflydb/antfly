@@ -35,7 +35,7 @@ pub fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: 
         return error.EmptyPath;
     }
 
-    const stat = try compat.cwd().statFile(compat.io(), path, .{});
+    const stat = try std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{});
     if (stat.kind == .file) {
         if (std.mem.eql(u8, std.fs.path.basename(path), "manifest.json")) {
             const paths = try resolveFromManifest(arena_alloc, path, split);
@@ -51,7 +51,7 @@ pub fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: 
     }
 
     const manifest_path = try std.fs.path.join(arena_alloc, &.{ path, "manifest.json" });
-    if (compat.cwd().access(compat.io(), manifest_path, .{})) |_| {
+    if (std.Io.Dir.cwd().access(compat.testingIo(), manifest_path, .{})) |_| {
         const paths = try resolveFromManifest(arena_alloc, manifest_path, split);
         return .{ .arena = arena, .paths = paths };
     } else |_| {
@@ -84,14 +84,14 @@ fn resolveFromManifest(allocator: std.mem.Allocator, manifest_path: []const u8, 
 }
 
 fn resolveFromDirectory(allocator: std.mem.Allocator, dir_path: []const u8, split: ?[]const u8) ![][]const u8 {
-    var dir = try compat.cwd().openDir(compat.io(), dir_path, .{ .iterate = true });
-    defer dir.close(compat.io());
+    var dir = try std.Io.Dir.cwd().openDir(compat.testingIo(), dir_path, .{ .iterate = true });
+    defer dir.close(compat.testingIo());
 
     var iter = dir.iterate();
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
     defer paths.deinit(allocator);
 
-    while (try iter.next(compat.io())) |entry| {
+    while (try iter.next(compat.testingIo())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
         if (split) |want_split| {

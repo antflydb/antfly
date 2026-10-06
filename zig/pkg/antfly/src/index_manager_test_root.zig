@@ -13,6 +13,15 @@
 // limitations.
 
 test {
-    _ = @import("storage/db/catalog/index_manager.zig");
+    _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
     _ = @import("storage/index_manager_vopr.zig");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+/// Implementation choices for fixtures that cross the DB source boundary.
+pub const antfly_sources = struct {
+    pub const physical_db = @import("antfly_local_sources").storage_db_db;
+    pub const selected_db = @import("antfly_local_sources").storage_db_mod;
+};

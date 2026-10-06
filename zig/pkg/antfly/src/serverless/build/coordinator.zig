@@ -15,7 +15,7 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const catalog_service = @import("../catalog/service.zig");
 const work_lease = @import("work_lease.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
@@ -345,7 +345,7 @@ const PublicationCoalescing = struct {
     const Entry = struct { published_lsn: u64, until_ns: i96, seen: bool = true, attempted: bool = false };
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.entries.deinit(alloc);
     }
     fn beginPass(self: *@This()) void {
@@ -404,7 +404,7 @@ const BudgetBackoff = struct {
     const Entry = struct { until_ns: i96, attempts: u8, seen: bool = true };
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
 
-    fn deinit(self: *BudgetBackoff, alloc: Allocator) void {
+    pub fn deinit(self: *BudgetBackoff, alloc: Allocator) void {
         self.entries.deinit(alloc);
     }
 
@@ -526,7 +526,7 @@ test "serverless background publisher drains small WAL and enrichment batches af
     defer ingest.deinit(a);
     const Clock = struct {
         ns: i96 = 0,
-        fn read(ptr: *anyopaque) i96 {
+        pub fn read(ptr: *anyopaque) i96 {
             return @as(*@This(), @ptrCast(@alignCast(ptr))).ns;
         }
     };

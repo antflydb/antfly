@@ -22,20 +22,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
-const catalog_binding = @import("../external_source/catalog_binding.zig");
-const external_source = @import("../external_source/mod.zig");
+const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const external_source = @import("antfly_local_sources").serverless_external_source_mod;
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_publish = @import("external_source_publish.zig");
-const object_store_support = @import("../object_store_support.zig");
-const object_storage = @import("../../storage/object_storage.zig");
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const resolver_api = @import("external_source_plan_resolver_api.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
-const lake_iceberg_snapshot = @import("../query/lake_iceberg_snapshot.zig");
-const lake_object_reader = @import("../query/lake_object_reader.zig");
-const lake_parquet_footer = @import("../query/lake_parquet_footer.zig");
-const lake_parquet_metadata = @import("../query/lake_parquet_metadata.zig");
-const lake_parquet_rowgroup = @import("../query/lake_parquet_rowgroup.zig");
-const lake_range_io = @import("../query/lake_range_io.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
+const lake_iceberg_snapshot = @import("antfly_local_sources").serverless_query_lake_iceberg_snapshot;
+const lake_object_reader = @import("antfly_local_sources").serverless_query_lake_object_reader;
+const lake_parquet_footer = @import("antfly_local_sources").serverless_query_lake_parquet_footer;
+const lake_parquet_metadata = @import("antfly_local_sources").serverless_query_lake_parquet_metadata;
+const lake_parquet_rowgroup = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
+const lake_range_io = @import("antfly_local_sources").serverless_query_lake_range_io;
 
 pub const OpenedObjectStoreResolver = struct {
     ptr: *anyopaque,
@@ -862,7 +862,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         if (self.bytes) |bytes| self.alloc.free(bytes);
         self.* = undefined;
     }
@@ -885,7 +885,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         if (!std.mem.eql(u8, artifact_id, "mem:external-files")) return error.ArtifactNotFound;
         const bytes = self.bytes orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, bytes);
@@ -931,7 +931,7 @@ const MemoryArtifactStore = struct {
         .delete = deleteErased,
     };
 
-    fn putScoped(ptr: *anyopaque, alloc: Allocator, scope: artifacts_mod.store.UploadScope, bytes: []const u8, cancellation: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+    fn putScoped(ptr: *anyopaque, alloc: Allocator, scope: artifacts_mod.store.UploadScope, bytes: []const u8, cancellation: @import("antfly_cancellation").CancellationToken) !artifacts_mod.ArtifactMetadata {
         try cancellation.check();
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.bytes) |old| self.alloc.free(old);

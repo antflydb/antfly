@@ -46,7 +46,7 @@ const SyncPool = struct {
         }
     }
 
-    fn deinit(self: *SyncPool) void {
+    pub fn deinit(self: *SyncPool) void {
         if (comptime supports_sync_parallelism) self.io_impl.deinit();
     }
 
@@ -84,7 +84,7 @@ pub inline fn cachedCpuCount() usize {
     };
     const cached = Once.value.load(.acquire);
     if (cached != 0) return cached;
-    const detected = std.Thread.getCpuCount() catch 1;
+    const detected = @import("cpu_budget.zig").effective(std.Thread.getCpuCount() catch 1);
     Once.value.store(@max(detected, 1), .release);
     return @max(detected, 1);
 }

@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const Sink = @import("runtime_scan_sink.zig").ScanStreamSink;
-const errors = @import("runtime_error_abi.zig");
+const Sink = @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink;
+const errors = @import("antfly_runtime_abi").error_abi;
 extern fn scan_sink_test_consume(*const Sink, [*]const u8, usize) callconv(.c) errors.Status;
 extern fn scan_sink_test_provider_sink(*Sink, *errors.Status) callconv(.c) void;
 
@@ -77,3 +77,6 @@ test "scan sink local calls retain private consumer errors" {
     try sink.start();
     try std.testing.expectError(error.ConsumerStopped, sink.write(consumer.expected));
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

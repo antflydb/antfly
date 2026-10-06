@@ -27,9 +27,9 @@ fn heapAllocator() std.mem.Allocator {
 const use_evented_async_runtime =
     build_options.lmdb_evented_async_io and
     builtin.os.tag == .macos and
-    std.Io.Evented != void;
+    @import("antfly_platform").Evented != void;
 
-const AsyncRuntime = if (use_evented_async_runtime) std.Io.Evented else std.Io.Threaded;
+const AsyncRuntime = if (use_evented_async_runtime) @import("antfly_platform").Evented else std.Io.Threaded;
 // This module is built independently from the Antfly root module, so it cannot
 // import common/threaded_io_limits.zig. Keep the LMDB commit runtime finite at
 // the same conservative process-lifetime ceiling.
@@ -280,7 +280,7 @@ pub const Environment = struct {
         }
 
         const alloc = heapAllocator();
-        const data_path_owned = alloc.dupeZ(u8, data_path) catch return error.OutOfMemory;
+        const data_path_owned = alloc.dupeSentinel(u8, data_path, 0) catch return error.OutOfMemory;
         errdefer alloc.free(data_path_owned);
 
         var metas = try selectMetas(mapped);
@@ -794,7 +794,7 @@ test "environment rejects files without valid meta pages" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const bytes = [_]u8{0} ** 4096;
+    const bytes = @as([4096]u8, @splat(0));
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "broken.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;

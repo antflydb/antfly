@@ -14,20 +14,41 @@
 
 const std = @import("std");
 const platform_build = @import("build_support.zig");
+pub const ModuleOptions = platform_build.ModuleOptions;
+pub const createModule = platform_build.createModule;
+pub const addModule = platform_build.addModule;
+pub const addFilesystemCapacitySource = platform_build.addFilesystemCapacitySource;
+pub const addTests = platform_build.addTests;
+pub const canRunNativeProcess = platform_build.canRunNativeProcess;
 pub const addNativeProcessTest = platform_build.addNativeProcessTest;
+pub const addMacosSdkPaths = platform_build.addMacosSdkPaths;
+pub const macosSdkLibCFile = platform_build.macosSdkLibCFile;
+pub const finalizeMacosSdk = platform_build.finalizeMacosSdk;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const link_libc = b.option(bool, "link_libc", "Link the platform module against libc") orelse true;
 
-    _ = platform_build.addModule(b, "antfly_platform", .{
+    const platform_mod = platform_build.addModule(b, "antfly_platform", .{
         .root_source_file = b.path("src/root.zig"),
         .filesystem_capacity_source_file = b.path("src/filesystem_capacity.c"),
         .target = target,
         .optimize = optimize,
         .link_libc = link_libc,
     });
+
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/io_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    bench_mod.addImport("antfly_platform", platform_mod);
+    const bench = b.addExecutable(.{ .name = "io-backend-bench", .root_module = bench_mod });
+    const install_bench = b.addInstallArtifact(bench, .{});
+    b.step("io-backend-bench", "Build Threaded versus Evented positional I/O comparison")
+        .dependOn(&install_bench.step);
 
     const tests = platform_build.addTests(b, .{
         .root = b.path("."),

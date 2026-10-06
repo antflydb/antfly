@@ -26,7 +26,7 @@ const metadata_service = @import("../metadata/service.zig");
 const metadata_vopr = @import("../metadata/vopr_harness.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const raft_vopr = @import("../raft/vopr_harness.zig");
@@ -45,8 +45,8 @@ const api_tables = @import("tables.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const indexes_api = @import("indexes.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-const docstore_mod = @import("../storage/docstore.zig");
-const transactions_mod = @import("../storage/transactions.zig");
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const transactions_mod = @import("antfly_local_sources").storage_transactions;
 const distributed_txn = @import("distributed_txn.zig");
 const transactions_api = @import("transactions.zig");
 
@@ -460,7 +460,7 @@ const PublicApiStatusSource = struct {
         self.node.freeAdminSnapshot(snapshot);
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
+    pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -468,7 +468,7 @@ const PublicApiStatusSource = struct {
         _ = try workflow.createTable(&self.node, table, api_tables.deriveInitialRange(table));
     }
 
-    fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
+    pub fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var snapshot = try self.node.adminSnapshot();
         defer self.node.freeAdminSnapshot(&snapshot);
@@ -479,7 +479,7 @@ const PublicApiStatusSource = struct {
         _ = try workflow.dropTable(&self.node, table.table_id);
     }
 
-    fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var snapshot = try self.node.adminSnapshot();
         defer self.node.freeAdminSnapshot(&snapshot);
@@ -504,7 +504,7 @@ const PublicApiStatusSource = struct {
         return .{ .version = try api_tables.schemaVersion(updated.schema_json), .schema_json = response_schema };
     }
 
-    fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+    pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var snapshot = try self.node.adminSnapshot();
         defer self.node.freeAdminSnapshot(&snapshot);
@@ -525,7 +525,7 @@ const PublicApiStatusSource = struct {
         try self.node.upsertTable(replacement);
     }
 
-    fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+    pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var snapshot = try self.node.adminSnapshot();
         defer self.node.freeAdminSnapshot(&snapshot);
@@ -2821,7 +2821,7 @@ test "public api multi-node integration reloads durable cross-table transaction 
     var durable_session_stores: [4]transactions_api.DurableSessionStore = undefined;
     var session_store_ptrs: [4]?*transactions_api.DurableSessionStore = undefined;
     for (session_paths, 0..) |path, i| {
-        session_store_paths[i] = try std.testing.allocator.dupeZ(u8, path);
+        session_store_paths[i] = try std.testing.allocator.dupeSentinel(u8, path, 0);
         session_docstores[i] = try docstore_mod.DocStore.open(std.testing.allocator, session_store_paths[i], .{});
         durable_session_stores[i] = transactions_api.DurableSessionStore.init(std.testing.allocator, &session_docstores[i]);
         session_store_ptrs[i] = &durable_session_stores[i];
@@ -3360,7 +3360,7 @@ test "public api multi-node integration reloads durable transaction sessions aft
     var durable_session_stores: [4]transactions_api.DurableSessionStore = undefined;
     var session_store_ptrs: [4]?*transactions_api.DurableSessionStore = undefined;
     for (session_paths, 0..) |path, i| {
-        session_store_paths[i] = try std.testing.allocator.dupeZ(u8, path);
+        session_store_paths[i] = try std.testing.allocator.dupeSentinel(u8, path, 0);
         session_docstores[i] = try docstore_mod.DocStore.open(std.testing.allocator, session_store_paths[i], .{});
         durable_session_stores[i] = transactions_api.DurableSessionStore.init(std.testing.allocator, &session_docstores[i]);
         session_store_ptrs[i] = &durable_session_stores[i];

@@ -16,8 +16,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const http_server = @import("../transport/http_server.zig");
 const snapshot_transfer = @import("../transport/snapshot_transfer.zig");
 const raft_engine = @import("raft_engine");
@@ -86,7 +86,7 @@ pub const FileSnapshotStore = struct {
     cfg: FileSnapshotStoreConfig,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
-    upload_locks: [1024]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 1024,
+    upload_locks: [1024]std.atomic.Mutex = @as([1024]std.atomic.Mutex, @splat(.unlocked)),
     artifact_ledger_mutex: std.atomic.Mutex = .unlocked,
     artifact_usage: ArtifactUsage = .{},
     artifact_reserved: ArtifactUsage = .{},

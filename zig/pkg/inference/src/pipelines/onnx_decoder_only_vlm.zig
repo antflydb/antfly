@@ -120,7 +120,7 @@ const SharedDebugResources = struct {
         };
     }
 
-    fn deinit(self: *SharedDebugResources) void {
+    pub fn deinit(self: *SharedDebugResources) void {
         if (self.chat_tmpl) |ct| {
             var ct_mut = ct;
             ct_mut.deinit();
@@ -764,7 +764,7 @@ const ImageFeatures = struct {
 const SamplingPenaltyState = struct {
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 
-    fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
         self.counts.deinit(allocator);
         self.* = .{};
     }

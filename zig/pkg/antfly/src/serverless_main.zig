@@ -103,7 +103,7 @@ pub fn runFromIterator(
     );
     defer if (secret_store) |*store| store.deinit();
     var native_keys: @import("common/secret_keyring.zig").Keyring = undefined;
-    var native_objects: ?@import("serverless/object_store_support.zig").OpenedObjectStore = null;
+    var native_objects: ?@import("antfly_local_sources").serverless_object_store_support.OpenedObjectStore = null;
     defer if (native_objects) |*objects| objects.deinit();
     var native_secrets: ?@import("serverless/secret_store.zig").Store = null;
     defer if (native_secrets) |*store| store.deinit();
@@ -114,7 +114,7 @@ pub fn runFromIterator(
             // Bootstrap credentials come from workload identity/environment,
             // independently of the encrypted store being opened.
             if (!(std.mem.startsWith(u8, cfg.path, "s3://") or std.mem.startsWith(u8, cfg.path, "gs://") or std.mem.startsWith(u8, cfg.path, "file://"))) return error.InvalidConfig;
-            native_objects = try @import("serverless/object_store_support.zig").OpenedObjectStore.initRemoteUriWithS3AndOpenOptions(alloc, cfg.path, "native-secrets", null, .{ .ensure_bucket = false });
+            native_objects = try @import("antfly_local_sources").serverless_object_store_support.OpenedObjectStore.initRemoteUriWithS3AndOpenOptions(alloc, cfg.path, "native-secrets", null, .{ .ensure_bucket = false });
             native_keys = .{ .alloc = alloc, .io = runtime_io, .path = cfg.keyring_path.? };
             try native_keys.validate();
             native_secrets = try @import("serverless/secret_store.zig").Store.init(alloc, runtime_io, cfg.scope, native_keys.provider(), .{
@@ -274,7 +274,7 @@ const ServerlessHealthSource = struct {
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
-        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(self.supervisor.currentState()));
+        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(self.supervisor.currentState()));
         try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
         const run_stats = self.srv.stack.runtime.metricsSnapshot();
         const query_metrics = self.srv.stack.query.metricsSnapshot();
@@ -511,7 +511,7 @@ const ConfiguredStorageUris = struct {
         return out;
     }
 
-    fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
         if (self.artifacts) |value| alloc.free(value);
         if (self.manifests) |value| alloc.free(value);
         if (self.wal) |value| alloc.free(value);
@@ -1018,3 +1018,6 @@ test "serverless main derives GCS lanes and configured credentials" {
     try std.testing.expectEqualStrings("antfly-prod", configured.gcs_options[0].?.project_id.?);
     try std.testing.expectEqualStrings("https://storage.example/v1", configured.gcs_options[0].?.endpoint.?);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

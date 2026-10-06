@@ -27,10 +27,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const backend_erased = @import("backend_erased.zig");
-const backend_scan = @import("backend_scan.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const backend_scan = @import("antfly_local_sources").storage_backend_scan;
 const platform_time = @import("antfly_platform").time;
-const docstore = @import("docstore.zig");
+const docstore = @import("antfly_local_sources").storage_docstore;
 const DocStore = docstore.DocStore;
 const ByteRange = docstore.ByteRange;
 
@@ -125,7 +125,7 @@ const ScanState = struct {
     batch: std.ArrayListUnmanaged(DocumentScanState) = .empty,
     seen_enrichments: std.StringHashMapUnmanaged(u64) = .empty,
 
-    fn deinit(self: *ScanState) void {
+    pub fn deinit(self: *ScanState) void {
         // Free any remaining current_doc
         if (self.current_doc) |doc| {
             self.alloc.free(doc.doc_key);
@@ -332,7 +332,7 @@ pub const EnrichmentStatus = enum(u8) {
 pub fn writeEnrichmentStatus(store: *DocStore, key: []const u8, suffix: []const u8, status: EnrichmentStatus) !void {
     var buf: [1024]u8 = undefined;
     const full_key = makeFullKey(&buf, key, suffix);
-    const val = [_]u8{@intFromEnum(status)};
+    const val = [_]u8{@backingInt(status)};
     try store.put(full_key, &val);
 }
 
@@ -346,7 +346,7 @@ pub fn readEnrichmentStatus(store: *DocStore, alloc: Allocator, key: []const u8,
     };
     defer alloc.free(val);
     if (val.len < 1) return null;
-    return @enumFromInt(val[0]);
+    return @fromBackingInt(@intCast(val[0]));
 }
 
 /// Mark a key as permanently unenrichable (dud).

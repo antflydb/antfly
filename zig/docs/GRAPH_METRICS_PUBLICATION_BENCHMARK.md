@@ -4,7 +4,7 @@ The opt-in fixture exercises a complete small-WAL serverless publication, not
 only an in-memory graph/tree operation. Run from `zig/`:
 
 ```sh
-ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'publication qualification benchmark'
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=fast -- --test-filter 'publication qualification benchmark'
 ```
 
 Set `ANTFLY_DOCUMENT_FACTS_BENCH_DOCS=1024` or `16384`, and optionally
@@ -15,7 +15,7 @@ and is not included in the production binary.
 ## Pending-work routing qualification
 
 ```sh
-ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'pending work index qualification benchmark'
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=fast -- --test-filter 'pending work index qualification benchmark'
 ```
 
 The in-memory page-store fixture compares a complete facts scan with the new
@@ -214,7 +214,7 @@ that discovery-free status can prove a pin-to-current transition still names
 the published snapshot; status remains conservative without that evidence.
 
 ```sh
-ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'external metadata retention qualification benchmark'
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=fast -- --test-filter 'external metadata retention qualification benchmark'
 ```
 
 ## Finite enrichment cycle qualification
@@ -253,14 +253,14 @@ it verifies that the queue format does not add work to unrelated publication,
 not the write cost of moving a pending entry between LSN positions.
 
 ```sh
-ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'pending cycle boundary qualification benchmark' --test-filter 'pending work index qualification benchmark'
+ANTFLY_DOCUMENT_FACTS_BENCH=1 zig build antfly-document-facts-test -Doptimize=fast -- --test-filter 'pending cycle boundary qualification benchmark' --test-filter 'pending work index qualification benchmark'
 ```
 
 ## Focused correctness checks
 
 ```sh
-zig build antfly-document-facts-test -Doptimize=ReleaseFast -- --test-filter 'document facts' --test-filter 'external graph bootstrap' --test-filter 'paged graph' --test-filter 'visits borrowed body records' --test-filter 'metadata graph alias'
-zig build antfly-storage-db-test -Doptimize=ReleaseFast -- --test-filter 'db dense target coverage reads one immutable primary commit epoch' --test-filter 'db shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend' --test-filter 'db inline dense generation remains rebuilding until outcomes cover the live corpus'
+zig build antfly-document-facts-test -Doptimize=fast -- --test-filter 'document facts' --test-filter 'external graph bootstrap' --test-filter 'paged graph' --test-filter 'visits borrowed body records' --test-filter 'metadata graph alias'
+zig build antfly-storage-db-test -Doptimize=fast -- --test-filter 'db dense target coverage reads one immutable primary commit epoch' --test-filter 'db shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend' --test-filter 'db inline dense generation remains rebuilding until outcomes cover the live corpus'
 ```
 
 The stateful counter regression verifies that a derived-coverage tuple and its

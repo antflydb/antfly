@@ -17,17 +17,26 @@ class GraphArtifactNodeMappingConfig:
 
     Attributes:
         model (GraphArtifactNodeMappingConfigModel | Unset):  Default: GraphArtifactNodeMappingConfigModel.DOCUMENT.
+        source (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
+            each materialized graph item.
         target (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
             each materialized graph item.
     """
 
     model: GraphArtifactNodeMappingConfigModel | Unset = GraphArtifactNodeMappingConfigModel.DOCUMENT
+    source: float | str | Unset = UNSET
     target: float | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         model: str | Unset = UNSET
         if not isinstance(self.model, Unset):
             model = self.model.value
+
+        source: float | str | Unset
+        if isinstance(self.source, Unset):
+            source = UNSET
+        else:
+            source = self.source
 
         target: float | str | Unset
         if isinstance(self.target, Unset):
@@ -40,6 +49,8 @@ class GraphArtifactNodeMappingConfig:
         field_dict.update({})
         if model is not UNSET:
             field_dict["model"] = model
+        if source is not UNSET:
+            field_dict["source"] = source
         if target is not UNSET:
             field_dict["target"] = target
 
@@ -55,6 +66,13 @@ class GraphArtifactNodeMappingConfig:
         else:
             model = GraphArtifactNodeMappingConfigModel(_model)
 
+        def _parse_source(data: object) -> float | str | Unset:
+            if isinstance(data, Unset):
+                return data
+            return cast(float | str | Unset, data)
+
+        source = _parse_source(d.pop("source", UNSET))
+
         def _parse_target(data: object) -> float | str | Unset:
             if isinstance(data, Unset):
                 return data
@@ -64,6 +82,7 @@ class GraphArtifactNodeMappingConfig:
 
         graph_artifact_node_mapping_config = cls(
             model=model,
+            source=source,
             target=target,
         )
 

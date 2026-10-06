@@ -13,34 +13,35 @@
 // limitations.
 
 const std = @import("std");
-const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const relationship_filter = @import("antfly_local_sources").graph_relationship_filter;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const raft_mod = struct {
     pub const ReadConsistency = @import("../raft/read_gate.zig").ReadConsistency;
 };
-const db_mod = struct {
-    pub const types = @import("../storage/db/types.zig");
-    pub const doc_filter_wire = @import("../storage/db/doc_filter_wire.zig");
-    pub const algebraic = @import("../storage/db/algebraic/mod.zig");
-};
-const graph_query_mod = @import("../graph/query.zig");
-const graph_mod = @import("../graph/graph.zig");
-const graph_node_admission = @import("../graph/node_admission.zig");
-const graph_node_identity = @import("../graph/node_identity.zig");
-const graph_pattern_mod = @import("../graph/pattern.zig");
-const graph_paths_mod = @import("../graph/paths.zig");
-const graph_traversal_mod = @import("../graph/traversal.zig");
-const graph_work_budget = @import("../graph/work_budget.zig");
-const graph_distinct_budget_diagnostic = @import("../graph/distinct_budget_diagnostic.zig");
-const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
-const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const mem_backend = @import("../storage/mem_backend.zig");
-const doc_set = @import("../storage/db/doc_set.zig");
-const graph_exec = @import("../storage/db/query/graph_exec.zig");
-const algebraic_ir = db_mod.algebraic.ir;
-const algebraic_law = db_mod.algebraic.law;
-const algebraic_planner = db_mod.algebraic.planner;
+const db_mod = @import("antfly_local_sources").api_local_graph.db_mod;
+
+const graph_query_mod = @import("antfly_local_sources").graph_query;
+const graph_mod = @import("antfly_local_sources").graph_graph;
+const graph_node_admission = @import("antfly_local_sources").graph_node_admission;
+const graph_node_identity = @import("antfly_local_sources").graph_node_identity;
+const graph_pattern_mod = @import("antfly_local_sources").graph_pattern;
+const graph_paths_mod = @import("antfly_local_sources").graph_paths;
+const graph_traversal_mod = @import("antfly_local_sources").graph_traversal;
+const graph_work_budget = @import("antfly_local_sources").graph_work_budget;
+const graph_distinct_budget_diagnostic = @import("antfly_local_sources").graph_distinct_budget_diagnostic;
+const graph_work_budget_diagnostic = @import("antfly_local_sources").graph_work_budget_diagnostic;
+const graph_path_weight_diagnostic = @import("antfly_local_sources").graph_path_weight_diagnostic;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const doc_set = @import("antfly_local_sources").storage_db_doc_set;
+const graph_exec = @import("antfly_local_sources").storage_db_query_graph_exec;
+const algebraic_ir = @import("antfly_local_sources").api_local_graph.algebraic_ir;
+
+const algebraic_law = @import("antfly_local_sources").api_local_graph.algebraic_law;
+
+const algebraic_planner = @import("antfly_local_sources").api_local_graph.algebraic_planner;
+
 const table_catalog = @import("table_catalog.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
@@ -50,7 +51,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 const indexes_api = @import("indexes.zig");
-const query_contract = @import("query_contract.zig");
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const tables_api = @import("tables.zig");
 
@@ -328,7 +329,7 @@ test "distributed graph translates native worker and catalog deadline boundaries
     const catalog = table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
-        .io = @import("../runtime_io_abi.zig").Borrow.init(&catalog_io.io()),
+        .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&catalog_io.io()),
     };
     const routed_deadline = worker.routingDeadline(catalog).?;
     try std.testing.expect(routed_deadline > 17 * std.time.ns_per_s);
@@ -348,18 +349,7 @@ pub const IncomingSourceGroupsRequest = struct {
     identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{},
 };
 
-pub const GraphIndexIdentity = struct {
-    incarnation: u64 = 0,
-    config_hash: u64 = 0,
-
-    pub fn valid(self: @This()) bool {
-        return self.incarnation != 0 and self.config_hash != 0;
-    }
-
-    pub fn eql(self: @This(), other: @This()) bool {
-        return self.incarnation == other.incarnation and self.config_hash == other.config_hash;
-    }
-};
+pub const GraphIndexIdentity = @import("antfly_local_sources").api_local_graph.GraphIndexIdentity;
 
 pub const IncomingSourceGroupEntry = struct {
     source_group_ids: []u64 = &.{},
@@ -463,7 +453,7 @@ pub const IncomingSourceGroupCache = struct {
         cache_key: []u8,
         groups: []u64,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.cache_key);
             if (self.groups.len > 0) alloc.free(self.groups);
             self.* = undefined;
@@ -940,7 +930,7 @@ pub const IncomingSourceGroupCache = struct {
             job.cache.flushPendingDurableWrites();
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const job: *@This() = @ptrCast(@alignCast(ptr));
             job.cache.alloc.destroy(job);
         }
@@ -1305,11 +1295,7 @@ fn hashIncomingRouteU64(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
 /// Reconstitutes a node-local absolute deadline from the coordinator's
 /// remaining transport budget. Saturating addition keeps maliciously large
 /// values from wrapping into an already-expired deadline.
-pub fn executionDeadlineFromTimeoutMs(timeout_ms: ?u32) ?u64 {
-    const value = timeout_ms orelse return null;
-    const duration_ns = std.math.mul(u64, value, std.time.ns_per_ms) catch std.math.maxInt(u64);
-    return std.math.add(u64, platform_time.monotonicNs(), duration_ns) catch std.math.maxInt(u64);
-}
+pub const executionDeadlineFromTimeoutMs = @import("antfly_local_sources").api_local_graph.executionDeadlineFromTimeoutMs;
 
 const GraphFanoutPlan = struct {
     parallel: bool,
@@ -1444,255 +1430,25 @@ fn planGraphFanout(has_io: bool, width_cap: ?usize, batch_count: usize) GraphFan
     };
 }
 
-pub const GraphExpandRequest = struct {
-    name: []u8,
-    index_name: []u8,
-    frontier: []GraphFrontierItem,
-    exclude_nodes: []GraphNodeIdentity,
-    exclude_edges: [][]u8,
-    target_constraint_keys: [][]u8 = &.{},
-    params: graph_query_mod.QueryParams,
-    metrics: []graph_query_mod.GraphMetricRead = &.{},
-    include_metric_status: bool = false,
-    defer_result_limit: bool = false,
-    tensor_access_path: ?OwnedGraphTensorAccessPath = null,
-    tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
-    topology_epoch: u64 = 0,
-    ttl_now_ns: u64 = 0,
-    max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
-    /// Only non-TTL expansion may retry an older worker's wire contract.
-    allow_legacy_wire_fallback: bool = false,
-    /// Parsed from a request that predates physical-scan accounting.
-    legacy_wire_request: bool = false,
-    /// Local-only synchronous observer, never serialized on this RPC.
-    physical_scan_observation: ?*usize = null,
-    identity_read_generation: ?u64 = null,
-    resolved_doc_filter: ?*const anyopaque = null,
-    resolved_doc_filter_owned: bool = false,
-    resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
-    /// Local request controls. They are deliberately excluded from the graph
-    /// JSON contract; remote workers receive the deadline as their transport
-    /// timeout and cancellation by connection interruption.
-    timeout_ms: ?u32 = null,
-    execution_deadline_ns: ?u64 = null,
-    cancellation: ?CancellationToken = null,
+pub const GraphExpandRequest = @import("antfly_local_sources").api_local_graph.GraphExpandRequest;
 
-    pub fn deinit(self: *GraphExpandRequest, alloc: std.mem.Allocator) void {
-        alloc.free(self.name);
-        alloc.free(self.index_name);
-        for (self.frontier) |*item| item.deinit(alloc);
-        if (self.frontier.len > 0) alloc.free(self.frontier);
-        for (self.exclude_nodes) |*identity| identity.deinit(alloc);
-        if (self.exclude_nodes.len > 0) alloc.free(self.exclude_nodes);
-        for (self.exclude_edges) |edge| alloc.free(edge);
-        if (self.exclude_edges.len > 0) alloc.free(self.exclude_edges);
-        for (self.target_constraint_keys) |key| alloc.free(key);
-        if (self.target_constraint_keys.len > 0) alloc.free(self.target_constraint_keys);
-        freeConstStrings(alloc, self.params.edge_types);
-        freeGraphMetricReads(alloc, self.metrics);
-        if (self.tensor_access_path) |*path| path.deinit(alloc);
-        if (self.tensor_program) |*program| program.deinit(alloc);
-        if (self.resolved_doc_filter_owned) {
-            if (self.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
-        }
-        self.* = undefined;
-    }
-};
+pub const OwnedGraphTensorAccessPath = @import("antfly_local_sources").api_local_graph.OwnedGraphTensorAccessPath;
 
-pub const OwnedGraphTensorAccessPath = struct {
-    owner: []u8,
-    layout: algebraic_ir.PhysicalLayout,
-    fragments: []algebraic_ir.TensorFragment,
-    output_dims: []algebraic_ir.Dimension,
-    law_ids: []algebraic_law.Id,
+pub const GraphNodeIdentity = @import("antfly_local_sources").api_local_graph.GraphNodeIdentity;
 
-    pub fn deinit(self: *OwnedGraphTensorAccessPath, alloc: std.mem.Allocator) void {
-        alloc.free(self.owner);
-        if (self.fragments.len > 0) alloc.free(self.fragments);
-        if (self.output_dims.len > 0) alloc.free(self.output_dims);
-        if (self.law_ids.len > 0) alloc.free(self.law_ids);
-        self.* = undefined;
-    }
+pub const GraphFrontierItem = @import("antfly_local_sources").api_local_graph.GraphFrontierItem;
 
-    pub fn asAccessPath(self: *const OwnedGraphTensorAccessPath) algebraic_ir.PhysicalAccessPath {
-        return .{
-            .owner = self.owner,
-            .layout = self.layout,
-            .fragments = self.fragments,
-            .output_dims = self.output_dims,
-            .law_ids = self.law_ids,
-        };
-    }
-};
+pub const GraphExpandResponse = @import("antfly_local_sources").api_local_graph.GraphExpandResponse;
 
-pub const GraphNodeIdentity = struct {
-    key: []u8,
-    table: ?[]u8 = null,
+pub const GraphHydrateRequest = @import("antfly_local_sources").api_local_graph.GraphHydrateRequest;
 
-    pub fn ref(self: GraphNodeIdentity) graph_node_identity.Ref {
-        return .{ .table = self.table, .key = self.key };
-    }
+pub const GraphHydrateResponse = @import("antfly_local_sources").api_local_graph.GraphHydrateResponse;
 
-    pub fn deinit(self: *GraphNodeIdentity, alloc: std.mem.Allocator) void {
-        alloc.free(self.key);
-        if (self.table) |table| alloc.free(table);
-        self.* = undefined;
-    }
-};
+pub const GraphEdgesRequest = @import("antfly_local_sources").api_local_graph.GraphEdgesRequest;
 
-pub const GraphFrontierItem = struct {
-    id: u32,
-    key: []u8,
-    table: ?[]u8 = null,
-    depth: u32 = 0,
-    distance: f64 = 0,
+pub const GraphEdgesResponse = @import("antfly_local_sources").api_local_graph.GraphEdgesResponse;
 
-    pub fn deinit(self: *GraphFrontierItem, alloc: std.mem.Allocator) void {
-        alloc.free(self.key);
-        if (self.table) |table| alloc.free(table);
-        self.* = undefined;
-    }
-};
-
-pub const GraphExpandResponse = struct {
-    expansions: []GraphExpansion,
-    scanned_rows: u32 = 0,
-
-    pub fn deinit(self: *GraphExpandResponse, alloc: std.mem.Allocator) void {
-        for (self.expansions) |*expansion| expansion.deinit(alloc);
-        if (self.expansions.len > 0) alloc.free(self.expansions);
-        self.* = undefined;
-    }
-};
-
-pub const GraphHydrateRequest = struct {
-    keys: [][]u8,
-    metric_index_name: []const u8 = "",
-    metric_index_name_owned: bool = false,
-    metric_index_identity: GraphIndexIdentity = .{},
-    metric_reads: []graph_query_mod.GraphMetricRead = &.{},
-    legacy_wire_request: bool = false,
-    topology_epoch: u64 = 0,
-    identity_read_generation: ?u64 = null,
-    filter_query_json: []const u8 = "",
-    filter_query_json_owned: bool = false,
-    exclusion_query_json: []const u8 = "",
-    exclusion_query_json_owned: bool = false,
-    include_stored: bool = true,
-    fields: []const []const u8 = &.{},
-    fields_owned: bool = false,
-    include_all_fields: bool = true,
-    include_hits: bool = true,
-    incoming_index_name: []const u8 = "",
-    incoming_index_identity: GraphIndexIdentity = .{},
-    incoming_index_name_owned: bool = false,
-    /// Applies only to incoming existence reads; ordinary hydration is unchanged.
-    incoming_ttl_now_ns: u64 = 0,
-    incoming_max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
-    resolved_doc_filter: ?*const anyopaque = null,
-    resolved_doc_filter_owned: bool = false,
-    resolved_doc_filter_wire_context: ?db_mod.types.ResolvedDocFilterWireContext = null,
-    timeout_ms: ?u32 = null,
-    execution_deadline_ns: ?u64 = null,
-    cancellation: ?CancellationToken = null,
-
-    pub fn deinit(self: *GraphHydrateRequest, alloc: std.mem.Allocator) void {
-        for (self.keys) |key| alloc.free(key);
-        if (self.keys.len > 0) alloc.free(self.keys);
-        if (self.metric_index_name_owned and self.metric_index_name.len > 0)
-            alloc.free(@constCast(self.metric_index_name));
-        freeGraphMetricReads(alloc, self.metric_reads);
-        if (self.fields_owned) freeConstStrings(alloc, self.fields);
-        if (self.filter_query_json_owned and self.filter_query_json.len > 0) {
-            alloc.free(@constCast(self.filter_query_json));
-        }
-        if (self.exclusion_query_json_owned and self.exclusion_query_json.len > 0) {
-            alloc.free(@constCast(self.exclusion_query_json));
-        }
-        if (self.incoming_index_name_owned and self.incoming_index_name.len > 0) {
-            alloc.free(@constCast(self.incoming_index_name));
-        }
-        if (self.resolved_doc_filter_owned) {
-            if (self.resolved_doc_filter) |ptr| db_mod.doc_filter_wire.destroyResolvedDocFilter(alloc, ptr);
-        }
-        self.* = undefined;
-    }
-};
-
-pub const GraphHydrateResponse = struct {
-    hits: []db_mod.types.SearchHit = &.{},
-    has_incoming: []bool = &.{},
-    has_physical_incoming: []bool = &.{},
-    metric_scores: []?f64 = &.{},
-    metric_status: []db_mod.types.GraphMetricStatus = &.{},
-    incoming_index_identity: GraphIndexIdentity = .{},
-
-    /// Missing fields identify a peer without bounded, pinned incoming reads.
-    incoming_ttl_now_ns: ?u64 = null,
-    incoming_scanned_rows: ?u32 = null,
-
-    pub fn deinit(self: *GraphHydrateResponse, alloc: std.mem.Allocator) void {
-        for (self.hits) |*hit| hit.deinit(alloc);
-        if (self.hits.len > 0) alloc.free(self.hits);
-        if (self.has_incoming.len > 0) alloc.free(self.has_incoming);
-        if (self.has_physical_incoming.len > 0) alloc.free(self.has_physical_incoming);
-        if (self.metric_scores.len > 0) alloc.free(self.metric_scores);
-        db_mod.types.freeGraphMetricStatuses(alloc, self.metric_status);
-        self.* = undefined;
-    }
-};
-
-pub const GraphEdgesRequest = struct {
-    index_name: []u8,
-    key: []u8,
-    edge_types: [][]const u8 = &.{},
-    direction: graph_mod.EdgeDirection,
-    tensor_access_path: ?OwnedGraphTensorAccessPath = null,
-    tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = null,
-    topology_epoch: u64 = 0,
-    ttl_now_ns: u64 = 0,
-    identity_read_generation: ?u64 = null,
-    max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
-    max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
-    max_scanned_rows: u32 = graph_pattern_mod.default_max_explored_edges,
-    allow_legacy_wire_fallback: bool = false,
-    legacy_wire_request: bool = false,
-    timeout_ms: ?u32 = null,
-    execution_deadline_ns: ?u64 = null,
-    cancellation: ?CancellationToken = null,
-
-    pub fn deinit(self: *GraphEdgesRequest, alloc: std.mem.Allocator) void {
-        alloc.free(self.index_name);
-        alloc.free(self.key);
-        freeConstStrings(alloc, self.edge_types);
-        if (self.tensor_access_path) |*path| path.deinit(alloc);
-        if (self.tensor_program) |*program| program.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const GraphEdgesResponse = struct {
-    edges: []graph_mod.Edge,
-    scanned_rows: u32 = 0,
-
-    pub fn deinit(self: *GraphEdgesResponse, alloc: std.mem.Allocator) void {
-        for (self.edges) |e| graph_mod.GraphIndex.freeEdge(alloc, e);
-        if (self.edges.len > 0) alloc.free(self.edges);
-        self.* = undefined;
-    }
-};
-
-pub const GraphExpansion = struct {
-    frontier_id: u32,
-    frontier_key: []u8,
-    graph_result: db_mod.types.GraphSearchResult,
-
-    pub fn deinit(self: *GraphExpansion, alloc: std.mem.Allocator) void {
-        alloc.free(self.frontier_key);
-        self.graph_result.deinit(alloc);
-        self.* = undefined;
-    }
-};
+pub const GraphExpansion = @import("antfly_local_sources").api_local_graph.GraphExpansion;
 
 const GraphExpandBatchEntry = struct {
     table_name: []const u8,
@@ -1751,7 +1507,7 @@ const GraphExpandFanoutSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 
-    fn deinit(self: *GraphExpandFanoutSlot) void {
+    pub fn deinit(self: *GraphExpandFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1766,7 +1522,7 @@ const GraphHydrateFanoutSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 
-    fn deinit(self: *GraphHydrateFanoutSlot) void {
+    pub fn deinit(self: *GraphHydrateFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1781,167 +1537,39 @@ const GraphEdgesFanoutSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 
-    fn deinit(self: *GraphEdgesFanoutSlot) void {
+    pub fn deinit(self: *GraphEdgesFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
 };
 
-const GraphExpandRequestJson = struct {
-    name: []const u8,
-    index_name: []const u8,
-    frontier: []const GraphFrontierItemJson,
-    exclude_nodes: []const GraphNodeIdentityJson = &.{},
-    exclude_edges: []const []const u8 = &.{},
-    target_constraint_keys: []const []const u8 = &.{},
-    metrics: []const GraphMetricReadJson = &.{},
-    include_metric_status: bool = false,
-    defer_result_limit: bool = false,
-    topology_epoch: u64 = 0,
-    ttl_now_ns: ?u64 = null,
-    max_scanned_rows: ?u32 = null,
-    identity_read_generation: ?u64 = null,
-    _resolved_doc_filter: ?std.json.Value = null,
-    params: GraphExpandParamsJson,
-    tensor_access_path: ?GraphTensorAccessPathJson = null,
-    tensor_program: ?std.json.Value = null,
-};
+const GraphExpandRequestJson = @import("antfly_local_sources").api_local_graph.GraphExpandRequestJson;
 
-const GraphFrontierItemJson = struct {
-    id: u32,
-    key: []const u8,
-    table: ?[]const u8 = null,
-    depth: u32 = 0,
-    distance: f64 = 0,
-};
+const GraphFrontierItemJson = @import("antfly_local_sources").api_local_graph.GraphFrontierItemJson;
 
-const GraphNodeIdentityJson = struct {
-    key: []const u8,
-    table: ?[]const u8 = null,
-};
+const GraphNodeIdentityJson = @import("antfly_local_sources").api_local_graph.GraphNodeIdentityJson;
 
-const GraphExpandParamsJson = struct {
-    edge_types: []const []const u8 = &.{},
-    direction: []const u8 = "out",
-    max_depth: u32 = 1,
-    max_results: u32 = 0,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
-    deduplicate: bool = true,
-    include_paths: bool = false,
-    weight_mode: []const u8 = "min_hops",
-    algebraic_semiring: bool = false,
-};
+const GraphExpandParamsJson = @import("antfly_local_sources").api_local_graph.GraphExpandParamsJson;
 
-const GraphMetricReadJson = struct {
-    name: []const u8,
-    freshness: []const u8 = "published",
-    seed_nodes: ?[]const []const u8 = null,
-    damping: ?f64 = null,
-};
+const GraphMetricReadJson = @import("antfly_local_sources").api_local_graph.GraphMetricReadJson;
 
-const GraphTensorAccessPathJson = struct {
-    owner: []const u8,
-    layout: []const u8,
-    fragments: []const []const u8,
-    output_dims: []const []const u8,
-    law_ids: []const []const u8,
-};
+const GraphTensorAccessPathJson = @import("antfly_local_sources").api_local_graph.GraphTensorAccessPathJson;
 
-const GraphExpandResponseJson = struct {
-    expansions: []const GraphExpansionJson,
-    scanned_rows: ?u32 = null,
-};
+const GraphExpandResponseJson = @import("antfly_local_sources").api_local_graph.GraphExpandResponseJson;
 
-const GraphExpansionJson = struct {
-    frontier_id: u32,
-    frontier_key: []const u8,
-    name: []const u8,
-    total: u32,
-    nodes: []const graph_query_mod.GraphResultNode,
-    hits: []const db_mod.types.SearchHit = &.{},
-    metric_status: []const db_mod.types.GraphMetricStatus = &.{},
-};
+const GraphExpansionJson = @import("antfly_local_sources").api_local_graph.GraphExpansionJson;
 
-const GraphHydrateRequestJson = struct {
-    keys: []const []const u8,
-    metric_index_name: ?[]const u8 = null,
-    metric_index_incarnation: ?u64 = null,
-    metric_index_config_hash: ?u64 = null,
-    metric_reads: ?[]const GraphMetricReadJson = null,
-    topology_epoch: u64 = 0,
-    identity_read_generation: ?u64 = null,
-    _filter_query_json: []const u8 = "",
-    _exclusion_query_json: []const u8 = "",
-    include_stored: bool = true,
-    fields: []const []const u8 = &.{},
-    include_all_fields: bool = true,
-    include_hits: bool = true,
-    incoming_index_name: []const u8 = "",
-    incoming_index_incarnation: u64 = 0,
-    incoming_index_config_hash: u64 = 0,
-    incoming_ttl_now_ns: ?u64 = null,
-    incoming_max_scanned_rows: ?u32 = null,
-    _resolved_doc_filter: ?std.json.Value = null,
-};
+const GraphHydrateRequestJson = @import("antfly_local_sources").api_local_graph.GraphHydrateRequestJson;
 
-const GraphHydrateResponseJson = struct {
-    has_physical_incoming: ?[]const bool = null,
-    incoming_ttl_now_ns: ?u64 = null,
-    incoming_scanned_rows: ?u32 = null,
-    hits: []const db_mod.types.SearchHit = &.{},
-    has_incoming: []const bool = &.{},
-    metric_scores: ?[]const ?f64 = null,
-    metric_status: ?[]const db_mod.types.GraphMetricStatus = null,
-    incoming_index_incarnation: u64 = 0,
-    incoming_index_config_hash: u64 = 0,
-};
+const GraphHydrateResponseJson = @import("antfly_local_sources").api_local_graph.GraphHydrateResponseJson;
 
-const GraphEdgesRequestJson = struct {
-    index_name: []const u8,
-    key: []const u8,
-    edge_types: []const []const u8 = &.{},
-    direction: []const u8 = "out",
-    topology_epoch: u64 = 0,
-    ttl_now_ns: ?u64 = null,
-    identity_read_generation: ?u64 = null,
-    max_edges: u32 = graph_pattern_mod.default_max_explored_edges,
-    max_owned_bytes: u32 = graph_pattern_mod.default_max_explored_edge_bytes,
-    max_scanned_rows: ?u32 = null,
-    tensor_access_path: GraphTensorAccessPathJson,
-    tensor_program: std.json.Value,
-};
+const GraphEdgesRequestJson = @import("antfly_local_sources").api_local_graph.GraphEdgesRequestJson;
 
-const GraphEdgeJson = struct {
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64,
-    created_at: u64,
-    updated_at: u64,
-    metadata: []const u8 = "",
-    winner_rank: u64 = std.math.maxInt(u64),
-    winner_key_hex: []const u8 = "",
-};
+const GraphEdgeJson = @import("antfly_local_sources").api_local_graph.GraphEdgeJson;
 
-const GraphEdgesResponseJson = struct {
-    edges: []const GraphEdgeJson,
-    scanned_rows: ?u32 = null,
-};
+const GraphEdgesResponseJson = @import("antfly_local_sources").api_local_graph.GraphEdgesResponseJson;
 
-const LegacyGraphEdgeJson = struct {
-    source: []const u8,
-    target: []const u8,
-    edge_type: []const u8,
-    weight: f64,
-    created_at: u64,
-    updated_at: u64,
-    metadata: []const u8 = "",
-};
-
-fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
-}
+const jsonStringifyAlloc = @import("antfly_local_sources").api_local_graph.jsonStringifyAlloc;
 
 pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
     if (req.graph_queries.len == 0) return false;
@@ -2369,7 +1997,7 @@ const QueryState = struct {
         self.seen_retained_bytes = 0;
     }
 
-    fn deinit(self: *QueryState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *QueryState, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         for (self.nodes.items) |*node| node.deinit(alloc);
         self.nodes.deinit(alloc);
@@ -2477,7 +2105,7 @@ const TargetNodeSet = struct {
             self.exact.contains(.{ .table = table, .key = key });
     }
 
-    fn deinit(self: *TargetNodeSet, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *TargetNodeSet, alloc: std.mem.Allocator) void {
         self.exact.deinit(alloc);
         var it = self.wildcard_keys.keyIterator();
         while (it.next()) |key| alloc.free(key.*);
@@ -2488,6 +2116,7 @@ const TargetNodeSet = struct {
 };
 
 const GraphAdmissionTableState = struct {
+    projects_endpoints: bool = false,
     table_name: []u8,
     logical_name: ?[]u8 = null,
     topology_epoch: u64 = 0,
@@ -2504,7 +2133,7 @@ const GraphAdmissionTableState = struct {
     requires_hydration: bool,
     decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
-    fn deinit(self: *GraphAdmissionTableState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphAdmissionTableState, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         if (self.logical_name) |name| alloc.free(name);
         if (self.filter_query_json.len > 0) alloc.free(self.filter_query_json);
@@ -2579,7 +2208,7 @@ const GraphNodeAdmissionContext = struct {
         };
     }
 
-    fn deinit(self: *GraphNodeAdmissionContext) void {
+    pub fn deinit(self: *GraphNodeAdmissionContext) void {
         for (self.tables.values()) |*state| state.deinit(self.alloc);
         self.tables.deinit(self.alloc);
         self.* = undefined;
@@ -2692,6 +2321,7 @@ const GraphNodeAdmissionContext = struct {
             .table_name = owned_name,
             .topology_epoch = topology_epoch,
             .graph_index_identity = graph_index_identity,
+            .projects_endpoints = if (allowed) try catalogGraphProjectsEndpoints(self.alloc, self.catalog, table_name, self.graph_index_name, graph_index_identity) else false,
             .identity_read_generation = identity_read_generation,
             .identity_read_generations = identity_read_generations,
             .filter_query_json = filter_query_json,
@@ -2749,7 +2379,7 @@ const GraphNodeAdmissionContext = struct {
             keys: std.ArrayListUnmanaged([]const u8) = .empty,
             seen: std.StringHashMapUnmanaged(void) = .empty,
 
-            fn deinit(self_inner: *@This(), alloc_inner: std.mem.Allocator) void {
+            pub fn deinit(self_inner: *@This(), alloc_inner: std.mem.Allocator) void {
                 self_inner.keys.deinit(alloc_inner);
                 self_inner.seen.deinit(alloc_inner);
             }
@@ -2849,7 +2479,7 @@ const PathState = struct {
     incoming_edge: ?graph_query_mod.PathEdgeInfo = null,
     retained_lease: graph_work_budget.RetainedLease = .{},
 
-    fn deinit(self: *PathState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PathState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         if (self.incoming_edge) |edge| freeOwnedPathEdge(alloc, edge);
@@ -2867,7 +2497,7 @@ const FrontierState = struct {
     path_state_id: ?u32 = null,
     retained_lease: graph_work_budget.RetainedLease = .{},
 
-    fn deinit(self: *FrontierState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FrontierState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         self.retained_lease.deinit();
@@ -2890,7 +2520,7 @@ const PathCostLabels = struct {
         return .{ .max_depth = max_depth, .work_budget = work_budget };
     }
 
-    fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
         var it = self.values.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.values.deinit(alloc);
@@ -3119,10 +2749,11 @@ const DistributedEdgeReader = struct {
     admission: *GraphNodeAdmissionContext,
     physical_work_budget: ?*graph_pattern_mod.WorkBudget = null,
 
-    /// MATCH uses null as the canonical source-table qualifier. Graph edge
-    /// metadata necessarily uses absolute table names when an external hop
-    /// returns to that table, so normalize before the graph matcher performs
-    /// identity-sensitive cycle, predicate, and aggregate work.
+    pub fn routingIndexTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        return table orelse self.source_table;
+    }
+
+    /// Normalize absolute endpoint tags before identity-sensitive MATCH work.
     pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
         return canonicalGraphNodeTable(self.source_table, table);
     }
@@ -3581,13 +3212,14 @@ const CanonicalGraphStep = struct {
     group_ids: []u64,
     node_count: usize,
     array_lease: graph_work_budget.RetainedLease,
+    table_scratch: graph_traversal_mod.MetadataScratch,
     metrics_lease: graph_work_budget.RetainedLease = .{},
 
     fn visibleNodes(self: @This()) []const graph_query_mod.GraphResultNode {
         return self.nodes[0..self.node_count];
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.nodes[0..self.node_count]) |*node| {
             for (node.metrics) |*metric| metric.deinit(alloc);
             if (node.metrics.len > 0) alloc.free(node.metrics);
@@ -3597,6 +3229,7 @@ const CanonicalGraphStep = struct {
         alloc.free(self.group_ids);
         graph_mod.GraphIndex.freeEdges(alloc, self.edges);
         self.metrics_lease.deinit();
+        self.table_scratch.deinit();
         self.array_lease.deinit();
         self.* = undefined;
     }
@@ -3606,6 +3239,7 @@ fn canonicalGraphStepAlloc(
     alloc: std.mem.Allocator,
     reader: DistributedEdgeReader,
     expansion_table: []const u8,
+    current_table: []const u8,
     key: []const u8,
     params: graph_query_mod.QueryParams,
     work_budget: *graph_pattern_mod.WorkBudget,
@@ -3621,6 +3255,10 @@ fn canonicalGraphStepAlloc(
         true,
     );
     errdefer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    const edge_filter = try params.edge_filter.prepare(alloc);
+    defer if (params.edge_filter.prepared == null) edge_filter.releasePrepared(alloc);
+    var filter_lease = try graph_work_budget.RetainedLease.init(work_budget, edge_filter.retainedBytes());
+    defer filter_lease.deinit();
     const capacity = @min(edges.len, @min(work_budget.remaining_nodes, work_budget.remaining_edges));
     const array_bytes = std.math.mul(
         usize,
@@ -3636,31 +3274,34 @@ fn canonicalGraphStepAlloc(
     const group_ids = try alloc.alloc(u64, capacity);
     errdefer alloc.free(group_ids);
     var node_count: usize = 0;
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    errdefer table_scratch.deinit();
     var edge_bytes: usize = 0;
     for (edges) |edge| {
         edge_bytes = std.math.add(usize, edge_bytes, graphEdgeOwnedBytes(edge)) catch
             return work_budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+        if (!(try edge_filter.matchesWithBudget(alloc, edge, work_budget))) continue;
         if (params.min_weight) |minimum| if (edge.weight < minimum) continue;
         if (params.max_weight) |maximum| if (edge.weight > maximum) continue;
         if (!std.math.isFinite(edge.weight)) return error.InvalidGraphEdgeValue;
+        const endpoint = try graph_traversal_mod.resolveAdjacent(&table_scratch, edge, key, current_table, expansion_table, params.direction);
+        if (!endpoint.connected) continue;
         if (node_count == capacity) {
             if (work_budget.remaining_nodes <= work_budget.remaining_edges)
                 return work_budget.exhaust(.explored_nodes, work_budget.max_nodes);
             return work_budget.exhaust(.explored_edges, work_budget.max_edges);
         }
-        const forward = std.mem.eql(u8, key, edge.source);
-        const adjacent = if (forward) edge.target else edge.source;
-        const declared_table = if (forward)
-            graph_traversal_mod.metadataTargetTable(edge.metadata)
-        else
-            graph_traversal_mod.metadataSourceTable(edge.metadata);
+        const adjacent = endpoint.key;
+        const declared_table = endpoint.table;
         path_edges[node_count] = .{
             .source = edge.source,
             .target = edge.target,
             .edge_type = edge.edge_type,
+            .edge_id = edge.edge_id,
+            .owner_document = edge.owner_document,
             .weight = edge.weight,
             .metadata = edge.metadata,
-            .traversal_direction = if (forward) .out else .in,
+            .traversal_direction = endpoint.direction,
         };
         nodes[node_count] = .{
             .key = adjacent,
@@ -3675,7 +3316,7 @@ fn canonicalGraphStepAlloc(
     try work_budget.consumeEdgeBytes(edge_bytes);
     try work_budget.consumeNodes(node_count);
     try work_budget.consumeEdges(node_count);
-    return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease };
+    return .{ .edges = edges, .nodes = nodes, .path_edges = path_edges, .group_ids = group_ids, .node_count = node_count, .array_lease = array_lease, .table_scratch = table_scratch };
 }
 
 fn attachCanonicalGraphStepMetrics(
@@ -3794,6 +3435,8 @@ fn consumeGraphEdgePhysicalRows(
 }
 
 const GraphEdgeIdentity = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -3802,18 +3445,22 @@ const GraphEdgeIdentity = struct {
 const GraphEdgeIdentityContext = struct {
     pub fn hash(_: @This(), value: GraphEdgeIdentity) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        hasher.update(value.source);
-        hasher.update("\x00");
-        hasher.update(value.target);
-        hasher.update("\x00");
-        hasher.update(value.edge_type);
+        // Frame every component: arbitrary identity bytes (including NUL)
+        // and differing ID/owner splits must not share the same hash input.
+        inline for (.{ "source", "target", "edge_type", "edge_id", "owner_document" }) |field| {
+            const part = @field(value, field);
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(part.len), .little);
+            hasher.update(&length);
+            hasher.update(part);
+        }
         return hasher.final();
     }
 
     pub fn eql(_: @This(), left: GraphEdgeIdentity, right: GraphEdgeIdentity) bool {
         return std.mem.eql(u8, left.source, right.source) and
             std.mem.eql(u8, left.target, right.target) and
-            std.mem.eql(u8, left.edge_type, right.edge_type);
+            std.mem.eql(u8, left.edge_id, right.edge_id) and std.mem.eql(u8, left.owner_document, right.owner_document) and std.mem.eql(u8, left.edge_type, right.edge_type);
     }
 };
 
@@ -3824,8 +3471,39 @@ const GraphEdgeIdentitySet = std.HashMapUnmanaged(
     std.hash_map.default_max_load_percentage,
 );
 
+test "distributed graph identity hashing bounds probes for ambiguous component splits" {
+    const Context = struct {
+        probes: *usize,
+        pub fn hash(_: @This(), value: GraphEdgeIdentity) u64 {
+            return (GraphEdgeIdentityContext{}).hash(value);
+        }
+        pub fn eql(self: @This(), left: GraphEdgeIdentity, right: GraphEdgeIdentity) bool {
+            self.probes.* += 1;
+            return (GraphEdgeIdentityContext{}).eql(left, right);
+        }
+    };
+    var text: [1025]u8 = @splat('x');
+    // Include NUL bytes too: separators alone cannot frame arbitrary identities.
+    text[512] = 0;
+    var probes: usize = 0;
+    const context = Context{ .probes = &probes };
+    var seen = std.HashMapUnmanaged(GraphEdgeIdentity, usize, Context, 80).empty;
+    defer seen.deinit(std.testing.allocator);
+    for (1..text.len) |split| {
+        const identity = GraphEdgeIdentity{ .source = "a", .target = "b", .edge_type = "R", .edge_id = text[0..split], .owner_document = text[split..] };
+        try seen.putContext(std.testing.allocator, identity, split, context);
+    }
+    try std.testing.expectEqual(@as(usize, 1024), seen.count());
+    for (1..text.len) |split| {
+        const identity = GraphEdgeIdentity{ .source = "a", .target = "b", .edge_type = "R", .edge_id = text[0..split], .owner_document = text[split..] };
+        try std.testing.expectEqual(split, seen.getContext(identity, context).?);
+    }
+    // The former unframed hash used nearly a million equality probes here.
+    try std.testing.expect(probes < 20 * seen.count());
+}
+
 fn graphEdgeIdentity(edge: graph_mod.Edge) GraphEdgeIdentity {
-    return .{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type };
+    return .{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document };
 }
 
 fn cloneOwnedGraphEdge(alloc: std.mem.Allocator, edge: graph_mod.Edge) !graph_mod.Edge {
@@ -3835,6 +3513,10 @@ fn cloneOwnedGraphEdge(alloc: std.mem.Allocator, edge: graph_mod.Edge) !graph_mo
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     const winner_key_hex = if (edge.winner_key_hex.len > 0) try alloc.dupe(u8, edge.winner_key_hex) else "";
@@ -3842,6 +3524,8 @@ fn cloneOwnedGraphEdge(alloc: std.mem.Allocator, edge: graph_mod.Edge) !graph_mo
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .created_at = edge.created_at,
         .updated_at = edge.updated_at,
@@ -3856,6 +3540,8 @@ fn graphEdgeOwnedBytes(edge: graph_mod.Edge) usize {
     total = std.math.add(usize, total, edge.source.len) catch return std.math.maxInt(usize);
     total = std.math.add(usize, total, edge.target.len) catch return std.math.maxInt(usize);
     total = std.math.add(usize, total, edge.edge_type.len) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, edge.edge_id.len) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, edge.owner_document.len) catch return std.math.maxInt(usize);
     total = std.math.add(usize, total, edge.metadata.len) catch return std.math.maxInt(usize);
     return std.math.add(usize, total, edge.winner_key_hex.len) catch std.math.maxInt(usize);
 }
@@ -3965,7 +3651,7 @@ fn executeDistributedPattern(
 
     // Hydrate documents if requested.
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
 
@@ -4269,7 +3955,7 @@ fn executeDistributedConjunctivePattern(
         if (unique_nodes.len > 0) alloc.free(unique_nodes);
     }
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     const name = state.name;
@@ -4287,7 +3973,7 @@ const DistributedPatternFilterEvaluator = struct {
     admission: *GraphNodeAdmissionContext,
     contexts: std.StringArrayHashMapUnmanaged(GraphNodeAdmissionContext) = .empty,
 
-    fn evaluate(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+    pub fn evaluate(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
         const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (filter.filter_query_json == null) return true;
         const scoped = try self.contextFor(filter);
@@ -4340,7 +4026,7 @@ const DistributedPatternFilterEvaluator = struct {
         return self.contexts.getPtr(encoded).?;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.contexts.values()) |*context| context.deinit();
         self.contexts.deinit(self.admission.alloc);
         self.* = undefined;
@@ -4383,6 +4069,8 @@ fn convertPatternMatches(
                 alloc.free(edge.source);
                 alloc.free(edge.target);
                 alloc.free(edge.edge_type);
+                if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+                if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
                 if (edge.metadata.len > 0) alloc.free(edge.metadata);
             }
             alloc.free(path);
@@ -4438,6 +4126,8 @@ fn convertedPatternMatchesRetainedBytes(
             total = try std.math.add(usize, total, edge.source.len);
             total = try std.math.add(usize, total, edge.target.len);
             total = try std.math.add(usize, total, edge.edge_type.len);
+            total = try std.math.add(usize, total, edge.edge_id.len);
+            total = try std.math.add(usize, total, edge.owner_document.len);
             total = try std.math.add(usize, total, edge.metadata.len);
         }
         total = try std.math.add(
@@ -4501,6 +4191,8 @@ fn clonePatternPathEdge(
         .source = edge.source,
         .target = edge.target,
         .edge_type = edge.edge_type,
+        .edge_id = edge.edge_id,
+        .owner_document = edge.owner_document,
         .weight = edge.weight,
         .metadata = edge.metadata,
         .traversal_direction = edge.traversal_direction,
@@ -4615,6 +4307,7 @@ fn executeDistributedTraverse(
                         alloc,
                         reader,
                         expansion_table,
+                        item.table orelse table_name,
                         item.key,
                         graph_query.query.params,
                         request_work_budget,
@@ -5070,7 +4763,7 @@ fn executeDistributedTraverse(
         });
     }
     const hydrated_hits = if (hydration_requested)
-        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     state.hits = try adoptHydratedHits(
@@ -5129,8 +4822,10 @@ fn executeDistributedShortestPath(
 
     var output_retained_bytes: usize = 0;
     if (path_result) |result| {
-        output_retained_bytes = graphResultNodeFromPathRetainedBytes(result.path) catch
-            return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+        output_retained_bytes = graphResultNodeFromPathRetainedBytes(alloc, result.path, request_work_budget) catch |err| switch (err) {
+            error.Overflow => return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+            else => return err,
+        };
         output_retained_bytes = std.math.add(
             usize,
             output_retained_bytes,
@@ -5142,7 +4837,7 @@ fn executeDistributedShortestPath(
     errdefer output_lease.deinit();
 
     const nodes = if (path_result) |result| blk: {
-        var node = try graphPathToResultNode(alloc, result.path);
+        var node = try graphPathToResultNode(alloc, result.path, request_work_budget);
         errdefer node.deinit(alloc);
         const out = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
         out[0] = node;
@@ -5165,7 +4860,7 @@ fn executeDistributedShortestPath(
     }
 
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
@@ -5319,6 +5014,8 @@ fn executeDistributedKShortestPaths(
                     },
                     if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].traversal_direction else null,
                     if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_type else "",
+                    if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_id else "",
+                    if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].owner_document else "",
                 );
             }
 
@@ -5429,8 +5126,10 @@ fn executeDistributedKShortestPaths(
         out_nodes_retained_bytes = std.math.add(
             usize,
             out_nodes_retained_bytes,
-            graphResultNodeFromPathRetainedBytes(result.path) catch
-                return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+            graphResultNodeFromPathRetainedBytes(alloc, result.path, request_work_budget) catch |err| switch (err) {
+                error.Overflow => return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+                else => return err,
+            },
         ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
     }
     var out_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, out_nodes_retained_bytes);
@@ -5442,7 +5141,7 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_nodes);
     }
     for (results.items, 0..) |path, i| {
-        out_nodes[i] = try graphPathToResultNode(alloc, path.path);
+        out_nodes[i] = try graphPathToResultNode(alloc, path.path, request_work_budget);
         out_nodes_initialized += 1;
     }
 
@@ -5462,7 +5161,7 @@ fn executeDistributedKShortestPaths(
     }
 
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
@@ -5487,7 +5186,7 @@ const ShortestPathResult = struct {
     path: db_mod.types.GraphPath,
     retained_lease: graph_work_budget.RetainedLease,
 
-    fn deinit(self: *ShortestPathResult, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ShortestPathResult, alloc: std.mem.Allocator) void {
         graph_paths_mod.freePath(alloc, self.path);
         self.retained_lease.deinit();
         self.* = undefined;
@@ -5507,7 +5206,7 @@ const BudgetedGraphPath = struct {
     path: db_mod.types.GraphPath,
     retained_lease: graph_work_budget.RetainedLease,
 
-    fn deinit(self: *BudgetedGraphPath, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *BudgetedGraphPath, alloc: std.mem.Allocator) void {
         graph_paths_mod.freePath(alloc, self.path);
         self.retained_lease.deinit();
         self.* = undefined;
@@ -5673,8 +5372,11 @@ fn insertExcludedEdgeIdentity(
     to: graph_node_identity.Ref,
     direction: ?graph_mod.EdgeDirection,
     edge_type: []const u8,
+    edge_id: []const u8,
+    owner_document: []const u8,
 ) !bool {
-    const key_len = try edgeExclusionIdentityEncodedLen(from, to, direction, edge_type);
+    const legacy_len = try edgeExclusionIdentityEncodedLen(from, to, direction, edge_type);
+    const key_len = if (edge_id.len == 0) legacy_len else try std.math.add(usize, legacy_len, 16 + edge_id.len + owner_document.len);
     const next_count = std.math.add(usize, set.count(), 1) catch
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const growth = retainedHashGrowth(
@@ -5689,7 +5391,7 @@ fn insertExcludedEdgeIdentity(
         growth.bytes,
     ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const previous = try growRetainedLease(lease, retained_bytes, budget);
-    const key = allocEdgeExclusionKey(alloc, from, to, direction, edge_type) catch |err| {
+    const key = allocRelationshipExclusionKey(alloc, from, to, direction, edge_type, edge_id, owner_document) catch |err| {
         restoreRetainedLease(lease, previous);
         return err;
     };
@@ -5809,6 +5511,8 @@ test "Yen scratch reservations fail before allocation and release exactly" {
             .{ .table = "docs", .key = "b" },
             .out,
             "links",
+            "",
+            "",
         ));
         const expected_edge_bytes = try std.math.add(
             usize,
@@ -5831,6 +5535,8 @@ test "Yen scratch reservations fail before allocation and release exactly" {
             .{ .table = "docs", .key = "b" },
             .out,
             "links",
+            "",
+            "",
         ));
         try std.testing.expectEqual(edge_bytes, budget.retained_state_bytes);
     }
@@ -5962,6 +5668,7 @@ fn findDistributedShortestPath(
                     alloc,
                     reader,
                     expansion_table,
+                    item.table orelse table_name,
                     item.key,
                     graph_query.query.params,
                     request_work_budget,
@@ -5982,12 +5689,14 @@ fn findDistributedShortestPath(
                     if (excluded_nodes) |set| if (set.contains(node_ref)) continue;
                     if (excluded_edges) |set| {
                         const physical_edge = node.path_edges.?[0];
-                        const exclusion_key = try allocEdgeExclusionKey(
+                        const exclusion_key = try allocRelationshipExclusionKey(
                             alloc,
                             .{ .table = item.table orelse table_name, .key = item.key },
                             .{ .table = node_table orelse table_name, .key = node.key },
                             physical_edge.traversal_direction,
                             physical_edge.edge_type,
+                            physical_edge.edge_id,
+                            physical_edge.owner_document,
                         );
                         defer alloc.free(exclusion_key);
                         if (set.contains(exclusion_key)) continue;
@@ -6025,61 +5734,6 @@ fn findDistributedShortestPath(
         const expansion_table = item.table orelse table_name;
         const table_state = try admission.ensureTable(expansion_table);
         if (!table_state.allowed) return error.TableNotFound;
-        const tagged_index_available = try admission.graphIndexAvailable(table_state, graph_query.query.index_name);
-        const item_cross_table = item.table != null;
-        if (!tagged_index_available and !item_cross_table) continue;
-        // Mirror batchFrontierByGroup: a cross-table node's entity-sourced
-        // edges are owner-scoped rows scattered across the SOURCE table's
-        // groups, so the weighted search fans the expansion across them in
-        // addition to the tagged table's owner route. Pareto admission
-        // deduplicates the merged frontier.
-        const WeightedExpandRoute = struct {
-            table_state: *const GraphAdmissionTableState,
-            table_name: []const u8,
-            group_id: u64,
-        };
-        var expand_routes = std.ArrayListUnmanaged(WeightedExpandRoute).empty;
-        defer expand_routes.deinit(alloc);
-        if (tagged_index_available) {
-            const group_id = (try table_catalog.resolveGroupForKeyPinnedUntil(
-                alloc,
-                catalog,
-                expansion_table,
-                item.key,
-                table_state.topology_epoch,
-                worker.routingDeadline(catalog),
-            )) orelse return error.TableNotFound;
-            try expand_routes.append(alloc, .{
-                .table_state = table_state,
-                .table_name = expansion_table,
-                .group_id = group_id,
-            });
-        }
-        if (item_cross_table) {
-            const source_state = try admission.ensureTable(table_name);
-            if (!source_state.allowed) return error.TableNotFound;
-            if (try admission.graphIndexAvailable(source_state, graph_query.query.index_name)) {
-                const group_ids = try table_catalog.resolveGroupsForSpanPinnedUntil(
-                    alloc,
-                    catalog,
-                    table_name,
-                    "",
-                    "",
-                    source_state.topology_epoch,
-                    worker.routingDeadline(catalog),
-                );
-                defer if (group_ids.len > 0) alloc.free(group_ids);
-                if (group_ids.len == 0) return error.TableNotFound;
-                for (group_ids) |group_id| {
-                    try expand_routes.append(alloc, .{
-                        .table_state = source_state,
-                        .table_name = table_name,
-                        .group_id = group_id,
-                    });
-                }
-            }
-        }
-        const frontier_ids = [_]u32{0};
         // The caller-facing slices and GraphExpandRequest each own one copy of
         // every exclusion. Reserve both peaks before the first allocation.
         const exclusion_copy_bytes = excludedIdentityCopiesRetainedBytes(
@@ -6102,18 +5756,21 @@ fn findDistributedShortestPath(
         }
         const exclude_edge_keys = try collectExcludedEdgeKeys(alloc, excluded_edges);
         defer freeKeys(alloc, exclude_edge_keys);
-        for (expand_routes.items) |route| {
-            var one_frontier = [_]FrontierState{item};
-            var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, one_frontier[0..], frontier_ids[0..], exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
+        var one_frontier = [_]FrontierState{item};
+        var batches = try batchFrontierByGroup(alloc, catalog, worker, table_name, &one_frontier, max_depth, graph_query.query.params.direction, graph_query.query.index_name, consistency, admission);
+        defer freeFrontierBatches(alloc, &batches);
+        var batch_it = batches.iterator();
+        while (batch_it.next()) |entry| {
+            var step_req = try makeGraphExpandRequestWithAlgebraicMode(alloc, graph_query, one_frontier[0..], entry.value_ptr.frontier_ids.items, exclude_node_refs, exclude_edge_keys, true, algebraic_semiring_selected);
             step_req.ttl_now_ns = req.graph_ttl_now_ns;
-            step_req.allow_legacy_wire_fallback = try catalogGraphIndexAllowsLegacyWire(alloc, catalog, route.table_name, graph_query.query.index_name);
-            step_req.topology_epoch = route.table_state.topology_epoch;
-            step_req.identity_read_generation = try route.table_state.generationForGroup(route.group_id);
+            step_req.allow_legacy_wire_fallback = try catalogGraphIndexAllowsLegacyWire(alloc, catalog, entry.key_ptr.table_name, graph_query.query.index_name);
             if (request_work_budget.remaining_physical_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
             step_req.max_scanned_rows = @intCast(@min(request_work_budget.remaining_physical_edges, graph_pattern_mod.default_max_explored_edges));
+            step_req.topology_epoch = entry.value_ptr.topology_epoch;
+            step_req.identity_read_generation = entry.value_ptr.identity_read_generation;
             defer step_req.deinit(alloc);
 
-            var step_result = try worker.executeGraphExpand(alloc, route.group_id, route.table_name, step_req, consistency);
+            var step_result = try worker.executeGraphExpand(alloc, entry.key_ptr.group_id, entry.key_ptr.table_name, step_req, consistency);
             defer step_result.deinit(alloc);
             if (step_result.scanned_rows > step_req.max_scanned_rows) return error.InvalidGraphExpandResponse;
             try consumeDistributedExpansionWork(request_work_budget, step_result);
@@ -6124,7 +5781,7 @@ fn findDistributedShortestPath(
                 alloc,
                 admission,
                 table_name,
-                route.table_name,
+                entry.key_ptr.table_name,
                 step_graph.nodes,
             );
             defer alloc.free(admitted_nodes);
@@ -6132,7 +5789,7 @@ fn findDistributedShortestPath(
                 if (!allowed) continue;
                 const node_table = canonicalExpandedNodeTable(
                     table_name,
-                    route.table_name,
+                    entry.key_ptr.table_name,
                     node.table,
                 );
                 const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
@@ -7694,7 +7351,7 @@ fn hydrateHitsForResultNodes(
     const HydratedBucket = struct {
         hits: []db_mod.types.SearchHit,
 
-        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
             for (self.hits) |*hit| hit.deinit(a);
             if (self.hits.len > 0) a.free(self.hits);
         }
@@ -8416,98 +8073,9 @@ fn encodeGraphHydrateRequestWithWireMode(alloc: std.mem.Allocator, req: GraphHyd
     return try appendResolvedDocFilterToObjectAlloc(alloc, encoded, req.resolved_doc_filter.?, req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest);
 }
 
-pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !GraphHydrateRequest {
-    var parsed = try std.json.parseFromSlice(GraphHydrateRequestJson, alloc, body, .{});
-    defer parsed.deinit();
+pub const parseGraphHydrateRequest = @import("antfly_local_sources").api_local_graph.parseGraphHydrateRequest;
 
-    var parsed_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null;
-    errdefer if (parsed_filter) |*filter| filter.deinit(alloc);
-    if (parsed.value._resolved_doc_filter) |value| {
-        parsed_filter = try db_mod.doc_filter_wire.parseFilterEnvelopeAlloc(alloc, value);
-    }
-    const identity_read_generation = try identityGenerationFromResolvedFilterEnvelope(parsed.value.identity_read_generation, if (parsed_filter) |*filter| filter else null);
-
-    const keys = try dupKeys(alloc, parsed.value.keys);
-    errdefer freeKeys(alloc, keys);
-    const filter_query_json = if (parsed.value._filter_query_json.len > 0)
-        try alloc.dupe(u8, parsed.value._filter_query_json)
-    else
-        &.{};
-    errdefer if (filter_query_json.len > 0) alloc.free(filter_query_json);
-    const exclusion_query_json = if (parsed.value._exclusion_query_json.len > 0)
-        try alloc.dupe(u8, parsed.value._exclusion_query_json)
-    else
-        &.{};
-    errdefer if (exclusion_query_json.len > 0) alloc.free(exclusion_query_json);
-    const incoming_index_name = if (parsed.value.incoming_index_name.len > 0)
-        try alloc.dupe(u8, parsed.value.incoming_index_name)
-    else
-        &.{};
-    errdefer if (incoming_index_name.len > 0) alloc.free(incoming_index_name);
-    const fields = try dupConstStrings(alloc, parsed.value.fields);
-    errdefer freeConstStrings(alloc, fields);
-    const metric_index_name = if (parsed.value.metric_index_name != null and parsed.value.metric_index_name.?.len > 0)
-        try alloc.dupe(u8, parsed.value.metric_index_name.?)
-    else
-        "";
-    errdefer if (metric_index_name.len > 0) alloc.free(@constCast(metric_index_name));
-    const metric_reads = try parseGraphMetricReads(alloc, parsed.value.metric_reads orelse &.{});
-    errdefer freeGraphMetricReads(alloc, metric_reads);
-
-    const out = GraphHydrateRequest{
-        .keys = keys,
-        .metric_index_name = metric_index_name,
-        .metric_index_name_owned = metric_index_name.len > 0,
-        .metric_index_identity = .{
-            .incarnation = parsed.value.metric_index_incarnation orelse 0,
-            .config_hash = parsed.value.metric_index_config_hash orelse 0,
-        },
-        .metric_reads = metric_reads,
-        .legacy_wire_request = parsed.value.metric_index_name == null and parsed.value.metric_index_incarnation == null and parsed.value.metric_index_config_hash == null and parsed.value.metric_reads == null,
-        .topology_epoch = parsed.value.topology_epoch,
-        .identity_read_generation = identity_read_generation,
-        .filter_query_json = filter_query_json,
-        .filter_query_json_owned = filter_query_json.len > 0,
-        .exclusion_query_json = exclusion_query_json,
-        .exclusion_query_json_owned = exclusion_query_json.len > 0,
-        .include_stored = parsed.value.include_stored,
-        .fields = fields,
-        .fields_owned = fields.len > 0,
-        .include_all_fields = parsed.value.include_all_fields,
-        .include_hits = parsed.value.include_hits,
-        .incoming_index_name = incoming_index_name,
-        .incoming_index_identity = .{
-            .incarnation = parsed.value.incoming_index_incarnation,
-            .config_hash = parsed.value.incoming_index_config_hash,
-        },
-        .incoming_index_name_owned = incoming_index_name.len > 0,
-        .incoming_ttl_now_ns = parsed.value.incoming_ttl_now_ns orelse 0,
-        .incoming_max_scanned_rows = @min(parsed.value.incoming_max_scanned_rows orelse graph_pattern_mod.default_max_explored_edges, graph_pattern_mod.default_max_explored_edges),
-        .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
-        .resolved_doc_filter_owned = parsed_filter != null,
-        .resolved_doc_filter_wire_context = if (parsed_filter) |filter| filter.context else null,
-    };
-    parsed_filter = null;
-    return out;
-}
-
-pub fn encodeGraphHydrateResponse(alloc: std.mem.Allocator, res: GraphHydrateResponse) ![]u8 {
-    return encodeGraphHydrateResponseForWire(alloc, res, false);
-}
-
-pub fn encodeGraphHydrateResponseForWire(alloc: std.mem.Allocator, res: GraphHydrateResponse, legacy: bool) ![]u8 {
-    return try jsonStringifyAlloc(alloc, GraphHydrateResponseJson{
-        .hits = res.hits,
-        .has_incoming = res.has_incoming,
-        .has_physical_incoming = if (legacy or res.incoming_ttl_now_ns == null) null else res.has_physical_incoming,
-        .metric_scores = if (legacy) null else res.metric_scores,
-        .metric_status = if (legacy) null else res.metric_status,
-        .incoming_index_incarnation = res.incoming_index_identity.incarnation,
-        .incoming_index_config_hash = res.incoming_index_identity.config_hash,
-        .incoming_ttl_now_ns = if (legacy) null else res.incoming_ttl_now_ns,
-        .incoming_scanned_rows = if (legacy) null else res.incoming_scanned_rows,
-    });
-}
+pub const encodeGraphHydrateResponse = @import("antfly_local_sources").api_local_graph.encodeGraphHydrateResponse;
 
 pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !GraphHydrateResponse {
     var parsed = try std.json.parseFromSlice(GraphHydrateResponseJson, alloc, body, .{});
@@ -8568,39 +8136,7 @@ test "graph hydrate response wire flattens index identity" {
     try std.testing.expect(decoded.incoming_index_identity.eql(response.incoming_index_identity));
 }
 
-test "legacy graph hydrate wire omits metric fields in both directions" {
-    const alloc = std.testing.allocator;
-    var req = GraphHydrateRequest{ .keys = try dupKeys(alloc, &.{"doc:a"}) };
-    defer req.deinit(alloc);
-    const encoded = try encodeLegacyGraphHydrateRequest(alloc, req);
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_index_name\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_reads\"") == null);
-    var parsed = try parseGraphHydrateRequest(alloc, encoded);
-    defer parsed.deinit(alloc);
-    try std.testing.expect(parsed.legacy_wire_request);
-    const response = try encodeGraphHydrateResponseForWire(alloc, .{}, parsed.legacy_wire_request);
-    defer alloc.free(response);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"metric_scores\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, response, "\"metric_status\"") == null);
-    var legacy_response = try parseGraphHydrateResponse(alloc, response);
-    defer legacy_response.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), legacy_response.metric_scores.len);
-    req.metric_reads = try dupGraphMetricReads(alloc, &.{.{ .name = "rank" }});
-    try std.testing.expectError(error.GraphMetricGlobalMaterializationRequired, encodeLegacyGraphHydrateRequest(alloc, req));
-}
-
-fn identityGenerationFromResolvedFilterEnvelope(
-    explicit_generation: ?u64,
-    parsed_filter: ?*const db_mod.doc_filter_wire.ParsedResolvedDocFilter,
-) !?u64 {
-    const filter = parsed_filter orelse return explicit_generation;
-    if (explicit_generation) |generation| {
-        if (generation != filter.context.identity_read_generation) return error.InvalidQueryRequest;
-        return generation;
-    }
-    return filter.context.identity_read_generation;
-}
+const identityGenerationFromResolvedFilterEnvelope = @import("antfly_local_sources").api_local_graph.identityGenerationFromResolvedFilterEnvelope;
 
 pub fn encodeGraphEdgesRequest(alloc: std.mem.Allocator, req: GraphEdgesRequest) ![]u8 {
     return encodeGraphEdgesRequestWithWireMode(alloc, req, false);
@@ -8645,110 +8181,27 @@ fn encodeGraphEdgesRequestWithWireMode(alloc: std.mem.Allocator, req: GraphEdges
     });
 }
 
-pub fn parseGraphEdgesRequest(alloc: std.mem.Allocator, body: []const u8) !GraphEdgesRequest {
-    var parsed = try std.json.parseFromSlice(GraphEdgesRequestJson, alloc, body, .{});
-    defer parsed.deinit();
-    var tensor_access_path = try parseGraphTensorAccessPathAlloc(alloc, parsed.value.tensor_access_path);
-    errdefer tensor_access_path.deinit(alloc);
-    var tensor_program = try parseGraphTensorProgramJsonValueAlloc(alloc, parsed.value.tensor_program);
-    errdefer tensor_program.deinit(alloc);
-    try validateGraphEdgesTensorAccessPathParts(
-        alloc,
-        parsed.value.index_name,
-        tensor_access_path,
-        &tensor_program,
-    );
-    const max_scanned_rows = parsed.value.max_scanned_rows orelse @as(u32, graph_pattern_mod.default_max_explored_edges);
-    try validateGraphEdgesReadLimits(parsed.value.max_edges, parsed.value.max_owned_bytes, max_scanned_rows);
-    return .{
-        .index_name = try alloc.dupe(u8, parsed.value.index_name),
-        .key = try alloc.dupe(u8, parsed.value.key),
-        .edge_types = try dupConstStrings(alloc, parsed.value.edge_types),
-        .direction = if (std.mem.eql(u8, parsed.value.direction, "in"))
-            .in
-        else if (std.mem.eql(u8, parsed.value.direction, "both"))
-            .both
-        else
-            .out,
-        .topology_epoch = parsed.value.topology_epoch,
-        .ttl_now_ns = parsed.value.ttl_now_ns orelse 0,
-        .identity_read_generation = parsed.value.identity_read_generation,
-        .max_edges = parsed.value.max_edges,
-        .max_owned_bytes = parsed.value.max_owned_bytes,
-        .max_scanned_rows = max_scanned_rows,
-        .legacy_wire_request = parsed.value.ttl_now_ns == null and parsed.value.max_scanned_rows == null,
-        .tensor_access_path = tensor_access_path,
-        .tensor_program = tensor_program,
-    };
-}
+pub const parseGraphEdgesRequest = @import("antfly_local_sources").api_local_graph.parseGraphEdgesRequest;
 
-fn validateGraphEdgesReadLimits(max_edges: u32, max_owned_bytes: u32, max_scanned_rows: u32) !void {
-    if (max_edges == 0 or max_edges > graph_pattern_mod.default_max_explored_edges or
-        max_owned_bytes == 0 or max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes or
-        max_scanned_rows == 0 or max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
-        return error.InvalidQueryRequest;
-}
+const validateGraphEdgesReadLimits = @import("antfly_local_sources").api_local_graph.validateGraphEdgesReadLimits;
 
 fn cloneGraphEdge(alloc: std.mem.Allocator, edge: GraphEdgeJson) !graph_mod.Edge {
-    const source = try alloc.dupe(u8, edge.source);
-    errdefer alloc.free(source);
-    const target = try alloc.dupe(u8, edge.target);
-    errdefer alloc.free(target);
-    const edge_type = try alloc.dupe(u8, edge.edge_type);
-    errdefer alloc.free(edge_type);
-    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
-    errdefer if (metadata.len > 0) alloc.free(metadata);
-    const winner_key_hex = if (edge.winner_key_hex.len > 0) try alloc.dupe(u8, edge.winner_key_hex) else "";
-    return .{
-        .source = source,
-        .target = target,
-        .edge_type = edge_type,
+    return cloneOwnedGraphEdge(alloc, .{
+        .source = edge.source,
+        .target = edge.target,
+        .edge_type = edge.edge_type,
+        .edge_id = edge.edge_id,
+        .owner_document = edge.owner_document,
         .weight = edge.weight,
         .created_at = edge.created_at,
         .updated_at = edge.updated_at,
-        .metadata = metadata,
+        .metadata = edge.metadata,
         .winner_rank = edge.winner_rank,
-        .winner_key_hex = winner_key_hex,
-    };
+        .winner_key_hex = edge.winner_key_hex,
+    });
 }
 
-pub fn encodeGraphEdgesResponse(alloc: std.mem.Allocator, res: GraphEdgesResponse) ![]u8 {
-    return encodeGraphEdgesResponseForWire(alloc, res, false);
-}
-
-pub fn encodeGraphEdgesResponseForWire(alloc: std.mem.Allocator, res: GraphEdgesResponse, legacy: bool) ![]u8 {
-    if (res.scanned_rows < res.edges.len) return error.InvalidGraphEdgesResponse;
-    if (legacy) {
-        const edges = try alloc.alloc(LegacyGraphEdgeJson, res.edges.len);
-        defer alloc.free(edges);
-        for (res.edges, 0..) |edge, i| edges[i] = .{
-            .source = edge.source,
-            .target = edge.target,
-            .edge_type = edge.edge_type,
-            .weight = edge.weight,
-            .created_at = edge.created_at,
-            .updated_at = edge.updated_at,
-            .metadata = edge.metadata,
-        };
-        return jsonStringifyAlloc(alloc, .{ .edges = edges });
-    }
-    const edges = try alloc.alloc(GraphEdgeJson, res.edges.len);
-    defer alloc.free(edges);
-    for (res.edges, 0..) |edge, i| {
-        edges[i] = .{
-            .source = edge.source,
-            .target = edge.target,
-            .edge_type = edge.edge_type,
-            .weight = edge.weight,
-            .created_at = edge.created_at,
-            .updated_at = edge.updated_at,
-            .metadata = edge.metadata,
-            .winner_rank = edge.winner_rank,
-            .winner_key_hex = edge.winner_key_hex,
-        };
-    }
-    return try jsonStringifyAlloc(alloc, GraphEdgesResponseJson{ .edges = edges, .scanned_rows = res.scanned_rows });
-}
+pub const encodeGraphEdgesResponse = @import("antfly_local_sources").api_local_graph.encodeGraphEdgesResponse;
 
 pub fn parseGraphEdgesResponse(alloc: std.mem.Allocator, body: []const u8) !GraphEdgesResponse {
     var parsed = try std.json.parseFromSlice(GraphEdgesResponseJson, alloc, body, .{});
@@ -8800,6 +8253,10 @@ fn consumeDistributedExpansionWork(
                         return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
                     owned_bytes = std.math.add(usize, owned_bytes, edge.edge_type.len) catch
                         return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.edge_id.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.owner_document.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
                     owned_bytes = std.math.add(usize, owned_bytes, edge.metadata.len) catch
                         return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
                 }
@@ -8827,13 +8284,16 @@ fn edgeWeightFromNode(node: graph_query_mod.GraphResultNode) f64 {
 fn graphPathToResultNode(
     alloc: std.mem.Allocator,
     path: db_mod.types.GraphPath,
+    work_budget: ?*graph_work_budget.WorkBudget,
 ) !graph_query_mod.GraphResultNode {
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
     const target_key = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
     const target_table = if (path.nodes.len > 0 and path.node_tables.len == path.nodes.len)
         path.node_tables[path.node_tables.len - 1]
     else if (path.edges.len > 0 and
         std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
-        graph_traversal_mod.metadataTargetTable(path.edges[path.edges.len - 1].metadata)
+        try graph_traversal_mod.metadataTargetTable(&table_scratch, path.edges[path.edges.len - 1].metadata)
     else
         null;
     const nodes = try dupPath(alloc, path.nodes);
@@ -8861,7 +8321,9 @@ fn graphPathToResultNode(
     );
 }
 
-fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
+fn graphResultNodeFromPathRetainedBytes(alloc: std.mem.Allocator, path: db_mod.types.GraphPath, work_budget: ?*graph_work_budget.WorkBudget) !usize {
+    var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
     var total: usize = @sizeOf(graph_query_mod.GraphResultNode);
     if (path.nodes.len > 0) {
         const target_key = path.nodes[path.nodes.len - 1];
@@ -8869,7 +8331,7 @@ fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
         const target_table: ?[]const u8 = if (graphPathNodeTable(path, path.nodes.len - 1)) |table|
             table
         else if (path.edges.len > 0 and std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
-            graph_traversal_mod.metadataTargetTable(path.edges[path.edges.len - 1].metadata)
+            try graph_traversal_mod.metadataTargetTable(&table_scratch, path.edges[path.edges.len - 1].metadata)
         else
             null;
         if (target_table) |table|
@@ -8900,6 +8362,8 @@ fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
         total = try std.math.add(usize, total, edge.source.len);
         total = try std.math.add(usize, total, edge.target.len);
         total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.edge_id.len);
+        total = try std.math.add(usize, total, edge.owner_document.len);
         total = try std.math.add(usize, total, edge.metadata.len);
     }
     return total;
@@ -8959,6 +8423,8 @@ fn graphPathFromStatesRetainedBytes(path_states: []const PathState, id: u32) !us
             total = try std.math.add(usize, total, edge.source.len);
             total = try std.math.add(usize, total, edge.target.len);
             total = try std.math.add(usize, total, edge.edge_type.len);
+            total = try std.math.add(usize, total, edge.edge_id.len);
+            total = try std.math.add(usize, total, edge.owner_document.len);
             total = try std.math.add(usize, total, edge.metadata.len);
         }
         cursor = state.parent;
@@ -8998,32 +8464,7 @@ fn reconstructGraphPathEdges(
     return out;
 }
 
-fn cloneGraphPath(
-    alloc: std.mem.Allocator,
-    source: db_mod.types.GraphPath,
-) !db_mod.types.GraphPath {
-    const nodes = try dupPath(alloc, source.nodes);
-    errdefer freePathArray(alloc, nodes);
-    const node_tables = try dupOptionalStrings(alloc, source.node_tables);
-    errdefer freeOptionalStrings(alloc, node_tables);
-    const edges = try alloc.alloc(graph_paths_mod.PathEdge, source.edges.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (edges[0..initialized]) |edge| freeOwnedGraphPathEdge(alloc, edge);
-        alloc.free(edges);
-    }
-    for (source.edges, 0..) |edge, i| {
-        edges[i] = try dupeGraphPathEdge(alloc, edge);
-        initialized += 1;
-    }
-    return .{
-        .nodes = nodes,
-        .node_tables = node_tables,
-        .edges = edges,
-        .total_weight = source.total_weight,
-        .length = source.length,
-    };
-}
+const cloneGraphPath = @import("antfly_local_sources").api_local_graph.cloneGraphPath;
 
 fn graphPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
     var total: usize = @sizeOf(BudgetedGraphPath);
@@ -9052,42 +8493,16 @@ fn graphPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
         total = try std.math.add(usize, total, edge.source.len);
         total = try std.math.add(usize, total, edge.target.len);
         total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.edge_id.len);
+        total = try std.math.add(usize, total, edge.owner_document.len);
         total = try std.math.add(usize, total, edge.metadata.len);
     }
     return total;
 }
 
-fn dupeGraphPathEdge(
-    alloc: std.mem.Allocator,
-    edge: anytype,
-) !graph_paths_mod.PathEdge {
-    const source = try alloc.dupe(u8, edge.source);
-    errdefer alloc.free(source);
-    const target = try alloc.dupe(u8, edge.target);
-    errdefer alloc.free(target);
-    const edge_type = try alloc.dupe(u8, edge.edge_type);
-    errdefer alloc.free(edge_type);
-    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
-    errdefer if (metadata.len > 0) alloc.free(metadata);
-    return .{
-        .source = source,
-        .target = target,
-        .edge_type = edge_type,
-        .weight = edge.weight,
-        .metadata = metadata,
-        .traversal_direction = edge.traversal_direction,
-    };
-}
+const dupeGraphPathEdge = @import("antfly_local_sources").api_local_graph.dupeGraphPathEdge;
 
-fn freeOwnedGraphPathEdge(
-    alloc: std.mem.Allocator,
-    edge: graph_paths_mod.PathEdge,
-) void {
-    alloc.free(edge.source);
-    alloc.free(edge.target);
-    alloc.free(edge.edge_type);
-    if (edge.metadata.len > 0) alloc.free(edge.metadata);
-}
+const freeOwnedGraphPathEdge = @import("antfly_local_sources").api_local_graph.freeOwnedGraphPathEdge;
 
 fn dupPathEdgesFromGraphPath(
     alloc: std.mem.Allocator,
@@ -9124,7 +8539,7 @@ fn graphPathIdentityEncodedLen(path: db_mod.types.GraphPath) !usize {
     for (path.edges) |edge| {
         total_len = std.math.add(usize, total_len, 1) catch
             return error.PathIdentityTooLarge;
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document }) |part| {
             total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
                 return error.PathIdentityTooLarge;
             total_len = std.math.add(usize, total_len, part.len) catch
@@ -9157,7 +8572,7 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
     for (path.edges) |edge| {
         out[pos] = graphPathTraversalDirectionTag(edge.traversal_direction);
         pos += 1;
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document }) |part| {
             std.mem.writeInt(u64, out[pos..][0..8], @intCast(part.len), .little);
             pos += 8;
             @memcpy(out[pos..][0..part.len], part);
@@ -9167,13 +8582,7 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
     return out;
 }
 
-fn graphPathTraversalDirectionTag(direction: ?graph_mod.EdgeDirection) u8 {
-    return if (direction) |value| switch (value) {
-        .out => 1,
-        .in => 2,
-        .both => 3,
-    } else 0;
-}
+const graphPathTraversalDirectionTag = @import("antfly_local_sources").api_local_graph.graphPathTraversalDirectionTag;
 
 fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_idx: usize) bool {
     if (a.nodes.len <= spur_idx or b.nodes.len <= spur_idx) return false;
@@ -9191,6 +8600,8 @@ fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_id
         if (!std.mem.eql(u8, a.edges[i].source, b.edges[i].source) or
             !std.mem.eql(u8, a.edges[i].target, b.edges[i].target) or
             !std.mem.eql(u8, a.edges[i].edge_type, b.edges[i].edge_type) or
+            !std.mem.eql(u8, a.edges[i].edge_id, b.edges[i].edge_id) or
+            !std.mem.eql(u8, a.edges[i].owner_document, b.edges[i].owner_document) or
             a.edges[i].traversal_direction != b.edges[i].traversal_direction) return false;
     }
     return true;
@@ -9322,6 +8733,8 @@ fn joinDistributedPaths(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
@@ -9420,12 +8833,16 @@ fn joinedGraphPathRetainedBytes(
         total = try std.math.add(usize, total, edge.source.len);
         total = try std.math.add(usize, total, edge.target.len);
         total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.edge_id.len);
+        total = try std.math.add(usize, total, edge.owner_document.len);
         total = try std.math.add(usize, total, edge.metadata.len);
     }
     for (spur_path.edges) |edge| {
         total = try std.math.add(usize, total, edge.source.len);
         total = try std.math.add(usize, total, edge.target.len);
         total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.edge_id.len);
+        total = try std.math.add(usize, total, edge.owner_document.len);
         total = try std.math.add(usize, total, edge.metadata.len);
     }
     return total;
@@ -9484,6 +8901,70 @@ fn computeGraphPathWeightSum(
     return total;
 }
 
+test "distributed K path identity preserves same type fact ids" {
+    const alloc = std.testing.allocator;
+    var first_edge = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "primary",
+        .weight = 1,
+    }};
+    var second_edge = first_edge;
+    second_edge[0].edge_id = "fact:second";
+    second_edge[0].owner_document = "fact:second";
+    var nodes = [_][]const u8{ "a", "b" };
+    const first = db_mod.types.GraphPath{
+        .nodes = &nodes,
+        .edges = &first_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const second = db_mod.types.GraphPath{
+        .nodes = first.nodes,
+        .edges = &second_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const first_key = try graphPathToKey(alloc, first);
+    defer alloc.free(first_key);
+    const second_key = try graphPathToKey(alloc, second);
+    defer alloc.free(second_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, second_key));
+    try std.testing.expect(!rootPathMatches(first, second, 1));
+
+    var outgoing_edge = [_]graph_paths_mod.PathEdge{.{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "cross_table",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    var incoming_edge = outgoing_edge;
+    incoming_edge[0].traversal_direction = .in;
+    var node_tables = [_]?[]const u8{ "left", "right" };
+    var shared_nodes = [_][]const u8{ "shared", "shared" };
+    const outgoing = db_mod.types.GraphPath{
+        .nodes = &shared_nodes,
+        .node_tables = &node_tables,
+        .edges = &outgoing_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const incoming = db_mod.types.GraphPath{
+        .nodes = outgoing.nodes,
+        .node_tables = outgoing.node_tables,
+        .edges = &incoming_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const outgoing_key = try graphPathToKey(alloc, outgoing);
+    defer alloc.free(outgoing_key);
+    const incoming_key = try graphPathToKey(alloc, incoming);
+    defer alloc.free(incoming_key);
+    try std.testing.expect(!std.mem.eql(u8, outgoing_key, incoming_key));
+    try std.testing.expect(!rootPathMatches(outgoing, incoming, 1));
+}
+
 test "distributed canonical path weight is the checked raw edge sum" {
     const root = [_]graph_paths_mod.PathEdge{.{
         .source = "a",
@@ -9508,26 +8989,8 @@ test "distributed canonical path weight is the checked raw edge sum" {
     try std.testing.expectError(error.GraphPathWeightOverflow, computeGraphPathWeightSum(&overflow, &overflow));
 }
 
-fn allocEdgeExclusionKey(
-    alloc: std.mem.Allocator,
-    from: graph_node_identity.Ref,
-    to: graph_node_identity.Ref,
-    direction: ?graph_mod.EdgeDirection,
-    edge_type: []const u8,
-) ![]u8 {
-    const from_table = from.table orelse return error.InvalidGraphPath;
-    const to_table = to.table orelse return error.InvalidGraphPath;
-    const direction_tag = [_]u8{graphPathTraversalDirectionTag(direction)};
-    return try compositeIdentityAlloc(alloc, &.{
-        "path-edge-v1",
-        from_table,
-        from.key,
-        to_table,
-        to.key,
-        direction_tag[0..],
-        edge_type,
-    });
-}
+const allocRelationshipExclusionKey = @import("antfly_local_sources").api_local_graph.allocRelationshipExclusionKey;
+const allocEdgeExclusionKey = @import("antfly_local_sources").api_local_graph.allocEdgeExclusionKey;
 
 fn edgeExclusionIdentityEncodedLen(
     from: graph_node_identity.Ref,
@@ -9549,33 +9012,9 @@ fn edgeExclusionIdentityEncodedLen(
     });
 }
 
-fn compositeIdentityAlloc(
-    alloc: std.mem.Allocator,
-    parts: []const []const u8,
-) ![]u8 {
-    const encoded_len = try compositeIdentityEncodedLen(parts);
+const compositeIdentityAlloc = @import("antfly_local_sources").api_local_graph.compositeIdentityAlloc;
 
-    const encoded = try alloc.alloc(u8, encoded_len);
-    var cursor: usize = 0;
-    for (parts) |part| {
-        std.mem.writeInt(u64, encoded[cursor..][0..8], @intCast(part.len), .little);
-        cursor += 8;
-        @memcpy(encoded[cursor..][0..part.len], part);
-        cursor += part.len;
-    }
-    return encoded;
-}
-
-fn compositeIdentityEncodedLen(parts: []const []const u8) !usize {
-    var encoded_len: usize = 0;
-    for (parts) |part| {
-        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u64)) catch
-            return error.GraphIdentityTooLarge;
-        encoded_len = std.math.add(usize, encoded_len, part.len) catch
-            return error.GraphIdentityTooLarge;
-    }
-    return encoded_len;
-}
+const compositeIdentityEncodedLen = @import("antfly_local_sources").api_local_graph.compositeIdentityEncodedLen;
 
 test "distributed graph identities are length framed" {
     const alloc = std.testing.allocator;
@@ -9618,7 +9057,7 @@ test "distributed shortest path identity and endpoint retain table provenance" {
     defer alloc.free(entity_key);
     try std.testing.expect(!std.mem.eql(u8, source_key, entity_key));
 
-    var result_node = try graphPathToResultNode(alloc, entity_path);
+    var result_node = try graphPathToResultNode(alloc, entity_path, null);
     defer result_node.deinit(alloc);
     try std.testing.expectEqualStrings("same", result_node.key);
     try std.testing.expectEqualStrings("entities", result_node.table.?);
@@ -10533,7 +9972,14 @@ fn resolveResultRefNodes(
 
     if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
         const name = result_ref.ref["$graph_results.".len..];
-        for (prior_results) |graph_result| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        for (prior_results) |original| {
+            var output_limit: ?u32 = null;
+            for (req.graph_queries) |query| if (std.mem.eql(u8, query.name, original.name)) {
+                output_limit = query.query.evaluation_output_limit;
+            };
+            const graph_result = try original.dependencyView(scratch.allocator(), output_limit, source_table);
             if (!std.mem.eql(u8, graph_result.name, name)) continue;
             if (result_ref.binding) |binding| {
                 if (result_ref.limit == 0 and
@@ -10721,21 +10167,9 @@ fn cloneGraphTensorAccessPathAlloc(alloc: std.mem.Allocator, path: algebraic_ir.
     };
 }
 
-fn enumSliceEql(comptime T: type, left: []const T, right: []const T) bool {
-    if (left.len != right.len) return false;
-    for (left, right) |l, r| {
-        if (l != r) return false;
-    }
-    return true;
-}
+const enumSliceEql = @import("antfly_local_sources").api_local_graph.enumSliceEql;
 
-fn graphTensorAccessPathEql(left: algebraic_ir.PhysicalAccessPath, right: algebraic_ir.PhysicalAccessPath) bool {
-    return std.mem.eql(u8, left.owner, right.owner) and
-        left.layout == right.layout and
-        enumSliceEql(algebraic_ir.TensorFragment, left.fragments, right.fragments) and
-        enumSliceEql(algebraic_ir.Dimension, left.output_dims, right.output_dims) and
-        enumSliceEql(algebraic_law.Id, left.law_ids, right.law_ids);
-}
+const graphTensorAccessPathEql = @import("antfly_local_sources").api_local_graph.graphTensorAccessPathEql;
 
 fn graphTensorProgramJsonValueAlloc(
     alloc: std.mem.Allocator,
@@ -10748,14 +10182,7 @@ fn graphTensorProgramJsonValueAlloc(
     return std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch return error.InvalidQueryRequest;
 }
 
-fn parseGraphTensorProgramJsonValueAlloc(
-    alloc: std.mem.Allocator,
-    value: std.json.Value,
-) !query_contract.OwnedAlgebraicTensorProgramEnvelope {
-    const encoded = try jsonStringifyAlloc(alloc, value);
-    defer alloc.free(encoded);
-    return try query_contract.parseAlgebraicTensorProgramEnvelopeAlloc(alloc, encoded);
-}
+const parseGraphTensorProgramJsonValueAlloc = @import("antfly_local_sources").api_local_graph.parseGraphTensorProgramJsonValueAlloc;
 
 pub fn graphTraversalTensorProgramEnvelopeAlloc(
     alloc: std.mem.Allocator,
@@ -10767,82 +10194,17 @@ pub fn graphTraversalTensorProgramEnvelopeAlloc(
     return try cloneGraphTensorProgramEnvelopeAlloc(alloc, plan.asProgram());
 }
 
-pub fn graphEdgesTensorProgramEnvelopeAlloc(
-    alloc: std.mem.Allocator,
-    index_name: []const u8,
-) !query_contract.OwnedAlgebraicTensorProgramEnvelope {
-    var plan = (try algebraic_planner.planGraphEdgesTensorProgramAlloc(alloc, index_name)) orelse return error.InvalidQueryRequest;
-    defer plan.deinit(alloc);
-    return try cloneGraphTensorProgramEnvelopeAlloc(alloc, plan.asProgram());
-}
+pub const graphEdgesTensorProgramEnvelopeAlloc = @import("antfly_local_sources").api_local_graph.graphEdgesTensorProgramEnvelopeAlloc;
 
-fn cloneGraphTensorProgramEnvelopeAlloc(
-    alloc: std.mem.Allocator,
-    program: algebraic_ir.TensorProgram,
-) !query_contract.OwnedAlgebraicTensorProgramEnvelope {
-    const encoded = try query_contract.encodeAlgebraicTensorProgramEnvelopeAlloc(alloc, program);
-    defer alloc.free(encoded);
-    return try query_contract.parseAlgebraicTensorProgramEnvelopeAlloc(alloc, encoded);
-}
+const cloneGraphTensorProgramEnvelopeAlloc = @import("antfly_local_sources").api_local_graph.cloneGraphTensorProgramEnvelopeAlloc;
 
-pub fn validateGraphExpandTensorAccessPath(alloc: std.mem.Allocator, req: GraphExpandRequest) !void {
-    try validateGraphExpandTensorAccessPathParts(
-        alloc,
-        req.index_name,
-        req.params.algebraic_semiring,
-        req.target_constraint_keys.len > 0,
-        req.tensor_access_path,
-        if (req.tensor_program) |*program| program else null,
-    );
-}
+pub const validateGraphExpandTensorAccessPath = @import("antfly_local_sources").api_local_graph.validateGraphExpandTensorAccessPath;
 
-fn validateGraphExpandTensorAccessPathParts(
-    alloc: std.mem.Allocator,
-    index_name: []const u8,
-    algebraic_semiring: bool,
-    target_constraints: bool,
-    tensor_access_path: ?OwnedGraphTensorAccessPath,
-    tensor_program: ?*const query_contract.OwnedAlgebraicTensorProgramEnvelope,
-) !void {
-    if (!algebraic_semiring) {
-        if (target_constraints) return error.InvalidQueryRequest;
-        return;
-    }
-    const selected = tensor_access_path orelse return error.InvalidQueryRequest;
-    const selected_path = selected.asAccessPath();
-    var plan = (try algebraic_planner.planGraphTraversalTensorProgramAlloc(alloc, index_name, target_constraints)) orelse return error.InvalidQueryRequest;
-    defer plan.deinit(alloc);
-    if (!graphTensorAccessPathEql(selected_path, plan.access_paths[0])) return error.InvalidQueryRequest;
-    const selected_program = tensor_program orelse return error.InvalidQueryRequest;
-    var selected_view = try selected_program.asProgramAlloc(alloc);
-    defer selected_view.deinit(alloc);
-    if (!algebraic_ir.graphTraversalProgramMatchesTarget(selected_view.program, index_name, target_constraints)) return error.InvalidQueryRequest;
-    if (!(try algebraic_ir.tensorProgramProof(alloc, &.{selected_path}, selected_view.program)).safe()) return error.InvalidQueryRequest;
-    if (!std.mem.eql(u8, selected_program.program_id, plan.program_id)) return error.InvalidQueryRequest;
-}
+const validateGraphExpandTensorAccessPathParts = @import("antfly_local_sources").api_local_graph.validateGraphExpandTensorAccessPathParts;
 
-pub fn validateGraphEdgesTensorAccessPath(alloc: std.mem.Allocator, req: GraphEdgesRequest) !void {
-    try validateGraphEdgesTensorAccessPathParts(alloc, req.index_name, req.tensor_access_path, if (req.tensor_program) |*program| program else null);
-}
+pub const validateGraphEdgesTensorAccessPath = @import("antfly_local_sources").api_local_graph.validateGraphEdgesTensorAccessPath;
 
-fn validateGraphEdgesTensorAccessPathParts(
-    alloc: std.mem.Allocator,
-    index_name: []const u8,
-    tensor_access_path: ?OwnedGraphTensorAccessPath,
-    tensor_program: ?*const query_contract.OwnedAlgebraicTensorProgramEnvelope,
-) !void {
-    const selected = tensor_access_path orelse return error.InvalidQueryRequest;
-    const selected_path = selected.asAccessPath();
-    var plan = (try algebraic_planner.planGraphEdgesTensorProgramAlloc(alloc, index_name)) orelse return error.InvalidQueryRequest;
-    defer plan.deinit(alloc);
-    if (!graphTensorAccessPathEql(selected_path, plan.access_paths[0])) return error.InvalidQueryRequest;
-    const selected_program = tensor_program orelse return error.InvalidQueryRequest;
-    var selected_view = try selected_program.asProgramAlloc(alloc);
-    defer selected_view.deinit(alloc);
-    if (!algebraic_ir.graphEdgesProgramMatchesTarget(selected_view.program, index_name)) return error.InvalidQueryRequest;
-    if (!(try algebraic_ir.tensorProgramProof(alloc, &.{selected_path}, selected_view.program)).safe()) return error.InvalidQueryRequest;
-    if (!std.mem.eql(u8, selected_program.program_id, plan.program_id)) return error.InvalidQueryRequest;
-}
+const validateGraphEdgesTensorAccessPathParts = @import("antfly_local_sources").api_local_graph.validateGraphEdgesTensorAccessPathParts;
 
 pub fn makeGraphExpandRequest(
     alloc: std.mem.Allocator,
@@ -10902,9 +10264,17 @@ fn makeGraphExpandRequestWithAlgebraicModeAndTargetConstraints(
     var params = named_query.query.params;
     params.edge_types = try dupConstStrings(alloc, named_query.query.params.edge_types);
     errdefer freeConstStrings(alloc, params.edge_types);
+    params.edge_filter = try params.edge_filter.clone(alloc);
+    errdefer params.edge_filter.deinit(alloc);
     params.algebraic_semiring = params.algebraic_semiring or algebraic_semiring_selected;
     params.max_depth = 1;
-    params.deduplicate = true;
+    // Path coordinators must see every relationship before ranking or Yen
+    // exclusions. Node deduplication here would discard parallel fact weights.
+    params.deduplicate = switch (named_query.query.query_type) {
+        .shortest_path, .k_shortest_paths => false,
+        else => true,
+    };
+    if (!params.deduplicate) params.max_results = 0;
     params.include_paths = include_paths;
     params.weight_mode = .min_hops;
 
@@ -10981,6 +10351,29 @@ fn catalogGraphIndexEnablesAlgebraicSemiring(
     defer lookup.deinit();
     if (indexes_api.inferIndexType(index_name, lookup.config) != .graph) return false;
     return graphConfigEnablesAlgebraicSemiring(lookup.config);
+}
+
+fn graphSourceProjectsEndpoints(config: std.json.Value) bool {
+    if (config != .object) return false;
+    if (config.object.get("nodes")) |nodes| if (nodes == .object and nodes.object.get("source") != null) return true;
+    if (config.object.get("source")) |source| if (graphSourceProjectsEndpoints(source)) return true;
+    if (config.object.get("sources")) |sources| if (sources == .array) {
+        for (sources.array.items) |source| if (graphSourceProjectsEndpoints(source)) return true;
+    };
+    return false;
+}
+
+fn catalogGraphProjectsEndpoints(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, index_name: []const u8, expected: GraphIndexIdentity) !bool {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return false;
+    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name)) orelse return false;
+    defer lookup.deinit();
+    if (expected.valid()) {
+        const identity = (try indexes_api.indexRuntimeIdentity(alloc, index_name, lookup.config)) orelse return error.TopologyChanged;
+        if (identity.incarnation != expected.incarnation or identity.config_hash != expected.config_hash) return error.TopologyChanged;
+    }
+    return graphSourceProjectsEndpoints(lookup.config);
 }
 
 fn catalogGraphIndexNeedsCanonicalEdgeReads(
@@ -11183,62 +10576,7 @@ fn graphConfigEnablesAlgebraicSemiring(config: std.json.Value) bool {
     return true;
 }
 
-pub fn frontierItemToSearchRequest(
-    alloc: std.mem.Allocator,
-    req: GraphExpandRequest,
-    item: GraphFrontierItem,
-) !db_mod.types.SearchRequest {
-    try validateGraphExpandTensorAccessPath(alloc, req);
-
-    const frontier_keys = try alloc.alloc([]const u8, 1);
-    frontier_keys[0] = "";
-    errdefer {
-        if (frontier_keys[0].len > 0) alloc.free(frontier_keys[0]);
-        alloc.free(frontier_keys);
-    }
-    frontier_keys[0] = try alloc.dupe(u8, item.key);
-
-    var params = req.params;
-    params.edge_types = try dupConstStrings(alloc, req.params.edge_types);
-    errdefer freeConstStrings(alloc, params.edge_types);
-    if (req.defer_result_limit) params.max_results = graph_query_mod.graph_metric_candidate_limit + 1;
-
-    const name = try alloc.dupe(u8, req.name);
-    errdefer alloc.free(name);
-    const index_name = try alloc.dupe(u8, req.index_name);
-    errdefer alloc.free(index_name);
-    const metrics = try dupGraphMetricReads(alloc, req.metrics);
-    errdefer freeGraphMetricReads(alloc, metrics);
-
-    const graph_queries = try alloc.alloc(db_mod.types.NamedGraphQuery, 1);
-    errdefer alloc.free(graph_queries);
-    graph_queries[0] = .{
-        .name = name,
-        .query = .{
-            .query_type = .neighbors,
-            .index_name = index_name,
-            .start_nodes = .{ .keys = frontier_keys },
-            .params = params,
-            .metrics = metrics,
-            .include_metric_status = req.include_metric_status,
-        },
-    };
-
-    return .{
-        .query = .{ .match_all = {} },
-        .graph_queries = graph_queries,
-        .graph_ttl_now_ns = req.ttl_now_ns,
-        .graph_execution_limits = .{ .max_explored_edges = req.max_scanned_rows },
-        .graph_physical_scan_observation = req.physical_scan_observation,
-        .limit = 0,
-        .include_stored = true,
-        .identity_read_generation = req.identity_read_generation,
-        .resolved_doc_filter = req.resolved_doc_filter,
-        .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
-        .execution_deadline_ns = req.execution_deadline_ns orelse executionDeadlineFromTimeoutMs(req.timeout_ms),
-        .cancellation = req.cancellation,
-    };
-}
+pub const frontierItemToSearchRequest = @import("antfly_local_sources").api_local_graph.frontierItemToSearchRequest;
 
 fn enumNameArrayAlloc(comptime T: type, alloc: std.mem.Allocator, values: []const T) ![][]const u8 {
     const out = try alloc.alloc([]const u8, values.len);
@@ -11265,76 +10603,9 @@ fn graphTensorAccessPathJsonAlloc(
     };
 }
 
-fn parseGraphTensorAccessPathAlloc(
-    alloc: std.mem.Allocator,
-    input: GraphTensorAccessPathJson,
-) !OwnedGraphTensorAccessPath {
-    const layout = std.meta.stringToEnum(algebraic_ir.PhysicalLayout, input.layout) orelse return error.InvalidQueryRequest;
-    const owner = try alloc.dupe(u8, input.owner);
-    errdefer alloc.free(owner);
-    const fragments = try alloc.alloc(algebraic_ir.TensorFragment, input.fragments.len);
-    errdefer alloc.free(fragments);
-    for (input.fragments, 0..) |fragment, i| {
-        fragments[i] = std.meta.stringToEnum(algebraic_ir.TensorFragment, fragment) orelse return error.InvalidQueryRequest;
-    }
-    const output_dims = try alloc.alloc(algebraic_ir.Dimension, input.output_dims.len);
-    errdefer alloc.free(output_dims);
-    for (input.output_dims, 0..) |dim, i| {
-        output_dims[i] = std.meta.stringToEnum(algebraic_ir.Dimension, dim) orelse return error.InvalidQueryRequest;
-    }
-    const law_ids = try alloc.alloc(algebraic_law.Id, input.law_ids.len);
-    errdefer alloc.free(law_ids);
-    for (input.law_ids, 0..) |law_id, i| {
-        law_ids[i] = algebraic_law.Id.parse(law_id) orelse return error.InvalidQueryRequest;
-    }
-    return .{
-        .owner = owner,
-        .layout = layout,
-        .fragments = fragments,
-        .output_dims = output_dims,
-        .law_ids = law_ids,
-    };
-}
+const parseGraphTensorAccessPathAlloc = @import("antfly_local_sources").api_local_graph.parseGraphTensorAccessPathAlloc;
 
-pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) void {
-    for (req.graph_queries) |graph_query| {
-        alloc.free(@constCast(graph_query.name));
-        alloc.free(@constCast(graph_query.query.index_name));
-        switch (graph_query.query.start_nodes) {
-            .keys => |keys| {
-                for (keys) |key| alloc.free(@constCast(key));
-                alloc.free(keys);
-            },
-            .identities => |identities| {
-                for (identities) |identity| {
-                    alloc.free(@constCast(identity.key));
-                    if (identity.table) |table| alloc.free(@constCast(table));
-                }
-                alloc.free(identities);
-            },
-            .result_ref => {},
-        }
-        if (graph_query.query.target_nodes) |target_nodes| {
-            switch (target_nodes) {
-                .keys => |keys| {
-                    for (keys) |key| alloc.free(@constCast(key));
-                    alloc.free(keys);
-                },
-                .identities => |identities| {
-                    for (identities) |identity| {
-                        alloc.free(@constCast(identity.key));
-                        if (identity.table) |table| alloc.free(@constCast(table));
-                    }
-                    alloc.free(identities);
-                },
-                .result_ref => {},
-            }
-        }
-        freeConstStrings(alloc, graph_query.query.params.edge_types);
-        freeGraphMetricReads(alloc, graph_query.query.metrics);
-    }
-    if (req.graph_queries.len > 0) alloc.free(req.graph_queries);
-}
+pub const freeExpandSearchRequest = @import("antfly_local_sources").api_local_graph.freeExpandSearchRequest;
 
 fn graphMetricReadJsonAlloc(
     alloc: std.mem.Allocator,
@@ -11355,55 +10626,9 @@ fn graphMetricReadJsonAlloc(
     return out;
 }
 
-fn parseGraphMetricReads(
-    alloc: std.mem.Allocator,
-    metrics: []const GraphMetricReadJson,
-) ![]graph_query_mod.GraphMetricRead {
-    if (metrics.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
-    const out = try alloc.alloc(graph_query_mod.GraphMetricRead, metrics.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |metric| alloc.free(@constCast(metric.name));
-        alloc.free(out);
-    }
-    for (metrics, 0..) |metric, i| {
-        if (metric.damping != null or (metric.seed_nodes != null and metric.seed_nodes.?.len != 0))
-            return error.GraphMetricPersonalizationUnsupported;
-        out[i] = .{
-            .name = try alloc.dupe(u8, metric.name),
-            .freshness = if (std.mem.eql(u8, metric.freshness, "fresh"))
-                .fresh
-            else if (std.mem.eql(u8, metric.freshness, "published"))
-                .published
-            else
-                return error.InvalidQueryRequest,
-        };
-        initialized += 1;
-    }
-    return out;
-}
+const parseGraphMetricReads = @import("antfly_local_sources").api_local_graph.parseGraphMetricReads;
 
-fn dupGraphMetricReads(
-    alloc: std.mem.Allocator,
-    metrics: []const graph_query_mod.GraphMetricRead,
-) ![]graph_query_mod.GraphMetricRead {
-    try validateGraphMetricReadsForDistributedTransport(metrics);
-    if (metrics.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricRead{})[0..]);
-    const out = try alloc.alloc(graph_query_mod.GraphMetricRead, metrics.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |metric| alloc.free(@constCast(metric.name));
-        alloc.free(out);
-    }
-    for (metrics, 0..) |metric, i| {
-        out[i] = .{
-            .name = try alloc.dupe(u8, metric.name),
-            .freshness = metric.freshness,
-        };
-        initialized += 1;
-    }
-    return out;
-}
+const dupGraphMetricReads = @import("antfly_local_sources").api_local_graph.dupGraphMetricReads;
 
 fn graphMetricExecutionReadsAlloc(
     alloc: std.mem.Allocator,
@@ -11445,23 +10670,12 @@ fn stricterGraphMetricFreshness(
     return if (left == .fresh or right == .fresh) .fresh else .published;
 }
 
-fn freeGraphMetricReads(
-    alloc: std.mem.Allocator,
-    metrics: []const graph_query_mod.GraphMetricRead,
-) void {
-    for (metrics) |metric| alloc.free(@constCast(metric.name));
-    if (metrics.len > 0) alloc.free(@constCast(metrics));
-}
+const freeGraphMetricReads = @import("antfly_local_sources").api_local_graph.freeGraphMetricReads;
 
 /// Published columns are shard-local. A seeded metric needs a query-time
 /// computation over the complete graph, so it cannot use distributed column
 /// hydration or expansion until that computation has a distributed owner.
-pub fn validateGraphMetricReadsForDistributedTransport(metrics: []const graph_query_mod.GraphMetricRead) !void {
-    for (metrics) |metric| {
-        if (metric.seed_nodes.len != 0 or metric.damping != null)
-            return error.GraphMetricPersonalizationUnsupported;
-    }
-}
+pub const validateGraphMetricReadsForDistributedTransport = @import("antfly_local_sources").api_local_graph.validateGraphMetricReadsForDistributedTransport;
 
 fn validateDistributedGraphMetricCandidateCount(count: usize, needs_full_candidates: bool) !void {
     if (needs_full_candidates and count > graph_query_mod.graph_metric_candidate_limit)
@@ -11538,6 +10752,7 @@ fn encodeGraphExpandRequestWithWireMode(alloc: std.mem.Allocator, req: GraphExpa
         .identity_read_generation = req.identity_read_generation,
         .params = .{
             .edge_types = req.params.edge_types,
+            .edge_filter = req.params.edge_filter,
             .direction = switch (req.params.direction) {
                 .out => "out",
                 .in => "in",
@@ -11580,155 +10795,9 @@ fn appendResolvedDocFilterToObjectAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !GraphExpandRequest {
-    var parsed = try std.json.parseFromSlice(GraphExpandRequestJson, alloc, body, .{});
-    defer parsed.deinit();
-    const max_scanned_rows: u32 = parsed.value.max_scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges);
-    if (max_scanned_rows == 0 or max_scanned_rows > graph_pattern_mod.default_max_explored_edges)
-        return error.InvalidQueryRequest;
+pub const parseGraphExpandRequest = @import("antfly_local_sources").api_local_graph.parseGraphExpandRequest;
 
-    if (parsed.value.params.algebraic_semiring and parsed.value.tensor_access_path == null) return error.InvalidQueryRequest;
-    if (parsed.value.params.algebraic_semiring and parsed.value.tensor_program == null) return error.InvalidQueryRequest;
-    var tensor_access_path: ?OwnedGraphTensorAccessPath = if (parsed.value.tensor_access_path) |path|
-        try parseGraphTensorAccessPathAlloc(alloc, path)
-    else
-        null;
-    errdefer if (tensor_access_path) |*path| path.deinit(alloc);
-    var tensor_program: ?query_contract.OwnedAlgebraicTensorProgramEnvelope = if (parsed.value.tensor_program) |program|
-        try parseGraphTensorProgramJsonValueAlloc(alloc, program)
-    else
-        null;
-    errdefer if (tensor_program) |*program| program.deinit(alloc);
-    const target_constraint_keys = try dupSortedUniqueKeys(alloc, parsed.value.target_constraint_keys);
-    errdefer {
-        for (target_constraint_keys) |key| alloc.free(key);
-        if (target_constraint_keys.len > 0) alloc.free(target_constraint_keys);
-    }
-    try validateGraphExpandTensorAccessPathParts(
-        alloc,
-        parsed.value.index_name,
-        parsed.value.params.algebraic_semiring,
-        target_constraint_keys.len > 0,
-        tensor_access_path,
-        if (tensor_program) |*program| program else null,
-    );
-
-    const frontier = try alloc.alloc(GraphFrontierItem, parsed.value.frontier.len);
-    var frontier_initialized: usize = 0;
-    errdefer {
-        for (frontier[0..frontier_initialized]) |*item| item.deinit(alloc);
-        alloc.free(frontier);
-    }
-    for (parsed.value.frontier, 0..) |item, i| {
-        frontier[i] = try cloneGraphFrontierItemParts(
-            alloc,
-            item.id,
-            item.key,
-            item.table,
-            item.depth,
-            item.distance,
-        );
-        frontier_initialized += 1;
-    }
-
-    var parsed_filter: ?db_mod.doc_filter_wire.ParsedResolvedDocFilter = null;
-    errdefer if (parsed_filter) |*filter| filter.deinit(alloc);
-    if (parsed.value._resolved_doc_filter) |value| {
-        parsed_filter = try db_mod.doc_filter_wire.parseFilterEnvelopeAlloc(alloc, value);
-    }
-    const identity_read_generation = try identityGenerationFromResolvedFilterEnvelope(parsed.value.identity_read_generation, if (parsed_filter) |*filter| filter else null);
-
-    const exclude_nodes = try alloc.alloc(GraphNodeIdentity, parsed.value.exclude_nodes.len);
-    var exclude_nodes_initialized: usize = 0;
-    errdefer {
-        for (exclude_nodes[0..exclude_nodes_initialized]) |*identity| identity.deinit(alloc);
-        alloc.free(exclude_nodes);
-    }
-    for (parsed.value.exclude_nodes, 0..) |identity, i| {
-        exclude_nodes[i] = try cloneGraphNodeIdentityParts(
-            alloc,
-            identity.key,
-            identity.table,
-        );
-        exclude_nodes_initialized += 1;
-    }
-
-    const name = try alloc.dupe(u8, parsed.value.name);
-    errdefer alloc.free(name);
-    const index_name = try alloc.dupe(u8, parsed.value.index_name);
-    errdefer alloc.free(index_name);
-    const exclude_edges = try dupKeys(alloc, parsed.value.exclude_edges);
-    errdefer freeKeys(alloc, exclude_edges);
-    const edge_types = try dupConstStrings(alloc, parsed.value.params.edge_types);
-    errdefer freeConstStrings(alloc, edge_types);
-
-    const out = GraphExpandRequest{
-        .name = name,
-        .index_name = index_name,
-        .frontier = frontier,
-        .exclude_nodes = exclude_nodes,
-        .exclude_edges = exclude_edges,
-        .target_constraint_keys = target_constraint_keys,
-        .metrics = try parseGraphMetricReads(alloc, parsed.value.metrics),
-        .include_metric_status = parsed.value.include_metric_status,
-        .defer_result_limit = parsed.value.defer_result_limit,
-        .topology_epoch = parsed.value.topology_epoch,
-        .ttl_now_ns = parsed.value.ttl_now_ns orelse 0,
-        .max_scanned_rows = max_scanned_rows,
-        .legacy_wire_request = parsed.value.ttl_now_ns == null and parsed.value.max_scanned_rows == null,
-        .identity_read_generation = identity_read_generation,
-        .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
-        .resolved_doc_filter_owned = parsed_filter != null,
-        .resolved_doc_filter_wire_context = if (parsed_filter) |filter| filter.context else null,
-        .params = .{
-            .edge_types = edge_types,
-            .direction = if (std.mem.eql(u8, parsed.value.params.direction, "in"))
-                .in
-            else if (std.mem.eql(u8, parsed.value.params.direction, "both"))
-                .both
-            else
-                .out,
-            .max_depth = parsed.value.params.max_depth,
-            .max_results = parsed.value.params.max_results,
-            .min_weight = parsed.value.params.min_weight,
-            .max_weight = parsed.value.params.max_weight,
-            .deduplicate = parsed.value.params.deduplicate,
-            .include_paths = parsed.value.params.include_paths,
-            .weight_mode = if (std.mem.eql(u8, parsed.value.params.weight_mode, "min_weight"))
-                .min_weight
-            else if (std.mem.eql(u8, parsed.value.params.weight_mode, "max_weight"))
-                .max_weight
-            else
-                .min_hops,
-            .algebraic_semiring = parsed.value.params.algebraic_semiring,
-        },
-        .tensor_access_path = tensor_access_path,
-        .tensor_program = tensor_program,
-    };
-    parsed_filter = null;
-    return out;
-}
-
-pub fn encodeGraphExpandResponse(alloc: std.mem.Allocator, res: GraphExpandResponse) ![]u8 {
-    return encodeGraphExpandResponseForWire(alloc, res, false);
-}
-
-pub fn encodeGraphExpandResponseForWire(alloc: std.mem.Allocator, res: GraphExpandResponse, legacy: bool) ![]u8 {
-    const expansions = try alloc.alloc(GraphExpansionJson, res.expansions.len);
-    defer alloc.free(expansions);
-    for (res.expansions, 0..) |expansion, i| {
-        expansions[i] = .{
-            .frontier_id = expansion.frontier_id,
-            .frontier_key = expansion.frontier_key,
-            .name = expansion.graph_result.name,
-            .total = @intCast(expansion.graph_result.total_hits),
-            .nodes = expansion.graph_result.nodes,
-            .hits = expansion.graph_result.hits,
-            .metric_status = expansion.graph_result.metric_status,
-        };
-    }
-    return try jsonStringifyAlloc(alloc, GraphExpandResponseJson{ .expansions = expansions, .scanned_rows = if (legacy) null else res.scanned_rows });
-}
+pub const encodeGraphExpandResponse = @import("antfly_local_sources").api_local_graph.encodeGraphExpandResponse;
 
 pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !GraphExpandResponse {
     var parsed = try std.json.parseFromSlice(GraphExpandResponseJson, alloc, body, .{});
@@ -11783,209 +10852,11 @@ pub fn parseGraphExpandResponse(alloc: std.mem.Allocator, body: []const u8) !Gra
     return .{ .expansions = expansions, .scanned_rows = parsed.value.scanned_rows orelse @intCast(graph_pattern_mod.default_max_explored_edges) };
 }
 
-pub fn cloneGraphSearchResult(
-    alloc: std.mem.Allocator,
-    src: db_mod.types.GraphSearchResult,
-) !db_mod.types.GraphSearchResult {
-    const nodes = if (src.nodes.len > 0)
-        try cloneGraphNodes(alloc, src.nodes)
-    else
-        @constCast((&[_]graph_query_mod.GraphResultNode{})[0..]);
-    errdefer if (nodes.len > 0) {
-        for (nodes) |*node| node.deinit(alloc);
-        alloc.free(nodes);
-    };
+pub const cloneGraphSearchResult = @import("antfly_local_sources").api_local_graph.cloneGraphSearchResult;
 
-    const hits = if (src.hits.len > 0)
-        try cloneSearchHits(alloc, src.hits)
-    else
-        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
-    errdefer if (hits.len > 0) {
-        for (hits) |*hit| hit.deinit(alloc);
-        alloc.free(hits);
-    };
+pub const filterGraphSearchResult = @import("antfly_local_sources").api_local_graph.filterGraphSearchResult;
 
-    const paths = if (src.paths.len > 0)
-        try cloneGraphPaths(alloc, src.paths)
-    else
-        @constCast((&[_]db_mod.types.GraphPath{})[0..]);
-    errdefer if (paths.len > 0) {
-        for (paths) |path| graph_paths_mod.freePath(alloc, path);
-        alloc.free(paths);
-    };
-
-    const matches = if (src.matches.len > 0)
-        try cloneGraphPatternMatches(alloc, src.matches)
-    else
-        @constCast((&[_]db_mod.types.GraphPatternMatch{})[0..]);
-    errdefer if (matches.len > 0) {
-        for (matches) |*match| match.deinit(alloc);
-        alloc.free(matches);
-    };
-
-    const aggregates = if (src.aggregates.len > 0)
-        try cloneGraphAggregates(alloc, src.aggregates)
-    else
-        @constCast((&[_]db_mod.types.GraphAggregateResult{})[0..]);
-    errdefer if (aggregates.len > 0) {
-        for (aggregates) |*aggregate| aggregate.deinit(alloc);
-        alloc.free(aggregates);
-    };
-
-    return .{
-        .name = try alloc.dupe(u8, src.name),
-        .nodes = nodes,
-        .paths = paths,
-        .matches = matches,
-        .aggregates = aggregates,
-        .hits = hits,
-        .total_hits = src.total_hits,
-        .truncated = src.truncated,
-    };
-}
-
-pub fn filterGraphSearchResult(
-    alloc: std.mem.Allocator,
-    source_table: []const u8,
-    src: db_mod.types.GraphSearchResult,
-    exclude_nodes: []const GraphNodeIdentity,
-    exclude_edges: []const []const u8,
-) !db_mod.types.GraphSearchResult {
-    if (exclude_nodes.len == 0 and exclude_edges.len == 0) return try cloneGraphSearchResult(alloc, src);
-
-    var exclude = graph_node_identity.Map(void){};
-    defer exclude.deinit(alloc);
-    for (exclude_nodes) |identity| {
-        _ = try exclude.putIfAbsent(alloc, .{
-            .table = identity.table orelse source_table,
-            .key = identity.key,
-        }, {});
-    }
-
-    var exclude_edge_set = std.StringHashMapUnmanaged(void).empty;
-    defer exclude_edge_set.deinit(alloc);
-    for (exclude_edges) |edge| try exclude_edge_set.put(alloc, edge, {});
-
-    var nodes = std.ArrayListUnmanaged(graph_query_mod.GraphResultNode).empty;
-    defer {
-        for (nodes.items) |*node| node.deinit(alloc);
-        nodes.deinit(alloc);
-    }
-    for (src.nodes) |node| {
-        if (exclude.contains(.{
-            .table = canonicalGraphNodeTable(source_table, node.table) orelse source_table,
-            .key = node.key,
-        })) continue;
-        if (exclude_edge_set.count() > 0) {
-            if (try graphResultNodeHasExcludedEdge(alloc, source_table, node, &exclude_edge_set)) continue;
-        }
-        var owned_node = try cloneGraphNode(alloc, node);
-        nodes.append(alloc, owned_node) catch |err| {
-            owned_node.deinit(alloc);
-            return err;
-        };
-    }
-
-    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    defer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-    for (src.hits) |hit| {
-        if (exclude.contains(.{ .table = hit.source_table orelse source_table, .key = hit.id })) continue;
-        var owned_hit = try hit.clone(alloc);
-        hits.append(alloc, owned_hit) catch |err| {
-            owned_hit.deinit(alloc);
-            return err;
-        };
-    }
-
-    var paths = std.ArrayListUnmanaged(db_mod.types.GraphPath).empty;
-    defer {
-        for (paths.items) |path| graph_paths_mod.freePath(alloc, path);
-        paths.deinit(alloc);
-    }
-    for (src.paths) |path| {
-        if (try graphPathIsExcluded(
-            alloc,
-            source_table,
-            path,
-            &exclude,
-            &exclude_edge_set,
-        )) continue;
-        const owned_path = try cloneGraphPath(alloc, path);
-        paths.append(alloc, owned_path) catch |err| {
-            graph_paths_mod.freePath(alloc, owned_path);
-            return err;
-        };
-    }
-
-    var matches = std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch).empty;
-    defer {
-        for (matches.items) |*match| match.deinit(alloc);
-        matches.deinit(alloc);
-    }
-    for (src.matches) |match| {
-        if (try graphPatternMatchIsExcluded(
-            alloc,
-            source_table,
-            match,
-            &exclude,
-            &exclude_edge_set,
-        )) continue;
-        var owned_match = try cloneGraphPatternMatch(alloc, match);
-        matches.append(alloc, owned_match) catch |err| {
-            owned_match.deinit(alloc);
-            return err;
-        };
-    }
-
-    const total_hits: u32 = @intCast(nodes.items.len);
-    const name = try alloc.dupe(u8, src.name);
-    errdefer alloc.free(name);
-    const owned_nodes = try nodes.toOwnedSlice(alloc);
-    errdefer {
-        for (owned_nodes) |*node| node.deinit(alloc);
-        if (owned_nodes.len > 0) alloc.free(owned_nodes);
-    }
-    const owned_paths = try paths.toOwnedSlice(alloc);
-    errdefer {
-        for (owned_paths) |path| graph_paths_mod.freePath(alloc, path);
-        if (owned_paths.len > 0) alloc.free(owned_paths);
-    }
-    const owned_matches = try matches.toOwnedSlice(alloc);
-    errdefer {
-        for (owned_matches) |*match| match.deinit(alloc);
-        if (owned_matches.len > 0) alloc.free(owned_matches);
-    }
-    const owned_hits = try hits.toOwnedSlice(alloc);
-    errdefer {
-        for (owned_hits) |*hit| hit.deinit(alloc);
-        if (owned_hits.len > 0) alloc.free(owned_hits);
-    }
-
-    const metric_status = try cloneGraphMetricStatuses(alloc, src.metric_status);
-    errdefer {
-        for (metric_status) |*status| status.deinit(alloc);
-        if (metric_status.len > 0) alloc.free(metric_status);
-    }
-
-    return .{
-        .name = name,
-        .nodes = owned_nodes,
-        .paths = owned_paths,
-        .matches = owned_matches,
-        .hits = owned_hits,
-        .total_hits = total_hits,
-        .metric_status = metric_status,
-    };
-}
-
-fn canonicalGraphNodeTable(source_table: []const u8, table: ?[]const u8) ?[]const u8 {
-    const table_name = table orelse return null;
-    if (std.mem.eql(u8, source_table, table_name)) return null;
-    return table_name;
-}
+const canonicalGraphNodeTable = @import("antfly_local_sources").api_local_graph.canonicalGraphNodeTable;
 
 fn canonicalExpandedNodeTable(
     source_table: []const u8,
@@ -11998,19 +10869,7 @@ fn canonicalExpandedNodeTable(
     );
 }
 
-pub fn emptyGraphSearchResult(
-    alloc: std.mem.Allocator,
-    name: []const u8,
-) !db_mod.types.GraphSearchResult {
-    return .{
-        .name = try alloc.dupe(u8, name),
-        .nodes = @constCast((&[_]graph_query_mod.GraphResultNode{})[0..]),
-        .paths = @constCast((&[_]db_mod.types.GraphPath{})[0..]),
-        .matches = @constCast((&[_]db_mod.types.GraphPatternMatch{})[0..]),
-        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
-        .total_hits = 0,
-    };
-}
+pub const emptyGraphSearchResult = @import("antfly_local_sources").api_local_graph.emptyGraphSearchResult;
 
 fn appendRootPathState(
     alloc: std.mem.Allocator,
@@ -12072,6 +10931,8 @@ fn pathStateRetainedBytes(
         total = try std.math.add(usize, total, edge.source.len);
         total = try std.math.add(usize, total, edge.target.len);
         total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.edge_id.len);
+        total = try std.math.add(usize, total, edge.owner_document.len);
         total = try std.math.add(usize, total, edge.metadata.len);
     }
     return total;
@@ -12216,6 +11077,10 @@ fn reserveMaterializedResultNode(
                 total = std.math.add(usize, total, edge.target.len) catch
                     return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
                 total = std.math.add(usize, total, edge.edge_type.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.edge_id.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.owner_document.len) catch
                     return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
                 total = std.math.add(usize, total, edge.metadata.len) catch
                     return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
@@ -12385,54 +11250,11 @@ test "distributed frontier reservations precede allocation and release on deinit
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
-fn cloneGraphFrontierItemParts(
-    alloc: std.mem.Allocator,
-    id: u32,
-    key: []const u8,
-    table: ?[]const u8,
-    depth: u32,
-    distance: f64,
-) !GraphFrontierItem {
-    const owned_key = try alloc.dupe(u8, key);
-    errdefer alloc.free(owned_key);
-    const owned_table = if (table) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_table) |value| alloc.free(value);
+const cloneGraphFrontierItemParts = @import("antfly_local_sources").api_local_graph.cloneGraphFrontierItemParts;
 
-    return .{
-        .id = id,
-        .key = owned_key,
-        .table = owned_table,
-        .depth = depth,
-        .distance = distance,
-    };
-}
+const cloneGraphNodeIdentityParts = @import("antfly_local_sources").api_local_graph.cloneGraphNodeIdentityParts;
 
-fn cloneGraphNodeIdentityParts(
-    alloc: std.mem.Allocator,
-    key: []const u8,
-    table: ?[]const u8,
-) !GraphNodeIdentity {
-    const owned_key = try alloc.dupe(u8, key);
-    errdefer alloc.free(owned_key);
-    const owned_table = if (table) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (owned_table) |value| alloc.free(value);
-
-    return .{ .key = owned_key, .table = owned_table };
-}
-
-fn dupKeys(alloc: std.mem.Allocator, keys: []const []const u8) ![][]u8 {
-    const out = try alloc.alloc([]u8, keys.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |key| alloc.free(key);
-        alloc.free(out);
-    }
-    for (keys, 0..) |key, i| {
-        out[i] = try alloc.dupe(u8, key);
-        initialized += 1;
-    }
-    return out;
-}
+const dupKeys = @import("antfly_local_sources").api_local_graph.dupKeys;
 
 fn dupNodeIdentities(
     alloc: std.mem.Allocator,
@@ -12459,36 +11281,11 @@ fn freeNodeIdentities(
     if (identities.len > 0) alloc.free(identities);
 }
 
-fn dupSortedUniqueKeys(alloc: std.mem.Allocator, keys: []const []const u8) ![][]u8 {
-    if (keys.len == 0) return &.{};
-    var out = try dupKeys(alloc, keys);
-    std.mem.sort([]u8, out, {}, stringSliceLessThan);
+const dupSortedUniqueKeys = @import("antfly_local_sources").api_local_graph.dupSortedUniqueKeys;
 
-    var write: usize = 0;
-    for (out, 0..) |key, read| {
-        if (read > 0 and std.mem.eql(u8, key, out[read - 1])) {
-            alloc.free(key);
-            continue;
-        }
-        out[write] = key;
-        write += 1;
-    }
-    if (write == out.len) return out;
-    return alloc.realloc(out, write) catch |err| {
-        for (out[0..write]) |key| alloc.free(key);
-        alloc.free(out);
-        return err;
-    };
-}
+const stringSliceLessThan = @import("antfly_local_sources").api_local_graph.stringSliceLessThan;
 
-fn stringSliceLessThan(_: void, left: []const u8, right: []const u8) bool {
-    return std.mem.lessThan(u8, left, right);
-}
-
-fn freeKeys(alloc: std.mem.Allocator, keys: [][]u8) void {
-    for (keys) |key| alloc.free(key);
-    if (keys.len > 0) alloc.free(keys);
-}
+const freeKeys = @import("antfly_local_sources").api_local_graph.freeKeys;
 
 pub fn testResultRefFailClosedGuards(alloc: std.mem.Allocator) !void {
     {
@@ -13043,29 +11840,11 @@ fn freeFrontier(alloc: std.mem.Allocator, items: []FrontierState) void {
     if (items.len > 0) alloc.free(items);
 }
 
-fn dupConstStrings(alloc: std.mem.Allocator, items: []const []const u8) ![][]const u8 {
-    const out = try alloc.alloc([]const u8, items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |item| alloc.free(item);
-        alloc.free(out);
-    }
-    for (items, 0..) |item, i| {
-        out[i] = try alloc.dupe(u8, item);
-        initialized += 1;
-    }
-    return out;
-}
+const dupConstStrings = @import("antfly_local_sources").api_local_graph.dupConstStrings;
 
-fn freeConstStrings(alloc: std.mem.Allocator, items: []const []const u8) void {
-    for (items) |item| alloc.free(item);
-    if (items.len > 0) alloc.free(items);
-}
+const freeConstStrings = @import("antfly_local_sources").api_local_graph.freeConstStrings;
 
-fn freePathArray(alloc: std.mem.Allocator, path: [][]const u8) void {
-    for (path) |item| alloc.free(item);
-    if (path.len > 0) alloc.free(path);
-}
+const freePathArray = @import("antfly_local_sources").api_local_graph.freePathArray;
 
 fn reconstructPath(
     alloc: std.mem.Allocator,
@@ -13142,10 +11921,7 @@ fn reconstructPathEdges(
     return out;
 }
 
-fn freePathEdges(alloc: std.mem.Allocator, edges: []graph_query_mod.PathEdgeInfo) void {
-    for (edges) |edge| freeOwnedPathEdge(alloc, edge);
-    if (edges.len > 0) alloc.free(edges);
-}
+const freePathEdges = @import("antfly_local_sources").api_local_graph.freePathEdges;
 
 fn pathLength(path_states: []const PathState, id: u32) usize {
     var len: usize = 0;
@@ -13167,299 +11943,33 @@ fn pathEdgeLength(path_states: []const PathState, id: u32) usize {
     return len;
 }
 
-fn cloneGraphNodes(
-    alloc: std.mem.Allocator,
-    nodes: []const graph_query_mod.GraphResultNode,
-) ![]graph_query_mod.GraphResultNode {
-    const out = try alloc.alloc(graph_query_mod.GraphResultNode, nodes.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*node| node.deinit(alloc);
-        alloc.free(out);
-    }
-    for (nodes, 0..) |node, i| {
-        out[i] = try cloneGraphNode(alloc, node);
-        initialized += 1;
-    }
-    return out;
-}
+const cloneGraphNodes = @import("antfly_local_sources").api_local_graph.cloneGraphNodes;
 
-fn graphPathIsExcluded(
-    alloc: std.mem.Allocator,
-    source_table: []const u8,
-    path: db_mod.types.GraphPath,
-    exclude: *graph_node_identity.Map(void),
-    exclude_edge_set: *std.StringHashMapUnmanaged(void),
-) !bool {
-    if (path.nodes.len == 0 or path.edges.len != path.nodes.len - 1)
-        return error.InvalidGraphPath;
-    for (path.nodes, 0..) |node, i| {
-        if (exclude.contains(.{
-            .table = graphPathNodeTable(path, i) orelse source_table,
-            .key = node,
-        })) return true;
-    }
-    if (exclude_edge_set.count() == 0) return false;
-    for (path.edges, 0..) |edge, i| {
-        const edge_key = try allocEdgeExclusionKey(
-            alloc,
-            .{
-                .table = graphPathNodeTable(path, i) orelse source_table,
-                .key = path.nodes[i],
-            },
-            .{
-                .table = graphPathNodeTable(path, i + 1) orelse source_table,
-                .key = path.nodes[i + 1],
-            },
-            edge.traversal_direction,
-            edge.edge_type,
-        );
-        defer alloc.free(edge_key);
-        if (exclude_edge_set.contains(edge_key)) return true;
-    }
-    return false;
-}
+const graphPathIsExcluded = @import("antfly_local_sources").api_local_graph.graphPathIsExcluded;
 
-fn graphResultNodePathTable(
-    source_table: []const u8,
-    node: graph_query_mod.GraphResultNode,
-    index: usize,
-) []const u8 {
-    if (node.path_tables) |tables| {
-        if (index < tables.len) return tables[index] orelse source_table;
-    }
-    return source_table;
-}
+const graphResultNodePathTable = @import("antfly_local_sources").api_local_graph.graphResultNodePathTable;
 
-fn graphResultNodeTouchesExcludedNode(
-    source_table: []const u8,
-    node: graph_query_mod.GraphResultNode,
-    exclude: *graph_node_identity.Map(void),
-) !bool {
-    const path = node.path orelse return false;
-    if (node.path_tables) |tables| {
-        if (tables.len != path.len) return error.InvalidGraphPath;
-    }
-    for (path, 0..) |key, index| {
-        if (exclude.contains(.{
-            .table = graphResultNodePathTable(source_table, node, index),
-            .key = key,
-        })) return true;
-    }
-    return false;
-}
+const graphResultNodeTouchesExcludedNode = @import("antfly_local_sources").api_local_graph.graphResultNodeTouchesExcludedNode;
 
-fn graphResultNodeHasExcludedEdge(
-    alloc: std.mem.Allocator,
-    source_table: []const u8,
-    node: graph_query_mod.GraphResultNode,
-    exclude_edge_set: *std.StringHashMapUnmanaged(void),
-) !bool {
-    const edges = node.path_edges orelse return false;
-    if (edges.len == 0) return false;
-    const path = node.path orelse return error.InvalidGraphPath;
-    if (path.len != edges.len + 1) return error.InvalidGraphPath;
-    if (node.path_tables) |tables| {
-        if (tables.len != path.len) return error.InvalidGraphPath;
-    }
-    for (edges, 0..) |edge, index| {
-        const edge_key = try allocEdgeExclusionKey(
-            alloc,
-            .{
-                .table = graphResultNodePathTable(source_table, node, index),
-                .key = path[index],
-            },
-            .{
-                .table = graphResultNodePathTable(source_table, node, index + 1),
-                .key = path[index + 1],
-            },
-            edge.traversal_direction,
-            edge.edge_type,
-        );
-        defer alloc.free(edge_key);
-        if (exclude_edge_set.contains(edge_key)) return true;
-    }
-    return false;
-}
+const graphResultNodeHasExcludedEdge = @import("antfly_local_sources").api_local_graph.graphResultNodeHasExcludedEdge;
 
-fn graphPatternMatchIsExcluded(
-    alloc: std.mem.Allocator,
-    source_table: []const u8,
-    match: db_mod.types.GraphPatternMatch,
-    exclude: *graph_node_identity.Map(void),
-    exclude_edge_set: *std.StringHashMapUnmanaged(void),
-) !bool {
-    for (match.bindings) |binding| {
-        if (exclude.contains(.{
-            .table = canonicalGraphNodeTable(source_table, binding.node.table) orelse source_table,
-            .key = binding.node.key,
-        })) return true;
-        if (try graphResultNodeTouchesExcludedNode(source_table, binding.node, exclude)) return true;
-        if (exclude_edge_set.count() > 0 and
-            try graphResultNodeHasExcludedEdge(alloc, source_table, binding.node, exclude_edge_set)) return true;
-    }
-    return false;
-}
+const graphPatternMatchIsExcluded = @import("antfly_local_sources").api_local_graph.graphPatternMatchIsExcluded;
 
-fn cloneGraphPaths(
-    alloc: std.mem.Allocator,
-    paths: []const db_mod.types.GraphPath,
-) ![]db_mod.types.GraphPath {
-    const out = try alloc.alloc(db_mod.types.GraphPath, paths.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |path| graph_paths_mod.freePath(alloc, path);
-        alloc.free(out);
-    }
-    for (paths, 0..) |path, i| {
-        out[i] = try cloneGraphPath(alloc, path);
-        initialized += 1;
-    }
-    return out;
-}
+const cloneGraphPaths = @import("antfly_local_sources").api_local_graph.cloneGraphPaths;
 
-fn cloneGraphPatternMatches(
-    alloc: std.mem.Allocator,
-    matches: []const db_mod.types.GraphPatternMatch,
-) ![]db_mod.types.GraphPatternMatch {
-    const out = try alloc.alloc(db_mod.types.GraphPatternMatch, matches.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*match| match.deinit(alloc);
-        alloc.free(out);
-    }
-    for (matches, 0..) |match, i| {
-        out[i] = try cloneGraphPatternMatch(alloc, match);
-        initialized += 1;
-    }
-    return out;
-}
+const cloneGraphPatternMatches = @import("antfly_local_sources").api_local_graph.cloneGraphPatternMatches;
 
-fn cloneGraphAggregates(
-    alloc: std.mem.Allocator,
-    aggregates: []const db_mod.types.GraphAggregateResult,
-) ![]db_mod.types.GraphAggregateResult {
-    const out = try alloc.alloc(db_mod.types.GraphAggregateResult, aggregates.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*aggregate| aggregate.deinit(alloc);
-        alloc.free(out);
-    }
-    for (aggregates, 0..) |aggregate, i| {
-        const distinct_values = try alloc.alloc(graph_node_identity.Ref, aggregate.distinct_values.len);
-        var distinct_initialized: usize = 0;
-        errdefer {
-            for (distinct_values[0..distinct_initialized]) |identity| {
-                if (identity.table) |table| alloc.free(table);
-                alloc.free(identity.key);
-            }
-            if (distinct_values.len > 0) alloc.free(distinct_values);
-        }
-        for (aggregate.distinct_values, 0..) |identity, identity_index| {
-            const table = if (identity.table) |table_name| try alloc.dupe(u8, table_name) else null;
-            errdefer if (table) |table_name| alloc.free(table_name);
-            distinct_values[identity_index] = .{
-                .table = table,
-                .key = try alloc.dupe(u8, identity.key),
-            };
-            distinct_initialized += 1;
-        }
-        out[i] = .{
-            .name = try alloc.dupe(u8, aggregate.name),
-            .value = aggregate.value,
-            .exact = aggregate.exact,
-            .distinct_values = distinct_values,
-        };
-        initialized += 1;
-    }
-    return out;
-}
+const cloneGraphAggregates = @import("antfly_local_sources").api_local_graph.cloneGraphAggregates;
 
-fn cloneGraphPatternMatch(
-    alloc: std.mem.Allocator,
-    match: db_mod.types.GraphPatternMatch,
-) !db_mod.types.GraphPatternMatch {
-    const bindings = try alloc.alloc(db_mod.types.GraphPatternBinding, match.bindings.len);
-    var bindings_initialized: usize = 0;
-    errdefer {
-        for (bindings[0..bindings_initialized]) |*binding| binding.deinit(alloc);
-        alloc.free(bindings);
-    }
-    for (match.bindings, 0..) |binding, i| {
-        bindings[i] = try cloneGraphPatternBinding(alloc, binding);
-        bindings_initialized += 1;
-    }
+const cloneGraphPatternMatch = @import("antfly_local_sources").api_local_graph.cloneGraphPatternMatch;
 
-    const path = try dupPathEdges(alloc, match.path);
-    errdefer freePathEdges(alloc, path);
+const cloneGraphPatternBinding = @import("antfly_local_sources").api_local_graph.cloneGraphPatternBinding;
 
-    const null_aliases = try cloneOwnedStrings(alloc, match.null_aliases);
-    errdefer {
-        for (null_aliases) |alias| alloc.free(alias);
-        if (null_aliases.len > 0) alloc.free(null_aliases);
-    }
+const cloneSearchHits = @import("antfly_local_sources").api_local_graph.cloneSearchHits;
 
-    return .{
-        .bindings = bindings,
-        .path = path,
-        .null_aliases = null_aliases,
-    };
-}
+const cloneGraphMetricValues = @import("antfly_local_sources").api_local_graph.cloneGraphMetricValues;
 
-fn cloneGraphPatternBinding(
-    alloc: std.mem.Allocator,
-    binding: db_mod.types.GraphPatternBinding,
-) !db_mod.types.GraphPatternBinding {
-    const alias = try alloc.dupe(u8, binding.alias);
-    errdefer alloc.free(alias);
-    const node = try cloneGraphNode(alloc, binding.node);
-    return .{ .alias = alias, .node = node };
-}
-
-fn cloneSearchHits(
-    alloc: std.mem.Allocator,
-    hits: []const db_mod.types.SearchHit,
-) ![]db_mod.types.SearchHit {
-    const out = try alloc.alloc(db_mod.types.SearchHit, hits.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*hit| hit.deinit(alloc);
-        alloc.free(out);
-    }
-    for (hits, 0..) |hit, i| {
-        out[i] = try hit.clone(alloc);
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneGraphMetricValues(
-    alloc: std.mem.Allocator,
-    values: []const graph_query_mod.GraphMetricValue,
-) ![]graph_query_mod.GraphMetricValue {
-    if (values.len == 0) return @constCast((&[_]graph_query_mod.GraphMetricValue{})[0..]);
-    const out = try alloc.alloc(graph_query_mod.GraphMetricValue, values.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*value| value.deinit(alloc);
-        alloc.free(out);
-    }
-    for (values, 0..) |value, i| {
-        out[i] = .{
-            .name = try alloc.dupe(u8, value.name),
-            .score = value.score,
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn cloneGraphMetricStatuses(
-    alloc: std.mem.Allocator,
-    statuses: []const db_mod.types.GraphMetricStatus,
-) ![]db_mod.types.GraphMetricStatus {
-    return db_mod.types.cloneGraphMetricStatuses(alloc, statuses);
-}
+const cloneGraphMetricStatuses = @import("antfly_local_sources").api_local_graph.cloneGraphMetricStatuses;
 
 fn cloneGraphMetricStatus(
     alloc: std.mem.Allocator,
@@ -13802,97 +12312,17 @@ fn retainDistributedGraphProjectedMetrics(
     }
 }
 
-fn cloneGraphNode(
-    alloc: std.mem.Allocator,
-    node: graph_query_mod.GraphResultNode,
-) !graph_query_mod.GraphResultNode {
-    const key = try alloc.dupe(u8, node.key);
-    errdefer alloc.free(key);
-    const path = if (node.path) |value| try dupPath(alloc, value) else null;
-    errdefer if (path) |value| freePathArray(alloc, value);
-    const path_tables = if (node.path_tables) |value| try dupOptionalStrings(alloc, value) else null;
-    errdefer if (path_tables) |value| freeOptionalStrings(alloc, value);
-    const path_edges = if (node.path_edges) |value| try dupPathEdges(alloc, value) else null;
-    errdefer if (path_edges) |value| freePathEdges(alloc, value);
-    const provenance = if (node.provenance) |value| try dupPath(alloc, value) else null;
-    errdefer if (provenance) |value| freePathArray(alloc, value);
-    const table = if (node.table) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (table) |value| alloc.free(value);
+const cloneGraphNode = @import("antfly_local_sources").api_local_graph.cloneGraphNode;
 
-    return .{
-        .key = key,
-        .depth = node.depth,
-        .distance = node.distance,
-        .path = path,
-        .path_tables = path_tables,
-        .path_edges = path_edges,
-        .provenance = provenance,
-        .table = table,
-        .metrics = try cloneGraphMetricValues(alloc, node.metrics),
-    };
-}
+const dupPath = @import("antfly_local_sources").api_local_graph.dupPath;
 
-fn dupPath(alloc: std.mem.Allocator, path: []const []const u8) ![][]const u8 {
-    const out = try alloc.alloc([]const u8, path.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |item| alloc.free(item);
-        alloc.free(out);
-    }
-    for (path, 0..) |item, i| {
-        out[i] = try alloc.dupe(u8, item);
-        initialized += 1;
-    }
-    return out;
-}
+const cloneOwnedStrings = @import("antfly_local_sources").api_local_graph.cloneOwnedStrings;
 
-fn cloneOwnedStrings(alloc: std.mem.Allocator, items: []const []const u8) ![][]u8 {
-    const out = try alloc.alloc([]u8, items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |item| alloc.free(item);
-        alloc.free(out);
-    }
-    for (items, 0..) |item, i| {
-        out[i] = try alloc.dupe(u8, item);
-        initialized += 1;
-    }
-    return out;
-}
+const dupOptionalStrings = @import("antfly_local_sources").api_local_graph.dupOptionalStrings;
 
-fn dupOptionalStrings(
-    alloc: std.mem.Allocator,
-    items: []const ?[]const u8,
-) ![]?[]const u8 {
-    if (items.len == 0) return &.{};
-    const out = try alloc.alloc(?[]const u8, items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |item| if (item) |value| alloc.free(value);
-        alloc.free(out);
-    }
-    for (items, 0..) |item, i| {
-        out[i] = if (item) |value| try alloc.dupe(u8, value) else null;
-        initialized += 1;
-    }
-    return out;
-}
+const freeOptionalStrings = @import("antfly_local_sources").api_local_graph.freeOptionalStrings;
 
-fn freeOptionalStrings(
-    alloc: std.mem.Allocator,
-    items: []const ?[]const u8,
-) void {
-    for (items) |item| if (item) |value| alloc.free(value);
-    if (items.len > 0) alloc.free(items);
-}
-
-fn graphPathNodeTable(
-    path: db_mod.types.GraphPath,
-    index: usize,
-) ?[]const u8 {
-    if (path.node_tables.len != path.nodes.len) return null;
-    return path.node_tables[index];
-}
+const graphPathNodeTable = @import("antfly_local_sources").api_local_graph.graphPathNodeTable;
 
 fn optionalGraphTableEql(
     left: ?[]const u8,
@@ -13908,49 +12338,11 @@ fn optionalStringsContainValue(items: []const ?[]const u8) bool {
     return false;
 }
 
-fn dupPathEdges(alloc: std.mem.Allocator, edges: []const graph_query_mod.PathEdgeInfo) ![]graph_query_mod.PathEdgeInfo {
-    const out = try alloc.alloc(graph_query_mod.PathEdgeInfo, edges.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |edge| freeOwnedPathEdge(alloc, edge);
-        alloc.free(out);
-    }
-    for (edges, 0..) |edge, i| {
-        out[i] = try clonePathEdge(alloc, edge);
-        initialized += 1;
-    }
-    return out;
-}
+const dupPathEdges = @import("antfly_local_sources").api_local_graph.dupPathEdges;
 
-fn clonePathEdge(
-    alloc: std.mem.Allocator,
-    edge: graph_query_mod.PathEdgeInfo,
-) !graph_query_mod.PathEdgeInfo {
-    const source = try alloc.dupe(u8, edge.source);
-    errdefer alloc.free(source);
-    const target = try alloc.dupe(u8, edge.target);
-    errdefer alloc.free(target);
-    const edge_type = try alloc.dupe(u8, edge.edge_type);
-    errdefer alloc.free(edge_type);
-    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
-    errdefer if (metadata.len > 0) alloc.free(metadata);
+const clonePathEdge = @import("antfly_local_sources").api_local_graph.clonePathEdge;
 
-    return .{
-        .source = source,
-        .target = target,
-        .edge_type = edge_type,
-        .weight = edge.weight,
-        .metadata = metadata,
-        .traversal_direction = edge.traversal_direction,
-    };
-}
-
-fn freeOwnedPathEdge(alloc: std.mem.Allocator, edge: graph_query_mod.PathEdgeInfo) void {
-    alloc.free(edge.source);
-    alloc.free(edge.target);
-    alloc.free(edge.edge_type);
-    if (edge.metadata.len > 0) alloc.free(edge.metadata);
-}
+const freeOwnedPathEdge = @import("antfly_local_sources").api_local_graph.freeOwnedPathEdge;
 
 test "distributed graph expansion charges physical rows with no visible nodes" {
     const alloc = std.testing.allocator;
@@ -14025,6 +12417,7 @@ test "distributed graph expand request preserves algebraic semiring planning fla
             .start_nodes = .{ .keys = &.{"doc:a"} },
             .params = .{
                 .edge_types = &.{"links"},
+                .edge_filter = .{ .valid_at_ns = 123, .known_at_ns = -456, .properties = &.{.{ .field = "/metadata/group_id", .op = .eq, .value_json = "\"g\"" }} },
                 .max_depth = 3,
                 .max_results = 0,
                 .min_weight = 1.25,
@@ -14083,6 +12476,9 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(parsed.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expect(parsed.params.algebraic_semiring);
     try std.testing.expectEqual(@as(?f64, 1.25), parsed.params.min_weight);
+    try std.testing.expectEqual(@as(?i128, 123), parsed.params.edge_filter.valid_at_ns);
+    try std.testing.expectEqual(@as(?i128, -456), parsed.params.edge_filter.known_at_ns);
+    try std.testing.expectEqualStrings("\"g\"", parsed.params.edge_filter.properties[0].value_json);
     try std.testing.expectEqual(@as(?f64, 9.5), parsed.params.max_weight);
     try std.testing.expect(parsed.tensor_access_path != null);
     try std.testing.expectEqual(algebraic_ir.PhysicalLayout.graph_edges, parsed.tensor_access_path.?.layout);
@@ -14107,6 +12503,7 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(search_req.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expect(search_req.query == .match_all);
     try std.testing.expectEqual(@as(?f64, 1.25), search_req.graph_queries[0].query.params.min_weight);
+    try std.testing.expectEqual(@as(?i128, 123), search_req.graph_queries[0].query.params.edge_filter.valid_at_ns);
     try std.testing.expectEqual(@as(?f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
     try std.testing.expect(search_req.graph_queries[0].query.params.algebraic_semiring);
 
@@ -14585,6 +12982,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
         tie_priorities: bool = false,
         conflicting_copy: bool = false,
         legacy_projection: bool = false,
+        equal_key_endpoints: bool = false,
     };
 
     const FakeWorker = struct {
@@ -14667,13 +13065,13 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
                     try std.testing.expectEqual(if (outgoing) @as(u32, 7) else @as(u32, 4), req.max_scanned_rows);
                 const duplicate = try inner_alloc.alloc(graph_mod.Edge, 1);
                 duplicate[0] = .{
-                    .source = try inner_alloc.dupe(u8, if (outgoing) "doc:a" else "doc:z"),
-                    .target = try inner_alloc.dupe(u8, if (outgoing) "doc:t" else "doc:a"),
+                    .source = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (outgoing) "doc:a" else "doc:z"),
+                    .target = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (outgoing) "doc:t" else "doc:a"),
                     .edge_type = try inner_alloc.dupe(u8, "links"),
                     .weight = 2,
                     .created_at = 0,
                     .updated_at = 0,
-                    .metadata = "",
+                    .metadata = if (state.equal_key_endpoints) try inner_alloc.dupe(u8, "{\"source_table\":\"people\",\"target_table\":\"docs\"}") else "",
                     .winner_rank = if (state.legacy_projection) std.math.maxInt(u64) else if (state.tie_priorities or state.conflicting_copy) 1 else 2,
                     .winner_key_hex = if (state.legacy_projection) "" else try inner_alloc.dupe(u8, if (state.conflicting_copy) "62" else "63"),
                 };
@@ -14684,13 +13082,13 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
                 try std.testing.expectEqual(if (req.direction == .out) @as(u32, 5) else @as(u32, 3), req.max_scanned_rows);
             const result_edges = try inner_alloc.alloc(graph_mod.Edge, 1);
             result_edges[0] = .{
-                .source = try inner_alloc.dupe(u8, if (req.direction == .out) "doc:a" else "doc:z"),
-                .target = try inner_alloc.dupe(u8, if (req.direction == .out) "doc:t" else "doc:a"),
+                .source = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (req.direction == .out) "doc:a" else "doc:z"),
+                .target = try inner_alloc.dupe(u8, if (state.equal_key_endpoints) "doc:a" else if (req.direction == .out) "doc:t" else "doc:a"),
                 .edge_type = try inner_alloc.dupe(u8, "links"),
                 .weight = 1,
                 .created_at = 0,
                 .updated_at = 0,
-                .metadata = "",
+                .metadata = if (state.equal_key_endpoints) try inner_alloc.dupe(u8, "{\"source_table\":\"people\",\"target_table\":\"docs\"}") else "",
                 .winner_rank = if (state.legacy_projection) std.math.maxInt(u64) else 1,
                 .winner_key_hex = try inner_alloc.dupe(u8, "62"),
             };
@@ -14771,7 +13169,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     state.tie_priorities = false;
     var filtered_budget = graph_pattern_mod.WorkBudget.init(10, 7);
     tie_reader.physical_work_budget = &filtered_budget;
-    var filtered_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "doc:a", .{
+    var filtered_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "docs", "doc:a", .{
         .direction = .out,
         .edge_types = &.{"links"},
         .min_weight = 1.5,
@@ -14783,7 +13181,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
 
     var selected_budget = graph_pattern_mod.WorkBudget.init(10, 7);
     tie_reader.physical_work_budget = &selected_budget;
-    var selected_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "doc:a", .{
+    var selected_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "docs", "doc:a", .{
         .direction = .out,
         .edge_types = &.{"links"},
         .max_weight = 1.5,
@@ -14797,6 +13195,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
         alloc,
         tie_reader,
         "docs",
+        "docs",
         "doc:a",
         .{ .direction = .out, .edge_types = &.{"links"} },
         &exhausted_budget,
@@ -14805,6 +13204,30 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     try std.testing.expectEqual(graph_work_budget.Dimension.explored_nodes, exhausted_budget.exhaustion().?.dimension);
 
     state.strict_scan_ceiling = false;
+    state.equal_key_endpoints = true;
+    // A physical edge can share the key while departing from another table.
+    // It consumes scan allowance, but no logical neighbor capacity.
+    var wrong_table_budget = graph_pattern_mod.WorkBudget.init(0, 7);
+    tie_reader.physical_work_budget = &wrong_table_budget;
+    var wrong_table_step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", "docs", "doc:a", .{ .direction = .out, .edge_types = &.{"links"} }, &wrong_table_budget);
+    defer wrong_table_step.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), wrong_table_step.visibleNodes().len);
+    try std.testing.expect(wrong_table_budget.exhaustion() == null);
+    try std.testing.expect(wrong_table_budget.remaining_physical_edges < 7);
+    for ([_]struct { current: []const u8, direction: graph_mod.EdgeDirection, adjacent_table: []const u8, orientation: graph_mod.EdgeDirection }{
+        .{ .current = "docs", .direction = .in, .adjacent_table = "people", .orientation = .in },
+        .{ .current = "docs", .direction = .both, .adjacent_table = "people", .orientation = .in },
+        .{ .current = "people", .direction = .both, .adjacent_table = "docs", .orientation = .out },
+    }) |case| {
+        var qualified_budget = graph_pattern_mod.WorkBudget.init(100, 100);
+        tie_reader.physical_work_budget = &qualified_budget;
+        var step = try canonicalGraphStepAlloc(alloc, tie_reader, "docs", case.current, "doc:a", .{ .direction = case.direction, .edge_types = &.{"links"} }, &qualified_budget);
+        defer step.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), step.visibleNodes().len);
+        try std.testing.expectEqualStrings(case.adjacent_table, step.visibleNodes()[0].table.?);
+        try std.testing.expectEqual(case.orientation, step.visibleNodes()[0].path_edges.?[0].traversal_direction.?);
+    }
+    state.equal_key_endpoints = false;
     const base_result = db_mod.types.SearchResult{
         .alloc = alloc,
         .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
@@ -14940,12 +13363,190 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     try std.testing.expectEqual(@as(f64, 1), shortest.paths[0].total_weight);
 }
 
+test "distributed graph edge reader finds fact owners outside the source endpoint shard" {
+    const alloc = std.testing.allocator;
+
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"source\":{\"artifact\":\"facts\",\"nodes\":{\"source\":\"{{ _item.source }}\"},\"edge\":{\"edge_id\":\"{{ _doc.key }}\"}}}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "doc:m" },
+            .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "doc:m", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    const TestState = struct {
+        edge_calls: u32 = 0,
+        probe_calls: u32 = 0,
+    };
+
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{
+                .ptr = state,
+                .vtable = &.{
+                    .execute_graph_expand = executeGraphExpand,
+                    .execute_graph_hydrate = executeGraphHydrate,
+                    .execute_graph_get_edges = executeGraphGetEdges,
+                },
+            };
+        }
+
+        fn executeGraphExpand(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            return error.UnsupportedQueryRequest;
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.probe_calls += 1;
+            try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
+            const mask = try inner_alloc.alloc(bool, req.keys.len);
+            @memset(mask, group_id == 22);
+            return .{ .has_incoming = mask };
+        }
+
+        fn executeGraphGetEdges(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: GraphEdgesRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !GraphEdgesResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.edge_calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings("graph_idx", req.index_name);
+            try std.testing.expectEqual(@as(usize, 1), req.edge_types.len);
+            try std.testing.expectEqualStrings("links", req.edge_types[0]);
+            try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
+            if (group_id == 11) {
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
+                return .{ .edges = @constCast((&[_]graph_mod.Edge{})[0..]) };
+            }
+            try std.testing.expectEqual(@as(u64, 22), group_id);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
+            const result_edges = try inner_alloc.alloc(graph_mod.Edge, 1);
+            result_edges[0] = .{
+                .source = try inner_alloc.dupe(u8, "doc:a"),
+                .edge_id = try inner_alloc.dupe(u8, "fact:z"),
+                .owner_document = try inner_alloc.dupe(u8, "fact:z"),
+                .target = try inner_alloc.dupe(u8, "doc:z"),
+                .edge_type = try inner_alloc.dupe(u8, "links"),
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            };
+            return .{ .edges = result_edges, .scanned_rows = @intCast(result_edges.len) };
+        }
+    };
+
+    var state = TestState{};
+    const topology_epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
+    var admission = GraphNodeAdmissionContext.init(
+        alloc,
+        FakeCatalog.iface(),
+        FakeWorker.iface(&state),
+        "docs",
+        "graph_idx",
+        topology_epoch,
+        .{ .identity_read_generation = 12345 },
+        null,
+        &.{},
+        .{},
+        .read_index,
+    );
+    defer admission.deinit();
+
+    const reader = DistributedEdgeReader{
+        .catalog = FakeCatalog.iface(),
+        .worker = FakeWorker.iface(&state),
+        .source_table = "docs",
+        .index_name = "graph_idx",
+        .consistency = .read_index,
+        .admission = &admission,
+    };
+
+    const edges = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .out);
+    defer reader.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("fact:z", edges[0].edge_id);
+    try std.testing.expectEqualStrings("doc:a", edges[0].source);
+    try std.testing.expectEqual(@as(u32, 2), state.edge_calls);
+    try std.testing.expectEqual(@as(u32, 0), state.probe_calls);
+    var batches = try batchFrontierByGroup(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", &.{.{ .key = @constCast("doc:a"), .depth = 0 }}, 1, .out, "graph_idx", .read_index, &admission);
+    defer freeFrontierBatches(alloc, &batches);
+    try std.testing.expectEqual(@as(usize, 2), batches.count());
+}
+
 test "distributed graph edges response round trips owned edges" {
     const alloc = std.testing.allocator;
     var edges = [_]graph_mod.Edge{.{
         .source = "doc:a",
         .target = "doc:b",
         .edge_type = "links",
+        .edge_id = "fact:1",
+        .owner_document = "fact:1",
         .weight = 2.5,
         .created_at = 11,
         .updated_at = 12,
@@ -14965,6 +13566,16 @@ test "distributed graph edges response round trips owned edges" {
     try std.testing.expect(std.mem.indexOf(u8, legacy_wire, "\"winner_rank\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, legacy_wire, "\"winner_key_hex\"") == null);
 
+    const FailureCase = struct {
+        fn run(allocator: std.mem.Allocator, body: []const u8) !void {
+            var response = try parseGraphEdgesResponse(allocator, body);
+            defer response.deinit(allocator);
+            try std.testing.expectEqualStrings("fact:1", response.edges[0].edge_id);
+            try std.testing.expectEqualStrings("fact:1", response.edges[0].owner_document);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, FailureCase.run, .{encoded});
+
     var parsed = try parseGraphEdgesResponse(alloc, encoded);
     defer parsed.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), parsed.edges.len);
@@ -14972,6 +13583,8 @@ test "distributed graph edges response round trips owned edges" {
     try std.testing.expectEqualStrings("doc:a", parsed.edges[0].source);
     try std.testing.expectEqualStrings("doc:b", parsed.edges[0].target);
     try std.testing.expectEqualStrings("links", parsed.edges[0].edge_type);
+    try std.testing.expectEqualStrings("fact:1", parsed.edges[0].edge_id);
+    try std.testing.expectEqualStrings("fact:1", parsed.edges[0].owner_document);
     try std.testing.expectEqual(@as(u64, 3), parsed.edges[0].winner_rank);
     try std.testing.expectEqualStrings("6162", parsed.edges[0].winner_key_hex);
     try std.testing.expectEqual(@as(f64, 2.5), parsed.edges[0].weight);
@@ -16470,8 +15083,8 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
-        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
-            .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
+        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".field_names.len]u32 =
+            @splat(0),
         lifecycle_valid: bool = true,
     };
 
@@ -16534,7 +15147,7 @@ test "distributed graph retries once on topology change and succeeds" {
 
         fn reachLifecycle(ptr: *anyopaque, event: LifecycleEvent) void {
             const state: *TestState = @ptrCast(@alignCast(ptr));
-            state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
+            state.lifecycle_counts[@backingInt(event.phase)] += 1;
             switch (event.phase) {
                 // This fixture deliberately uses the scalar identity stamp,
                 // so it has no per-shard snapshot vector to count.
@@ -16664,12 +15277,12 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:b", results[0].hits[0].id);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.source_snapshot_acquired)]);
-    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@intFromEnum(LifecyclePhase.snapshot_validated)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.attempt_failed)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.expand_round_completed)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.source_snapshot_acquired)]);
+    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@backingInt(LifecyclePhase.snapshot_validated)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.attempt_failed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.expand_round_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.hydration_started)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.hydration_completed)]);
     try std.testing.expect(state.lifecycle_valid);
 }
 
@@ -17173,6 +15786,156 @@ test "distributed graph metric post processing applies max results after filter 
     try std.testing.expectEqualStrings("C", nodes.items[0].key);
 }
 
+test "projected graph endpoint routing recognizes every source form" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"nodes\":{\"source\":\"alice\"},\"edge\":{\"edge_id\":\"fact:1\"}}",
+        "{\"source\":{\"nodes\":{\"source\":\"alice\"},\"edge\":{\"edge_id\":\"fact:1\"}}}",
+        "{\"sources\":[{\"artifact\":\"facts\",\"nodes\":{\"source\":\"alice\"},\"edge\":{\"edge_id\":\"fact:1\"}}]}",
+    }) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expect(graphSourceProjectsEndpoints(parsed.value));
+    }
+    var legacy = try std.json.parseFromSlice(std.json.Value, alloc, "{\"source\":{\"nodes\":{\"target\":\"bob\"}}}", .{});
+    defer legacy.deinit();
+    try std.testing.expect(!graphSourceProjectsEndpoints(legacy.value));
+    const first = try allocRelationshipExclusionKey(alloc, .{ .table = "entities", .key = "a" }, .{ .table = "entities", .key = "b" }, .out, "RELATES_TO", "fact:1", "fact:1");
+    defer alloc.free(first);
+    const second = try allocRelationshipExclusionKey(alloc, .{ .table = "entities", .key = "a" }, .{ .table = "entities", .key = "b" }, .out, "RELATES_TO", "fact:2", "fact:2");
+    defer alloc.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "distributed weighted fact paths rank every owner shard relationship before deduplication" {
+    const alloc = std.testing.allocator;
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .description = "docs table",
+            .schema_json = "",
+            .read_schema_json = "",
+            .indexes_json = "{\"graph_idx\":{\"type\":\"graph\",\"source\":{\"artifact\":\"facts\",\"nodes\":{\"source\":\"{{ _item.source }}\"},\"edge\":{\"edge_id\":\"{{ _doc.key }}\"}}}}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "doc:m" },
+            .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "doc:m", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .routing_snapshot = routingSnapshot,
+                    .linearizable_routing_snapshot = routingSnapshot,
+                    .free_routing_snapshot = freeRoutingSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn routingSnapshot(_: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            return .{
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+            };
+        }
+
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+    };
+
+    const TestState = struct { graph: *graph_mod.GraphIndex, calls: u32 = 0 };
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{ .ptr = state, .vtable = &.{ .execute_graph_expand = expand, .execute_graph_hydrate = hydrate, .execute_graph_get_edges = edges } };
+        }
+        fn hydrate(_: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphHydrateRequest, _: raft_mod.ReadConsistency) !GraphHydrateResponse {
+            const mask = try a.alloc(bool, request.keys.len);
+            @memset(mask, group == 22);
+            const physical = try a.dupe(bool, mask);
+            return .{ .has_incoming = mask, .has_physical_incoming = physical, .incoming_index_identity = request.incoming_index_identity, .incoming_ttl_now_ns = request.incoming_ttl_now_ns, .incoming_scanned_rows = @intCast(mask.len) };
+        }
+        fn edges(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphEdgesRequest, _: raft_mod.ReadConsistency) !GraphEdgesResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            if (group == 11) return .{ .edges = &.{} };
+            const result = try state.graph.getEdgesByTypesBounded(a, request.key, request.edge_types, request.direction, request.max_edges, request.max_owned_bytes);
+            return .{ .edges = result, .scanned_rows = @intCast(result.len) };
+        }
+        fn expand(ptr: *anyopaque, a: std.mem.Allocator, group: u64, _: []const u8, request: GraphExpandRequest, _: raft_mod.ReadConsistency) !GraphExpandResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            try std.testing.expect(!request.params.deduplicate);
+            try std.testing.expectEqual(@as(u32, 0), request.params.max_results);
+            if (group == 11) return .{ .expansions = &.{} };
+            var engine = graph_query_mod.GraphQueryEngine{ .alloc = a };
+            var native = try engine.execute(state.graph, .{ .query_type = .traverse, .index_name = "graph_idx", .start_nodes = .{ .keys = &.{request.frontier[0].key} }, .params = request.params }, &.{request.frontier[0].key});
+            var native_owned = true;
+            errdefer if (native_owned) native.deinit(a);
+            var raw = db_mod.types.GraphSearchResult{ .name = try a.dupe(u8, request.name), .nodes = native.nodes, .hits = &.{}, .total_hits = @intCast(native.nodes.len) };
+            native_owned = false;
+            defer raw.deinit(a);
+            var filtered = try filterGraphSearchResult(a, "docs", raw, request.exclude_nodes, request.exclude_edges);
+            errdefer filtered.deinit(a);
+            const key = try a.dupe(u8, request.frontier[0].key);
+            errdefer a.free(key);
+            const expansions = try a.alloc(GraphExpansion, 1);
+            expansions[0] = .{ .frontier_id = 0, .frontier_key = key, .graph_result = filtered };
+            return .{ .expansions = expansions };
+        }
+    };
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "graph_idx", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "doc:a", .target = "doc:z", .edge_type = "R", .edge_id = "a-heavy", .owner_document = "fact:heavy", .weight = 0.9 },
+        .{ .source = "doc:a", .target = "doc:z", .edge_type = "R", .edge_id = "b-light", .owner_document = "fact:light", .weight = 0.2 },
+        .{ .source = "doc:a", .target = "doc:z", .edge_type = "R", .edge_id = "c-expired", .owner_document = "fact:expired", .weight = 0.01, .metadata_json = "{\"invalid_at\":\"2020-01-01T00:00:00Z\"}" },
+    }, &.{});
+    var state = TestState{ .graph = &graph };
+    for ([_]graph_mod.EdgeDirection{ .out, .in, .both }) |direction| {
+        for ([_]graph_paths_mod.PathWeightMode{ .min_weight, .max_weight }) |mode| {
+            const req = db_mod.types.SearchRequest{ .identity_read_generation = 12345 };
+            const query = db_mod.types.NamedGraphQuery{ .name = "facts", .query = .{
+                .query_type = .k_shortest_paths,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{if (direction == .in) "doc:z" else "doc:a"} },
+                .target_nodes = .{ .keys = &.{if (direction == .in) "doc:a" else "doc:z"} },
+                .k = 3,
+                .params = .{ .max_depth = 2, .direction = direction, .weight_mode = mode, .edge_filter = .{ .valid_at_ns = @import("antfly_local_sources").storage_schema.parseRfc3339ToSignedNs("2022-01-01T00:00:00Z") } },
+            } };
+            const epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
+            var admission = GraphNodeAdmissionContext.init(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", "graph_idx", epoch, req, null, &.{}, .{}, .read_index);
+            defer admission.deinit();
+            var budget = graph_work_budget.WorkBudget.initWithLimits(.{});
+            var result = try executeDistributedKShortestPaths(alloc, FakeCatalog.iface(), FakeWorker.iface(&state), "docs", req, .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 }, &.{}, query, .read_index, &admission, &budget);
+            defer result.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), result.paths.len);
+            try std.testing.expectEqualStrings(if (mode == .min_weight) "b-light" else "a-heavy", result.paths[0].edges[0].edge_id);
+            try std.testing.expectEqualStrings(if (mode == .min_weight) "a-heavy" else "b-light", result.paths[1].edges[0].edge_id);
+            try std.testing.expectEqual(@as(f64, if (mode == .min_weight) 0.2 else 0.9), result.paths[0].total_weight);
+        }
+    }
+    try std.testing.expect(state.calls >= 4);
+}
+
 test "graph hydrate incoming probe wire carries pinned clock and physical allowance" {
     const alloc = std.testing.allocator;
     var request = GraphHydrateRequest{
@@ -17209,4 +15972,32 @@ test "graph hydrate incoming probe wire carries pinned clock and physical allowa
     defer legacy.deinit(alloc);
     try std.testing.expect(legacy.incoming_ttl_now_ns == null);
     try std.testing.expect(legacy.incoming_scanned_rows == null);
+}
+
+pub const encodeGraphHydrateResponseForWire = @import("antfly_local_sources").api_local_graph.encodeGraphHydrateResponseForWire;
+
+pub const encodeGraphEdgesResponseForWire = @import("antfly_local_sources").api_local_graph.encodeGraphEdgesResponseForWire;
+
+pub const encodeGraphExpandResponseForWire = @import("antfly_local_sources").api_local_graph.encodeGraphExpandResponseForWire;
+
+test "legacy graph hydrate wire omits metric fields in both directions" {
+    const alloc = std.testing.allocator;
+    var req = GraphHydrateRequest{ .keys = try dupKeys(alloc, &.{"doc:a"}) };
+    defer req.deinit(alloc);
+    const encoded = try encodeLegacyGraphHydrateRequest(alloc, req);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_index_name\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"metric_reads\"") == null);
+    var parsed = try parseGraphHydrateRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.legacy_wire_request);
+    const response = try encodeGraphHydrateResponseForWire(alloc, .{}, parsed.legacy_wire_request);
+    defer alloc.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"metric_scores\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"metric_status\"") == null);
+    var legacy_response = try parseGraphHydrateResponse(alloc, response);
+    defer legacy_response.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), legacy_response.metric_scores.len);
+    req.metric_reads = try dupGraphMetricReads(alloc, &.{.{ .name = "rank" }});
+    try std.testing.expectError(error.GraphMetricGlobalMaterializationRequired, encodeLegacyGraphHydrateRequest(alloc, req));
 }

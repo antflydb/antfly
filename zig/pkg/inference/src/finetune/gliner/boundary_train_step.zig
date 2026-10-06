@@ -182,7 +182,7 @@ const Session = union(enum) {
             .stages => |*value| &value.base,
         };
     }
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         switch (self.*) {
             inline else => |*value| value.deinit(),
         }
@@ -193,7 +193,7 @@ const Recomputed = struct {
     recipes: replay_bindings.Recipes,
     head_admission: ?recomputed.EnclosingAdmission = null,
 
-    fn deinit(self: *Recomputed) void {
+    pub fn deinit(self: *Recomputed) void {
         self.graph.deinit();
         self.recipes.deinit();
         self.* = undefined;
@@ -311,15 +311,15 @@ pub const Plan = struct {
         for (self.bindings) |*binding| binding.node = try rewritten.remap(binding.node);
         for (self.outputs) |*output| output.node = try rewritten.remap(output.node);
         for (self.proposal_views) |*node| node.* = try rewritten.remap(node.*);
-        if (self.pool_input) |*pool| inline for (std.meta.fields(candidate_graph.PoolInput)) |field| {
-            if (field.type == Id and !std.mem.eql(u8, field.name, "capacity")) @field(pool, field.name) = try rewritten.remap(@field(pool, field.name));
-            if (field.type == ?Id) if (@field(pool, field.name)) |node| {
-                @field(pool, field.name) = try rewritten.remap(node);
+        if (self.pool_input) |*pool| inline for (@typeInfo(candidate_graph.PoolInput).@"struct".field_names, @typeInfo(candidate_graph.PoolInput).@"struct".field_types) |reflected_name, field_type| {
+            if (field_type == Id and !std.mem.eql(u8, reflected_name, "capacity")) @field(pool, reflected_name) = try rewritten.remap(@field(pool, reflected_name));
+            if (field_type == ?Id) if (@field(pool, reflected_name)) |node| {
+                @field(pool, reflected_name) = try rewritten.remap(node);
             };
         };
         if (self.relation_input) |*relation| {
-            inline for (std.meta.fields(task_graph.RelationInput)) |field| {
-                if (field.type == Id and !std.mem.eql(u8, field.name, "pairs") and !std.mem.eql(u8, field.name, "relations")) @field(relation, field.name) = try rewritten.remap(@field(relation, field.name));
+            inline for (@typeInfo(task_graph.RelationInput).@"struct".field_names, @typeInfo(task_graph.RelationInput).@"struct".field_types) |reflected_name, field_type| {
+                if (field_type == Id and !std.mem.eql(u8, reflected_name, "pairs") and !std.mem.eql(u8, reflected_name, "relations")) @field(relation, reflected_name) = try rewritten.remap(@field(relation, reflected_name));
             }
             for (&relation.text_indices) |*node| node.* = try rewritten.remap(node.*);
         }
@@ -520,8 +520,8 @@ pub const Plan = struct {
 
     pub fn sealRecomputedAdmission(self: *Plan, owner: recomputed.EnclosingAdmission) !recomputed.Admission {
         var enclosing = try self.recomputedHeadAdmission();
-        inline for (std.meta.fields(recomputed.EnclosingAdmission)) |field| {
-            @field(enclosing, field.name) = try std.math.add(field.type, @field(enclosing, field.name), @field(owner, field.name));
+        inline for (@typeInfo(recomputed.EnclosingAdmission).@"struct".field_names, @typeInfo(recomputed.EnclosingAdmission).@"struct".field_types) |reflected_name, field_type| {
+            @field(enclosing, reflected_name) = try std.math.add(field_type, @field(enclosing, reflected_name), @field(owner, reflected_name));
         }
         return self.recomputation.?.graph.regional.sealAdmission(enclosing);
     }
@@ -905,7 +905,7 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
         try outputAppend(a, &outputs, limits, .classification, classified, 0);
     }
     if (plan_objectives.heads and layout.queries != 0) {
-        const input = graph_mod.Input{ .text = encoder.nodes.text, .queries = encoder.nodes.queries, .text_mask = try g.reshape(encoder.inputs.routes[@intFromEnum(encoder_graph.RouteKind.text)].valid, &.{ layout.batch, layout.words }), .query_mask = try g.reshape(encoder.inputs.routes[@intFromEnum(encoder_graph.RouteKind.queries)].valid, &.{ layout.batch, layout.queries }) };
+        const input = graph_mod.Input{ .text = encoder.nodes.text, .queries = encoder.nodes.queries, .text_mask = try g.reshape(encoder.inputs.routes[@backingInt(encoder_graph.RouteKind.text)].valid, &.{ layout.batch, layout.words }), .query_mask = try g.reshape(encoder.inputs.routes[@backingInt(encoder_graph.RouteKind.queries)].valid, &.{ layout.batch, layout.queries }) };
         const deferred_query_heads = arithmetic.input_gradients == .pytorch_v2;
         var proposals = try g.buildProposalsWithQueryHeads(input, !deferred_query_heads);
         try proposal_views.appendSlice(a, &.{ proposals.start_logits, proposals.end_logits, proposals.inside_logits, proposals.pool_start, proposals.pool_end });
@@ -1070,10 +1070,10 @@ fn buildOwned(backing: Allocator, owner: *HostOwner, config: model.Config, prepa
     }
     if (!std.meta.eql(plan_objectives, Objectives{})) {
         hash.update("\x00objectives\x00");
-        inline for (std.meta.fields(Objectives)) |field| appendHash(&hash, @intFromBool(@field(plan_objectives, field.name)));
+        inline for (comptime std.meta.fieldNames(Objectives)) |reflected_name| appendHash(&hash, @intFromBool(@field(plan_objectives, reflected_name)));
     }
     hash.update(@tagName(mode));
-    inline for (std.meta.fields(encoder_graph.Layout)) |field| appendHash(&hash, @field(layout, field.name));
+    inline for (comptime std.meta.fieldNames(encoder_graph.Layout)) |reflected_name| appendHash(&hash, @field(layout, reflected_name));
     appendHash(&hash, pool_capacity);
     appendHash(&hash, gold_capacity);
     for (schema_fingerprints) |fingerprint| hash.update(&fingerprint);
@@ -1139,7 +1139,7 @@ const Uploads = struct {
     cb: *const ops.ComputeBackend,
     io: *transfer.IO,
     values: std.ArrayListUnmanaged(ops.CT) = .empty,
-    fn deinit(self: *Uploads) void {
+    pub fn deinit(self: *Uploads) void {
         for (self.values.items) |value| self.cb.free(value);
         self.values.deinit(self.allocator);
     }
@@ -1228,7 +1228,7 @@ fn validateDraws(draws: ?[]const f32, count: usize) !void {
 const DropoutOverrides = struct {
     values: std.StringHashMapUnmanaged([]const f32) = .empty,
     fingerprint: ?[32]u8 = null,
-    fn deinit(self: *DropoutOverrides, a: Allocator) void {
+    pub fn deinit(self: *DropoutOverrides, a: Allocator) void {
         self.values.deinit(a);
     }
 };
@@ -1286,8 +1286,8 @@ fn preparedIdentity(plan: *Plan, targets: [32]u8, prepared: *const processor.Pre
     hash.update(&.{@intFromBool(dropout_fingerprint != null)});
     if (dropout_fingerprint) |fingerprint| hash.update(&fingerprint);
     hash.update(&.{@intFromBool(context.scales_override != null)});
-    if (context.scales_override) |scales| inline for (std.meta.fields(objectives.Scales)) |field| hashFloat(&hash, @field(scales, field.name));
-    inline for (std.meta.fields(objectives.Weights)) |field| hashFloat(&hash, @field(context.weights, field.name));
+    if (context.scales_override) |scales| inline for (comptime std.meta.fieldNames(objectives.Scales)) |reflected_name| hashFloat(&hash, @field(scales, reflected_name));
+    inline for (comptime std.meta.fieldNames(objectives.Weights)) |reflected_name| hashFloat(&hash, @field(context.weights, reflected_name));
     for ([_]f32{ context.progress.gold_start, context.progress.gold_end, context.progress.gold_hold_fraction }) |value| hashFloat(&hash, value);
     for (prepared.input_ids) |id| appendHash(&hash, @bitCast(id));
     for (prepared.attention_mask) |mask| appendHash(&hash, @bitCast(mask));
@@ -1554,8 +1554,8 @@ fn runStep(plan: *Plan, a: Allocator, cb: *const ops.ComputeBackend, parameters:
     }
     const scheduled_scales = try objectives.scales(plan.config.head, context.progress);
     const active_scales = context.scales_override orelse scheduled_scales;
-    inline for (std.meta.fields(objectives.Scales)) |field| {
-        const value = @field(active_scales, field.name);
+    inline for (comptime std.meta.fieldNames(objectives.Scales)) |reflected_name| {
+        const value = @field(active_scales, reflected_name);
         if (!std.math.isFinite(value) or value < 0) return error.InvalidBoundaryTrainingSchedule;
     }
     if (active_scales.gold_injection > 1) return error.InvalidBoundaryTrainingSchedule;

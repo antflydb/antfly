@@ -36,7 +36,7 @@ const Summary = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -248,7 +248,7 @@ fn parseDecodeOptions(value: ?std.json.Value) toon.DecodeOptions {
 fn jsonEqual(a: std.json.Value, b: std.json.Value) bool {
     if (a == .integer and b == .float) return @as(f64, @floatFromInt(a.integer)) == b.float;
     if (a == .float and b == .integer) return a.float == @as(f64, @floatFromInt(b.integer));
-    if (@intFromEnum(a) != @intFromEnum(b)) return false;
+    if (@backingInt(a) != @backingInt(b)) return false;
     return switch (a) {
         .null => true,
         .bool => a.bool == b.bool,

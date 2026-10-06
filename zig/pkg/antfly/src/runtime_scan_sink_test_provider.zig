@@ -12,8 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const Sink = @import("runtime_scan_sink.zig").ScanStreamSink;
-const errors = @import("runtime_error_abi.zig");
+const Sink = @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink;
+const errors = @import("antfly_runtime_abi").error_abi;
 
 export fn scan_sink_test_consume(sink: *const Sink, bytes: [*]const u8, len: usize) callconv(.c) errors.Status {
     sink.start() catch |err| return errors.statusFromError(err);
@@ -31,3 +31,6 @@ fn write(raw: ?*anyopaque, _: []const u8) !void {
     const failure: *const errors.Status = @ptrCast(@alignCast(raw.?));
     if (!failure.isOk()) return errors.errorFromStatus(failure.*);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

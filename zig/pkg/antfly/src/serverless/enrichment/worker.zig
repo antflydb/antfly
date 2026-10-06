@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_codec = @import("../api/codec.zig");
 const api_types = @import("../api/types.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
@@ -26,7 +26,7 @@ const read_lease = @import("../manifest/read_lease.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const query_reader = @import("../query/indexed_reader.zig");
 const wal_mod = @import("../wal/mod.zig");
-const embedder_mod = @import("../../storage/db/enrichment/embedder.zig");
+const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embedder;
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const objectstore = @import("objectstore");
 const artifacts_object_store = @import("../artifacts/object_store.zig");
@@ -234,7 +234,7 @@ pub const SparseEnricher = struct {
         const facts = try document_facts.loadRoot(self.alloc, &pages, manifest.artifacts[facts_index]);
         if (facts.wal_end_lsn != manifest.wal_end_lsn or facts.document_count != manifest.stats.document_count) return error.DocumentFactsSourceChanged;
         if (try @import("../build/document_facts_builder.zig").needsRebuild(self.alloc, facts, manifest.stats.policy, manifest.stats.indexes_json)) return error.EnrichmentPolicyChanged;
-        const stage_index: usize = @intFromEnum(cfg.stage) - 1;
+        const stage_index: usize = @backingInt(cfg.stage) - 1;
         const pending_count = facts.counts[3 + stage_index];
         const pending_page = facts.pending_pages[stage_index];
         const policy = manifest.stats.policy;
@@ -390,7 +390,7 @@ pub const SparseEnricher = struct {
         if (encoded.len > cfg.document_limits.max_output_bytes) return error.EnrichmentDocumentBudgetExceeded;
         try pin.check();
         var operation_buffer: [128]u8 = undefined;
-        const operation = try operation_identity.formatDocument(&operation_buffer, head, @intFromEnum(cfg.stage), key, cfg.pipeline_version);
+        const operation = try operation_identity.formatDocument(&operation_buffer, head, @backingInt(cfg.stage), key, cfg.pipeline_version);
         const timestamp = std.math.add(u64, fact.last_timestamp_ns, 1) catch return error.EnrichmentTimestampOverflow;
         const appended = (try self.wal.appendIdempotentIfLatest(namespace, timestamp, encoded, operation, expected_lsn)) orelse return error.EnrichmentProgressChanged;
         stats.enriched_documents += 1;
@@ -960,7 +960,7 @@ const TrackingEmbedder = struct {
         return error.UnexpectedEmbeddingCall;
     }
 
-    fn deinit(ptr: *anyopaque, _: Allocator) void {
+    pub fn deinit(ptr: *anyopaque, _: Allocator) void {
         const self: *TrackingEmbedder = @ptrCast(@alignCast(ptr));
         self.deinit_count.* += 1;
     }
@@ -1058,7 +1058,7 @@ const CancelAfterAppendWal = struct {
         .truncate_prefix = truncatePrefix,
     };
 
-    fn deinit(_: Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: Allocator, _: *anyopaque) void {}
 
     fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1105,7 +1105,7 @@ const InjectBeforeConditionalAppendWal = struct {
         .truncate_prefix = truncatePrefix,
     };
 
-    fn deinit(_: Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: Allocator, _: *anyopaque) void {}
 
     fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1683,7 +1683,7 @@ test "serverless enrichment pending key cursor admits large bodies and preserves
     update.deinit(a);
     var saw_updated = false;
     for (4..9) |i| {
-        const id_buf = [_]u8{'m'} ** 16;
+        const id_buf = @as([16]u8, @splat('m'));
         const id = id_buf[0..i];
         arrival = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = i + 10, .mutations = &.{.{ .kind = .upsert, .doc_id = id, .body = "{\"text\":\"new tail\"}" }} });
         arrival.deinit(a);

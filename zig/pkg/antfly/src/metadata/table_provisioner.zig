@@ -15,33 +15,33 @@
 const std = @import("std");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
-const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
+const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const backups_api = @import("../api/backups.zig");
-const common_config = @import("../common/config.zig");
-const fs_paths = @import("../common/fs_paths.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const metadata_api = @import("api.zig");
 const table_manager = @import("table_manager.zig");
-const raft_catalog = @import("../raft/catalog.zig");
+const raft_catalog = @import("../raft/storage/catalog.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
-const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
-const internal_keys = @import("../storage/internal_keys.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const coverage_policy = @import("../api/coverage_policy.zig");
-const table_index_config = @import("../api/table_index_config.zig");
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
+const change_journal_mod = @import("antfly_local_sources").storage_db_derived_change_journal;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 const indexes_api = @import("../api/indexes.zig");
-const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+const enrichment_config_validation = @import("antfly_local_sources").storage_db_enrichment_config_validation;
 const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_catalog = @import("../api/table_catalog.zig");
 const tables_api = @import("../api/tables.zig");
 const raft_mod = @import("../raft/mod.zig");
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const shard_db_adapter_mod = @import("shard_db_adapter.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 
-pub const ProvisionSummary = @import("provision_contract.zig").ProvisionSummary;
+pub const ProvisionSummary = @import("antfly_provision_contract").ProvisionSummary;
 
 pub const ReconcileReplicaRootOptions = struct {
     drain_resolver_backfill: bool = true,
@@ -221,7 +221,7 @@ pub fn reconcileReplicaRootWithOptions(
 
         const schema_json = tables_api.effectiveSchemaJson(table.schema_json);
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, schema_json);
-        defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
+        defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, runtime_schema);
         var open_options = provisioningDbOpenOptions();
         open_options.start_resolver_workers = options.drain_resolver_backfill;
         open_options.backend_runtime = options.backend_runtime;
@@ -239,12 +239,22 @@ pub fn reconcileReplicaRootWithOptions(
             .source_table = table.name,
             .destination_authorizer = options.destination_authorizer,
         });
-        summary.merge(index_summary);
+        summary.merge(.{
+            .indexes_added = index_summary.indexes_added,
+            .indexes_removed = index_summary.indexes_removed,
+            .indexes_pending = index_summary.indexes_pending,
+            .enrichments_added = index_summary.enrichments_added,
+            .enrichments_updated = index_summary.enrichments_updated,
+            .enrichments_removed = index_summary.enrichments_removed,
+            .resolvers_added = index_summary.resolvers_added,
+            .resolvers_updated = index_summary.resolvers_updated,
+            .resolvers_removed = index_summary.resolvers_removed,
+        });
     }
     return summary;
 }
 
-fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !@import("../storage/schema.zig").TableSchema {
+fn runtimeTableSchemaFromJson(alloc: std.mem.Allocator, schema_json: []const u8) !@import("antfly_local_sources").storage_schema.TableSchema {
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
     return try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -254,202 +264,28 @@ pub fn reconcileDbIndexes(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
-) !ProvisionSummary {
+) !IndexReconcileSummary {
     return try reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{});
 }
 
-pub const ReconcileDbIndexOptions = struct {
-    /// Hidden restore owners admit physical projections while empty. External
-    /// enrichment/resolution producers remain disabled until publication.
-    restore_build_only: bool = false,
-    drain_resolver_backfill: bool = true,
-    embedding_options: managed_embedder.InitOptions = .{},
-    source_table: []const u8 = "",
-    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
-};
+pub const IndexReconcileSummary = @import("antfly_local_sources").metadata_local_index_reconcile.IndexReconcileSummary;
 
-fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
-    return db.open_mode != .query_readonly and db.open_mode != .status_only;
-}
+pub const ReconcileDbIndexOptions = @import("antfly_local_sources").metadata_local_index_reconcile.ReconcileDbIndexOptions;
 
-pub fn reconcileDbIndexesWithOptions(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-    options: ReconcileDbIndexOptions,
-) !ProvisionSummary {
-    if (options.restore_build_only) {
-        if (!dbIndexReconciliationCanMutate(db)) return error.ReadOnly;
-        const removed = try removeMissingIndexes(alloc, db, indexes_json);
-        const indexes = try ensureIndexes(alloc, db, indexes_json);
-        try db.syncIndexes(true);
-        return .{ .indexes_added = indexes.added, .indexes_removed = removed + indexes.removed, .indexes_pending = indexes.pending };
-    }
-    var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
-    defer {
-        for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
-        desired_enrichments.deinit(alloc);
-    }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
-    try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
-    dedupeDesiredEnrichments(alloc, &desired_enrichments);
-    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
+const dbIndexReconciliationCanMutate = @import("antfly_local_sources").metadata_local_index_reconcile.dbIndexReconciliationCanMutate;
 
-    // Read/query opens attach to already-persisted index state only. Metadata-driven
-    // materialization is owned by writable provisioners so stale readers never
-    // race the single-writer root contract.
-    if (!dbIndexReconciliationCanMutate(db)) return .{};
+pub const reconcileDbIndexesWithOptions = @import("antfly_local_sources").metadata_local_index_reconcile.reconcileDbIndexesWithOptions;
 
-    const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
-    const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
-        .drain_backfill = options.drain_resolver_backfill,
-        .source_table = options.source_table,
-        .destination_authorizer = options.destination_authorizer,
-    });
-    const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
-    const index_summary = try ensureIndexes(alloc, db, indexes_json);
-    const enrichments_removed = try removeMissingEnrichments(alloc, db, desired_enrichments.items);
-    const indexes_removed = missing_indexes_removed + index_summary.removed;
-    if (index_summary.added > 0 or indexes_removed > 0 or enrichment_summary.changed() or enrichments_removed > 0 or resolver_summary.changed()) {
-        const pending = db.pendingWorkStats();
-        if (pending.enrichment.error_count == 0) {
-            // Reconciliation persists catalog/applied-sequence state through the
-            // primary store. Avoid forcing every newly-created empty index WAL
-            // during create-table; repair/replay paths force-sync real index
-            // mutations after applying data.
-            try db.core.index_manager.syncAll(false);
-        }
-    }
-    return .{
-        .groups_considered = 0,
-        .dbs_opened = 0,
-        .indexes_added = index_summary.added,
-        .indexes_removed = indexes_removed,
-        .indexes_pending = index_summary.pending,
-        .enrichments_added = enrichment_summary.added,
-        .enrichments_updated = enrichment_summary.updated,
-        .enrichments_removed = enrichments_removed,
-        .resolvers_added = resolver_summary.added,
-        .resolvers_updated = resolver_summary.updated,
-        .resolvers_removed = resolver_summary.removed,
-    };
-}
-
-/// Reconcile one catalog index without applying sibling index, resolver, or
-/// table-schema changes carried by the same metadata snapshot.
-/// This is the storage boundary used by online index DDL after its foreground
-/// write-capability barrier has completed (or partially completed).
 pub fn reconcileDbIndexTarget(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
     index_name: []const u8,
-) !ProvisionSummary {
+) !IndexReconcileSummary {
     return try reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{});
 }
 
-pub fn reconcileDbIndexTargetWithOptions(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-    index_name: []const u8,
-    options: ReconcileDbIndexOptions,
-) !ProvisionSummary {
-    if (!dbIndexReconciliationCanMutate(db)) return .{};
-    if (index_name.len == 0 or indexes_api.isReservedIndexMetadataEntry(index_name))
-        return error.InvalidTableIndexMetadata;
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidTableIndexMetadata,
-    };
-
-    var desired_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
-    defer {
-        for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
-        desired_enrichments.deinit(alloc);
-    }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
-    try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
-    dedupeDesiredEnrichments(alloc, &desired_enrichments);
-    indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
-
-    var target_enrichments = std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig).empty;
-    defer {
-        for (target_enrichments.items) |*cfg| cfg.deinit(alloc);
-        target_enrichments.deinit(alloc);
-    }
-
-    const current = try db.listIndexes(alloc);
-    defer db_mod.types.freeIndexConfigs(alloc, current);
-    var target_summary: IndexEnsureSummary = .{};
-    var target_value: ?std.json.Value = null;
-    var target_array_form = false;
-
-    if (object.get("indexes")) |indexes_value| {
-        const items = switch (indexes_value) {
-            .array => |array| array.items,
-            else => return error.InvalidTableIndexMetadata,
-        };
-        for (items) |item| {
-            const name = try indexDefinitionName(item);
-            if (!std.mem.eql(u8, name, index_name)) continue;
-            if (target_value != null) return error.InvalidTableIndexMetadata;
-            target_value = item;
-            target_array_form = true;
-        }
-    } else {
-        if (object.get(index_name)) |config_value| {
-            target_value = config_value;
-        }
-    }
-
-    if (target_value) |value| {
-        try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
-        dedupeDesiredEnrichments(alloc, &target_enrichments);
-        indexes_api.sortArtifactEnrichmentsByDependency(target_enrichments.items);
-    }
-    const enrichment_summary = try ensureEnrichments(db, target_enrichments.items);
-
-    if (target_value) |value| {
-        try ensureIndexDefinition(
-            alloc,
-            db,
-            current,
-            &target_summary,
-            index_name,
-            try parseIndexKind(value),
-            if (target_array_form) indexDefinitionConfigValue(value) else value,
-            target_array_form,
-        );
-    } else {
-        if (try db.deleteIndex(index_name)) target_summary.removed += 1;
-    }
-    // Removing every persisted enrichment absent from the current catalog is
-    // target-safe: it never applies a sibling addition or update, while also
-    // making deletion retryable after a crash between index and enrichment
-    // retirement. Definitions still referenced by another index or by the
-    // table-level enrichment catalog remain in desired_enrichments.
-    const enrichments_removed = try removeAbsentEnrichments(alloc, db, desired_enrichments.items);
-    if (target_summary.added > 0 or target_summary.removed > 0 or enrichment_summary.changed() or enrichments_removed > 0) {
-        const pending = db.pendingWorkStats();
-        // Targeted DDL cannot wait on checkpoints or maintenance owned by a
-        // sibling index. Deletion already retires its durable generation; only
-        // an installed target has index state to sync here.
-        if (pending.enrichment.error_count == 0 and target_value != null and target_summary.pending == 0)
-            try db.core.index_manager.syncIndexByName(index_name, false);
-    }
-    return .{
-        .indexes_added = target_summary.added,
-        .indexes_removed = target_summary.removed,
-        .indexes_pending = target_summary.pending,
-        .enrichments_added = enrichment_summary.added,
-        .enrichments_updated = enrichment_summary.updated,
-        .enrichments_removed = enrichments_removed,
-    };
-}
+pub const reconcileDbIndexTargetWithOptions = @import("antfly_local_sources").metadata_local_index_reconcile.reconcileDbIndexTargetWithOptions;
 
 pub fn collectLocalSchemaProgress(
     alloc: std.mem.Allocator,
@@ -972,363 +808,45 @@ fn resolveRestoreIntent(
     return null;
 }
 
-fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !usize {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
+const removeMissingIndexes = @import("antfly_local_sources").metadata_local_index_reconcile.removeMissingIndexes;
 
-    const current = try db.listIndexes(alloc);
-    defer db_mod.types.freeIndexConfigs(alloc, current);
+const IndexEnsureSummary = @import("antfly_local_sources").metadata_local_index_reconcile.IndexEnsureSummary;
 
-    var removed: usize = 0;
-    for (current) |cfg| {
-        if (try desiredIndexContains(object, cfg.name)) continue;
-        if (try db.deleteIndex(cfg.name)) removed += 1;
-    }
-    return removed;
-}
+const ensureIndexes = @import("antfly_local_sources").metadata_local_index_reconcile.ensureIndexes;
 
-const IndexEnsureSummary = struct {
-    added: usize = 0,
-    removed: usize = 0,
-    pending: usize = 0,
-};
+const ensureIndexDefinition = @import("antfly_local_sources").metadata_local_index_reconcile.ensureIndexDefinition;
 
-fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !IndexEnsureSummary {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
+const desiredIndexContains = @import("antfly_local_sources").metadata_local_index_reconcile.desiredIndexContains;
 
-    const current = try db.listIndexes(alloc);
-    defer db_mod.types.freeIndexConfigs(alloc, current);
+const indexDefinitionName = @import("antfly_local_sources").metadata_local_index_reconcile.indexDefinitionName;
 
-    var summary: IndexEnsureSummary = .{};
-    if (object.get("indexes")) |indexes_value| {
-        const items = switch (indexes_value) {
-            .array => |array| array.items,
-            else => return error.InvalidTableIndexMetadata,
-        };
-        for (items) |item| {
-            const name = try indexDefinitionName(item);
-            const kind = try parseIndexKind(item);
-            const config_value = indexDefinitionConfigValue(item);
-            try ensureIndexDefinition(alloc, db, current, &summary, name, kind, config_value, true);
-        }
-        return summary;
-    }
+const indexDefinitionConfigValue = @import("antfly_local_sources").metadata_local_index_reconcile.indexDefinitionConfigValue;
 
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        // Reserved top-level sections are handled by their own reconcilers, not
-        // by the index reconciler.
-        if (indexes_api.isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
-        const kind = try parseIndexKind(entry.value_ptr.*);
-        try ensureIndexDefinition(alloc, db, current, &summary, entry.key_ptr.*, kind, entry.value_ptr.*, false);
-    }
-    return summary;
-}
+const findIndexConfig = @import("antfly_local_sources").metadata_local_index_reconcile.findIndexConfig;
 
-fn ensureIndexDefinition(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    current: []const db_mod.types.IndexConfig,
-    summary: *IndexEnsureSummary,
-    name: []const u8,
-    kind: db_mod.types.IndexKind,
-    config_value: std.json.Value,
-    storage_config: bool,
-) !void {
-    const config_json = if (storage_config)
-        try extractStoredIndexConfigJson(alloc, config_value)
-    else
-        try extractIndexConfigJsonForKind(alloc, name, kind, config_value);
-    defer alloc.free(config_json);
-    const configured_coverage_generation = coverage_policy.incarnation(config_value) orelse
-        internal_keys.derivedCoverageGeneration(config_json);
-    const desired = db_mod.types.IndexConfig{
-        .name = name,
-        .kind = kind,
-        .config_json = config_json,
-        // New catalog records carry a random incarnation. v0.2 records may
-        // predate that field, so derive the same deterministic fallback used
-        // by public readiness and storage-open parsing.
-        .coverage_generation = configured_coverage_generation,
-    };
-    const existing = findIndexConfig(current, name);
-    if (existing) |existing_cfg| {
-        if (existing_cfg.kind == kind and indexKindConfigReconcileDeferred(kind)) {
-            if (kind == .graph or
-                (existing_cfg.coverage_generation == desired.coverage_generation and
-                    try indexConfigsEqual(alloc, existing_cfg, desired))) return;
-        }
-    }
-    if (existing) |existing_cfg| {
-        if (try indexConfigsEqual(alloc, existing_cfg, desired)) {
-            if (db_mod.DB.indexKindSupportsManagedGenerationRepair(desired.kind)) {
-                if (try db.materializeManagedIndexAdmission(alloc, desired.name) != null) {
-                    summary.pending += 1;
-                }
-            }
-            return;
-        }
-        if (try db.deleteIndex(desired.name)) {
-            summary.removed += 1;
-            summary.pending += 1;
-            // Retirement publishes a durable cleanup tombstone. Re-admitting
-            // the same artifact namespace in this pass would either race the
-            // owner or require an unbounded request-thread corpus scan. The
-            // cleanup owner advances the tombstone in bounded pages and the
-            // next idempotent reconcile admits the desired generation.
-            return;
-        }
-    }
-    const admitted = db_mod.types.IndexConfig{
-        .name = desired.name,
-        .kind = desired.kind,
-        .config_json = desired.config_json,
-        .coverage_generation = desired.coverage_generation,
-    };
-    const repair_id = db.admitManagedIndex(admitted) catch |err| switch (err) {
-        error.IndexArtifactCleanupPending => {
-            summary.pending += 1;
-            return;
-        },
-        else => return err,
-    };
-    if (repair_id != null) summary.pending += 1;
-    summary.added += 1;
-}
+const indexConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.indexConfigsEqual;
 
-fn desiredIndexContains(object: std.json.ObjectMap, name: []const u8) !bool {
-    if (object.get("indexes")) |indexes_value| {
-        const items = switch (indexes_value) {
-            .array => |array| array.items,
-            else => return error.InvalidTableIndexMetadata,
-        };
-        for (items) |item| {
-            if (std.mem.eql(u8, try indexDefinitionName(item), name)) return true;
-        }
-        return false;
-    }
-    if (indexes_api.isReservedIndexMetadataEntry(name)) return false;
-    return object.contains(name);
-}
+const indexKindConfigReconcileDeferred = @import("antfly_local_sources").metadata_local_index_reconcile.indexKindConfigReconcileDeferred;
 
-fn indexDefinitionName(value: std.json.Value) ![]const u8 {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return error.InvalidTableIndexMetadata,
-    };
-    const name_value = object.get("name") orelse return error.InvalidTableIndexMetadata;
-    return switch (name_value) {
-        .string => |name| if (name.len > 0) name else error.InvalidTableIndexMetadata,
-        else => error.InvalidTableIndexMetadata,
-    };
-}
+const fullTextIndexConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.fullTextIndexConfigsEqual;
 
-fn indexDefinitionConfigValue(value: std.json.Value) std.json.Value {
-    const object = switch (value) {
-        .object => |object| object,
-        else => return value,
-    };
-    return object.get("config") orelse value;
-}
+const algebraicIndexConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.algebraicIndexConfigsEqual;
 
-fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const u8) ?db_mod.types.IndexConfig {
-    for (configs) |cfg| {
-        if (std.mem.eql(u8, cfg.name, name)) return cfg;
-    }
-    return null;
-}
+const jsonValuesEqualIgnoringTopLevelEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.jsonValuesEqualIgnoringTopLevelEnrichments;
 
-fn indexConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.IndexConfig, b: db_mod.types.IndexConfig) !bool {
-    if (a.kind != b.kind) return false;
-    if (a.kind == .full_text) return fullTextIndexConfigsEqual(alloc, a.config_json, b.config_json);
-    if (a.kind == .algebraic) return algebraicIndexConfigsEqual(alloc, a.config_json, b.config_json);
-    if ((a.kind == .dense_vector or a.kind == .sparse_vector) and
-        a.coverage_generation != b.coverage_generation) return false;
-    return std.mem.eql(u8, a.config_json, b.config_json);
-}
+const collectDesiredEnrichmentsFromJson = @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredEnrichmentsFromJson;
 
-fn indexKindConfigReconcileDeferred(kind: db_mod.types.IndexKind) bool {
-    return switch (kind) {
-        .dense_vector, .sparse_vector, .graph => true,
-        .full_text, .algebraic => false,
-    };
-}
+const EnrichmentEnsureSummary = @import("antfly_local_sources").metadata_local_index_reconcile.EnrichmentEnsureSummary;
 
-fn fullTextIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_json: []const u8) !bool {
-    var a_parsed = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
-    defer a_parsed.deinit();
-    var b_parsed = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
-    defer b_parsed.deinit();
-    return jsonValuesEqualIgnoringTopLevelEnrichments(a_parsed.value, b_parsed.value, true);
-}
+const ensureEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.ensureEnrichments;
 
-fn algebraicIndexConfigsEqual(alloc: std.mem.Allocator, a_json: []const u8, b_json: []const u8) !bool {
-    var a_parsed = try std.json.parseFromSlice(std.json.Value, alloc, a_json, .{});
-    defer a_parsed.deinit();
-    var b_parsed = try std.json.parseFromSlice(std.json.Value, alloc, b_json, .{});
-    defer b_parsed.deinit();
-    return jsonValuesEqualIgnoringTopLevelEnrichments(a_parsed.value, b_parsed.value, false);
-}
+const dedupeDesiredEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.dedupeDesiredEnrichments;
 
-fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Value, top_level: bool) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .null => true,
-        .bool => |value| value == b.bool,
-        .integer => |value| value == b.integer,
-        .float => |value| value == b.float,
-        .number_string => |value| std.mem.eql(u8, value, b.number_string),
-        .string => |value| std.mem.eql(u8, value, b.string),
-        .array => |array| blk: {
-            if (array.items.len != b.array.items.len) break :blk false;
-            for (array.items, b.array.items) |a_item, b_item| {
-                if (!jsonValuesEqualIgnoringTopLevelEnrichments(a_item, b_item, false)) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |object| blk: {
-            const b_object = b.object;
-            var a_count: usize = 0;
-            var a_it = object.iterator();
-            while (a_it.next()) |entry| {
-                if (top_level and std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                a_count += 1;
-                const b_value = b_object.get(entry.key_ptr.*) orelse break :blk false;
-                if (!jsonValuesEqualIgnoringTopLevelEnrichments(entry.value_ptr.*, b_value, false)) break :blk false;
-            }
-            var b_count: usize = 0;
-            var b_it = b_object.iterator();
-            while (b_it.next()) |entry| {
-                if (top_level and std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
-                b_count += 1;
-            }
-            break :blk a_count == b_count;
-        },
-    };
-}
+const removeMissingEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.removeMissingEnrichments;
 
-fn collectDesiredEnrichmentsFromJson(
-    alloc: std.mem.Allocator,
-    indexes_json: []const u8,
-    embedding_options: managed_embedder.InitOptions,
-    out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
-) !void {
-    {
-        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
-        errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
-        try out.appendSlice(alloc, collected);
-        alloc.free(collected);
-    }
-}
+const removeAbsentEnrichments = @import("antfly_local_sources").metadata_local_index_reconcile.removeAbsentEnrichments;
 
-const EnrichmentEnsureSummary = struct {
-    added: usize = 0,
-    updated: usize = 0,
-
-    fn changed(self: EnrichmentEnsureSummary) bool {
-        return self.added > 0 or self.updated > 0;
-    }
-};
-
-fn ensureEnrichments(db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !EnrichmentEnsureSummary {
-    var summary: EnrichmentEnsureSummary = .{};
-    for (desired) |cfg| {
-        switch (try db.upsertEnrichment(cfg)) {
-            .added => summary.added += 1,
-            .updated => summary.updated += 1,
-            .unchanged => {},
-        }
-    }
-    return summary;
-}
-
-fn dedupeDesiredEnrichments(
-    alloc: std.mem.Allocator,
-    desired: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
-) void {
-    var i: usize = 0;
-    while (i < desired.items.len) {
-        const cfg = desired.items[i];
-        var duplicate = false;
-        for (desired.items[0..i]) |prior| {
-            if (std.mem.eql(u8, prior.name, cfg.name)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            i += 1;
-            continue;
-        }
-        var removed = desired.orderedRemove(i);
-        removed.deinit(alloc);
-    }
-}
-
-fn removeMissingEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
-    const existing = try db.listEnrichments(alloc);
-    defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
-
-    var removed: usize = 0;
-    var i = existing.len;
-    while (i > 0) {
-        i -= 1;
-        const cfg = existing[i];
-        if (findEnrichmentByName(desired, cfg.name)) |desired_cfg| {
-            if (try enrichmentConfigsEqual(alloc, cfg, desired_cfg)) continue;
-        }
-        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
-            if (deleted) removed += 1;
-        } else |err| switch (err) {
-            error.EnrichmentInUse => continue,
-            else => return err,
-        }
-    }
-    return removed;
-}
-
-fn removeAbsentEnrichments(alloc: std.mem.Allocator, db: *db_mod.DB, desired: []const db_mod.types.EnrichmentConfig) !usize {
-    const existing = try db.listEnrichments(alloc);
-    defer db_mod.types.freeEnrichmentConfigs(alloc, existing);
-
-    var removed: usize = 0;
-    var i = existing.len;
-    while (i > 0) {
-        i -= 1;
-        const cfg = existing[i];
-        // Target reconciliation may observe a newer sibling definition. Its
-        // named operation must not delete the old sibling config merely because
-        // that config still needs a whole-table update; only catalog absence is
-        // globally safe cleanup.
-        if (findEnrichmentByName(desired, cfg.name) != null) continue;
-        if (db.deleteEnrichment(cfg.kind, cfg.name)) |deleted| {
-            if (deleted) removed += 1;
-        } else |err| switch (err) {
-            error.EnrichmentInUse => continue,
-            else => return err,
-        }
-    }
-    return removed;
-}
-
-fn findEnrichmentByName(
-    configs: []const db_mod.types.EnrichmentConfig,
-    name: []const u8,
-) ?db_mod.types.EnrichmentConfig {
-    for (configs) |cfg| {
-        if (std.mem.eql(u8, cfg.name, name)) return cfg;
-    }
-    return null;
-}
+const findEnrichmentByName = @import("antfly_local_sources").metadata_local_index_reconcile.findEnrichmentByName;
 
 fn findEnrichment(
     configs: []const db_mod.types.EnrichmentConfig,
@@ -1341,135 +859,21 @@ fn findEnrichment(
     return null;
 }
 
-fn enrichmentConfigsEqual(alloc: std.mem.Allocator, a: db_mod.types.EnrichmentConfig, b: db_mod.types.EnrichmentConfig) !bool {
-    return a.kind == b.kind and
-        std.mem.eql(u8, a.name, b.name) and
-        std.mem.eql(u8, a.field, b.field) and
-        std.mem.eql(u8, a.template, b.template) and
-        std.mem.eql(u8, a.source_artifact_name, b.source_artifact_name) and
-        a.expected_dims == b.expected_dims and
-        a.chunk_size == b.chunk_size and
-        a.chunk_overlap == b.chunk_overlap and
-        std.mem.eql(u8, a.chunker_json, b.chunker_json) and
-        a.full_text_index == b.full_text_index and
-        std.mem.eql(u8, a.content_type, b.content_type) and
-        try enrichment_config_validation.producerJsonValuesEqual(alloc, a.producer_json, b.producer_json) and
-        std.meta.eql(a.execution, b.execution);
-}
+const enrichmentConfigsEqual = @import("antfly_local_sources").metadata_local_index_reconcile.enrichmentConfigsEqual;
 
-pub const ResolverReconcileSummary = struct {
-    added: usize = 0,
-    updated: usize = 0,
-    removed: usize = 0,
-    unchanged: usize = 0,
-
-    fn changed(self: @This()) bool {
-        return self.added > 0 or self.updated > 0 or self.removed > 0;
-    }
-};
+pub const ResolverReconcileSummary = @import("antfly_local_sources").metadata_local_index_reconcile.ResolverReconcileSummary;
 
 pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !ResolverReconcileSummary {
     return try ensureResolversWithOptions(alloc, db, indexes_json, .{});
 }
 
-pub const EnsureResolverOptions = struct {
-    drain_backfill: bool = true,
-    source_table: []const u8 = "",
-    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
-};
+pub const EnsureResolverOptions = @import("antfly_local_sources").metadata_local_index_reconcile.EnsureResolverOptions;
 
-pub fn ensureResolversWithOptions(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    indexes_json: []const u8,
-    options: EnsureResolverOptions,
-) !ResolverReconcileSummary {
-    try stored_destination_authorization.authorizeIndexesJson(
-        alloc,
-        indexes_json,
-        options.source_table,
-        options.destination_authorizer,
-    );
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
-    defer parsed.deinit();
+pub const ensureResolversWithOptions = @import("antfly_local_sources").metadata_local_index_reconcile.ensureResolversWithOptions;
 
-    var desired = std.ArrayListUnmanaged(db_mod.ResolverConfig).empty;
-    defer {
-        for (desired.items) |*cfg| cfg.deinit(alloc);
-        desired.deinit(alloc);
-    }
-    try collectDesiredResolvers(alloc, parsed.value, &desired);
+const desiredResolverContains = @import("antfly_local_sources").metadata_local_index_reconcile.desiredResolverContains;
 
-    var summary: ResolverReconcileSummary = .{};
-    for (desired.items) |cfg| {
-        const result = try db.upsertResolverWithResultOptions(cfg, .{
-            .drain_backfill = options.drain_backfill,
-        });
-        switch (result) {
-            .inserted => summary.added += 1,
-            .updated_backfill_required => summary.updated += 1,
-            .updated_no_backfill => summary.unchanged += 1,
-        }
-    }
-
-    const existing = try db.listResolvers(alloc);
-    defer {
-        for (existing) |*cfg| cfg.deinit(alloc);
-        alloc.free(existing);
-    }
-    for (existing) |cfg| {
-        if (desiredResolverContains(desired.items, cfg.name)) continue;
-        const removed = if (options.drain_backfill)
-            try db.removeResolver(cfg.name)
-        else
-            try db.removeResolverWithoutDrain(cfg.name);
-        if (removed) summary.removed += 1;
-    }
-    return summary;
-}
-
-fn desiredResolverContains(desired: []const db_mod.ResolverConfig, name: []const u8) bool {
-    for (desired) |cfg| {
-        if (std.mem.eql(u8, cfg.name, name)) return true;
-    }
-    return false;
-}
-
-fn collectDesiredResolvers(
-    alloc: std.mem.Allocator,
-    value: std.json.Value,
-    out: *std.ArrayListUnmanaged(db_mod.ResolverConfig),
-) !void {
-    switch (value) {
-        .object => |object| {
-            if (object.get("resolvers")) |resolvers| {
-                if (resolvers == .array) {
-                    for (resolvers.array.items) |item| {
-                        if (item != .object) continue;
-                        const parsed = try std.json.parseFromValue(db_mod.ResolverConfig, alloc, item, .{
-                            .allocate = .alloc_always,
-                            .ignore_unknown_fields = true,
-                        });
-                        // `parsed.value` is owned by the parse arena; clone with
-                        // `alloc` so `out`'s entries free correctly (and so they
-                        // outlive the arena).
-                        defer parsed.deinit();
-                        try out.append(alloc, try db_mod.ResolverConfig.clone(alloc, parsed.value));
-                    }
-                }
-            }
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
-                try collectDesiredResolvers(alloc, entry.value_ptr.*, out);
-            }
-        },
-        .array => |array| {
-            for (array.items) |item| try collectDesiredResolvers(alloc, item, out);
-        },
-        else => {},
-    }
-}
+const collectDesiredResolvers = @import("antfly_local_sources").metadata_local_index_reconcile.collectDesiredResolvers;
 
 fn localRangeHasSchemaVersionIndex(
     alloc: std.mem.Allocator,
@@ -1610,7 +1014,18 @@ fn runtimeHasReadySchemaVersionIndex(
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
     if (target_full_text) {
         const target = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
-        if (target.doc_count != runtime.doc_identity.live_ordinals) return false;
+        // A chunk/artifact-sourced full-text index routes member documents
+        // (e.g. chunks) into the same index, so its doc_count is primary rows
+        // plus members and can never equal live_ordinals once a chunk
+        // enrichment targets it. The equality check historically existed only
+        // to reject a freshly-created or catalog-only placeholder index that
+        // looks idle before its own rebuild starts; findReadyRuntimeFullTextIndex
+        // above already requires backfill_active=false and replay caught up,
+        // which is the real proof that this incarnation's rebuild finished. A
+        // placeholder that has not started yet still reports doc_count=0 and
+        // is rejected by this bound; a 1:1 (no member documents) index still
+        // satisfies it at equality.
+        if (target.doc_count < runtime.doc_identity.live_ordinals) return false;
     } else {
         // An explicitly indexless relational table has no full-text rebuild
         // to wait for. Only a fresh owner observation of the exact applied
@@ -1705,52 +1120,11 @@ fn schemaVersion(alloc: std.mem.Allocator, schema_json: []const u8) !u32 {
     };
 }
 
-fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
-    if (value != .object) return .full_text;
-    const type_value = value.object.get("type") orelse {
-        if (looksLikeStoredAlgebraicIndexConfig(value)) return .algebraic;
-        return .full_text;
-    };
-    if (type_value != .string) return error.InvalidCreateTableRequest;
-    if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
-    if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
-    if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
-    if (std.mem.eql(u8, type_value.string, "embeddings")) {
-        const sparse = try embeddingIndexSparseFlag(value);
-        return if (sparse) .sparse_vector else .dense_vector;
-    }
-    return error.UnsupportedCreateTableRequest;
-}
+const parseIndexKind = @import("antfly_local_sources").metadata_local_index_reconcile.parseIndexKind;
 
-fn embeddingIndexSparseFlag(value: std.json.Value) !bool {
-    if (value != .object) return false;
-    if (value.object.get("sparse")) |sparse_value| {
-        return switch (sparse_value) {
-            .bool => sparse_value.bool,
-            else => error.InvalidCreateTableRequest,
-        };
-    }
-    const config_value = value.object.get("config") orelse return false;
-    const config_object = switch (config_value) {
-        .object => |object| object,
-        else => return error.InvalidCreateTableRequest,
-    };
-    const sparse_value = config_object.get("sparse") orelse return false;
-    return switch (sparse_value) {
-        .bool => sparse_value.bool,
-        else => error.InvalidCreateTableRequest,
-    };
-}
+const embeddingIndexSparseFlag = @import("antfly_local_sources").metadata_local_index_reconcile.embeddingIndexSparseFlag;
 
-fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
-    if (value != .object) return false;
-    if (value.object.get("schema_version") == null and
-        (value.object.get("version") == null or value.object.get("table") == null)) return false;
-    return value.object.get("group_fields") != null or
-        value.object.get("measure_fields") != null or
-        value.object.get("time_fields") != null or
-        value.object.get("materializations") != null;
-}
+const looksLikeStoredAlgebraicIndexConfig = @import("antfly_local_sources").metadata_local_index_reconcile.looksLikeStoredAlgebraicIndexConfig;
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {
     if (value != .object) return try alloc.dupe(u8, "{}");
@@ -1758,51 +1132,13 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
     return try extractIndexConfigJsonForKind(alloc, index_name, kind, value);
 }
 
-fn extractIndexConfigJsonForKind(
-    alloc: std.mem.Allocator,
-    index_name: []const u8,
-    kind: db_mod.types.IndexKind,
-    value: std.json.Value,
-) ![]u8 {
-    if (value != .object) return try alloc.dupe(u8, "{}");
-    switch (kind) {
-        .dense_vector, .sparse_vector => return try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, value),
-        else => {},
-    }
+const extractIndexConfigJsonForKind = @import("antfly_local_sources").metadata_local_index_reconcile.extractIndexConfigJsonForKind;
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(alloc);
-    try out.append(alloc, '{');
-    var first = true;
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (skipPublicIndexMetadataField(kind, entry.key_ptr.*)) continue;
-        if (!first) try out.append(alloc, ',');
-        first = false;
-        try appendJsonString(alloc, &out, entry.key_ptr.*);
-        try out.append(alloc, ':');
-        const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(entry.value_ptr.*, .{})});
-        defer alloc.free(encoded);
-        try out.appendSlice(alloc, encoded);
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
+const extractStoredIndexConfigJson = @import("antfly_local_sources").metadata_local_index_reconcile.extractStoredIndexConfigJson;
 
-fn extractStoredIndexConfigJson(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    if (value != .object) return try alloc.dupe(u8, "{}");
-    return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-}
+const skipPublicIndexMetadataField = @import("antfly_local_sources").metadata_local_index_reconcile.skipPublicIndexMetadataField;
 
-fn skipPublicIndexMetadataField(kind: db_mod.types.IndexKind, field: []const u8) bool {
-    return table_index_config.isCatalogMetadataField(kind, field);
-}
-
-fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(escaped);
-    try out.appendSlice(alloc, escaped);
-}
+const appendJsonString = @import("antfly_local_sources").metadata_local_index_reconcile.appendJsonString;
 
 fn findRange(ranges: []const table_manager.RangeRecord, group_id: u64) ?table_manager.RangeRecord {
     for (ranges) |record| {
@@ -1819,7 +1155,7 @@ fn findTable(tables: []const table_manager.TableRecord, table_id: u64) ?table_ma
 }
 
 fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
-    var path_tmp = try @import("../common/test_directory.zig").TestDirectory.initFast("backfill");
+    var path_tmp = try @import("antfly_local_sources").common_test_directory.TestDirectory.initFast("backfill");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
     const platform = @import("antfly_platform");
@@ -1868,7 +1204,7 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
 
         fn afterSnapshot(_: *anyopaque, _: *db_mod.DB, _: []const u8, _: u64) !void {}
 
-        fn afterPhase(ptr: *anyopaque, _: *db_mod.DB, _: u128, phase: @import("../storage/db/derived/index_repair_state.zig").Phase) !void {
+        fn afterPhase(ptr: *anyopaque, _: *db_mod.DB, _: u128, phase: @import("antfly_local_sources").storage_db_derived_index_repair_state.Phase) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (phase == .activating and !self.fired) {
                 self.fired = true;
@@ -4357,6 +3693,54 @@ fn implementationTests() type {
             runtime.doc_identity.live_ordinals = 0;
             indexes[1].doc_count = 0;
             try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+        }
+
+        test "table provisioner accepts chunk-inflated target full-text doc count" {
+            const range = table_manager.RangeRecord{ .group_id = 7, .table_id = 11, .start_key = "" };
+            var indexes = [_]table_manager.RuntimeIndexStatusReport{
+                .{
+                    .name = "full_text_index_v0",
+                    .kind = "full_text",
+                    .doc_count = 1000,
+                    .replay_applied_sequence = 7,
+                    .replay_target_sequence = 7,
+                },
+                .{
+                    // 1000 primary rows + 500 chunk members routed in by a chunk
+                    // enrichment with full_text_index: true.
+                    .name = "full_text_index_v1",
+                    .kind = "full_text",
+                    .doc_count = 1500,
+                    .replay_applied_sequence = 7,
+                    .replay_target_sequence = 7,
+                },
+            };
+            const runtime = table_manager.RuntimeGroupStatusReport{
+                .table_id = range.table_id,
+                .group_id = range.group_id,
+                .freshness = "fresh",
+                .doc_count = 1000,
+                .doc_identity = .{
+                    .namespace_table_id = range.table_id,
+                    .namespace_shard_id = range.group_id,
+                    .namespace_range_id = range.group_id,
+                    .next_ordinal = 1001,
+                    .allocated_ordinals = 1000,
+                    .live_ordinals = 1000,
+                },
+                .indexes = &indexes,
+            };
+
+            try std.testing.expect(runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+
+            // A rebuild still genuinely in progress (fewer full-text docs than
+            // primary identities) must still be rejected.
+            indexes[1].doc_count = 400;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
+
+            // A brand-new placeholder index (nothing written yet) is still rejected.
+            indexes[1].doc_count = 0;
+            try std.testing.expect(!runtimeHasReadySchemaVersionIndex(runtime, range, 1, 0, true));
         }
 
         test "table provisioner indexless relational schema cutover requires exact fresh owner epoch" {

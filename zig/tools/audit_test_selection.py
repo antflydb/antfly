@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 
@@ -52,7 +53,26 @@ def main() -> int:
     parser.add_argument("--filter", action="append", default=[])
     parser.add_argument("--skip-filter", action="append", default=[])
     parser.add_argument("--allow-empty", action="store_true")
-    args = parser.parse_args()
+    argv = sys.argv[1:]
+    separator = argv.index("--") if "--" in argv else len(argv)
+    args = parser.parse_args(argv[:separator])
+    runtime = argparse.ArgumentParser(
+        description="Runtime test selection", allow_abbrev=False
+    )
+    runtime.add_argument("--test-filter", "--suite-filter", action="append", default=[])
+    runtime.add_argument("--skip-test-filter", action="append", default=[])
+    runtime.add_argument("--allow-empty-test-filter", action="store_true")
+    runtime.add_argument("--list-tests", action="store_true")
+    runtime.add_argument("--seed")
+    runtime.add_argument("--cache-dir")
+    runtime.add_argument("--listen")
+    runtime.add_argument("--require-no-skips", action="store_true")
+    runtime.add_argument("--timeout-ms")
+    runtime.add_argument("patterns", nargs="*")
+    controls = runtime.parse_intermixed_args(argv[separator + 1 :])
+    args.filter.extend(controls.test_filter + controls.patterns)
+    args.skip_filter.extend(controls.skip_test_filter)
+    args.allow_empty |= controls.allow_empty_test_filter
     errors = audit(
         [path.read_text() for path in args.inventory],
         args.filter,

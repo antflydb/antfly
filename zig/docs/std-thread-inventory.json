@@ -921,7 +921,7 @@
       "source": "const thread_b = try std.Thread.spawn(.{}, Reader.run, .{&reader_b});"
     },
     {
-      "file": "zig/pkg/antfly/src/inference/bedrock.zig",
+      "file": "zig/pkg/antfly-embedded/src/inference/providers/bedrock.zig",
       "line": 1782,
       "category": "test/helper",
       "source": "const thread = try std.Thread.spawn(.{}, Worker.run, .{ &cache, io });"
@@ -939,31 +939,31 @@
       "source": "const parts_worker = try std.Thread.spawn(.{}, PartsWorker.run, .{ &multimodal, &err_out });"
     },
     {
-      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "file": "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
       "line": 506,
       "category": "test/helper",
       "source": "const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});"
     },
     {
-      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "file": "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
       "line": 508,
       "category": "test/helper",
       "source": "const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});"
     },
     {
-      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "file": "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
       "line": 572,
       "category": "test/helper",
       "source": "const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&producer});"
     },
     {
-      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "file": "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
       "line": 574,
       "category": "test/helper",
       "source": "const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&compute});"
     },
     {
-      "file": "zig/pkg/antfly/src/inference/query_embedding_cache.zig",
+      "file": "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
       "line": 662,
       "category": "test/helper",
       "source": "const producer_thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});"

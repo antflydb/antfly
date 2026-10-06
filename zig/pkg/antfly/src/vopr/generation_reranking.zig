@@ -11,13 +11,13 @@ const std = @import("std");
 const httpx = @import("httpx");
 const generating = @import("antfly_generating");
 const vopr = @import("vopr");
-const generating_runtime = @import("../generating/mod.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const provider_limits = @import("../common/provider_limits.zig");
+const generating_runtime = @import("antfly_local_sources").generating_mod;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const provider_limits = @import("antfly_local_sources").common_provider_limits;
 const reranking = @import("../reranking/mod.zig");
 
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 const valid_remote_generation =
     "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"remote-result\"}}]}";
@@ -109,7 +109,7 @@ pub const Scenario = struct {
     };
 
     const mode_ids = ids: {
-        var values: [@typeInfo(Mode).@"enum".fields.len]vopr.id.StableId = undefined;
+        var values: [@typeInfo(Mode).@"enum".field_names.len]vopr.id.StableId = undefined;
         for (std.meta.tags(Mode), 0..) |mode, index|
             values[index] = vopr.id.stable(name, @tagName(mode));
         break :ids values;
@@ -150,7 +150,7 @@ pub const Scenario = struct {
             errdefer owner_allocator.destroy(self);
             self.* = .{
                 .owner_allocator = owner_allocator,
-                .fixture_allocator = .init,
+                .fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 }),
                 .allocator = undefined,
                 .vopr_io = undefined,
                 .http = undefined,
@@ -172,7 +172,7 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             // A bounded history may stop with a request holding a provider
             // lease. Run its defers before destroying the registry and client.
             _ = self.vopr_io.cancelAndDrainTasksForTeardown(self.allocator, 100_000) catch |err|
@@ -181,7 +181,7 @@ pub const Scenario = struct {
             self.limits.deinit();
             self.vopr_io.deinit();
             const owner_allocator = self.owner_allocator;
-            std.debug.assert(self.fixture_allocator.deinit() == .ok);
+            std.debug.assert(self.fixture_allocator.deinit() == 0);
             owner_allocator.destroy(self);
         }
 
@@ -225,7 +225,7 @@ pub const Scenario = struct {
             model: []const u8,
             roles: []const []const u8,
             contents: []const []const u8,
-            _: @import("../inference/types.zig").GenerationOptions,
+            _: @import("antfly_inference_types").GenerationOptions,
         ) ![]u8 {
             const self: *State = @ptrCast(@alignCast(ptr));
             self.local_generation_calls += 1;
@@ -307,7 +307,7 @@ pub const Scenario = struct {
                 self.content = try self.state.allocator.dupe(u8, result.content);
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 if (self.content) |value| self.state.allocator.free(value);
                 self.content = null;
             }
@@ -331,7 +331,7 @@ pub const Scenario = struct {
                 );
             }
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 if (self.scores) |value| self.state.allocator.free(value);
                 self.scores = null;
             }
@@ -772,8 +772,8 @@ test "generation and reranking chain VOPR exact replays local and remote product
 }
 
 test "generation and reranking VOPR drains requests when the history budget expires" {
-    const mode_id = Scenario.mode_ids[@intFromEnum(Scenario.Mode.remote_composed)];
-    var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4745_4e52 + @as(u64, @intFromEnum(Scenario.Mode.remote_composed)));
+    const mode_id = Scenario.mode_ids[@backingInt(Scenario.Mode.remote_composed)];
+    var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4745_4e52 + @as(u64, @backingInt(Scenario.Mode.remote_composed)));
     var recorded = try vopr.runner.run(Scenario, std.testing.allocator, choices.source(), .{
         .system = "antfly",
         .transition_budget = 128,

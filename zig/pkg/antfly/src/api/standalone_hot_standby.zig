@@ -15,10 +15,10 @@
 //! Complete local-metadata hot-standby capability. Distributed metadata is replicated
 //! by its own Raft group and deliberately does not expose this port.
 const std = @import("std");
-const db = @import("../storage/db/ha_contract.zig");
-const record = @import("../storage/hot_standby/replication_record.zig");
+const db = @import("antfly_local_sources").storage_db_replication_contract;
+const record = @import("antfly_local_sources").storage_db_replication_record;
 const staging = @import("../metadata/restore_provisioning_contract.zig");
-const runtime_callback_abi = @import("../runtime_callback_abi.zig");
+const runtime_callback_abi = @import("antfly_local_sources").runtime_callback_abi;
 
 pub const Checkpoint = struct {
     size_bytes: u64,

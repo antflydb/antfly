@@ -586,6 +586,11 @@ func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifact
 		if source.Nodes.Model != "" && source.Nodes.Model != GraphArtifactNodeMappingConfigModelDocument && source.Nodes.Model != GraphArtifactNodeMappingConfigModelExternal {
 			return nil, fmt.Errorf("sources[%d].nodes.model is invalid", i)
 		}
+		sourceJSON, _ := source.Nodes.Source.MarshalJSON()
+		edgeIDJSON, _ := source.Edge.EdgeId.MarshalJSON()
+		if len(sourceJSON) > 0 && string(sourceJSON) != "null" && (len(edgeIDJSON) == 0 || string(edgeIDJSON) == "null") {
+			return nil, fmt.Errorf("sources[%d].nodes.source requires edge.edge_id", i)
+		}
 		fields := append([]string(nil), source.Context.DocFields...)
 		fieldSet := make(map[string]struct{}, len(fields))
 		for j, field := range fields {

@@ -173,7 +173,7 @@ const HttpxTransport = struct {
         };
     }
 
-    fn deinit(self: *HttpxTransport) void {
+    pub fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
         if (self.io_impl) |io_impl| {
             io_impl.deinit();

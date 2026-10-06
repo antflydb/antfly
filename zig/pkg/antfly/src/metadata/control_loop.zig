@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const api_operation = @import("../api/operation.zig");
+const api_operation = @import("antfly_local_sources").api_operation;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
@@ -219,7 +219,7 @@ pub const MetadataControlLoop = struct {
     }
 };
 
-fn lockCatalogMutation(service: anytype) bool {
+pub fn lockCatalogMutation(service: anytype) bool {
     const Service = switch (@typeInfo(@TypeOf(service))) {
         .pointer => |pointer| pointer.child,
         else => @TypeOf(service),
@@ -229,7 +229,7 @@ fn lockCatalogMutation(service: anytype) bool {
     return true;
 }
 
-fn unlockCatalogMutation(service: anytype, locked: bool) void {
+pub fn unlockCatalogMutation(service: anytype, locked: bool) void {
     const Service = switch (@typeInfo(@TypeOf(service))) {
         .pointer => |pointer| pointer.child,
         else => @TypeOf(service),

@@ -64,10 +64,10 @@ const RuntimeProcess = struct {
         errdefer alloc.free(argument_storage);
         var initialized_arguments: usize = 0;
         errdefer for (argument_storage[0..initialized_arguments]) |argument| alloc.free(argument);
-        argument_storage[0] = try alloc.dupeZ(u8, "antfly-runtime");
+        argument_storage[0] = try alloc.dupeSentinel(u8, "antfly-runtime", 0);
         initialized_arguments = 1;
         for (input_arguments, 1..) |argument, index| {
-            argument_storage[index] = try alloc.dupeZ(u8, argument.slice());
+            argument_storage[index] = try alloc.dupeSentinel(u8, argument.slice(), 0);
             initialized_arguments += 1;
         }
         const argument_ptrs = try alloc.alloc([*:0]const u8, argument_storage.len);
@@ -105,7 +105,7 @@ const RuntimeProcess = struct {
         };
     }
 
-    fn deinit(self: *RuntimeProcess) void {
+    pub fn deinit(self: *RuntimeProcess) void {
         self.io_impl.deinit();
         self.process_environ.block.deinit(self.alloc);
         self.environ_map.deinit();
@@ -144,3 +144,6 @@ pub fn runtimeAllocator() std.mem.Allocator {
     const fallback = if (!builtin.single_threaded) std.heap.smp_allocator else std.heap.page_allocator;
     return platform.allocator.processAllocator(fallback);
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

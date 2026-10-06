@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const raft_engine = @import("raft_engine");
 const platform_time = @import("antfly_platform").time;
 const wal_mod = @import("../../storage/wal_runtime.zig");
@@ -137,7 +137,7 @@ pub const WalReplicaState = struct {
         var wal_dir_owned = true;
         errdefer if (wal_dir_owned) alloc.free(wal_dir);
         try fs_paths.createDirPathPortable(io_impl.io(), wal_dir);
-        const wal_dir_z = try alloc.dupeZ(u8, wal_dir);
+        const wal_dir_z = try alloc.dupeSentinel(u8, wal_dir, 0);
         var wal_dir_z_owned = true;
         errdefer if (wal_dir_z_owned) alloc.free(wal_dir_z);
         const applied_watermark_path = try std.fmt.allocPrint(alloc, "{s}/applied-watermark.bin", .{layout.log_dir});
@@ -448,7 +448,7 @@ pub const WalReplicaState = struct {
             return .{ .ptr = task, .durable_term = task.owner.durable_hard_state.current_term, .durable_vote = task.owner.durable_hard_state.voted_for, .durable_index = task.owner.durable_last_index, .owned_bytes = task.encoded.len +| @sizeOf(AppendTask), .vtable = &.{ .is_complete = isComplete, .complete = complete, .deinit = AppendTask.deinit } };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const task: *@This() = @ptrCast(@alignCast(ptr));
             const owner = task.owner;
             if (task.future) |*future| future.await(owner.io_impl.io());
@@ -1082,7 +1082,7 @@ pub const WalReplicaState = struct {
 
         try appendInt(u32, self.alloc, &buffer, delta_magic);
         try appendInt(u32, self.alloc, &buffer, delta_version);
-        try buffer.append(self.alloc, @intFromEnum(DeltaRecordKind.ready));
+        try buffer.append(self.alloc, @backingInt(DeltaRecordKind.ready));
 
         // Carry a deferred commit cursor even when this Ready changes only
         // entries or configuration and RawNode omits its unchanged HardState.
@@ -1113,7 +1113,7 @@ pub const WalReplicaState = struct {
 
         try appendInt(u32, self.alloc, &buffer, delta_magic);
         try appendInt(u32, self.alloc, &buffer, delta_version);
-        try buffer.append(self.alloc, @intFromEnum(DeltaRecordKind.conf_state));
+        try buffer.append(self.alloc, @backingInt(DeltaRecordKind.conf_state));
 
         var initial_state = try self.store.storage().initialState(self.alloc);
         defer initial_state.deinit(self.alloc);
@@ -1132,8 +1132,8 @@ pub const WalReplicaState = struct {
         const kind_tag = if (cursor < bytes.len) bytes[cursor] else return error.InvalidReplicaState;
         cursor += 1;
         const kind: DeltaRecordKind = switch (kind_tag) {
-            @intFromEnum(DeltaRecordKind.ready) => .ready,
-            @intFromEnum(DeltaRecordKind.conf_state) => .conf_state,
+            @backingInt(DeltaRecordKind.ready) => .ready,
+            @backingInt(DeltaRecordKind.conf_state) => .conf_state,
             else => return error.InvalidReplicaState,
         };
 
@@ -1364,7 +1364,7 @@ pub const WalReplicaState = struct {
     fn encodeEntry(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: raft_engine.core.Entry) !void {
         try appendInt(u64, alloc, out, entry.term);
         try appendInt(u64, alloc, out, entry.index);
-        try out.append(alloc, @intFromEnum(entry.entry_type));
+        try out.append(alloc, @backingInt(entry.entry_type));
         try appendBytes(alloc, out, entry.data);
     }
 
@@ -1374,9 +1374,9 @@ pub const WalReplicaState = struct {
         const entry_type_tag = if (cursor.* < bytes.len) bytes[cursor.*] else return error.InvalidReplicaState;
         cursor.* += 1;
         const entry_type: raft_engine.core.types.EntryType = switch (entry_type_tag) {
-            @intFromEnum(raft_engine.core.types.EntryType.normal) => .normal,
-            @intFromEnum(raft_engine.core.types.EntryType.conf_change) => .conf_change,
-            @intFromEnum(raft_engine.core.types.EntryType.conf_change_v2) => .conf_change_v2,
+            @backingInt(raft_engine.core.types.EntryType.normal) => .normal,
+            @backingInt(raft_engine.core.types.EntryType.conf_change) => .conf_change,
+            @backingInt(raft_engine.core.types.EntryType.conf_change_v2) => .conf_change_v2,
             else => return error.InvalidReplicaState,
         };
         const data = try readBytes(alloc, bytes, cursor);
@@ -1444,7 +1444,7 @@ fn encodeLegacyWalReadyDeltaForTest(alloc: std.mem.Allocator, file_version: u32)
 
     try WalReplicaState.appendInt(u32, alloc, &buffer, delta_magic);
     try WalReplicaState.appendInt(u32, alloc, &buffer, file_version);
-    try buffer.append(alloc, @intFromEnum(DeltaRecordKind.ready));
+    try buffer.append(alloc, @backingInt(DeltaRecordKind.ready));
     try WalReplicaState.appendBool(alloc, &buffer, true);
     try WalReplicaState.appendInt(u64, alloc, &buffer, 7);
     try WalReplicaState.appendBool(alloc, &buffer, true);
@@ -1483,7 +1483,7 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
         const wal_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/state-wal", .{layout.log_dir});
         defer std.testing.allocator.free(wal_dir);
         try fs_paths.createDirPathPortable(std.testing.io, wal_dir);
-        const wal_dir_z = try std.testing.allocator.dupeZ(u8, wal_dir);
+        const wal_dir_z = try std.testing.allocator.dupeSentinel(u8, wal_dir, 0);
         defer std.testing.allocator.free(wal_dir_z);
 
         const inline_payload = if (file_version <= legacy_inline_snapshot_version) "checkpoint-snapshot" else "";

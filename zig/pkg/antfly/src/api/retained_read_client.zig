@@ -3,10 +3,10 @@
 const std = @import("std");
 const rpc = @import("retained_read_rpc.zig");
 const registry = @import("../storage/retained_read_registry.zig");
-const reads = @import("table_read_source.zig");
-const types = @import("../storage/db/types.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
+const types = @import("antfly_local_sources").storage_db_types;
 const metadata = @import("../metadata/api.zig");
-const http = @import("../common/http/http_common.zig");
+const http = @import("antfly_local_sources").common_http_http_common;
 const time = @import("antfly_platform").time;
 
 /// Owns endpoint and catalog capability bytes. Executor must be a stable
@@ -108,13 +108,13 @@ pub const Client = struct {
         return response;
     }
 
-    fn validate(ptr: *anyopaque) !void {
+    pub fn validate(ptr: *anyopaque) !void {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .validate, .schema_version = self.schema_version, .token = self.token });
         defer response.deinit(self.alloc);
     }
 
-    fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+    fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = rpc.max_lease_ms });
         defer response.deinit(self.alloc);
@@ -187,20 +187,20 @@ pub const Client = struct {
         self.destroy();
     }
 
-    fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+    fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .range_proofs, .schema_version = self.schema_version, .token = self.token });
         defer response.deinit(self.alloc);
         var parsed = try std.json.parseFromSlice(rpc.Response, self.alloc, response.body, .{});
         defer parsed.deinit();
         const proofs = parsed.value.range_proofs;
-        if (proofs.len == 0 or proofs.len > @import("range_read_guards.zig").max_proofs) return error.InvalidRetainedReadResponse;
+        if (proofs.len == 0 or proofs.len > @import("antfly_local_sources").api_range_read_guards.max_proofs) return error.InvalidRetainedReadResponse;
         for (proofs, 0..) |proof, i| {
-            const tracking = @import("../storage/range_protection.zig");
+            const tracking = @import("antfly_local_sources").storage_range_protection;
             tracking.validateProof(proof) catch return error.InvalidRetainedReadResponse;
             if (i != 0 and !tracking.proofLess(proofs[i - 1], proof)) return error.InvalidRetainedReadResponse;
         }
-        return alloc.dupe(@import("../storage/range_protection.zig").Proof, proofs);
+        return alloc.dupe(@import("antfly_local_sources").storage_range_protection.Proof, proofs);
     }
 
     fn normalize(ptr: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
@@ -261,7 +261,7 @@ fn consumerTests() type {
             };
             var fixture: Fixture = .{};
             const alloc = std.testing.allocator;
-            const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "a/b", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+            const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "a/b", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
             defer client.destroy();
             client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
             try std.testing.expect(std.mem.endsWith(u8, client.uri, "/tables/a%2Fb/retained-read"));
@@ -283,7 +283,7 @@ fn consumerTests() type {
                 fn capture(raw: *anyopaque, _: std.mem.Allocator, _: metadata.CatalogRouteFence, _: u64, _: []const u8, _: types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.StatementReadFence {
                     return .{ .ptr = raw, .vtable = &.{ .validate = validate, .open = open, .release = release } };
                 }
-                fn validate(_: *anyopaque) !void {}
+                pub fn validate(_: *anyopaque) !void {}
                 fn release(raw: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.capture_closed += 1;
@@ -294,8 +294,8 @@ fn consumerTests() type {
                     try std.testing.expect(opts.include_range_proofs);
                     return .{ .ptr = raw, .vtable = &.{ .next = next, .close = close, .normalize = normalizeWrites, .range_proofs = proofRows } };
                 }
-                fn proofRows(_: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
-                    return alloc.dupe(@import("../storage/range_protection.zig").Proof, &.{ .{ .bucket = 0, .generation = null }, .{ .bucket = 256, .generation = std.math.maxInt(u64) } });
+                fn proofRows(_: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
+                    return alloc.dupe(@import("antfly_local_sources").storage_range_protection.Proof, &.{ .{ .bucket = 0, .generation = null }, .{ .bucket = 256, .generation = std.math.maxInt(u64) } });
                 }
                 fn normalizeWrites(_: *anyopaque, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
                     const result = try alloc.alloc(types.BatchWrite, writes.len);
@@ -336,7 +336,7 @@ fn consumerTests() type {
             var lifetime = try registry.Registry.init(alloc, std.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
             defer lifetime.deinit();
             var fixture: Fixture = .{ .registry_owner = &lifetime };
-            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("../runtime_io_abi.zig").Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
+            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
             const fence = (try Client.capture(alloc, executor, "http://peer", "rows", Fixture.route, 5, null)).?;
             const view = try fence.open(alloc, "", "", .{ .relational_query = .{ .fields = &.{ "n", "j" } }, .sql_document_preimage = true, .include_content_hashes = true, .include_range_proofs = true });
             try fence.validate();

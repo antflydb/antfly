@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
@@ -21,22 +21,22 @@ const metadata_mod = @import("../metadata/domain.zig");
 const route_metadata_api = @import("../metadata/api.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("antfly_source_root").antfly_sources.physical_db;
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
-const distributed_stats_mod = @import("../search/distributed_stats.zig");
+const distributed_stats_mod = @import("antfly_local_sources").search_distributed_stats;
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const txn_api = @import("distributed_txn.zig");
-const txn_contract = @import("distributed_txn_contract.zig");
-const table_writes_api = @import("table_write_source.zig");
+const txn_contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const table_writes_api = @import("antfly_local_sources").api_table_write_source;
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const query_response = @import("query_response.zig");
-const backup_contract = @import("backup_contract.zig");
+const query_response = @import("antfly_local_sources").api_query_response;
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 const internal_service_auth = @import("internal_service_auth.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
@@ -739,7 +739,7 @@ pub const ApiHttpClient = struct {
         };
     }
 
-    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_owner.zig").Response {
+    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("restore_owner.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
@@ -769,7 +769,7 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_parent_activation.zig").Response {
+    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("restore_parent_activation.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         try request.validate(group_id);
@@ -798,7 +798,7 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
-    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("operation.zig").RequestContext) !Response {
+    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("antfly_local_sources").api_operation.RequestContext) !Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         try request.validate(group_id);
@@ -828,19 +828,19 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
+    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").Receipt, routes.Routes.fk_generation_parent_suffix, base_uri, group_id, table_name, request, context);
     }
 
-    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
+    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
     }
 
-    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
+    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
     }
 
-    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("row_policy_install.zig").Response {
+    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("row_policy_install.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         try @import("row_policy_install.zig").validate(request, group_id);
@@ -877,7 +877,7 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         fence: backup_contract.TableBackupFence,
         control: backup_contract.BackupOperationControl,
-        cohort: ?@import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+        cohort: ?@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
     ) !TablesResponse {
         if (cohort) |value| if (value.owner_group_id != group_id or value.namespace.table_id != fence.table_id or value.role != .backup_snapshot)
             return error.InvalidBackupFence;
@@ -1214,7 +1214,7 @@ pub const ApiHttpClient = struct {
             status: u16 = 0,
             error_body: std.ArrayListUnmanaged(u8) = .empty,
 
-            fn deinit(adapter: *@This()) void {
+            pub fn deinit(adapter: *@This()) void {
                 adapter.error_body.deinit(adapter.alloc);
             }
 
@@ -4099,10 +4099,10 @@ test "relational row query remote transaction prepare preserves scalar validatio
     };
     var executor: Executor = .{ .status = 400, .body = "" };
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
-    inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-        const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+    inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+        const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
         executor.status = @import("relational_row_errors.zig").status(reason);
-        executor.body = field.name;
+        executor.body = field;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
     }
     executor.status = 500;
@@ -4315,7 +4315,7 @@ fn consumerTests() type {
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
         test "relational backup cohort remote capture carries exact binary owner authority" {
-            const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+            const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
             const expected: topology.Fence = .{
                 .transition_id = std.math.maxInt(u64),
                 .attempt = 7,
@@ -4465,7 +4465,7 @@ fn consumerTests() type {
                 .table_name = "docs",
                 .index_name = "semantic_idx",
                 .indexes_json = "{}",
-                .indexes_digest = [_]u8{0x11} ** std.crypto.hash.sha2.Sha256.digest_length,
+                .indexes_digest = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x11)),
             };
             var executor = Executor{ .status = 200, .body = "{\"state\":\"accepted\",\"serviceable\":false,\"error_code\":null}" };
             var client = ApiHttpClient.init(std.testing.allocator, executor.iface());
@@ -4479,16 +4479,16 @@ fn consumerTests() type {
             try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.observed, observed.state);
             try std.testing.expect(observed.serviceable);
 
-            inline for (std.meta.fields(metadata_mod.IndexActivationProgress.FailureCode)) |field| {
+            inline for (comptime std.meta.fieldNames(metadata_mod.IndexActivationProgress.FailureCode)) |reflected_name| {
                 executor.body = try std.fmt.allocPrint(
                     std.testing.allocator,
                     "{{\"state\":\"action_required\",\"serviceable\":false,\"error_code\":\"{s}\"}}",
-                    .{field.name},
+                    .{reflected_name},
                 );
                 defer std.testing.allocator.free(@constCast(executor.body));
                 const progress = try client.activateGroupIndex("http://127.0.0.1:8080", target);
                 try std.testing.expectEqual(metadata_mod.IndexActivationProgress.State.action_required, progress.state);
-                try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, field.name), progress.error_code.?);
+                try std.testing.expectEqual(@field(metadata_mod.IndexActivationProgress.FailureCode, reflected_name), progress.error_code.?);
             }
 
             executor = .{ .status = 400, .body = "InvalidArgument" };
@@ -4522,7 +4522,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(error.LeaderUnavailable, remotePublicBatchError(alloc, 503, "write unavailable"));
             try std.testing.expectEqual(error.TransactionPrepareAbortedUnavailable, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true}"));
             try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":false}"));
-            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true,\"padding\":\"" ++ ("x" ** 1024) ++ "\"}"));
+            try std.testing.expectEqual(error.UnexpectedHttpStatus, remotePublicBatchError(alloc, 503, "{\"code\":\"transaction_precommit_aborted\",\"retryable\":true,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}"));
             try std.testing.expectEqual(error.HAReadOnlyStandby, remotePublicBatchError(alloc, 409, "standby is read-only"));
         }
 
@@ -5507,9 +5507,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
             ));
@@ -5544,9 +5544,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
                 .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
@@ -5581,9 +5581,9 @@ fn consumerTests() type {
                     .metadata_group_id = 3,
                     .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
                     .table_id = 7,
-                    .definition_digest = [_]u8{0x11} ** 32,
+                    .definition_digest = @as([32]u8, @splat(0x11)),
                     .topology_range_count = 1,
-                    .topology_digest = [_]u8{0x22} ** 32,
+                    .topology_digest = @as([32]u8, @splat(0x22)),
                     .writer_not_after_unix_ns = 123,
                 },
                 .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s },
@@ -5776,7 +5776,7 @@ fn consumerTests() type {
                 empty_splits: [0]@import("../metadata/transition_state.zig").SplitTransitionRecord = .{},
                 empty_merges: [0]@import("../metadata/transition_state.zig").MergeTransitionRecord = .{},
 
-                fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
                     if (self.owns_created_table and self.created_table != null) {
                         metadata_table_manager.freeTable(alloc, self.created_table.?);
                     }
@@ -5832,7 +5832,7 @@ fn consumerTests() type {
 
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-                fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
+                pub fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, req: @import("tables.zig").CreateTableRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.created = true;
                     _ = table_name;
@@ -5849,7 +5849,7 @@ fn consumerTests() type {
                     self.owns_created_table = false;
                 }
 
-                fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) !void {
+                pub fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.owns_created_table and self.created_table != null) {
                         metadata_table_manager.freeTable(alloc, self.created_table.?);
@@ -5859,7 +5859,7 @@ fn consumerTests() type {
                     self.owns_created_table = false;
                 }
 
-                fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, schema_json: []const u8) !void {
+                pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, schema_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.created_table) |*table| {
                         const updated = try tables_api.applySchemaUpdateRecord(alloc, table, schema_json);
@@ -5898,7 +5898,7 @@ fn consumerTests() type {
                     };
                 }
 
-                fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8, index_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const next = try @import("indexes.zig").addIndexToTableIndexesJson(alloc, self.indexes_json, index_name, index_json);
                     if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
@@ -5917,7 +5917,7 @@ fn consumerTests() type {
                     self.owns_created_table = true;
                 }
 
-                fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
+                pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, index_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     const next = (try @import("indexes.zig").removeIndexFromTableIndexesJson(alloc, self.indexes_json, index_name)) orelse return error.IndexNotFound;
                     if (!std.mem.eql(u8, self.indexes_json, "{\"full_text_index_v0\":{}}")) alloc.free(self.indexes_json);
@@ -6341,7 +6341,7 @@ fn consumerTests() type {
                     return error.UnsupportedOperation;
                 }
 
-                fn commitTransaction(
+                pub fn commitTransaction(
                     _: *anyopaque,
                     _: std.mem.Allocator,
                     _: []const txn_api.TableCommitRequest,
@@ -6500,4 +6500,15 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

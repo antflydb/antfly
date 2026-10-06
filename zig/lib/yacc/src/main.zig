@@ -52,9 +52,9 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(generated);
 
     // Publish the final source so checks and regeneration share one immutable output.
-    const terminated = try init.gpa.dupeZ(u8, generated);
+    const terminated = try init.gpa.dupeSentinel(u8, generated, 0);
     defer init.gpa.free(terminated);
-    var tree = try std.zig.Ast.parse(init.gpa, terminated, .zig);
+    var tree = try std.zig.Ast.parse(init.gpa, terminated, .{ .mode = .zig });
     defer tree.deinit(init.gpa);
     if (tree.errors.len != 0) return error.InvalidGeneratedZig;
     const formatted = try tree.renderAlloc(init.gpa);

@@ -1,0 +1,23 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+test {
+    _ = @import("api/lake_sql_cursor.zig");
+    _ = @import("api/lake_schema_detection.zig");
+    _ = @import("api/lake_table_reads.zig");
+    _ = @import("antfly_local_sources").serverless_query_lake_schema;
+    _ = @import("antfly_local_sources").schema_mod;
+    _ = @import("antfly_local_sources").serverless_query_lake_read_context;
+    _ = @import("antfly_local_sources").serverless_query_lake_serving_cache;
+}

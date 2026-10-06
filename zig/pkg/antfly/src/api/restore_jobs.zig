@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const docstore_mod = @import("../storage/docstore.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const mem_backend = @import("../storage/mem_backend.zig");
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
-const runtime_error_abi = @import("../runtime_error_abi.zig");
+const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 
 const key_prefix = "\x00\x00__api_restore_jobs__:";
@@ -160,7 +160,7 @@ pub const OpenedStore = struct {
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);
@@ -1302,7 +1302,7 @@ pub const Store = struct {
         defer parsed.deinit();
         if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id or parsed.value.staging_attempt_id == 0 or parsed.value.staging_resolution != .active) return error.RestoreJobFenced;
         const previous = parsed.value.rewrite_progress;
-        if (@intFromEnum(progress.phase) < @intFromEnum(previous.phase) or (progress.phase == previous.phase and
+        if (@backingInt(progress.phase) < @backingInt(previous.phase) or (progress.phase == previous.phase and
             (progress.round < previous.round or (progress.round == previous.round and progress.owner < previous.owner)))) return error.RestoreJobCheckpointOrder;
         return self.updateLocked(alloc, parsed.value, .{ .phase = .running, .rewrite_progress = progress });
     }
@@ -2960,7 +2960,7 @@ const TestReplicatedPersistence = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *TestReplicatedPersistence) void {
+    pub fn deinit(self: *TestReplicatedPersistence) void {
         var it = self.rows.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);

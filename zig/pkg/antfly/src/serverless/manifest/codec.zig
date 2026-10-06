@@ -14,11 +14,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const bounded_decode = @import("../bounded_decode.zig");
+const bounded_decode = @import("antfly_local_sources").serverless_bounded_decode;
 const catalog_types = @import("../catalog/types.zig");
-const manifest_base_source = @import("base_source.zig");
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const manifest_types = @import("types.zig");
-const artifact_ref = @import("artifact_ref.zig");
+const artifact_ref = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const search_sources = @import("../search_sources.zig");
 
 pub const wire_magic = "AFSM";
@@ -30,7 +30,7 @@ const header_size = 4 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 +
 
 fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(policy.default_query_view);
+    buf[pos] = @backingInt(policy.default_query_view);
     pos += 1;
     std.mem.writeInt(u64, buf[pos..][0..8], @intCast(policy.keep_latest_versions), .little);
     pos += 8;
@@ -44,15 +44,15 @@ fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     pos += 4;
     std.mem.writeInt(u32, buf[pos..][0..4], @bitCast(policy.vector_compaction_max_distance_span), .little);
     pos += 4;
-    buf[pos] = @intCast(@intFromEnum(policy.vector_distance_metric));
+    buf[pos] = @intCast(@backingInt(policy.vector_distance_metric));
     pos += 1;
     buf[pos] = @intFromBool(policy.enrichment_enabled);
     pos += 1;
-    buf[pos] = @intFromEnum(policy.lexical_sparse_model_preference);
+    buf[pos] = @backingInt(policy.lexical_sparse_model_preference);
     pos += 1;
     std.mem.writeInt(u64, buf[pos..][0..8], @intCast(policy.enrichment_batch_size), .little);
     pos += 8;
-    buf[pos] = @intFromEnum(policy.enrichment_failure_policy);
+    buf[pos] = @backingInt(policy.enrichment_failure_policy);
     pos += 1;
     std.mem.writeInt(u64, buf[pos..][0..8], policy.enrichment_publish_min_pending_records, .little);
     pos += 8;
@@ -66,7 +66,7 @@ fn encodePolicy(buf: []u8, policy: catalog_types.NamespacePolicy) void {
     pos += 8;
     buf[pos] = @intFromBool(policy.chunk_embeddings_enabled);
     pos += 1;
-    buf[pos] = @intFromEnum(policy.chunk_embeddings_model_preference);
+    buf[pos] = @backingInt(policy.chunk_embeddings_model_preference);
     pos += 1;
     std.mem.writeInt(u32, buf[pos..][0..4], policy.chunk_embeddings_pipeline_version, .little);
     pos += 4;
@@ -247,7 +247,7 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
     pos += 8;
     std.mem.writeInt(u64, buf[pos..][0..8], manifest.stats.document_base_version, .little);
     pos += 8;
-    buf[pos] = @intFromEnum(manifest.stats.document_publish_mode);
+    buf[pos] = @backingInt(manifest.stats.document_publish_mode);
     pos += 1;
     std.mem.writeInt(u32, buf[pos..][0..4], manifest.stats.text_segment_count, .little);
     pos += 4;
@@ -344,7 +344,7 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
     }
 
     for (manifest.artifacts) |artifact| {
-        buf[pos] = @intFromEnum(artifact.kind);
+        buf[pos] = @backingInt(artifact.kind);
         pos += 1;
         std.mem.writeInt(u32, buf[pos..][0..4], @intCast(artifact.name.len), .little);
         pos += 4;
@@ -385,9 +385,9 @@ pub fn encodeForVersionAlloc(alloc: Allocator, manifest: manifest_types.Manifest
             pos += 32;
             @memcpy(buf[pos..][0..32], &artifact.graph_metric_topology_checksum);
             pos += 32;
-            buf[pos] = @intFromEnum(artifact.graph_metric_materialization_state);
+            buf[pos] = @backingInt(artifact.graph_metric_materialization_state);
             pos += 1;
-            buf[pos] = @intFromEnum(artifact.graph_metric_rejection_reason);
+            buf[pos] = @backingInt(artifact.graph_metric_rejection_reason);
             pos += 1;
         }
         @memcpy(buf[pos..][0..artifact.name.len], artifact.name);
@@ -430,7 +430,7 @@ fn encodeStringList(buf: []u8, pos_ptr: *usize, values: []const []const u8) void
 
 fn encodeBaseSource(buf: []u8, descriptor: manifest_types.BaseSourceDescriptor) void {
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(std.meta.activeTag(descriptor));
+    buf[pos] = @backingInt(std.meta.activeTag(descriptor));
     pos += 1;
 
     switch (descriptor) {
@@ -442,7 +442,7 @@ fn encodeBaseSource(buf: []u8, descriptor: manifest_types.BaseSourceDescriptor) 
             encodeStringList(buf, &pos, source.row_fragment_stats_artifacts);
         },
         .external_parquet, .external_iceberg, .external_lance => |source| {
-            buf[pos] = @intFromEnum(source.format);
+            buf[pos] = @backingInt(source.format);
             pos += 1;
             encodeString(buf, &pos, source.source_uri);
             encodeString(buf, &pos, source.snapshot_id);
@@ -918,9 +918,9 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
     pos += 1;
 
     const descriptor: manifest_types.BaseSourceDescriptor = switch (kind_value) {
-        @intFromEnum(manifest_types.BaseSourceKind.antfly_document_segments) => .{ .antfly_document_segments = {} },
-        @intFromEnum(manifest_types.BaseSourceKind.antfly_lsm_overlay) => .{ .antfly_lsm_overlay = {} },
-        @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments) => blk: {
+        @backingInt(manifest_types.BaseSourceKind.antfly_document_segments) => .{ .antfly_document_segments = {} },
+        @backingInt(manifest_types.BaseSourceKind.antfly_lsm_overlay) => .{ .antfly_lsm_overlay = {} },
+        @backingInt(manifest_types.BaseSourceKind.antfly_row_fragments) => blk: {
             const snapshot_id = try decodeStringAlloc(alloc, data, &pos, &budget);
             errdefer alloc.free(snapshot_id);
             const schema_fingerprint = try decodeStringAlloc(alloc, data, &pos, &budget);
@@ -936,15 +936,15 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
                 .row_fragment_stats_artifacts = row_fragment_stats_artifacts,
             } };
         },
-        @intFromEnum(manifest_types.BaseSourceKind.external_parquet),
-        @intFromEnum(manifest_types.BaseSourceKind.external_iceberg),
-        @intFromEnum(manifest_types.BaseSourceKind.external_lance),
+        @backingInt(manifest_types.BaseSourceKind.external_parquet),
+        @backingInt(manifest_types.BaseSourceKind.external_iceberg),
+        @backingInt(manifest_types.BaseSourceKind.external_lance),
         => blk: {
             if (pos + 1 > data.len) return error.InvalidManifest;
             const format: manifest_types.ExternalBaseFormat = switch (data[pos]) {
-                @intFromEnum(manifest_types.ExternalBaseFormat.parquet_prefix) => .parquet_prefix,
-                @intFromEnum(manifest_types.ExternalBaseFormat.iceberg) => .iceberg,
-                @intFromEnum(manifest_types.ExternalBaseFormat.lance) => .lance,
+                @backingInt(manifest_types.ExternalBaseFormat.parquet_prefix) => .parquet_prefix,
+                @backingInt(manifest_types.ExternalBaseFormat.iceberg) => .iceberg,
+                @backingInt(manifest_types.ExternalBaseFormat.lance) => .lance,
                 else => return error.InvalidManifest,
             };
             pos += 1;
@@ -970,9 +970,9 @@ fn decodeBaseSourceAlloc(alloc: Allocator, data: []const u8) !manifest_types.Bas
                 .delete_metadata_artifact = delete_metadata_artifact,
             };
             break :blk switch (kind_value) {
-                @intFromEnum(manifest_types.BaseSourceKind.external_parquet) => .{ .external_parquet = source },
-                @intFromEnum(manifest_types.BaseSourceKind.external_iceberg) => .{ .external_iceberg = source },
-                @intFromEnum(manifest_types.BaseSourceKind.external_lance) => .{ .external_lance = source },
+                @backingInt(manifest_types.BaseSourceKind.external_parquet) => .{ .external_parquet = source },
+                @backingInt(manifest_types.BaseSourceKind.external_iceberg) => .{ .external_iceberg = source },
+                @backingInt(manifest_types.BaseSourceKind.external_lance) => .{ .external_lance = source },
                 else => unreachable,
             };
         },
@@ -1102,9 +1102,9 @@ test "serverless manifest codec round-trips deterministically" {
     try std.testing.expectEqual(@as(u64, 0x1234), decoded.artifacts[4].materializer_fingerprint);
     try std.testing.expectEqual(@as(u32, 73), decoded.artifacts[4].graph_metric_control_len);
     try std.testing.expectEqual(@as(u32, 17), decoded.artifacts[4].graph_metric_routing_footer_len);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x11} ** 32), &decoded.artifacts[4].graph_metric_control_checksum);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x44} ** 32), &decoded.artifacts[4].graph_metric_point_index_checksum);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 32), &decoded.artifacts[4].graph_metric_topology_checksum);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x11))), &decoded.artifacts[4].graph_metric_control_checksum);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x44))), &decoded.artifacts[4].graph_metric_point_index_checksum);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0x55))), &decoded.artifacts[4].graph_metric_topology_checksum);
 
     // The current manifest layout retains the old field positions, but graph
     // metrics deliberately fail closed if a pre-release version is forged.
@@ -1304,8 +1304,8 @@ test "serverless manifest rejects malformed descriptor tags without leaking name
 
 test "serverless lake manifest base source decoder rejects forged string-list counts before allocation" {
     const alloc = std.testing.allocator;
-    var encoded = [_]u8{0} ** 13;
-    encoded[0] = @intFromEnum(manifest_types.BaseSourceKind.antfly_row_fragments);
+    var encoded = @as([13]u8, @splat(0));
+    encoded[0] = @backingInt(manifest_types.BaseSourceKind.antfly_row_fragments);
     std.mem.writeInt(u32, encoded[1..5], 0, .little);
     std.mem.writeInt(u32, encoded[5..9], 0, .little);
     std.mem.writeInt(u32, encoded[9..13], std.math.maxInt(u32), .little);

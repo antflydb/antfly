@@ -210,7 +210,7 @@ const HttpxTransport = struct {
         };
     }
 
-    fn deinit(self: *HttpxTransport) void {
+    pub fn deinit(self: *HttpxTransport) void {
         self.client.deinit();
         if (self.io_impl) |io_impl| {
             io_impl.deinit();
@@ -256,7 +256,7 @@ const ContextHttpxTransport = struct {
         };
     }
 
-    fn deinit(self: *ContextHttpxTransport) void {
+    pub fn deinit(self: *ContextHttpxTransport) void {
         self.client.deinit();
         self.* = undefined;
     }
@@ -1415,7 +1415,7 @@ const RequestTarget = struct {
     canonical_uri: []u8,
     query_pairs: []QueryPair,
 
-    fn deinit(self: *RequestTarget, alloc: Allocator) void {
+    pub fn deinit(self: *RequestTarget, alloc: Allocator) void {
         alloc.free(self.url);
         alloc.free(self.host);
         alloc.free(self.canonical_uri);
@@ -1773,7 +1773,7 @@ const CanonicalHeaders = struct {
     header_block: []u8,
     signed_headers: []u8,
 
-    fn deinit(self: *CanonicalHeaders, alloc: Allocator) void {
+    pub fn deinit(self: *CanonicalHeaders, alloc: Allocator) void {
         for (self.entries) |*entry| entry.deinit(alloc);
         alloc.free(self.entries);
         alloc.free(self.header_block);
@@ -1786,7 +1786,7 @@ const CanonicalHeader = struct {
     name: []u8,
     value: []u8,
 
-    fn deinit(self: *CanonicalHeader, alloc: Allocator) void {
+    pub fn deinit(self: *CanonicalHeader, alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.value);
         self.* = undefined;
@@ -2006,7 +2006,7 @@ fn formatAmzDateAlloc(alloc: Allocator, unix_seconds: u64) ![]u8 {
         "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z",
         .{
             year_day.year,
-            @intFromEnum(month_day.month),
+            @backingInt(month_day.month),
             month_day.day_index + 1,
             day_seconds.getHoursIntoDay(),
             day_seconds.getMinutesIntoHour(),
@@ -2024,7 +2024,7 @@ fn formatScopeDateAlloc(alloc: Allocator, unix_seconds: u64) ![]u8 {
         "{d:0>4}{d:0>2}{d:0>2}",
         .{
             year_day.year,
-            @intFromEnum(month_day.month),
+            @backingInt(month_day.month),
             month_day.day_index + 1,
         },
     );

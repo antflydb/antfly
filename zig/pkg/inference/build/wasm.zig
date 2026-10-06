@@ -52,7 +52,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
         .root_module = b.createModule(.{
             .root_source_file = ctx.path(wasm_root),
             .target = wasm_target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .single_threaded = true,
         }),
     });
@@ -66,59 +66,59 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     const wasm_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tokenizer/src/tokenizer.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     const wasm_hf_tokenizer_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/tokenizer/src/hf_root.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     const wasm_audio_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/audio/src/mod.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     const wasm_image_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/image/src/mod.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     const wasm_hash_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/hash/src/mod.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     wasm_image_mod.addImport("antfly_hash", wasm_hash_mod);
     wasm_platform_mod.single_threaded = true;
     const wasm_linalg_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/linalg/src/mod.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     const wasm_ml_mod = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/ml/src/root.zig" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
     });
     wasm_ml_mod.addImport("antfly_platform", wasm_platform_mod);
-    const wasm_protobuf = b.dependency("protobuf", .{ .target = wasm_target, .optimize = .ReleaseSafe }).module("protobuf");
+    const wasm_protobuf = b.dependency("protobuf", .{ .target = wasm_target, .optimize = .safe }).module("protobuf");
     // Reuse generated source without importing the native runtime module.
     const wasm_sentencepiece_proto = b.createModule(.{
         .root_source_file = ctx.graph.sentencepiece_proto_mod.root_source_file,
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{.{ .name = "protobuf", .module = wasm_protobuf }},
     });
     const wasm_onnx = @import("onnx_graph").support.create(b, .{
         .root = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/onnx" })),
         .target = wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
         .protobuf = wasm_protobuf,
         .ml = wasm_ml_mod,

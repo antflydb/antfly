@@ -30,7 +30,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) [2]*std.Bui
         .root_module = b.createModule(.{
             .root_source_file = options.root.path(b, "audio_xiph_corpora_runner.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         }),
     });
     lib_audio_xiph_conformance.root_module.link_libc = true;
@@ -40,7 +40,7 @@ pub fn addConformance(b: *std.Build, options: AddConformanceOptions) [2]*std.Bui
         .root_module = b.createModule(.{
             .root_source_file = options.root.path(b, "audio_misc_corpora_runner.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
         }),
     });
     lib_audio_misc_conformance.root_module.link_libc = true;

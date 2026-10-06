@@ -52,7 +52,7 @@ fn storeRootProof(allocator: std.mem.Allocator, io: std.Io, args: *std.process.A
     @memcpy(&incarnation_bytes, incarnation);
     const node_id = try std.fmt.parseInt(u64, node_id_raw orelse cli.fatal("--node-id is required", .{}), 10);
     const store_id = try std.fmt.parseInt(u64, store_id_raw orelse cli.fatal("--store-id is required", .{}), 10);
-    const signing = try @import("../../storage/db/root_signing_identity.zig").load(
+    const signing = try @import("antfly_local_sources").storage_db_root_signing_identity.load(
         allocator,
         io,
         root_dir orelse cli.fatal("--replica-root-dir is required", .{}),
@@ -136,7 +136,7 @@ fn metadata(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
     cli.fatal("unknown internal metadata subcommand: {s}", .{subcommand});
 }
 
-fn metadataStatus(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+pub fn metadataStatus(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
     var resp = try client.getStatus();
     defer resp.deinit();
     if (resp.data) |data| {

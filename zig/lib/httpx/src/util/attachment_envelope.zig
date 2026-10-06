@@ -377,7 +377,7 @@ test "attachment envelope streaming decoder owns one compact payload slab" {
         bytes: []const u8,
         offset: usize = 0,
 
-        fn read(self: *@This(), dest: []u8) !usize {
+        pub fn read(self: *@This(), dest: []u8) !usize {
             if (self.offset == self.bytes.len) return 0;
             const n = @min(@min(dest.len, @as(usize, 3)), self.bytes.len - self.offset);
             @memcpy(dest[0..n], self.bytes[self.offset..][0..n]);
@@ -420,7 +420,7 @@ test "attachment envelope streaming payload admission is exact and released" {
         bytes: []const u8,
         offset: usize = 0,
 
-        fn read(self: *@This(), dest: []u8) !usize {
+        pub fn read(self: *@This(), dest: []u8) !usize {
             if (self.offset == self.bytes.len) return 0;
             const n = @min(dest.len, self.bytes.len - self.offset);
             @memcpy(dest[0..n], self.bytes[self.offset..][0..n]);

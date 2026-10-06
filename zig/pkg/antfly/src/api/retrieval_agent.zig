@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ascii_compat = @import("../common/ascii_compat.zig");
 const connections_api = @import("connections.zig");
 const agent_tools = @import("agent_tools.zig");
 const web_search = @import("web_search.zig");
@@ -25,12 +26,12 @@ const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const generating = @import("antfly_generating");
 const platform_time = @import("antfly_platform").time;
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const query_builder_agent = @import("query_builder_agent.zig");
-const json_helpers = @import("json_helpers.zig");
-const wildcard_mod = @import("../search/wildcard.zig");
-const graph_query_mod = @import("../graph/query.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
+const wildcard_mod = @import("antfly_local_sources").search_wildcard;
+const graph_query_mod = @import("antfly_local_sources").graph_query;
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -1719,7 +1720,7 @@ test "model-directed retrieval delegates full DSL refinement with a shared gener
                 .runtime_query_request_validator = .{ .ptr = ptr, .vtable = &.{ .validate_query_request = validate } },
             }, generator);
         }
-        fn validate(ptr: *anyopaque, _: std.mem.Allocator, candidate: QueryRequest) !?[]const u8 {
+        pub fn validate(ptr: *anyopaque, _: std.mem.Allocator, candidate: QueryRequest) !?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", candidate.table.?);
             try std.testing.expectEqual(@as(?i64, 3), candidate.limit);
@@ -1808,7 +1809,7 @@ test "model-directed nested planning reserves pending siblings within the shared
             }, generator);
         }
 
-        fn validate(_: *anyopaque, _: std.mem.Allocator, request: QueryRequest) !?[]const u8 {
+        pub fn validate(_: *anyopaque, _: std.mem.Allocator, request: QueryRequest) !?[]const u8 {
             try std.testing.expectEqualStrings("docs", request.table.?);
             try std.testing.expect(request.full_text_search != null);
             return null;
@@ -2253,7 +2254,7 @@ fn executeModelTools(
                     continue;
                 }
                 var planned = scope;
-                inline for (std.meta.fields(QueryRequest)) |field| @field(planned, field.name) = @field(built.query_request.?, field.name);
+                inline for (comptime std.meta.fieldNames(QueryRequest)) |reflected_name| @field(planned, reflected_name) = @field(built.query_request.?, reflected_name);
                 if (planned.table == null or scope.table == null or !std.mem.eql(u8, planned.table.?, scope.table.?) or !try toolPolicyAllowsRetrievalQuery(arena, policy, planned)) {
                     try rejectModelToolCall(arena, steps, live, &history, call, "{\"error\":\"Plan exceeds the authorized table or tool policy\"}");
                     continue;
@@ -2887,7 +2888,7 @@ fn runQueryWithResults(
     // The arena owns the allocation and will free it.
 
     const tree_root = if (has_tree_search)
-        try extractTreeFallbackRootKey(arena, query_json)
+        try extractTreeFallbackRootKeyAlloc(arena, query_json)
     else
         null;
 
@@ -5379,7 +5380,7 @@ fn queryCoverageScore(query: []const u8, text: []const u8) f32 {
     while (it.next()) |token| {
         if (token.len < 4) continue;
         total += 1;
-        if (std.ascii.indexOfIgnoreCase(text, token) != null) matched += 1;
+        if (ascii_compat.indexOfIgnoreCase(text, token) != null) matched += 1;
     }
     return if (total == 0) 0.0 else @as(f32, @floatFromInt(matched)) / @as(f32, @floatFromInt(total));
 }
@@ -5606,7 +5607,7 @@ fn maybeProbeAgenticSelection(
         }) catch continue;
 
         const fallback_tree_root = if (retrieval_query.tree_search != null)
-            try extractTreeFallbackRootKey(arena, query_json)
+            try extractTreeFallbackRootKeyAlloc(arena, query_json)
         else
             null;
         const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
@@ -5767,7 +5768,7 @@ fn probeAgenticFallbackCandidates(
         }) catch continue;
 
         const fallback_tree_root = if (retrieval_query.tree_search != null)
-            try extractTreeFallbackRootKey(arena, query_json)
+            try extractTreeFallbackRootKeyAlloc(arena, query_json)
         else
             null;
         const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
@@ -6620,7 +6621,7 @@ fn detectSelectedAgenticStrategy(
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| {
-        if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
+        if (ascii_compat.indexOfIgnoreCase(haystack, needle) != null) return true;
     }
     return false;
 }
@@ -6930,14 +6931,15 @@ fn injectSeedNodesIntoEncodedQuery(
 
 fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
     var canonical: QueryRequest = .{};
-    inline for (std.meta.fields(QueryRequest)) |field| {
-        if (!@hasField(RetrievalQueryRequest, field.name)) {
-            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ field.name);
+    const query_info = @typeInfo(QueryRequest).@"struct";
+    inline for (query_info.field_names, query_info.field_types) |reflected_name, Field| {
+        if (!@hasField(RetrievalQueryRequest, reflected_name)) {
+            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ reflected_name);
         }
-        if (@TypeOf(@field(request, field.name)) != field.type) {
-            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ field.name);
+        if (@TypeOf(@field(request, reflected_name)) != Field) {
+            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ reflected_name);
         }
-        @field(canonical, field.name) = @field(request, field.name);
+        @field(canonical, reflected_name) = @field(request, reflected_name);
     }
     return canonical;
 }
@@ -7767,7 +7769,7 @@ fn treePathSegmentKey(segment: anytype) []const u8 {
     return segment;
 }
 
-fn extractTreeFallbackRootKey(
+fn extractTreeFallbackRootKeyAlloc(
     alloc: std.mem.Allocator,
     query_json: []const u8,
 ) !?[]const u8 {
@@ -7787,7 +7789,7 @@ fn extractTreeFallbackRootKey(
         else => return null,
     };
     if (keys.len != 1) return null;
-    return keys[0];
+    return try alloc.dupe(u8, keys[0]);
 }
 
 fn detectAggregateStrategy(strategies: []const RetrievalStrategy) ?RetrievalStrategy {
@@ -8059,7 +8061,8 @@ test "retrieval agent supports pipeline tree search from previous hits" {
                     ),
                 };
             }
-            const start_key = (try extractTreeFallbackRootKey(alloc, query_json)).?;
+            const start_key = (try extractTreeFallbackRootKeyAlloc(alloc, query_json)).?;
+            defer alloc.free(start_key);
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
@@ -8141,7 +8144,8 @@ test "retrieval agent supports roots tree search" {
             defer parsed_query.deinit();
             try std.testing.expect(parsed_query.value.filter_query != null);
             try std.testing.expect(parsed_query.value.exclusion_query != null);
-            const start_key = (try extractTreeFallbackRootKey(alloc, query_json)).?;
+            const start_key = (try extractTreeFallbackRootKeyAlloc(alloc, query_json)).?;
+            defer alloc.free(start_key);
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
@@ -10654,7 +10658,7 @@ test "retrieval agent event sink receives live milestones" {
             return total;
         }
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             for (self.names.items) |event_name| alloc.free(event_name);
             self.names.deinit(alloc);
         }
@@ -11856,14 +11860,14 @@ test "retrieval graph navigation fills candidate slots and bounds lookahead" {
 test "retrieval graph navigation terminal answer preserves embedded JSON provider" {
     const httpx = @import("httpx");
     const Fake = struct {
-        fn generate(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?@import("../inference/execution_context.zig").RequestContext) ![]u8 {
+        fn generate(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: ?@import("antfly_inference_execution_context").RequestContext) ![]u8 {
             return alloc.dupe(u8, "{\"choices\":[{\"message\":{\"content\":\"grounded answer\"}}]}");
         }
     };
     const alloc = std.testing.allocator;
     var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
     defer client.deinit();
-    var factory = @import("../generating/mod.zig").BackendFactory.initWithOptions(alloc, &client, .{
+    var factory = @import("antfly_local_sources").generating_mod.BackendFactory.initWithOptions(alloc, &client, .{
         .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
         .request_context = .{ .io = std.testing.io, .deadline_ns = null },
     });
@@ -11913,7 +11917,7 @@ test "retrieval graph navigation pruning uses memory proportional to candidates"
             defer scratch.deinit();
             const a = scratch.allocator();
             var document = JsonObject{};
-            try document.map.put(a, "body", .{ .string = "x" ** 1024 });
+            try document.map.put(a, "body", .{ .string = z17RepeatString("x", 1024) });
             const nodes = try a.alloc(indexes_openapi.GraphResultNode, 256);
             for (nodes, 0..) |*node, i| node.* = .{ .key = try std.fmt.allocPrint(a, "node-{d}", .{i}), .depth = 1, .document = document };
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, .{ .responses = .{.{ .status = 200, .took = 1, .graph_results = .{ .navigation = .{ .kind = "nodes", .nodes = nodes, .stats = .{ .returned_items = 256, .truncated = false } } } }} }, .{ .emit_null_optional_fields = false }) };
@@ -12423,7 +12427,7 @@ test "retrieval agent fetch shrinks non-ASCII pages to the context budget" {
         fn fetchUrl(_: *anyopaque, arena: std.mem.Allocator, _: web_fetch.Config, _: []const u8) !web_fetch.Download {
             // Every code point is three bytes: a byte-halving loop that
             // counted code points would never shrink this page.
-            return .{ .content_type = "text/plain", .data = try arena.dupe(u8, "\u{4e2d}" ** 4000) };
+            return .{ .content_type = "text/plain", .data = try arena.dupe(u8, z17RepeatString("\u{4e2d}", 4000)) };
         }
         fn generate(_: *anyopaque, a: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
             if (messages[messages.len - 1].role != .tool) {
@@ -12561,4 +12565,15 @@ test "retrieval refinement preserves query syntax and only edits native match te
     try std.testing.expectEqualStrings("or", parsed.object.get("operator").?.string);
     try std.testing.expectEqual(@as(i64, 2), parsed.object.get("boost").?.integer);
     try std.testing.expect(parsed.object.get("query") == null);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

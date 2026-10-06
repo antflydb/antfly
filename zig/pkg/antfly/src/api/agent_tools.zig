@@ -190,7 +190,7 @@ test "agent tools enable every real generator adapter and omit empty schemas" {
     defer arena.deinit();
     for (std.enums.values(generating.Provider)) |provider| {
         const chain = [_]generating.ChainLink{.{ .generator = .{ .provider = provider, .model = "m", .url = "" } }};
-        if (provider == .mock) {
+        if (!provider.supportsTools()) {
             try std.testing.expectError(error.UnsupportedAgentToolProvider, withTools(arena.allocator(), &chain, "[]"));
             continue;
         }

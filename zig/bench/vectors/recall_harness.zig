@@ -67,7 +67,7 @@ const Heartbeat = struct {
 const RecallCase = recall_cases.RecallCase;
 
 pub fn main(init: std.process.Init) !void {
-    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
+    var gpa_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa_state.deinit();
     const alloc = gpa_state.allocator();
 
@@ -536,7 +536,7 @@ const BuiltHBC = struct {
     query_owned: common.OwnedVectorSet,
     idx: hbc.HBCIndex,
 
-    fn deinit(self: *BuiltHBC) void {
+    pub fn deinit(self: *BuiltHBC) void {
         const alloc = self.idx.alloc;
         self.idx.close();
         self.tp.cleanup();

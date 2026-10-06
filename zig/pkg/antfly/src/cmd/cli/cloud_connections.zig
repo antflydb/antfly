@@ -15,7 +15,7 @@
 //! Credentials for the machine running this CLI, independent of Antfly identity.
 const std = @import("std");
 const platform = @import("antfly_platform");
-const credentials = @import("../../common/cloud_credentials.zig");
+const credentials = @import("antfly_credentials").cloud;
 const cli = @import("mod.zig");
 
 pub const Provider = enum { google, aws };

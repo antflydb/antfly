@@ -47,6 +47,7 @@ pub fn main(init: std.process.Init) !void {
     var config_path: ?[]const u8 = null;
     var import_mapping = std.StringArrayHashMapUnmanaged([]const u8){};
     var zig_type_mapping = std.StringArrayHashMapUnmanaged([]const u8){};
+    var external_types_module: ?[]const u8 = null;
 
     // Parse CLI args
     const argv = try init.minimal.args.toSlice(arena);
@@ -104,6 +105,13 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             try zig_type_mapping.put(arena, mapping[0..eq_pos], mapping[eq_pos + 1 ..]);
+        } else if (std.mem.eql(u8, arg, "--external-types-module")) {
+            i += 1;
+            if (i >= argv.len or argv[i].len == 0) {
+                std.debug.print("Error: --external-types-module requires a module name\n", .{});
+                std.process.exit(1);
+            }
+            external_types_module = argv[i];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -169,6 +177,9 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+        if (root.object.get("external_types_module")) |v| {
+            if (v == .string) external_types_module = v.string;
+        }
     }
 
     const path = spec_path orelse {
@@ -207,6 +218,7 @@ pub fn main(init: std.process.Init) !void {
         .generate_extractors = gen.extractors,
         .import_mapping = import_mapping,
         .zig_type_mapping = zig_type_mapping,
+        .external_types_module = external_types_module,
     });
 
     // Write output files (ignore if directory already exists)
@@ -236,9 +248,9 @@ pub fn main(init: std.process.Init) !void {
 fn writeFile(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8, file_name: []const u8, source: []const u8) !void {
     // Formatting belongs to generation so cached outputs are immutable and
     // callers do not need a second, in-place `zig fmt` step.
-    const terminated = try allocator.dupeZ(u8, source);
+    const terminated = try allocator.dupeSentinel(u8, source, 0);
     defer allocator.free(terminated);
-    var tree = try std.zig.Ast.parse(allocator, terminated, .zig);
+    var tree = try std.zig.Ast.parse(allocator, terminated, .{ .mode = .zig });
     defer tree.deinit(allocator);
     if (tree.errors.len != 0) return error.InvalidGeneratedZig;
     const content = try tree.renderAlloc(allocator);
@@ -271,6 +283,7 @@ fn printUsage() void {
         \\  --config <path>           Path to JSON config file
         \\  --import-mapping <spec=mod>  Map external $ref file path to Zig module name
         \\  --zig-type-mapping <name=type> Map semantic x-zig-type name to a Zig type expression
+        \\  --external-types-module <mod> Import existing schema types for server-only output
         \\  --help                    Show this help
         \\
         \\Config file format (JSON):
@@ -278,7 +291,8 @@ fn printUsage() void {
         \\    "spec": "api.yaml",
         \\    "package": "metadata",
         \\    "output": "generated",
-        \\    "generate": ["types", "server"],
+        \\    "generate": ["server"],
+        \\    "external_types_module": "shared_api",
         \\    "import_mapping": {
         \\      "../../lib/schema/openapi.yaml": "schema",
         \\      "../../lib/embeddings/openapi.yaml": "embeddings"
@@ -293,6 +307,7 @@ fn printUsage() void {
         \\  openapi-zig --config codegen.json
         \\  openapi-zig --spec api.json --import-mapping "../lib/types.yaml=shared_types"
         \\  openapi-zig --spec api.json --zig-type-mapping 'raw_json_object=@import("json-runtime").RawObject'
+        \\  openapi-zig --spec api.json --generate server --external-types-module shared_api
         \\
     ;
     std.debug.print("{s}", .{usage});

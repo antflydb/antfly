@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const group_ids = @import("../common/group_ids.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const placement_planner = @import("placement_planner.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
@@ -112,7 +112,7 @@ pub const MergedGroupStatus = struct {
     voter_count_known: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: table_manager.VoterSetFingerprint = @as([table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     healthy_voter_reports: u16 = 0,
     joint_consensus: bool = false,
     readiness_from_leader: bool = false,
@@ -183,11 +183,11 @@ const PlacementVersionFenceIndex = struct {
         return index;
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.by_placement.deinit(alloc);
     }
 
-    fn version(
+    pub fn version(
         self: *const @This(),
         group_id: u64,
         local_node_id: u64,
@@ -1325,7 +1325,7 @@ const AutomaticTransitions = struct {
         };
     }
 
-    fn deinit(self: *AutomaticTransitions, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *AutomaticTransitions, alloc: std.mem.Allocator) void {
         for (self.splits) |intent| freeSplitIntentOwned(alloc, intent);
         if (self.splits.len > 0) alloc.free(self.splits);
         for (self.merges) |intent| freeMergeIntentOwned(alloc, intent);
@@ -1372,8 +1372,8 @@ test "metadata reconciler detects learner membership changes" {
 }
 
 fn snapshotBootstrapEqual(
-    a: ?@import("../raft/catalog.zig").SnapshotBootstrapRecord,
-    b: ?@import("../raft/catalog.zig").SnapshotBootstrapRecord,
+    a: ?@import("../raft/storage/catalog.zig").SnapshotBootstrapRecord,
+    b: ?@import("../raft/storage/catalog.zig").SnapshotBootstrapRecord,
 ) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -1385,7 +1385,7 @@ fn snapshotBootstrapEqual(
 }
 
 test "metadata reconciler normalizes versioned snapshot uri without a new wire tag" {
-    const legacy_wire: @import("../raft/catalog.zig").SnapshotBootstrapRecord = .{
+    const legacy_wire: @import("../raft/storage/catalog.zig").SnapshotBootstrapRecord = .{
         .from_node_id = 7,
         .term = 11,
         .snapshot_id = "snap-91",
@@ -1397,8 +1397,8 @@ test "metadata reconciler normalizes versioned snapshot uri without a new wire t
 }
 
 fn backupRestoreBootstrapEqual(
-    a: ?@import("../raft/catalog.zig").BackupRestoreBootstrapRecord,
-    b: ?@import("../raft/catalog.zig").BackupRestoreBootstrapRecord,
+    a: ?@import("../raft/storage/catalog.zig").BackupRestoreBootstrapRecord,
+    b: ?@import("../raft/storage/catalog.zig").BackupRestoreBootstrapRecord,
 ) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
@@ -1481,7 +1481,7 @@ const NativeRestoreCapabilityIndex = struct {
         return index;
     }
 
-    fn deinit(self: *NativeRestoreCapabilityIndex) void {
+    pub fn deinit(self: *NativeRestoreCapabilityIndex) void {
         self.capable_store_ids.deinit(self.alloc);
         self.capable_node_ids.deinit(self.alloc);
         self.groups.deinit(self.alloc);
@@ -1701,7 +1701,7 @@ const StoreEvidenceIndex = struct {
     const PlacementTopology = struct {
         member_count: usize = 0,
         voter_count: usize = 0,
-        voter_set_fingerprint: table_manager.VoterSetFingerprint = [_]u8{0} ** table_manager.voter_set_fingerprint_len,
+        voter_set_fingerprint: table_manager.VoterSetFingerprint = @as([table_manager.voter_set_fingerprint_len]u8, @splat(0)),
         initialized: bool = false,
         ambiguous: bool = false,
     };
@@ -1799,7 +1799,7 @@ const StoreEvidenceIndex = struct {
         return self;
     }
 
-    fn deinit(self: *StoreEvidenceIndex) void {
+    pub fn deinit(self: *StoreEvidenceIndex) void {
         self.stores_by_id.deinit(self.alloc);
         self.stores_by_node.deinit(self.alloc);
         self.reports_by_store_group.deinit(self.alloc);
@@ -2158,7 +2158,7 @@ const MembershipTransitionIndex = struct {
         return self;
     }
 
-    fn deinit(self: *MembershipTransitionIndex) void {
+    pub fn deinit(self: *MembershipTransitionIndex) void {
         self.groups.deinit(self.alloc);
         self.desired_by_member.deinit(self.alloc);
         self.* = undefined;
@@ -2714,7 +2714,7 @@ const AutomaticPlanningIndex = struct {
         return self;
     }
 
-    fn deinit(self: *AutomaticPlanningIndex) void {
+    pub fn deinit(self: *AutomaticPlanningIndex) void {
         self.range_spans_by_table.deinit(self.alloc);
         self.table_by_group.deinit(self.alloc);
         self.active_transitions_by_table.deinit(self.alloc);
@@ -3650,7 +3650,7 @@ const ActiveTransitionContractIndex = struct {
         return self;
     }
 
-    fn deinit(self: *ActiveTransitionContractIndex) void {
+    pub fn deinit(self: *ActiveTransitionContractIndex) void {
         self.by_table.deinit(self.alloc);
         self.table_by_group.deinit(self.alloc);
         self.range_mutation_fences.deinit(self.alloc);
@@ -3874,7 +3874,7 @@ const SchemaMigrationReadiness = struct {
             return self.hosts != 0 and self.missing == 0;
         }
     };
-    fn deinit(self: *SchemaMigrationReadiness) void {
+    pub fn deinit(self: *SchemaMigrationReadiness) void {
         self.arena.deinit();
     }
     fn init(alloc: std.mem.Allocator, current: CurrentMetadataState, desired_tables: []const table_manager.TableRecord) !SchemaMigrationReadiness {
@@ -9769,8 +9769,8 @@ test "metadata reconciler marks restore-active placements with fetch_snapshot un
     try std.testing.expectEqual(@as(usize, 2), plan.placement_upserts.len);
     const first = findPlacementIntent(plan.placement_upserts, 4901, 1).?;
     const second = findPlacementIntent(plan.placement_upserts, 4901, 2).?;
-    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
-    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/storage/catalog.zig").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/storage/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
     try std.testing.expect(second.record.backup_restore_bootstrap != null);
     try std.testing.expectEqualStrings("snap1", second.record.backup_restore_bootstrap.?.backup_id);
     try std.testing.expectEqualStrings("file:///tmp/backups", second.record.backup_restore_bootstrap.?.location);

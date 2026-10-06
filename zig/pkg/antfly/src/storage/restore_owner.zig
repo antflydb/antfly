@@ -15,13 +15,13 @@
 //! Private owner controls for the shared restore job. Materialization is local
 //! and disposable; every target mutation goes through the normal Raft batcher.
 const std = @import("std");
-const db = @import("db/mod.zig");
-const staging = @import("db/restore_staging.zig");
+const db = @import("antfly_local_sources").storage_db_mod;
+const staging = @import("antfly_local_sources").storage_db_restore_staging;
 const metadata_staging = @import("../metadata/restore_staging.zig");
-const generation = @import("db/generation_lifecycle.zig");
+const generation = @import("antfly_local_sources").storage_db_generation_lifecycle;
 const backups = @import("../api/backups.zig");
-const operation = @import("../api/operation.zig");
-const native_backup = @import("db/native_backup.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const native_backup = @import("antfly_local_sources").storage_db_native_backup;
 var test_fail_after_source_stage_rename = false;
 var test_fail_after_source_publication = false;
 
@@ -58,7 +58,7 @@ fn snapshotRecord(source: Source) backups.ShardSnapshot {
 /// Build a source decoder once per scope, using the existing generation
 /// staging/publish protocol. Replays open the same immutable decoder; they do
 /// not download or hash the corpus for each 128-row import page.
-fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owner_range: db.types.ByteRange, context: operation.RequestContext, source_next_offset: *u64, program: ?*const @import("db/relational_rewrite_program.zig").ProgramSet) !bool {
+fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owner_range: db.types.ByteRange, context: operation.RequestContext, source_next_offset: *u64, program: ?*const @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet) !bool {
     const source = input.source.?;
     source_next_offset.* = if (source.peer_descriptor) |descriptor| descriptor.total_bytes else 0;
     const marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{env.cache_path});
@@ -122,14 +122,14 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
                 defer scratch.deinit();
                 var read = try decoder.core.store.beginReadTxn();
                 defer read.abort();
-                const manifest = try @import("db/relational_rewrite_manifest.zig").read(scratch.allocator(), &read, context.cancellation);
+                const manifest = try @import("antfly_local_sources").storage_db_relational_rewrite_manifest.read(scratch.allocator(), &read, context.cancellation);
                 try compiled.requireSourceManifest(alloc, manifest, try read.get("\x00\x00__metadata__:schema_json"));
             }
         }
         const portable_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
         defer alloc.free(portable_marker);
         _ = try native_backup.writeFileDurable(env.io, portable_marker, &input.scope.digest());
-        try @import("../common/fs_paths.zig").syncDirPortable(env.io, files);
+        try @import("antfly_runtime_fs").fs_paths.syncDirPortable(env.io, files);
         try context.ensureActive();
         try materialization.installDurableTree(alloc, env.io, work_path, durable_stage, input.scope);
         if (@import("builtin").is_test and test_fail_after_source_stage_rename) {
@@ -155,7 +155,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
             const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.scope", .{files});
             defer alloc.free(candidate_marker);
             _ = try native_backup.writeFileDurable(env.io, candidate_marker, &input.scope.digest());
-            try @import("../common/fs_paths.zig").syncDirPortable(env.io, files);
+            try @import("antfly_runtime_fs").fs_paths.syncDirPortable(env.io, files);
         }
         try context.ensureActive();
         try materialization.installDurableTree(alloc, env.io, work_path, durable_stage, input.scope);
@@ -190,7 +190,7 @@ fn ensureSource(alloc: std.mem.Allocator, env: Environment, input: Request, owne
     // streaming. Native directories require the separate tree inventory.
     if (source.artifact.format == .native) try backups.verifyShardArtifactIntegrityWithCancellation(alloc, env.io, .native, source_path, &shard, context.cancellation);
     if (source.artifact.cohort_seal) |seal| {
-        if (source.artifact.format == .native) _ = try @import("db/native_backup_seal.zig").exportedBytes(alloc, env.io, artifact.path(), seal);
+        if (source.artifact.format == .native) _ = try @import("antfly_local_sources").storage_db_native_backup_seal.exportedBytes(alloc, env.io, artifact.path(), seal);
     }
     try context.ensureActive();
     var candidate = try transition.beginStaging();
@@ -256,7 +256,7 @@ fn releaseSourceAt(alloc: std.mem.Allocator, env: Environment, scope: staging.Sc
     }
     var candidate = try transition.beginStaging();
     defer candidate.deinit();
-    try @import("../common/fs_paths.zig").createDirPathPortable(env.io, candidate.path());
+    try @import("antfly_runtime_fs").fs_paths.createDirPathPortable(env.io, candidate.path());
     const candidate_marker = try std.fmt.allocPrint(alloc, "{s}/restore-source.released", .{candidate.path()});
     defer alloc.free(candidate_marker);
     _ = try native_backup.writeFileDurable(env.io, candidate_marker, &scope.digest());
@@ -295,7 +295,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             target.restore_decoder_cache.retire(env.io);
             var transition = try generation.beginProcessExclusiveWithRuntimeAndIo(env.cache_path, env.runtime, env.io);
             defer transition.deinit();
-            break :blk try @import("rewrite_tail_spool.zig").resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
+            break :blk try @import("antfly_local_sources").storage_rewrite_tail_spool.resumeOffset(alloc, env.io, env.cache_path, input.scope, progress.sequence);
         } else 0;
         return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .generation_admission_receipt = admission_digest, .rewrite = before.value.rewrite, .tail_next = resume_offset };
     }
@@ -303,7 +303,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
         if (try target.restoreGenerationAdmissionReceipt()) |receipt| {
             const command = input.generation_admissions.?;
             if (!std.mem.eql(u8, &receipt.scope, &command.scope) or
-                !std.mem.eql(u8, &receipt.logical_digest, &try @import("db/restore_staging_contract.zig").admissionReceiptDigest(command)))
+                !std.mem.eql(u8, &receipt.logical_digest, &try @import("antfly_local_sources").storage_db_restore_staging_contract.admissionReceiptDigest(command)))
                 return error.RestoreStagingScopeChanged;
             return .{ .phase = before.value.phase, .rows = before.value.rows, .receipt = before.value.receipt(), .generation_admission_receipt = receipt.logical_digest };
         }
@@ -358,7 +358,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
             if (input.rewrite_finish) |receipt| {
                 target.restore_decoder_cache.retire(env.io);
                 try receipt.validate(input.scope.rewrite.?);
-                var page = try @import("db/relational_rewrite_staging.zig").prepareFinish(target, alloc, input.scope, receipt.cut);
+                var page = try @import("antfly_local_sources").storage_db_relational_rewrite_staging.prepareFinish(target, alloc, input.scope, receipt.cut);
                 defer page.deinit();
                 if (page.batch) |batch| try env.proposer.propose(env.proposer.ptr, batch, context);
                 target.rewrite_program_cache.evict(env.io);
@@ -382,9 +382,9 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 const cache = &target.rewrite_tail_cache;
                 try cache.mutex.lock(env.io);
                 defer cache.mutex.unlock(env.io);
-                const assembled = @import("rewrite_tail_spool.zig").receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager) catch |err| {
+                const assembled = @import("antfly_local_sources").storage_rewrite_tail_spool.receive(alloc, env.io, env.cache_path, input.scope, progress.sequence, chunk, cache, target.alloc, target.core.index_manager.resource_manager) catch |err| {
                     if (err == error.RestoreSpoolCorrupt) {
-                        try @import("rewrite_tail_spool.zig").resetCorruptCopy(alloc, env.io, env.cache_path, input.scope, chunk.sequence, cache);
+                        try @import("antfly_local_sources").storage_rewrite_tail_spool.resetCorruptCopy(alloc, env.io, env.cache_path, input.scope, chunk.sequence, cache);
                         return error.StorageReadTemporarilyUnavailable;
                     }
                     return err;
@@ -395,14 +395,14 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                     // lifetimes. Account temporary decoded rows and owned
                     // output through proposal, not just the immutable cache.
                     var budget = if (target.core.index_manager.resource_manager) |manager|
-                        @import("resource_manager.zig").BudgetedAllocator.init(manager, .relational_preparation_working_set, alloc, 1)
+                        @import("antfly_local_sources").storage_resource_manager.BudgetedAllocator.init(manager, .relational_preparation_working_set, alloc, 1)
                     else
                         null;
                     defer if (budget) |*tracked| tracked.deinit();
                     const preparation_alloc = if (budget) |*tracked| tracked.allocator() else alloc;
-                    var page = @import("db/relational_rewrite_staging.zig").prepareTailVerified(target, preparation_alloc, input.scope, frame, program.?, input.max_rows, context.cancellation) catch |err| {
+                    var page = @import("antfly_local_sources").storage_db_relational_rewrite_staging.prepareTailVerified(target, preparation_alloc, input.scope, frame, program.?, input.max_rows, context.cancellation) catch |err| {
                         if (err == error.RestoreSpoolCorrupt) {
-                            try @import("rewrite_tail_spool.zig").resetCorruptCopy(alloc, env.io, env.cache_path, input.scope, chunk.sequence, cache);
+                            try @import("antfly_local_sources").storage_rewrite_tail_spool.resetCorruptCopy(alloc, env.io, env.cache_path, input.scope, chunk.sequence, cache);
                             return error.StorageReadTemporarilyUnavailable;
                         }
                         if (err == error.OutOfMemory) if (budget) |*tracked| if (tracked.denied()) return error.ResourceBudgetExceeded;
@@ -423,7 +423,7 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
                 break :import;
             }
             const cache = &target.restore_decoder_cache;
-            const cache_key: @import("restore_decoder_cache.zig").Key = .{
+            const cache_key: @import("antfly_local_sources").storage_restore_decoder_cache.Key = .{
                 .scope = input.scope.digest(),
                 .artifact = input.scope.source_artifact_digest,
                 .descriptor = input.scope.source_descriptor_digest,
@@ -511,9 +511,9 @@ pub fn executeResident(alloc: std.mem.Allocator, target: *db.DB, env: Environmen
 test "restore owner verified decoder rewrite history compiles once across production tail pages" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const rewrite = @import("db/relational_rewrite_contract.zig");
-    const ProgramSet = @import("db/relational_rewrite_program.zig").ProgramSet;
-    const keys = @import("internal_keys.zig");
+    const rewrite = @import("antfly_local_sources").storage_db_relational_rewrite_contract;
+    const ProgramSet = @import("antfly_local_sources").storage_db_relational_rewrite_program.ProgramSet;
+    const keys = @import("antfly_local_sources").storage_internal_keys;
     var directory = std.testing.tmpDir(.{});
     defer directory.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -522,8 +522,8 @@ test "restore owner verified decoder rewrite history compiles once across produc
     const root = try directory.dir.realPathFileAlloc(io, ".", a);
     var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = io });
     defer runtime.deinit();
-    const source_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 12 };
-    const target_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 };
+    const source_ns: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 12 };
+    const target_ns: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 };
     var definitions: [65][]const u8 = undefined;
     for (&definitions, 1..) |*definition, version| definition.* = try std.fmt.allocPrint(a, "{{\"version\":{d},\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"x\":{{\"type\":\"integer\"}}}},\"additionalProperties\":false}}}}}}}}", .{version});
     var reference = try ProgramSet.init(alloc, definitions[0..64], definitions[64], .{});
@@ -544,7 +544,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
     try source.setSchemaJson(alloc, definitions[63]);
     var rows: [256]db.types.BatchWrite = undefined;
     for (&rows, 0..) |*row, i| row.* = .{ .key = try std.fmt.allocPrint(a, "row:{d:0>8}", .{i}), .value = "{\"x\":7}" };
-    try source.batchRaftReplicatedApply(.{ .timestamp_ns = 42, .writes = &rows }, .{ .term = 1, .index = 1 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .timestamp_ns = 42, .writes = &rows }, .{ .term = 1, .index = 1 });
     var frame = std.ArrayList(u8).empty;
     defer frame.deinit(alloc);
     var header: [16]u8 = undefined;
@@ -593,7 +593,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
                 try std.testing.expectEqual(@as(usize, 1), self.target.rewrite_program_cache.entry.?.refs.load(.acquire));
                 self.target.rewrite_program_cache.evict(std.testing.io);
             }
-            try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
+            try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .term = 1, .index = self.index });
             if (self.lose_reply) {
                 self.lose_reply = false;
                 return error.InjectedReplyLoss;
@@ -622,7 +622,7 @@ test "restore owner verified decoder rewrite history compiles once across produc
         defer alloc.free(encoded);
         var txn = try target.core.store.beginWriteTxn();
         errdefer txn.abort();
-        try txn.put(@import("db/restore_staging_contract.zig").key, encoded);
+        try txn.put(@import("antfly_local_sources").storage_db_restore_staging_contract.key, encoded);
         try txn.commit();
     }
     var chunk: rewrite.TailChunk = .{ .pin = scope.rewrite.?.retained_pin, .sequence = 1, .frame_digest = digest, .total = @intCast(frame.items.len), .offset = 0, .data = frame.items[0..@min(frame.items.len, 64 * 1024)] };
@@ -668,27 +668,27 @@ test "restore owner verified decoder portable resumes and preserves vector proje
 
 test "restore owner verified decoder portable range binding is immutable and durable" {
     const alloc = std.testing.allocator;
-    const range_state = @import("db/range_state.zig");
+    const range_state = @import("antfly_local_sources").storage_db_range_state;
     const materialization = @import("../api/restore_materialization.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(root);
-    const options: @import("lsm_backend.zig").Options = .{ .read_runtime = @import("lsm_backend/storage_io.zig").ReadRuntime.init(std.testing.io) };
+    const options: @import("antfly_local_sources").storage_lsm_backend.Options = .{ .read_runtime = @import("antfly_local_sources").storage_lsm_backend_storage_io.ReadRuntime.init(std.testing.io) };
     const expected: db.types.ByteRange = .{ .start = &.{ 0, 127, 255 }, .end = &.{ 1, 0, 128 } };
     {
-        var backend = try @import("lsm_backend.zig").Backend.open(alloc, root, options);
+        var backend = try @import("antfly_local_sources").storage_lsm_backend.Backend.open(alloc, root, options);
         defer backend.close();
-        var store = try @import("docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
+        var store = try @import("antfly_local_sources").storage_docstore.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
         defer store.close();
         try materialization.bindPortableDecoderRange(alloc, &store, expected);
         try materialization.bindPortableDecoderRange(alloc, &store, expected);
         try std.testing.expectError(error.RestoreStagingScopeChanged, materialization.bindPortableDecoderRange(alloc, &store, .{ .start = "", .end = "" }));
         try std.testing.expectError(error.RestoreStagingScopeChanged, materialization.bindPortableDecoderRange(alloc, &store, .{ .start = "z", .end = "a" }));
     }
-    var reopened = try @import("lsm_backend.zig").Backend.open(alloc, root, options);
+    var reopened = try @import("antfly_local_sources").storage_lsm_backend.Backend.open(alloc, root, options);
     defer reopened.close();
-    var store = try @import("docstore.zig").DocStore.openRuntime(alloc, try reopened.runtimeStore(alloc, .{ .name = "docs" }));
+    var store = try @import("antfly_local_sources").storage_docstore.DocStore.openRuntime(alloc, try reopened.runtimeStore(alloc, .{ .name = "docs" }));
     defer store.close();
     const range = try range_state.loadRange(alloc, &store);
     defer range_state.freeRange(alloc, range);
@@ -709,8 +709,8 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     const cache_path = try std.fmt.allocPrint(a, "{s}/decoder", .{root});
     var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
     defer runtime.deinit();
-    const source_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 12 };
-    const target_ns: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 };
+    const source_ns: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 12 };
+    const target_ns: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 21, .shard_id = 22, .range_id = 22 };
     const source_options: db.OpenOptions = .{ .backend_runtime = &runtime, .identity_namespace = source_ns, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
     const target_options: db.OpenOptions = .{ .backend_runtime = &runtime, .identity_namespace = target_ns, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false };
     var source = try db.DB.open(alloc, source_path, source_options);
@@ -721,23 +721,23 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
     var random = std.Random.DefaultPrng.init(71942);
     for (padding) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
     const document = try std.fmt.allocPrint(a, "{{\"padding\":\"{s}\"}}", .{padding});
-    try source.batchRaftReplicatedApply(.{ .writes = &.{.{ .key = "a", .value = document }}, .timestamp_ns = 123 }, .{ .term = 1, .index = 1 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .writes = &.{.{ .key = "a", .value = document }}, .timestamp_ns = 123 }, .{ .term = 1, .index = 1 });
     const identity = try source.relationalTopologyIdentity();
-    const source_scope: @import("db/online_source_contract.zig").Scope = .{
+    const source_scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .owner_group_id = 12, .peer_group_id = 22, .namespace = source_ns, .admission_epoch = identity.next_epoch, .catalog_digest = identity.catalog_digest },
         .receiver_namespace = target_ns,
         .consumer_epoch = 1,
         .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
     };
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = @import("retained_effects.zig").default_limit } } }, .{ .term = 1, .index = 2 });
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .admit = .{ .scope = source_scope, .limit = @import("antfly_local_sources").storage_retained_effects.default_limit } } }, .{ .term = 1, .index = 2 });
     const certificate = try source.prepareOnlineSourcePublication(source_scope, .none);
-    try source.batchRaftReplicatedApply(.{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
-    const transfer = @import("db/source_artifact_transfer.zig");
+    try @import("server_db_adapter.zig").applyOrdered(&source, .{ .online_source = .{ .publish_certificate = .{ .scope = source_scope, .certificate = certificate } } }, .{ .term = 1, .index = 3 });
+    const transfer = @import("antfly_local_sources").storage_db_source_artifact_transfer;
     const descriptor = try transfer.describe(&source, source_scope, .none);
     try std.testing.expect(descriptor.total_bytes > transfer.max_chunk_bytes);
-    var program = try @import("db/relational_rewrite_staging.zig").ProgramSet.initDocumentPreservation(alloc, schema_json);
+    var program = try @import("antfly_local_sources").storage_db_relational_rewrite_staging.ProgramSet.initDocumentPreservation(alloc, schema_json);
     defer program.deinit();
-    const binding: @import("db/relational_rewrite_contract.zig").Binding = .{ .program_digest = program.identity, .retained_pin = source_scope.pin(), .snapshot_certificate = try certificate.digest(), .retained_epoch = 1, .retained_start = certificate.cut.retained_start, .source_applied_index = certificate.cut.applied_index, .source_scope = source_scope };
+    const binding: @import("antfly_local_sources").storage_db_relational_rewrite_contract.Binding = .{ .program_digest = program.identity, .retained_pin = source_scope.pin(), .snapshot_certificate = try certificate.digest(), .retained_epoch = 1, .retained_start = certificate.cut.retained_start, .source_applied_index = certificate.cut.applied_index, .source_scope = source_scope };
     const artifact: metadata_staging.SourceArtifact = .{ .target_group_id = 22, .source_namespace = source_ns, .format = .portable, .snapshot_path = "source.afb2", .artifact_size_bytes = descriptor.total_bytes, .artifact_sha256 = try certificate.digest(), .rewrite = binding };
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = artifact.artifact_sha256, .source_descriptor_digest = try artifact.digest(alloc), .source_namespace = source_ns, .target_namespace = target_ns, .target_schema_digest = program.target_runtime_digest, .rewrite = binding };
     var target = try db.DB.open(alloc, target_path, target_options);
@@ -755,7 +755,7 @@ test "restore owner verified decoder peer rewrite certificate chunks survive reo
             var batch = value;
             batch.restore_staging_scope = self.scope_digest;
             self.index += 1;
-            try self.target.batchRaftReplicatedApply(batch, .{ .term = 1, .index = self.index });
+            try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .term = 1, .index = self.index });
         }
     };
     var apply: Apply = .{ .target = &target, .scope_digest = scope.digest() };
@@ -876,8 +876,8 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     defer alloc.free(cache_path);
     var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
     defer runtime.deinit();
-    const source_namespace: @import("db/doc_identity.zig").Namespace = .{ .table_id = 11, .shard_id = 101, .range_id = 101 };
-    const target_namespace: @import("db/doc_identity.zig").Namespace = .{ .table_id = 12, .shard_id = 102, .range_id = 102 };
+    const source_namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 11, .shard_id = 101, .range_id = 101 };
+    const target_namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 12, .shard_id = 102, .range_id = 102 };
     var source = try db.DB.open(alloc, source_path, .{ .backend_runtime = &runtime, .identity_namespace = source_namespace, .primary_backend = .{ .lsm = .{} }, .start_optional_runtimes = false, .start_index_workers = false });
     defer source.close();
     const row_schema =
@@ -888,7 +888,7 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     try source.addIndex(dense_index);
     try source.batch(.{ .sync_level = .full_index, .writes = &.{ .{ .key = "a", .value = "{\"v\":1,\"embedding\":[1,0]}" }, .{ .key = "b", .value = "{\"v\":2,\"embedding\":[0,1]}" }, .{ .key = "c", .value = "{\"v\":3,\"embedding\":[1,1]}" } } });
     const source_identity = try source.relationalTopologyIdentity();
-    const source_fence: @import("db/relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 101, .owner_group_id = 101, .admission_epoch = source_identity.next_epoch, .namespace = source_identity.namespace, .catalog_digest = source_identity.catalog_digest };
+    const source_fence: @import("antfly_local_sources").storage_db_relational_integrity_topology.Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 101, .owner_group_id = 101, .admission_epoch = source_identity.next_epoch, .namespace = source_identity.namespace, .catalog_digest = source_identity.catalog_digest };
     try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .begin }, null);
     const seal = try source.sealBackupCohort("source-pin", source_fence, .none);
     try source.applyRelationalTopologyControl(.{ .fence = source_fence, .action = .release }, null);
@@ -913,7 +913,7 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
     defer if (target_open) target.close();
     try target.setSchemaJson(alloc, row_schema);
     try target.addIndex(dense_index);
-    const schema = try @import("schema.zig").serializeSchema(alloc, target.core.schema orelse .{});
+    const schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, target.core.schema orelse .{});
     defer alloc.free(schema);
     var scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = artifact_digest, .source_namespace = source_namespace, .target_namespace = target_namespace, .target_schema_digest = staging.digest(schema) };
     const Apply = struct {
@@ -933,7 +933,7 @@ fn testVerifiedDecoder(comptime portable: bool) !void {
             }
             var batch = request;
             batch.restore_staging_scope = scopeDigest(self.target);
-            try self.target.batchRaftReplicatedApply(batch, .{ .index = self.index, .term = 1 });
+            try @import("server_db_adapter.zig").applyOrdered(&self.target, batch, .{ .index = self.index, .term = 1 });
         }
         fn scopeDigest(target_db: *db.DB) staging.Digest {
             var progress = (target_db.restoreStagingStatus(std.testing.allocator) catch unreachable).?;

@@ -17,7 +17,7 @@
 //! pinned entries remain charged and admission bypasses a saturated cache.
 const std = @import("std");
 const codec = @import("../graph_metric_segment/codec.zig");
-const CancellationToken = @import("../../api/operation.zig").CancellationToken;
+const CancellationToken = @import("antfly_local_sources").api_operation.CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const Entry = struct {
@@ -284,13 +284,13 @@ pub const Cache = struct {
     }
 
     fn unlink(self: *Cache, entry: *Entry) void {
-        const class = @intFromEnum(entry.class);
+        const class = @backingInt(entry.class);
         if (entry.older) |older| older.newer = entry.newer else self.oldest[class] = entry.newer;
         if (entry.newer) |newer| newer.older = entry.older else self.newest[class] = entry.older;
     }
 
     fn append(self: *Cache, entry: *Entry) void {
-        const class = @intFromEnum(entry.class);
+        const class = @backingInt(entry.class);
         entry.older = self.newest[class];
         entry.newer = null;
         if (self.newest[class]) |newest| newest.newer = entry else self.oldest[class] = entry;

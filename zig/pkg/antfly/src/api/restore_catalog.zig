@@ -19,11 +19,11 @@ const std = @import("std");
 const metadata = @import("../metadata/api.zig");
 const tables = @import("../metadata/table_manager.zig");
 const routing = @import("table_catalog.zig");
-const reads = @import("table_read_source.zig");
+const reads = @import("antfly_local_sources").api_table_read_source;
 const read_adapters = @import("antfly_source_root").antfly_sources.table_reads;
-const writes = @import("table_write_source.zig");
+const writes = @import("antfly_local_sources").api_table_write_source;
 const write_adapters = @import("antfly_source_root").antfly_sources.table_writes;
-const Scope = @import("../storage/db/restore_staging_contract.zig").Scope;
+const Scope = @import("antfly_local_sources").storage_db_restore_staging_contract.Scope;
 
 pub const Owner = struct { group_id: u64, scope: Scope };
 pub const Authority = struct {
@@ -34,7 +34,7 @@ pub const Authority = struct {
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
     const VTable = struct { verify: *const fn (*anyopaque, [16]u8, [32]u8) anyerror!bool };
-    const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+    const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
     fn permits(self: @This(), id: [16]u8, digest: [32]u8) !bool {
         return BoundaryAbi.call("verify", self.boundary_dispatch, self.verify, .{ self.ptr, id, digest });
@@ -48,7 +48,7 @@ pub const Catalog = struct {
     plan_id: [16]u8,
     plan_digest: [32]u8,
     authority: Authority,
-    io: ?@import("../runtime_io_abi.zig").Borrow = null,
+    io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
 
     /// All snapshot/owner slices are immutable and borrowed for this Catalog's
     /// lifetime. The driver owns their arena through completion of a page/2PC.
@@ -197,8 +197,8 @@ pub const ValidationPort = struct {
     }
 
     pub const SourcePair = struct {
-        reader: @import("table_read_source.zig").TableReadSource,
-        writer: @import("table_write_source.zig").TableWriteSource,
+        reader: @import("antfly_local_sources").api_table_read_source.TableReadSource,
+        writer: @import("antfly_local_sources").api_table_write_source.TableWriteSource,
         owner: ?*anyopaque = null,
         release: ?*const fn (*anyopaque) void = null,
         pub fn deinit(self: *@This()) void {
@@ -213,7 +213,7 @@ pub const ValidationPort = struct {
         boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
 
         const VTable = struct { bind: *const fn (*anyopaque, ?*anyopaque, *Catalog) anyerror!SourcePair };
-        const BoundaryAbi = @import("../runtime_callback_abi.zig").Boundary(VTable);
+        const BoundaryAbi = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
 
         fn bindSources(self: @This(), catalog: *Catalog) !SourcePair {
             return BoundaryAbi.call("bind", self.boundary_dispatch, self.bind, .{ self.ptr, self.secondary, catalog });
@@ -266,7 +266,7 @@ pub const ValidationPort = struct {
         }
     };
 
-    pub fn validate(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
+    pub fn validate(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, cursor: *ValidationCursor, request: @import("antfly_local_sources").api_operation.RequestContext) !bool {
         const session = try self.prepare(alloc, job, request);
         defer session.deinit();
         return session.step(alloc, cursor, request);
@@ -274,7 +274,7 @@ pub const ValidationPort = struct {
 
     /// Retain the immutable plan/routing projection for one bounded scheduler
     /// slice. Authority is checked independently before every page.
-    pub fn prepare(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, request: @import("operation.zig").RequestContext) !*ValidationSession {
+    pub fn prepare(self: @This(), alloc: std.mem.Allocator, job: @import("../metadata/restore_staging.zig").Job, request: @import("antfly_local_sources").api_operation.RequestContext) !*ValidationSession {
         try request.ensureActive();
         if (self.timings) |timings| _ = timings.prepare_calls.fetchAdd(1, .monotonic);
         const staging = @import("../metadata/restore_staging.zig");
@@ -330,7 +330,7 @@ pub const ValidationSession = struct {
     live: metadata.AdminSnapshot,
     catalog: Catalog,
     bound: ValidationPort.SourcePair = undefined,
-    request: @import("operation.zig").RequestContext,
+    request: @import("antfly_local_sources").api_operation.RequestContext,
 
     pub fn deinit(self: *@This()) void {
         self.bound.deinit();
@@ -345,7 +345,7 @@ pub const ValidationSession = struct {
         return true;
     }
 
-    pub fn step(self: *@This(), alloc: std.mem.Allocator, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
+    pub fn step(self: *@This(), alloc: std.mem.Allocator, cursor: *ValidationCursor, request: @import("antfly_local_sources").api_operation.RequestContext) !bool {
         try request.ensureActive();
         self.request = request;
         if (self.port.timings) |timings| _ = timings.step_calls.fetchAdd(1, .monotonic);
@@ -362,7 +362,7 @@ pub const ValidationSession = struct {
 
 /// Owner-local activation receipts are authoritative. Advance a bounded
 /// window within one phase; the cohort-wide UNIQUE/FK barrier stays intact.
-fn validateWindow(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.TableReadSource, writer: writes.TableWriteSource, cursor: *ValidationCursor, request: @import("operation.zig").RequestContext) !bool {
+fn validateWindow(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.TableReadSource, writer: writes.TableWriteSource, cursor: *ValidationCursor, request: @import("antfly_local_sources").api_operation.RequestContext) !bool {
     const capability = request.fanout_io orelse request.deadline_io;
     if (capability == null or cursor.phase == .complete or cursor.owner_index >= catalog.snapshot.ranges.len)
         return validateSlice(alloc, catalog, reader, writer, cursor);
@@ -417,13 +417,13 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
     // Unconstrained document and typed tables have no distributed activation
     // work. Their physical/index readiness still belongs to the per-owner
     // validation barrier; do not require an unrelated routed read-index here.
-    if (!try @import("relational_integrity_commit.zig").requiresActivation(alloc, table.schema_json)) {
+    if (!try @import("antfly_local_sources").api_relational_integrity_commit.requiresActivation(alloc, table.schema_json)) {
         cursor.owner_index += 1;
         return false;
     }
     var status = (try reader.integrityActivation(alloc, table.name, owner.start_key, "{\"mode\":\"status\"}")) orelse return error.IntegrityCatalogUnavailable;
     defer status.deinit(alloc);
-    const State = @import("../storage/db/relational_integrity_activation_contract.zig").State;
+    const State = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract.State;
     var parsed = try std.json.parseFromSlice(struct { state: State, unique_covered: bool, failure: []const u8 = "" }, alloc, status.json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     // Unlike live activation, all rows of this hidden cohort have finished
@@ -440,11 +440,11 @@ pub fn validateSlice(alloc: std.mem.Allocator, catalog: *Catalog, reader: reads.
 
 test "distributed txn staged mixed restore rebuilds fresh FK claims with durable 2PC and hides invalid cohorts" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const types = @import("../storage/db/types.zig");
-    const native = @import("../storage/db/restore_staging_contract.zig");
-    const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
+    const types = @import("antfly_local_sources").storage_db_types;
+    const native = @import("antfly_local_sources").storage_db_restore_staging_contract;
+    const activation = @import("antfly_local_sources").storage_db_relational_integrity_activation_contract;
     const distributed = @import("distributed_txn.zig");
-    const contract = @import("distributed_txn_contract.zig");
+    const contract = @import("antfly_local_sources").api_distributed_txn_contract;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -476,8 +476,8 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         for ([_][]const u8{ "parent", "child", "docs" }, 0..) |name, index| {
             const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source-{d}-{d}", .{ tmp.sub_path, trial, index });
             const target_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/target-{d}-{d}", .{ tmp.sub_path, trial, index });
-            const source_namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 10 + index, .shard_id = 20 + index, .range_id = 20 + index };
-            const target_namespace: @import("../storage/db/doc_identity.zig").Namespace = .{ .table_id = 100 + index, .shard_id = 200 + index, .range_id = 200 + index };
+            const source_namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 10 + index, .shard_id = 20 + index, .range_id = 20 + index };
+            const target_namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace = .{ .table_id = 100 + index, .shard_id = 200 + index, .range_id = 200 + index };
             var options: db_mod.OpenOptions = .{ .identity_namespace = source_namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
             {
                 var source = try db_mod.DB.open(alloc, source_path, options);
@@ -503,7 +503,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
             dbs[index] = target;
             opened += 1;
             try target.setSchemaJson(alloc, schema_json);
-            const schema_bytes = try @import("../storage/schema.zig").serializeSchema(owned, target.core.schema orelse .{});
+            const schema_bytes = try @import("antfly_local_sources").storage_schema.serializeSchema(owned, target.core.schema orelse .{});
             const scope: Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(@intCast(index + 3)), .source_namespace = source_namespace, .target_namespace = target_namespace, .target_schema_digest = native.digest(schema_bytes) };
             scopes[index] = .{ .group_id = target_namespace.shard_id, .scope = scope };
             try target.reserveRestoreStaging(alloc, scope.plan_id, scope.plan_digest, target_namespace);
@@ -542,7 +542,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
             fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: types.ScanOptions, _: read_gate.ReadConsistency) !?reads.ScanResponse {
                 return error.UnexpectedCall;
             }
-            fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: types.SearchRequest, _: read_gate.ReadConsistency) !?@import("query_response.zig").QueryResponse {
+            fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: types.SearchRequest, _: read_gate.ReadConsistency) !?@import("antfly_local_sources").api_query_response.QueryResponse {
                 return error.UnexpectedCall;
             }
             fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: types.BatchRequest) !?void {
@@ -581,7 +581,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         var threaded: std.Io.Threaded = .init(alloc, .{ .async_limit = .limited(4) });
         defer threaded.deinit();
         const io = threaded.io();
-        const control: @import("operation.zig").RequestContext = if (concurrent) .{ .fanout_io = @import("../runtime_io_abi.zig").Borrow.init(&io) } else .{};
+        const control: @import("antfly_local_sources").api_operation.RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};
         var validation: ValidationCursor = .{};
         for (0..80) |_| {
             const complete = validateWindow(alloc, &private_catalog, reader, writer, &validation, control) catch |err| {

@@ -4,14 +4,14 @@
 //! Administrator SQL for durable policy drafts. No operation in this module
 //! installs a bundle or changes the serving policy generation.
 const std = @import("std");
-const ast = @import("../sql/ast.zig");
-const catalog = @import("../sql/catalog.zig");
-const scalar = @import("../sql/scalar.zig");
-const settings = @import("../sql/setting_catalog.zig");
-const policies = @import("../system_catalog/policies.zig");
-const domain = @import("../system_catalog/domain.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const scalar = @import("antfly_local_sources").sql_scalar;
+const settings = @import("antfly_local_sources").sql_setting_catalog;
+const policies = @import("antfly_local_sources").system_catalog_policies;
+const domain = @import("antfly_local_sources").system_catalog_domain;
 const server_mod = @import("http_server.zig");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 
 const SettingLoader = struct {
     server: *server_mod.ApiHttpServer,
@@ -70,11 +70,11 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const physical = resolved.tables[0] orelse return error.TableNotFound;
     const definition = physical.query_definition orelse return error.InvalidSqlBackendResponse;
     if (definition.table_id != physical.table_id) return error.InvalidSqlBackendResponse;
-    var parsed_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(a, definition.schema_json);
+    var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, definition.schema_json);
     defer parsed_schema.deinit(a);
-    const native = try @import("../schema/mod.zig").deriveRuntimeTableSchema(a, parsed_schema);
+    const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed_schema);
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
-    const layout = try @import("../storage/schema.zig").serializeSchema(a, native);
+    const layout = try @import("antfly_local_sources").storage_schema.serializeSchema(a, native);
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(layout, &schema_digest, .{});
     const table = try server.sql_schema_cache.resolve(server.sqlPlanCacheIo(), a, definition.schema_json, physical.table_id, physical.name);
@@ -144,7 +144,7 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
         fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
-        fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: domain.Call) ![]u8 {
+        fn systemCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return switch (call) {
                 .snapshot => alloc.dupe(u8, "{\"revision\":7,\"next_id\":42}"),
@@ -183,24 +183,24 @@ test "SQL policy DDL writes a durable draft only and never publishes it" {
     var fixture: Fixture = .{};
     var server = server_mod.ApiHttpServer.init(alloc, .{}, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .system_catalog = Fixture.systemCatalog, .supports_query_definitions = true } }, null, null);
     defer server.deinit();
-    var create = try @import("../sql/compiler.zig").compile(alloc, "CREATE POLICY visible ON accounts FOR SELECT USING (id > 0)", .{});
+    var create = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE POLICY visible ON accounts FOR SELECT USING (id > 0)", .{});
     defer create.deinit();
     _ = try execute(&server, null, .{}, "default", "public", alloc, create.statement.policy_ddl);
     try std.testing.expectEqual(@as(usize, 1), fixture.mutation_calls);
 
-    var missing_drop = try @import("../sql/compiler.zig").compile(alloc, "DROP POLICY IF EXISTS missing ON accounts", .{});
+    var missing_drop = try @import("antfly_local_sources").sql_compiler.compile(alloc, "DROP POLICY IF EXISTS missing ON accounts", .{});
     defer missing_drop.deinit();
     _ = try execute(&server, null, .{}, "default", "public", alloc, missing_drop.statement.policy_ddl);
     try std.testing.expectEqual(@as(usize, 1), fixture.mutation_calls);
 
-    var enable = try @import("../sql/compiler.zig").compile(alloc, "ALTER TABLE accounts ENABLE ROW LEVEL SECURITY", .{});
+    var enable = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE accounts ENABLE ROW LEVEL SECURITY", .{});
     defer enable.deinit();
     try std.testing.expectEqual(@as(?catalog.MutationOutcome, .committed_pending), (try execute(&server, null, .{}, "default", "public", alloc, enable.statement.policy_ddl)).mutation_outcome);
     try std.testing.expectEqual(@as(usize, 1), fixture.publication_calls);
     try std.testing.expectEqual(@as(usize, 1), fixture.mutation_calls);
 
     fixture.expected_enable = false;
-    var disable = try @import("../sql/compiler.zig").compile(alloc, "ALTER TABLE accounts DISABLE ROW LEVEL SECURITY", .{});
+    var disable = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE accounts DISABLE ROW LEVEL SECURITY", .{});
     defer disable.deinit();
     try std.testing.expectEqual(@as(?catalog.MutationOutcome, .committed_pending), (try execute(&server, null, .{}, "default", "public", alloc, disable.statement.policy_ddl)).mutation_outcome);
     try std.testing.expectEqual(@as(usize, 2), fixture.publication_calls);

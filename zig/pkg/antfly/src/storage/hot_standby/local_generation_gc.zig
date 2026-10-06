@@ -7,7 +7,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const fs_paths = @import("../../common/fs_paths.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const validation = @import("validation.zig");
 
 pub const marker_name = ".antfly-ha-local-gc-eligible.json";
@@ -85,7 +85,7 @@ const Candidate = struct {
     checkpoint_lsn: u64,
     checkpoint_sha256: []u8,
 
-    fn deinit(self: *Candidate, alloc: Allocator) void {
+    pub fn deinit(self: *Candidate, alloc: Allocator) void {
         alloc.free(self.generation);
         alloc.free(self.checkpoint_sha256);
         self.* = undefined;
@@ -95,7 +95,7 @@ const Candidate = struct {
 const Tombstone = struct {
     name: []u8,
 
-    fn deinit(self: *Tombstone, alloc: Allocator) void {
+    pub fn deinit(self: *Tombstone, alloc: Allocator) void {
         alloc.free(self.name);
         self.* = undefined;
     }
@@ -107,7 +107,7 @@ const OwnedMarker = struct {
     checkpoint_lsn: u64,
     checkpoint_sha256: []u8,
 
-    fn deinit(self: *OwnedMarker, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedMarker, alloc: Allocator) void {
         alloc.free(self.slot_name);
         alloc.free(self.checkpoint_sha256);
         self.* = undefined;

@@ -3,8 +3,8 @@
 //! Mounted bootstrap keyring. Reloaded per operation so atomic file replacement
 //! can rotate the active wrapping key while retaining previous decrypt keys.
 const std = @import("std");
-const record = @import("secret_record.zig");
-const contract = @import("secret_contract.zig");
+const record = @import("antfly_local_sources").common_secret_record;
+const contract = @import("antfly_local_sources").common_secret_contract;
 const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 
 pub const Keyring = struct {
@@ -24,7 +24,7 @@ pub const Keyring = struct {
     const Loaded = struct {
         id: []u8,
         key: record.DataKey,
-        fn deinit(self: *Loaded, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *Loaded, alloc: std.mem.Allocator) void {
             std.crypto.secureZero(u8, &self.key);
             alloc.free(self.id);
         }

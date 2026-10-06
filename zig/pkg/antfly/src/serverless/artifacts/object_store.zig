@@ -15,9 +15,9 @@
 const std = @import("std");
 const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
-const remote_uri = @import("../remote_uri.zig");
-const object_store_support = @import("../object_store_support.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const ObjectStore = struct {
     const verified_object_cache_limit: usize = 4096;
@@ -27,7 +27,7 @@ pub const ObjectStore = struct {
         version_id: ?[]u8 = null,
         etag: ?[]u8 = null,
 
-        fn deinit(self: *VerifiedObject, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *VerifiedObject, alloc: std.mem.Allocator) void {
             if (self.version_id) |value| alloc.free(value);
             if (self.etag) |value| alloc.free(value);
             self.* = undefined;
@@ -38,7 +38,7 @@ pub const ObjectStore = struct {
         version_id: ?[]u8 = null,
         etag: ?[]u8 = null,
 
-        fn deinit(self: *VerifiedObjectPin, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *VerifiedObjectPin, alloc: std.mem.Allocator) void {
             if (self.version_id) |value| alloc.free(value);
             if (self.etag) |value| alloc.free(value);
             self.* = undefined;
@@ -775,8 +775,8 @@ fn metadataIdentity(meta: objectstore.ObjectMetadata) ?[std.crypto.hash.sha2.Sha
         has_identity = true;
     }
     if (meta.checksum) |checksum| {
-        var algorithm: u64 = @intFromEnum(checksum.algorithm);
-        var checksum_type: u64 = @intFromEnum(checksum.checksum_type);
+        var algorithm: u64 = @backingInt(checksum.algorithm);
+        var checksum_type: u64 = @backingInt(checksum.checksum_type);
         hashIdentityField(&hasher, 3, std.mem.asBytes(&algorithm));
         hashIdentityField(&hasher, 4, std.mem.asBytes(&checksum_type));
         hashIdentityField(&hasher, 5, checksum.value);
@@ -965,7 +965,7 @@ test "serverless objectstore verification caches immutable provider identities" 
             .list_objects = listObjects,
         };
 
-        fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 
         fn from(ptr: *anyopaque) *@This() {
             return @ptrCast(@alignCast(ptr));

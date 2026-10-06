@@ -64,7 +64,7 @@ pub const Limits = struct {
     max_merged_tokens: usize = 576,
     hard_max_merged_tokens: usize = 1024,
 
-    fn validate(self: Limits) !void {
+    pub fn validate(self: Limits) !void {
         if (self.max_encoded_image_bytes == 0 or self.max_decoded_pixels == 0 or self.max_images == 0 or
             self.min_merged_tokens < 4 or self.max_merged_tokens < self.min_merged_tokens or
             self.hard_max_merged_tokens < self.min_merged_tokens or
@@ -280,7 +280,7 @@ const Config = struct {
     rope_theta: f32 = 10_000.0,
     image_mean: [3]f32,
     image_std: [3]f32,
-    deepstack_layers: [64]usize = [_]usize{0} ** 64,
+    deepstack_layers: [64]usize = @as([64]usize, @splat(0)),
     deepstack_len: usize = 0,
 
     fn headDim(self: Config) usize {
@@ -327,7 +327,7 @@ const WeightCache = struct {
         return .{ .allocator = allocator, .cb = cb, .source = .{ .resident = config } };
     }
 
-    fn deinit(self: *WeightCache) void {
+    pub fn deinit(self: *WeightCache) void {
         var value_it = self.tensors.valueIterator();
         while (value_it.next()) |tensor| {
             if (self.cb.kind() == .metal) {
@@ -886,7 +886,7 @@ const EncodedImage = struct {
     preprocess_evidence: ?PreprocessEvidence,
     preprocess_spatial_patches: ?[]f32,
 
-    fn deinit(self: *EncodedImage, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *EncodedImage, allocator: std.mem.Allocator) void {
         allocator.free(self.embeddings);
         allocator.free(self.deepstack);
         if (self.preprocess_spatial_patches) |patches| allocator.free(patches);
@@ -902,27 +902,46 @@ fn encodeSingleImage(
     limits: Limits,
     collect_preprocess_evidence: bool,
 ) !EncodedImage {
+    var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
     var failed_stage: []const u8 = "admission";
     var failed_layer: ?usize = null;
-    errdefer |err| if (profile) {
+    errdefer if (zig017_return_error) |err| if (profile) {
         if (failed_layer) |layer|
             std.debug.print("qwen3vl-projector-error: stage={s} layer={d} error={s}\n", .{ failed_stage, layer, @errorName(err) })
         else
             std.debug.print("qwen3vl-projector-error: stage={s} error={s}\n", .{ failed_stage, @errorName(err) });
     };
-    if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return error.VisionAdmissionExceeded;
+    if (bytes.len == 0 or bytes.len > limits.max_encoded_image_bytes) return zig017_failure: {
+        zig017_return_error = error.VisionAdmissionExceeded;
+        break :zig017_failure error.VisionAdmissionExceeded;
+    };
     failed_stage = "decode";
-    const decoded = try image.decode(allocator, bytes);
+    const decoded = (image.decode(allocator, bytes) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer decoded.deinit(allocator);
-    try cb.checkExecutionControl();
+    (cb.checkExecutionControl() catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     const decode_ns = profileLap(profile, &stage_started_at);
-    const decoded_pixels = std.math.mul(usize, decoded.width, decoded.height) catch return error.VisionAdmissionExceeded;
-    if (decoded_pixels == 0 or decoded_pixels > limits.max_decoded_pixels) return error.VisionAdmissionExceeded;
+    const decoded_pixels = std.math.mul(usize, decoded.width, decoded.height) catch return zig017_failure: {
+        zig017_return_error = error.VisionAdmissionExceeded;
+        break :zig017_failure error.VisionAdmissionExceeded;
+    };
+    if (decoded_pixels == 0 or decoded_pixels > limits.max_decoded_pixels) return zig017_failure: {
+        zig017_return_error = error.VisionAdmissionExceeded;
+        break :zig017_failure error.VisionAdmissionExceeded;
+    };
     failed_stage = "preprocess";
-    const geometry = try targetGeometry(cfg, decoded.width, decoded.height, limits);
-    const pixels = try image.preprocessDecodedRectScaledWithResample(
+    const geometry = (targetGeometry(cfg, decoded.width, decoded.height, limits) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
+    const pixels = (image.preprocessDecodedRectScaledWithResample(
         allocator,
         decoded,
         @intCast(geometry.width),
@@ -931,12 +950,18 @@ fn encodeSingleImage(
         cfg.image_std,
         1.0 / 255.0,
         .pillow_bicubic,
-    );
+    ) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer allocator.free(pixels);
     const preprocess_ns = profileLap(profile, &stage_started_at);
 
     failed_stage = "patchify";
-    const patch_rows = try extractPatchesMergeMajor(allocator, pixels, cfg, geometry);
+    const patch_rows = (extractPatchesMergeMajor(allocator, pixels, cfg, geometry) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer allocator.free(patch_rows);
     const patchify_ns = profileLap(profile, &stage_started_at);
     const preprocess_evidence: ?PreprocessEvidence = if (collect_preprocess_evidence) .{
@@ -948,72 +973,117 @@ fn encodeSingleImage(
         .patch_rows = geometry.patchCount(),
         .patch_columns = cfg.patch_size * cfg.patch_size * 3,
         .spatial_patch_f32le_sha256 = sha256F32LeHex(patch_rows),
-        .positioned_embedding_f32le_sha256 = [_]u8{0} ** 64,
+        .positioned_embedding_f32le_sha256 = @as([64]u8, @splat(0)),
         .vision_trace_layer = null,
         .vision_trace_f32le_sha256 = null,
     } else null;
     const preprocess_spatial_patches = if (collect_preprocess_evidence)
-        try allocator.dupe(f32, patch_rows)
+        (allocator.dupe(f32, patch_rows) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        })
     else
         null;
     errdefer if (preprocess_spatial_patches) |patches| allocator.free(patches);
     failed_stage = "patch_weights";
-    const patch_bias = try weights.weight("v.patch_embd.bias");
+    const patch_bias = (weights.weight("v.patch_embd.bias") catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     const patch_dim = cfg.patch_size * cfg.patch_size * 3;
     const full_resident_patch = if (comptime build_options.enable_cuda)
-        if (cb.kind() == .cuda) try weights.fullResidentPatch() else null
+        if (cb.kind() == .cuda) (weights.fullResidentPatch() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        }) else null
     else
         null;
     const embedded = if (full_resident_patch) |full_patch| blk: {
         failed_stage = "patch_temporal_expand";
-        const temporal_rows = try duplicateStillImageTemporalPatches(
+        const temporal_rows = (duplicateStillImageTemporalPatches(
             allocator,
             patch_rows,
             geometry.patchCount(),
             cfg.patch_size,
-        );
+        ) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer allocator.free(temporal_rows);
         const temporal_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(patch_dim * 2) };
-        const temporal_input = try cb.fromFloat32Shape(temporal_rows, &temporal_shape);
+        const temporal_input = (cb.fromFloat32Shape(temporal_rows, &temporal_shape) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer cb.free(temporal_input);
         failed_stage = "patch_linear_bf16";
-        break :blk try cb.linear(
+        break :blk (cb.linear(
             temporal_input,
             full_patch,
             patch_bias,
             geometry.patchCount(),
             patch_dim * 2,
             cfg.vision_hidden,
-        );
+        ) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
     } else blk: {
         const patch_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(patch_dim) };
         failed_stage = "patch_upload";
-        const patch_input = try cb.fromFloat32Shape(patch_rows, &patch_shape);
+        const patch_input = (cb.fromFloat32Shape(patch_rows, &patch_shape) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer cb.free(patch_input);
-        const patch0 = try weights.patch("v.patch_embd.weight", cfg);
-        const patch1 = try weights.patch("v.patch_embd.weight.1", cfg);
+        const patch0 = (weights.patch("v.patch_embd.weight", cfg) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
+        const patch1 = (weights.patch("v.patch_embd.weight.1", cfg) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         failed_stage = "patch_linear_first";
-        const first_temporal = try cb.linear(patch_input, patch0, patch_bias, geometry.patchCount(), patch_dim, cfg.vision_hidden);
+        const first_temporal = (cb.linear(patch_input, patch0, patch_bias, geometry.patchCount(), patch_dim, cfg.vision_hidden) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer cb.free(first_temporal);
         failed_stage = "patch_linear_second";
-        const second_temporal = try cb.linearNoBias(patch_input, patch1, geometry.patchCount(), patch_dim, cfg.vision_hidden);
+        const second_temporal = (cb.linearNoBias(patch_input, patch1, geometry.patchCount(), patch_dim, cfg.vision_hidden) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer cb.free(second_temporal);
         failed_stage = "patch_add";
-        break :blk try cb.add(first_temporal, second_temporal);
+        break :blk (cb.add(first_temporal, second_temporal) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
     };
     defer cb.free(embedded);
     failed_stage = "patch_download";
-    const embedded_host = try cb.toFloat32(embedded, allocator);
+    const embedded_host = (cb.toFloat32(embedded, allocator) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer allocator.free(embedded_host);
     failed_stage = "position_embedding";
-    try addInterpolatedPositions(weights, embedded_host, cfg, geometry);
+    (addInterpolatedPositions(weights, embedded_host, cfg, geometry) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     var completed_preprocess_evidence = preprocess_evidence;
     if (completed_preprocess_evidence) |*evidence| {
         evidence.positioned_embedding_f32le_sha256 = sha256F32LeHex(embedded_host);
     }
     const hidden_shape = [_]i32{ @intCast(geometry.patchCount()), @intCast(cfg.vision_hidden) };
     failed_stage = "positioned_upload";
-    var hidden = try cb.fromFloat32Shape(embedded_host, &hidden_shape);
+    var hidden = (cb.fromFloat32Shape(embedded_host, &hidden_shape) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     // Keep exactly one owner for the current vision tensor. Every successful
     // stage replaces that owner only after freeing its predecessor, so all
     // later failures (including cancellation and backend allocation errors)
@@ -1022,7 +1092,10 @@ fn encodeSingleImage(
     const patch_embed_ns = profileLap(profile, &stage_started_at);
 
     failed_stage = "rope_positions";
-    const positions = try visionPositions(allocator, geometry, cfg.spatial_merge);
+    const positions = (visionPositions(allocator, geometry, cfg.spatial_merge) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer allocator.free(positions);
     const positions_ns = profileLap(profile, &stage_started_at);
     var deepstack = std.ArrayListUnmanaged(f32).empty;
@@ -1032,7 +1105,10 @@ fn encodeSingleImage(
     else
         null;
     if (vision_trace_layer) |trace_layer| {
-        if (trace_layer >= cfg.block_count) return error.InvalidQwen3VlQualificationTraceLayer;
+        if (trace_layer >= cfg.block_count) return zig017_failure: {
+            zig017_return_error = error.InvalidQwen3VlQualificationTraceLayer;
+            break :zig017_failure error.InvalidQwen3VlQualificationTraceLayer;
+        };
     }
     var vision_trace_digest: ?[64]u8 = null;
     var next_tap: usize = 0;
@@ -1041,52 +1117,88 @@ fn encodeSingleImage(
     for (0..cfg.block_count) |layer| {
         // GGUF-backed projector weights bypass ComputeBackend.getWeight, so
         // retain explicit bounded checkpoints even when those weights cache.
-        try cb.checkExecutionControl();
+        (cb.checkExecutionControl() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         failed_stage = "vision_block";
         failed_layer = layer;
         const block_started_at = if (profile) monotonicNowNs() else 0;
-        const next = try encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer);
+        const next = (encoderBlock(cb, allocator, weights, cfg, hidden, positions, geometry.patchCount(), layer) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (profile) blocks_ns +|= monotonicNowNs() -| block_started_at;
         cb.free(hidden);
         hidden = next;
         if (vision_trace_layer != null and vision_trace_layer.? == layer) {
-            const trace_host = try cb.toFloat32(hidden, allocator);
+            const trace_host = (cb.toFloat32(hidden, allocator) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer allocator.free(trace_host);
             vision_trace_digest = sha256F32LeHex(trace_host);
         }
         if (next_tap < cfg.deepstack_len and cfg.deepstack_layers[next_tap] == layer) {
             const tap_started_at = if (profile) monotonicNowNs() else 0;
-            const feature = try mergeProjected(cb, allocator, weights, cfg, hidden, geometry, layer);
+            const feature = (mergeProjected(cb, allocator, weights, cfg, hidden, geometry, layer) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer cb.free(feature);
-            const host = try cb.toFloat32(feature, allocator);
+            const host = (cb.toFloat32(feature, allocator) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer allocator.free(host);
-            try deepstack.appendSlice(allocator, host);
+            (deepstack.appendSlice(allocator, host) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             if (profile) deepstack_ns +|= monotonicNowNs() -| tap_started_at;
             next_tap += 1;
         }
     }
     stage_started_at = if (profile) monotonicNowNs() else 0;
     failed_layer = null;
-    if (next_tap != cfg.deepstack_len) return error.InvalidGgufProjector;
+    if (next_tap != cfg.deepstack_len) return zig017_failure: {
+        zig017_return_error = error.InvalidGgufProjector;
+        break :zig017_failure error.InvalidGgufProjector;
+    };
     if (completed_preprocess_evidence) |*evidence| {
         evidence.vision_trace_layer = vision_trace_layer;
         evidence.vision_trace_f32le_sha256 = vision_trace_digest;
     }
 
     failed_stage = "post_norm";
-    try cb.checkExecutionControl();
-    const post_norm = try layerNormNamed(cb, allocator, weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps);
+    (cb.checkExecutionControl() catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
+    const post_norm = (layerNormNamed(cb, allocator, weights, hidden, "v.post_ln", cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     cb.free(hidden);
     hidden = post_norm;
     failed_stage = "final_merge";
-    const projected = try mergeProjectedNamed(cb, allocator, weights, cfg, post_norm, geometry, "mm.0", "mm.2");
+    const projected = (mergeProjectedNamed(cb, allocator, weights, cfg, post_norm, geometry, "mm.0", "mm.2") catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     cb.free(hidden);
     hidden = projected;
     failed_stage = "final_download";
-    const embeddings = try cb.toFloat32(projected, allocator);
+    const embeddings = (cb.toFloat32(projected, allocator) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     const final_merge_ns = profileLap(profile, &stage_started_at);
     errdefer allocator.free(embeddings);
-    const owned_deepstack = try deepstack.toOwnedSlice(allocator);
+    const owned_deepstack = (deepstack.toOwnedSlice(allocator) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     errdefer allocator.free(owned_deepstack);
     if (profile) {
         std.debug.print(
@@ -1141,48 +1253,88 @@ fn encoderBlock(
     token_count: usize,
     layer: usize,
 ) !CT {
+    var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
     var failed_stage: []const u8 = "ln1";
-    errdefer |err| if (profile) std.debug.print(
+    errdefer if (zig017_return_error) |err| if (profile) std.debug.print(
         "qwen3vl-vision-block-error: layer={d} stage={s} error={s}\n",
         .{ layer, failed_stage, @errorName(err) },
     );
     var prefix_buf: [96]u8 = undefined;
-    const ln1_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ln1", .{layer});
-    const normed1 = try layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps);
+    const ln1_prefix = (std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ln1", .{layer}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
+    const normed1 = (layerNormNamed(cb, allocator, weights, input, ln1_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(normed1);
     const ln1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention";
-    const attn = try visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer);
+    const attn = (visionAttention(cb, allocator, weights, cfg, normed1, positions, token_count, layer) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(attn);
     const attention_ns = profileLap(profile, &stage_started_at);
     failed_stage = "attention_residual";
-    const residual1 = try cb.add(input, attn);
+    const residual1 = (cb.add(input, attn) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     errdefer cb.free(residual1);
     const attention_residual_ns = profileLap(profile, &stage_started_at);
 
-    const ln2_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ln2", .{layer});
+    const ln2_prefix = (std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ln2", .{layer}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     failed_stage = "ln2";
-    const normed2 = try layerNormNamed(cb, allocator, weights, residual1, ln2_prefix, cfg.vision_hidden, cfg.layer_norm_eps);
+    const normed2 = (layerNormNamed(cb, allocator, weights, residual1, ln2_prefix, cfg.vision_hidden, cfg.layer_norm_eps) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(normed2);
     const ln2_ns = profileLap(profile, &stage_started_at);
-    const fc1_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ffn_up", .{layer});
+    const fc1_prefix = (std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ffn_up", .{layer}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     failed_stage = "fc1";
-    const fc1 = try linearNamed(cb, allocator, weights, normed2, fc1_prefix, token_count, cfg.vision_hidden, cfg.intermediate);
+    const fc1 = (linearNamed(cb, allocator, weights, normed2, fc1_prefix, token_count, cfg.vision_hidden, cfg.intermediate) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(fc1);
     const fc1_ns = profileLap(profile, &stage_started_at);
     failed_stage = "gelu";
-    const activated = try cb.geluExact(fc1) orelse try cb.gelu(fc1);
+    const activated = (cb.geluExact(fc1) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    }) orelse (cb.gelu(fc1) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(activated);
     const activation_ns = profileLap(profile, &stage_started_at);
-    const fc2_prefix = try std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ffn_down", .{layer});
+    const fc2_prefix = (std.fmt.bufPrint(&prefix_buf, "v.blk.{d}.ffn_down", .{layer}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     failed_stage = "fc2";
-    const fc2 = try linearNamed(cb, allocator, weights, activated, fc2_prefix, token_count, cfg.intermediate, cfg.vision_hidden);
+    const fc2 = (linearNamed(cb, allocator, weights, activated, fc2_prefix, token_count, cfg.intermediate, cfg.vision_hidden) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(fc2);
     const fc2_ns = profileLap(profile, &stage_started_at);
     failed_stage = "ffn_residual";
-    const output = try cb.add(residual1, fc2);
+    const output = (cb.add(residual1, fc2) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     cb.free(residual1);
     const ffn_residual_ns = profileLap(profile, &stage_started_at);
     if (profile) {
@@ -1214,46 +1366,83 @@ fn visionAttention(
     token_count: usize,
     layer: usize,
 ) !CT {
+    var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var stage_started_at = if (profile) monotonicNowNs() else 0;
     var failed_stage: []const u8 = "qkv";
-    errdefer |err| if (profile) std.debug.print(
+    errdefer if (zig017_return_error) |err| if (profile) std.debug.print(
         "qwen3vl-vision-attention-error: layer={d} stage={s} error={s}\n",
         .{ layer, failed_stage, @errorName(err) },
     );
     var buf: [96]u8 = undefined;
-    const qkv_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_qkv", .{layer});
-    const qkv = try linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3);
+    const qkv_prefix = (std.fmt.bufPrint(&buf, "v.blk.{d}.attn_qkv", .{layer}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
+    const qkv = (linearNamed(cb, allocator, weights, input, qkv_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden * 3) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(qkv);
     const qkv_ns = profileLap(profile, &stage_started_at);
     failed_stage = "split_q";
-    const q_unrotated = try cb.sliceLastDim(qkv, 0, cfg.vision_hidden);
+    const q_unrotated = (cb.sliceLastDim(qkv, 0, cfg.vision_hidden) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(q_unrotated);
     failed_stage = "split_k";
-    const k_unrotated = try cb.sliceLastDim(qkv, cfg.vision_hidden, cfg.vision_hidden * 2);
+    const k_unrotated = (cb.sliceLastDim(qkv, cfg.vision_hidden, cfg.vision_hidden * 2) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(k_unrotated);
     failed_stage = "split_v";
-    const v = try cb.sliceLastDim(qkv, cfg.vision_hidden * 2, cfg.vision_hidden * 3);
+    const v = (cb.sliceLastDim(qkv, cfg.vision_hidden * 2, cfg.vision_hidden * 3) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(v);
     failed_stage = "rope_q";
-    const q = (try cb.visionRope(q_unrotated, token_count, cfg.headDim(), cfg.rope_theta, positions)) orelse
-        return error.UnsupportedVisionRopeBackend;
+    const q = ((cb.visionRope(q_unrotated, token_count, cfg.headDim(), cfg.rope_theta, positions) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    })) orelse
+        return zig017_failure: {
+            zig017_return_error = error.UnsupportedVisionRopeBackend;
+            break :zig017_failure error.UnsupportedVisionRopeBackend;
+        };
     defer cb.free(q);
     failed_stage = "rope_k";
-    const k = (try cb.visionRope(k_unrotated, token_count, cfg.headDim(), cfg.rope_theta, positions)) orelse
-        return error.UnsupportedVisionRopeBackend;
+    const k = ((cb.visionRope(k_unrotated, token_count, cfg.headDim(), cfg.rope_theta, positions) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    })) orelse
+        return zig017_failure: {
+            zig017_return_error = error.UnsupportedVisionRopeBackend;
+            break :zig017_failure error.UnsupportedVisionRopeBackend;
+        };
     defer cb.free(k);
     const split_rope_ns = profileLap(profile, &stage_started_at);
     // Every patch is active in the single-image vision tower. An explicit
     // all-ones mask only adds a device upload and blocks specialized unmasked
     // SDPA routes without changing the mathematical result.
     failed_stage = "sdpa";
-    const attended = try cb.scaledDotProductAttentionQwen3VlVision(q, k, v, 1, token_count, cfg.head_count, cfg.headDim());
+    const attended = (cb.scaledDotProductAttentionQwen3VlVision(q, k, v, 1, token_count, cfg.head_count, cfg.headDim()) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer cb.free(attended);
     const sdpa_ns = profileLap(profile, &stage_started_at);
-    const out_prefix = try std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out", .{layer});
+    const out_prefix = (std.fmt.bufPrint(&buf, "v.blk.{d}.attn_out", .{layer}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     failed_stage = "output_projection";
-    const output = try linearNamed(cb, allocator, weights, attended, out_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden);
+    const output = (linearNamed(cb, allocator, weights, attended, out_prefix, token_count, cfg.vision_hidden, cfg.vision_hidden) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     const out_ns = profileLap(profile, &stage_started_at);
     if (profile) {
         std.debug.print(
@@ -1357,21 +1546,37 @@ fn linearNamed(
     in_dim: usize,
     out_dim: usize,
 ) !CT {
+    var zig017_return_error: ?anyerror = null;
     const profile = qwen3VlProfileEnabled();
     var failed_stage: []const u8 = "weight";
-    errdefer |err| if (profile) std.debug.print(
+    errdefer if (zig017_return_error) |err| if (profile) std.debug.print(
         "qwen3vl-linear-error: prefix={s} stage={s} error={s}\n",
         .{ prefix, failed_stage, @errorName(err) },
     );
-    const weight_name = try std.fmt.allocPrint(allocator, "{s}.weight", .{prefix});
+    const weight_name = (std.fmt.allocPrint(allocator, "{s}.weight", .{prefix}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer allocator.free(weight_name);
-    const bias_name = try std.fmt.allocPrint(allocator, "{s}.bias", .{prefix});
+    const bias_name = (std.fmt.allocPrint(allocator, "{s}.bias", .{prefix}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer allocator.free(bias_name);
-    const weight = try weights.linear(weight_name, in_dim, out_dim);
+    const weight = (weights.linear(weight_name, in_dim, out_dim) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     failed_stage = "bias";
-    const bias = try weights.weight(bias_name);
+    const bias = (weights.weight(bias_name) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     failed_stage = "linear";
-    return cb.linear(input, weight, bias, rows, in_dim, out_dim);
+    return cb.linear(input, weight, bias, rows, in_dim, out_dim) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    };
 }
 
 fn loadPatchWeight(

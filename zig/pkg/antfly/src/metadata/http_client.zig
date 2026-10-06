@@ -15,7 +15,7 @@
 const std = @import("std");
 const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
@@ -1124,7 +1124,7 @@ pub const MetadataHttpClient = struct {
 
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
-    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+    pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
         if (input == .fk_initial_retirement_page) return error.InitialFkRetirementNotActivated;
         if (input.isMutation()) return error.InvalidCatalogMutation;
         if (remaining_ms == 0) return error.Timeout;
@@ -1184,7 +1184,7 @@ pub const MetadataHttpClient = struct {
         const raw_incarnation = responseHeader(response, "x-antfly-catalog-metadata-incarnation") orelse return error.MetadataIncarnationUnavailable;
         if (raw_incarnation.len != 32) return error.InvalidMetadataIncarnation;
         const incarnation: metadata_api.MetadataClusterIncarnation = raw_incarnation[0..32].*;
-        if (!@import("incarnation.zig").isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        if (!@import("antfly_local_sources").metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
         return .{
             .metadata_group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch,
             .metadata_incarnation = incarnation,
@@ -1192,7 +1192,7 @@ pub const MetadataHttpClient = struct {
         };
     }
 
-    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: system_catalog.Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
+    pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
         defer self.alloc.free(body);
@@ -2545,7 +2545,7 @@ fn consumerTests() type {
                 .{ .status = 426, .body = "", .result = false, .err = null },
                 .{ .status = 200, .body = "{\"activated_version\":16}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 200, .body = "not json", .result = null, .err = error.InvalidStoreRootReadinessResponse },
-                .{ .status = 200, .body = "{\"activated_version\":17,\"padding\":\"" ++ ("x" ** 1024) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 200, .body = "{\"activated_version\":17,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 503, .body = "", .result = null, .err = error.StoreRootReadinessUnavailable },
             };
             for (cases) |case| {
@@ -2562,7 +2562,7 @@ fn consumerTests() type {
                 .{ .status = 200, .body = "{\"activated_version\":17}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 404, .body = "", .result = false, .err = null },
                 .{ .status = 426, .body = "", .result = false, .err = null },
-                .{ .status = 200, .body = "{\"activated_version\":18,\"padding\":\"" ++ ("x" ** 1024) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 200, .body = "{\"activated_version\":18,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 503, .body = "", .result = null, .err = error.StoreRootReadinessUnavailable },
             };
             for (signing_cases) |case| {
@@ -4151,7 +4151,7 @@ fn consumerTests() type {
                     self.reallocate_count += 1;
                 }
 
-                fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
                     _ = alloc;
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
@@ -4159,32 +4159,32 @@ fn consumerTests() type {
                     self.create_count += 1;
                 }
 
-                fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").api_operation.RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (request.deadline_ns != null) self.forwarded_create_deadline_seen = true;
                     try createTable(ptr, alloc, table_name, req);
                 }
 
-                fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+                pub fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     self.drop_count += 1;
                 }
 
-                fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8) !void {
+                fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").api_operation.RequestContext, table_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (request.deadline_ns != null) self.forwarded_drop_deadline_seen = true;
                     try dropTable(ptr, alloc, table_name);
                 }
 
-                fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+                pub fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("{\"kind\":\"demo\"}", schema_json);
                     self.update_schema_count += 1;
                 }
 
-                fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                pub fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("embed_idx", index_name);
@@ -4192,14 +4192,14 @@ fn consumerTests() type {
                     self.create_index_count += 1;
                 }
 
-                fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+                pub fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("embed_idx", index_name);
                     self.drop_index_count += 1;
                 }
 
-                fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+                pub fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
@@ -4207,7 +4207,7 @@ fn consumerTests() type {
                     self.put_artifact_enrichment_count += 1;
                 }
 
-                fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+                pub fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
@@ -4513,10 +4513,11 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
     try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
 }
 
-test "system catalog policy publication status preserves absent stamp without reclassifying other conflicts" {
+test "system catalog policy publication status preserves explicit absence without reclassifying policy conflicts" {
     const alloc = std.testing.allocator;
     const Executor = struct {
         body: []const u8,
+        status: u16 = 409,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
@@ -4525,13 +4526,24 @@ test "system catalog policy publication status preserves absent stamp without re
                 try std.testing.expect(request.header(@import("../system_catalog/setting_authority.zig").header_name) == null or
                     request.header(@import("../system_catalog/setting_authority.zig").header_name).?.len == 0);
             }
-            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+            if (self.status != 200) return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+            const headers = try a.alloc(http_common.Header, 2);
+            errdefer a.free(headers);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "77") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+            return .{ .status = 200, .body = try a.dupe(u8, self.body), .headers = headers };
         }
     };
     var executor = Executor{ .body = "RowPolicyCatalogChanged" };
     var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withInternalServiceAuth("policy-status-service-secret-0123456789", "policy-status-test");
     try std.testing.expectError(error.RowPolicyCatalogChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.status = 200;
+    executor.body = "null";
+    var absent = try client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null);
+    defer absent.deinit(alloc);
+    try std.testing.expectEqualStrings("null", absent.body);
+    executor.status = 409;
     executor.body = "CatalogGenerationChanged";
     try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
     executor.body = "RowPolicyCatalogChanged";
@@ -4553,8 +4565,8 @@ test "system catalog FK decision preserves absent publication for initial-parent
     var executor = Executor{ .body = "GenerationPublicationNotFound" };
     var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withSettingAuthority("fk-decision-test-secret", "fk-decision-test");
-    const decision: system_catalog.Call = .{ .fk_generation_publication_decision = .{
-        .plan_id = .{1} ** 16,
+    const decision: @import("../system_catalog/server_call.zig").Call = .{ .fk_generation_publication_decision = .{
+        .plan_id = @splat(1),
         .parent_table_id = 1,
         .parent_group_id = 2,
         .child_table_id = 3,
@@ -4588,7 +4600,7 @@ test "system catalog initial FK retirement page requires a store-bound transport
     var executor = Executor{};
     var client = MetadataHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withSettingAuthority("retirement-read-test-secret", "retirement-read-test");
-    const call: system_catalog.Call = .{ .fk_initial_retirement_page = .{ .store_id = 13, .limit = 1 } };
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .fk_initial_retirement_page = .{ .store_id = 13, .limit = 1 } };
     try std.testing.expectError(error.InitialFkRetirementNotActivated, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
     try std.testing.expectEqual(@as(usize, 0), executor.calls);
 }
@@ -4628,4 +4640,15 @@ test "metadata mutation topology avoids diagnostics and owns parsed roles across
     var client = MetadataHttpClient.init(a, .{ .ptr = &unavailable, .vtable = &.{ .execute = Executor.execute } });
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
     try std.testing.expectEqual(@as(usize, 0), unavailable.diagnostic_calls);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

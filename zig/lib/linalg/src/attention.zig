@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const primitives = @import("primitives.zig");
-const gemm = @import("gemm.zig");
+const gemm = @import("gemm_dispatch.zig");
 const pool = @import("pool.zig");
 
 const vec_len = primitives.vec_len;
@@ -1752,8 +1752,8 @@ test "channelAttention matches scalar reference" {
         0.5, 0.2, 0.1, 0.6, 0.4, 0.3, 0.7, 0.8, 0.9, 0.2, 0.5, 0.4,
         0.9, 0.3, 0.2, 0.7, 0.5, 0.1, 0.4, 0.6, 0.3, 0.8, 0.7, 0.2,
     };
-    var actual = [_]f32{0} ** 12;
-    var expected = [_]f32{0} ** 12;
+    var actual = @as([12]f32, @splat(0));
+    var expected = @as([12]f32, @splat(0));
     try channelAttention(allocator, &actual, &qkv, 1, 3, 4, 2);
     channelAttentionReference(&expected, &qkv, 1, 3, 4, 2);
     for (actual, expected) |got, want| {

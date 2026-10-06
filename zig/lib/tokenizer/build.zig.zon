@@ -16,7 +16,7 @@
     .name = .antfly_tokenizer_build,
     .version = "0.0.1",
     .fingerprint = 0xa213845aa5518582,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

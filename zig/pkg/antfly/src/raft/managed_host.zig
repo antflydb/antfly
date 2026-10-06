@@ -17,8 +17,8 @@ const raft_engine = @import("raft_engine");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const backups_api = @import("../api/backups.zig");
-const common_config = @import("../common/config.zig");
-const catalog = @import("catalog.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const catalog = @import("storage/catalog.zig");
 const data_storage = @import("../data/storage/mod.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const kernel_owner_abi = @import("kernel_owner_abi");
@@ -36,8 +36,8 @@ const reconciler = @import("reconciler.zig");
 const state_machine = @import("state_machine/mod.zig");
 const storage = @import("storage/mod.zig");
 const backup_restore = @import("storage/backup_restore.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
-const resource_manager = @import("../storage/resource_manager.zig");
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
 const linked_storage = control_only_storage_sources;
 pub const DataApplyStore = if (linked_storage) data_apply_client.RaftApplyStore else data_storage.RaftApplyStore;
 
@@ -916,7 +916,7 @@ const DataApplyPreparedSnapshotSource = struct {
         self.prepared.cancel();
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.prepared.deinit();
         std.heap.page_allocator.destroy(self);
@@ -935,7 +935,7 @@ const PreparedHostDeps = struct {
     owned_data_state_machine: ?*state_machine.DataStateMachine = null,
     owned_routed_state_machine: ?*state_machine.RoutedStateMachine = null,
 
-    fn deinit(self: *PreparedHostDeps, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PreparedHostDeps, alloc: std.mem.Allocator) void {
         if (self.owned_backup_restore_bootstrapper) |bootstrapper| {
             bootstrapper.deinit(alloc);
             alloc.destroy(bootstrapper);
@@ -982,7 +982,7 @@ const ReplicaBackupRestoreBootstrapper = struct {
         };
     }
 
-    fn deinit(self: *ReplicaBackupRestoreBootstrapper, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ReplicaBackupRestoreBootstrapper, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         self.* = undefined;
     }

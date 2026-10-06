@@ -27,7 +27,7 @@ const vector_index = @import("vector_index.zig");
 const publication_plan = @import("publication_plan.zig");
 const catalog_mod = @import("../catalog/mod.zig");
 const shared_vector = @import("antfly_vector").vector;
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
 const builder_mod = @import("builder.zig");
 const work_lease = @import("work_lease.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
@@ -1357,7 +1357,7 @@ test "serverless compactor no-ops when head is already compacted" {
     try std.testing.expect(first.published);
 
     const RejectUploads = struct {
-        fn put(_: *anyopaque, _: Allocator, _: @import("../artifacts/store.zig").UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.ArtifactMetadata {
+        fn put(_: *anyopaque, _: Allocator, _: @import("../artifacts/store.zig").UploadScope, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedCompactionUpload;
         }
     };

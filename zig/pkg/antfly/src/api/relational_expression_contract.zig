@@ -5,8 +5,8 @@
 //! unsupported JSON before admission and preserves the same closed GET shape.
 const std = @import("std");
 const wire = @import("antfly_schema_openapi");
-const impl = @import("../schema/table_schema_impl.zig");
-const ColumnKind = @import("../storage/schema.zig").RelationalColumnType;
+const impl = @import("antfly_local_sources").schema_table_schema_impl;
+const ColumnKind = @import("antfly_local_sources").storage_schema.RelationalColumnType;
 
 /// Request-local cached binding for column/op predicates. Parsed API handlers
 /// reuse their immutable schema; raw/wire paths parse only referenced fields.
@@ -24,7 +24,7 @@ pub const ColumnTypes = struct {
         const result = switch (self.source) {
             .parsed => |schema| found: {
                 for (schema.document_schemas) |document| for (document.properties) |property| {
-                    if (std.mem.eql(u8, property.name, name)) break :found @import("../schema/mod.zig").runtimeRelationalColumnType(property);
+                    if (std.mem.eql(u8, property.name, name)) break :found @import("antfly_local_sources").schema_mod.runtimeRelationalColumnType(property);
                 };
                 break :found null;
             },
@@ -142,11 +142,11 @@ fn canonicalLiteral(alloc: std.mem.Allocator, kind: wire.RelationalExpressionTyp
         .integer => {
             // Invalid values remain untouched for normal typed admission to
             // reject, never rounded or silently coerced by normalization.
-            const integer = @import("../schema/table_schema_impl.zig").documentIntegerToI64(value) orelse return value;
+            const integer = @import("antfly_local_sources").schema_table_schema_impl.documentIntegerToI64(value) orelse return value;
             if (integer > safe or integer < -safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{integer}) };
         },
         .datetime => {
-            const timestamp = @import("../schema/table_schema_impl.zig").documentDateTimeToNs(value) orelse return value;
+            const timestamp = @import("antfly_local_sources").schema_table_schema_impl.documentDateTimeToNs(value) orelse return value;
             if (timestamp > safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{timestamp}) };
         },
         else => {},

@@ -15,56 +15,22 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const preload_model_spec = @import("../common/preload_model_spec.zig");
-const process_memory_budget = @import("../common/process_memory_budget.zig");
+const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
 const httpx = @import("httpx");
 
 pub const ServerBudgetOverrides = inference.server.BudgetOverrides;
 
-/// Returns ~/.antfly/inference/models if $HOME is set, otherwise falls back to ./models.
-pub fn defaultModelsDir(allocator: std.mem.Allocator) []const u8 {
-    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
-    const home = platform.env.getenv("HOME") orelse return "./models";
-    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" }) catch "./models";
-}
-
-/// Returns ~/.antfly/inference/ml if $HOME is set, otherwise falls back to ./ml.
-pub fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
-    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value| return value;
-    const home = platform.env.getenv("HOME") orelse return "./ml";
-    return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
-}
-
-/// Compatibility wrappers for callers that also resolve a data directory.
-/// Inference asset discovery deliberately remains independent of the database data root.
-pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
-    _ = data_dir;
-    return defaultModelsDir(allocator);
-}
-
-pub fn defaultModelsDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    _ = data_dir;
-    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
-        return try allocator.dupe(u8, value);
-    const home = platform.env.getenv("HOME") orelse return try allocator.dupe(u8, "./models");
-    return try std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" });
-}
-
-pub fn defaultMlDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
-    _ = data_dir;
-    return defaultMlDir(allocator);
-}
-
-pub fn defaultMlDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
-    _ = data_dir;
-    if (platform.env.getenv("ANTFLY_INFERENCE_ML_DIR")) |value|
-        return try allocator.dupe(u8, value);
-    const home = platform.env.getenv("HOME") orelse return try allocator.dupe(u8, "./ml");
-    return try std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" });
-}
+const runtime_paths = @import("antfly_inference_runtime_paths");
+pub const defaultModelsDir = runtime_paths.defaultModelsDir;
+pub const defaultMlDir = runtime_paths.defaultMlDir;
+pub const defaultModelsDirForDataDir = runtime_paths.defaultModelsDirForDataDir;
+pub const defaultModelsDirForDataDirAlloc = runtime_paths.defaultModelsDirForDataDirAlloc;
+pub const defaultMlDirForDataDir = runtime_paths.defaultMlDirForDataDir;
+pub const defaultMlDirForDataDirAlloc = runtime_paths.defaultMlDirForDataDirAlloc;
 
 pub const SpawnedServer = struct {
     base_uri: []u8,
@@ -130,21 +96,8 @@ const BudgetOverridesMb = struct {
     scratch_budget_mb: usize = 0,
 };
 
-pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
-    if (std.mem.eql(u8, value, "native")) return .native;
-    if (std.mem.eql(u8, value, "onnx")) return .onnx;
-    if (std.mem.eql(u8, value, "metal")) return .metal;
-    if (std.mem.eql(u8, value, "cuda")) return .cuda;
-    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
-    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
-    return null;
-}
-
-pub fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType {
-    const raw = value orelse return null;
-    if (std.mem.eql(u8, raw, "auto")) return null;
-    return parseBackendType(raw) orelse error.InvalidArguments;
-}
+pub const parseBackendType = inference.backends.BackendType.parse;
+pub const parseOptionalBackendType = inference.backends.BackendType.parseOptional;
 
 fn parseKernelJitMode(value: []const u8) !inference.graph.kernel_jit.Mode {
     return std.meta.stringToEnum(inference.graph.kernel_jit.Mode, value) orelse error.InvalidArguments;
@@ -216,7 +169,7 @@ fn resolveRunPromptCache(config: ?*const common_config.Config) inference.server.
 
 const default_run_keep_alive_ms: u64 = 300_000;
 
-// Mirrors zig/pkg/antfly/src/standalone/inference_host.zig's parseKeepAliveMs.
+// Mirrors zig/pkg/inference/src/host/host.zig's parseKeepAliveMs.
 // Duplicated rather than imported: standalone already depends on
 // inference_runtime for path helpers, so importing standalone code back here
 // would create a module cycle.
@@ -267,8 +220,9 @@ fn resolveRunKeepAliveMs(config: ?*const common_config.Config) !u64 {
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(inference.server.WarmModelKind).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, value, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -305,7 +259,7 @@ pub fn runFromIterator(
     const command = args.next() orelse "run";
 
     if (std.mem.eql(u8, command, "_worker")) {
-        return @import("../standalone/inference_worker.zig").runChild(alloc, io);
+        return @import("antfly_inference_host").worker_module.runChild(alloc, io);
     }
 
     if (std.mem.eql(u8, command, "run")) {
@@ -849,7 +803,7 @@ pub fn spawnServerProcess(
     };
 }
 
-fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+pub fn listModels(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const configured_models_dir = try parseListModelsDir(args);
     const models_dir: []const u8 = configured_models_dir orelse defaultModelsDir(alloc);
 

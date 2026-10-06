@@ -360,9 +360,9 @@ const Encoder = struct {
         try self.out.print(self.allocator, "[{d}{s}]", .{ count, self.options.delimiter.marker() });
         if (fields) |field_names| {
             try self.out.append(self.allocator, '{');
-            for (field_names, 0..) |field_name, i| {
+            for (field_names, 0..) |reflected_name, i| {
                 if (i > 0) try self.out.append(self.allocator, self.options.delimiter.byte());
-                try self.emitKey(field_name);
+                try self.emitKey(reflected_name);
             }
             try self.out.append(self.allocator, '}');
         }

@@ -16,8 +16,8 @@
 //! Checkpoints bracket every remote operation, renewing the namespace lease
 //! throughout multi-page listing/footer discovery. Ownership stays with caller.
 const std = @import("std");
-const storage = @import("../../storage/object_storage.zig");
-const Token = @import("../../common/cancellation.zig").CancellationToken;
+const storage = @import("antfly_local_sources").storage_object_storage;
+const Token = @import("antfly_cancellation").CancellationToken;
 const Allocator = std.mem.Allocator;
 
 pub const ReadAuthority = struct {
@@ -41,7 +41,7 @@ pub const ReadAuthority = struct {
     fn selfFrom(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(_: Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: Allocator, _: *anyopaque) void {}
     fn make(_: *anyopaque, _: []const u8, _: storage.BucketOptions) !void {
         return error.ExternalTableReadOnly;
     }

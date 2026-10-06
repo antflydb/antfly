@@ -13,7 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const topology_records = @import("../../common/topology_records.zig");
+const topology_records = @import("antfly_local_sources").common_topology_records;
 const extensions = @import("../../extensions/mod.zig");
 const validation = @import("validation.zig");
 
@@ -21,7 +21,7 @@ pub const topology_format_version: u16 = 4;
 pub const topology_name = "TOPOLOGY.json";
 pub const private_provisioning_name = "restore-provisioning.json";
 pub const standalone_metadata_name = "standalone-metadata.bin";
-pub const logical_snapshot_manifest_name = "SNAPSHOT.json";
+pub const logical_snapshot_manifest_name = @import("antfly_local_sources").storage_backup_codec.logical_snapshot_manifest_file_name;
 pub const max_topology_bytes: usize = 64 * 1024 * 1024;
 pub const max_files: usize = 1_000_000;
 pub const max_file_bytes: u64 = 64 * 1024 * 1024 * 1024;
@@ -44,8 +44,8 @@ pub const PortableAuthSeed = struct {
 pub const LogicalCatalog = struct {
     epoch: u64,
     // Optional only for reading v3 seeds. V4 always carries the catalog.
-    system_catalog: ?@import("../../system_catalog/domain.zig").State = null,
-    policy_install_snapshots: []const @import("../../system_catalog/policies.zig").InstallSnapshot = &.{},
+    system_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
+    policy_install_snapshots: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot = &.{},
     tables: []const topology_records.TableRecord,
     ranges: []const topology_records.RangeRecord,
     extension_packages: []const extensions.PackageManifest = &.{},
@@ -375,12 +375,12 @@ fn readFileAlloc(io: std.Io, alloc: Allocator, path: []const u8, max_bytes: usiz
 pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCatalog) !void {
     if (version >= 4 and catalog.system_catalog == null) return error.InvalidSeedTopology;
     if (catalog.system_catalog) |state| {
-        @import("../../system_catalog/projection.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
+        @import("../../system_catalog/portable_policy_contract.zig").validatePolicyPrograms(alloc, state.policy_publications, catalog.policy_install_snapshots) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.InvalidSeedTopology,
         };
         if (state.next_id < 3) return error.InvalidSeedTopology;
-        const domain = @import("../../system_catalog/domain.zig");
+        const domain = @import("antfly_local_sources").system_catalog_domain;
         var index = try domain.StateIndex.init(alloc, state);
         defer index.deinit(alloc);
         for (state.resources) |resource| {
@@ -400,7 +400,7 @@ pub fn validateLogicalCatalog(alloc: Allocator, version: u16, catalog: LogicalCa
 }
 
 pub fn validateTableIdentityName(name: []const u8) !void {
-    const domain = @import("../../system_catalog/domain.zig");
+    const domain = @import("antfly_local_sources").system_catalog_domain;
     if (name.len <= 255) {
         domain.validateTableName(name) catch return error.InvalidSeedTopology;
     } else domain.validateStorageName(name) catch return error.InvalidSeedTopology;

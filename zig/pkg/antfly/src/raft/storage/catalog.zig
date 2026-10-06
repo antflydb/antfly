@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const fs_paths = @import("../../common/fs_paths.zig");
-const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
+const fs_paths = @import("antfly_runtime_fs").fs_paths;
+const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const raft_engine = @import("raft_engine");
 const platform_sync = @import("antfly_platform").sync;
 

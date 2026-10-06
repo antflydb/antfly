@@ -29,7 +29,7 @@ export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-/tmp/antfly-ci-zig-global}"
 mkdir -p "$HOME" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 
 cpu="${ANTFLY_CI_ZIG_CPU:-baseline}"
-optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-Debug}"
+optimize="${ANTFLY_CI_ZIG_OPTIMIZE:-debug}"
 build_args=(build)
 if [[ -n "${ANTFLY_CI_ZIG_TARGET:-}" ]]; then
   build_args+=("-Dtarget=$ANTFLY_CI_ZIG_TARGET")

@@ -44,7 +44,7 @@ pub const SplitTerminalOutcome = enum(u8) {
     rolled_back = 2,
 };
 
-pub const ByteRange = @import("byte_range.zig").ByteRange;
+pub const ByteRange = @import("antfly_local_sources").storage_byte_range.ByteRange;
 
 pub const SplitState = struct {
     phase: SplitPhase,
@@ -110,7 +110,7 @@ pub const KeyValue = struct {
     key: []u8,
     value: []u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeBytes(alloc, self.key);
         freeBytes(alloc, self.value);
         self.* = undefined;
@@ -134,7 +134,7 @@ pub const SplitDelta = struct {
     writes: []KeyValue,
     deletes: [][]u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.writes) |*write| write.deinit(alloc);
         alloc.free(self.writes);
         for (self.deletes) |key| freeBytes(alloc, key);
@@ -331,7 +331,7 @@ fn readRange(reader: *Reader, alloc: std.mem.Allocator) !ByteRange {
 }
 
 fn writeSplitState(writer: *Writer, state: anytype) !void {
-    try writer.byte(@intFromEnum(state.phase));
+    try writer.byte(@backingInt(state.phase));
     try writer.int(u64, state.transition_id);
     try writer.int(u64, state.attempt_epoch);
     try writer.bytes(state.split_key);
@@ -361,7 +361,7 @@ fn writeSplitTerminal(writer: *Writer, terminal: anytype) !void {
     try writer.int(u64, terminal.attempt_epoch);
     try writer.int(u64, terminal.destination_group_id);
     try writer.bytes(terminal.split_key);
-    try writer.byte(@intFromEnum(terminal.outcome));
+    try writer.byte(@backingInt(terminal.outcome));
 }
 
 fn readSplitTerminal(reader: *Reader, alloc: std.mem.Allocator) !SplitTerminal {
@@ -406,11 +406,11 @@ const Writer = struct {
         errdefer self.deinit();
         try self.bytes_list.appendSlice(alloc, magic);
         try self.bytes_list.append(alloc, format_version);
-        try self.bytes_list.append(alloc, @intFromEnum(kind));
+        try self.bytes_list.append(alloc, @backingInt(kind));
         return self;
     }
 
-    fn deinit(self: *Writer) void {
+    pub fn deinit(self: *Writer) void {
         self.bytes_list.deinit(self.alloc);
     }
 
@@ -447,7 +447,7 @@ const Reader = struct {
         if (encoded.len < magic.len + 2 or
             !std.mem.eql(u8, encoded[0..magic.len], magic) or
             encoded[magic.len] != format_version or
-            encoded[magic.len + 1] != @intFromEnum(expected))
+            encoded[magic.len + 1] != @backingInt(expected))
             return error.InvalidProjectionWire;
         return .{ .encoded = encoded, .position = magic.len + 2 };
     }

@@ -13,13 +13,13 @@
 // limitations.
 
 const std = @import("std");
-const backend_types = @import("backend_types.zig");
-const mem_backend_mod = @import("mem_backend.zig");
-const lsm_backend_mod = @import("lsm_backend/mod.zig");
-const storage_sim = @import("sim_runtime.zig");
-const segment_mod = @import("../segment.zig");
-const inverted = @import("../section/inverted.zig");
-const roaring = @import("../encoding/roaring.zig");
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const mem_backend_mod = @import("antfly_local_sources").storage_mem_backend;
+const lsm_backend_mod = @import("antfly_local_sources").storage_lsm_backend_mod;
+const storage_sim = @import("antfly_local_sources").storage_sim_runtime;
+const segment_mod = @import("antfly_local_sources").segment;
+const inverted = @import("antfly_local_sources").section_inverted;
+const roaring = @import("antfly_local_sources").encoding_roaring;
 
 const namespaces = [_]backend_types.Namespace{
     .{},
@@ -547,7 +547,7 @@ test "lsm backend simulation immutable flush write fault keeps wal-backed state 
     var lsm_backend = try lsm_backend_mod.Backend.open(std.testing.allocator, root_dir, open_options);
     defer lsm_backend.close();
 
-    const large_value = [_]u8{'v'} ** 256;
+    const large_value = @as([256]u8, @splat('v'));
     try putBoth(&mem_backend, &lsm_backend, .{ .name = "docs" }, "doc:a", large_value[0..]);
     try std.testing.expectEqual(@as(usize, 1), lsm_backend.immutable_memtables.items.len);
     try std.testing.expectEqual(@as(usize, 0), lsm_backend.runs.count());
@@ -572,7 +572,7 @@ test "lsm backend simulation journal append and checkpoint faults preserve ackno
     const Attempt = struct {
         fn run(backend: *lsm_backend_mod.Backend, checkpoint: bool) !void {
             if (!checkpoint) return backend.sync(true);
-            const runtime = @import("lsm_backend/runtime.zig");
+            const runtime = @import("antfly_local_sources").storage_lsm_backend_runtime;
             const locked = runtime.lockBackend(lsm_backend_mod.Backend, backend);
             defer runtime.unlockBackend(lsm_backend_mod.Backend, backend, locked);
             _ = try backend.manifest_journal.runCheckpoint(backend);
@@ -624,7 +624,7 @@ test "lsm backend simulation journal append and checkpoint faults preserve ackno
 }
 
 test "lsm backend simulation every checkpoint handoff stage survives crash and writable recovery" {
-    const runtime = @import("lsm_backend/runtime.zig");
+    const runtime = @import("antfly_local_sources").storage_lsm_backend_runtime;
     for ([_][]const u8{ ".journal", ".next", ".checkpoint", "manifest.bin" }) |target| for ([_]bool{ false, true }) |sync_fault| {
         var device = storage_sim.ModeledDevice.init(std.testing.allocator);
         defer device.deinit();
@@ -772,7 +772,7 @@ test "lsm backend simulation post-commit wal checkpoint fault is acknowledged an
 
     try lsm_backend.beginBulkIngestSession();
     try modeled_device.injectSyncFailureForPathContains("manifest.bin");
-    const value = [_]u8{'v'} ** 512;
+    const value = @as([512]u8, @splat('v'));
     var txn = try lsm_backend.beginBatchWithOptions(.{
         .mode = .bulk_ingest,
         .defer_commit_flush = true,

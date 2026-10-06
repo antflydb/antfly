@@ -204,7 +204,7 @@ const FixtureBatch = struct {
         self.writes.clearRetainingCapacity();
     }
 
-    fn deinit(self: *FixtureBatch, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FixtureBatch, alloc: std.mem.Allocator) void {
         for (self.owned.items) |bytes| alloc.free(bytes);
         self.owned.deinit(alloc);
         self.writes.deinit(alloc);

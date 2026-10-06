@@ -22,10 +22,10 @@ const keys = @import("page_keys.zig");
 const tree = @import("page_tree.zig");
 const page_store = @import("page_store.zig");
 const artifacts = @import("../artifacts/store.zig");
-const refs = @import("../manifest/artifact_ref.zig");
+const refs = @import("antfly_local_sources").serverless_manifest_artifact_ref;
 const wire = @import("packed.zig");
 const types = @import("types.zig");
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const Dictionary = std.StringArrayHashMapUnmanaged(void);
 
 fn clear(alloc: Allocator, dict: *Dictionary) void {

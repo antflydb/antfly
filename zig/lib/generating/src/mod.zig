@@ -15,6 +15,7 @@
 const std = @import("std");
 const json = @import("antfly-json");
 const openapi = @import("antfly_generating_openapi");
+pub const apple_native = @import("antfly_apple_native");
 
 pub const Role = enum {
     system,
@@ -96,6 +97,112 @@ pub const GenerateResult = struct {
     }
 };
 
+pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
+    try cfg.validate();
+    if (cfg.provider != .apple) return error.InvalidGeneratorConfig;
+    if (messages.len == 0 or messages.len > 128) return error.UnsupportedAppleGenerationOptions;
+    const Message = struct { role: []const u8, text: []const u8 };
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |value| alloc.free(value);
+        owned.deinit(alloc);
+    }
+    const normalized = try alloc.alloc(Message, messages.len);
+    defer alloc.free(normalized);
+    var expected: Role = .user;
+    var history_started = false;
+    for (messages, normalized) |message, *target| {
+        if (message.role == .tool or message.tool_calls != null or message.tool_call_id != null or message.google_parts_json != null)
+            return error.UnsupportedAppleGenerationOptions;
+        if (message.role == .system) {
+            if (history_started) return error.UnsupportedAppleGenerationOptions;
+        } else {
+            if (message.role != expected) return error.UnsupportedAppleGenerationOptions;
+            history_started = true;
+            expected = if (expected == .user) .assistant else .user;
+        }
+        const content = message.content orelse return error.UnsupportedAppleGenerationOptions;
+        const text = switch (content) {
+            .text => |value| value,
+            .parts => |parts| blk: {
+                var values: std.ArrayList([]const u8) = .empty;
+                defer values.deinit(alloc);
+                for (parts) |part| switch (part) {
+                    .text => |value| try values.append(alloc, value),
+                    else => return error.UnsupportedAppleGenerationOptions,
+                };
+                const value = try std.mem.join(alloc, "\n", values.items);
+                errdefer alloc.free(value);
+                try owned.append(alloc, value);
+                break :blk value;
+            },
+        };
+        target.* = .{ .role = message.role.toSlice(), .text = text };
+    }
+    if (!history_started or expected != .assistant) return error.UnsupportedAppleGenerationOptions;
+    const request = try std.json.Stringify.valueAlloc(alloc, .{
+        .messages = normalized,
+        .max_tokens = cfg.max_tokens,
+        .temperature = cfg.temperature,
+    }, .{});
+    defer alloc.free(request);
+    return .{ .content = try apple_native.invoke(alloc, .generate, request, &.{}, limit, control), .allocator = alloc };
+}
+
+test "Apple generation configuration is local and rejects unsupported options" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"apple\"}");
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("", cfg.model);
+    try std.testing.expectEqualStrings("", cfg.url);
+    try std.testing.expect(!cfg.provider.supportsTools());
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, parseConfigFromSlice(alloc, "{\"provider\":\"apple\",\"model\":\"system\"}"));
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, parseConfigFromSlice(alloc, "{\"provider\":\"apple\",\"model\":\"\"}"));
+    const serialized = try stringifyConfigAlloc(alloc, cfg);
+    defer alloc.free(serialized);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "\"model\"") == null);
+    cfg.top_p = 0.9;
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, cfg.validate());
+    cfg.top_p = null;
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, generateApple(alloc, cfg, &.{.{ .role = .assistant, .content = .{ .text = "bad history" } }}, 1024, .{}));
+}
+
+test "Apple generation reports readiness or generates bounded text" {
+    if (!apple_native.enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const status_json = try apple_native.invoke(alloc, .availability, "{}", &.{}, 65536, .{ .timeout_ms = 10_000 });
+    defer alloc.free(status_json);
+    const status = try std.json.parseFromSlice(struct { generation_status: i32 }, alloc, status_json, .{ .ignore_unknown_fields = true });
+    defer status.deinit();
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "", .max_tokens = 32 };
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "Reply with the word ready." } }};
+    if (status.value.generation_status == 4) {
+        try std.testing.expectError(error.AppleModelNotReady, generateApple(alloc, cfg, &messages, 1024, .{}));
+        return;
+    }
+    if (status.value.generation_status != 0) return error.SkipZigTest;
+    var result = try generateApple(alloc, cfg, &messages, 1024, .{ .timeout_ms = 60_000 });
+    defer result.deinit();
+    try std.testing.expect(result.content.len > 0 and result.content.len <= 1024);
+    var history_result = try generateApple(alloc, cfg, &.{
+        .{ .role = .system, .content = .{ .text = "Answer the user's question in one word." } },
+        .{ .role = .user, .content = .{ .text = "Remember the word pear." } },
+        .{ .role = .assistant, .content = .{ .text = "I'll remember pear." } },
+        .{ .role = .user, .content = .{ .text = "Which word did I ask you to remember?" } },
+    }, 1024, .{ .timeout_ms = 60_000 });
+    defer history_result.deinit();
+    try std.testing.expect(std.ascii.findIgnoreCase(history_result.content, "pear") != null);
+    try std.testing.expectError(error.ResponseTooLarge, generateApple(alloc, cfg, &messages, 1, .{ .timeout_ms = 60_000 }));
+}
+
+test "Apple generation cancellation and disabled provider" {
+    const alloc = std.testing.allocator;
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
+    const cancelled = std.atomic.Value(bool).init(true);
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "Hello" } }};
+    try std.testing.expectError(if (apple_native.enabled) error.Cancelled else error.AppleIntelligenceProviderUnavailable, generateApple(alloc, cfg, &messages, 1024, .{ .cancellation = apple_native.CancellationToken.fromAtomic(&cancelled) }));
+}
+
 pub const Provider = enum {
     gemini,
     vertex,
@@ -104,13 +211,14 @@ pub const Provider = enum {
     openrouter,
     ollama,
     antfly,
+    apple,
     mock,
 
     /// Adapter capability; the selected model must also support function calling.
     pub fn supportsTools(self: Provider) bool {
         return switch (self) {
             .antfly, .openai, .chatgpt, .openrouter, .ollama, .gemini, .vertex => true,
-            .mock => false,
+            .mock, .apple => false,
         };
     }
 
@@ -126,17 +234,34 @@ pub const default_max_tokens: i64 = 256;
 
 pub const OpenAIReasoningEffort = openapi.OpenAIReasoningEffort;
 
+pub const openai_default_url = "https://api.openai.com/v1";
+pub const vertex_default_url = "https://aiplatform.googleapis.com/v1";
+pub const gemini_default_url = "https://generativelanguage.googleapis.com/v1beta";
+pub const ollama_default_url = "http://127.0.0.1:11434/v1";
+
 pub const OpenAIConfig = struct {
     model: []const u8,
-    url: []const u8 = "https://api.openai.com/v1",
+    url: []const u8 = openai_default_url,
     api_key: ?[]const u8 = null,
 };
+
+pub fn defaultUrl(provider: Provider) []const u8 {
+    return switch (provider) {
+        .openai => openai_default_url,
+        .openrouter => openrouter_default_url,
+        .ollama => ollama_default_url,
+        .gemini => gemini_default_url,
+        .vertex => vertex_default_url,
+        // Antfly's empty URL selects embedded inference when available.
+        .antfly, .mock, .apple, .chatgpt => "",
+    };
+}
 
 pub const openrouter_default_url = "https://openrouter.ai/api/v1";
 
 pub const OllamaConfig = struct {
     model: []const u8,
-    url: []const u8 = "http://127.0.0.1:11434/v1",
+    url: []const u8 = ollama_default_url,
 };
 
 pub const AntflyConfig = struct {
@@ -245,8 +370,15 @@ pub const GeneratorConfig = struct {
                 self.frequency_penalty != null or self.presence_penalty != null)
                 return error.InvalidGeneratorConfig;
         } else if (self.connection_id != null) return error.InvalidGeneratorConfig;
-        if (self.model.len == 0 and self.provider != .mock) return error.InvalidGeneratorConfig;
-        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt) return error.InvalidGeneratorConfig;
+        if (self.model.len == 0 and self.provider != .mock and self.provider != .apple) return error.InvalidGeneratorConfig;
+        if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini and self.provider != .chatgpt) return error.InvalidGeneratorConfig;
+        if (self.provider == .apple) {
+            if (self.model.len > 0 or self.url.len > 0 or self.api_key != null or
+                self.capability_token != null or self.capability_revision != null or self.project_id != null or
+                self.location != null or self.credentials_path != null or self.tools_json != null or self.tool_choice_json != null or
+                self.rate_limit != null or self.top_p != null or self.top_k != null or self.frequency_penalty != null or self.presence_penalty != null)
+                return error.UnsupportedAppleGenerationOptions;
+        }
         if (self.max_tokens <= 0) return error.InvalidGeneratorConfig;
         if (self.max_completion_tokens) |limit| if (limit <= 0) return error.InvalidGeneratorConfig;
         if (self.provider != .openai and self.provider != .chatgpt and (self.max_completion_tokens != null or self.reasoning_effort != null)) return error.InvalidGeneratorConfig;
@@ -349,6 +481,7 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
     const provider = try providerFromOpenApi(generated.provider);
     if (provider == .chatgpt and (generated.max_tokens != null or generated.max_completion_tokens != null or generated.api_url != null)) return error.InvalidGeneratorConfig;
+    if (provider == .apple and generated.model != null) return error.UnsupportedAppleGenerationOptions;
     if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
     var cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
@@ -358,10 +491,8 @@ pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorC
             try alloc.dupe(u8, url)
         else if (generated.api_url) |api_url|
             try alloc.dupe(u8, api_url)
-        else if (provider == .openrouter)
-            try alloc.dupe(u8, openrouter_default_url)
         else
-            "",
+            try alloc.dupe(u8, defaultUrl(provider)),
         .connection_id = if (generated.connection_id) |id| try alloc.dupe(u8, id) else null,
         .api_key = if (generated.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
         .project_id = if (generated.project_id) |project_id| try alloc.dupe(u8, project_id) else null,
@@ -388,7 +519,7 @@ pub fn openApiFromConfig(cfg: GeneratorConfig) openapi.GeneratorConfig {
         .model = if (cfg.model.len > 0) cfg.model else null,
         .url = switch (cfg.provider) {
             .openai, .openrouter, .ollama, .gemini, .vertex, .mock => if (cfg.url.len > 0) cfg.url else null,
-            .antfly, .chatgpt => null,
+            .antfly, .chatgpt, .apple => null,
         },
         .api_url = switch (cfg.provider) {
             .antfly => if (cfg.url.len > 0) cfg.url else null,
@@ -669,6 +800,7 @@ fn providerFromOpenApi(provider: ?[]const u8) !Provider {
     if (std.mem.eql(u8, name, "openrouter")) return .openrouter;
     if (std.mem.eql(u8, name, "ollama")) return .ollama;
     if (std.mem.eql(u8, name, "antfly")) return .antfly;
+    if (std.mem.eql(u8, name, "apple")) return .apple;
     return error.UnsupportedGeneratorProvider;
 }
 
@@ -1031,4 +1163,39 @@ test "chatgpt generation rejects credentials unsupported settings and billing fa
         try std.testing.expectError(error.InvalidGeneratorConfig, parseConfigFromSlice(a, raw));
     }
     try std.testing.expectError(error.ChatGPTBillingFallbackForbidden, resolveGeneratorOrChain(a, null, &.{ .{ .generator = config }, .{ .generator = GeneratorConfig.fromOpenAI(.{ .model = "paid" }) } }));
+}
+
+test "generator provider URL defaults survive parsing and round trip" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { provider: Provider, url: []const u8 }{
+        .{ .provider = .openai, .url = "https://api.openai.com/v1" },
+        .{ .provider = .openrouter, .url = "https://openrouter.ai/api/v1" },
+        .{ .provider = .ollama, .url = "http://127.0.0.1:11434/v1" },
+        .{ .provider = .antfly, .url = "" },
+        .{ .provider = .gemini, .url = "https://generativelanguage.googleapis.com/v1beta" },
+        .{ .provider = .vertex, .url = "https://aiplatform.googleapis.com/v1" },
+    };
+    for (cases) |case| {
+        const raw = try std.fmt.allocPrint(alloc, "{{\"provider\":\"{s}\",\"model\":\"test-model\"}}", .{@tagName(case.provider)});
+        defer alloc.free(raw);
+        var cfg = try parseConfigFromSlice(alloc, raw);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqualStrings(case.url, cfg.url);
+        const encoded = try stringifyConfigAlloc(alloc, cfg);
+        defer alloc.free(encoded);
+        var round_trip = try parseConfigFromSlice(alloc, encoded);
+        defer round_trip.deinit(alloc);
+        try std.testing.expectEqualStrings(cfg.url, round_trip.url);
+    }
+}
+
+test "generator explicit URL and api_url take precedence over defaults" {
+    const alloc = std.testing.allocator;
+    inline for (.{ "url", "api_url" }) |field| {
+        const raw = try std.fmt.allocPrint(alloc, "{{\"provider\":\"openai\",\"model\":\"test\",\"{s}\":\"http://custom/v1\"}}", .{field});
+        defer alloc.free(raw);
+        var cfg = try parseConfigFromSlice(alloc, raw);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqualStrings("http://custom/v1", cfg.url);
+    }
 }

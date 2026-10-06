@@ -34,7 +34,7 @@ pub const Extent = struct {
 
 pub const Set = struct {
     count: u8 = 0,
-    items: [max_extents]Extent = [_]Extent{.{}} ** max_extents,
+    items: [max_extents]Extent = @as([max_extents]Extent, @splat(.{})),
 
     pub fn slice(self: *const Set) []const Extent {
         return self.items[0..self.count];

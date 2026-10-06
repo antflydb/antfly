@@ -705,7 +705,7 @@ test "whisper mel takes the checkpoint's mel bin count" {
 }
 
 test "whisper mel from pcm returns whisper-shaped output" {
-    const samples = [_]f32{0.0} ** 1600;
+    const samples = @as([1600]f32, @splat(0.0));
     const mel = try whisperMelFromPcm(std.testing.allocator, &samples, WHISPER_SAMPLE_RATE);
     defer std.testing.allocator.free(mel);
     try std.testing.expectEqual(@as(usize, WHISPER_N_MELS * WHISPER_N_FRAMES), mel.len);
@@ -716,7 +716,7 @@ test "whisper dynamic context sizes the mel to the audio" {
     try std.testing.expectEqual(@as(u32, 30), dynamicContextSeconds(WHISPER_SAMPLE_RATE * 60, WHISPER_SAMPLE_RATE));
     try std.testing.expectEqual(@as(u32, 1), dynamicContextSeconds(0, WHISPER_SAMPLE_RATE));
     try std.testing.expectEqual(@as(usize, 400), whisperFramesForSeconds(4));
-    const samples = [_]f32{0.0} ** 1600;
+    const samples = @as([1600]f32, @splat(0.0));
     const mel = try whisperMelFromPcmSeconds(std.testing.allocator, &samples, WHISPER_SAMPLE_RATE, 2);
     defer std.testing.allocator.free(mel);
     try std.testing.expectEqual(@as(usize, WHISPER_N_MELS * 200), mel.len);
@@ -724,7 +724,7 @@ test "whisper dynamic context sizes the mel to the audio" {
 }
 
 test "whisper input is validated and sliced before resampling" {
-    const samples = [_]f32{0.0} ** 31;
+    const samples = @as([31]f32, @splat(0.0));
     try std.testing.expectEqual(@as(usize, 30), (try whisperInputWindow(&samples, 1)).len);
     try std.testing.expectError(error.UnsupportedAudioFormat, whisperInputWindow(&.{}, 16_000));
     try std.testing.expectError(error.UnsupportedAudioFormat, whisperInputWindow(&samples, 0));
@@ -769,9 +769,9 @@ test "clap input features marks long audio and returns 4 channels" {
 }
 
 test "clap source duration is bounded before resampling" {
-    const allowed = [_]f32{0.0} ** CLAP_MAX_INPUT_SECONDS;
+    const allowed = @as([CLAP_MAX_INPUT_SECONDS]f32, @splat(0.0));
     try validateClapInput(&allowed, 1);
-    const too_long = [_]f32{0.0} ** (CLAP_MAX_INPUT_SECONDS + 1);
+    const too_long = @as([(CLAP_MAX_INPUT_SECONDS + 1)]f32, @splat(0.0));
     try std.testing.expectError(error.AudioInputTooLong, validateClapInput(&too_long, 1));
     try std.testing.expectError(error.UnsupportedAudioFormat, validateClapInput(&.{}, 48_000));
     try std.testing.expectError(error.UnsupportedAudioFormat, validateClapInput(&allowed, 0));

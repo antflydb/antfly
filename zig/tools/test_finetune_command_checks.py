@@ -32,7 +32,7 @@ class FinetuneCommandChecks(unittest.TestCase):
                     "zig",
                     "build-exe",
                     "-lc",
-                    "-ODebug",
+                    "-Odebug",
                     "--dep",
                     "command_0",
                     "--dep",

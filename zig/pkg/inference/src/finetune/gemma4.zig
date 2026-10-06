@@ -175,7 +175,7 @@ const PrepareMediaKind = enum { image, audio };
 const PrepareMediaTokenCache = struct {
     items: std.StringHashMapUnmanaged(usize) = .empty,
 
-    fn deinit(self: *PrepareMediaTokenCache, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PrepareMediaTokenCache, allocator: std.mem.Allocator) void {
         var it = self.items.iterator();
         while (it.next()) |entry| allocator.free(entry.key_ptr.*);
         self.items.deinit(allocator);
@@ -239,7 +239,7 @@ const LoadedGemmaTokenizer = union(enum) {
     hf: *hf_tokenizer.HfTokenizer,
     sp: *sentencepiece.Processor,
 
-    fn deinit(self: *LoadedGemmaTokenizer, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *LoadedGemmaTokenizer, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .hf => |tok| tok.deinitSelf(),
             .sp => |sp| {
@@ -486,7 +486,7 @@ pub fn savePreparedInputsSummary(allocator: std.mem.Allocator, path: []const u8,
     var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
     try std.json.Stringify.value(.{ .summary = summary }, .{ .whitespace = .indent_2 }, &buffer.writer);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = buffer.written() });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = buffer.written() });
 }
 
 pub fn freePreparedInputsSummary(allocator: std.mem.Allocator, summary: *const PreparedInputsSummary) void {
@@ -645,7 +645,7 @@ const LoRALayerSFState = struct {
         return .{ .allocator = alloc, .z_a = z_a, .v_a = v_a, .z_b = z_b, .v_b = v_b, .step = 0 };
     }
 
-    fn deinit(self: *LoRALayerSFState) void {
+    pub fn deinit(self: *LoRALayerSFState) void {
         self.allocator.free(self.z_a);
         self.allocator.free(self.v_a);
         self.allocator.free(self.z_b);
@@ -1716,7 +1716,7 @@ fn applyScheduleFreeInPlace(params: []f32, grads: []const f32, z: []f32, v: []f3
 }
 
 test "hash supervised token transitions ignores masked labels" {
-    var row: [32]f32 = [_]f32{0} ** 32;
+    var row: [32]f32 = @as([32]f32, @splat(0));
     const input_ids = [_]i32{ 10, 11, 12, 13, 14 };
     const labels = [_]i32{ -100, -100, 12, -100, 14 };
     hashSupervisedTokenTransitionsIntoRow(&row, &input_ids, &labels, 1.0);
@@ -1788,7 +1788,7 @@ const TestWhitespaceTokenizer = struct {
     const EncodeResult = struct {
         ids: []i32,
 
-        fn deinit(self: *EncodeResult) void {
+        pub fn deinit(self: *EncodeResult) void {
             std.testing.allocator.free(self.ids);
             self.* = undefined;
         }
@@ -1810,7 +1810,7 @@ const TestWhitespaceTokenizer = struct {
 // ---------------------------------------------------------------------------
 
 fn isRegularFilePath(path: []const u8) bool {
-    const stat = compat.cwd().statFile(compat.io(), path, .{}) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{}) catch return false;
     return stat.kind == .file;
 }
 
@@ -1896,9 +1896,9 @@ test "gemma4 bootstrap EVA and LoRA-GA require and consume stats files" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_real_initializer_stats_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);
@@ -1965,9 +1965,9 @@ test "gemma4 moe expert preset targets only expert parameter tensors" {
     const allocator = std.testing.allocator;
     const root = try std.fmt.allocPrint(allocator, "/tmp/termite_gemma4_moe_expert_targets_test_{d}", .{std.posix.system.getpid()});
     defer allocator.free(root);
-    compat.cwd().deleteTree(compat.io(), root) catch {};
-    try compat.cwd().createDirPath(compat.io(), root);
-    defer compat.cwd().deleteTree(compat.io(), root) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), root);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), root) catch {};
 
     const checkpoint_path = try std.fs.path.join(allocator, &.{ root, checkpoint_file_name });
     defer allocator.free(checkpoint_path);

@@ -20,9 +20,7 @@ const jpeg = @import("jpeg.zig");
 const png = @import("png.zig");
 const test_support = @import("test_support.zig");
 const webp = @import("webp.zig");
-const c = if (build_options.enable_spng) @cImport({
-    @cInclude("spng.h");
-}) else struct {};
+const c = @import("spng_c");
 
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;

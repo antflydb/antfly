@@ -16,12 +16,11 @@
 // Mirrors the legacy Go inference caching strategy.
 
 const std = @import("std");
-const libc = @cImport(@cInclude("time.h"));
 
 fn nowNs() i64 {
-    var ts: libc.struct_timespec = undefined;
-    if (libc.clock_gettime(libc.CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return @as(i64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.tv_nsec));
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
 pub fn ResultCache(comptime V: type) type {

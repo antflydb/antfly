@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a Zig build with a host-aware max-RSS budget and the fixed 0.16 runner."""
+"""Run a Zig build with a host-aware max-RSS budget and version-appropriate scheduler."""
 
 from __future__ import annotations
 
@@ -101,6 +101,8 @@ def zig_version(zig: str) -> tuple[int, int, int]:
 
 
 def prepare_build_runner(zig: str, destination: Path) -> Path | None:
+    if zig_version(zig) >= (0, 17, 0):
+        return None
     source = zig_lib_dir(zig) / "compiler" / "build_runner.zig"
     try:
         patch_build_runner(source, destination)

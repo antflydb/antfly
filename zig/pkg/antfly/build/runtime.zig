@@ -13,15 +13,9 @@
 // limitations.
 
 const std = @import("std");
-const AntflyRootImports = @import("imports.zig").AntflyRootImports;
+const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 
-pub const RuntimeArtifactRole = enum {
-    cli,
-    data,
-    inference,
-    metadata,
-    standalone,
-};
+pub const RuntimeArtifactRole = @import("../../../build_support/antfly/runtime_roles.zig").RuntimeArtifactRole;
 
 const runtime_memory = @import("runtime_memory.zig");
 pub const RuntimeLibraryUnit = runtime_memory.RuntimeLibraryUnit;
@@ -44,12 +38,12 @@ pub const runtime_library_link_order = [_]RuntimeLibraryUnit{
 };
 
 comptime {
-    const unit_count = std.meta.fields(RuntimeLibraryUnit).len;
+    const unit_count = @typeInfo(RuntimeLibraryUnit).@"enum".field_names.len;
     if (runtime_library_link_order.len != unit_count)
         @compileError("runtime_library_link_order must contain every runtime library unit exactly once");
-    var seen = [_]bool{false} ** unit_count;
+    var seen = @as([unit_count]bool, @splat(false));
     for (runtime_library_link_order) |unit| {
-        const index = @intFromEnum(unit);
+        const index = @backingInt(unit);
         if (seen[index])
             @compileError("runtime_library_link_order contains a duplicate runtime library unit");
         seen[index] = true;
@@ -65,11 +59,11 @@ pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(
         setStripRecursively(imported_module, visited);
     }
 }
-const addMacosSdkPaths = @import("../../../lib/platform/build_support.zig").addMacosSdkPaths;
+const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 
 pub const AddRuntimeOptions = struct {
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     link_libc: bool,
     sanitize_thread: bool,
@@ -87,7 +81,7 @@ pub const AddRuntimeResult = struct {
     antfly_main_tests: *std.Build.Step.Compile,
     antfly_main: *std.Build.Step.Compile,
     run_linked_inference_abi_integration: *std.Build.Step.Run,
-    runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
+    runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile,
 };
 
 pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
@@ -122,7 +116,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     const antfly_main_tests = b.addTest(.{
         .root_module = b.createModule(main_module_options),
         .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -136,10 +130,10 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .root_module = antfly_main_mod,
     });
 
-    var runtime_library_artifacts: [std.meta.fields(RuntimeLibraryUnit).len]?*std.Build.Step.Compile = @splat(null);
+    var runtime_library_artifacts: [@typeInfo(RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile = @splat(null);
     inline for (std.meta.tags(RuntimeLibraryUnit)) |unit| {
-        // The executable, C API, and focused artifacts reuse their owning
-        // runtime units instead of recompiling implementations in each root.
+        // The server executable and focused server artifacts reuse their owning
+        // runtime units. Public embedded products have independent owners.
         const role_mod = b.createModule(.{
             .root_source_file = b.path(b.fmt("pkg/antfly/src/runtime_{s}_root.zig", .{@tagName(unit)})),
             .target = target,
@@ -163,6 +157,15 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             .serverless => role_imports.configureServerless(b, role_mod, link_libc),
         }
         role_imports.storage_boundary.configureProfile(role_mod, unit != .storage_kernel and unit != .enrichment_compute, true, role_imports.boundary_profile);
+        if (unit == .inference) {
+            const native_exports = b.createModule(.{
+                .root_source_file = b.path("pkg/inference/src/host/native_exports.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            production_antfly_imports.configureInference(b, native_exports, link_libc);
+            role_mod.addImport("antfly_inference_native_exports", native_exports);
+        }
         if (unit == .storage_kernel) {
             const capi_options = b.addOptions();
             capi_options.addOption(bool, "linked_storage", true);
@@ -209,7 +212,7 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             b.fmt("Build only the {s} runtime library unit", .{@tagName(unit)}),
         );
         runtime_unit_step.dependOn(&role_artifact.step);
-        runtime_library_artifacts[@intFromEnum(unit)] = role_artifact;
+        runtime_library_artifacts[@backingInt(unit)] = role_artifact;
         if (unit == .storage_kernel) {
             // The executable and C ABI libraries share this one optimized
             // PIC object. Give the final links enough section granularity
@@ -219,11 +222,8 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
             role_artifact.link_data_sections = true;
         }
         // Zig's build runner uses these claims to run as many LLVM codegen
-        // steps concurrently as fit in available RAM. The storage archive
-        // is PIC and shared by the executable and C API final links.
-        if (unit == .storage_kernel) {
-            libantfly_link_mod.linkLibrary(role_artifact);
-        }
+        // steps concurrently as fit in available RAM. The server storage
+        // archive owns private operations used by the executable.
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
             defer visited.deinit();
@@ -231,22 +231,15 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         }
     }
 
-    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
-    // libantfly embeds the standalone inference runtime in-process, the same
-    // as the `antfly` executable (2026-09-17 product decision: Lite hosts
-    // get local inference without a separate runtime). This is why
-    // `link_anchor.zig` no longer traps
-    // `antfly_standalone_inference_get_function_table`.
-    libantfly_link_mod.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
-
     // Exercise the real production archive boundary for encoded-image reads.
     // The probe resolves only the exported C function table, so it cannot
-    // accidentally pass by importing inference_host.zig into the test root.
+    // accidentally pass by importing pkg/inference/src/host/host.zig into the test root.
     const linked_inference_abi_integration_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/inference_abi_integration.zig"),
         .target = target,
         .optimize = optimize,
     });
+    linked_inference_abi_integration_mod.addImport("antfly_inference_bridge", production_antfly_imports.inference_bridge);
     // This executable loads the production archive, including version consumers.
     production_antfly_imports.build_info.link(linked_inference_abi_integration_mod);
     linked_inference_abi_integration_mod.link_libc = link_libc;
@@ -256,12 +249,12 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         .root_module = linked_inference_abi_integration_mod,
     });
     linked_inference_abi_integration.root_module.linkLibrary(
-        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?,
+        runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?,
     );
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
     for (runtime_library_link_order) |unit| {
-        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
+        antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
 
     if (runtime_artifact_role) |role| {
@@ -289,26 +282,26 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
         role_exe.link_gc_sections = true;
         switch (role) {
             .cli => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.cli)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.cli)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
             },
             .data, .metadata => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?);
             },
             .inference => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
             },
             .standalone => {
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.distributed)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?);
-                role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.distributed)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?);
+                role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
             },
         }
         if (role != .inference) {
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.storage_kernel)].?);
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.enrichment_compute)].?);
-            role_exe.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.inference)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.storage_kernel)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.enrichment_compute)].?);
+            role_exe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
         }
         if (strip) {
             var visited = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);

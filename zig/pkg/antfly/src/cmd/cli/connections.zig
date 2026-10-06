@@ -88,7 +88,7 @@ fn validateLocalServer(url: []const u8) !void {
     const uri = std.Uri.parse(url) catch return error.LocalConnectionServerRequired;
     if (!std.mem.eql(u8, uri.scheme, "http") or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.LocalConnectionServerRequired;
     var buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = (uri.getHost(&buffer) catch return error.LocalConnectionServerRequired).bytes;
+    const host = (uri.host orelse return error.LocalConnectionServerRequired).toRaw(&buffer) catch return error.LocalConnectionServerRequired;
     if (!std.mem.eql(u8, host, "127.0.0.1") and !std.mem.eql(u8, host, "localhost") and !std.mem.eql(u8, host, "[::1]")) return error.LocalConnectionServerRequired;
 }
 

@@ -1,11 +1,11 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const ast = @import("ast.zig");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const merge_mutation = @import("merge_mutation.zig");
-const runtime = @import("runtime.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const merge_mutation = @import("antfly_local_sources").sql_merge_mutation;
+const runtime = @import("antfly_local_sources").sql_runtime;
 
 test "SQL original MERGE corpus admitted plans retain exact source SQL" {
     const Probe = struct {
@@ -47,7 +47,7 @@ test "SQL original MERGE corpus admitted plans retain exact source SQL" {
             return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
         }
     };
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer parsed.deinit();
     var probe: Probe = .{};
     var covered: usize = 0;
@@ -73,25 +73,27 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
     const Probe = struct {
         const Cursor = struct {
             table_id: u64,
+            both_matched: bool = false,
             done: bool = false,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !catalog.Page {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 if (self.done) return .{ .rows = &.{} };
                 self.done = true;
-                const count: usize = if (self.table_id == 1) 1 else 2;
+                const count: usize = if (self.table_id == 1 and !self.both_matched) 1 else 2;
                 const rows = try alloc.alloc(catalog.Row, count);
                 for (rows, 0..) |*row, index| {
                     var object: std.json.ObjectMap = .empty;
                     const id = if (index == 0) "a" else "b";
                     try object.put(alloc, "id", .{ .string = id });
                     try object.put(alloc, "status", .{ .string = if (self.table_id == 1) "old" else if (index == 0) "updated" else "new" });
-                    row.* = .{ .id = if (self.table_id == 1) "row-a" else id, .version = 7, .expected_content_digest = @splat(4), .value = .{ .object = object } };
+                    row.* = .{ .id = if (self.table_id == 1) (if (index == 0) "row-a" else "row-b") else id, .version = 7, .expected_content_digest = @splat(4), .value = .{ .object = object } };
                 }
                 return .{ .rows = rows };
             }
         };
         cursors: [2]Cursor = undefined,
         handles: [2]catalog.Cursor = undefined,
+        both_matched: bool = false,
         captures: usize = 0,
         commits: usize = 0,
         fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -119,7 +121,7 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
             try std.testing.expectEqual(@as(u64, 2), scans[1].table.id);
             self.captures += 1;
             for (scans, &self.cursors, &self.handles) |request, *cursor, *handle| {
-                cursor.* = .{ .table_id = request.table.id };
+                cursor.* = .{ .table_id = request.table.id, .both_matched = self.both_matched };
                 handle.* = .{ .ptr = cursor, .next = Cursor.next, .close = closeCursor };
             }
             return .{ .ptr = self, .cursors = &self.handles, .close = close };
@@ -139,18 +141,21 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
             try std.testing.expectEqualStrings("a", mutations[0].row.?.object.get("id").?.string);
             try std.testing.expectEqualStrings("updated", mutations[0].row.?.object.get("status").?.string);
             try std.testing.expectEqualStrings("row-b", mutations[1].key);
-            try std.testing.expectEqual(@as(u64, 0), mutations[1].expected_version);
+            try std.testing.expectEqual(@as(u64, if (self.both_matched) 7 else 0), mutations[1].expected_version);
             try std.testing.expectEqualStrings("b", mutations[1].row.?.object.get("id").?.string);
             try std.testing.expectEqualStrings("new", mutations[1].row.?.object.get("status").?.string);
             self.commits += 1;
             return .committed;
         }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
+            return mutations;
+        }
         fn checkpoint(_: *anyopaque) !void {}
         fn backend(self: *@This()) catalog.Backend {
-            return .{ .ptr = self, .atomic_statement_read_set = true, .coordinated_point_reads = true, .vtable = &.{ .generate_row_id = generate, .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+            return .{ .ptr = self, .atomic_statement_read_set = true, .coordinated_point_reads = true, .vtable = &.{ .prepare_mutations = prepare, .mutate_prepared = mutate, .generate_row_id = generate, .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
         }
     };
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
     defer parsed.deinit();
     const sql = for (parsed.value.object.get("entries").?.array.items) |entry| {
         if (std.mem.eql(u8, entry.object.get("id").?.string, "sql-0579")) break entry.object.get("sql").?.string;
@@ -163,6 +168,72 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
     try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
     try std.testing.expectEqual(@as(usize, 1), probe.captures);
     try std.testing.expectEqual(@as(usize, 1), probe.commits);
+    // Decision predicates and assignments run only for the selected arm;
+    // RETURNING completes before the native commit is published.
+    const Provider = @import("antfly_local_sources").sql_decision_eval.testing.Provider;
+    const decision_sql = "MERGE INTO usage_records t USING source_records s ON t.id=s.id WHEN MATCHED AND FALSE THEN UPDATE SET status=ai_choice(s.status,'Unused','{\"yes\":\"Yes\",\"no\":\"No\"}','local') WHEN MATCHED AND ai_probability(s.status,'Refund?','local')>0.8 THEN UPDATE SET status=CASE WHEN ai_probability(s.status,'Refund?','local')>0.8 THEN s.status ELSE 'wrong' END WHEN NOT MATCHED THEN INSERT (id,status) VALUES (s.id,s.status) RETURNING ai_probability(t.status,'Refund?','local')";
+    var ai = try compiler.compile(std.testing.allocator, decision_sql, .{});
+    defer ai.deinit();
+    probe = .{};
+    var provider: Provider = .{};
+    var backend = probe.backend();
+    backend.decision_provider = provider.provider();
+    for ([_][]const u8{ "EXPLAIN ", "EXPLAIN (FORMAT JSON) " }) |prefix| {
+        const sql_text = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ prefix, decision_sql });
+        defer std.testing.allocator.free(sql_text);
+        var explanation = try compiler.compile(std.testing.allocator, sql_text, .{});
+        defer explanation.deinit();
+        var planned = try runtime.execute(std.testing.allocator, backend, &explanation, &.{}, .{});
+        defer planned.deinit();
+        const plan = planned.output.rows[0][0].string;
+        try std.testing.expect(std.mem.indexOf(u8, plan, "DecisionEval") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "ai_choice") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "ai_probability") != null);
+        try std.testing.expectEqual(@as(usize, 0), provider.calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.captures);
+        try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    }
+    var decided = try runtime.execute(std.testing.allocator, backend, &ai, &.{}, .{});
+    defer decided.deinit();
+    try std.testing.expectEqual(@as(u64, 2), decided.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), decided.output.rows.len);
+    for (decided.output.rows) |row| try std.testing.expectApproxEqAbs(@as(f64, 0.9), row[0].float, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), probe.commits);
+    try std.testing.expectEqual(@as(usize, 2), provider.max_batch);
+    probe = .{ .both_matched = true };
+    provider = .{};
+    var batched = try runtime.execute(std.testing.allocator, backend, &ai, &.{}, .{});
+    defer batched.deinit();
+    try std.testing.expectEqual(@as(usize, 6), provider.calls);
+    try std.testing.expectEqual(@as(usize, 2), provider.max_batch);
+    try std.testing.expectEqual(@as(usize, 1), probe.commits);
+    for ([_]runtime.Limits{ .{ .page_rows = 2 }, .{ .page_bytes = 1 } }) |limits| {
+        probe = .{ .both_matched = true };
+        provider = .{};
+        var paged = try runtime.execute(std.testing.allocator, backend, &ai, &.{}, limits);
+        defer paged.deinit();
+        try std.testing.expectEqual(@as(usize, 6), provider.calls);
+        try std.testing.expectEqual(@as(usize, if (limits.page_bytes == 1) 1 else 2), provider.max_batch);
+        try std.testing.expectEqual(@as(usize, 1), probe.commits);
+        probe = .{ .both_matched = true };
+        provider = .{ .fail_after = 2 };
+        try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, backend, &ai, &.{}, limits));
+        try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    }
+    probe = .{};
+    provider = .{ .fail_after = 2 };
+    try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, backend, &ai, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    // RETURNING inference failed after predicate and assignment inference.
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
+    probe = .{};
+    provider.fail = true;
+    try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, backend, &ai, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    probe = .{};
+    try std.testing.expectError(error.DecisionProviderUnavailable, runtime.execute(std.testing.allocator, probe.backend(), &ai, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), probe.captures);
 }
 
 test "SQL MERGE candidate binding pins target and projects only referenced source fields" {
@@ -391,7 +462,7 @@ test "SQL MERGE source-preserving candidates exclude target-only rows" {
     try std.testing.expectEqual(@as(i64, 4), mutations[0].row.?.object.get("n").?.integer);
     try std.testing.expectError(error.SqlProgramLimitExceeded, candidates.prepareMutations(alloc, probe.backend(), output.rows, output.sql_nulls.?, parameters, 3, 1));
     for (output.rows, output.sql_nulls.?, 0..) |row, nulls, row_index| {
-        const cells = try alloc.alloc(@import("scalar.zig").Datum, row.len);
+        const cells = try alloc.alloc(@import("antfly_local_sources").sql_scalar.Datum, row.len);
         for (row, nulls, cells) |value, is_null, *cell| cell.* = .{ .value = value, .sql_null = is_null };
         const selected = (try candidates.selectArm(alloc, cells, parameters)).?;
         try std.testing.expectEqual(if (row_index == 0) @as(usize, 2) else @as(usize, 4), selected);
@@ -487,7 +558,7 @@ test "SQL MERGE source-preserving candidates exclude target-only rows" {
         defer per_row.deinit();
         const old_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
         const old_selections = try per_row.allocator().alloc(?usize, count);
-        const cells = try per_row.allocator().alloc(@import("scalar.zig").Datum, rows[0].len);
+        const cells = try per_row.allocator().alloc(@import("antfly_local_sources").sql_scalar.Datum, rows[0].len);
         for (rows, nulls, old_selections) |row, flags, *selected_arm| {
             for (row, flags, cells) |value, is_null, *cell| cell.* = .{ .value = value, .sql_null = is_null };
             var scratch = std.heap.ArenaAllocator.init(per_row.allocator());
@@ -657,7 +728,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
     try Cell.put(update_plan, update_row, update_flags, "s\x00id", .{ .string = "a" });
     try Cell.put(update_plan, update_row, update_flags, "s\x00delta", .{ .integer = 5 });
     try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_version", .{ .string = "7" });
-    const digest = std.fmt.bytesToHex([_]u8{1} ** 32, .lower);
+    const digest = std.fmt.bytesToHex(@as([32]u8, @splat(1)), .lower);
     try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_digest", .{ .string = &digest });
     var previous: std.json.ObjectMap = .empty;
     try previous.put(alloc, "n", .{ .integer = 1 });

@@ -16,18 +16,18 @@
 //! remain owned by backups.zig; this adapter never holds a write fence across
 //! an upload and never substitutes a fresh snapshot for a missing durable pin.
 const std = @import("std");
-const cohort = @import("../metadata/backup_cohort.zig");
+const cohort = @import("antfly_local_sources").metadata_backup_cohort;
 const metadata = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
-const operation = @import("operation.zig");
-const reads = @import("table_read_source.zig");
-const writes = @import("table_write_source.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const writes = @import("antfly_local_sources").api_table_write_source;
 const router_api = @import("table_router.zig");
 const catalog_api = @import("table_catalog.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
-const identity = @import("../storage/db/doc_identity.zig");
-const seal = @import("../storage/db/native_backup_seal.zig");
-var diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+const identity = @import("antfly_local_sources").storage_db_doc_identity;
+const seal = @import("antfly_local_sources").storage_db_native_backup_seal;
+var diagnostic_gate: @import("antfly_local_sources").api_bounded_diagnostic_gate.Gate = .{};
 
 pub fn idForAttempt(attempt: []const u8) u64 {
     var hash = std.crypto.hash.Blake3.init(.{});
@@ -79,7 +79,7 @@ pub fn Session(comptime Source: type) type {
                     try request.ensureActive();
                     var response = (try read.topologyStatus(alloc, table.name, range.start_key, "{\"mode\":\"identity\"}")) orelse return error.TableNotFound;
                     defer response.deinit(alloc);
-                    const Identity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+                    const Identity = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
                     const native = try std.json.parseFromSlice(Identity, a, response.json, .{ .allocate = .alloc_always });
                     if (!native.value.backup_seal_supported) return error.BackupSealBackendUnsupported;
                     if (native.value.namespace.table_id != table.table_id) return error.CatalogChanged;
@@ -120,16 +120,32 @@ pub fn Session(comptime Source: type) type {
         }
 
         fn checkpoint(self: *Self, phase: cohort.Phase, cursor: usize, receipt: ?cohort.SealReceipt, digest: ?[32]u8) !void {
-            errdefer |err| self.logFailure("checkpoint", err);
-            try self.request.ensureActive();
+            var zig017_return_error: ?anyerror = null;
+            errdefer if (zig017_return_error) |err| self.logFailure("checkpoint", err);
+            (self.request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             var replacement: cohort.Progress = .{ .revision = self.parsed.value.revision + 1, .phase = phase, .cursor = cursor, .owner_count = @intCast(self.parsed.value.state.owners.len), .plan_digest = self.plan_digest, .manifest_sha256 = self.parsed.value.manifest_sha256 };
             if (digest) |value| replacement.manifest_sha256 = value;
-            const json = try std.json.Stringify.valueAlloc(self.alloc, replacement, .{});
+            const json = (std.json.Stringify.valueAlloc(self.alloc, replacement, .{}) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer self.alloc.free(json);
-            try self.source.compareAndSetBackupCohort(self.alloc, .{ .job_id = self.parsed.value.id, .expected_revision = self.parsed.value.revision, .value = json, .seal = receipt }, self.request);
-            try replacement.applyTo(&self.parsed.value);
+            (self.source.compareAndSetBackupCohort(self.alloc, .{ .job_id = self.parsed.value.id, .expected_revision = self.parsed.value.revision, .value = json, .seal = receipt }, self.request) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (replacement.applyTo(&self.parsed.value) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             if (receipt) |value| {
-                if (self.parsed.value.seals.len == self.seal_capacity.len) return error.InvalidBackupCohort;
+                if (self.parsed.value.seals.len == self.seal_capacity.len) return zig017_failure: {
+                    zig017_return_error = error.InvalidBackupCohort;
+                    break :zig017_failure error.InvalidBackupCohort;
+                };
                 self.seal_capacity[self.parsed.value.seals.len] = value;
                 self.parsed.value.seals = self.seal_capacity[0 .. self.parsed.value.seals.len + 1];
             }
@@ -141,15 +157,38 @@ pub fn Session(comptime Source: type) type {
         }
 
         fn control(self: *Self, owner: cohort.Owner, action: @FieldType(topology.Command, "action")) !void {
-            errdefer |err| self.logFailure(@tagName(action), err);
-            try self.request.ensureActive();
-            _ = (try self.write.batch(self.alloc, owner.table_name, .{ .relational_topology = .{ .fence = owner.fence, .action = action } })) orelse return error.TableNotFound;
+            var zig017_return_error: ?anyerror = null;
+            errdefer if (zig017_return_error) |err| self.logFailure(@tagName(action), err);
+            (self.request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            _ = ((self.write.batch(self.alloc, owner.table_name, .{ .relational_topology = .{ .fence = owner.fence, .action = action } }) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            })) orelse return zig017_failure: {
+                zig017_return_error = error.TableNotFound;
+                break :zig017_failure error.TableNotFound;
+            };
         }
 
         fn pin(self: *Self, owner: cohort.Owner, command: seal.Request) ![]u8 {
-            errdefer |err| self.logFailure("pin", err);
-            try self.request.ensureActive();
-            return (try self.write.backupPinControl(self.alloc, owner.table_name, owner.fence.owner_group_id, command, .{ .deadline_ns = self.request.deadline_ns orelse return error.InvalidArgument, .cancellation = self.request.cancellation, .capture_node_id = owner.capture_node_id })) orelse return error.BackupPinSourceUnavailable;
+            var zig017_return_error: ?anyerror = null;
+            errdefer if (zig017_return_error) |err| self.logFailure("pin", err);
+            (self.request.ensureActive() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            return ((self.write.backupPinControl(self.alloc, owner.table_name, owner.fence.owner_group_id, command, .{ .deadline_ns = self.request.deadline_ns orelse return zig017_failure: {
+                zig017_return_error = error.InvalidArgument;
+                break :zig017_failure error.InvalidArgument;
+            }, .cancellation = self.request.cancellation, .capture_node_id = owner.capture_node_id }) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            })) orelse return zig017_failure: {
+                zig017_return_error = error.BackupPinSourceUnavailable;
+                break :zig017_failure error.BackupPinSourceUnavailable;
+            };
         }
 
         pub const Preparation = enum { advanced, waiting, ready };

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
@@ -50,8 +50,8 @@ const InventoryPublication = struct {
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
 const tables_api = @import("../../api/tables.zig");
-const full_text_indexes = @import("../../api/full_text_indexes.zig");
-const coverage_policy = @import("../../api/coverage_policy.zig");
+const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
 const shared_vector = @import("antfly_vector").vector;
 
 const PublicationPlanPurpose = enum {
@@ -335,7 +335,7 @@ pub const CatalogService = struct {
         manifest_version: u64 = 0,
         manifest: ?manifest_mod.Manifest = null,
 
-        fn deinit(self: *PublishedHead, alloc: Allocator) void {
+        pub fn deinit(self: *PublishedHead, alloc: Allocator) void {
             if (self.manifest) |*manifest| manifest.deinit(alloc);
             self.* = undefined;
         }
@@ -671,11 +671,11 @@ pub const CatalogService = struct {
             .head_graph_index_actions = head_graph_index_actions,
             .head_derived_output_actions = head_actions.derived_output_actions,
             .artifact_actions = .{
-                .document_segment = @enumFromInt(@intFromEnum(plan.artifact_actions.document_segment)),
-                .full_text = @enumFromInt(@intFromEnum(plan.artifact_actions.full_text)),
-                .dense_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.dense_vector)),
-                .sparse_vector = @enumFromInt(@intFromEnum(plan.artifact_actions.sparse_vector)),
-                .graph = @enumFromInt(@intFromEnum(plan.artifact_actions.graph)),
+                .document_segment = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.document_segment))),
+                .full_text = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.full_text))),
+                .dense_vector = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.dense_vector))),
+                .sparse_vector = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.sparse_vector))),
+                .graph = @fromBackingInt(@intCast(@backingInt(plan.artifact_actions.graph))),
             },
             .index_config_actions = owned_index_config_actions,
             .full_text_index_actions = full_text_index_actions,
@@ -683,9 +683,9 @@ pub const CatalogService = struct {
             .sparse_index_actions = sparse_index_actions,
             .graph_index_actions = graph_index_actions,
             .derived_output_actions = .{
-                .chunk_preview = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_preview)),
-                .chunk_embeddings = @enumFromInt(@intFromEnum(plan.derived_output_actions.chunk_embeddings)),
-                .rerank_terms = @enumFromInt(@intFromEnum(plan.derived_output_actions.rerank_terms)),
+                .chunk_preview = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.chunk_preview))),
+                .chunk_embeddings = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.chunk_embeddings))),
+                .rerank_terms = @fromBackingInt(@intCast(@backingInt(plan.derived_output_actions.rerank_terms))),
             },
             .derived_output_resolutions = derived_output_resolutions,
             .max_pending_records = effective_policy.max_pending_records,
@@ -1406,7 +1406,7 @@ fn cloneFullTextIndexActionsAlloc(
     for (items, 0..) |item, idx| {
         out[idx] = .{
             .name = try alloc.dupe(u8, item.name),
-            .action = @enumFromInt(@intFromEnum(item.action)),
+            .action = @fromBackingInt(@intCast(@backingInt(item.action))),
             .source_mode = item.source_mode,
             .chunked_source_count = item.chunked_source_count,
         };
@@ -1452,7 +1452,7 @@ fn cloneNamedArtifactActionsAlloc(
     for (items, 0..) |item, idx| {
         out[idx] = .{
             .name = try alloc.dupe(u8, item.name),
-            .action = @enumFromInt(@intFromEnum(item.action)),
+            .action = @fromBackingInt(@intCast(@backingInt(item.action))),
         };
         initialized += 1;
     }
@@ -1841,7 +1841,7 @@ const HeadPublicationActions = struct {
     graph_index_actions: []catalog_types.NamedArtifactPublicationAction = &.{},
     derived_output_actions: catalog_types.DerivedOutputPublicationActions = .{},
 
-    fn deinit(self: *HeadPublicationActions, alloc: Allocator) void {
+    pub fn deinit(self: *HeadPublicationActions, alloc: Allocator) void {
         for (self.full_text_index_actions) |*entry| entry.deinit(alloc);
         if (self.full_text_index_actions.len > 0) alloc.free(self.full_text_index_actions);
         for (self.vector_index_actions) |*entry| entry.deinit(alloc);
@@ -2236,7 +2236,7 @@ fn parseFullTextIndexVersion(index_name: []const u8) ?u32 {
 }
 
 fn jsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
-    if (@intFromEnum(lhs) != @intFromEnum(rhs)) return false;
+    if (@backingInt(lhs) != @backingInt(rhs)) return false;
     return switch (lhs) {
         .null => true,
         .bool => |value| value == rhs.bool,
@@ -2296,7 +2296,7 @@ test "serverless named graph planning reuses topology for metric-only changes" {
 }
 
 test "serverless named graph planning unwinds every failed allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(a: Allocator) !void {
             const actions = try planNamedIndexActionsAlloc(a, "{\"old\":{\"type\":\"graph\"}}", "{\"a\":{\"type\":\"graph\"},\"b\":{\"type\":\"graph\"},\"c\":{\"type\":\"graph\"},\"d\":{\"type\":\"graph\"},\"e\":{\"type\":\"graph\"},\"f\":{\"type\":\"graph\"},\"g\":{\"type\":\"graph\"},\"h\":{\"type\":\"graph\"}}", .graph, 1);
             defer freeNamedArtifactActions(a, actions);
@@ -2596,7 +2596,7 @@ const VectorCompactionSignal = struct {
     cluster_imbalance: f32 = 0,
     distance_span_max: f32 = 0,
 
-    fn deinit(self: *VectorCompactionSignal, alloc: Allocator) void {
+    pub fn deinit(self: *VectorCompactionSignal, alloc: Allocator) void {
         if (self.driver_index_name) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -5527,8 +5527,8 @@ test "serverless external readiness shares exact publication bindings and actual
             defer plan.deinit(alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
-    try std.testing.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
 }
 
 test "serverless materialization readiness distinguishes absent drops from real work" {
@@ -5557,11 +5557,11 @@ test "serverless catalog status stays local and write admission rejects read-onl
             self.calls += 1;
             return error.UnexpectedArtifactAccess;
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.store.ArtifactMetadata {
             return denied(ptr);
         }
-        fn putScoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("../../common/cancellation.zig").CancellationToken) !artifacts_mod.store.ArtifactMetadata {
+        fn putScoped(ptr: *anyopaque, _: Allocator, _: artifacts_mod.store.UploadScope, _: []const u8, _: @import("antfly_cancellation").CancellationToken) !artifacts_mod.store.ArtifactMetadata {
             return denied(ptr);
         }
         fn get(ptr: *anyopaque, _: Allocator, _: []const u8) ![]u8 {

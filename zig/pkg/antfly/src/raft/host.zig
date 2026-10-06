@@ -16,9 +16,9 @@ const std = @import("std");
 const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
 const tracing = @import("../tracing/mod.zig");
-pub const catalog = @import("catalog.zig");
+pub const catalog = @import("storage/catalog.zig");
 const backup_restore = @import("storage/backup_restore.zig");
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const peer_resolver = @import("peer_resolver.zig");
 const transport = @import("transport/mod.zig");
 const snapshot_transfer = @import("transport/snapshot_transfer.zig");
@@ -382,7 +382,7 @@ pub const Host = struct {
         group_id: u64,
         message: raft_engine.core.Message,
 
-        fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
             self.message.deinit(alloc);
             self.* = undefined;
         }
@@ -397,7 +397,7 @@ pub const Host = struct {
         backup_id: ?[]u8 = null,
         snapshot_path: ?[]u8 = null,
 
-        fn deinit(self: *OwnedBootstrapStatus, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *OwnedBootstrapStatus, alloc: std.mem.Allocator) void {
             if (self.last_error) |msg| alloc.free(msg);
             if (self.backup_id) |value| alloc.free(value);
             if (self.snapshot_path) |value| alloc.free(value);
@@ -1543,7 +1543,7 @@ pub const HttpHost = struct {
             // native scheduling fallback; a virtual lane must never block in accept.
             if (!deps.listener_disabled and !runtime.usesBorrowedIo()) {
                 worker_leases[2] = try runtime.acquireWorkers(.{ .stack_size = cfg.listener.thread_stack_size });
-                worker_leases[3] = try runtime.acquireWorkers(.{ .stack_size = @import("../runtime_thread_config.zig").minimum_partitioned_stack_size });
+                worker_leases[3] = try runtime.acquireWorkers(.{ .stack_size = @import("antfly_local_sources").runtime_thread_config.minimum_partitioned_stack_size });
                 listener_config.accept_io = worker_leases[2].?.io();
                 listener_config.observer_io = worker_leases[3].?.io();
             }
@@ -2771,8 +2771,8 @@ const TestBackupRestoreBootstrapper = struct {
     }
 };
 
-fn testBackupRestoreNodeConfig(alloc: std.mem.Allocator) !@import("../common/config.zig").Config {
-    return @import("../common/config.zig").Config.parseFromSlice(alloc,
+fn testBackupRestoreNodeConfig(alloc: std.mem.Allocator) !@import("antfly_local_sources").common_config.Config {
+    return @import("antfly_local_sources").common_config.Config.parseFromSlice(alloc,
         \\{
         \\  "connections": {
         \\    "test-backups": {

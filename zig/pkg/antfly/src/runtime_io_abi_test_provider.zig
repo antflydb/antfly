@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const bridge = @import("runtime_io_abi.zig");
+const bridge = @import("antfly_runtime_abi").io_abi;
 var inject = false;
 const vtable: std.Io.VTable = blk: {
     var table = std.Options.debug_io.vtable.*;
     table.dirOpenFile = open;
     table.sleep = sleep;
     table.operate = operate;
-    table.netSend = send;
     table.fileWriteFilePositional = copyFile;
     table.batchAwaitAsync = batchAwait;
     break :blk table;
@@ -24,12 +23,11 @@ fn sleep(ptr: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
     return std.Options.debug_io.vtable.sleep(ptr, timeout);
 }
 fn operate(ptr: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
-    if (inject) return .{ .file_read_streaming = error.InputOutput };
+    if (inject) return switch (operation) {
+        .net_send => .{ .net_send = .{ error.NetworkDown, 0 } },
+        else => .{ .file_read_streaming = error.InputOutput },
+    };
     return std.Options.debug_io.vtable.operate(ptr, operation);
-}
-fn send(ptr: ?*anyopaque, socket: std.Io.net.Socket.Handle, messages: []std.Io.net.OutgoingMessage, flags: std.Io.net.SendFlags) struct { ?std.Io.net.Socket.SendError, usize } {
-    if (inject) return .{ error.NetworkDown, 0 };
-    return std.Options.debug_io.vtable.netSend(ptr, socket, messages, flags);
 }
 fn copyFile(ptr: ?*anyopaque, file: std.Io.File, header: []const u8, reader: *std.Io.File.Reader, limit: std.Io.Limit, offset: u64) std.Io.File.WriteFilePositionalError!usize {
     if (inject) {
@@ -67,3 +65,6 @@ export fn runtime_io_abi_test_destroy(borrow: *const bridge.Borrow) callconv(.c)
 export fn runtime_io_abi_test_inject(enabled: bool) callconv(.c) void {
     inject = enabled;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

@@ -12,9 +12,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const user_manager = @import("user_manager.zig");
+const user_manager = @import("antfly_local_sources").usermgr_user_manager;
 const storage_adapter = @import("storage_adapter.zig");
-pub const row_policy_authority = @import("row_policy_authority.zig");
+pub const row_policy_authority = @import("antfly_local_sources").usermgr_row_policy_authority;
 
 pub const MemoryStore = user_manager.MemoryStore;
 pub const verifyPassword = user_manager.verifyPassword;

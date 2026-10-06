@@ -15,10 +15,10 @@
 //! Authenticated HA-created owners which do not belong to public Raft placement.
 //! Immutable per-owner records survive replay restart and offline reseeding.
 const std = @import("std");
-const native = @import("../db/restore_staging_contract.zig");
-const backup = @import("../db/native_backup.zig");
-const fs = @import("../../common/fs_paths.zig");
-const records = @import("../../common/topology_records.zig");
+const native = @import("antfly_local_sources").storage_db_restore_staging_contract;
+const backup = @import("antfly_local_sources").storage_db_native_backup;
+const fs = @import("antfly_runtime_fs").fs_paths;
+const records = @import("antfly_local_sources").common_topology_records;
 pub const directory = "native-restore-owners";
 pub const max_owners = @import("restore_owner_contract.zig").max_owners;
 pub const Owner = native.OwnerBootstrap;

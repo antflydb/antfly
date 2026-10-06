@@ -218,7 +218,7 @@ const RecoveryLog = struct {
         errdefer allocator.free(path);
         var file = try dir.createFile(io, path, .{ .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         errdefer file.close(io);
-        try @import("../../common/fs_paths.zig").syncDirectoryHandlePortable(io, dir);
+        try @import("antfly_runtime_fs").fs_paths.syncDirectoryHandlePortable(io, dir);
         return .{ .file = file, .path = path, .alloc = allocator };
     }
 
@@ -237,7 +237,7 @@ const RecoveryLog = struct {
         self.offset = writer.pos;
     }
 
-    fn deinit(self: *RecoveryLog, io: std.Io) void {
+    pub fn deinit(self: *RecoveryLog, io: std.Io) void {
         self.file.close(io);
         self.alloc.free(self.path);
     }
@@ -345,7 +345,7 @@ test "maintenance recovery replay sends saved proofs directly and rejects foreig
     const httpx = @import("httpx");
     const alloc = std.testing.allocator;
     const io = std.testing.io;
-    const request: types.IndexMaintenanceRequest = .{ .table_id = "7", .schema_version = 0, .owners = &.{.{ .group_id = "9", .generation = "1", .slot = 0, .owner = "aa" ** 32, .comparison = "bb" ** 32, .progress_digest = "cc" ** 32, .maintenance_epoch = "0" }} };
+    const request: types.IndexMaintenanceRequest = .{ .table_id = "7", .schema_version = 0, .owners = &.{.{ .group_id = "9", .generation = "1", .slot = 0, .owner = z17RepeatString("aa", 32), .comparison = z17RepeatString("bb", 32), .progress_digest = z17RepeatString("cc", 32), .maintenance_epoch = "0" }} };
     const Task = struct {
         fn check(info: httpx.testing_mod.RequestInfo) !void {
             try @import("antfly-json").testing.expectSubsetJsonText(std.testing.allocator,
@@ -637,4 +637,15 @@ test "maintenance help and nested completions share action descriptions" {
         try std.testing.expect(std.mem.indexOf(u8, out.written(), "advance") != null);
         try std.testing.expect(std.mem.indexOf(u8, out.written(), "__maintenance-worker") == null);
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

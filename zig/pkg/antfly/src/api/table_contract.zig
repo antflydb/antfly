@@ -16,12 +16,13 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const matcher = @import("antfly_matcher");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
-const coverage_policy = @import("coverage_policy.zig");
-const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
+const coverage_policy = @import("antfly_local_sources").api_coverage_policy;
+const enrichment_config_validation = @import("antfly_local_sources").storage_db_enrichment_config_validation;
 const public_index_contract = @import("public_index_contract.zig");
-const table_index_config = @import("table_index_config.zig");
+const table_index_config = @import("antfly_local_sources").api_table_index_config;
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -95,8 +96,8 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) try tables_api.validateCreateSchemaVersion(schema_value, false);
     }
 
-    const storage_settings: ?@import("../common/table_storage.zig").Settings = if (raw_root.get("storage")) |value|
-        try @import("../common/table_storage.zig").Settings.parse(value)
+    const storage_settings: ?@import("antfly_local_sources").common_table_storage.Settings = if (raw_root.get("storage")) |value|
+        try @import("antfly_local_sources").common_table_storage.Settings.parse(value)
     else
         null;
 
@@ -104,7 +105,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     // replication_sources). For indexes, parse from the raw body to preserve
     // type-specific fields (external, dimension, edge_types, etc.) that the
     // generated IndexConfig struct doesn't capture.
-    var parsed = metadata_openapi.server.parseCreateTableBody(alloc, body) catch {
+    var parsed = metadata_server_openapi.server.parseCreateTableBody(alloc, body) catch {
         var fallback = try tables_api.parseCreateTableRequest(alloc, body);
         errdefer fallback.deinit(alloc);
         // Raw public fields were validated above. The compatibility parser
@@ -115,7 +116,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
-        try @import("../schema/relational_index_namespace.zig").validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
+        try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, fallback.schema_json orelse "", fallback.indexes_json orelse tables_api.default_indexes_json);
         return fallback;
     };
     defer parsed.deinit();
@@ -125,7 +126,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     errdefer req.deinit(alloc);
 
     if (parsed.value.tablespace_name) |name| {
-        try @import("../system_catalog/domain.zig").validateName(name);
+        try @import("antfly_local_sources").system_catalog_domain.validateName(name);
         req.tablespace_name = try alloc.dupe(u8, name);
     }
     if (parsed.value.num_shards) |num_shards| {
@@ -154,7 +155,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
-            const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
+            const validated_schema = @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, raw_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
@@ -169,7 +170,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         req.replication_sources_json = try stringifyJsonAlloc(alloc, replication_sources);
     }
 
-    try @import("../schema/relational_index_namespace.zig").validate(alloc, req.schema_json orelse "", req.indexes_json.?);
+    try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, req.schema_json orelse "", req.indexes_json.?);
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
@@ -291,7 +292,7 @@ test "table storage creation intent survives public and internal forwarding" {
         if (index == 0) {
             try std.testing.expect(request.storage == null);
         } else {
-            const expected: @import("../common/table_storage.zig").DenseEmbeddings = if (index == 3) .vector_store else .primary_lsm;
+            const expected: @import("antfly_local_sources").common_table_storage.DenseEmbeddings = if (index == 3) .vector_store else .primary_lsm;
             try std.testing.expectEqual(expected, request.storage.?.dense_embeddings);
         }
         const public = try encodeCreateTableRequest(alloc, request);
@@ -1311,7 +1312,7 @@ test "table contract encodes internal create table request back to public json" 
 
     const body = try encodeCreateTableRequest(std.testing.allocator, req);
     defer std.testing.allocator.free(body);
-    var parsed = try metadata_openapi.server.parseCreateTableBody(std.testing.allocator, body);
+    var parsed = try metadata_server_openapi.server.parseCreateTableBody(std.testing.allocator, body);
     defer parsed.deinit();
     var raw = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer raw.deinit();
@@ -1446,12 +1447,20 @@ test "table contract enforces stable graph source identities and numeric targets
     defer std.testing.allocator.free(config_json);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
 
+    const numeric_source_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_graph",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"},\"edge\":{\"edge_id\":\"fact:42\"}}]}",
+    );
+    defer std.testing.allocator.free(numeric_source_json);
+    try std.testing.expect(std.mem.indexOf(u8, numeric_source_json, "\"source\":42") != null);
+
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
         parseCreateIndexRequest(
             std.testing.allocator,
             "document_graph",
-            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"}}]}",
+            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":true,\"target\":\"doc:b\"}}]}",
         ),
     );
 }
@@ -2215,4 +2224,13 @@ test "create table default index incarnation survives the system catalog hop" {
         const incarnation = coverage_policy.incarnation(before.value.object.get("full_text_index_v0").?) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(incarnation, coverage_policy.incarnation(after.value.object.get("full_text_index_v0").?).?);
     }
+}
+
+test "lake SQL public create accepts an unpublished inference draft only for creation" {
+    const a = std.testing.allocator;
+    var draft = try parseCreateTableRequest(a, "{\"schema\":{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"table_id\":\"events\",\"uri\":\"file:///tmp/lake\"}}}");
+    defer draft.deinit(a);
+    try std.testing.expect(draft.schema_json != null);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, tables_api.parseSchemaUpdateRequest(a, draft.schema_json.?));
+    try std.testing.expectError(error.InvalidCreateTableSchemaRequest, parseCreateTableRequest(a, "{\"schema\":{\"storage_mode\":\"relational\"}}"));
 }

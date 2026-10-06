@@ -283,7 +283,7 @@ const ExtensionMcpTool = struct {
     required_capabilities: []extension_domain.Capability = &.{},
     runtime_binding: ?ExtensionRuntimeBinding = null,
 
-    fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ExtensionMcpTool, alloc: std.mem.Allocator) void {
         alloc.free(self.description);
         alloc.free(self.input_schema_json);
         alloc.free(self.handler);
@@ -300,7 +300,7 @@ const ExtensionRuntimeBinding = struct {
     artifact: []u8,
     entrypoint: []u8,
 
-    fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ExtensionRuntimeBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.package_name);
         alloc.free(self.package_version);
         alloc.free(self.package_digest);
@@ -376,7 +376,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             };
         }
 
-        fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        pub fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
             var body = std.json.ObjectMap.empty;
@@ -395,7 +395,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             return try ctx.executeOperation(alloc, .{ .create_table = .{ .table_name = table_name, .body = body_json } });
         }
 
-        fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        pub fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
@@ -418,7 +418,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             } });
         }
 
-        fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+        pub fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const table_name = mcpTableNameAlloc(alloc, args, "tableName") catch return mcpError(alloc, "invalid table target");
             defer alloc.free(table_name);
             const result = try ctx.executeOperation(alloc, .{ .list_indexes = .{ .table_name = table_name } });
@@ -735,7 +735,7 @@ fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype)
 /// effective table permission again immediately before dispatch so denied MCP
 /// calls cannot reach an extension, router, or metadata mutation path.
 fn mcpTableNameAlloc(alloc: std.mem.Allocator, args: std.json.Value, argument: []const u8) ![]u8 {
-    const catalog = @import("../system_catalog/domain.zig");
+    const catalog = @import("antfly_local_sources").system_catalog_domain;
     const table = jsonStringArg(args, argument) orelse return error.InvalidCatalogName;
     var target = try catalog.Target.literal(table);
     if (jsonValueArg(args, "database") != null) target.database = jsonStringArg(args, "database") orelse return error.InvalidCatalogName;
@@ -1201,23 +1201,49 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         }
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
+            var zig017_return_error: ?anyerror = null;
             const ctx = hostContext(ptr);
-            errdefer |err| ctx.noteBindingFailure(err);
-            try ctx.requireCapability("db:read");
-            const table_name = try ctx.resolveTableName(table);
-            const body = try extensionQueryBodyAlloc(alloc, query_json);
+            errdefer if (zig017_return_error) |err| ctx.noteBindingFailure(err);
+            (ctx.requireCapability("db:read") catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const table_name = (ctx.resolveTableName(table) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const body = (extensionQueryBodyAlloc(alloc, query_json) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name);
+            return (ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
+            var zig017_return_error: ?anyerror = null;
             const ctx = hostContext(ptr);
-            errdefer |err| ctx.noteBindingFailure(err);
-            try ctx.requireCapability("db:write");
-            const table_name = try ctx.resolveTableName(table);
-            const body = try extensionBatchBodyAlloc(alloc, writes_json);
+            errdefer if (zig017_return_error) |err| ctx.noteBindingFailure(err);
+            (ctx.requireCapability("db:write") catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const table_name = (ctx.resolveTableName(table) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            const body = (extensionBatchBodyAlloc(alloc, writes_json) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             defer alloc.free(body);
-            return try ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name);
+            return (ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {

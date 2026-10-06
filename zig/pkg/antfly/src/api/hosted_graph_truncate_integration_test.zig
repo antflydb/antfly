@@ -61,8 +61,8 @@ fn assertGraphEdgesRetired(alloc: std.mem.Allocator, io: std.Io, transport: http
     try awaitGraphTarget(alloc, io, transport, headers, base, false);
 }
 
-fn readPausedGraphSeal(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, receipt: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !@import("../storage/db/graph_retirement_seal.zig").Receipt {
-    const seal = @import("../storage/db/graph_retirement_seal.zig");
+fn readPausedGraphSeal(alloc: std.mem.Allocator, io: std.Io, metadata: *metadata_runtime.Server, data: *data_runtime.DataServer, receipt: http.HttpResponse, drivers: []const *raft.ManagedProgressDriver) !@import("antfly_local_sources").storage_db_graph_retirement_seal.Receipt {
+    const seal = @import("antfly_local_sources").storage_db_graph_retirement_seal;
     var accepted = try std.json.parseFromSlice(std.json.Value, alloc, receipt.body, .{});
     defer accepted.deinit();
     const text = (try field(try field(accepted.value, "ddl_receipt"), "restore_job_id")).string;
@@ -254,7 +254,7 @@ fn awaitGraphTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.Requ
     const deadline = platform.time.monotonicNs() +| 45 * std.time.ns_per_s;
     var published = false;
     while (platform.time.monotonicNs() < deadline) {
-        const context: @import("operation.zig").RequestContext = .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) };
+        const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s) };
         if (try source.getRestoreStaging(alloc, plan_id, context)) |encoded| {
             defer alloc.free(encoded);
             var staged = try std.json.parseFromSlice(staging.Job, alloc, encoded, .{ .ignore_unknown_fields = true });
@@ -326,7 +326,7 @@ fn awaitGraphTruncate(alloc: std.mem.Allocator, io: std.Io, transport: http.Requ
         }
         try io.sleep(.fromMilliseconds(20), .awake);
     }
-    const diagnostic_context: @import("operation.zig").RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_s };
+    const diagnostic_context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_s };
     const diagnostic = source.getRestoreStaging(alloc, plan_id, diagnostic_context) catch |err| blk: {
         std.log.warn("graph truncate staging diagnostic unavailable err={s}", .{@errorName(err)});
         break :blk null;
@@ -366,7 +366,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, met
     const job_text = (try field(try field(accepted.value, "ddl_receipt"), "restore_job_id")).string;
     const plan_id = try staging.idForAttempt(try std.fmt.parseUnsigned(u64, job_text, 10), 1);
     const source = http_server.StatusSource.fromMetadataHttpService(metadata.server.svc);
-    const context: @import("operation.zig").RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s };
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = platform.time.monotonicNs() +| 5 * std.time.ns_per_s };
     const encoded = (try source.getRestoreStaging(alloc, plan_id, context)) orelse return error.GraphTruncatePlanMismatch;
     defer alloc.free(encoded);
     var staged = try std.json.parseFromSlice(staging.Job, alloc, encoded, .{ .ignore_unknown_fields = true });
@@ -388,7 +388,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, met
             return error.GraphTruncatePlanMismatch;
         const range = target.ranges[0];
         const mapped = (try staging.mappedEmptyGenerationHandoffForGroup(alloc, staged.value.plan, staged.value.plan_digest, range.group_id)) orelse return error.GraphTruncatePlanMismatch;
-        var first: ?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt = null;
+        var first: ?@import("antfly_local_sources").storage_db_restore_staging_contract.GenerationAdmissionReceipt = null;
         for (0..2) |_| {
             const observed = blk: while (platform.time.monotonicNs() < deadline) {
                 for (drivers) |driver| try driver.checkFailure();
@@ -418,7 +418,7 @@ fn assertHandoffInstallSurvivesRestart(alloc: std.mem.Allocator, io: std.Io, met
             } else return error.GenerationHandoffInstallRoutingTimeout;
             var response = observed;
             defer response.deinit(alloc);
-            var parsed = try std.json.parseFromSlice(?@import("../storage/db/restore_staging_contract.zig").GenerationAdmissionReceipt, alloc, response.json, .{});
+            var parsed = try std.json.parseFromSlice(?@import("antfly_local_sources").storage_db_restore_staging_contract.GenerationAdmissionReceipt, alloc, response.json, .{});
             defer parsed.deinit();
             const installed = parsed.value orelse return error.GenerationHandoffInstallMissing;
             if (installed.applied_term == 0 or installed.applied_index == 0 or
@@ -501,16 +501,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     var data_live = true;
     defer if (data_live) data.deinit();
     try data.start();
-    for (0..32) |_| {
-        data.registerNodeIfConfigured() catch |err| switch (err) {
-            error.StoreRegistrationNotVisible => {
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    } else return error.StoreRegistrationNotVisible;
+    try recovery_fixture.awaitStoreRegistration(io, &data);
     var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     var data_raft_live = true;
     defer if (data_raft_live) data_raft.deinit();
@@ -559,6 +550,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     defer index.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), index.status);
     try awaitIndex(alloc, io, transport, &headers, base);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, old_id);
     var inserted = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-a\":{\"id\":1,\"graph_target\":\"graph-target\"},\"graph-target\":{\"id\":99}},\"sync_level\":\"full_index\"}");
     defer inserted.deinit(alloc);
     if (inserted.status != 201) std.debug.print("graph seed status={d} body={s}\n", .{ inserted.status, inserted.body[0..@min(inserted.body.len, 2048)] });
@@ -617,7 +609,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     }, metadata_uri);
     data_live = true;
     try data.start();
-    try data.registerNodeIfConfigured();
+    try recovery_fixture.awaitStoreRegistration(io, &data);
     data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     data_raft_live = true;
     try data_raft.start();
@@ -640,12 +632,15 @@ fn mountedGraphTruncate(faults: bool) !void {
     defer created_child.deinit(alloc);
     try std.testing.expect(created_child.status == 200 or created_child.status == 202);
     const old_child_id = try awaitNamedTableId(alloc, io, transport, &headers, restarted_base, "children", null, null);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, new_id);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, old_child_id);
     var parent_insert = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-b\":{\"id\":2}},\"sync_level\":\"full_text\"}");
     defer parent_insert.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), parent_insert.status);
     var pre_fk_child = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/children/batch", .POST, "{\"inserts\":{\"child-b\":{\"id\":7,\"parent_id\":2}},\"sync_level\":\"full_text\"}");
     defer pre_fk_child.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), pre_fk_child.status);
+    try recovery_fixture.awaitMetadataRead(io, &metadata);
     var add_fk = try sql(alloc, transport, &admin_headers, metadata_uri, "ALTER TABLE children ADD CONSTRAINT child_parent FOREIGN KEY (parent_id) REFERENCES docs(id)");
     defer add_fk.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), add_fk.status);
@@ -696,7 +691,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     }, metadata_uri);
     data_live = true;
     try data.start();
-    try data.registerNodeIfConfigured();
+    try recovery_fixture.awaitStoreRegistration(io, &data);
     data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     data_raft_live = true;
     try data_raft.start();
