@@ -17,7 +17,7 @@
 const std = @import("std");
 const wire = @import("packed.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const edge_type = @import("../../graph/edge_type.zig");
+const edge_type = @import("antfly_local_sources").graph_edge_type;
 const Allocator = std.mem.Allocator;
 
 const Dictionary = struct {

@@ -1,9 +1,9 @@
 //! Real-file, checksum-validated fetch batch replay; never mutates the store.
 const std = @import("std");
 const builtin = @import("builtin");
-const native = @import("vector_block_store.zig");
-const lsm = @import("lsm_backend/mod.zig");
-const resources = @import("resource_manager.zig");
+const native = @import("antfly_local_sources").storage_vector_block_store;
+const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
+const resources = @import("antfly_local_sources").storage_resource_manager;
 const time = @import("antfly_platform").time;
 extern "c" fn getenv([*:0]const u8) ?[*:0]const u8;
 const Row = struct { generation: u64, shard: u32, offset: usize, length: usize, checksum: u32 };

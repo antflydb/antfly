@@ -77,7 +77,7 @@ const ModernBertNormSlotKind = enum(u1) { attention, mlp };
 /// Like the linear slots they stay attached to the model's Metal provider, so
 /// requests after the first upload no norm weights.
 fn modernBertNormSlot(layer: usize, kind: ModernBertNormSlotKind) usize {
-    return layer * 2 + @intFromEnum(kind);
+    return layer * 2 + @backingInt(kind);
 }
 fn modernBertEmbeddingNormSlot(config: Config) usize {
     return @as(usize, @intCast(config.num_hidden_layers)) * 2;

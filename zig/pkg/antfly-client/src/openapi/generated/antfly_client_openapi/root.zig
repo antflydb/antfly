@@ -34,6 +34,7 @@ pub const AntflyRerankerConfig = types.AntflyRerankerConfig;
 pub const AntflyType = types.AntflyType;
 pub const ApiKey = types.ApiKey;
 pub const ApiKeyWithSecret = types.ApiKeyWithSecret;
+pub const AppleGeneratorConfig = types.AppleGeneratorConfig;
 pub const ArtifactIndexSource = types.ArtifactIndexSource;
 pub const ArtifactRepairKind = types.ArtifactRepairKind;
 pub const ArtifactRepairReason = types.ArtifactRepairReason;

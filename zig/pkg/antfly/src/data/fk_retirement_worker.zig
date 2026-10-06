@@ -7,8 +7,8 @@ const std = @import("std");
 const fs = @import("antfly_runtime_fs").fs_paths;
 const contract = @import("../metadata/fk_initial_retirement_contract.zig");
 const auth = @import("../metadata/fk_initial_retirement_auth.zig");
-const signing = @import("../storage/db/root_signing_identity.zig");
-const publication = @import("../storage/db/relational_initial_child_publication.zig");
+const signing = @import("antfly_local_sources").storage_db_root_signing_identity;
+const publication = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
 
 pub const Ticket = contract.Ticket;
 pub const journal_name = ".antfly-initial-fk-retirement";

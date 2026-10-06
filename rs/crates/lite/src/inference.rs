@@ -17,7 +17,7 @@
 //! generate, generate/batch, rewrite, extract, read, transcribe, models,
 //! pull). See `zig/CAPI.md`'s "Inference" and "Inference In Process"
 //! sections and the `Embedded inference without a database` block in
-//! `zig/pkg/antfly/include/antfly.h`.
+//! `zig/pkg/antfly-embedded/include/antfly.h`.
 //!
 //! [`Inference`] mirrors [`crate::Database`]'s handle-safety story (it is
 //! `Send + Sync`, close waits for in-flight calls and is idempotent/
@@ -75,7 +75,7 @@ fn validate_inference_abi() -> crate::Result<()> {
 /// calls are documented to always reset and fill their output buffer, even
 /// on failure, with the runtime's JSON error (`{"error":...,"message":...}`)
 /// -- see the "Embedded inference without a database" block in
-/// `zig/pkg/antfly/include/antfly.h`. This type carries that body forward
+/// `zig/pkg/antfly-embedded/include/antfly.h`. This type carries that body forward
 /// instead of discarding it; every buffer is freed (via `antfly_buffer_free`)
 /// either way, whether the call succeeded or not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -558,7 +558,7 @@ impl Inference {
 
     /// Downloads a model from the Hugging Face Hub into the handle's models
     /// directory, like `antfly inference pull`. `request` is documented on
-    /// `antfly_inference_pull_json` in `zig/pkg/antfly/include/antfly.h`
+    /// `antfly_inference_pull_json` in `zig/pkg/antfly-embedded/include/antfly.h`
     /// (`{"model": "owner/name[:variant]", ...}`).
     ///
     /// `progress`, if given, is called synchronously on the calling thread

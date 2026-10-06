@@ -4,7 +4,7 @@
 //! A restore intent authorizes opening only its exact imported generation.
 //! Keep this read lease until DB.open has acquired its own generation lease.
 const std = @import("std");
-const lifecycle = @import("db/generation_lifecycle.zig");
+const lifecycle = @import("antfly_local_sources").storage_db_generation_lifecycle;
 const backup_restore = @import("../raft/storage/backup_restore.zig");
 const Identity = @import("restore_identity.zig").Identity;
 

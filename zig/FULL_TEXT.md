@@ -336,21 +336,21 @@ optimization order, highest-leverage first, is:
 
 The boolean iterator tree, the competitive two-phase phrase executor, and the
 segment/codec/allocation optimizations described in Search Execution Design below
-are implemented, in `pkg/antfly/src/search/scorer.zig` and
-`pkg/antfly/src/section/inverted.zig`.
+are implemented, in `pkg/antfly-embedded/src/local/search/scorer.zig` and
+`pkg/antfly-embedded/src/local/section/inverted.zig`.
 
 > **Relocated:** The dated implementation-progress log that previously lived here (2,310 lines, 2026-07-12 through 2026-07-16) is preserved verbatim in [work-log/completed/full-text/implementation-progress-2026-07.md](../work-log/completed/full-text/implementation-progress-2026-07.md). Durable decisions from it are in Search Execution Design, Decisions, and Design Constraints in this document.
 
 ### Capabilities already present
 
-- `pkg/antfly/src/search/scorer.zig` contains `WANDScorer`, a shared top-k
+- `pkg/antfly-embedded/src/local/search/scorer.zig` contains `WANDScorer`, a shared top-k
   collector interface, block-max impact evaluation, and chunk skipping.
 - Ranking-only term iterators disable position decoding.
 - WAND advancement calls the postings iterator's `advanceTo` implementation.
-- `pkg/antfly/src/index.zig` computes global BM25 statistics and searches each
+- `pkg/antfly-embedded/src/local/index.zig` computes global BM25 statistics and searches each
   segment against a shared global collector. Deleted documents are rejected by
   the live-doc collector.
-- `pkg/antfly/src/section/inverted.zig` owns the inverted-index encoding,
+- `pkg/antfly-embedded/src/local/section/inverted.zig` owns the inverted-index encoding,
   postings iterators, norms, positions, block-max data, term dictionary, and
   segment merge implementation.
 - The embedded search-kernel benchmark (see [bench/full_text/BENCHMARK.md](bench/full_text/BENCHMARK.md))

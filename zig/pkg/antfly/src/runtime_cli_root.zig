@@ -32,3 +32,6 @@ fn cliEntry(context: *const bridge.Context) callconv(.c) c_int {
 comptime {
     exportInternal(&cliEntry, "antfly_runtime_cli");
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

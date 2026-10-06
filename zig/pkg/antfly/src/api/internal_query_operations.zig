@@ -17,10 +17,10 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
-const common_secrets = @import("../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const platform_time = @import("antfly_platform").time;
 const scraping = @import("antfly_scraping");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
@@ -28,11 +28,11 @@ const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 pub const max_query_embedding_input_bytes: usize = 1024 * 1024;
 pub const max_query_embedding_template_bytes: usize = 64 * 1024;
 pub const default_query_embedding_timeout_ns: u64 = 30 * std.time.ns_per_s;
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
-const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
+const algebraic_ir = @import("antfly_local_sources").storage_db_algebraic_ir;
 const distributed_graph = @import("distributed_graph.zig");
-const query_api = @import("query.zig");
-const query_contract = @import("query_contract.zig");
+const query_api = @import("antfly_local_sources").api_query;
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const tables_api = @import("tables.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 
@@ -95,7 +95,7 @@ pub const Context = struct {
     catalog: CatalogSource,
     query_router: QueryRouter,
     query_planning: ?QueryPlanningContext = null,
-    graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
+    graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
 
     fn queryPlanning(self: Context) ?QueryPlanningContext {
         if (self.query_planning) |planning| return planning;

@@ -4,10 +4,10 @@
 //! Shared SQL protocol/HTTP control adapter. All state belongs to the durable
 //! transaction registry; commit is the native coordinator, never HTTP replay.
 const std = @import("std");
-const sql = @import("../sql/session.zig");
+const sql = @import("antfly_local_sources").sql_session;
 const transactions = @import("transactions.zig");
 const http = @import("http_server.zig");
-const operation = @import("operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const connections = @import("sql_connections.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -98,7 +98,7 @@ pub const Adapter = struct {
     supports_range_guards: bool = false,
     connection_id: ?[32]u8 = null,
     connection_revision: ?u64 = null,
-    connection_overlay: []const @import("../sql/setting_catalog.zig").OverlayEntry = &.{},
+    connection_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
 
     fn connectionMutation(self: *Adapter, scope: sql.Scope, action: connections.Action) !void {
         const store = self.registry.durable orelse return error.SqlConnectionUnavailable;

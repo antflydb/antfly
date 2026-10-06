@@ -59,7 +59,7 @@ def main() -> int:
     runtime = argparse.ArgumentParser(
         description="Runtime test selection", allow_abbrev=False
     )
-    runtime.add_argument("--test-filter", action="append", default=[])
+    runtime.add_argument("--test-filter", "--suite-filter", action="append", default=[])
     runtime.add_argument("--skip-test-filter", action="append", default=[])
     runtime.add_argument("--allow-empty-test-filter", action="store_true")
     runtime.add_argument("--list-tests", action="store_true")

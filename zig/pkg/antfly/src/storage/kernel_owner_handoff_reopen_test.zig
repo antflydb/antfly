@@ -6,25 +6,25 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const client = @import("kernel_owner_client.zig");
-const db_mod = @import("db/db.zig");
-const staging = @import("db/restore_staging_contract.zig");
-const handoff = @import("db/empty_generation_handoff.zig");
+const db_mod = @import("antfly_local_sources").storage_db_db;
+const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
+const handoff = @import("antfly_local_sources").storage_db_empty_generation_handoff;
 
 test "storage owner handoff receipt survives shared-context hidden to public reopen" {
     const alloc = std.testing.allocator;
     const public_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
     ;
-    const namespace: @import("db/doc_identity_namespace.zig").Namespace = .{ .table_id = 72, .shard_id = 7201, .range_id = 7201 };
+    const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 72, .shard_id = 7201, .range_id = 7201 };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owner-handoff-reopen", .{tmp.sub_path});
     defer alloc.free(path);
-    var parsed_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, public_schema_json);
+    var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, public_schema_json);
     defer parsed_schema.deinit(alloc);
-    const runtime_schema = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer @import("schema.zig").freeSchema(alloc, runtime_schema);
-    const schema_bytes = try @import("schema.zig").serializeSchema(alloc, runtime_schema);
+    const runtime_schema = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, runtime_schema);
+    const schema_bytes = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, runtime_schema);
     defer alloc.free(schema_bytes);
     const scope: staging.Scope = .{
         .plan_id = @splat(1),
@@ -58,7 +58,7 @@ test "storage owner handoff receipt survives shared-context hidden to public reo
     {
         var seeded = try db_mod.DB.open(alloc, path, .{ .identity_namespace = namespace, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
         defer seeded.close();
-        try @import("db/doc_identity.zig").writeNamespaceToStore(seeded.core.store, namespace);
+        try @import("antfly_local_sources").storage_db_doc_identity.writeNamespaceToStore(seeded.core.store, namespace);
         try seeded.setSchemaJson(alloc, public_schema_json);
         try seeded.reserveRestoreStagingScoped(alloc, scope);
         try seeded.installRestoreStagingBootstrap(alloc, bootstrap);
@@ -92,7 +92,7 @@ test "storage owner handoff receipt survives shared-context hidden to public reo
         .indexes_json = .fromSlice("{}"),
         .restore_bootstrap_json = .fromSlice(bootstrap_json),
     };
-    const lookup_contract = @import("../api/local_query_contract.zig");
+    const lookup_contract = @import("antfly_local_sources").api_local_query_contract;
     const hidden_request = try lookup_contract.encodeStorageKernelLookupRequest(alloc, "", .{
         .restore_staging_scope = scope.digest(),
         .restore_staging_plan_id = scope.plan_id,

@@ -22,8 +22,8 @@ pub const Owner = struct {
     plan_digest: [32]u8,
     table: tables.TableRecord,
     range: tables.RangeRecord,
-    bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap,
-    scope: @import("../storage/db/restore_staging_contract.zig").Scope,
+    bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap,
+    scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope,
     cancel_recovery: bool = false,
 };
 pub const InitialOwner = struct {
@@ -57,7 +57,7 @@ pub fn validateInitial(alloc: std.mem.Allocator, public_tables: []const tables.T
         var digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(table.schema_json, &digest, .{});
         if (!std.mem.eql(u8, &digest, &descriptor.public_schema_json_digest)) return error.InvalidGenerationPublication;
-        var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, table.schema_json);
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
         defer parsed.deinit(alloc);
         if (parsed.version != descriptor.schema_version or parsed.storage_mode != .relational) return error.InvalidGenerationPublication;
         var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, table.table_id, null);
@@ -228,7 +228,7 @@ test "initial FK private owner is exact, unpublished, and supports schema epoch 
     const schema_json = "{\"version\":0,\"storage_mode\":\"relational\"}";
     var schema_digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
-    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, schema_json);
+    var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     var compiled = try @import("../metadata/fk_generation_publication.zig").compileCatalog(alloc, parsed, 7, null);
     defer compiled.deinit();
@@ -281,7 +281,7 @@ test "private provisioning validates immutable hidden owners and rejects forged 
     var portable_artifacts = [_]staging.SourceArtifact{target.source_artifacts[0]};
     portable_artifacts[0].format = .portable;
     portable_target.source_artifacts = &portable_artifacts;
-    const proof_digest = try @import("../storage/portable_backup.zig").sourceGenerationAdmissionSummaryDigest(portable_artifacts[0].source_namespace, &.{});
+    const proof_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(portable_artifacts[0].source_namespace, &.{});
     portable_target.source_generation_admissions = &.{.{ .target_group_id = 701, .source_namespace = portable_artifacts[0].source_namespace, .entries = &.{}, .digest = proof_digest }};
     const portable_plan: staging.Plan = .{ .id = plan.id, .cohort_digest = plan.cohort_digest, .targets = &.{portable_target} };
     const portable_job: staging.Job = .{ .plan = portable_plan, .plan_digest = try portable_plan.digest(alloc) };

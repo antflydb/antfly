@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const httpx = @import("httpx");
-const common = @import("http_common.zig");
+const common = @import("antfly_local_sources").common_http_http_common;
 
 pub const IoHttpExecutorConfig = struct {
     max_response_bytes: usize = 4 << 20,
@@ -351,7 +351,7 @@ test "I/O HTTP executor streams routed response headers and bounded chunks beyon
         }
     };
     var app: App = .{};
-    var listener = @import("std_http_listener.zig").StdHttpListener.init(std.testing.allocator, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    var listener = @import("antfly_local_sources").common_http_std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
     defer listener.deinit();
     try listener.start();
     const uri = try listener.baseUri(std.testing.allocator);

@@ -3,7 +3,7 @@
 //! Administrator-approved identity for a physical store root. Ordinary store
 //! registration advertises a key; it cannot grant that key retirement authority.
 const std = @import("std");
-const incarnation = @import("incarnation.zig");
+const incarnation = @import("antfly_local_sources").metadata_incarnation;
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const Identity = struct {

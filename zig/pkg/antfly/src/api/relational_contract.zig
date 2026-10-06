@@ -18,8 +18,8 @@
 
 const std = @import("std");
 const wire = @import("antfly_schema_openapi");
-const native = @import("../storage/relational_index.zig");
-const storage = @import("../storage/schema.zig");
+const native = @import("antfly_local_sources").storage_relational_index;
+const storage = @import("antfly_local_sources").storage_schema;
 
 pub const StorageMode = EnumBridge(wire.TableStorageMode, storage.StorageMode);
 pub const IndexAccessMethod = EnumBridge(wire.RelationalIndexAccessMethod, native.RelationalIndexAccessMethod);

@@ -1,5 +1,5 @@
 const std = @import("std");
-const db_mod = @import("../pkg/antfly/src/storage/db/mod.zig");
+const db_mod = @import("../pkg/antfly-embedded/src/local/storage/db/mod.zig");
 const metadata_mod = @import("../pkg/antfly/src/metadata/mod.zig");
 
 pub fn main() !void {

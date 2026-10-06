@@ -191,7 +191,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     const headers = [_]http.RequestHeader{.{ .name = http_server.trusted_principal_header, .value = token }};
     // Hosted owner receipts require explicit administrator enrollment of the
     // physical store key; ordinary service registration cannot authorize it.
-    const signing_root = try @import("../storage/db/root_signing_identity.zig").load(alloc, io, data_root);
+    const signing_root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, data_root);
     const proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
         .metadata_incarnation = (try metadata.server.svc.metadataIncarnation()) orelse return error.MetadataIncarnationUnavailable,
         .node_id = 9,
@@ -207,7 +207,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer enrolled.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), enrolled.status);
     for (peers, 0..) |peer, index| if (peer) |active| {
-        const peer_root = try @import("../storage/db/root_signing_identity.zig").load(alloc, io, active.replica_root);
+        const peer_root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(alloc, io, active.replica_root);
         const node_id: u64 = 10 + @as(u64, @intCast(index));
         const peer_proof = try @import("../metadata/store_root_enrollment.zig").Request.sign(.{
             .metadata_incarnation = proof.identity.metadata_incarnation,
@@ -273,7 +273,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         if (observed) |value| {
             var response = value;
             defer response.deinit(alloc);
-            const Identity = struct { namespace: @import("../storage/db/doc_identity.zig").Namespace, catalog_digest: [32]u8, next_epoch: u64 };
+            const Identity = struct { namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace, catalog_digest: [32]u8, next_epoch: u64 };
             var identity = try std.json.parseFromSlice(Identity, alloc, response.json, .{ .ignore_unknown_fields = true });
             defer identity.deinit();
             try std.testing.expectEqual(parent_table_id, identity.value.namespace.table_id);
@@ -333,7 +333,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
             const index: usize = if (peers[0].?.server.data_raft.?.raftStatus(before.group_id).?.id != leader) 0 else 1;
             const node_id: u64 = 10 + @as(u64, @intCast(index));
             const active = peers[index].?;
-            const expected_phase: @import("../storage/db/relational_initial_child_publication.zig").Phase = if (scenario == .cancel_offline) .hidden else .released;
+            const expected_phase: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase = if (scenario == .cancel_offline) .hidden else .released;
             const applied_deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
             while (platform.time.monotonicNs() < applied_deadline) {
                 if (try active.server.readHiddenInitialChildRecord(before.group_id, child_id)) |cold| {
@@ -382,7 +382,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
         }
         if (!leadership_transfer and !restarted and before.phase == .published_hidden) {
             const cold_before = (try data.readHiddenInitialChildRecord(before.group_id, child_id)) orelse return error.MissingHiddenReceipt;
-            try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.hidden, cold_before.phase);
+            try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.hidden, cold_before.phase);
             data_control.deinit();
             data_control_alive = false;
             data_raft.deinit();
@@ -534,7 +534,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
             // The surviving current owner remains released. Retirement of a
             // historical root must neither cancel nor unlink this public root.
             const current = (try data.readHiddenInitialChildRecord(completed.group_id, child_id)) orelse return error.CurrentPublishedOwnerRemoved;
-            try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.released, current.phase);
+            try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.released, current.phase);
             try std.testing.expect((try pendingTicket(alloc, &metadata, 9, completed.group_id)) == null);
             try metadata.server.svc.cancelNodeShutdown(node_id);
         }
@@ -545,7 +545,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     try std.testing.expectEqual(@as(usize, 1), completed.released);
     if (leadership_transfer) _ = try peers_api.awaitThreeVoters(io, &data, .{ peers[0].?, peers[1].? }, completed.group_id);
     const released = (try data.readHiddenInitialChildRecord(completed.group_id, child_id)) orelse return error.MissingHiddenReceipt;
-    try std.testing.expectEqual(@import("../storage/db/relational_initial_child_publication.zig").Phase.released, released.phase);
+    try std.testing.expectEqual(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Phase.released, released.phase);
     var visible = try metadata.server.svc.adminSnapshot();
     defer metadata.server.svc.freeAdminSnapshot(&visible);
     var children: usize = 0;

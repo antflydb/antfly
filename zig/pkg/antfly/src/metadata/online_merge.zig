@@ -17,17 +17,17 @@
 //! An effect and the metadata CAS deliberately are separate steps: after an
 //! ambiguous response/restart the same immutable attempt is observed again.
 const std = @import("std");
-const source = @import("../storage/db/online_source_contract.zig");
-const snapshot = @import("../storage/source_snapshot.zig");
-const page = @import("../storage/db/merge_page_contract.zig");
+const source = @import("antfly_local_sources").storage_db_online_source_contract;
+const snapshot = @import("antfly_local_sources").storage_source_snapshot;
+const page = @import("antfly_local_sources").storage_db_merge_page_contract;
 
 pub const Phase = enum { admit, publish, snapshot, tail, freeze, final_tail, cutover, release, complete, cancel_receiver, cancel_release, cancelled };
 pub const State = struct {
     version: u8 = 1,
     revision: u64 = 1,
     scope: source.Scope,
-    artifact_catalog: ?@import("../storage/db/artifact_inventory.zig").Binding = null,
-    receiver_artifact_catalog: ?@import("../storage/db/artifact_inventory.zig").Binding = null,
+    artifact_catalog: ?@import("antfly_local_sources").storage_db_artifact_inventory.Binding = null,
+    receiver_artifact_catalog: ?@import("antfly_local_sources").storage_db_artifact_inventory.Binding = null,
     phase: Phase = .admit,
     certificate: ?snapshot.Certificate = null,
     acknowledged: u64 = 0,
@@ -151,7 +151,7 @@ pub const Observation = struct {
     /// Adapter-owned immutable context, valid until release_observation.
     execution_context: ?*const anyopaque = null,
     scope: source.Scope,
-    source_progress: ?@import("../storage/db/online_source.zig").Progress = null,
+    source_progress: ?@import("antfly_local_sources").storage_db_online_source.Progress = null,
     certificate: ?snapshot.Certificate = null,
     receiver: ?page.Progress = null,
     retained_head: u64 = 0,
@@ -396,7 +396,7 @@ fn testReceipt(state: State) !page.Progress {
 }
 
 test "metadata transition driver online reclaims acknowledged frames before healthy tail consumes quota" {
-    var retained: @import("../storage/retained_effects.zig").State = .{ .latest = 30, .reclaimed = 11 };
+    var retained: @import("antfly_local_sources").storage_retained_effects.State = .{ .latest = 30, .reclaimed = 11 };
     retained.consumers[0] = .{ .epoch = 1, .acknowledged = 20 };
     retained.consumers[1] = .{ .epoch = 2, .acknowledged = 15 };
     try std.testing.expectEqual(@as(u64, 15), retained.reclaimableThrough());

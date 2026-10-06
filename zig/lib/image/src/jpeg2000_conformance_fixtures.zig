@@ -143,7 +143,7 @@ fn runChild(io: std.Io, argv: []const []const u8) !void {
 /// Setup prerequisite for `zig build lib-image-conformance`. Ordinary
 /// library tests do not invoke this helper or download fixtures.
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
