@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -246,8 +247,8 @@ fn addGliner25Fuzz(ctx: Context) *std.Build.Step.Run {
     const b = ctx.b;
     const no_error_tracing = b.option(bool, "gliner25-fuzz-no-error-tracing", "Work around Zig 0.16.0 fuzz runner error-trace mismatch for GLiNER25 only (use with --fuzz)") orelse false;
     // Keep the standard test runner for deterministic corpus and --fuzz runs.
-    // Reuse the runtime graph's platform module. A second instance gives Zig
-    // two owners for transitive tokenizer sources imported by this test.
+    // Reuse the runtime graph's platform module so tokenizer sources have one
+    // module owner even when this test imports them through multiple paths.
     const platform = ctx.graph.platform_mod;
     const ml = b.createModule(.{
         .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/ml/src/root.zig" })),

@@ -2,7 +2,7 @@
 
 This is the durable design for native local LLM support in antfly inference: GGUF ingestion, the storage/compute split, the paged KV cache, and MoE execution ownership. The subsystems it plans for now each have their own current design doc; this file states the decisions that still hold and what remains open. The original pre-implementation plan — a point-in-time status snapshot, the major refactor writeup, KV cache design narrative, delivery-phase tracking, and testing strategy — is preserved in the work-log for historical context.
 
-> **Relocated:** The pre-implementation status snapshot, major refactor plan, KV cache design narrative, delivery phases, grammar-decoding notes, concrete code changes, and testing strategy that previously lived here (908 lines) are preserved verbatim in [work-log/completed/inference/llms-plan.md](../../../work-log/completed/inference/llms-plan.md). Durable decisions from it are in Core Decisions and Open work in this document.
+> **Relocated:** The pre-implementation status snapshot, major refactor plan, KV cache design narrative, delivery phases, grammar-decoding notes, concrete code changes, and testing strategy that previously lived here (908 lines) are preserved verbatim in [docs/design/inference/history/llms-plan.md](../../../docs/design/inference/history/llms-plan.md). Durable decisions from it are in Core Decisions and Open work in this document.
 
 ## Goal
 

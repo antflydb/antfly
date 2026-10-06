@@ -23,12 +23,12 @@ Antfly Lite database (`.aflite`) and builds a small knowledge graph over them:
   depth-2, both-direction traversal of the knowledge graph starting from the
   matched documents.
 
-This dogfoods the docs cleanup itself: every ingested row is tagged
-`kind: "design"` (design docs under `zig/*.md`, `zig/pkg/**/*.md`,
-`zig/lib/**/*.md`, `docs/design/**`) or `kind: "work-log"`
-(`work-log/**/*.md`), so `dogfood query` and `dogfood entity` can be used to
-sanity-check that the split between durable design docs and point-in-time
-work-log entries reads sensibly end to end.
+Every ingested row is tagged `kind: "design"` for living subsystem docs,
+`kind: "plan"` for `docs/plans/`, or `kind: "work-log"` for records under
+`docs/**/history/`. The historical kind value remains compatible with existing
+queries. The corpus includes Zig subsystem docs, `docs/design/`, plans, and
+operations/reference history. Use `dogfood query` and `dogfood entity` to check
+that durable decisions and dated evidence remain distinguishable.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ work-log entries reads sensibly end to end.
    ```
 
    This also produces `libantfly` for the Go cgo bindings (the minimal
-   equivalent is `zig build capi`; see `go/pkg/lite/README.md`).
+   equivalent is `zig build capi`; see `go/pkg/embedded/README.md`).
 
 2. Inference runs in-process by default. `libantfly` links the standalone
    inference runtime (the same one the `antfly` executable embeds), so a Lite
@@ -83,7 +83,7 @@ work-log entries reads sensibly end to end.
 
    In-process inference budgets (host, backend, combined, KV, scratch) are
    derived from the host memory policy the way `antfly inference run` derives
-   its defaults, and can be overridden on `lite.OpenOptions`.
+   its defaults, and can be overridden on `embedded.OpenOptions`.
 
 4. `dogfood ingest` fails fast before doing any work: in-process mode it
    checks that the linked `libantfly` advertises `local_inference_runtime`;

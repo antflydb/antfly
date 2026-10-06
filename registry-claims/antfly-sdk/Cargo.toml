@@ -1,0 +1,11 @@
+[package]
+name = "antfly-sdk"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Name reservation for the forthcoming Antfly Rust API client"
+repository = "https://github.com/antflydb/antfly"
+readme = "README.md"
+publish = ["crates-io"]
+
+[workspace]

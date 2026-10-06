@@ -2,7 +2,7 @@
 
 `root.zig` is a Zig implementation of LMDB's file format, transactions, cursors, and page management. It is a standalone library under `zig/lib/lmdb`; Antfly's database does not select LMDB as a storage backend.
 
-The C implementation in `zig/lib/lmdb/mdb.c` and `midl.c` remains as a differential oracle. `lmdb.zig` supplies the shared Zig-facing wrapper used by the C-versus-Zig tests, and `lmdb_vopr.zig` and the fixtures in `zig/lib/lmdb/fixtures` cover replay and crash outcomes. The wrapper is test and benchmark infrastructure, not an Antfly storage adapter.
+The Apache-2.0 license for this Zig library is in `zig/lib/lmdb/LICENSE`. The upstream C implementation in `zig/deps/lmdb` retains the OpenLDAP Public License 2.8 and remains a differential oracle. `lmdb.zig` supplies the shared Zig-facing wrapper used by the C-versus-Zig tests, and `lmdb_vopr.zig` and the fixtures in `zig/lib/lmdb/fixtures` cover replay and crash outcomes. The wrapper is test and benchmark infrastructure, not an Antfly storage adapter.
 
 From `zig/`, use these focused targets:
 

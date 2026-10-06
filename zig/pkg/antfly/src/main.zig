@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -109,7 +110,6 @@ extern fn antfly_runtime_storage(context: *const runtime_bridge.Context) callcon
 extern fn antfly_runtime_serverless(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_standalone(context: *const runtime_bridge.Context) callconv(.c) c_int;
 extern fn antfly_runtime_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
-extern fn antfly_runtime_standalone_lite(context: *const runtime_bridge.Context) callconv(.c) c_int;
 
 pub fn runRuntimeUnit(
     comptime role: RuntimeRole,
@@ -156,10 +156,7 @@ pub fn runRuntimeUnit(
         .storage => antfly_runtime_storage(&context),
         .serverless => antfly_runtime_serverless(&context),
         .standalone => if (std.mem.eql(u8, command, "lite"))
-            if (argument_views.items.len > 0 and std.mem.eql(u8, argument_views.items[0].slice(), "serve"))
-                antfly_runtime_standalone_lite(&context)
-            else
-                antfly_runtime_lite(&context)
+            antfly_runtime_lite(&context)
         else
             antfly_runtime_standalone(&context),
     };
@@ -272,6 +269,7 @@ fn printUsage(argv0: []const u8) void {
         \\  backup         Backup tables
         \\  restore        Restore tables from backup, including Lite *.aflite input
         \\  storage        Manage table storage (migrate)
+        \\  connections    Manage provider connections (login, list, models, logout)
         \\  auth           Manage data-plane users, roles, permissions, row filters, and API keys
         \\  internal       Internal cluster management
         \\  cloud          Delegate to the separate Antfly Cloud CLI

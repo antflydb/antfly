@@ -1524,7 +1524,7 @@ silently falling back to the mutable flush path.
 > command shapes, smoke-run numbers, and the write-path optimization narrative
 > that led to the fixes above) that previously lived here is preserved
 > verbatim in
-> [work-log/completed/docid/query-bench-diary.md](../work-log/completed/docid/query-bench-diary.md).
+> [docs/design/docid/history/query-bench-diary.md](../docs/design/docid/history/query-bench-diary.md).
 
 - The identity table now has a persisted table/shard/range namespace record.
   Existing single-store callers use the compatibility namespace (`0/0/0`),

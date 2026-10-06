@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -127,6 +128,7 @@ pub const Graph = struct {
     qualification_pjrt_mod: *std.Build.Module,
     inference_api_mod: *std.Build.Module,
     transcribing_mod: *std.Build.Module,
+    apple_native_mod: *std.Build.Module,
     inference_client_mod: ?*std.Build.Module,
     inference_tokenizer_mod: *std.Build.Module,
     inference_hf_tokenizer_mod: *std.Build.Module,
@@ -279,6 +281,15 @@ pub fn create(config: Config) Graph {
     transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
     transcribing_mod.addImport("antfly_google", google_mod);
+    // Every inference composition has a portable Apple provider surface.
+    // Native server composition replaces these imports when it builds the bridge.
+    const apple_native_options = b.addOptions();
+    apple_native_options.addOption(bool, "enabled", false);
+    const apple_native_mod = createSharedModule(config, "lib/apple_native/src/mod.zig");
+    apple_native_mod.addImport("apple_native_options", apple_native_options.createModule());
+    apple_native_mod.addImport("antfly_platform", platform_mod);
+    apple_native_mod.addImport("httpx", httpx_mod);
+    transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{
             .root_source_file = b.path(pathJoin(b, paths.inference_root, "../inference-client/src/root.zig")),
@@ -431,6 +442,7 @@ pub fn create(config: Config) Graph {
         .qualification_pjrt_mod = qualification_pjrt_mod,
         .inference_api_mod = inference_api_mod,
         .transcribing_mod = transcribing_mod,
+        .apple_native_mod = apple_native_mod,
         .inference_client_mod = inference_client_mod,
         .inference_tokenizer_mod = inference_tokenizer_mod,
         .inference_hf_tokenizer_mod = inference_hf_tokenizer_mod,

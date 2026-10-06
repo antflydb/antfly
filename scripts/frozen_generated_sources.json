@@ -1,0 +1,9 @@
+{
+  "note": "Retain the exact output of the frozen GLiNER inventory generator; its inference package LICENSE applies.",
+  "files": {
+    "zig/pkg/inference/src/models/gliner_boundary_tensor_inventory.zig": {
+      "size_bytes": 119222,
+      "sha256": "04002fef7e575a7243ed6a584996cbdc6eff6580f251f8de27a1058c6ab139b1"
+    }
+  }
+}

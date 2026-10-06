@@ -9,7 +9,7 @@ This document has three jobs:
   useful.
 - Document the graph-execution partitioning and backend-executor design that
   implements that shape (the implementation history is in
-  [ggml-graph-execution-history.md](../../../work-log/completed/inference/ggml-graph-execution-history.md)).
+  [ggml-graph-execution-history.md](../../../docs/design/inference/history/ggml-graph-execution-history.md)).
 
 It fits with:
 
@@ -636,7 +636,7 @@ unlock and how close they are to already-covered paths.
 > **Relocated:** The bullet-by-bullet implementation history for the Metal,
 > quant-matmul, and WebGPU partition executors that previously lived here
 > (320 lines) is preserved verbatim in
-> [work-log/completed/inference/ggml-graph-execution-history.md](../../../work-log/completed/inference/ggml-graph-execution-history.md).
+> [docs/design/inference/history/ggml-graph-execution-history.md](../../../docs/design/inference/history/ggml-graph-execution-history.md).
 > Durable decisions from it are in Metal Partition Executor, Quant Matmul
 > Routing, WebGPU Partition Executor, and Debug And Bisection Controls above.
 

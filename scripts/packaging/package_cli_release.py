@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Repack Antfly release archives as PyPI wheels and npm CLI packages."""
 
 from __future__ import annotations
@@ -263,12 +278,14 @@ def package_python_wheel(
         write_bytes(zf, arcname, path.read_bytes(), mode)
 
     metadata = Message()
-    metadata["Metadata-Version"] = "2.3"
+    metadata["Metadata-Version"] = "2.4"
     metadata["Name"] = "antfly-cli"
     metadata["Version"] = python_version
     metadata["Summary"] = "Native Antfly CLI installer package"
     metadata["Author-email"] = "Antfly, Inc. <ajroetker@antfly.io>"
-    metadata["License"] = "Elastic-2.0"
+    metadata["License-Expression"] = "Elastic-2.0 AND Apache-2.0"
+    for license_name in ("Elastic-2.0.txt", "Apache-2.0.txt"):
+        metadata["License-File"] = f"LICENSES/{license_name}"
     metadata["Requires-Python"] = project_requires_python(
         repo_root / "py" / "packages" / "cli" / "pyproject.toml"
     )
@@ -296,6 +313,12 @@ def package_python_wheel(
                 ):
                     rel = path.relative_to(extracted)
                     write_file(zf, f"{package_name}/{rel.as_posix()}", path)
+        for license_name in ("Elastic-2.0.txt", "Apache-2.0.txt"):
+            write_file(
+                zf,
+                f"{dist_info}/licenses/LICENSES/{license_name}",
+                repo_root / "py" / "packages" / "cli" / "LICENSES" / license_name,
+            )
         write_bytes(zf, f"{dist_info}/METADATA", metadata.as_bytes())
         write_bytes(zf, f"{dist_info}/WHEEL", wheel.encode())
         write_bytes(zf, f"{dist_info}/entry_points.txt", entry_points.encode())

@@ -1,0 +1,37 @@
+{
+  "Apache-2.0": [
+    "zig/build.zig",
+    "zig/build.zig.zon",
+    "zig/build_support",
+    "zig/tools",
+    "zig/examples",
+    "zig/pkg/antfly-embedded",
+    "zig/pkg/antfly-client",
+    "zig/pkg/antfly-server-api",
+    "zig/pkg/inference",
+    "zig/pkg/inference-client",
+    "zig/lib",
+    "zig/e2e/inference",
+    "go/pkg/embedded",
+    "py/packages/embedded",
+    "ts/packages/embedded",
+    "rs",
+    "examples",
+    "go/pkg/docsaf",
+    "go/pkg/evalaf",
+    "go/pkg/genkit",
+    "go/pkg/memoryaf",
+    "go/pkg/operator",
+    "go/pkg/proxy",
+    "go/pkg/sdk",
+    "scripts",
+    "tools",
+    "specs",
+    "bench",
+    "compat"
+  ],
+  "Elastic-2.0": [
+    "zig/pkg/antfly",
+    "zig/e2e/antfly"
+  ]
+}
