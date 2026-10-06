@@ -39,7 +39,6 @@ pub const AntflySTTConfig = struct {
 
 /// On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported.
 pub const AppleSTTConfig = struct {
-    model: ?[]const u8 = null,
     /// Supported Speech locale; Apple transcription does not infer a language.
     language_code: ?[]const u8 = null,
     timestamps: ?bool = null,
@@ -48,7 +47,6 @@ pub const AppleSTTConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "model", "model", true },
         .{ "language_code", "language_code", true },
         .{ "timestamps", "timestamps", true },
         .{ "download_assets", "download_assets", true },
@@ -64,10 +62,6 @@ pub const AppleSTTConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.model) |value| {
-            try jw.objectField("model");
-            try jw.write(value);
-        }
         if (self.language_code) |value| {
             try jw.objectField("language_code");
             try jw.write(value);

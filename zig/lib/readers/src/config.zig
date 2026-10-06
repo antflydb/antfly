@@ -89,8 +89,7 @@ pub const Config = struct {
                 return error.InvalidReaderConfig;
         }
         if (self.provider == .apple) {
-            if (self.model) |model| if (!std.mem.eql(u8, model, "vision-text"))
-                return error.InvalidAppleReaderConfig;
+            if (self.model != null) return error.InvalidAppleReaderConfig;
             if (self.api_key != null or self.bearer_token != null or
                 self.capability_token != null or self.capability_revision != null or
                 self.base_url != null or self.url != null or self.api_url != null or
@@ -125,7 +124,9 @@ pub fn validateAppleRequest(prompt: ?[]const u8, max_tokens: ?i64) !void {
 
 test "apple OCR configuration validates native-only options" {
     try (Config{ .provider = .apple }).validate();
-    try (Config{ .provider = .apple, .model = "vision-text", .prompt = "<OCR>" }).validate();
+    try (Config{ .provider = .apple, .prompt = "<OCR>" }).validate();
+    try std.testing.expectError(error.InvalidAppleReaderConfig, (Config{ .provider = .apple, .model = "vision-text" }).validate());
+    try std.testing.expectError(error.InvalidAppleReaderConfig, (Config{ .provider = .apple, .model = "" }).validate());
     try std.testing.expectError(error.InvalidAppleReaderConfig, (Config{ .provider = .apple, .url = "http://localhost" }).validate());
     try std.testing.expectError(error.InvalidAppleReaderConfig, (Config{ .provider = .apple, .model = "system" }).validate());
     try std.testing.expectError(error.InvalidAppleReaderConfig, (Config{ .provider = .apple, .recognition_languages = &.{} }).validate());

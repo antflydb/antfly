@@ -85,7 +85,7 @@ test "Apple generation backend bypasses HTTP quotas and honors request deadlines
     var factory = BackendFactory.initWithOptions(alloc, &client, .{
         .request_context = .{ .io = std.testing.io, .deadline_ns = 1 },
     });
-    const cfg = GeneratorConfig{ .provider = .apple, .model = "system", .url = "" };
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
     if (!lib.apple_native.enabled) {
         try std.testing.expectError(error.AppleIntelligenceProviderUnavailable, factory.factory().create(alloc, cfg));
         return;
@@ -94,7 +94,7 @@ test "Apple generation backend bypasses HTTP quotas and honors request deadlines
     defer generator.deinit();
     const state: *BackendState = @ptrCast(@alignCast(generator.ptr));
     try std.testing.expect(state.quota == null);
-    try std.testing.expectError(error.Timeout, generator.generate(alloc, "system", &.{.{ .role = .user, .content = .{ .text = "hello" } }}));
+    try std.testing.expectError(error.Timeout, generator.generate(alloc, "", &.{.{ .role = .user, .content = .{ .text = "hello" } }}));
 }
 
 pub const BackendFactory = struct {
@@ -353,7 +353,8 @@ const BackendState = struct {
         if (self.provider == .apple) {
             const timeout = if (self.request_context) |context| try context.remainingTimeoutMs() else try self.execution.remainingTimeoutMs(platform_time.monotonicNs(), 120_000);
             const cancellation = if (self.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else httpx.CancellationToken.fromCallback(self.execution.cancellation.ptr, self.execution.cancellation.is_cancelled_fn);
-            return lib.generateApple(alloc, self.cfg, model, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
+            if (model.len > 0) return error.UnsupportedAppleGenerationOptions;
+            return lib.generateApple(alloc, self.cfg, messages, self.max_response_bytes orelse (8 * 1024 * 1024), .{ .timeout_ms = timeout, .cancellation = cancellation });
         }
         const policy = try provider_limits.Policy.fromConfig(self.cfg.rate_limit);
         try validateGenerationMessagesTokenBudget(self.cfg, messages);

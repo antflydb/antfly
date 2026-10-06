@@ -2036,7 +2036,7 @@ fn validateReaderConfigJson(alloc: Allocator, raw: []const u8, prompt: []const u
 test "document extraction Apple OCR defaults to a plain prompt" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"enabled":true,"config":{"provider":"apple","model":"vision-text"}}}
+        \\{"ocr":{"enabled":true,"config":{"provider":"apple"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expectEqual(OcrPromptPolicy.plain, config.ocr_prompt_policy);

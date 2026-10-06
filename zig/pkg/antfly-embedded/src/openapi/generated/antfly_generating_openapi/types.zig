@@ -147,15 +147,12 @@ pub const AnthropicGeneratorConfig = struct {
 /// On-device Apple Foundation Models generation. Requires a macOS Apple provider build, Apple Intelligence enabled, and its system model ready. Supports text conversations; tool calling and media attachments are not supported.
 pub const AppleGeneratorConfig = struct {
     provider: ?[]const u8 = null,
-    /// Only system is supported; requests are validated by the native provider.
-    model: ?[]const u8 = null,
     max_tokens: ?i64 = null,
     temperature: ?f64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "provider", "provider", true },
-        .{ "model", "model", true },
         .{ "max_tokens", "max_tokens", true },
         .{ "temperature", "temperature", true },
     };
@@ -172,10 +169,6 @@ pub const AppleGeneratorConfig = struct {
         try jw.beginObject();
         if (self.provider) |value| {
             try jw.objectField("provider");
-            try jw.write(value);
-        }
-        if (self.model) |value| {
-            try jw.objectField("model");
             try jw.write(value);
         }
         if (self.max_tokens) |value| {

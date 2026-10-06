@@ -18,7 +18,6 @@ import { cn } from "@/lib/utils";
 
 export const GENERATOR_PROVIDER_DEFAULTS: Partial<Record<GeneratorProvider, string>> = {
   antfly: "gemma-3-1b-it",
-  apple: "system",
   ollama: "llama3.3:70b",
   gemini: "gemini-2.5-flash",
   openai: "gpt-4.1",
@@ -55,9 +54,10 @@ export const QUERY_BUILDER_PROVIDERS: GeneratorProvider[] = [
 ];
 
 export function formatGeneratorSummary(
-  config: Pick<GeneratorConfig, "provider" | "model"> | null | undefined,
+  config: { provider: string; model?: string } | null | undefined,
   defaultLabel = "Server default"
 ): string {
+  if (config?.provider === "apple") return GENERATOR_PROVIDER_LABELS.apple!;
   if (!config?.provider || !config?.model) {
     return defaultLabel;
   }
@@ -152,7 +152,6 @@ export function GeneratorSelector({
     if (nextProvider === "apple") {
       onChange({
         provider: "apple",
-        model: "system",
         max_tokens: value.max_tokens ?? 256,
         ...(value.temperature !== undefined && { temperature: value.temperature }),
       });
@@ -161,7 +160,10 @@ export function GeneratorSelector({
     onChange({
       ...value,
       provider: nextProvider,
-      model: liveDefault || GENERATOR_PROVIDER_DEFAULTS[nextProvider] || value.model,
+      model:
+        liveDefault ||
+        GENERATOR_PROVIDER_DEFAULTS[nextProvider] ||
+        ("model" in value ? value.model : undefined),
     } as GeneratorConfig);
   };
 
@@ -200,7 +202,9 @@ export function GeneratorSelector({
         <div
           className={cn(
             "grid gap-4",
-            showTemperature ? "grid-cols-1 lg:grid-cols-3" : "grid-cols-1 lg:grid-cols-2"
+            showTemperature && value.provider !== "apple"
+              ? "grid-cols-1 lg:grid-cols-3"
+              : "grid-cols-1 lg:grid-cols-2"
           )}
         >
           <div className="space-y-2">
@@ -218,18 +222,20 @@ export function GeneratorSelector({
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-2">
-            <Label className="text-xs text-muted-foreground">Model</Label>
-            <Combobox
-              options={modelOptions}
-              value={value.model}
-              onChange={(model) => onChange({ ...value, model })}
-              placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
-              searchPlaceholder="Search or type a model..."
-              emptyText="Type a model name."
-              allowCustomValue
-            />
-          </div>
+          {value.provider !== "apple" && (
+            <div className="space-y-2">
+              <Label className="text-xs text-muted-foreground">Model</Label>
+              <Combobox
+                options={modelOptions}
+                value={value.model}
+                onChange={(model) => onChange({ ...value, model })}
+                placeholder={GENERATOR_PROVIDER_DEFAULTS[value.provider]}
+                searchPlaceholder="Search or type a model..."
+                emptyText="Type a model name."
+                allowCustomValue
+              />
+            </div>
+          )}
           {showTemperature && (
             <div className="space-y-2">
               <Label className="text-xs text-muted-foreground">Temperature</Label>

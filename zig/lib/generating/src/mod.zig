@@ -91,9 +91,9 @@ pub const GenerateResult = struct {
     }
 };
 
-pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, model: []const u8, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
+pub fn generateApple(alloc: std.mem.Allocator, cfg: GeneratorConfig, messages: []const ChatMessage, limit: usize, control: apple_native.Control) !GenerateResult {
     try cfg.validate();
-    if (cfg.provider != .apple or !std.mem.eql(u8, model, "system")) return error.InvalidGeneratorConfig;
+    if (cfg.provider != .apple) return error.InvalidGeneratorConfig;
     if (messages.len == 0 or messages.len > 128) return error.UnsupportedAppleGenerationOptions;
     const Message = struct { role: []const u8, text: []const u8 };
     var owned: std.ArrayList([]u8) = .empty;
@@ -147,13 +147,18 @@ test "Apple generation configuration is local and rejects unsupported options" {
     const alloc = std.testing.allocator;
     var cfg = try parseConfigFromSlice(alloc, "{\"provider\":\"apple\"}");
     defer cfg.deinit(alloc);
-    try std.testing.expectEqualStrings("system", cfg.model);
+    try std.testing.expectEqualStrings("", cfg.model);
     try std.testing.expectEqualStrings("", cfg.url);
     try std.testing.expect(!cfg.provider.supportsTools());
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, parseConfigFromSlice(alloc, "{\"provider\":\"apple\",\"model\":\"system\"}"));
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, parseConfigFromSlice(alloc, "{\"provider\":\"apple\",\"model\":\"\"}"));
+    const serialized = try stringifyConfigAlloc(alloc, cfg);
+    defer alloc.free(serialized);
+    try std.testing.expect(std.mem.indexOf(u8, serialized, "\"model\"") == null);
     cfg.top_p = 0.9;
     try std.testing.expectError(error.UnsupportedAppleGenerationOptions, cfg.validate());
     cfg.top_p = null;
-    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, generateApple(alloc, cfg, "system", &.{.{ .role = .assistant, .content = .{ .text = "bad history" } }}, 1024, .{}));
+    try std.testing.expectError(error.UnsupportedAppleGenerationOptions, generateApple(alloc, cfg, &.{.{ .role = .assistant, .content = .{ .text = "bad history" } }}, 1024, .{}));
 }
 
 test "Apple generation reports readiness or generates bounded text" {
@@ -163,17 +168,17 @@ test "Apple generation reports readiness or generates bounded text" {
     defer alloc.free(status_json);
     const status = try std.json.parseFromSlice(struct { generation_status: i32 }, alloc, status_json, .{ .ignore_unknown_fields = true });
     defer status.deinit();
-    const cfg = GeneratorConfig{ .provider = .apple, .model = "system", .url = "", .max_tokens = 32 };
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "", .max_tokens = 32 };
     const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "Reply with the word ready." } }};
     if (status.value.generation_status == 4) {
-        try std.testing.expectError(error.AppleModelNotReady, generateApple(alloc, cfg, "system", &messages, 1024, .{}));
+        try std.testing.expectError(error.AppleModelNotReady, generateApple(alloc, cfg, &messages, 1024, .{}));
         return;
     }
     if (status.value.generation_status != 0) return error.SkipZigTest;
-    var result = try generateApple(alloc, cfg, "system", &messages, 1024, .{ .timeout_ms = 60_000 });
+    var result = try generateApple(alloc, cfg, &messages, 1024, .{ .timeout_ms = 60_000 });
     defer result.deinit();
     try std.testing.expect(result.content.len > 0 and result.content.len <= 1024);
-    var history_result = try generateApple(alloc, cfg, "system", &.{
+    var history_result = try generateApple(alloc, cfg, &.{
         .{ .role = .system, .content = .{ .text = "Answer the user's question in one word." } },
         .{ .role = .user, .content = .{ .text = "Remember the word pear." } },
         .{ .role = .assistant, .content = .{ .text = "I'll remember pear." } },
@@ -181,15 +186,15 @@ test "Apple generation reports readiness or generates bounded text" {
     }, 1024, .{ .timeout_ms = 60_000 });
     defer history_result.deinit();
     try std.testing.expect(std.ascii.findIgnoreCase(history_result.content, "pear") != null);
-    try std.testing.expectError(error.ResponseTooLarge, generateApple(alloc, cfg, "system", &messages, 1, .{ .timeout_ms = 60_000 }));
+    try std.testing.expectError(error.ResponseTooLarge, generateApple(alloc, cfg, &messages, 1, .{ .timeout_ms = 60_000 }));
 }
 
 test "Apple generation cancellation and disabled provider" {
     const alloc = std.testing.allocator;
-    const cfg = GeneratorConfig{ .provider = .apple, .model = "system", .url = "" };
+    const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
     const cancelled = std.atomic.Value(bool).init(true);
     const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "Hello" } }};
-    try std.testing.expectError(if (apple_native.enabled) error.Cancelled else error.AppleIntelligenceProviderUnavailable, generateApple(alloc, cfg, "system", &messages, 1024, .{ .cancellation = apple_native.CancellationToken.fromAtomic(&cancelled) }));
+    try std.testing.expectError(if (apple_native.enabled) error.Cancelled else error.AppleIntelligenceProviderUnavailable, generateApple(alloc, cfg, &messages, 1024, .{ .cancellation = apple_native.CancellationToken.fromAtomic(&cancelled) }));
 }
 
 pub const Provider = enum {
@@ -345,10 +350,10 @@ pub const GeneratorConfig = struct {
 
     pub fn validate(self: GeneratorConfig) !void {
         try self.provider.validate();
-        if (self.model.len == 0 and self.provider != .mock) return error.InvalidGeneratorConfig;
+        if (self.model.len == 0 and self.provider != .mock and self.provider != .apple) return error.InvalidGeneratorConfig;
         if (self.url.len == 0 and self.provider != .mock and self.provider != .antfly and self.provider != .apple and self.provider != .vertex and self.provider != .gemini) return error.InvalidGeneratorConfig;
         if (self.provider == .apple) {
-            if (!std.mem.eql(u8, self.model, "system") or self.url.len > 0 or self.api_key != null or
+            if (self.model.len > 0 or self.url.len > 0 or self.api_key != null or
                 self.capability_token != null or self.capability_revision != null or self.project_id != null or
                 self.location != null or self.credentials_path != null or self.tools_json != null or self.tool_choice_json != null or
                 self.rate_limit != null or self.top_p != null or self.top_k != null or self.frequency_penalty != null or self.presence_penalty != null)
@@ -455,11 +460,12 @@ pub fn stringifyChainLinkAlloc(alloc: std.mem.Allocator, link: ChainLink) ![]u8 
 
 pub fn configFromOpenApi(alloc: std.mem.Allocator, generated: openapi.GeneratorConfig) !GeneratorConfig {
     const provider = try providerFromOpenApi(generated.provider);
+    if (provider == .apple and generated.model != null) return error.UnsupportedAppleGenerationOptions;
     if (generated.max_tokens != null and generated.max_completion_tokens != null) return error.InvalidGeneratorConfig;
     var cfg = GeneratorConfig{
         .rate_limit = generated.rate_limit,
         .provider = provider,
-        .model = if (generated.model) |model| try alloc.dupe(u8, model) else if (provider == .apple) try alloc.dupe(u8, "system") else "",
+        .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
         .url = if (generated.url) |url|
             try alloc.dupe(u8, url)
         else if (generated.api_url) |api_url|

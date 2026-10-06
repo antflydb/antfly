@@ -19,13 +19,11 @@ class AppleGeneratorConfig:
 
         Attributes:
             provider (AppleGeneratorConfigProvider | Unset):
-            model (str | Unset): Only system is supported; requests are validated by the native provider. Default: 'system'.
             max_tokens (int | Unset):  Default: 256.
             temperature (float | Unset):
     """
 
     provider: AppleGeneratorConfigProvider | Unset = UNSET
-    model: str | Unset = "system"
     max_tokens: int | Unset = 256
     temperature: float | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -34,8 +32,6 @@ class AppleGeneratorConfig:
         provider: str | Unset = UNSET
         if not isinstance(self.provider, Unset):
             provider = self.provider.value
-
-        model = self.model
 
         max_tokens = self.max_tokens
 
@@ -46,8 +42,6 @@ class AppleGeneratorConfig:
         field_dict.update({})
         if provider is not UNSET:
             field_dict["provider"] = provider
-        if model is not UNSET:
-            field_dict["model"] = model
         if max_tokens is not UNSET:
             field_dict["max_tokens"] = max_tokens
         if temperature is not UNSET:
@@ -65,15 +59,12 @@ class AppleGeneratorConfig:
         else:
             provider = AppleGeneratorConfigProvider(_provider)
 
-        model = d.pop("model", UNSET)
-
         max_tokens = d.pop("max_tokens", UNSET)
 
         temperature = d.pop("temperature", UNSET)
 
         apple_generator_config = cls(
             provider=provider,
-            model=model,
             max_tokens=max_tokens,
             temperature=temperature,
         )

@@ -10,8 +10,9 @@ on macOS 26, and treat macOS 27 additions as a separate capability tier.
 Status: OCR, text generation, and file transcription are implemented in the Zig
 runtime behind the single `-Dapple-providers=true` flag. Vision uses the existing
 Objective-C bridge; Foundation Models and SpeechAnalyzer share an in-process
-Swift bridge in `zig/lib/apple_native`. The public provider name is `apple`, with
-`vision-text`, `system`, and `speech-transcriber` aliases. SDKs and the generator
+Swift bridge in `zig/lib/apple_native`. The public provider name is `apple`; the
+task selects the native API. Apple configurations do not accept a model name.
+SDKs and the generator
 selector have been regenerated/updated.
 
 See [the native provider guide](../guides/apple-native-ocr.mdx) for current
@@ -172,17 +173,16 @@ integration.
 
 ## Provider behavior
 
-Use one public provider name, `apple`, with task-specific model aliases. These
-aliases select an API/use case, not downloadable Antfly model weights. Proposed
-aliases are `vision-text`, `speech-transcriber`, and `system`. These aliases are now supported in the config schema. Keep `provider: antfly` behavior unchanged and do not
-change existing defaults merely because a Mac is eligible.
+Use one public provider name, `apple`, without a `model` field. The task selects
+Vision OCR, SpeechAnalyzer transcription, or Foundation Models generation. Keep
+`provider: antfly` behavior unchanged and do not change existing defaults merely
+because a Mac is eligible.
 
 Current configurations (advanced options below remain roadmap items):
 
 ```yaml
 # Reader config
 provider: apple
-model: vision-text
 recognition_languages: [en-US]
 recognition_level: accurate
 uses_language_correction: false
@@ -191,7 +191,6 @@ uses_language_correction: false
 ```yaml
 # Transcriber enrichment config
 provider: apple
-model: speech-transcriber
 language_code: en-US
 timestamps: true
 diarization: false
@@ -200,7 +199,6 @@ diarization: false
 ```yaml
 # Generator config
 provider: apple
-model: system
 temperature: 0.2
 max_tokens: 256
 ```

@@ -140,7 +140,7 @@ test "asset producer runtime apple OCR uses local media without embedded inferen
     const media = [_]asset_producer.EncodedMedia{.{ .bytes = readers.apple.testing.fixture_png, .mime_type = "image/png" }};
     const request = asset_producer.Request{
         .producer_type = .reader,
-        .config_json = "{\"provider\":\"apple\",\"model\":\"vision-text\"}",
+        .config_json = "{\"provider\":\"apple\"}",
         .source_text = "",
         .media = &media,
         .content_type = "text/plain",

@@ -5,7 +5,7 @@ description: Use macOS native OCR, file transcription, and Apple Intelligence te
 
 Antfly's opt-in `apple` provider uses Vision for OCR, SpeechAnalyzer for file
 transcription, and Foundation Models for on-device text generation. All three
-use one build flag, `-Dapple-providers=true`, and task-specific model aliases.
+use one build flag, `-Dapple-providers=true`, and task-specific native APIs.
 They have independent availability: working OCR or transcription does not imply
 that the Apple Intelligence generation model is ready.
 
@@ -66,12 +66,12 @@ Use this generator configuration in the existing generation endpoints or a
 generator enrichment:
 
 ```json
-{"provider": "apple", "model": "system", "max_tokens": 256, "temperature": 0.2}
+{"provider": "apple", "max_tokens": 256, "temperature": 0.2}
 ```
 
-`model` defaults to `system`, its only supported value. Each request creates a
-fresh on-device session. System instructions and alternating user/assistant text
-history preserve their roles. Tools, image/audio attachments, remote endpoints,
+Apple generation does not accept `model`; macOS selects its system model. Each
+request creates a fresh on-device session. System instructions and alternating
+user/assistant text history preserve their roles. Tools, image/audio attachments, remote endpoints,
 API keys, HTTP rate limits, and other sampling options are rejected.
 
 Availability is checked on every call. `AppleModelNotReady` means macOS has not
@@ -88,16 +88,15 @@ Use this transcriber configuration in a transcriber enrichment:
 ```json
 {
   "provider": "apple",
-  "model": "speech-transcriber",
   "language_code": "en-US",
   "timestamps": true,
   "download_assets": false
 }
 ```
 
-`model` is optional. The locale defaults to `en-US` and must be supported by the
-installed SpeechTranscriber runtime. Installed assets are used without a setup
-download. Set `download_assets: true` explicitly to allow Apple's asset installer
+Apple transcription does not accept `model`. The locale defaults to `en-US` and
+must be supported by the installed SpeechTranscriber runtime. Installed assets
+are used without a setup download. Set `download_assets: true` explicitly to allow Apple's asset installer
 when a requested locale is missing. Unsupported locales and missing assets have
 distinct errors. Diarization and live transcription are not supported.
 
@@ -124,7 +123,6 @@ Use this producer on an asset enrichment whose field contains a PNG or JPEG URL:
   "type": "reader",
   "config": {
     "provider": "apple",
-    "model": "vision-text",
     "recognition_languages": ["en-US"],
     "recognition_level": "accurate",
     "uses_language_correction": false
@@ -132,7 +130,7 @@ Use this producer on an asset enrichment whose field contains a PNG or JPEG URL:
 }
 ```
 
-`model` is optional; `vision-text` is its only supported value. Language tags
+Apple OCR does not accept `model`; it uses Vision text recognition. Language tags
 must be supported by the installed Vision runtime. `recognition_level` accepts
 `accurate` or `fast`. The defaults are accurate recognition, English, and no
 language correction. HTTP(S) and inline `data:image/...;base64,...` inputs use
@@ -175,7 +173,6 @@ retains text spans for grounding. This example creates an index over OCR chunks:
                 "prompt_policy": "plain",
                 "config": {
                   "provider": "apple",
-                  "model": "vision-text",
                   "recognition_languages": ["en-US"]
                 }
               }

@@ -52,10 +52,6 @@ components:
         provider:
           type: string
           enum: [apple]
-        model:
-          type: string
-          default: system
-          description: "Only system is supported; requests are validated by the native provider."
         max_tokens:
           type: integer
           minimum: 1

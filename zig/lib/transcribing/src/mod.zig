@@ -91,7 +91,7 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.provider != .apple) return;
-        if (self.model) |model| if (!std.mem.eql(u8, model, "speech-transcriber")) return error.InvalidAppleTranscribingConfig;
+        if (self.model != null) return error.InvalidAppleTranscribingConfig;
         if (self.api_key != null or self.bearer_token != null or self.capability_token != null or self.capability_revision != null or
             self.base_url != null or self.url != null or self.api_url != null or self.project_id != null or self.location != null or self.credentials_path != null or
             self.framed_attachments or self.use_enhanced != null or self.enable_automatic_punctuation != null or (self.diarization orelse false))
@@ -527,6 +527,8 @@ test "Apple transcription validates native options and owns cloned timestamps" {
     try (Config{ .provider = .apple }).validate();
     try std.testing.expectError(error.UnsupportedAppleTranscriptionOptions, (Config{ .provider = .apple, .diarization = true }).validate());
     try std.testing.expectError(error.InvalidAppleTranscribingConfig, (Config{ .provider = .apple, .model = "whisper-1" }).validate());
+    try std.testing.expectError(error.InvalidAppleTranscribingConfig, (Config{ .provider = .apple, .model = "speech-transcriber" }).validate());
+    try std.testing.expectError(error.InvalidAppleTranscribingConfig, (Config{ .provider = .apple, .model = "" }).validate());
     const Check = struct {
         fn run(alloc: Allocator) !void {
             var response = try cloneResponse(alloc, .{

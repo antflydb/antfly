@@ -292,9 +292,6 @@ components:
       type: object
       description: "On-device SpeechAnalyzer file transcription. Requires a macOS Apple provider build and supported Speech assets. Diarization is unsupported."
       properties:
-        model:
-          type: string
-          enum: [speech-transcriber]
         language_code:
           type: string
           default: en-US

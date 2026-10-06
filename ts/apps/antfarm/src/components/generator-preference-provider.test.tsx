@@ -9,7 +9,13 @@ function Consumer() {
 
   return (
     <>
-      <div data-testid="generator">{dashboardGenerator ? dashboardGenerator.model : "none"}</div>
+      <div data-testid="generator">
+        {dashboardGenerator
+          ? "model" in dashboardGenerator
+            ? dashboardGenerator.model
+            : dashboardGenerator.provider
+          : "none"}
+      </div>
       <button
         type="button"
         onClick={() =>
@@ -33,6 +39,19 @@ function renderWithProvider(children: ReactNode) {
 const originalLocalStorageDescriptor = Object.getOwnPropertyDescriptor(window, "localStorage");
 
 describe("GeneratorPreferenceProvider", () => {
+  it("restores an Apple preference without a model", () => {
+    window.localStorage.setItem(
+      "antfarm-dashboard-generator",
+      JSON.stringify({ provider: "apple", max_tokens: 256 })
+    );
+    try {
+      renderWithProvider(<Consumer />);
+      expect(screen.getByTestId("generator").textContent).toBe("apple");
+    } finally {
+      window.localStorage.removeItem("antfarm-dashboard-generator");
+    }
+  });
+
   afterEach(() => {
     cleanup();
     if (originalLocalStorageDescriptor) {

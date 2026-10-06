@@ -13329,11 +13329,6 @@ export interface components {
         AppleGeneratorConfig: {
             /** @enum {string} */
             provider?: "apple";
-            /**
-             * @description Only system is supported; requests are validated by the native provider.
-             * @default system
-             */
-            model?: string;
             /** @default 256 */
             max_tokens?: number;
             temperature?: number;
