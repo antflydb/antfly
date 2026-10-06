@@ -1765,7 +1765,11 @@ fn workerMetadataScenario(a: std.mem.Allocator) !void {
     }
 }
 test "SQL native worker metadata admits rows atomically across allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, workerMetadataScenario, .{});
+    try workerMetadataScenario(std.testing.allocator);
+    // Arena resizing depends on heap placement. Force allocation on growth so
+    // the fault sweep visits the same allocation sequence on every attempt.
+    var fixed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed.allocator(), workerMetadataScenario, .{});
 }
 
 const ManyOrderedColumns = struct {
