@@ -15,7 +15,7 @@ The canonical Zig runtime artifacts are tarballs named:
 - `antfly_<version>_Linux_x86_64.tar.gz`
 - `antfly_<version>_Linux_x86_64_gnu.tar.gz`
 
-Each archive has this root layout:
+Each server archive has this root layout:
 
 ```text
 antfly
@@ -27,6 +27,29 @@ README.md
 LICENSE
 THIRD_PARTY_NOTICES.md
 ```
+
+For each platform, the Apache runtime is distributed as
+`antfly-embedded_<version>_<OS>_<arch>[_gnu].tar.gz`. It contains both public
+CLIs (`antfly-lite` and `antfly-inference`), `libantfly`, `include/antfly.h`, the
+private inference worker, runtime files and notices. The root license is Apache;
+third-party components retain their original notices. Database serving remains
+in the separate ELv2 server product.
+
+Build contract schema 5 declares `server` and `embedded`, includes pkg-config
+metadata, and omits unused workers from language packages. Schema 3 retains
+the original combined archive/package contract. Schema 1 retains the
+historical server-only layout; schema 2 retains separate Lite and inference
+archives. The controller follows the immutable source contract and promotion
+requires every declared runtime archive for each supported platform.
+
+`.github/workflows/embedded-package.yml` assembles Python wheels and npm packages
+from the embedded archives, bundling only the native library. Prebuilt language
+packages cover Linux x86-64/ARM64 (glibc 2.28+) and macOS ARM64; the native
+archive matrix is separate. Go/Rust/C use `lib/pkgconfig/libantfly.pc`.
+Dispatch `.github/workflows/embedded-release-publish.yml` with the immutable tag
+and successful build run to verify and publish that snapshot. Go and Rust link
+`libantfly` from an embedded archive or local build. See
+[licensing maintenance](docs/reference/licensing.md) for trusted publisher setup.
 
 Linux has an explicit two-ABI contract:
 
@@ -41,6 +64,16 @@ package names. Its supported Node.js 24 runtime has the same glibc 2.28 floor as
 the GNU archive. The standalone shell installer still checks the glibc version
 and falls back to the portable musl archive when the GNU compatibility floor is
 not met.
+
+Zig source consumers receive `antfly-embedded-source_<version>.tar.gz`, its
+`.zig-hash`, and `embedded-zig-source.json`. The package has a public
+`build.zig.zon` and bundles the Apache build/dependency closure, source
+manifest, and notices; it excludes ELv2 implementations. The artifact builder
+packages the immutable source commit and computes its Zig hash with the pinned
+compiler. Promotion requires matching commit/version provenance and digests;
+development packages made with `--working-tree` cannot be promoted. The source
+archive is included in the checksum ledger and runtime publication scope.
+Schema 4 retains the native pkg-config shape without this source artifact.
 
 All release targets use `ReleaseFast`. Linux amd64 and GNU arm64 build on their
 native Linux architectures; portable musl arm64 and macOS arm64 cross-compile

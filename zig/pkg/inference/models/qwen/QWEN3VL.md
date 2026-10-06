@@ -13,7 +13,7 @@ generation also supports CUDA. See [model compatibility](../../MODEL_COMPATIBILI
 
 > **Relocated:** The dated 2026-08-29/08-30 qualification campaign is
 > preserved verbatim in
-> [work-log/completed/inference/qwen3vl-qualification-2026-08.md](../../../../../work-log/completed/inference/qwen/qwen3vl-qualification-2026-08.md).
+> [docs/design/inference/history/qwen/qwen3vl-qualification-2026-08.md](../../../../../docs/design/inference/history/qwen/qwen3vl-qualification-2026-08.md).
 > See Current status below for the durable, undated summary.
 
 ## Pinned artifacts
@@ -648,7 +648,7 @@ tests cover their strict contracts.
 > generation, reranker, Metal kernel enablement measurements, and the
 > stale-weight-cache and tokenizer-regex fixes it found) that previously
 > lived here (150 lines) is preserved verbatim in
-> [work-log/completed/inference/qwen3vl-qualification-2026-08.md](../../../../../work-log/completed/inference/qwen/qwen3vl-qualification-2026-08.md).
+> [docs/design/inference/history/qwen/qwen3vl-qualification-2026-08.md](../../../../../docs/design/inference/history/qwen/qwen3vl-qualification-2026-08.md).
 > Durable decisions from it are in Runtime architecture, Metal kernel
 > enablement, and Local qualification workflow in this document.
 

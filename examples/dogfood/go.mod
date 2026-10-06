@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/antflydb/antfly/go/pkg/docsaf v0.0.0
-	github.com/antflydb/antfly/go/pkg/lite v0.0.0
+	github.com/antflydb/antfly/go/pkg/embedded v0.0.0
 )
 
 require (
@@ -86,6 +86,6 @@ require (
 
 replace (
 	github.com/antflydb/antfly/go/pkg/docsaf => ../../go/pkg/docsaf
-	github.com/antflydb/antfly/go/pkg/lite => ../../go/pkg/lite
+	github.com/antflydb/antfly/go/pkg/embedded => ../../go/pkg/embedded
 	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 )

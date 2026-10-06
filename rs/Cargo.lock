@@ -43,17 +43,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
 
 [[package]]
-name = "antfly-lite"
+name = "antfly-embedded"
 version = "0.1.0"
 dependencies = [
- "antfly-lite-sys",
+ "antfly-embedded-sys",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "antfly-lite-sys"
+name = "antfly-embedded-sys"
 version = "0.1.0"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
+name = "antfly-postgres"
+version = "0.1.0"
+dependencies = [
+ "antfly-sdk",
+ "pgrx",
+ "pgrx-tests",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "url",
+]
 
 [[package]]
 name = "antfly-sdk"
@@ -1445,19 +1461,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "serde",
-]
-
-[[package]]
-name = "pgaf"
-version = "0.1.0"
-dependencies = [
- "antfly-sdk",
- "pgrx",
- "pgrx-tests",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "url",
 ]
 
 [[package]]

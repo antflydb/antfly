@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
 """Audit the local engine's authored production imports and resolved owners.
 
 The default check follows authored relative imports. Build targets additionally
@@ -80,13 +79,13 @@ def production_exclusions(
     # compilation instead of silently reaching a server fixture.
     test_owner = re.compile(
         r"\bconst\s+\w+\s*=\s*if\s*\(\s*builtin\.is_test\s*\)"
-        r'\s*@import\(\s*"[^"\n]+"\s*\)\s*else\s*struct\s*\{\s*\}\s*;'
+        r'\s*@import\(\s*"[^"\n]+"\s*\)(?:\.\w+)*\s*else\s*struct\s*\{\s*\}\s*;'
     )
     for owner in test_owner.finditer(source):
         if masked[owner.start() : owner.start() + 5] == "const":
             excluded.append((owner.start(), owner.end()))
     for test_import in re.finditer(
-        r'\bif\s*\(\s*builtin\.is_test\s*\)\s*(@import\(\s*"[^"\n]+"\s*\))\s*else\b',
+        r'\bif\s*\(\s*builtin\.is_test\s*\)\s*(@import\(\s*"[^"\n]+"\s*\))(?:\.\w+)*\s*else\b',
         source,
     ):
         if masked[test_import.start() : test_import.start() + 2] == "if":

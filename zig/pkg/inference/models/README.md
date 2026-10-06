@@ -4,7 +4,7 @@ Per-model-family design and status docs for the inference runtime. Backend
 docs (CUDA, Metal, WASM, native, PJRT, ONNX, GGML) and cross-cutting runtime
 docs live one level up in `zig/pkg/inference/`; fine-tuning lives in
 `../finetuning/`. Dated qualification evidence and implementation ledgers for
-each family are under `work-log/completed/inference/<family>/`.
+each family are under `docs/design/inference/history/<family>/`.
 
 | Family | Document | Covers |
 |---|---|---|

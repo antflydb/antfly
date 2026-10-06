@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/antflydb/antfly/go/pkg/lite"
+	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
 // Provisioning is name-keyed (an existing index is never re-added), so a
@@ -101,7 +102,7 @@ type catalogEnrichment struct {
 // artifact wiring and dimensions, and (via the stored index config, which is
 // translated for dense indexes and therefore only checked for the model
 // string) the embedding model itself.
-func verifyChunkPipelineEnrichments(db *lite.DB, storedChunkVectorsConfig string, cfg indexBuildConfig) error {
+func verifyChunkPipelineEnrichments(db *embedded.DB, storedChunkVectorsConfig string, cfg indexBuildConfig) error {
 	raw, err := db.EnrichmentsJSON()
 	if err != nil {
 		return fmt.Errorf("list enrichments: %w", err)

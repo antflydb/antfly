@@ -1,0 +1,75 @@
+{
+  "name": "@antfly/embedded",
+  "version": "0.1.0",
+  "description": "TypeScript/Node binding for local Antfly databases and inference (libantfly C ABI)",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run --maxWorkers=2",
+    "test:watch": "vitest",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "lint": "biome check .",
+    "clean": "rm -rf dist",
+    "prepare": "pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run build && pnpm run test"
+  },
+  "keywords": [
+    "antfly",
+    "lite",
+    "embedded",
+    "database",
+    "vector",
+    "search",
+    "koffi",
+    "ffi"
+  ],
+  "author": "Antfly Contributors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/embedded"
+  },
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/embedded#readme",
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsup": "^8.5.1",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "koffi": "^3.3.1"
+  },
+  "engines": {
+    "node": ">=24.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "optionalDependencies": {
+    "@antfly/embedded-darwin-arm64": "workspace:*",
+    "@antfly/embedded-linux-arm64": "workspace:*",
+    "@antfly/embedded-linux-x64": "workspace:*"
+  }
+}

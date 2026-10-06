@@ -2,6 +2,7 @@
   "name": "@antfly/graph",
   "version": "0.0.3",
   "private": false,
+  "license": "Apache-2.0",
   "description": "Force-directed graph component for the Antfly design system",
   "type": "module",
   "sideEffects": [

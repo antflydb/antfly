@@ -5277,7 +5277,7 @@ provide independent cache ownership and device-domain KV admission.
 
 > **Relocated:** The dated September 2026 render-control verification notes
 > that previously lived here (86 lines) are preserved verbatim in
-> [work-log/completed/pdf/render-control-verification-2026-09.md](../work-log/completed/pdf/render-control-verification-2026-09.md).
+> [docs/design/pdf/history/render-control-verification-2026-09.md](../docs/design/pdf/history/render-control-verification-2026-09.md).
 > Durable decisions from it are in
 > [Backpressure and controlled overlap](#backpressure-and-controlled-overlap)
 > in this document.

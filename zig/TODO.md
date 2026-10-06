@@ -11,7 +11,7 @@ None currently tracked as active full-suite failures.
 > **Relocated:** The dated 2026-05-11 test-run status and per-test
 > resolved/superseded failure narrative (71 lines) that previously lived here
 > is preserved verbatim in
-> [work-log/completed/e2e/resolved-failures-2026-05.md](../work-log/completed/e2e/resolved-failures-2026-05.md).
+> [docs/operations/e2e/history/resolved-failures-2026-05.md](../docs/operations/e2e/history/resolved-failures-2026-05.md).
 
 ### Resolved
 

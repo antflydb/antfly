@@ -477,7 +477,7 @@ The feature can be built incrementally.
 - Store extracted units as named artifacts under the parent document.
 - Persist an artifact manifest with source fingerprint and route decision.
 
-> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [work-log/completed/derived-documents/implementation-status-history.md](../work-log/completed/derived-documents/implementation-status-history.md).
+> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [docs/design/derived-documents/history/implementation-status-history.md](../docs/design/derived-documents/history/implementation-status-history.md).
 
 Document extraction (`asset` producer type `document_extraction`, handled internally) resolves sources to a URL (including `data:` URLs) and routes PDF, text, HTML, email, OOXML, ZIP, image, and audio content into canonical units via a public `route_preset` contract: `mixed_files` (default) runs built-in extractors after caller-provided ordered overrides matched by content type, prefix, extension, or magic bytes; `explicit_only` disables fallback and fails closed with a structured `route_type: "unsupported"` manifest when nothing matches. `GET /db/v1/tables/{table}/documents/{key}/artifacts` lists a document's artifact manifests, `GET .../artifacts/{artifact}` inspects one with `detail=summary|raw` (raw requires table-admin under public auth; summary is the auth-enabled default), and `POST .../artifacts/{artifact}:reprocess` forces a synchronous reprocess; all three apply the caller's row filter first and return `404` for hidden documents. A bounded table-range repair endpoint (`POST /db/v1/tables/{table}/artifacts/{artifact}:reprocess`, with `from_key`/`to_key`/`limit`/`shard_cursors`) and a durable reprocess-job resource (`POST .../reprocess-jobs`, `GET .../reprocess-jobs/{job}`, `:advance`, `:cancel`) support resumable per-shard repair at table scale.
 
@@ -488,7 +488,7 @@ Document extraction (`asset` producer type `document_extraction`, handled intern
 - Add full-text and embedding indexing over units/chunks.
 - Keep unchanged units/chunks stable across parent updates.
 
-> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [work-log/completed/derived-documents/implementation-status-history.md](../work-log/completed/derived-documents/implementation-status-history.md).
+> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [docs/design/derived-documents/history/implementation-status-history.md](../docs/design/derived-documents/history/implementation-status-history.md).
 
 Chunk enrichments can set `source_artifact_name` to a document-unit asset, fanning out per unit with unit-scoped chunk keys and chunk payload fields `_parent_doc_key`, `_parent_unit_key`, `_parent_unit_id`, `_source_artifact_name`, `_artifact_name`, `_source_field`. Query responses carry a stable `hierarchy` envelope (`level`, `parent_doc_key`, `parent_unit_id`, artifact identity, nested children) and an `ancestors` envelope for source/unit/chunk hydration, plus first-class `mention` return levels backed by `antfly.resolution_mention.v1` evidence artifacts. `hierarchy.group_by.level: "unit"` returns relevance-ranked units with bounded matching chunks and rejects `order_by`/cursor controls; sequential unit navigation instead returns an opaque `_hierarchy.position` bound to a composite revision over every participating unit artifact/generation/key/fingerprint, returning `409 hierarchy_cursor_stale` with `restart_hierarchy_traversal` guidance on invalidation. Unit fingerprints use the versioned `duf2:` encoding, and the public cursor exposes only a domain-separated commitment, never the reversible storage fingerprint.
 
@@ -499,7 +499,7 @@ Chunk enrichments can set `source_artifact_name` to a document-unit asset, fanni
 - Allow large child ranges to split independently from the parent shard.
 - Make merge plans idempotent and resumable across child shards.
 
-> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [work-log/completed/derived-documents/implementation-status-history.md](../work-log/completed/derived-documents/implementation-status-history.md).
+> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [docs/design/derived-documents/history/implementation-status-history.md](../docs/design/derived-documents/history/implementation-status-history.md).
 
 Document extraction manifests are versioned (`manifest_version: 2`) with a monotonic `generation` and deterministic `child_ranges` (range IDs, key bounds, counts, placement, split-boundary metadata), plus a `merge_plan` (`from_generation`, `to_generation`, `operation_granularity: "unit_fingerprint"`) recording idempotent keep/upsert/delete decisions; an `in_progress` merge plan is durably written before child writes and replaced by the converged plan after commit, so crash replay never skips a generation. Child ranges carry route/ownership metadata (`owner_group_id`, `placement_generation`, `route_status`, `split_eligible`); ranges move from `local_committed`/parent-owned to `remote_committed` on split, dispatched to the new owner group through a durable source-shard outbox. Unit ranges split at 256 units or 1 MiB of unit text (an oversized unit stays intact); chunk ranges split at 256 children with `split_boundary: "chunk"` under large units, per a `range_policy` envelope recorded in the manifest. Manifests also carry a `coverage_plan` stating full-text replay remains `stored_artifact_required` with no suppression until coverage watermarks exist.
 
@@ -509,7 +509,7 @@ Document extraction manifests are versioned (`manifest_version: 2`) with a monot
 - Store mentions and relation evidence as child artifacts.
 - Link evidence to canonical graph nodes and edges.
 
-> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [work-log/completed/derived-documents/implementation-status-history.md](../work-log/completed/derived-documents/implementation-status-history.md).
+> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [docs/design/derived-documents/history/implementation-status-history.md](../docs/design/derived-documents/history/implementation-status-history.md).
 
 Graph/entity extractors can target asset-backed document units and chunk-backed document chunks, not only root artifacts, with per-unit/per-chunk graph materialization state so children don't clobber each other's replay state. Resolver configs declare a `(source_artifact_kind, source_artifact)` subscription (kind `asset` (default), `chunk`, or `any`); resolution replay materializes `antfly.resolution_mention.v1` evidence artifacts keyed by source artifact, resolution artifact, and local mention ID. Canonical mention provenance edges roll up evidence as `target_table`, `mention_count`, and `mention_artifact_keys` metadata — one graph edge per canonical entity regardless of mention count — surfaced through graph path/pattern responses via a public `evidence` envelope.
 
@@ -518,7 +518,7 @@ Graph/entity extractors can target asset-backed document units and chunk-backed 
 - Add DOCX, PPTX, XLSX, image OCR, scanned PDF fallback, archives, and audio transcripts.
 - Track extraction method, OCR use, page/section coordinates, and confidence in provenance metadata.
 
-> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [work-log/completed/derived-documents/implementation-status-history.md](../work-log/completed/derived-documents/implementation-status-history.md).
+> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [docs/design/derived-documents/history/implementation-status-history.md](../docs/design/derived-documents/history/implementation-status-history.md).
 
 Email (`message/rfc822`/`.eml`), OOXML (DOCX/PPTX/XLSX, via an in-memory ZIP reader), ZIP archives, images, and audio all route into `document_units_v1` with deterministic unit types (`email_headers`/`email_body`/`email_part`, `section`/`slide`/`sheet`, `archive_entry`, `image`, audio/transcript) and per-format provenance. Image and audio units without a configured producer stay pending (`method: "ocr_pending"`/`"transcript_pending"`, `extraction_status: "pending_ocr"`/`"pending_transcription"`) until an asset `reader`/`transcriber` producer completes them (`extraction_status: "completed"`, `ocr_used`/`transcript_used: true`); scanned PDF pages without mechanical text use the same pending-OCR contract at page granularity. OCR/transcription producers may return structured JSON (`text`, `confidence`, `bbox`/`ocr_bbox`/`coordinates`, `warning`) normalized into unit/chunk provenance and fingerprints.
 
@@ -599,7 +599,7 @@ Recommended direction:
 - Add reprocess controls such as `POST /tables/{table}/documents/{key}/artifacts/{artifact}:reprocess`.
 - Add table-level repair/replay commands for an artifact across many source rows.
 
-> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [work-log/completed/derived-documents/implementation-status-history.md](../work-log/completed/derived-documents/implementation-status-history.md).
+> **Relocated:** The implementation-status detail that previously lived here is preserved verbatim in [docs/design/derived-documents/history/implementation-status-history.md](../docs/design/derived-documents/history/implementation-status-history.md).
 
 The DB, bound table-source, local public HTTP, generated OpenAPI/httpx, and hosted/provisioned routing layers all expose per-document manifest listing, per-artifact manifest inspection (typed source/fingerprint/range/merge/error summaries, with `summary`/`raw` detail modes — raw is admin/debug-gated under public auth), forced per-artifact reprocess, bounded table-range artifact reprocess, and a durable reprocess-job envelope for long-running repair; per-document routes enforce source-document row filters first. Failed extraction writes a manifest generation with `route_type: "error"`, `merge_status: "failed"`, and typed `last_error_code`/`last_error_message`; a later successful extraction advances the generation and clears the error. Table-range repair and reprocess-job responses carry per-shard continuation cursors, cumulative counts, phase, and completion status so callers resume shard-local progress instead of collapsing it into one global key.
 

@@ -101,7 +101,7 @@ Release tags:
 - `go/pkg/operator/v*` — integrated Antfly operator container build
 ## Secrets Management
 
-Never store credentials in config. Use `${secret:...}` keystore or env vars. See `docs/secrets.md`.
+Never store credentials in config. Use `${secret:...}` keystore or env vars. See `docs/reference/secrets.md`.
 
 ## Common Patterns
 

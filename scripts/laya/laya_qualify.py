@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +21,7 @@
 """Capture released-checkpoint accuracy and numerical references on pinned data.
 
 Consumes the prepared Antfly model, upstream common.py, and local dataset files.
-Dataset revisions and downloads are documented in docs/design/laya-qualification.md.
+Dataset revisions and downloads are documented in docs/design/inference/history/laya/qualification.md.
 No generated labels, model downloads, or remote code loading occur here.
 """
 

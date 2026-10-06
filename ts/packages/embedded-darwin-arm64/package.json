@@ -1,0 +1,26 @@
+{
+  "name": "@antfly/embedded-darwin-arm64",
+  "version": "0.0.0",
+  "description": "Apache-2.0 Antfly Lite and Inference native artifacts for darwin-arm64",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/embedded-darwin-arm64"
+  },
+  "files": [
+    "include",
+    "lib",
+    "share",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSES"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ]
+}

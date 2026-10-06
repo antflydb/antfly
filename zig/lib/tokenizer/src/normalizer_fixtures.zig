@@ -1,3 +1,18 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // Generated from Tokenizers 0.21.4 normalization fixtures.
 // Published tokenizer SHA256: cbc8ae6037812709c9c26f2a160f8dc48b0440bcb79c8141804259ae2d6adac3
 pub const tiny_tokenizer_json = "{\"version\":\"1.0\",\"truncation\":null,\"padding\":null,\"added_tokens\":[{\"id\":11,\"content\":\"[SEP_TEXT]\",\"single_word\":false,\"lstrip\":false,\"rstrip\":false,\"normalized\":false,\"special\":true}],\"normalizer\":{\"type\":\"Sequence\",\"normalizers\":[{\"type\":\"Replace\",\"pattern\":{\"Regex\":\"\\\\s{2,}|[\\\\n\\\\r\\\\t]\"},\"content\":\" \"},{\"type\":\"NFC\"},{\"type\":\"Strip\",\"strip_left\":false,\"strip_right\":true}]},\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":[{\"type\":\"Metaspace\",\"replacement\":\"▁\",\"prepend_scheme\":\"always\",\"split\":true}]},\"post_processor\":null,\"decoder\":null,\"model\":{\"type\":\"Unigram\",\"unk_id\":0,\"vocab\":[[\"<unk>\",0.0],[\"▁\",-1.0],[\"▁é\",-0.2],[\"▁café\",-0.2],[\"▁a\",-0.3],[\"a\",-1.0],[\"b\",-1.0],[\"▁b\",-0.3],[\"▁x\",-0.3],[\"x\",-1.0],[\"é\",-0.5]],\"byte_fallback\":false}}";

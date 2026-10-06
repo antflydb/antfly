@@ -434,18 +434,15 @@ Table restore jobs are visible to administrators of that table; cluster restore
 jobs require cluster administration. Cancellation is observed at table-publication
 boundaries.
 
-The canonical and convenience forms are equivalent:
+The ELv2 standalone server serves Lite database files:
 
 ```console
 antfly standalone --storage-engine lite --storage-path ./data.antfly.aflite
-antfly lite serve ./data.antfly.aflite --fsync true --config production.json
 ```
 
-Both start the normal standalone metadata, data, inference, SQL, and public
-HTTP runtime. `antfly lite serve` is only an artifact-oriented constructor; it
-atomically creates the file when it does not exist and opens it otherwise. All
-other standalone options are forwarded; storage path/engine and listen address
-remain owned by the Lite constructor so conflicting duplicates fail closed.
+This starts the normal standalone metadata, data, inference, SQL, and public
+HTTP runtime. The Apache Lite CLI exposes file operations; database HTTP serving
+belongs to standalone.
 There is no storage-specific HTTP namespace. Clients use the same `/db/v1`
 contract regardless of whether standalone storage is `local` or `lite`.
 

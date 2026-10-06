@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,17 +24,19 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/docsaf"
-	"github.com/antflydb/antfly/go/pkg/lite"
+	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
-// corpusIncludes selects Antfly's own design docs and work log, relative to
+// corpusIncludes selects Antfly's own design docs, plans, and history, relative to
 // the repository root (the -repo flag).
 var corpusIncludes = []string{
 	"zig/*.md",
 	"zig/pkg/**/*.md",
 	"zig/lib/**/*.md",
 	"docs/design/**",
-	"work-log/**/*.md",
+	"docs/operations/**/history/**/*.md",
+	"docs/reference/**/history/**/*.md",
+	"docs/plans/**/*.md",
 }
 
 // corpusExcludes trims generated, vendored, and non-prose files out of the
@@ -47,7 +50,7 @@ var corpusExcludes = []string{
 }
 
 // docSection is dogfood's document shape: one row per markdown section,
-// classified as a design doc or a work-log entry by path prefix. This is
+// classified as design, plan, or history by path. This is
 // deliberately narrower than docsaf.DocumentSection.ToDocument(): dogfood
 // wants a stable, dogfood-specific field set (title/heading_path/body/
 // source/kind) rather than docsaf's generic content-source document shape.
@@ -60,11 +63,14 @@ type docSection struct {
 	Kind        string
 }
 
-// docKind classifies a corpus-relative path as a design doc or a work-log
-// entry. Everything under work-log/ is "work-log"; everything else in the
-// corpus (zig/*.md, zig/pkg/**, zig/lib/**, docs/design/**) is "design".
+// docKind classifies a corpus-relative path as design, plan, or history.
+// Historical records retain the "work-log" kind for existing queries; proposed
+// work is "plan" and living subsystem documentation is "design".
 func docKind(relPath string) string {
-	if strings.HasPrefix(relPath, "work-log/") {
+	if strings.HasPrefix(relPath, "docs/plans/") {
+		return "plan"
+	}
+	if strings.HasPrefix(relPath, "docs/") && strings.Contains(relPath, "/history/") {
 		return "work-log"
 	}
 	return "design"
@@ -133,19 +139,19 @@ const ingestBatchSize = 200
 
 // ingestSections writes docSections to db in bounded batches, returning the
 // number of documents written.
-func ingestSections(db *lite.DB, sections []docSection) (int, error) {
+func ingestSections(db *embedded.DB, sections []docSection) (int, error) {
 	written := 0
 	for start := 0; start < len(sections); start += ingestBatchSize {
 		end := min(start+ingestBatchSize, len(sections))
 		batch := sections[start:end]
 
-		writes := make([]lite.WriteIntent, 0, len(batch))
+		writes := make([]embedded.WriteIntent, 0, len(batch))
 		for _, section := range batch {
 			value, err := json.Marshal(section.toDocument())
 			if err != nil {
 				return written, fmt.Errorf("marshal %s: %w", section.Key, err)
 			}
-			writes = append(writes, lite.WriteIntent{
+			writes = append(writes, embedded.WriteIntent{
 				Key:   section.Key,
 				Value: value,
 			})

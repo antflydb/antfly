@@ -17,7 +17,7 @@ the design this implements.
 > **Relocated:** The dated implementation log (September 2026) documenting the
 > experiments, qualification rounds, and the final pre-refinement 1M repeat
 > qualification that led to this design is preserved verbatim in
-> [work-log/completed/vector-store/experiments-2026-09.md](../work-log/completed/vector-store/experiments-2026-09.md).
+> [docs/design/vector-store/history/experiments-2026-09.md](../docs/design/vector-store/history/experiments-2026-09.md).
 > Durable decisions from it are folded into the Objective, Ownership, Table
 > setting, and Reads/updates/deletion sections below.
 

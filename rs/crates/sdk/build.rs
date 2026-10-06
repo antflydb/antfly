@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +17,7 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    let spec_path = Path::new("../../../openapi.yaml");
+    let spec_path = Path::new("openapi.yaml");
     println!("cargo::rerun-if-changed={}", spec_path.display());
 
     let yaml = fs::read_to_string(spec_path).expect("failed to read OpenAPI spec");

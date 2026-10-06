@@ -339,7 +339,7 @@ segment/codec/allocation optimizations described in Search Execution Design belo
 are implemented, in `pkg/antfly-embedded/src/local/search/scorer.zig` and
 `pkg/antfly-embedded/src/local/section/inverted.zig`.
 
-> **Relocated:** The dated implementation-progress log that previously lived here (2,310 lines, 2026-07-12 through 2026-07-16) is preserved verbatim in [work-log/completed/full-text/implementation-progress-2026-07.md](../work-log/completed/full-text/implementation-progress-2026-07.md). Durable decisions from it are in Search Execution Design, Decisions, and Design Constraints in this document.
+> **Relocated:** The dated implementation-progress log that previously lived here (2,310 lines, 2026-07-12 through 2026-07-16) is preserved verbatim in [docs/design/full-text/history/implementation-progress-2026-07.md](../docs/design/full-text/history/implementation-progress-2026-07.md). Durable decisions from it are in Search Execution Design, Decisions, and Design Constraints in this document.
 
 ### Capabilities already present
 

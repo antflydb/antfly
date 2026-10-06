@@ -16,7 +16,7 @@ behavior.
 
 ### Implementation checkpoint
 
-> **Relocated:** The route-by-route implementation-checkpoint changelog that previously lived here (333 lines) is preserved verbatim in [work-log/completed/http-runtime/implementation-checkpoint.md](../work-log/completed/http-runtime/implementation-checkpoint.md). Durable decisions from it are folded into the deadline/cancellation, HTTP transport runtime, and continuous-HA sections below; see also [`Implemented migration sequence`](#implemented-migration-sequence).
+> **Relocated:** The route-by-route implementation-checkpoint changelog that previously lived here (333 lines) is preserved verbatim in [docs/operations/http-runtime/history/implementation-checkpoint.md](../docs/operations/http-runtime/history/implementation-checkpoint.md). Durable decisions from it are folded into the deadline/cancellation, HTTP transport runtime, and continuous-HA sections below; see also [`Implemented migration sequence`](#implemented-migration-sequence).
 
 The legacy public transport migration is complete on this branch: public test
 fixtures exercise direct operations or owned real-`httpx` listeners, and no

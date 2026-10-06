@@ -248,7 +248,6 @@ antfly lite import app.aflite --from app.afb
 antfly lite check app.aflite
 antfly lite compact app.aflite
 antfly lite vacuum app.aflite
-antfly lite serve app.aflite --addr 127.0.0.1:8080 --config production.json
 ```
 
 A Lite database is provisioned with the default `full_text_index_v0`
@@ -280,14 +279,16 @@ For native `.aflite`, the public status contract should report
 native index engine is being completed is an implementation detail and must not
 appear as the public index layout for native Lite files.
 
-`antfly lite serve` is an artifact-oriented convenience constructor for the
-full standalone runtime. It serves the normal `/db/v1` API and is equivalent to
-`antfly standalone --storage-engine lite --storage-path <file>`. Lite does not
-define a storage-specific HTTP namespace. The convenience command binds only
-to loopback hosts. It forwards the complete standalone option surface,
-including configuration, authentication, TLS, secrets, inference, and
-connections. It owns `--storage-engine`, `--storage-path`, `--host`, and
-`--port`; conflicting duplicates fail closed.
+The Apache Lite CLI and embedded engine provide local file and in-process
+operations. Database HTTP serving uses the ELv2 standalone binary:
+
+```sh
+antfly standalone --storage-engine lite --storage-path app.aflite --config production.json
+```
+
+Standalone exposes the normal `/db/v1` API, with its configuration,
+authentication, TLS, secrets, inference, and connection options. Lite does not
+define a storage-specific HTTP namespace.
 
 Network backup and restore always use named, capability-scoped `external_io`
 connections. This includes `file://`, whose URI path is logical and resolved
@@ -338,13 +339,12 @@ orphan its documents or indexes. Embedded root databases use the deterministic
 document-identity namespace of that future `default` table from creation, so
 adoption is O(1) rather than rewriting every live document; an identity mismatch
 fails closed. Subsequent standalone tables use isolated
-namespaces in the same artifact. This makes `lite batch` followed by `lite
-serve` a genuine interoperability path rather than two unrelated databases.
+namespaces in the same artifact. This allows a file populated by `lite batch` to be served by standalone.
 After that adoption, embedded data commands continue to address the `default`
 table through the persisted alias. A file created directly by standalone has
 no unambiguous root table, so root-oriented `lite batch`, query, schema, index,
 enrichment, import, promote, and compact operations fail closed and direct the
-user to `lite serve` plus `/db/v1`. Artifact `status` and the physical `check`,
+user to `standalone --storage-engine lite --storage-path` plus `/db/v1`. Artifact `status` and the physical `check`,
 `vacuum`, and `snapshot` operations remain available.
 
 The equivalent tagged configuration is:
@@ -801,9 +801,8 @@ unexpectedly start sending data to a network provider.
 #### Local Embedded Inference
 
 Local inference is built in, not optional packaging: every `libantfly`/
-`antfly lite` build embeds the standalone inference runtime in-process, the
-same as the `antfly` executable (see COMPILATION.md's "C API composition"
-section). There is no separate base/full build distinction -- `zig build
+`antfly-lite` build links the inference runtime (see COMPILATION.md's
+"C API composition" section). There is no separate base/full build distinction -- `zig build
 capi` always links the inference archive (2026-09-17 product decision: Lite
 hosts get local inference without a separate runtime, at the cost of a much
 larger shared library).
@@ -815,47 +814,36 @@ Adding an `embeddings` index whose `embedder` (or chunker/extractor producer)
 uses `"provider": "antfly"` with no `api_url` runs against that embedded
 provider instead of failing or requiring a remote URL -- `antfly lite
 run-until-idle app.aflite` drains the resulting enrichment work locally, with
-no network calls. Application embedding (see `go/pkg/lite/README.md`
+no network calls. Application embedding (see `go/pkg/embedded/README.md`
 for the Go binding) gets the same embedded behavior automatically by linking
 the standard `libantfly` -- no separate library or extra link flags.
 
 Models are still auto-discovered the same way as `antfly inference pull`,
 under `~/.antfly/inference/models/`.
 
-**Worker process.** GPU-hosted and driver-backed backends (Metal, CUDA, ONNX,
-PJRT) run model construction and, for Metal/CUDA/PJRT, execution itself in a
-separate, replaceable child process (`<worker executable> inference
-_worker`), not in the host process -- see
-`BackendRuntime.requiresProcessIsolation` in
-`zig/pkg/inference/src/backends/backends.zig`. This is crash containment, not
-an implementation accident: an unabortable driver call or a model load that
-corrupts GPU state can only be recovered by killing and respawning the
-process that made it, and that must never be the process embedding
-`libantfly`. Worker placement is decided per build, not per model: when any
-process-isolated backend is compiled in (Metal is on by default on macOS), the
-worker starts when a local-runtime handle opens and all local inference runs
-there, CPU models included. Only builds without those backends run inference
-in-process.
+**In-process execution.** The local database provider used by `libantfly`
+and Lite CLI enrichment explicitly sets `process_isolation: false`. All
+backends, including Metal, CUDA, ONNX, and PJRT, therefore run in the host
+process. `ANTFLY_INFERENCE_WORKER` is not used by this provider, and opening
+an embedded inference handle does not require a worker executable. The
+private worker bundled with the Apache Embedded archive serves CLI hosts;
+Python/npm packages omit it because library calls do not use it.
 
-The `antfly` CLI resolves the worker by re-executing itself (`argv[0]` names
-the `antfly` binary the user launched, which understands `inference
-_worker`). A library host has no such self -- `argv[0]` is the Go test
-binary, `examples/dogfood`, or whatever else linked `libantfly` -- so the
-runtime resolves the worker executable in this order:
+Once a call enters a GPU driver, a deadline or close cannot interrupt it;
+cancellation takes effect after the call returns. A driver fault can
+terminate the embedding application. Keep inference resource budgets and
+concurrency bounded. The binding READMEs describe the same execution contract.
 
-1. `ANTFLY_INFERENCE_WORKER`, an environment variable naming the worker
-   executable directly (typically the path to an `antfly` binary).
-2. The image this code was loaded from, via `dladdr`: for the statically
-   linked `antfly` executable this is itself (unchanged CLI behavior); for a
-   shared `libantfly`/`libantfly.dylib`, the runtime looks for a sibling
-   `antfly` binary in the same directory.
-3. `antfly` on `PATH`.
-
-If none of these resolve, model construction on a process-isolated backend
-fails with a clear error naming `ANTFLY_INFERENCE_WORKER`. Set that variable
-(or ship an `antfly` binary next to `libantfly`, or put one on `PATH`) when
-embedding Lite in a host that is not the `antfly` binary itself and needs
-Metal/CUDA/ONNX/PJRT models.
+**Server worker isolation.** Server hosts that enable process isolation run
+local inference in a replaceable child process when a compiled backend
+requires it; CPU models also run there in that configuration. This policy
+belongs to the server host, rather than the embedded database provider.
+The worker resolver uses `ANTFLY_INFERENCE_WORKER` as an explicit override,
+then the executable image itself for a statically linked CLI, or sibling
+`antfly-inference-worker` and `antfly-lite` executables for a shared library,
+then those Apache executable names on `PATH`. It does not automatically
+fall back to the ELv2 `antfly` executable. Library users do not need to ship
+an ELv2 server to use embedded inference.
 
 #### Manual Maintenance
 
@@ -958,7 +946,6 @@ antfly lite vacuum
 antfly lite backup
 antfly lite restore
 antfly lite promote
-antfly lite serve
 ```
 
 The CLI should accept JSON request files that match the public API contracts.
@@ -1046,7 +1033,7 @@ query-visible results should match within documented index rebuild semantics.
 
 - Added the `antfly lite` command group and embedded database operations.
 - Added full standalone composition through `--storage-engine lite` and
-  `--storage-path`, with `lite serve` as an equivalent constructor.
+  `--storage-path`.
 - Added multi-table key/index namespaces and same-file metadata persistence.
 - Keep `~/.antfly/lite/` for CLI registry data, caches, temporary workspaces,
   and internal developer databases only.
@@ -1078,7 +1065,7 @@ query-visible results should match within documented index rebuild semantics.
 - Expose stable error-code names and descriptions for language bindings.
 - Provide a buffer free-and-zero helper for generated bindings while retaining
   the raw pointer/length free function.
-- Add Go as the first post-Zig/C binding in `go/pkg/lite`, backed by the
+- Add Go as the first post-Zig/C binding in `go/pkg/embedded`, backed by the
   stable C ABI and gated C-library smoke tests.
 - Freeze the Lite open options and capabilities response.
 

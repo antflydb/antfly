@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +22,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/antflydb/antfly/go/pkg/lite"
+	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
 type document struct {
@@ -58,7 +59,7 @@ func main() {
 		log.Fatalf("marshal document: %v", err)
 	}
 
-	if err := db.Batch([]lite.WriteIntent{{
+	if err := db.Batch([]embedded.WriteIntent{{
 		Key:   "doc:lite-go",
 		Value: body,
 	}}, 1); err != nil {
@@ -92,18 +93,18 @@ func main() {
 	}
 	fmt.Printf("wrote portable backup: %s\n", *backupPath)
 
-	check, err := lite.CheckFile(*dbPath)
+	check, err := embedded.CheckFile(*dbPath)
 	if err != nil {
 		log.Fatalf("check Lite file: %v", err)
 	}
 	fmt.Printf("check: valid=%t size=%d compact_size=%d\n", check.Valid, check.FileSize, check.CompactSize)
 }
 
-func openOrCreateLite(path string) (*lite.DB, error) {
+func openOrCreateLite(path string) (*embedded.DB, error) {
 	if _, err := os.Stat(path); err == nil {
-		return lite.Open(path)
+		return embedded.Open(path)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	return lite.Create(path)
+	return embedded.Create(path)
 }

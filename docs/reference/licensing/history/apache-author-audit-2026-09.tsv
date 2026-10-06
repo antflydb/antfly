@@ -1,0 +1,40 @@
+commit	authored_at	author	email	subject
+20fb9f572acc083e92fbad2bc8a0b6b2e9bf3956	2026-09-17T20:33:34-07:00	huckleberryseed	andreasontrace@gmail.com	Allow OpenRouter retrieval agent tools (#792)
+04df69feb22883aa07e9554a51b020b76d8824ae	2026-09-16T11:40:07-07:00	huckleberryseed	andreasontrace@gmail.com	add openrouter as a generator provider (#763)
+4da9b1cc6901c869d41770b55b9209cc4bc888c7	2026-09-15T20:50:11-07:00	huckleberryseed	andreasontrace@gmail.com	fix secret timestamps (#759)
+7cea82910797e1dc37c5f79a96cfaf3313ee9153	2026-09-01T15:00:24-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	docs(operator): link to the API reference overview and the SDKs page
+08da1b7256b85d7813948cb5c8b28a45063dcaef	2026-08-26T10:13:31-07:00	Andrew Batz	andrew.batz@visitingmedia.com	fix(inference): preserve preload registry variants
+5ff02bb2bd271885193e3fe24f5f1047ba608c2e	2026-08-26T10:13:31-07:00	Andrew Batz	andrew.batz@visitingmedia.com	fix(inference): correct Bedrock request construction
+c16fc65ce12db335b0d28db60d2b005fafac57da	2026-08-26T10:13:31-07:00	Andrew Batz	andrew.batz@visitingmedia.com	fix(cli): honor transient restore polling responses
+cce0bc3d41278bba1fbf087b0703e21e5e049279	2026-08-26T10:13:31-07:00	Andrew Batz	andrew.batz@visitingmedia.com	fix(httpx): return 413 for oversized request bodies
+03272ffb2803777e4e2c14f8511872912c055535	2026-08-26T03:12:00-04:00	Andrew Batz	andrew.batz@visitingmedia.com	fix(operator): advertise stable data pod routes
+5d2ca00c5a026dc6bf08ea9e4150b370a0169d53	2026-07-14T11:26:16-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): allow exact-gated target seed descriptors
+4c69d90d999c9b99e49553acc2c3fbc271a54b2f	2026-07-14T11:18:03-07:00	Codex (GPT-5)	codex@openai.com	feat(ha): add fail-closed runtime suspension policy
+b387f6ca3c62d455befbf6322928cbc360acb84e	2026-07-14T11:15:57-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): include derived journal in logical snapshots
+92d7a22ceaf8705f1acdca488b3152748098e871	2026-07-14T11:12:06-07:00	Codex (GPT-5)	codex@openai.com	feat(ha): verify activated seed before runtime readiness
+ad0149e6e8c30273cba0622ac95adaec84a514bb	2026-07-14T11:08:42-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): snapshot logical runtime state for seeds
+8f3b3b3f5a531c6264924ac0094b3d828167a64e	2026-07-14T11:04:39-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): validate shared topology annotation
+2fe2dececc2f345a1e60c077a0d6aaf73ef7b86b	2026-07-14T10:59:15-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): preserve explicit startup suspension
+d6abef7b09f0e886f1f22c3d38d9ce87a838f293	2026-07-14T10:58:25-07:00	Codex (GPT-5)	codex@openai.com	feat(ha): fail closed on exact seed activation receipt
+0ccc3b438ab5b0ceae790e697b4db2a5018ec68b	2026-07-14T10:48:23-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): publish catalog and gate state atomically
+d644c4de38b8ba2685cbe98e3c33aa27530e2645	2026-07-14T10:42:10-07:00	Codex (GPT-5)	codex@openai.com	test(ha): expose catalog and gate races
+927a5109bda081188802be1db72f9faa86873acb	2026-07-14T10:36:29-07:00	Codex (GPT-5)	codex@openai.com	feat(ha): wire runtime-owned seed capture activation
+143af27647f2ee6f4be3e2c2a1689d25893191e2	2026-07-14T09:39:13-07:00	Codex (GPT-5)	codex@openai.com	test(ha): require offline seed activation before slot streaming
+a1bc701f078ed15d43264383302f0f1def8bf1e1	2026-07-14T09:38:03-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): serialize seed capture with durable mutations
+f80a9a59f7409bb1dd4f755ad74df91ebcd0c054	2026-07-14T09:32:27-07:00	Codex (GPT-5)	codex@openai.com	test(ha): expose capture versus wal commit race
+79e6b506632e1d10d7555d4b7a8059a3e896d5d0	2026-07-14T09:30:25-07:00	Codex (GPT-5)	codex@openai.com	feat(ha): add global seed capture mutation barrier
+8c65aad1abb0c635062403a10b939c843634d13c	2026-07-14T09:23:47-07:00	Codex (GPT-5)	codex@openai.com	test(operator): require runtime-owned HA seed workflow
+5cdf80b285a485cbf33743a418b005f09f479ffd	2026-07-14T09:00:42-07:00	Codex (GPT-5)	codex@openai.com	fix(ha): make restore completion query ready
+62306809ca017acd76d698e82ee314cc0094ee29	2026-07-14T08:49:06-07:00	Codex (GPT-5)	codex@openai.com	test(ha): expose restore repair completion races
+69e7a884ef9920c0f93d50aeb6ec23c16ec1dbff	2026-07-06T13:37:40-07:00	stinkbugaf	stinkbugaf@users.noreply.github.com	Fix document extraction state recovery
+40c9460040e8b832e16c7e528398e1c62b6ddb96	2026-07-06T08:57:49-07:00	stinkbugaf	stinkbugaf@users.noreply.github.com	Fix thin replay delete hints for managed indexes
+e37fa2633357eb5acd4ed16303409441c41ef6c7	2026-07-04T06:47:56-07:00	stinkbugaf	stinkbugaf@users.noreply.github.com	Wire platform env into ML modules
+cc5d30f7b34c56f076de87d667e698110ea5fb7b	2026-07-04T05:52:18-07:00	stinkbugaf	stinkbugaf@users.noreply.github.com	Use platform env in ML fuse pass
+82d0628ec5a0c1512af39661ad8601cb0051f0d4	2026-07-03T16:10:48-07:00	stinkbugaf	stinkbugaf@users.noreply.github.com	Handle unsupported OCR backend paths
+13d9f6a40685822e94cd915c4d1a0e19ac348c51	2026-06-26T22:25:57-07:00	stinkbugaf	stinkbugaf@users.noreply.github.com	Handle empty scheduled text merges
+17bee652faa52150729bb74b8d0e38c51d4de8bc	2026-06-14T06:52:42-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	Preserve document enrichment recovery state
+b35c60bef816124b459ba618be0ce15d1d1e21ae	2026-06-14T06:34:46-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	Tolerate malformed PDF content streams
+66da5198e848f2623997da0974ddeeb67dad2800	2026-06-10T10:05:43-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	Pin later-retired segments for holders of older snapshots
+02ff9ad43106732c0c2db8b322025b3e9c06781d	2026-06-09T17:01:14-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	Fix acquireSnapshot TOCTOU race against snapshot publish
+a83f04d6afe7cdac363178bca3a3ef1fa1182313	2026-06-09T16:26:42-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	Fix HBC delete panic on stale parent links
+dd175ff7bf1db231dd8dc64dc24c6a65fc46202e	2026-06-09T14:23:53-07:00	stinkbugaf	272596736+stinkbugaf@users.noreply.github.com	Quarantine broken indexes instead of failing the table open

@@ -1,5 +1,11 @@
 # Local database source separation
 
+The structural extraction and physical separation are merged into main. License
+preservation notes below describe those refactor PRs; #893 applies the Apache
+transition. Current ownership and licensing are documented in
+[embedded source ownership](../design/embedded-source-ownership.md) and
+[LICENSING.md](../../LICENSING.md).
+
 This refactor targets main before the Lite/inference licensing and release PR
 (#893). Existing source licenses remain unchanged; moved files keep their
 original headers. License-header tooling records ELv2 files that moved into

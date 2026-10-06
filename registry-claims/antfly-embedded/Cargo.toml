@@ -1,0 +1,11 @@
+[package]
+name = "antfly-embedded"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Name reservation for the forthcoming Antfly embedded Rust binding"
+repository = "https://github.com/antflydb/antfly"
+readme = "README.md"
+publish = ["crates-io"]
+
+[workspace]

@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Compile lake, public C API, and browser artifacts without server implementations."""
 
@@ -41,9 +42,12 @@ def stage_sources(repository: Path, destination: Path) -> int:
             "zig",
             "specs",
             "scripts",
-        } and not relative.as_posix().startswith(
-            "ts/packages/design-system/src/fonts/"
-        ):
+            "LICENSES",
+        } and relative.as_posix() not in {
+            "LICENSE",
+            "LICENSING.md",
+            "THIRD_PARTY_NOTICES.md",
+        }:
             continue
         source = repository / relative
         if not source.is_file():
@@ -141,6 +145,11 @@ def main() -> None:
                 *flags,
             ],
             cwd=stage / "zig",
+            check=True,
+        )
+        subprocess.run(
+            [args.zig, "build", "-Dmetal=false", *flags],
+            cwd=stage / "zig/pkg/inference",
             check=True,
         )
         smoke_lite(stage)

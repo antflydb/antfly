@@ -16,7 +16,7 @@ Constructors return artifacts and runs; entrypoints publish target names and con
 aggregates. Native and WASM configurations remain separate. Runtime archive boundaries, link order, and
 test selections belong to their owners; moving a definition does not change them.
 
-The unified browser runtime in `pkg/antfly-embedded/build/wasm.zig` owns a fixed WASM32
+The unified browser runtime in `build_support/embedded/wasm.zig` owns a fixed WASM32
 ReleaseSafe configuration, including HTTPX, JSON, OpenAPI, and storage modules.
 Native optimization, target, and storage flags do not configure those modules.
 Native and WASM OpenAPI modules use one wiring constructor with separate module
@@ -573,3 +573,10 @@ the separate HTTP-linked serving harness. To select the navigation regressions:
 ```sh
 zig build antfly-retrieval-test -Doptimize=fast -- --test-filter 'retrieval graph navigation'
 ```
+
+The full suite also runs `tools/check_embedded_zig_package.py`. It constructs
+an immutable Apache source archive, resolves it as a URL/hash dependency in
+an external consumer, runs local DB/SQL/native inference checks, and compiles
+the WASM product. This checks the release package shape without a checkout
+path dependency. Use `--working-tree` for development changes and
+`--native-only` when iterating on native build composition.

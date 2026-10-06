@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +22,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/antflydb/antfly/go/pkg/lite"
+	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
 // searchHitHierarchy is the ancestry envelope QueryHit carries for a chunk or
@@ -101,7 +102,7 @@ const (
 // enrichment worker never started for a remote-provider handle -- see the
 // dogfood README's "Known limitations" section), runQuery falls back to
 // full-text-only search rather than failing outright.
-func runQuery(db *lite.DB, text string, limit int) error {
+func runQuery(db *embedded.DB, text string, limit int) error {
 	// Antfly embeds the semantic_search text itself through the index's
 	// configured embedder (the handle's in-process runtime, or the index's
 	// api_url provider), exactly like the server does. The match form scores
@@ -211,7 +212,7 @@ func runQuery(db *lite.DB, text string, limit int) error {
 // traverseKnowledgeGraph runs a both-direction breadth-first traversal from
 // startKey over the knowledge graph index and returns the reached node keys
 // (decoded from base64), including nodes at every depth up to maxDepth.
-func traverseKnowledgeGraph(db *lite.DB, startKey string, maxDepth uint32) ([]string, error) {
+func traverseKnowledgeGraph(db *embedded.DB, startKey string, maxDepth uint32) ([]string, error) {
 	req := traverseEdgesRequest{
 		IndexName:        knowledgeGraphIndex,
 		StartKeyB64:      base64.StdEncoding.EncodeToString([]byte(startKey)),
@@ -272,7 +273,7 @@ type neighborhoodFailures struct {
 // maxNeighborhoodEdges, and read/decode failures are counted instead of
 // silently swallowed. Iteration is sorted so output and truncation are
 // deterministic.
-func collectGraphNeighborhood(db *lite.DB, nodeKeys map[string]bool) ([]string, []resolvedEdge, neighborhoodFailures) {
+func collectGraphNeighborhood(db *embedded.DB, nodeKeys map[string]bool) ([]string, []resolvedEdge, neighborhoodFailures) {
 	entitySet := make(map[string]bool)
 	edgeSeen := make(map[string]bool)
 	var edges []resolvedEdge
@@ -347,7 +348,7 @@ func isDocumentKey(key string) bool {
 // `label/slug` keys (e.g. component/metadata_server), so a bare name like
 // "metadata server" is slugified and probed under every extraction label; an
 // exact key is used as-is.
-func runEntity(db *lite.DB, name string) error {
+func runEntity(db *embedded.DB, name string) error {
 	candidates := entityKeyCandidates(name)
 	for _, key := range candidates {
 		edges, err := entityEdges(db, key)
@@ -372,7 +373,7 @@ func runEntity(db *lite.DB, name string) error {
 	return nil
 }
 
-func entityEdges(db *lite.DB, key string) ([]graphEdge, error) {
+func entityEdges(db *embedded.DB, key string) ([]graphEdge, error) {
 	raw, err := db.EdgesJSON(knowledgeGraphIndex, key, "", edgeDirectionBoth)
 	if err != nil {
 		return nil, err

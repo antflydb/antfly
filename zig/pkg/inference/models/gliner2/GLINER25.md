@@ -501,7 +501,7 @@ elements) even while remaining within this row's reviewed geometry bounds
 to, the qualification table. Both are documented in detail, with the exact
 fix needed, in
 `gliner25-longdoc-handoff.md` (scratchpad; not committed, since the fix
-lives in `zig/pkg/antfly/**`/`go/pkg/lite`, outside this file's
+lives in `zig/pkg/antfly/**`/`go/pkg/embedded`, outside this file's
 ownership).
 
 ### 10. Follow-up: long-document throughput (window size, batching, precision)

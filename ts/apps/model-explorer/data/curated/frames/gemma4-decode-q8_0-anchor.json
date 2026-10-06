@@ -137,6 +137,6 @@
     }
   ],
   "source": {
-    "path": "work-log/completed/inference/metal/status-history.md"
+    "path": "docs/design/inference/history/metal/status-history.md"
   }
 }

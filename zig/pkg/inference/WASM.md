@@ -1138,7 +1138,7 @@ passes for both profiles.
 
 > **Relocated:** The detailed bullet-by-bullet refactor log behind this
 > status (31 lines) is preserved verbatim in
-> [work-log/completed/inference/wasm-status-history.md](../../../work-log/completed/inference/wasm-status-history.md).
+> [docs/design/inference/history/wasm-status-history.md](../../../docs/design/inference/history/wasm-status-history.md).
 
 ### Initial Refactor Slice
 
@@ -1225,7 +1225,7 @@ buffers today, so this is the first seam, not the full architecture.
 
 > **Relocated:** The detailed bullet-by-bullet implementation log behind
 > this status (23 lines) is preserved verbatim in
-> [work-log/completed/inference/wasm-status-history.md](../../../work-log/completed/inference/wasm-status-history.md).
+> [docs/design/inference/history/wasm-status-history.md](../../../docs/design/inference/history/wasm-status-history.md).
 
 ## Electron Shell
 

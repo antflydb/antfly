@@ -1,0 +1,4 @@
+# Apache-2.0 first-party files outside the Apache package roots.
+# Package roots are declared in scripts/source_license_roots.json; server sources have no exceptions.
+zig/embedded.build.zig
+zig/pdf_standard_fonts.zig

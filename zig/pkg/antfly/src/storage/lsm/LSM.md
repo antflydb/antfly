@@ -359,7 +359,7 @@ ResourceManager pressure.
 
 > **Relocated:** The dated 2026-06-02 sampled baseline evidence (48 lines) that
 > previously lived here is preserved verbatim in
-> [work-log/completed/lsm-writes/baseline-evidence-2026-06.md](../../../../../../work-log/completed/lsm-writes/baseline-evidence-2026-06.md).
+> [docs/design/lsm-writes/history/baseline-evidence-2026-06.md](../../../../../../docs/design/lsm-writes/history/baseline-evidence-2026-06.md).
 > Run the commands in Baseline Commands above to collect current numbers.
 
 ### Read And Scan Work

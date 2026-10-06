@@ -1,10 +1,13 @@
 # antfly-sdk
 
 Async Rust client for the Antfly API. Crate `antfly-sdk`, edition 2024.
-Licensed Apache-2.0 (see the [root README](../../../README.md#license)).
+Licensed Apache-2.0 (see [LICENSE](LICENSE)).
 
 The client is generated at build time by [Progenitor](https://github.com/oxidecomputer/progenitor)
-from the root `openapi.yaml` (see `build.rs`). Before generation, `build.rs`
+from the crate-local `openapi.yaml` (see `build.rs`). This bundled input is
+synchronized from the root public spec by `make build-docs` / `make generate`,
+and SDK CI checks that the two files match. Published crates therefore build
+without a repository checkout. Before generation, `build.rs`
 preprocesses the spec (stripping non-JSON media types, unifying error
 response schemas, normalizing mutation success responses, and marking
 OpenAPI code fences as `text` so they aren't treated as Rust doctests) and
@@ -53,6 +56,6 @@ completed result or a pending commit decode into `MutationOutcome<T>`
 
 ## Used by
 
-[`rs/crates/pgaf`](../pgaf) depends on `antfly-sdk` for its generated types
+[`antfly-postgres`](../postgres) depends on `antfly-sdk` for its generated types
 (e.g. `QueryResponses`, `QueryHit`) while keeping its own blocking HTTP
 client, since Postgres extensions cannot run an async runtime.

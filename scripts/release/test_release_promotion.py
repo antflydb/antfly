@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Tests for immutable release storage and the unified release ledger."""
 
 from __future__ import annotations
@@ -7,6 +22,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import shutil
+import subprocess
+import textwrap
 import sys
 import tempfile
 import unittest
@@ -56,7 +75,7 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         document = {
             "schema_version": 1,
-            "required_source_paths": sorted(contract.REQUIRED_PATHS),
+            "required_source_paths": sorted(contract.LEGACY_REQUIRED_PATHS),
         }
 
         def read_object(_root: Path, _commit: str, path: str) -> bytes:
@@ -73,6 +92,221 @@ class ReleasePromotionTests(unittest.TestCase):
             self.assertRaisesRegex(SystemExit, "unsupported release build contract"),
         ):
             contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_apache_source_contract_requires_products_and_package_inputs(self) -> None:
+        contract = load_module(
+            "validate_apache_source_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 2,
+            "runtime_products": ["server", "lite", "inference"],
+            "required_source_paths": sorted(contract.SPLIT_REQUIRED_PATHS),
+        }
+
+        def read_object(_root: Path, _commit: str, path: str) -> bytes:
+            return (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            )
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 2)
+            document["runtime_products"] = ["server", "lite"]
+            with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
+                contract.validate(RELEASE_DIR, COMMIT)
+            document["runtime_products"] = ["server", "lite", "inference"]
+            document["required_source_paths"].remove(
+                "scripts/packaging/package_lite_release.py"
+            )
+            with self.assertRaisesRegex(SystemExit, "required builder inputs"):
+                contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_combined_source_contract_requires_embedded_product_and_readme(
+        self,
+    ) -> None:
+        contract = load_module(
+            "combined_source_contract_test", "validate_source_contract.py"
+        )
+        document = json.loads((RELEASE_DIR / "build-contract.json").read_text())
+
+        def read_object(_root: Path, _commit: str, path: str) -> bytes:
+            return (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            )
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 5)
+            document["runtime_products"] = ["server", "lite", "inference"]
+            with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
+                contract.validate(RELEASE_DIR, COMMIT)
+            document["runtime_products"] = ["server", "embedded"]
+            document["required_source_paths"].remove(
+                "scripts/packaging/embedded-release-README.md"
+            )
+            with self.assertRaisesRegex(SystemExit, "required builder inputs"):
+                contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_historical_combined_source_contract_is_preserved(self) -> None:
+        contract = load_module(
+            "historical_combined_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 3,
+            "runtime_products": ["server", "embedded"],
+            "required_source_paths": sorted(contract.COMBINED_REQUIRED_PATHS),
+        }
+
+        def read_object(_root, _commit, path):
+            return (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            )
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 3)
+
+    def test_runtime_archives_follow_source_contract_and_fail_closed(self) -> None:
+        payload = load_module(
+            "build_contract_runtime_archives_test", "build_release_payload.py"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            archive_dir = Path(directory)
+            server = archive_dir / "antfly_0.3.0_Linux_x86_64_gnu.tar.gz"
+            server.write_bytes(b"server")
+            self.assertEqual(payload.collect_runtime_archives(archive_dir, 1), [server])
+            with self.assertRaisesRegex(SystemExit, "missing matching antfly-lite"):
+                payload.collect_runtime_archives(archive_dir, 2)
+            lite = archive_dir / "antfly-lite_0.3.0_Linux_x86_64_gnu.tar.gz"
+            lite.write_bytes(b"lite")
+            with self.assertRaisesRegex(
+                SystemExit, "missing matching antfly-inference"
+            ):
+                payload.collect_runtime_archives(archive_dir, 2)
+            inference = archive_dir / "antfly-inference_0.3.0_Linux_x86_64_gnu.tar.gz"
+            inference.write_bytes(b"inference")
+            self.assertEqual(
+                payload.collect_runtime_archives(archive_dir, 2),
+                sorted([server, lite, inference]),
+            )
+            with self.assertRaisesRegex(SystemExit, "missing matching antfly-embedded"):
+                payload.collect_runtime_archives(archive_dir, 3)
+            embedded = archive_dir / "antfly-embedded_0.3.0_Linux_x86_64_gnu.tar.gz"
+            embedded.write_bytes(b"combined database and inference")
+            self.assertEqual(
+                payload.collect_runtime_archives(archive_dir, 3),
+                sorted([server, embedded]),
+            )
+            self.assertEqual(payload.artifact_kind(embedded), "runtime-archive")
+            with self.assertRaisesRegex(
+                SystemExit, "unsupported release build contract"
+            ):
+                payload.collect_runtime_archives(archive_dir, 999)
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is required by the release workflow")
+    def test_archive_workflow_dispatches_legacy_and_apache_products(self) -> None:
+        workflow = (
+            RELEASE_DIR.parents[1] / ".github/workflows/antfly-artifact-build.yml"
+        ).read_text()
+        step = workflow.split(
+            "      - name: Build source-declared runtime archives\n", 1
+        )[1].split("      - uses:", 1)[0]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        for key, value in {
+            "archive_os": "Linux",
+            "archive_arch": "x86_64",
+            "archive_suffix": "_gnu",
+            "zig_target": "x86_64-linux-gnu",
+            "zig_optimize": "fast",
+            "metal": "false",
+            "system_blas": "false",
+        }.items():
+            script = script.replace("${{ matrix." + key + " }}", value)
+        contract = load_module(
+            "workflow_dispatch_source_contract_test", "validate_source_contract.py"
+        )
+        for schema, jobs in (
+            (1, ""),
+            (1, "2"),
+            (2, ""),
+            (2, "2"),
+            (3, ""),
+            (3, "2"),
+            (4, ""),
+            (4, "2"),
+            (5, ""),
+            (5, "2"),
+        ):
+            with (
+                self.subTest(schema=schema, jobs=jobs),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                packaging = root / "scripts/packaging"
+                packaging.mkdir(parents=True)
+                command = packaging / "build_zig_release_archive.sh"
+                # Record actual workflow invocations instead of compiling native artifacts.
+                command.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls.txt\n")
+                command.chmod(0o755)
+                subprocess.run(
+                    ["bash", "-c", script.replace("${{ matrix.zig_jobs }}", jobs)],
+                    cwd=root,
+                    check=True,
+                    env={
+                        **os.environ,
+                        "RELEASE_TAG": "v0.3.0",
+                        "RUNTIME_PRODUCTS": json.dumps(
+                            contract.runtime_products(schema)
+                        ),
+                    },
+                )
+                calls = (root / "calls.txt").read_text().splitlines()
+                self.assertEqual(len(calls), len(contract.runtime_products(schema)))
+                self.assertEqual("--jobs 2" in calls[0], bool(jobs))
+                self.assertNotIn("--product", calls[0])
+                self.assertIn(
+                    "--archive-name antfly_0.3.0_Linux_x86_64_gnu.tar.gz", calls[0]
+                )
+                for product, call in zip(
+                    contract.runtime_products(schema)[1:], calls[1:]
+                ):
+                    self.assertIn(f"--product {product}", call)
+                    self.assertIn(
+                        f"--archive-name antfly-{product}_0.3.0_Linux_x86_64_gnu.tar.gz",
+                        call,
+                    )
+
+    def test_release_spec_records_the_validated_source_contract(self) -> None:
+        channels = load_module("apache_release_spec_test", "release_channels.py")
+        payload = load_module(
+            "apache_release_spec_payload_test", "build_release_payload.py"
+        )
+        for schema in (1, 2, 3, 4, 5):
+            with (
+                self.subTest(schema=schema),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                document = channels.build_release_spec(
+                    "v0.3.0",
+                    "stable",
+                    COMMIT,
+                    "f" * 40,
+                    release_line="0.3",
+                    source_ref="refs/heads/main",
+                    source_ref_head=SOURCE_HEAD,
+                    build_contract_schema=schema,
+                ).document()
+                path = Path(directory) / "release-request.json"
+                path.write_text(json.dumps(document))
+                self.assertEqual(
+                    payload.verify_release_spec(path, "v0.3.0", COMMIT)[
+                        "build_contract_schema"
+                    ],
+                    schema,
+                )
 
     def test_release_source_snapshot_is_extracted_from_the_exact_commit(self) -> None:
         stage = load_module("stage_release_source_test", "stage_release_source.py")
@@ -1434,7 +1668,84 @@ class ReleasePromotionTests(unittest.TestCase):
     def test_release_ledger_is_deterministic_and_includes_registry_artifacts(
         self,
     ) -> None:
+        self.assert_release_ledger(2)
+
+    def test_combined_release_ledger_checksums_and_promotion_scope(self) -> None:
+        self.assert_release_ledger(3)
+
+    def test_pkgconfig_release_ledger(self) -> None:
+        self.assert_release_ledger(4)
+
+    def test_fetchable_source_release_ledger(self) -> None:
+        self.assert_release_ledger(5)
+
+    def test_historical_pkgconfig_source_contract_is_preserved(self) -> None:
+        contract = load_module(
+            "historical_pkgconfig_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 4,
+            "runtime_products": ["server", "embedded"],
+            "required_source_paths": sorted(contract.PKGCONFIG_REQUIRED_PATHS),
+        }
+        with mock.patch.object(
+            contract,
+            "git_object",
+            side_effect=lambda _root, _commit, path: (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            ),
+        ):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 4)
+
+    def test_source_package_identity_and_digests_fail_closed(self) -> None:
+        payload = load_module("source_package_payload_test", "build_release_payload.py")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            manifest = self.source_package_fixture(root, payload)
+            self.assertEqual(
+                len(payload.verify_embedded_source(root, "0.2.1", COMMIT)), 3
+            )
+            for field, value in {
+                "commit": "f" * 40,
+                "version": "0.3.0",
+                "working_tree": True,
+                "sha256": "0" * 64,
+                "zig_hash": "not-a-zig-hash",
+            }.items():
+                changed = dict(manifest, **{field: value})
+                (root / "embedded-zig-source.json").write_text(json.dumps(changed))
+                with self.subTest(field=field), self.assertRaises(SystemExit):
+                    payload.verify_embedded_source(root, "0.2.1", COMMIT)
+            (root / "embedded-zig-source.json").write_text(json.dumps(manifest))
+            (root / "unexpected").write_text("stale")
+            with self.assertRaisesRegex(SystemExit, "artifact set"):
+                payload.verify_embedded_source(root, "0.2.1", COMMIT)
+
+    def source_package_fixture(self, root: Path, payload) -> dict:
+        root.mkdir(exist_ok=True)
+        archive = root / "antfly-embedded-source_0.2.1.tar.gz"
+        archive.write_bytes(b"Apache source fixture")
+        zig_hash = "antfly_embedded-0.2.1-fixtureHash"
+        (root / (archive.name + ".zig-hash")).write_text(zig_hash + "\n")
+        manifest = {
+            "schema_version": 1,
+            "version": "0.2.1",
+            "commit": COMMIT,
+            "working_tree": False,
+            "archive": archive.name,
+            "sha256": payload.sha256(archive),
+            "zig_hash": zig_hash,
+        }
+        (root / "embedded-zig-source.json").write_text(json.dumps(manifest))
+        return manifest
+
+    def assert_release_ledger(self, schema: int) -> None:
         payload = load_module("build_release_payload_test", "build_release_payload.py")
+        products = (
+            ("antfly-lite", "antfly-inference") if schema == 2 else ("antfly-embedded",)
+        )
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
             archives, extras, source, output = (
@@ -1447,6 +1758,10 @@ class ReleasePromotionTests(unittest.TestCase):
             extras.mkdir()
             source.mkdir()
             (archives / "antfly_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(b"native")
+            for product in products:
+                (archives / f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz").write_bytes(
+                    product.encode()
+                )
             (extras / "antfly-cli-0.2.1.tgz").write_bytes(b"npm")
             (extras / "cli-snapshot.json").write_text(
                 json.dumps(
@@ -1498,7 +1813,7 @@ class ReleasePromotionTests(unittest.TestCase):
                         "source_ref": "refs/heads/main",
                         "source_ref_head": SOURCE_HEAD,
                         "build_controller_commit": "f" * 40,
-                        "build_contract_schema": 1,
+                        "build_contract_schema": schema,
                         "registry_versions": {
                             "npm": "0.2.1",
                             "python": "0.2.1",
@@ -1526,6 +1841,10 @@ class ReleasePromotionTests(unittest.TestCase):
                 "--promotion-controller-commit",
                 "e" * 40,
             ]
+            if schema >= 5:
+                source_package = root / "embedded-source"
+                self.source_package_fixture(source_package, payload)
+                argv.extend(["--embedded-source-dir", str(source_package)])
             with (
                 mock.patch.object(sys, "argv", argv),
                 mock.patch.dict("os.environ", {"SOURCE_DATE_EPOCH": "0"}),
@@ -1545,6 +1864,27 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             kinds = {artifact["kind"] for artifact in ledger["artifacts"]}
             self.assertIn("runtime-archive", kinds)
+            runtime_names = {
+                artifact["name"]
+                for artifact in ledger["artifacts"]
+                if artifact["kind"] == "runtime-archive"
+            }
+            self.assertEqual(
+                runtime_names,
+                {
+                    "antfly_0.2.1_Linux_x86_64_gnu.tar.gz",
+                    *(["antfly-embedded-source_0.2.1.tar.gz"] if schema >= 5 else []),
+                    *(
+                        f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
+                        for product in products
+                    ),
+                },
+            )
+            checksums = (output / "antfly_zig_checksums.txt").read_text()
+            self.assertEqual(
+                {line.split("  ", 1)[1] for line in checksums.splitlines()},
+                runtime_names,
+            )
             self.assertIn("npm-package", kinds)
             self.assertIn("cli-manifest", kinds)
             self.assertIn("source-manifest", kinds)
@@ -1552,9 +1892,53 @@ class ReleasePromotionTests(unittest.TestCase):
             scopes = {artifact["scope"] for artifact in ledger["artifacts"]}
             self.assertEqual(scopes, {"runtime", "cli", "support"})
 
+            for product in products:
+                missing_archive = archives / f"{product}_0.2.1_Linux_x86_64_gnu.tar.gz"
+                contents = missing_archive.read_bytes()
+                missing_archive.unlink()
+                missing_archive_argv = argv.copy()
+                missing_archive_argv[missing_archive_argv.index(str(output))] = str(
+                    root / f"missing-{product}-output"
+                )
+                with (
+                    self.subTest(missing=product),
+                    mock.patch.object(sys, "argv", missing_archive_argv),
+                    self.assertRaisesRegex(SystemExit, f"missing matching {product}"),
+                ):
+                    payload.main()
+                missing_archive.write_bytes(contents)
+
             verifier = load_module(
                 "verify_release_ledger_test", "verify_release_ledger.py"
             )
+            runtime = root / "runtime"
+            runtime.mkdir()
+            for name in runtime_names:
+                (runtime / name).write_bytes((output / name).read_bytes())
+            runtime_argv = [
+                "verify_release_ledger.py",
+                "--ledger",
+                str(output / "artifacts.json"),
+                "--payload-dir",
+                str(runtime),
+                "--scope",
+                "runtime",
+                "--tag",
+                "v0.2.1",
+                "--commit",
+                COMMIT,
+                "--ledger-sha256",
+                verifier.sha256(output / "artifacts.json"),
+            ]
+            with mock.patch.object(sys, "argv", runtime_argv):
+                self.assertEqual(verifier.main(), 0)
+            (runtime / f"{products[0]}_0.2.1_Linux_x86_64_gnu.tar.gz").unlink()
+            with (
+                mock.patch.object(sys, "argv", runtime_argv),
+                self.assertRaisesRegex(SystemExit, "release runtime scope mismatch"),
+            ):
+                verifier.main()
+
             promotion = root / "promotion"
             promotion.mkdir()
             promoted_package = promotion / "antfly-cli-0.2.1.tgz"

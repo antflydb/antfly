@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -755,6 +756,8 @@ impl Default for types::CreateGraphIndexRequest {
             sources: None,
             summarizer: None,
             template: None,
+            ttl: None,
+            ttl_duration: None,
             type_: types::CreateGraphIndexRequestType::Graph,
             version: 0,
         }

@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +19,7 @@
 // entity/relation extraction feeding a graph index (the "autograph" pattern).
 //
 // It dogfoods the docs cleanup itself: design docs (zig/*.md, zig/pkg/**/*.md,
-// zig/lib/**/*.md, docs/design/**) and work-log entries (work-log/**/*.md) are
+// zig/lib/**/*.md, docs/design/**) and topic history (docs/**/history/**/*.md) are
 // ingested as distinct document kinds, so `dogfood query` and `dogfood entity`
 // can be used to sanity-check that the split reads sensibly end to end.
 package main
@@ -36,7 +37,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/lite"
+	"github.com/antflydb/antfly/go/pkg/embedded"
 )
 
 const (
@@ -96,7 +97,7 @@ Usage:
 func runIngestCmd(args []string) error {
 	fs := flag.NewFlagSet("ingest", flag.ExitOnError)
 	dbPath := fs.String("db", "dogfood.aflite", "Antfly Lite database path")
-	repoRoot := fs.String("repo", "../..", "repository root to ingest design docs and work-log from")
+	repoRoot := fs.String("repo", "../..", "repository root to ingest design docs, plans, and history from")
 	reset := fs.Bool("reset", false, "remove the existing Lite database before ingesting")
 	inferenceURL := fs.String("inference-url", defaultInferenceURL, "optional remote antfly inference server (e.g. http://127.0.0.1:8090); empty runs inference in-process")
 	embedModel := fs.String("embed-model", defaultEmbedModel, "Antfly inference embedding model for chunk_vectors")
@@ -318,10 +319,10 @@ func runStatusCmd(args []string) error {
 // `antfly inference run` server and sets RemoteProviderConfigured so
 // Status().Inference.Mode reports "remote_provider" rather than the default
 // caller-supplied/deferred mode.
-func liteOpenOptions(inferenceURL string) lite.OpenOptions {
-	opts := lite.OpenOptions{
-		Mode:    lite.OpenModeWriter,
-		Profile: lite.ProfileNative,
+func liteOpenOptions(inferenceURL string) embedded.OpenOptions {
+	opts := embedded.OpenOptions{
+		Mode:    embedded.OpenModeWriter,
+		Profile: embedded.ProfileNative,
 	}
 	if inferenceURL == "" {
 		// libantfly links the standalone inference runtime, so a Lite handle
@@ -336,18 +337,18 @@ func liteOpenOptions(inferenceURL string) lite.OpenOptions {
 	return opts
 }
 
-func openOrCreateLite(path, inferenceURL string) (*lite.DB, error) {
+func openOrCreateLite(path, inferenceURL string) (*embedded.DB, error) {
 	opts := liteOpenOptions(inferenceURL)
 	if _, err := os.Stat(path); err == nil {
-		return lite.OpenWithOptions(path, opts)
+		return embedded.OpenWithOptions(path, opts)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	return lite.CreateWithOptions(path, opts)
+	return embedded.CreateWithOptions(path, opts)
 }
 
-func openExistingLite(path, inferenceURL string) (*lite.DB, error) {
-	return lite.OpenWithOptions(path, liteOpenOptions(inferenceURL))
+func openExistingLite(path, inferenceURL string) (*embedded.DB, error) {
+	return embedded.OpenWithOptions(path, liteOpenOptions(inferenceURL))
 }
 
 // requireInferenceProvider fails fast with a clear message when the
@@ -357,7 +358,7 @@ func openExistingLite(path, inferenceURL string) (*lite.DB, error) {
 // comment). Without this check, ingest would silently accumulate enrichment
 // debt with no producer able to satisfy it, or fail deep inside RunUntilIdle
 // with a much less clear error.
-func requireInferenceProvider(db *lite.DB, inferenceURL, extractModel string) error {
+func requireInferenceProvider(db *embedded.DB, inferenceURL, extractModel string) error {
 	if inferenceURL == "" {
 		caps, err := db.Capabilities()
 		if err != nil {
@@ -478,7 +479,7 @@ type existingIndex struct {
 // existing index is verified against this run's settings (see verify.go), so
 // changed flags fail loudly with a rebuild instruction instead of silently
 // keeping the old configuration.
-func ensureSchemaAndIndexes(db *lite.DB, cfg indexBuildConfig) error {
+func ensureSchemaAndIndexes(db *embedded.DB, cfg indexBuildConfig) error {
 	if err := db.SetSchemaJSON(schemaJSON()); err != nil {
 		return fmt.Errorf("set schema: %w", err)
 	}

@@ -288,4 +288,4 @@ Current execution status:
   and deferred L0 runs, then add metrics around both backfill and apply-log
   windows.
 
-> **Relocated:** The dated 2026-04-16 write-amplification follow-up log (nine dated sections plus the execution checklist, 971 lines) that previously lived here is preserved verbatim in [work-log/completed/lsm-writes/follow-ups-2026-04.md](../../../../../../work-log/completed/lsm-writes/follow-ups-2026-04.md). Durable decisions from it are folded into Benchmark Targets, Longer-Term Shape, and Remaining Write-Amplification Plan above.
+> **Relocated:** The dated 2026-04-16 write-amplification follow-up log (nine dated sections plus the execution checklist, 971 lines) that previously lived here is preserved verbatim in [docs/design/lsm-writes/history/follow-ups-2026-04.md](../../../../../../docs/design/lsm-writes/history/follow-ups-2026-04.md). Durable decisions from it are folded into Benchmark Targets, Longer-Term Shape, and Remaining Write-Amplification Plan above.

@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Build the Antfly release payload and manifest files."""
 
 from __future__ import annotations
@@ -38,7 +53,15 @@ def copy_payload_file(src: Path, out_dir: Path) -> Path:
 
 def artifact_kind(path: Path) -> str:
     name = path.name
-    if name.startswith("antfly_") and name.endswith(".tar.gz"):
+    if name.startswith(
+        (
+            "antfly_",
+            "antfly-embedded_",
+            "antfly-embedded-source_",
+            "antfly-lite_",
+            "antfly-inference_",
+        )
+    ) and name.endswith(".tar.gz"):
         return "runtime-archive"
     if name.endswith("_checksums.txt"):
         return "checksums"
@@ -135,10 +158,15 @@ def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
     channel = document.get("channel")
     if not isinstance(build_controller_commit, str) or not isinstance(channel, str):
         raise SystemExit("release spec does not match the release identity")
+    build_contract_schema = document.get("build_contract_schema")
     schema_version = document.get("schema_version")
     if schema_version == 4:
         expected = build_release_spec(
-            tag, channel, commit, build_controller_commit
+            tag,
+            channel,
+            commit,
+            build_controller_commit,
+            build_contract_schema=build_contract_schema,
         ).document()
     elif schema_version == 5:
         release_line = document.get("release_line")
@@ -157,12 +185,67 @@ def verify_release_spec(path: Path, tag: str, commit: str) -> dict[str, object]:
             release_line=release_line,
             source_ref=source_ref,
             source_ref_head=source_ref_head,
+            build_contract_schema=build_contract_schema,
         ).document()
     else:
         raise SystemExit("release spec uses an unsupported schema")
     if document != expected:
         raise SystemExit("release spec does not match the release identity")
     return document
+
+
+def collect_runtime_archives(archive_dir: Path, schema: int) -> list[Path]:
+    from validate_source_contract import runtime_products
+
+    products = runtime_products(schema)
+    server_archives = sorted(archive_dir.glob("antfly_*.tar.gz"))
+    if not server_archives:
+        raise SystemExit(f"no antfly release archives found in {archive_dir}")
+    archives = list(server_archives)
+    for product in products[1:]:
+        prefix = f"antfly-{product}"
+        matching = [
+            archive_dir / f"{prefix}_{archive.name.removeprefix('antfly_')}"
+            for archive in server_archives
+        ]
+        missing = [archive.name for archive in matching if not archive.is_file()]
+        if missing:
+            raise SystemExit(
+                f"missing matching {prefix} release archives: {', '.join(missing)}"
+            )
+        archives.extend(matching)
+    return sorted(archives)
+
+
+def verify_embedded_source(directory: Path, version: str, commit: str) -> list[Path]:
+    manifest = directory / "embedded-zig-source.json"
+    document = json.loads(manifest.read_text())
+    archive_name = f"antfly-embedded-source_{version}.tar.gz"
+    archive = directory / archive_name
+    package_hash = directory / (archive_name + ".zig-hash")
+    if (
+        document.get("schema_version") != 1
+        or document.get("version") != version
+        or document.get("commit") != commit
+        or document.get("working_tree") is not False
+        or document.get("archive") != archive_name
+    ):
+        raise SystemExit("embedded Zig source identity differs from release")
+    if (
+        document.get("sha256") != sha256(archive)
+        or document.get("zig_hash") != package_hash.read_text().strip()
+        or not re.fullmatch(
+            r"antfly_embedded-[A-Za-z0-9.+_-]+", document.get("zig_hash", "")
+        )
+    ):
+        raise SystemExit("embedded Zig source archive or package hash differs")
+    if {p.name for p in directory.iterdir()} != {
+        manifest.name,
+        archive.name,
+        package_hash.name,
+    }:
+        raise SystemExit("embedded Zig source artifact set differs")
+    return [archive, package_hash, manifest]
 
 
 def main() -> int:
@@ -175,7 +258,12 @@ def main() -> int:
         "--archive-dir",
         type=Path,
         required=True,
-        help="directory containing antfly_*.tar.gz",
+        help="directory containing matching runtime archives declared by the source build contract",
+    )
+    parser.add_argument(
+        "--embedded-source-dir",
+        type=Path,
+        help="commit-bound Apache Zig package artifacts (schema 5+)",
     )
     parser.add_argument(
         "--extra-dir",
@@ -215,9 +303,9 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
-    archives = sorted(args.archive_dir.glob("antfly_*.tar.gz"))
-    if not archives:
-        raise SystemExit(f"no antfly release archives found in {args.archive_dir}")
+    archives = collect_runtime_archives(
+        args.archive_dir, release_spec["build_contract_schema"]
+    )
 
     for archive in archives:
         copied.append(copy_payload_file(archive, out_dir))
@@ -250,6 +338,18 @@ def main() -> int:
         if cli_registry_versions != expected_cli_registry_versions:
             raise SystemExit("CLI registry versions do not match the release spec")
         registry_versions = release_registry_versions
+
+    if release_spec["build_contract_schema"] >= 5:
+        if args.embedded_source_dir is None:
+            raise SystemExit("schema 5 requires Apache Zig source package artifacts")
+        for source in verify_embedded_source(
+            args.embedded_source_dir, version, args.commit
+        ):
+            copied.append(copy_payload_file(source, out_dir))
+    elif args.embedded_source_dir is not None:
+        raise SystemExit(
+            "historical build contract does not declare a Zig source package"
+        )
 
     checksums = out_dir / "antfly_zig_checksums.txt"
     with checksums.open("w", encoding="utf-8") as dst:

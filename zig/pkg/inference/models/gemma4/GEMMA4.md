@@ -385,7 +385,7 @@ effects in the target, or a still-missing detail in the clustered output head
 
 > **Relocated:** The dated smoke-test acceptance narrative that previously
 > lived here (27 lines) is preserved verbatim in
-> [work-log/completed/inference/gemma4-mtp-cuda-branch-status.md](../../../../../work-log/completed/inference/gemma4/mtp-cuda.md).
+> [docs/design/inference/history/gemma4/mtp-cuda.md](../../../../../docs/design/inference/history/gemma4/mtp-cuda.md).
 > Durable decisions from it are in the paragraph above and in Open work.
 
 ### CUDA Branch Status
@@ -434,7 +434,7 @@ Useful CUDA/MTP isolation flags:
 
 > **Relocated:** The dated per-branch update log and smoke-test history that
 > previously lived here (219 lines) is preserved verbatim in
-> [work-log/completed/inference/gemma4-mtp-cuda-branch-status.md](../../../../../work-log/completed/inference/gemma4/mtp-cuda.md).
+> [docs/design/inference/history/gemma4/mtp-cuda.md](../../../../../docs/design/inference/history/gemma4/mtp-cuda.md).
 > Durable decisions from it are in the paragraphs above.
 
 ### Metal GGUF Runtime Status
@@ -487,7 +487,7 @@ depending on MLX availability, even in builds with both backends enabled.
 
 > **Relocated:** The dated validator-smoke bisection history that previously
 > lived here (53 lines, 2026-05-07) is preserved verbatim in
-> [work-log/completed/inference/gemma4-mtp-cuda-branch-status.md](../../../../../work-log/completed/inference/gemma4/mtp-cuda.md).
+> [docs/design/inference/history/gemma4/mtp-cuda.md](../../../../../docs/design/inference/history/gemma4/mtp-cuda.md).
 > Durable decisions from it are in the paragraph above and in Current Status.
 
 Baseline, no-MTP prefill/decode optimization is tracked separately in
@@ -545,7 +545,7 @@ not be used to qualify the baseline model path.
 
 ## Metal Performance Plan
 
-This section was `GEMMA4_PERF_PLAN.md`; its implementation ledgers (§§9–16) are preserved in [work-log/completed/inference/gemma4/metal-perf-plan.md](../../../../../work-log/completed/inference/gemma4/metal-perf-plan.md).
+This section was `GEMMA4_PERF_PLAN.md`; its implementation ledgers (§§9–16) are preserved in [docs/design/inference/history/gemma4/metal-perf-plan.md](../../../../../docs/design/inference/history/gemma4/metal-perf-plan.md).
 
 Originally written 2026-08-26 against v0.2.1-rc0 circus benchmark (`https://circus.antfly.io/v0.2.1-rc0/#inference-generation`). Scope: single-stream Gemma 4 E4B/E2B QAT Q4_0 generation on Apple Silicon (Metal). The initial analysis was plan-only; §§9–16 record the subsequent implementation and qualification ledgers.
 
@@ -690,7 +690,7 @@ device-event evidence.
 > **Relocated:** The implementation and qualification ledgers (§9–16, 371
 > lines, 2026-08-26 through 2026-08-28) that previously lived here are
 > preserved verbatim in
-> [work-log/completed/inference/gemma4-perf-plan-ledgers.md](../../../../../work-log/completed/inference/gemma4/metal-perf-plan.md).
+> [docs/design/inference/history/gemma4/metal-perf-plan.md](../../../../../docs/design/inference/history/gemma4/metal-perf-plan.md).
 > Durable decisions from them — pipelined decode frame default-on,
 > pair-activation fusion default-on for M4, the LM-head Q4_K repack opt-in and
 > its Q4_0-head EOT-collapse caveat, the per-model short-KV split-GQA floor

@@ -869,3 +869,8 @@ tests. The focused `zig build resource-budget-test` gate passes both
 filesystem tests and all resource-manager tests without leaks. The
 ReleaseFast build step verifies the installed benchmark artifact used by the
 external experiments.
+
+Unicode-derived classification and normalization tables retain the full Unicode
+License V3 copyright and permission notice when regenerated. The canonical
+notice is in `LICENSES/third-party/Unicode-V3.txt` at the repository root and is
+included in product license bundles. Generator implementation code is Apache-2.0.

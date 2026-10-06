@@ -87,7 +87,7 @@ the subset another model admits.
 
 Encoder latency for the GLiNER2.5 and Laya encoders is a ReleaseFast test,
 `src/bench/antenna_encoder_timing_test.zig`. Results and commands:
-[work-log/completed/inference/antenna/2026-09-25-baselines.md](../../../../../work-log/completed/inference/antenna/2026-09-25-baselines.md).
+[docs/design/inference/history/antenna/2026-09-25-baselines.md](../../../../../docs/design/inference/history/antenna/2026-09-25-baselines.md).
 
 ## Student and teacher targets
 
@@ -126,7 +126,7 @@ antfly-inference finetune train gliner25 <job.json>
 ### Feature distillation
 
 A raw trunk trained on task labels collapses; the student first learns a
-teacher encoder's states (work-log/completed/inference/antenna/2026-09-25-pilot.md).
+teacher encoder's states (docs/design/inference/history/antenna/2026-09-25-pilot.md).
 `distill_pool.py` writes an unlabeled pool (train-split texts under random
 classification or entity schemas), and a job's `distillation` section names
 the frozen teacher:

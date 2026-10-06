@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Render the Homebrew formula for the native Zig Antfly runtime."""
 
 from __future__ import annotations
@@ -71,7 +86,7 @@ class Antfly < Formula
   version "{args.version}"
   # Recover from older formulae that inferred version 64 from arm64 archives.
   version_scheme 1
-  license "Elastic-2.0"
+  license all_of: ["Elastic-2.0", "Apache-2.0"]
 
   if OS.mac?
     if Hardware::CPU.arm?

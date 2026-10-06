@@ -1,0 +1,5 @@
+comment = 'antfly_postgres: PostgreSQL extension for Antfly search'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/antfly_postgres'
+relocatable = false
+superuser = true

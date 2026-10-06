@@ -206,6 +206,9 @@ Near-term goals:
 ## Planning Rules
 
 - Put project-wide sequencing here.
+- Put proposed and active cross-cutting plans in [docs/plans/](../docs/plans/README.md).
+  On completion, fold lasting decisions into the living docs and retain useful
+  dated evidence beside the relevant topic; remove the completed plan.
 - Put current bugs and parity task detail in `TODO.md`.
 - Put subsystem implementation detail in the subsystem roadmap/plan.
 - If a task is mostly about one directory, update that subsystem plan first.
@@ -214,7 +217,9 @@ Near-term goals:
   names, decisions with rationale, a short undated `Status:` line, and an
   `Open work` list. Dated session narrative, pass counts, commit hashes, and
   single-host benchmark tables do not belong in them. Put that material in
-  [`../work-log/completed/`](../work-log/README.md), in a sibling
+  a topic-specific `history/` directory under `docs/design/`,
+  `docs/reference/`, or `docs/operations/` (see the
+  [history index](../docs/design/history.md)), in a sibling
   `*_FINDINGS.md`/`*_EXPERIMENTS.md` ledger, or in a `RESULTS-<date>.md`
   beside the bench script that produced it, and leave a one-line pointer.
   Before moving a log out of a design doc, lift every standing rule it

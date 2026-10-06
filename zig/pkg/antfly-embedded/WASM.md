@@ -222,6 +222,13 @@ const api = await instantiateAntflyEmbeddedApiFromBytes(wasmBytes, {
 });
 ```
 
+## License
+
+First-party embedded database, JavaScript bindings, and inference WASM sources
+are Apache-2.0. Third-party components retain their compatible upstream terms.
+The installed bundle contains `LICENSE`, `LICENSING.md`, `THIRD_PARTY_NOTICES.md`,
+and complete notices under `LICENSES/third-party`.
+
 ## WASM Smoke
 
 This package has a hosted/shared WASM smoke path built on the shared embedded

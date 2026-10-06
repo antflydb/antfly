@@ -9,7 +9,7 @@ SCRIPTS_PY ?= uv run --project scripts --locked python
 # Use Go 1.26 with SIMD experiment enabled for hardware SIMD acceleration
 GO := GOWORK=off GOEXPERIMENT=simd go
 GO_MODULES := \
-	./go/pkg/lite \
+	./go/pkg/embedded \
 	./go/pkg/sdk \
 	./go/pkg/proxy \
 	./go/pkg/operator \
@@ -73,7 +73,7 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check fmt fmt-check repository-check lint license-headers license-check apache-license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main release-scripting-test
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check zig-checksums-check
 
 build-antfarm: build-antfarm-main
@@ -92,6 +92,7 @@ build: build-antfarm
 
 build-docs:
 	uv run --project scripts --locked python scripts/join_public_openapi.py openapi.yaml
+	$(SCRIPTS_PY) scripts/sync_rust_sdk_spec.py
 
 release-scripting-test:
 	scripts/release/test.sh
@@ -117,8 +118,12 @@ graph-identifier-check:
 license-headers: ## Add first-party license headers.
 	$(SCRIPTS_PY) scripts/license_headers.py
 
+apache-license-check: ## Check Apache engine headers and server dependency boundary.
+	$(SCRIPTS_PY) scripts/check_apache_boundary.py
+
 license-check: ## Check first-party license headers.
 	$(SCRIPTS_PY) scripts/license_headers.py --check
+	$(SCRIPTS_PY) scripts/check_apache_boundary.py
 
 zig-build:
 	$(ZIG_MAKE) build ZIG_BUILD_FLAGS="$(ZIG_BUILD_FLAGS)"

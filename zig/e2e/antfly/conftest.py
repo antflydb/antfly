@@ -1,4 +1,5 @@
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Elastic-2.0
 #
 # Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 # except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -162,7 +163,7 @@ SERVER_LOG_DIAGNOSTIC_MARKER = "\nserver logs:\n"
 # Distributed binaries fail fast without an isolated internal RPC identity.
 # Every subprocess launched by this pytest tree inherits this test-only key;
 # production deployments must provision their own random credential as
-# documented in docs/secrets.md.
+# documented in docs/reference/secrets.md.
 os.environ.setdefault(
     "ANTFLY_INTERNAL_SERVICE_SECRET",
     "antfly-e2e-dedicated-internal-service-secret-v1",
