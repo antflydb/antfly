@@ -104,7 +104,7 @@ class MutationReferenceTest(unittest.TestCase):
     def test_campaign_is_a_fixed_unique_source_owned_cohort(self):
         fixtures = (
             Path(__file__).resolve().parents[1]
-            / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+            / "zig/pkg/antfly-embedded/src/sql/fixtures"
         )
         campaign = json.loads((fixtures / "sql_mutation_campaign.json").read_text())
         corpus = {

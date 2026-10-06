@@ -88,7 +88,7 @@ class DocumentReferenceTest(unittest.TestCase):
     def test_campaign_has_exact_source_owned_case_ids(self):
         root = (
             Path(__file__).resolve().parents[1]
-            / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+            / "zig/pkg/antfly-embedded/src/sql/fixtures"
         )
         campaign = json.loads((root / "sql_document_campaign.json").read_text())[
             "entries"

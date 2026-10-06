@@ -24,7 +24,7 @@ from generate_sql_postgres_reference import postgres
 
 FIXTURE = (
     Path(__file__).resolve().parents[1]
-    / "zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_text_reference.json"
+    / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_text_reference.json"
 )
 
 

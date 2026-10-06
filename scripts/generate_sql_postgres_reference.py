@@ -43,7 +43,7 @@ from generate_sql_document_reference import SEEDS
 from generate_sql_parity_read_reference import EMPTY_CONTRACTS, parameter
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures"
 ROW_LIMIT = 4096
 
 # Independent ordering observers for source cases with non-unique sort keys.

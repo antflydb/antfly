@@ -39,8 +39,8 @@ Install PostgreSQL 18 or newer, put its binaries on PATH or set `ANTFLY_PG_BIN`,
 then verify selected PostgreSQL goldens with:
 
 ```sh
-uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py read --check zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_read_campaign_reference.json
-uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py document --check zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_document_reference.json
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_read_campaign_reference.json
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py document --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_reference.json
 uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_generate_sql_postgres_reference.py
 ```
 
@@ -113,7 +113,7 @@ Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
 Original source SHA-256: `52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6`.
 
-`zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_parity_inventory.json` is an immutable compact
+`zig/pkg/antfly-embedded/src/sql/fixtures/sql_parity_inventory.json` is an immutable compact
 projection preserving source order, exact name/family/SQL/parameters, and the
 SHA-256 of every complete original entry. Stable IDs are original one-based
 positions, `sql-0001` through `sql-1586`. The entire projection is also checksum
@@ -174,7 +174,7 @@ The bounded independent reference checks complete RETURNING and final storage
 state, not just row counts. Regenerate only selected goldens with:
 
 ```sh
-python3 scripts/generate_sql_mutation_reference.py --check zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_mutation_reference.json
+python3 scripts/generate_sql_mutation_reference.py --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_reference.json
 ```
 
 The generator does not rewrite SQL or treat an empty mutation as evidence.
@@ -202,7 +202,7 @@ SQLite-backed cases are separate from the two explicit native contracts
 or check only explicitly selected golden IDs with:
 
 ```sh
-python3 scripts/generate_sql_parity_read_reference.py --cases zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_read_reference.json --check
+python3 scripts/generate_sql_parity_read_reference.py --cases zig/pkg/antfly-embedded/src/sql/fixtures/sql_read_reference.json --check
 ```
 
 Discovery output cannot update dispositions. Unknown/duplicate manifest IDs,

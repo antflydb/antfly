@@ -31,7 +31,7 @@ import sqlite3
 from generate_sql_parity_read_reference import parameter
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures"
 COLUMNS = {
     "id": "keyword",
     "status": "keyword",

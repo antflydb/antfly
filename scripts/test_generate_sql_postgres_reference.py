@@ -45,7 +45,7 @@ class PostgresReferenceTest(unittest.TestCase):
 
         fixtures = (
             Path(__file__).resolve().parents[1]
-            / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+            / "zig/pkg/antfly-embedded/src/sql/fixtures"
         )
         cases = json.loads((fixtures / "sql_parity_inventory.json").read_text())[
             "entries"
@@ -103,7 +103,7 @@ class PostgresReferenceTest(unittest.TestCase):
         fixture = json.loads(
             (
                 Path(__file__).resolve().parents[1]
-                / "zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_array_reference.json"
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_reference.json"
             ).read_text()
         )
         self.assertEqual(fixture["reference"], "PostgreSQL exact SQL")
@@ -171,7 +171,7 @@ class PostgresReferenceTest(unittest.TestCase):
         fixture = json.loads(
             (
                 Path(__file__).resolve().parents[1]
-                / "zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_array_binary_reference.json"
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_binary_reference.json"
             ).read_text()
         )
         self.assertEqual(fixture["reference"], "PostgreSQL 18+ binary array_send")

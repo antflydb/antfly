@@ -353,7 +353,7 @@ explicit parameter types, not SQL execution or storage throughput:
 ```sh
 zig run -O ReleaseSafe --dep sql_parser --dep antfly_local_sources \
   -Mroot=pkg/antfly/src/sql_bench.zig --dep sql_parser \
-  -Mantfly_local_sources=pkg/antfly-embedded/src/local/source_catalog.zig \
+  -Mantfly_local_sources=pkg/antfly-embedded/src/source_catalog.zig \
   -Msql_parser=lib/sql/root.zig
 ```
 

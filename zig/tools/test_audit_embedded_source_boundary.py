@@ -33,7 +33,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             repository = Path(directory) / "repo"
             stage = Path(directory) / "stage"
             files = {
-                "zig/pkg/antfly-embedded/src/local/storage/db/db.zig": "local working change",
+                "zig/pkg/antfly-embedded/src/storage/db/db.zig": "local working change",
                 "zig/pkg/antfly/src/storage/server_db_adapter.zig": "server",
                 "zig/pkg/antfly/src/storage/server_transaction_dispatch.zig": "server dispatch",
                 "zig/pkg/antfly/src/storage/server_transaction_recovery.zig": "server recovery",
@@ -56,9 +56,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             ):
                 self.assertEqual(stage_sources(repository, stage), 7)
             self.assertEqual(
-                (
-                    stage / "zig/pkg/antfly-embedded/src/local/storage/db/db.zig"
-                ).read_text(),
+                (stage / "zig/pkg/antfly-embedded/src/storage/db/db.zig").read_text(),
                 "local working change",
             )
             self.assertTrue((stage / "specs/openapi/public.yaml").is_file())
@@ -128,8 +126,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             contract = (
-                project
-                / "pkg/antfly-embedded/src/local/storage/db/replication_contract.zig"
+                project / "pkg/antfly-embedded/src/storage/db/replication_contract.zig"
             )
             contract.parent.mkdir(parents=True)
             contract.write_text("pub const sync_policy = 0;")
@@ -177,7 +174,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
     def test_real_visibility_hook_cannot_regain_server_fields(self):
         source_path = (
             Path(__file__).resolve().parents[1]
-            / "pkg/antfly-embedded/src/local/storage/db/query_visibility.zig"
+            / "pkg/antfly-embedded/src/storage/db/query_visibility.zig"
         )
         source = source_path.read_text()
         declaration = "pub const QueryVisibilityHook = struct {"

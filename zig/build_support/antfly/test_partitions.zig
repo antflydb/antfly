@@ -80,7 +80,7 @@ fn sourceText(b: *std.Build, path: []const u8) ?[]const u8 {
 /// facade remains a control contract; it deliberately does not resolve DB.
 fn requiresPhysical(b: *std.Build, path: []const u8) bool {
     if (physical_sources.get(path)) |value| return value;
-    const local = paths.authored(b, b.path("pkg/antfly-embedded/src/local")).?;
+    const local = paths.authored(b, b.path("pkg/antfly-embedded/src")).?;
     var pending: std.ArrayList([]const u8) = .empty;
     pending.append(b.allocator, path) catch @panic("OOM");
     var seen = std.StringHashMap(void).init(b.allocator);
@@ -114,7 +114,7 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
 }
 
 fn physicalName(b: *std.Build, name: []const u8) bool {
-    const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/local/source_catalog.zig")).?;
+    const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/source_catalog.zig")).?;
     const text = sourceText(b, catalog) orelse return false;
     const marker = b.fmt("pub const {s} = @import(\"", .{name});
     const offset = findMarker(text, 0, marker) orelse return false;
@@ -238,7 +238,7 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         .root_module = root,
         .filters = tests.filters,
         .max_rss = partition_max_rss,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     partitions.put(b.allocator, tests, artifact) catch @panic("OOM");
     return artifact;

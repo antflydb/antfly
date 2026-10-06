@@ -31,7 +31,7 @@ from pathlib import Path
 from sql_reference_functions import register
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures"
 FAMILIES = {"read", "query", "aggregate", "window", "join"}
 EMPTY_CONTRACTS = {"sql-0180"}  # Original WHERE false read, not an inferred waiver.
 

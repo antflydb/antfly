@@ -28,7 +28,7 @@ pub const snowball_languages = [_][]const u8{
     "swedish",
 };
 
-pub const snowball_generated_root = "pkg/antfly-embedded/src/local/search/snowball/generated";
+pub const snowball_generated_root = "pkg/antfly-embedded/src/search/snowball/generated";
 
 pub const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",

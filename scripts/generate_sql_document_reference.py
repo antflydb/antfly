@@ -32,7 +32,7 @@ from generate_sql_parity_read_reference import parameter
 from sql_reference_functions import register
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/local/sql/fixtures"
+FIXTURES = ROOT / "zig/pkg/antfly-embedded/src/sql/fixtures"
 SEEDS = [
     {
         "key": "doc:a",

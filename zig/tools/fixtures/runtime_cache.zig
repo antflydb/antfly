@@ -188,7 +188,7 @@ pub fn build(b: *std.Build) void {
             artifact.root_module.import_table.get("inference_server").?,
         );
         if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
-            .root_source_file = b.path("pkg/antfly-embedded/src/local/storage/lite/capabilities.zig"),
+            .root_source_file = b.path("pkg/antfly-embedded/src/storage/lite/capabilities.zig"),
             .target = artifact.root_module.resolved_target,
             .optimize = artifact.root_module.optimize,
             .imports = &.{.{ .name = "antfly_lite_options", .module = artifact.root_module.import_table.get("antfly_lite_options").? }},
