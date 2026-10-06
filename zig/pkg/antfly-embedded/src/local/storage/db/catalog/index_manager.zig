@@ -3764,7 +3764,7 @@ pub const IndexManager = struct {
     }
 
     fn vectorBlockRootAlloc(self: *const IndexManager) ![]u8 {
-        return try std.mem.join(self.alloc, "/", &.{ self.base_path, "vector-blocks" });
+        return try joinStoragePath(self.alloc, &.{ self.base_path, "vector-blocks" });
     }
 
     fn denseVectorArtifactNameCount(entry: *const DenseIndex) usize {
@@ -4628,7 +4628,7 @@ pub const IndexManager = struct {
         }
         const root = try self.vectorBlockRootAlloc();
         defer self.alloc.free(root);
-        const current_path = try std.mem.join(self.alloc, "/", &.{ root, "CURRENT" });
+        const current_path = try joinStoragePath(self.alloc, &.{ root, "CURRENT" });
         defer self.alloc.free(current_path);
         const current_exists = blk: {
             _ = self.vector_block_storage.?.fileSize(current_path) catch |err| switch (err) {
@@ -46502,4 +46502,11 @@ test "generator config ownership unwinds dense and sparse partial allocation" {
 fn appendOwnedString(alloc: Allocator, out: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
     try out.ensureUnusedCapacity(alloc, 1);
     out.appendAssumeCapacity(try alloc.dupe(u8, value));
+}
+
+/// Vector-block paths may live inside a Lite file, where only '/' is valid.
+/// Windows joins with '/'; other targets keep std.fs.path.join unchanged.
+fn joinStoragePath(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    if (comptime builtin.os.tag == .windows) return std.mem.join(alloc, "/", parts);
+    return std.fs.path.join(alloc, parts);
 }
