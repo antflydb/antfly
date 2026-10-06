@@ -451,7 +451,14 @@ def plan_gc(
         if expired
         else set()
     )
-    if not unknown_references:
+    if unknown_references:
+        # Keep the commit marker until its shared references can be collected.
+        # A later plan discovers these expired releases through their manifests,
+        # even after their other version-prefix objects have been removed.
+        delete_keys.difference_update(
+            f"{release_prefix(tag)}{LEDGER_NAME}" for tag in expired if tag in releases
+        )
+    else:
         delete_keys.update((expired_content - retained_content) & all_content_keys)
 
     retained_container_digests = {

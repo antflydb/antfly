@@ -130,8 +130,12 @@ A release prefix without `artifacts.json` is retained and reported as
 `missing-artifact-manifest`. It does not stop retention of other version
 prefixes. Because its shared artifact and container references are unknown,
 shared-object and container sweeping remains disabled until the manifest is
-repaired or the prefix is explicitly removed. Malformed existing manifests and
-missing manifests bound to a channel journal’s ledger digest still stop
+repaired or the prefix is explicitly removed. Expired releases retain their
+`artifacts.json` commit markers while this cleanup is blocked, so later runs can
+still discover and collect their shared artifacts and container identities;
+other expired version-prefix objects can be removed immediately. Malformed
+existing manifests and missing manifests bound to a channel journal’s ledger
+digest still stop
 planning. Legacy aliases without a ledger digest protect their version prefixes
 even when the manifest is absent.
 

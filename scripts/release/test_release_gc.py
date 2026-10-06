@@ -324,7 +324,8 @@ class ReleaseGCTests(unittest.TestCase):
         self.assertEqual(plan["retained"]["v0.0.0-dev22"], "missing-artifact-manifest")
         self.assertIn("v0.0.0-dev.1", plan["expired"])
         self.assertNotIn(unknown, plan["delete_keys"])
-        self.assertIn("antfly/v0.0.0-dev.1/artifacts.json", plan["delete_keys"])
+        self.assertNotIn("antfly/v0.0.0-dev.1/artifacts.json", plan["delete_keys"])
+        self.assertIn("antfly/v0.0.0-dev.1/metadata.json", plan["delete_keys"])
         self.assertFalse(
             any(k.startswith(gc.CONTENT_ROOT) for k in plan["delete_keys"])
         )
@@ -332,6 +333,72 @@ class ReleaseGCTests(unittest.TestCase):
             f"{gc.CONTAINER_IDENTITY_ROOT}{ledger}.json", plan["delete_keys"]
         )
         self.assertEqual(plan["container_deletions"], [])
+
+    def test_deferred_shared_cleanup_resumes_after_manifest_repair(self) -> None:
+        for cleanup in (False, True):
+            with self.subTest(cleanup=cleanup):
+                store = MemoryStore()
+                tag = "v0.0.0-dev.1"
+                version_ledger = f"antfly/{tag}/artifacts.json"
+                ledger = store.add_release(tag, 100)
+                shared_ledger = f"{gc.CONTENT_ROOT}{ledger}/artifacts.json"
+                store.put(shared_ledger, store.stored[version_ledger].body)
+                record_key = f"{gc.CONTAINER_IDENTITY_ROOT}{ledger}.json"
+                releases, _, _, _ = gc.load_releases(
+                    store, store.list_objects("antfly/")
+                )
+                content_keys = releases[tag].content_keys
+                unknown = "antfly/v9.0.0/antfly.tar.gz"
+                store.put(unknown, b"legacy stable")
+                store.add_release("v0.0.0-dev.2", 1)
+
+                def plan():
+                    return gc.plan_gc(
+                        store,
+                        now=NOW,
+                        nightly_min_count=1,
+                        delete_dev_releases=cleanup,
+                    )
+
+                def apply(deletion):
+                    for key in deletion["delete_keys"]:
+                        store.objects.pop(key, None)
+                        store.stored.pop(key, None)
+
+                blocked = plan()
+                self.assertIn(tag, blocked["expired"])
+                self.assertNotIn(version_ledger, blocked["delete_keys"])
+                self.assertIn(f"antfly/{tag}/metadata.json", blocked["delete_keys"])
+                self.assertFalse(content_keys & set(blocked["delete_keys"]))
+                self.assertEqual(blocked["container_deletions"], [])
+                apply(blocked)
+                # Repeated blocked sweeps must not lose the remaining manifest.
+                blocked_again = plan()
+                self.assertIn(tag, blocked_again["expired"])
+                apply(blocked_again)
+                self.assertIn(version_ledger, store.objects)
+                self.assertIn(record_key, store.objects)
+
+                # Repair the legacy stable release, then finish the deferred
+                # artifact and image cleanup through the next normal plan.
+                store.add_release("v9.0.0", 100)
+                resumed = plan()
+                self.assertEqual(resumed["policy"]["shared_sweep"], "enabled")
+                self.assertIn(version_ledger, resumed["delete_keys"])
+                self.assertTrue(content_keys <= set(resumed["delete_keys"]))
+                self.assertIn(record_key, resumed["container_record_deletions"])
+                self.assertIn(
+                    store.container_digests[tag],
+                    {
+                        item["container_digest"]
+                        for item in resumed["container_deletions"]
+                    },
+                )
+                apply(resumed)
+                self.assertFalse(content_keys & store.objects.keys())
+                self.assertNotIn(version_ledger, store.objects)
+                self.assertNotIn(record_key, store.objects)
+                self.assertIn(unknown, store.objects)
 
     def test_dev_cleanup_is_explicit_and_preserves_other_releases(self) -> None:
         store = MemoryStore()
