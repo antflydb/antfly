@@ -281,7 +281,14 @@ pub fn create(config: Config) Graph {
     transcribing_mod.addImport("inference_api", inference_api_mod);
     transcribing_mod.addImport("antfly_scraping", scraping_mod);
     transcribing_mod.addImport("antfly_google", google_mod);
-    const apple_native_mod = @import("../../../lib/apple_native/build_support.zig").createDisabled(b, b.path(paths.shared_lib_root), target, optimize, platform_mod, httpx_mod);
+    // Every inference composition has a portable Apple provider surface.
+    // Native server composition replaces these imports when it builds the bridge.
+    const apple_native_options = b.addOptions();
+    apple_native_options.addOption(bool, "enabled", false);
+    const apple_native_mod = createSharedModule(config, "lib/apple_native/src/mod.zig");
+    apple_native_mod.addImport("apple_native_options", apple_native_options.createModule());
+    apple_native_mod.addImport("antfly_platform", platform_mod);
+    apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
     const inference_client_mod = shared.inference_client orelse if (!backend.skip_openapi) blk: {
         const mod = addOrCreateModule(b, config.register_public_modules, "inference_client", .{

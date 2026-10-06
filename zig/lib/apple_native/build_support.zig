@@ -15,22 +15,6 @@
 
 const std = @import("std");
 
-/// Configure the portable, disabled Apple provider surface. Native server
-/// composition replaces these imports when it enables and builds the bridge.
-pub fn createDisabled(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, platform: *std.Build.Module, httpx: *std.Build.Module) *std.Build.Module {
-    const options = b.addOptions();
-    options.addOption(bool, "enabled", false);
-    const module = b.createModule(.{
-        .root_source_file = root.path(b, "lib/apple_native/src/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    module.addImport("apple_native_options", options.createModule());
-    module.addImport("antfly_platform", platform);
-    module.addImport("httpx", httpx);
-    return module;
-}
-
 /// Generated paths are resolved during the make phase in Zig 0.17. Pass the
 /// explicit test library path through env rather than baking a cache path into
 /// production binaries or resolving the installation prefix at configure time.
