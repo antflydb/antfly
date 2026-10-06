@@ -36,13 +36,18 @@ convenience package should be introduced only when it offers a distinct API or
 distribution benefit; the current combined bindings cover both use cases.
 
 Installing an embedded binding does not register `antfly-lite` or
-`antfly-inference` as a command. Platform packages keep
-`antfly-inference-worker` only as a private executable next to `libantfly`,
-where the runtime can find it when a backend requires process isolation.
-Bindings call the C API; inference runs in-process or in that private worker
-according to the backend and runtime configuration. The single Apache Embedded archive
-distributes both public CLIs (`antfly-lite` and `antfly-inference`), `libantfly`,
-`antfly.h`, and the private worker, with runtime files and license notices.
+`antfly-inference` as a command. Platform packages include
+`antfly-inference-worker` as a private executable next to `libantfly`.
+Bindings call the C API, which runs inference in-process on every backend,
+including Metal, CUDA, ONNX, and PJRT. `libantfly` disables process isolation
+and does not use `ANTFLY_INFERENCE_WORKER`. A GPU driver call cannot be
+interrupted once entered, and a driver fault can terminate the embedding
+application. The private worker does not provide crash containment for bindings.
+
+Server hosts that enable process isolation can use a replaceable inference
+worker. The single Apache Embedded archive distributes both public CLIs
+(`antfly-lite` and `antfly-inference`), `libantfly`, `antfly.h`, and the private
+worker, with runtime files and license notices.
 There are two primary release products: the ELv2 server and the Apache embedded
 runtime. Source ownership remains separated between the embedded integration
 and inference engine packages.

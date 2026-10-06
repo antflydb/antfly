@@ -801,9 +801,8 @@ unexpectedly start sending data to a network provider.
 #### Local Embedded Inference
 
 Local inference is built in, not optional packaging: every `libantfly`/
-`antfly lite` build embeds the standalone inference runtime in-process, the
-same as the `antfly` executable (see COMPILATION.md's "C API composition"
-section). There is no separate base/full build distinction -- `zig build
+`antfly-lite` build links the inference runtime (see COMPILATION.md's
+"C API composition" section). There is no separate base/full build distinction -- `zig build
 capi` always links the inference archive (2026-09-17 product decision: Lite
 hosts get local inference without a separate runtime, at the cost of a much
 larger shared library).
@@ -822,40 +821,29 @@ the standard `libantfly` -- no separate library or extra link flags.
 Models are still auto-discovered the same way as `antfly inference pull`,
 under `~/.antfly/inference/models/`.
 
-**Worker process.** GPU-hosted and driver-backed backends (Metal, CUDA, ONNX,
-PJRT) run model construction and, for Metal/CUDA/PJRT, execution itself in a
-separate, replaceable child process (`<worker executable> inference
-_worker`), not in the host process -- see
-`BackendRuntime.requiresProcessIsolation` in
-`zig/pkg/inference/src/backends/backends.zig`. This is crash containment, not
-an implementation accident: an unabortable driver call or a model load that
-corrupts GPU state can only be recovered by killing and respawning the
-process that made it, and that must never be the process embedding
-`libantfly`. Worker placement is decided per build, not per model: when any
-process-isolated backend is compiled in (Metal is on by default on macOS), the
-worker starts when a local-runtime handle opens and all local inference runs
-there, CPU models included. Only builds without those backends run inference
-in-process.
+**In-process execution.** The local database provider used by `libantfly`
+and Lite CLI enrichment explicitly sets `process_isolation: false`. All
+backends, including Metal, CUDA, ONNX, and PJRT, therefore run in the host
+process. `ANTFLY_INFERENCE_WORKER` is not used by this provider, and opening
+an embedded inference handle does not require a worker executable. The
+private worker bundled with the Apache Embedded archive and Python/npm
+packages does not provide process isolation for library calls.
 
-The `antfly` CLI resolves the worker by re-executing itself (`argv[0]` names
-the `antfly` binary the user launched, which understands `inference
-_worker`). A library host has no such self -- `argv[0]` is the Go test
-binary, `examples/dogfood`, or whatever else linked `libantfly` -- so the
-runtime resolves the worker executable in this order:
+Once a call enters a GPU driver, a deadline or close cannot interrupt it;
+cancellation takes effect after the call returns. A driver fault can
+terminate the embedding application. Keep inference resource budgets and
+concurrency bounded. The binding READMEs describe the same execution contract.
 
-1. `ANTFLY_INFERENCE_WORKER`, an environment variable naming the worker
-   executable directly (typically the path to an `antfly` binary).
-2. The image this code was loaded from, via `dladdr`: for the statically
-   linked `antfly` executable this is itself (unchanged CLI behavior); for a
-   shared `libantfly`/`libantfly.dylib`, the runtime looks for a sibling
-   `antfly` binary in the same directory.
-3. `antfly` on `PATH`.
-
-If none of these resolve, model construction on a process-isolated backend
-fails with a clear error naming `ANTFLY_INFERENCE_WORKER`. Set that variable
-(or ship an `antfly` binary next to `libantfly`, or put one on `PATH`) when
-embedding Lite in a host that is not the `antfly` binary itself and needs
-Metal/CUDA/ONNX/PJRT models.
+**Server worker isolation.** Server hosts that enable process isolation run
+local inference in a replaceable child process when a compiled backend
+requires it; CPU models also run there in that configuration. This policy
+belongs to the server host, rather than the embedded database provider.
+The worker resolver uses `ANTFLY_INFERENCE_WORKER` as an explicit override,
+then the executable image itself for a statically linked CLI, or sibling
+`antfly-inference-worker` and `antfly-lite` executables for a shared library,
+then those Apache executable names on `PATH`. It does not automatically
+fall back to the ELv2 `antfly` executable. Library users do not need to ship
+an ELv2 server to use embedded inference.
 
 #### Manual Maintenance
 
